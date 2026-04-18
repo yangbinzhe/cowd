@@ -8,19 +8,14 @@ pub mod comment;
 pub mod doc;
 pub mod rules;
 
-use adapter::{InboundMessage, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformResult};
-use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::sync::Arc;
-use tokio::sync::RwLock;
-
-// Re-export types for convenience
-pub use adapter::{FeishuConfig, FeishuAdapter};
+// Re-export types from sibling modules
+pub use adapter::{FeishuAdapter, FeishuConfig};
 pub use comment::{CommentHandler, CommentStatus, FeishuComment, CreateCommentRequest, ReplyCommentRequest, UpdateCommentRequest, CommentFilter};
 pub use doc::{DocumentClient, DocumentContent, DocumentMetadata, DocumentType, DocumentElement, SearchDocumentsRequest, SearchResult, SearchDocumentsResponse};
 pub use rules::{RulesEngine, RoutingRule, RuleCondition, RuleAction, RuleMatch};
+
+// Re-export from parent module (platform)
+pub use super::{PlatformError, PlatformResult};
 
 /// Create a Feishu adapter from config settings.
 pub fn create_feishu_adapter(settings: &serde_json::Value) -> PlatformResult<FeishuAdapter> {

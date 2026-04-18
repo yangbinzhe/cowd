@@ -502,21 +502,24 @@ impl CommentHandler {
     /// Reply to a comment.
     pub async fn reply_comment(&self, request: ReplyCommentRequest) -> PlatformResult<FeishuComment> {
         // Get the parent comment to find the doc_token
-        let mut cache = self.cache.write().await;
+        let cache = self.cache.read().await;
 
-        for (doc_token, comments) in cache.iter() {
-            if let Some(parent) = comments.iter().find(|c| c.id == request.comment_id) {
-                drop(cache);
-                return self.create_comment(CreateCommentRequest {
-                    doc_token: doc_token.clone(),
-                    content: request.content,
-                    parent_id: Some(request.comment_id),
-                    position: None,
-                }).await;
-            }
+        // Find the doc_token for this comment
+        let doc_token = cache.iter()
+            .find(|(_, comments)| comments.iter().any(|c| c.id == request.comment_id))
+            .map(|(dt, _)| dt.clone());
+
+        if let Some(dt) = doc_token {
+            drop(cache);
+            return self.create_comment(CreateCommentRequest {
+                doc_token: dt,
+                content: request.content,
+                parent_id: Some(request.comment_id),
+                position: None,
+            }).await;
         }
-        drop(cache);
 
+        drop(cache);
         Err(PlatformError::Unknown(
             "parent comment not found".to_string()
         ))
@@ -558,11 +561,11 @@ impl CommentHandler {
         };
 
         // Need to find the document token first
-        let mut cache = self.cache.write().await;
-        let (doc_token, _) = cache.iter()
+        let cache = self.cache.read().await;
+        let doc_token = cache.iter()
             .find(|(_, comments)| comments.iter().any(|c| c.id == request.comment_id))
-            .ok_or_else(|| PlatformError::Unknown("comment not found".to_string()))?
-            .clone();
+            .map(|(dt, _)| dt.clone())
+            .ok_or_else(|| PlatformError::Unknown("comment not found".to_string()))?;
         drop(cache);
 
         let url = format!(

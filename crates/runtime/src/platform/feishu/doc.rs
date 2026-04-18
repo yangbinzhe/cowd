@@ -510,9 +510,15 @@ impl DocumentClient {
         if let Some(cells_data) = block.get("table").and_then(|t| t.get("cells")) {
             if let Some(cells_arr) = cells_data.as_array() {
                 for (idx, cell_data) in cells_arr.iter().enumerate() {
-                    let content = self.extract_text_from_children(
+                    let text_elements = self.extract_text_from_children(
                         cell_data.get("children").and_then(|c| c.as_array())
                     );
+
+                    // Wrap text in a Paragraph element
+                    let content = vec![DocumentElement::Paragraph {
+                        elements: text_elements,
+                        style: None,
+                    }];
 
                     rows.push(TableRow {
                         cells: vec![TableCell { content }],
@@ -575,7 +581,7 @@ impl DocumentClient {
             DocumentElement::Table { rows } => {
                 for row in rows {
                     let cells: Vec<String> = row.cells.iter()
-                        .map(|c| self.elements_to_text(&c.content))
+                        .map(|c| self.elements_to_text_from_doc_elements(&c.content))
                         .collect();
                     let cell_str = cells.join(" | ");
                     if row.is_header {
@@ -614,6 +620,20 @@ impl DocumentClient {
             .map(|e| e.text.clone())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /// Convert document elements to plain text (for table cells).
+    fn elements_to_text_from_doc_elements(&self, elements: &[DocumentElement]) -> String {
+        elements.iter()
+            .filter_map(|e| match e {
+                DocumentElement::Paragraph { elements, .. } => Some(self.elements_to_text(elements)),
+                DocumentElement::Heading { elements, .. } => Some(self.elements_to_text(elements)),
+                DocumentElement::CodeBlock { elements, .. } => Some(self.elements_to_text(elements)),
+                DocumentElement::Quote { elements, .. } => Some(self.elements_to_text(elements)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -666,9 +686,10 @@ impl DocumentClient {
         let token = self.adapter.ensure_token().await?;
         let client = reqwest::Client::new();
 
-        let mut query_params = vec![
+        let count = request.page_size.unwrap_or(20).to_string();
+        let mut query_params: Vec<(&str, &str)> = vec![
             ("search_key", &request.query),
-            ("count", &request.page_size.unwrap_or(20).to_string()),
+            ("count", &count),
         ];
 
         if let Some(page_token) = &request.page_token {
@@ -676,7 +697,8 @@ impl DocumentClient {
         }
 
         if let Some(owned_only) = request.owned_only {
-            query_params.push(("docs_search_type", if owned_only { "1" } else { "2" }));
+            let search_type = if owned_only { "1" } else { "2" };
+            query_params.push(("docs_search_type", search_type));
         }
 
         let response = client
@@ -701,13 +723,13 @@ impl DocumentClient {
             total: Option<u32>,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Clone)]
         struct SearchApiItem {
             doc: Option<SearchApiDoc>,
             snippets: Option<Vec<String>>,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Clone)]
         struct SearchApiDoc {
             doc_id: Option<String>,
             doc_type: Option<String>,
@@ -715,7 +737,7 @@ impl DocumentClient {
             owner: Option<SearchApiOwner>,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Clone)]
         struct SearchApiOwner {
             name: Option<String>,
         }
@@ -740,7 +762,8 @@ impl DocumentClient {
         }
 
         let results: Vec<SearchResult> = resp.data
-            .and_then(|d| d.docs)
+            .as_ref()
+            .and_then(|d| d.docs.clone())
             .unwrap_or_default()
             .into_iter()
             .filter_map(|item| {
@@ -760,10 +783,13 @@ impl DocumentClient {
             })
             .collect();
 
+        let next_page_token = resp.data.as_ref().and_then(|d| d.page_token.clone());
+        let total = resp.data.as_ref().and_then(|d| d.total).unwrap_or(0);
+
         Ok(SearchDocumentsResponse {
             results,
-            next_page_token: resp.data.and_then(|d| d.page_token),
-            total: resp.data.and_then(|d| d.total).unwrap_or(0),
+            next_page_token,
+            total,
         })
     }
 }
