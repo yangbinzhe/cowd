@@ -13,6 +13,7 @@ mod compact;
 mod config;
 pub mod config_validate;
 mod conversation;
+pub mod doc_ingestion;
 mod file_ops;
 mod git_context;
 pub mod green_contract;
@@ -82,6 +83,10 @@ pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
     WriteFileOutput,
+};
+pub use doc_ingestion::{
+    ClassificationResult, ConflictStrategy, DocumentCategory, DocumentClassifier, DocumentIngestor,
+    DocumentMetadata, IngestionResult,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
