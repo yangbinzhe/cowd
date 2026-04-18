@@ -15,6 +15,7 @@ pub mod config_validate;
 mod conversation;
 pub mod doc_ingestion;
 pub mod gates;
+pub mod wave;
 mod file_ops;
 mod git_context;
 pub mod green_contract;
@@ -93,6 +94,10 @@ pub use gates::{
     AbortGate, EscalationGate, Gate, GateContext, GateError, GateEvaluator, GateResult,
     HardStop, PreFlightGate, PreFlightCheck, RevisionCheck, RevisionGate, ViolationSeverity,
     ViolationType,
+};
+pub use wave::{
+    DependencyGraph, TaskId, TaskResult, TaskStatus, Wave, WaveConfig, WaveError,
+    WaveOrchestrator, WaveResult, WaveStatus, WaveTask,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{

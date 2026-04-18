@@ -1,0 +1,722 @@
+//! Wave Orchestration for Parallel Task Execution.
+//!
+//! Implements a wave-based execution model where tasks are organized into waves
+//! based on dependencies, allowing parallel execution within each wave.
+
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use thiserror::Error;
+
+/// Wave execution error.
+#[derive(Error, Debug)]
+pub enum WaveError {
+    #[error("dependency cycle detected: {0}")]
+    DependencyCycle(String),
+
+    #[error("task not found: {0}")]
+    TaskNotFound(String),
+
+    #[error("wave execution failed: {0}")]
+    ExecutionFailed(String),
+
+    #[error("invalid dependency: {0}")]
+    InvalidDependency(String),
+}
+
+/// Task identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TaskId(pub String);
+
+impl TaskId {
+    /// Create a new task ID.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Task status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    /// Task is pending.
+    Pending,
+    /// Task is running.
+    Running,
+    /// Task completed successfully.
+    Completed,
+    /// Task failed.
+    Failed,
+    /// Task was skipped.
+    Skipped,
+}
+
+impl Default for TaskStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+/// Task result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskResult {
+    /// Task ID.
+    pub task_id: TaskId,
+    /// Whether the task succeeded.
+    pub success: bool,
+    /// Output from the task.
+    pub output: Option<String>,
+    /// Error message if failed.
+    pub error: Option<String>,
+    /// Execution duration in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// A task to be executed.
+#[derive(Debug, Clone)]
+pub struct WaveTask {
+    /// Task identifier.
+    pub id: TaskId,
+    /// Task name for display.
+    pub name: String,
+    /// Task description.
+    pub description: Option<String>,
+    /// Dependencies on other tasks (by task ID).
+    pub dependencies: Vec<TaskId>,
+    /// Task priority (higher = earlier execution within wave).
+    pub priority: i32,
+    /// Whether this task can run in parallel with others.
+    pub parallelizable: bool,
+    /// Task payload/data.
+    pub payload: serde_json::Value,
+}
+
+impl WaveTask {
+    /// Create a new task.
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: TaskId::new(id),
+            name: name.into(),
+            description: None,
+            dependencies: Vec::new(),
+            priority: 0,
+            parallelizable: true,
+            payload: serde_json::Value::Null,
+        }
+    }
+
+    /// Add a dependency.
+    pub fn with_dependency(mut self, dep: TaskId) -> Self {
+        self.dependencies.push(dep);
+        self
+    }
+
+    /// Set priority.
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Set description.
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = Some(desc.into());
+        self
+    }
+
+    /// Set payload.
+    pub fn with_payload(mut self, payload: serde_json::Value) -> Self {
+        self.payload = payload;
+        self
+    }
+}
+
+/// A wave of tasks that can be executed in parallel.
+#[derive(Debug, Clone)]
+pub struct Wave {
+    /// Wave number.
+    pub number: u32,
+    /// Tasks in this wave.
+    pub tasks: Vec<TaskId>,
+    /// Status of the wave.
+    pub status: WaveStatus,
+}
+
+impl Wave {
+    /// Create a new wave.
+    pub fn new(number: u32) -> Self {
+        Self {
+            number,
+            tasks: Vec::new(),
+            status: WaveStatus::Waiting,
+        }
+    }
+}
+
+/// Wave status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaveStatus {
+    /// Wave is waiting for dependencies.
+    Waiting,
+    /// Wave is ready to execute.
+    Ready,
+    /// Wave is executing.
+    Executing,
+    /// Wave completed.
+    Completed,
+    /// Wave failed.
+    Failed,
+}
+
+impl Default for WaveStatus {
+    fn default() -> Self {
+        Self::Waiting
+    }
+}
+
+/// Wave execution result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaveResult {
+    /// Wave number.
+    pub wave_number: u32,
+    /// Whether all tasks in the wave succeeded.
+    pub success: bool,
+    /// Task results.
+    pub task_results: Vec<TaskResult>,
+    /// Total duration in milliseconds.
+    pub duration_ms: u64,
+    /// Error message if wave failed.
+    pub error: Option<String>,
+}
+
+/// Wave execution configuration.
+#[derive(Debug, Clone)]
+pub struct WaveConfig {
+    /// Maximum parallel tasks per wave.
+    pub max_parallel: usize,
+    /// Continue on failure (execute remaining tasks in wave).
+    pub continue_on_failure: bool,
+    /// Stop execution on first wave failure.
+    pub stop_on_wave_failure: bool,
+    /// Timeout per task in milliseconds.
+    pub task_timeout_ms: u64,
+    /// Timeout per wave in milliseconds.
+    pub wave_timeout_ms: u64,
+}
+
+impl Default for WaveConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel: 4,
+            continue_on_failure: true,
+            stop_on_wave_failure: false,
+            task_timeout_ms: 300000, // 5 minutes
+            wave_timeout_ms: 1800000, // 30 minutes
+        }
+    }
+}
+
+impl WaveConfig {
+    /// Set maximum parallel tasks.
+    pub fn with_max_parallel(mut self, max: usize) -> Self {
+        self.max_parallel = max;
+        self
+    }
+
+    /// Set continue on failure.
+    pub fn with_continue_on_failure(mut self, continue_on_failure: bool) -> Self {
+        self.continue_on_failure = continue_on_failure;
+        self
+    }
+}
+
+/// Wave orchestrator for managing task execution.
+pub struct WaveOrchestrator {
+    config: WaveConfig,
+    tasks: HashMap<TaskId, WaveTask>,
+    waves: Vec<Wave>,
+    task_status: HashMap<TaskId, TaskStatus>,
+    task_results: HashMap<TaskId, TaskResult>,
+}
+
+impl WaveOrchestrator {
+    /// Create a new orchestrator.
+    pub fn new() -> Self {
+        Self {
+            config: WaveConfig::default(),
+            tasks: HashMap::new(),
+            waves: Vec::new(),
+            task_status: HashMap::new(),
+            task_results: HashMap::new(),
+        }
+    }
+
+    /// Set configuration.
+    pub fn with_config(mut self, config: WaveConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Add a task.
+    pub fn add_task(&mut self, task: WaveTask) -> &mut Self {
+        self.task_status.insert(task.id.clone(), TaskStatus::Pending);
+        self.tasks.insert(task.id.clone(), task);
+        self
+    }
+
+    /// Add multiple tasks.
+    pub fn add_tasks(&mut self, tasks: impl IntoIterator<Item = WaveTask>) -> &mut Self {
+        for task in tasks {
+            self.add_task(task);
+        }
+        self
+    }
+
+    /// Build waves from task dependencies.
+    pub fn build_waves(&mut self) -> Result<&mut Self, WaveError> {
+        // Detect cycles using DFS
+        self.detect_cycles()?;
+
+        // Calculate in-degree for each task
+        let mut in_degree: HashMap<TaskId, usize> = self
+            .tasks
+            .keys()
+            .map(|id| (id.clone(), 0))
+            .collect();
+
+        for task in self.tasks.values() {
+            for dep in &task.dependencies {
+                if let Some(degree) = in_degree.get_mut(dep) {
+                    *degree += 1;
+                }
+            }
+        }
+
+        // Kahn's algorithm for topological sort with wave assignment
+        let mut waves: Vec<Vec<TaskId>> = Vec::new();
+
+        loop {
+            // Find tasks with no remaining dependencies
+            let ready: Vec<TaskId> = in_degree
+                .iter()
+                .filter(|(_, &degree)| degree == 0)
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            if ready.is_empty() {
+                break;
+            }
+
+            // Sort by priority within wave
+            let mut ready_sorted: Vec<&TaskId> = ready.iter().collect();
+            ready_sorted.sort_by(|a, b| {
+                let task_a = self.tasks.get(*a).unwrap();
+                let task_b = self.tasks.get(*b).unwrap();
+                task_b.priority.cmp(&task_a.priority)
+            });
+
+            let current_wave: Vec<TaskId> = ready_sorted.into_iter().cloned().collect();
+
+            // Remove from dependency graph
+            for id in &current_wave {
+                in_degree.remove(id);
+                for task in self.tasks.values() {
+                    if task.dependencies.contains(id) {
+                        if let Some(degree) = in_degree.get_mut(&task.id) {
+                            *degree = degree.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+
+            waves.push(current_wave);
+        }
+
+        // Check if all tasks were assigned
+        if !in_degree.is_empty() {
+            let unassigned: Vec<String> = in_degree.keys().map(|id| id.0.clone()).collect();
+            return Err(WaveError::DependencyCycle(format!(
+                "unassigned tasks: {}",
+                unassigned.join(", ")
+            )));
+        }
+
+        // Build Wave objects
+        self.waves = waves
+            .into_iter()
+            .enumerate()
+            .map(|(i, tasks)| {
+                let mut wave = Wave::new(i as u32 + 1);
+                wave.tasks = tasks;
+                wave.status = WaveStatus::Waiting;
+                wave
+            })
+            .collect();
+
+        Ok(self)
+    }
+
+    /// Detect circular dependencies.
+    fn detect_cycles(&self) -> Result<(), WaveError> {
+        let mut visited: HashSet<TaskId> = HashSet::new();
+        let mut rec_stack: HashSet<TaskId> = HashSet::new();
+        let mut path: Vec<TaskId> = Vec::new();
+
+        fn dfs(
+            tasks: &HashMap<TaskId, WaveTask>,
+            visited: &mut HashSet<TaskId>,
+            rec_stack: &mut HashSet<TaskId>,
+            path: &mut Vec<TaskId>,
+            node: &TaskId,
+        ) -> Option<Vec<TaskId>> {
+            visited.insert(node.clone());
+            rec_stack.insert(node.clone());
+            path.push(node.clone());
+
+            if let Some(task) = tasks.get(node) {
+                for dep in &task.dependencies {
+                    if !visited.contains(dep) {
+                        if let Some(cycle) =
+                            dfs(tasks, visited, rec_stack, path, dep)
+                        {
+                            return Some(cycle);
+                        }
+                    } else if rec_stack.contains(dep) {
+                        // Found cycle
+                        if let Some(cycle_start) = path.iter().position(|id| id == dep) {
+                            return Some(path[cycle_start..].to_vec());
+                        }
+                    }
+                }
+            }
+
+            path.pop();
+            rec_stack.remove(node);
+            None
+        }
+
+        for id in self.tasks.keys() {
+            if !visited.contains(id) {
+                if let Some(cycle) = dfs(&self.tasks, &mut visited, &mut rec_stack, &mut path, id)
+                {
+                    let cycle_str: Vec<String> = cycle.iter().map(|id| id.0.clone()).collect();
+                    return Err(WaveError::DependencyCycle(cycle_str.join(" -> ")));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get all waves.
+    pub fn get_waves(&self) -> &[Wave] {
+        &self.waves
+    }
+
+    /// Get wave by number.
+    pub fn get_wave(&self, number: u32) -> Option<&Wave> {
+        self.waves.iter().find(|w| w.number == number)
+    }
+
+    /// Get task status.
+    pub fn get_task_status(&self, id: &TaskId) -> Option<TaskStatus> {
+        self.task_status.get(id).copied()
+    }
+
+    /// Get task result.
+    pub fn get_task_result(&self, id: &TaskId) -> Option<&TaskResult> {
+        self.task_results.get(id)
+    }
+
+    /// Get task by ID.
+    pub fn get_task(&self, id: &TaskId) -> Option<&WaveTask> {
+        self.tasks.get(id)
+    }
+
+    /// Get all tasks.
+    pub fn get_all_tasks(&self) -> &HashMap<TaskId, WaveTask> {
+        &self.tasks
+    }
+
+    /// Get the number of waves.
+    pub fn wave_count(&self) -> usize {
+        self.waves.len()
+    }
+
+    /// Get tasks in a specific wave.
+    pub fn get_wave_tasks(&self, wave_number: u32) -> Option<Vec<&WaveTask>> {
+        let wave = self.get_wave(wave_number)?;
+        Some(
+            wave
+                .tasks
+                .iter()
+                .filter_map(|id| self.tasks.get(id))
+                .collect(),
+        )
+    }
+
+    /// Update task status.
+    pub fn set_task_status(&mut self, id: &TaskId, status: TaskStatus) {
+        self.task_status.insert(id.clone(), status);
+    }
+
+    /// Set task result.
+    pub fn set_task_result(&mut self, id: &TaskId, result: TaskResult) {
+        self.task_results.insert(id.clone(), result);
+    }
+
+    /// Update wave status.
+    pub fn set_wave_status(&mut self, wave_number: u32, status: WaveStatus) {
+        if let Some(wave) = self.waves.iter_mut().find(|w| w.number == wave_number) {
+            wave.status = status;
+        }
+    }
+}
+
+impl Default for WaveOrchestrator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Dependency graph for visualization.
+pub struct DependencyGraph<'a> {
+    orchestrator: &'a WaveOrchestrator,
+}
+
+impl<'a> DependencyGraph<'a> {
+    /// Create from orchestrator.
+    pub fn new(orchestrator: &'a WaveOrchestrator) -> Self {
+        Self { orchestrator }
+    }
+
+    /// Generate mermaid flowchart representation.
+    pub fn to_mermaid(&self) -> String {
+        let mut output = String::from("flowchart TD\n");
+
+        // Add nodes
+        for task in self.orchestrator.tasks.values() {
+            let label = task.name.replace('"', "'");
+            output.push_str(&format!("    {}[\"{}\"]\n", task.id.0, label));
+        }
+
+        output.push('\n');
+
+        // Add edges
+        for task in self.orchestrator.tasks.values() {
+            for dep in &task.dependencies {
+                output.push_str(&format!("    {} --> {}\n", dep.0, task.id.0));
+            }
+        }
+
+        output.push('\n');
+
+        // Add subgraph for waves
+        for (i, wave) in self.orchestrator.waves.iter().enumerate() {
+            output.push_str(&format!("    subgraph wave{} [Wave {}]\n", i + 1, i + 1));
+            for task_id in &wave.tasks {
+                output.push_str(&format!("        {}\n", task_id.0));
+            }
+            output.push_str("    end\n");
+        }
+
+        output
+    }
+
+    /// Generate DOT representation.
+    pub fn to_dot(&self) -> String {
+        let mut output = String::from("digraph Waves {\n");
+        output.push_str("    rankdir=TB;\n");
+        output.push_str("    node [shape=box];\n\n");
+
+        // Add nodes
+        for task in self.orchestrator.tasks.values() {
+            let label = task.name.replace('"', "\\\"");
+            output.push_str(&format!("    \"{}\" [label=\"{}\"];\n", task.id.0, label));
+        }
+
+        output.push('\n');
+
+        // Add edges
+        for task in self.orchestrator.tasks.values() {
+            for dep in &task.dependencies {
+                output.push_str(&format!("    \"{}\" -> \"{}\";\n", dep.0, task.id.0));
+            }
+        }
+
+        output.push_str("}\n");
+        output
+    }
+
+    /// Generate ASCII tree representation.
+    pub fn to_ascii_tree(&self) -> String {
+        let mut output = String::new();
+        let mut visited: HashSet<TaskId> = HashSet::new();
+
+        // Find root tasks (no dependencies)
+        let roots: Vec<&TaskId> = self
+            .orchestrator
+            .tasks
+            .values()
+            .filter(|t| t.dependencies.is_empty())
+            .map(|t| &t.id)
+            .collect();
+
+        for root_id in roots {
+            self.print_task_tree(root_id, "", true, &mut output, &mut visited);
+        }
+
+        // Print orphaned tasks
+        for task in self.orchestrator.tasks.values() {
+            if !visited.contains(&task.id) {
+                output.push_str(&format!("{}\n", task.name));
+            }
+        }
+
+        output
+    }
+
+    fn print_task_tree(
+        &self,
+        task_id: &TaskId,
+        prefix: &str,
+        is_last: bool,
+        output: &mut String,
+        visited: &mut HashSet<TaskId>,
+    ) {
+        visited.insert(task_id.clone());
+
+        if let Some(task) = self.orchestrator.tasks.get(task_id) {
+            let connector = if is_last { "`-- " } else { "|-- " };
+            output.push_str(&format!("{}{}{}\n", prefix, connector, task.name));
+
+            let new_prefix = if is_last {
+                format!("{}    ", prefix)
+            } else {
+                format!("{}|   ", prefix)
+            };
+
+            // Find dependents
+            let dependents: Vec<&TaskId> = self
+                .orchestrator
+                .tasks
+                .values()
+                .filter(|t| t.dependencies.contains(task_id))
+                .map(|t| &t.id)
+                .collect();
+
+            for (i, dep_id) in dependents.iter().enumerate() {
+                let is_last_dep = i == dependents.len() - 1;
+                self.print_task_tree(dep_id, &new_prefix, is_last_dep, output, visited);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wave_orchestrator() {
+        let mut orchestrator = WaveOrchestrator::new();
+
+        // Create tasks: A -> B -> C, D parallel with B
+        orchestrator.add_task(WaveTask::new("a", "Task A"));
+        orchestrator.add_task(
+            WaveTask::new("b", "Task B").with_dependency(TaskId::new("a")),
+        );
+        orchestrator.add_task(
+            WaveTask::new("c", "Task C").with_dependency(TaskId::new("b")),
+        );
+        orchestrator.add_task(
+            WaveTask::new("d", "Task D").with_dependency(TaskId::new("a")),
+        );
+
+        orchestrator.build_waves().unwrap();
+
+        let waves = orchestrator.get_waves();
+        assert_eq!(waves.len(), 3);
+
+        // Wave 1: A
+        assert_eq!(waves[0].number, 1);
+        assert!(waves[0].tasks.contains(&TaskId::new("a")));
+
+        // Wave 2: B, D (parallel)
+        assert_eq!(waves[1].number, 2);
+        assert!(waves[1].tasks.contains(&TaskId::new("b")));
+        assert!(waves[1].tasks.contains(&TaskId::new("d")));
+
+        // Wave 3: C
+        assert_eq!(waves[2].number, 3);
+        assert!(waves[2].tasks.contains(&TaskId::new("c")));
+    }
+
+    #[test]
+    fn test_dependency_cycle_detection() {
+        let mut orchestrator = WaveOrchestrator::new();
+
+        // Create circular dependency: A -> B -> C -> A
+        orchestrator.add_task(WaveTask::new("a", "Task A").with_dependency(TaskId::new("c")));
+        orchestrator.add_task(WaveTask::new("b", "Task B").with_dependency(TaskId::new("a")));
+        orchestrator.add_task(WaveTask::new("c", "Task C").with_dependency(TaskId::new("b")));
+
+        let result = orchestrator.build_waves();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dependency_graph_mermaid() {
+        let mut orchestrator = WaveOrchestrator::new();
+
+        orchestrator.add_task(WaveTask::new("a", "Task A"));
+        orchestrator.add_task(
+            WaveTask::new("b", "Task B").with_dependency(TaskId::new("a")),
+        );
+
+        orchestrator.build_waves().unwrap();
+
+        let graph = DependencyGraph::new(&orchestrator);
+        let mermaid = graph.to_mermaid();
+
+        assert!(mermaid.contains("Task A"));
+        assert!(mermaid.contains("Task B"));
+        assert!(mermaid.contains("-->"));
+    }
+
+    #[test]
+    fn test_get_wave_tasks() {
+        let mut orchestrator = WaveOrchestrator::new();
+
+        orchestrator.add_task(WaveTask::new("a", "Task A"));
+        orchestrator.add_task(WaveTask::new("b", "Task B").with_dependency(TaskId::new("a")));
+
+        orchestrator.build_waves().unwrap();
+
+        let wave1_tasks = orchestrator.get_wave_tasks(1).unwrap();
+        assert_eq!(wave1_tasks.len(), 1);
+        assert_eq!(wave1_tasks[0].name, "Task A");
+    }
+
+    #[test]
+    fn test_task_priority() {
+        let mut orchestrator = WaveOrchestrator::new();
+
+        orchestrator.add_task(WaveTask::new("a", "Task A").with_priority(1));
+        orchestrator.add_task(WaveTask::new("b", "Task B").with_priority(10));
+
+        orchestrator.build_waves().unwrap();
+
+        let wave1_tasks = orchestrator.get_wave_tasks(1).unwrap();
+        // Higher priority should come first
+        assert_eq!(wave1_tasks.len(), 2);
+        assert_eq!(wave1_tasks[0].name, "Task B"); // priority 10
+        assert_eq!(wave1_tasks[1].name, "Task A"); // priority 1
+    }
+}
