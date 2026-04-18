@@ -2,14 +2,26 @@
 //!
 //! Implements a wave-based execution model where tasks are organized into waves
 //! based on dependencies, allowing parallel execution within each wave.
+//!
+//! # Architecture
+//!
+//! - `WaveTask`: Individual task with dependencies and payload
+//! - `Wave`: Collection of tasks that can execute in parallel
+//! - `WaveOrchestrator`: Manages task registration, wave building, and execution
+//! - `WaveExecutor`: Trait for executing tasks (implement by application)
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 /// Wave execution error.
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum WaveError {
     #[error("dependency cycle detected: {0}")]
     DependencyCycle(String),
@@ -22,6 +34,12 @@ pub enum WaveError {
 
     #[error("invalid dependency: {0}")]
     InvalidDependency(String),
+
+    #[error("execution timeout: {0}")]
+    Timeout(String),
+
+    #[error("cancelled")]
+    Cancelled,
 }
 
 /// Task identifier.
@@ -55,6 +73,10 @@ pub enum TaskStatus {
     Failed,
     /// Task was skipped.
     Skipped,
+    /// Task timed out.
+    Timeout,
+    /// Task was cancelled.
+    Cancelled,
 }
 
 impl Default for TaskStatus {
@@ -172,6 +194,8 @@ pub enum WaveStatus {
     Completed,
     /// Wave failed.
     Failed,
+    /// Wave was cancelled.
+    Cancelled,
 }
 
 impl Default for WaveStatus {
@@ -234,6 +258,131 @@ impl WaveConfig {
         self.continue_on_failure = continue_on_failure;
         self
     }
+
+    /// Set stop on wave failure.
+    pub fn with_stop_on_wave_failure(mut self, stop: bool) -> Self {
+        self.stop_on_wave_failure = stop;
+        self
+    }
+
+    /// Set task timeout.
+    pub fn with_task_timeout(mut self, timeout_ms: u64) -> Self {
+        self.task_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Set wave timeout.
+    pub fn with_wave_timeout(mut self, timeout_ms: u64) -> Self {
+        self.wave_timeout_ms = timeout_ms;
+        self
+    }
+}
+
+/// Trait for executing tasks asynchronously.
+///
+/// Implement this trait to define how tasks should be executed.
+/// The executor receives the task payload and returns a result.
+pub trait WaveExecutor: Send + Sync + 'static {
+    /// Execute a single task and return the result.
+    fn execute(
+        self: Arc<Self>,
+        task: WaveTask,
+        context: TaskContext,
+    ) -> Pin<Box<dyn Future<Output = Result<TaskResult, WaveError>> + Send>>;
+
+    /// Called before a wave starts executing.
+    fn on_wave_start(self: Arc<Self>, wave: Wave) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move { let _ = wave; })
+    }
+
+    /// Called after a wave completes.
+    fn on_wave_complete(self: Arc<Self>, wave: Wave, result: WaveResult) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move { let _ = (wave, result); })
+    }
+}
+
+/// Context passed to task executors.
+#[derive(Debug, Clone)]
+pub struct TaskContext {
+    /// Wave number being executed.
+    pub wave_number: u32,
+    /// Total number of waves.
+    pub total_waves: usize,
+    /// Results from previous waves.
+    pub previous_results: HashMap<TaskId, TaskResult>,
+    /// Cancellation flag.
+    pub cancelled: Arc<RwLock<bool>>,
+}
+
+impl TaskContext {
+    /// Check if execution should be cancelled.
+    pub async fn is_cancelled(&self) -> bool {
+        *self.cancelled.read().await
+    }
+
+    /// Get result of a completed task.
+    pub fn get_result(&self, task_id: &TaskId) -> Option<&TaskResult> {
+        self.previous_results.get(task_id)
+    }
+}
+
+/// Execution state shared across waves.
+#[derive(Debug)]
+pub struct WaveExecutionState {
+    /// Task statuses.
+    pub task_statuses: HashMap<TaskId, TaskStatus>,
+    /// Task results.
+    pub task_results: HashMap<TaskId, TaskResult>,
+    /// Wave statuses.
+    pub wave_statuses: HashMap<u32, WaveStatus>,
+    /// Cancellation flag.
+    pub cancelled: Arc<RwLock<bool>>,
+}
+
+impl WaveExecutionState {
+    /// Create new execution state.
+    pub fn new() -> Self {
+        Self {
+            task_statuses: HashMap::new(),
+            task_results: HashMap::new(),
+            wave_statuses: HashMap::new(),
+            cancelled: Arc::new(RwLock::new(false)),
+        }
+    }
+
+    /// Mark a task as running.
+    pub fn set_running(&mut self, task_id: &TaskId) {
+        self.task_statuses.insert(task_id.clone(), TaskStatus::Running);
+    }
+
+    /// Record a task result.
+    pub fn record_result(&mut self, result: TaskResult) {
+        let status = if result.success {
+            TaskStatus::Completed
+        } else if result.error.as_deref() == Some("Cancelled") {
+            TaskStatus::Cancelled
+        } else {
+            TaskStatus::Failed
+        };
+        self.task_statuses.insert(result.task_id.clone(), status);
+        self.task_results.insert(result.task_id.clone(), result);
+    }
+
+    /// Check if cancelled.
+    pub async fn is_cancelled(&self) -> bool {
+        *self.cancelled.read().await
+    }
+
+    /// Cancel execution.
+    pub async fn cancel(&self) {
+        *self.cancelled.write().await = true;
+    }
+}
+
+impl Default for WaveExecutionState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Wave orchestrator for managing task execution.
@@ -241,8 +390,6 @@ pub struct WaveOrchestrator {
     config: WaveConfig,
     tasks: HashMap<TaskId, WaveTask>,
     waves: Vec<Wave>,
-    task_status: HashMap<TaskId, TaskStatus>,
-    task_results: HashMap<TaskId, TaskResult>,
 }
 
 impl WaveOrchestrator {
@@ -252,8 +399,6 @@ impl WaveOrchestrator {
             config: WaveConfig::default(),
             tasks: HashMap::new(),
             waves: Vec::new(),
-            task_status: HashMap::new(),
-            task_results: HashMap::new(),
         }
     }
 
@@ -265,7 +410,6 @@ impl WaveOrchestrator {
 
     /// Add a task.
     pub fn add_task(&mut self, task: WaveTask) -> &mut Self {
-        self.task_status.insert(task.id.clone(), TaskStatus::Pending);
         self.tasks.insert(task.id.clone(), task);
         self
     }
@@ -382,9 +526,7 @@ impl WaveOrchestrator {
             if let Some(task) = tasks.get(node) {
                 for dep in &task.dependencies {
                     if !visited.contains(dep) {
-                        if let Some(cycle) =
-                            dfs(tasks, visited, rec_stack, path, dep)
-                        {
+                        if let Some(cycle) = dfs(tasks, visited, rec_stack, path, dep) {
                             return Some(cycle);
                         }
                     } else if rec_stack.contains(dep) {
@@ -403,8 +545,7 @@ impl WaveOrchestrator {
 
         for id in self.tasks.keys() {
             if !visited.contains(id) {
-                if let Some(cycle) = dfs(&self.tasks, &mut visited, &mut rec_stack, &mut path, id)
-                {
+                if let Some(cycle) = dfs(&self.tasks, &mut visited, &mut rec_stack, &mut path, id) {
                     let cycle_str: Vec<String> = cycle.iter().map(|id| id.0.clone()).collect();
                     return Err(WaveError::DependencyCycle(cycle_str.join(" -> ")));
                 }
@@ -422,16 +563,6 @@ impl WaveOrchestrator {
     /// Get wave by number.
     pub fn get_wave(&self, number: u32) -> Option<&Wave> {
         self.waves.iter().find(|w| w.number == number)
-    }
-
-    /// Get task status.
-    pub fn get_task_status(&self, id: &TaskId) -> Option<TaskStatus> {
-        self.task_status.get(id).copied()
-    }
-
-    /// Get task result.
-    pub fn get_task_result(&self, id: &TaskId) -> Option<&TaskResult> {
-        self.task_results.get(id)
     }
 
     /// Get task by ID.
@@ -461,21 +592,238 @@ impl WaveOrchestrator {
         )
     }
 
-    /// Update task status.
-    pub fn set_task_status(&mut self, id: &TaskId, status: TaskStatus) {
-        self.task_status.insert(id.clone(), status);
-    }
+    /// Execute all waves with the given executor.
+    ///
+    /// Returns a vector of wave results, one for each wave.
+    pub async fn execute<E: WaveExecutor>(
+        &self,
+        executor: E,
+    ) -> Result<Vec<WaveResult>, WaveError> {
+        use std::sync::Arc;
+        let executor = Arc::new(executor);
 
-    /// Set task result.
-    pub fn set_task_result(&mut self, id: &TaskId, result: TaskResult) {
-        self.task_results.insert(id.clone(), result);
-    }
+        let mut state = WaveExecutionState::new();
+        let mut previous_results: HashMap<TaskId, TaskResult> = HashMap::new();
+        let mut wave_results: Vec<WaveResult> = Vec::new();
 
-    /// Update wave status.
-    pub fn set_wave_status(&mut self, wave_number: u32, status: WaveStatus) {
-        if let Some(wave) = self.waves.iter_mut().find(|w| w.number == wave_number) {
-            wave.status = status;
+        // Initialize wave statuses
+        for wave in &self.waves {
+            state.wave_statuses.insert(wave.number, WaveStatus::Ready);
         }
+
+        for wave in &self.waves {
+            // Check if cancelled
+            if state.is_cancelled().await {
+                return Err(WaveError::Cancelled);
+            }
+
+            let wave = wave.clone();
+            state.wave_statuses.insert(wave.number, WaveStatus::Executing);
+
+            // Notify wave start
+            executor.clone().on_wave_start(wave.clone()).await;
+
+            // Execute wave
+            let wave_result = self
+                .execute_wave(executor.clone(), &wave, &mut state, &previous_results)
+                .await;
+
+            // Update wave status
+            let success = wave_result.success;
+            state.wave_statuses.insert(
+                wave.number,
+                if success {
+                    WaveStatus::Completed
+                } else {
+                    WaveStatus::Failed
+                },
+            );
+
+            // Store task results for next wave
+            for result in &wave_result.task_results {
+                previous_results.insert(result.task_id.clone(), result.clone());
+            }
+
+            // Notify wave complete
+            executor.clone().on_wave_complete(wave.clone(), wave_result.clone()).await;
+
+            wave_results.push(wave_result);
+
+            // Check if we should stop on failure
+            if !success && self.config.stop_on_wave_failure {
+                // Mark remaining waves as cancelled
+                for remaining_wave in &self.waves {
+                    if remaining_wave.number > wave.number {
+                        state.wave_statuses.insert(remaining_wave.number, WaveStatus::Cancelled);
+                    }
+                }
+                break;
+            }
+        }
+
+        Ok(wave_results)
+    }
+
+    /// Execute a single wave with parallel task execution.
+    async fn execute_wave(
+        &self,
+        executor: std::sync::Arc<dyn WaveExecutor>,
+        wave: &Wave,
+        state: &mut WaveExecutionState,
+        previous_results: &HashMap<TaskId, TaskResult>,
+    ) -> WaveResult {
+        let start_time = Instant::now();
+        let max_parallel = self.config.max_parallel;
+        let task_timeout = Duration::from_millis(self.config.task_timeout_ms);
+        let cancelled = state.cancelled.clone();
+
+        // Create context for this wave
+        let context = TaskContext {
+            wave_number: wave.number,
+            total_waves: self.waves.len(),
+            previous_results: previous_results.clone(),
+            cancelled,
+        };
+
+        // Execute tasks in parallel batches
+        let mut task_results: Vec<TaskResult> = Vec::new();
+        let tasks: Vec<_> = wave.tasks.iter().cloned().collect();
+        let mut failed = false;
+
+        // Process in batches of max_parallel
+        for chunk in tasks.chunks(max_parallel) {
+            // Check cancellation
+            if state.is_cancelled().await {
+                // Mark remaining tasks as cancelled
+                for task_id in chunk {
+                    let result = TaskResult {
+                        task_id: task_id.clone(),
+                        success: false,
+                        output: None,
+                        error: Some("Cancelled".to_string()),
+                        duration_ms: 0,
+                    };
+                    task_results.push(result.clone());
+                    state.record_result(result);
+                }
+                continue;
+            }
+
+            // Execute chunk in parallel
+            let chunk_results = self
+                .execute_task_chunk(executor.clone(), chunk, &context, task_timeout)
+                .await;
+
+            for result in chunk_results {
+                if !result.success && !self.config.continue_on_failure {
+                    failed = true;
+                }
+                task_results.push(result.clone());
+                state.record_result(result);
+            }
+
+            // Check if we should stop due to failure
+            if failed && self.config.stop_on_wave_failure {
+                break;
+            }
+        }
+
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        let success = task_results.iter().all(|r| r.success);
+
+        WaveResult {
+            wave_number: wave.number,
+            success,
+            task_results,
+            duration_ms,
+            error: None,
+        }
+    }
+
+    /// Execute a chunk of tasks in parallel.
+    async fn execute_task_chunk(
+        &self,
+        executor: std::sync::Arc<dyn WaveExecutor>,
+        task_ids: &[TaskId],
+        context: &TaskContext,
+        timeout: Duration,
+    ) -> Vec<TaskResult> {
+        use std::sync::Arc;
+        let mut handles: Vec<tokio::task::JoinHandle<TaskResult>> = Vec::new();
+
+        for task_id in task_ids {
+            if let Some(task) = self.tasks.get(task_id) {
+                let task = task.clone();
+                let context = context.clone();
+                let timeout = timeout;
+                let exec = executor.clone();
+
+                let handle: tokio::task::JoinHandle<TaskResult> = tokio::spawn(async move {
+                    let start = Instant::now();
+                    let task_id = task.id.clone();
+
+                    // Execute with timeout
+                    let result = tokio::time::timeout(timeout, async {
+                        if context.is_cancelled().await {
+                            return Err(WaveError::Cancelled);
+                        }
+                        exec.execute(task.clone(), context.clone()).await
+                    })
+                    .await;
+
+                    let duration_ms = start.elapsed().as_millis() as u64;
+
+                    match result {
+                        Ok(Ok(mut task_result)) => {
+                            task_result.duration_ms = duration_ms;
+                            task_result
+                        }
+                        Ok(Err(e)) => TaskResult {
+                            task_id,
+                            success: false,
+                            output: None,
+                            error: Some(e.to_string()),
+                            duration_ms,
+                        },
+                        Err(_) => TaskResult {
+                            task_id,
+                            success: false,
+                            output: None,
+                            error: Some("Task timeout".to_string()),
+                            duration_ms,
+                        },
+                    }
+                });
+
+                handles.push(handle);
+            }
+        }
+
+        // Wait for all tasks in chunk
+        let mut results: Vec<TaskResult> = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(result) => results.push(result),
+                Err(_) => {} // Task panicked, skip
+            }
+        }
+
+        results
+    }
+
+    /// Cancel all execution.
+    pub async fn cancel(&self, state: &WaveExecutionState) {
+        state.cancel().await;
+    }
+
+    /// Get current task status.
+    pub fn get_task_status(state: &WaveExecutionState, id: &TaskId) -> Option<TaskStatus> {
+        state.task_statuses.get(id).copied()
+    }
+
+    /// Get wave status.
+    pub fn get_wave_status(state: &WaveExecutionState, wave_number: u32) -> Option<WaveStatus> {
+        state.wave_statuses.get(&wave_number).copied()
     }
 }
 
@@ -718,5 +1066,48 @@ mod tests {
         assert_eq!(wave1_tasks.len(), 2);
         assert_eq!(wave1_tasks[0].name, "Task B"); // priority 10
         assert_eq!(wave1_tasks[1].name, "Task A"); // priority 1
+    }
+
+    #[tokio::test]
+    async fn test_async_execution() {
+        use std::sync::Arc;
+
+        let mut orchestrator = WaveOrchestrator::new();
+
+        orchestrator.add_task(WaveTask::new("a", "Task A"));
+        orchestrator.add_task(WaveTask::new("b", "Task B").with_dependency(TaskId::new("a")));
+
+        orchestrator.build_waves().unwrap();
+
+        // Create a simple executor
+        struct SimpleExecutor;
+        impl WaveExecutor for SimpleExecutor {
+            fn execute(
+                self: Arc<Self>,
+                task: WaveTask,
+                _context: TaskContext,
+            ) -> Pin<Box<dyn Future<Output = Result<TaskResult, WaveError>> + Send>> {
+                let name = task.name.clone();
+                let task_id = task.id.clone();
+                Box::pin(async move {
+                    // Simulate some async work
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok(TaskResult {
+                        task_id,
+                        success: true,
+                        output: Some(format!("Executed: {}", name)),
+                        error: None,
+                        duration_ms: 10,
+                    })
+                })
+            }
+        }
+
+        let executor = SimpleExecutor;
+        let results = orchestrator.execute(executor).await.unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].success);
+        assert!(results[1].success);
     }
 }
