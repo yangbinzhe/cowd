@@ -13,6 +13,26 @@ use serde_json::{json, Value};
 use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
 
+/// Maximum number of characters from hook stdout/stderr to include in
+/// preview messages. Longer output is truncated with an ellipsis marker.
+pub const HOOK_PREVIEW_CHAR_LIMIT: usize = 160;
+
+/// Truncate hook output for inclusion in user-facing messages.
+/// Returns the original string when it fits within `HOOK_PREVIEW_CHAR_LIMIT`;
+/// otherwise returns a truncated version ending with `…`.
+#[must_use]
+pub fn format_hook_output(output: &str) -> String {
+    if output.len() <= HOOK_PREVIEW_CHAR_LIMIT {
+        return output.to_string();
+    }
+    let mut boundary = HOOK_PREVIEW_CHAR_LIMIT;
+    // Avoid splitting a multi-byte character
+    while !output.is_char_boundary(boundary) && boundary > 0 {
+        boundary -= 1;
+    }
+    format!("{}…", &output[..boundary])
+}
+
 pub type HookPermissionDecision = PermissionOverride;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -623,10 +643,10 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
     let mut message = format!("Hook `{command}` exited with status {code}");
     if let Some(stdout) = stdout.filter(|stdout| !stdout.is_empty()) {
         message.push_str(": ");
-        message.push_str(stdout);
+        message.push_str(&format_hook_output(stdout));
     } else if !stderr.is_empty() {
         message.push_str(": ");
-        message.push_str(stderr);
+        message.push_str(&format_hook_output(stderr));
     }
     message
 }
@@ -718,8 +738,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult,
-        HookRunner,
+        format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
+        HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
     };
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::PermissionOverride;
@@ -983,5 +1003,29 @@ mod tests {
     #[cfg(not(windows))]
     fn shell_snippet(script: &str) -> String {
         script.to_string()
+    }
+
+    #[test]
+    fn format_hook_output_keeps_short_output_intact() {
+        assert_eq!(format_hook_output("hello"), "hello");
+        assert_eq!(format_hook_output(""), "");
+    }
+
+    #[test]
+    fn format_hook_output_truncates_long_output() {
+        let long = "x".repeat(200);
+        let formatted = format_hook_output(&long);
+        assert!(formatted.ends_with('…'));
+        // 160 ASCII chars + 1 ellipsis char
+        assert_eq!(formatted.chars().count(), HOOK_PREVIEW_CHAR_LIMIT + 1);
+    }
+
+    #[test]
+    fn format_hook_output_does_not_split_multibyte() {
+        let text = "한글".repeat(100);
+        let formatted = format_hook_output(&text);
+        assert!(formatted.ends_with('…'));
+        // Verify no panic and no invalid UTF-8 boundary
+        assert!(String::from_utf8(formatted.into_bytes()).is_ok());
     }
 }

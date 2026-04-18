@@ -80,17 +80,38 @@ struct RepoDetection {
 pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::error::Error>> {
     let mut artifacts = Vec::new();
 
+    // Migration: if .claude directory exists but .cowd does not, copy contents
     let cowd_dir = cwd.join(".cowd");
-    artifacts.push(InitArtifact {
-        name: ".cowd/",
-        status: ensure_dir(&cowd_dir)?,
-    });
+    let claude_dir = cwd.join(".claude");
+    if claude_dir.is_dir() && !cowd_dir.exists() {
+        migrate_claude_to_cowd(&claude_dir, &cowd_dir)?;
+        artifacts.push(InitArtifact {
+            name: ".cowd/ (migrated from .claude)",
+            status: InitStatus::Created,
+        });
+    } else {
+        artifacts.push(InitArtifact {
+            name: ".cowd/",
+            status: ensure_dir(&cowd_dir)?,
+        });
+    }
 
+    // Migration: if .claude.json exists but .cowd.json does not, copy it
     let cowd_json = cwd.join(".cowd.json");
-    artifacts.push(InitArtifact {
-        name: ".cowd.json",
-        status: write_file_if_missing(&cowd_json, STARTER_COWD_JSON)?,
-    });
+    let claude_json = cwd.join(".claude.json");
+    if claude_json.is_file() && !cowd_json.exists() {
+        let content = fs::read_to_string(&claude_json)?;
+        fs::write(&cowd_json, &content)?;
+        artifacts.push(InitArtifact {
+            name: ".cowd.json (migrated from .claude.json)",
+            status: InitStatus::Created,
+        });
+    } else {
+        artifacts.push(InitArtifact {
+            name: ".cowd.json",
+            status: write_file_if_missing(&cowd_json, STARTER_COWD_JSON)?,
+        });
+    }
 
     let gitignore = cwd.join(".gitignore");
     artifacts.push(InitArtifact {
@@ -98,17 +119,48 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
         status: ensure_gitignore_entries(&gitignore)?,
     });
 
-    let claude_md = cwd.join("CLAUDE.md");
-    let content = render_init_claude_md(cwd);
-    artifacts.push(InitArtifact {
-        name: "CLAUDE.md",
-        status: write_file_if_missing(&claude_md, &content)?,
-    });
+    // Migration: if CLAUDE.md exists but COWD.md does not, copy it
+    let cowd_md = cwd.join("COWD.md");
+    let claude_md_path = cwd.join("CLAUDE.md");
+    if claude_md_path.is_file() && !cowd_md.exists() {
+        let content = fs::read_to_string(&claude_md_path)?;
+        fs::write(&cowd_md, &content)?;
+        artifacts.push(InitArtifact {
+            name: "COWD.md (migrated from CLAUDE.md)",
+            status: InitStatus::Created,
+        });
+    } else {
+        let content = render_init_claude_md(cwd);
+        artifacts.push(InitArtifact {
+            name: "COWD.md",
+            status: write_file_if_missing(&cowd_md, &content)?,
+        });
+    }
 
     Ok(InitReport {
         project_root: cwd.to_path_buf(),
         artifacts,
     })
+}
+
+/// Recursively copy the `.claude` directory to `.cowd`, preserving structure.
+fn migrate_claude_to_cowd(claude_dir: &Path, cowd_dir: &Path) -> Result<(), std::io::Error> {
+    copy_dir_recursive(claude_dir, cowd_dir)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_dir(path: &Path) -> Result<InitStatus, std::io::Error> {
@@ -162,7 +214,7 @@ fn ensure_gitignore_entries(path: &Path) -> Result<InitStatus, std::io::Error> {
 pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
     let detection = detect_repo(cwd);
     let mut lines = vec![
-        "# CLAUDE.md".to_string(),
+        "# COWD.md".to_string(),
         String::new(),
         "This file provides guidance to Cowd (cowd.dev) when working with code in this repository.".to_string(),
         String::new(),
@@ -210,7 +262,7 @@ pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
     lines.push("## Working agreement".to_string());
     lines.push("- Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.".to_string());
     lines.push("- Keep shared defaults in `.cowd.json`; reserve `.cowd/settings.local.json` for machine-local overrides.".to_string());
-    lines.push("- Do not overwrite existing `CLAUDE.md` content automatically; update it intentionally when repo workflows change.".to_string());
+    lines.push("- Do not overwrite existing `COWD.md` content automatically; update it intentionally when repo workflows change.".to_string());
     lines.push(String::new());
 
     lines.join("\n")
@@ -358,10 +410,10 @@ mod tests {
         assert!(rendered.contains(".cowd.json"));
         assert!(rendered.contains("created"));
         assert!(rendered.contains(".gitignore       created"));
-        assert!(rendered.contains("CLAUDE.md        created"));
+        assert!(rendered.contains("COWD.md"));
         assert!(root.join(".cowd").is_dir());
         assert!(root.join(".cowd.json").is_file());
-        assert!(root.join("CLAUDE.md").is_file());
+        assert!(root.join("COWD.md").is_file());
         assert_eq!(
             fs::read_to_string(root.join(".cowd.json")).expect("read cowd json"),
             concat!(
@@ -375,7 +427,7 @@ mod tests {
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert!(gitignore.contains(".cowd/settings.local.json"));
         assert!(gitignore.contains(".cowd/sessions/"));
-        let claude_md = fs::read_to_string(root.join("CLAUDE.md")).expect("read claude md");
+        let claude_md = fs::read_to_string(root.join("COWD.md")).expect("read claude md");
         assert!(claude_md.contains("Languages: Rust."));
         assert!(claude_md.contains("cargo clippy --workspace --all-targets -- -D warnings"));
 
@@ -386,22 +438,22 @@ mod tests {
     fn initialize_repo_is_idempotent_and_preserves_existing_files() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("CLAUDE.md"), "custom guidance\n").expect("write existing claude md");
+        fs::write(root.join("COWD.md"), "custom guidance\n").expect("write existing claude md");
         fs::write(root.join(".gitignore"), ".cowd/settings.local.json\n").expect("write gitignore");
 
         let first = initialize_repo(&root).expect("first init should succeed");
         assert!(first
             .render()
-            .contains("CLAUDE.md        skipped (already exists)"));
+            .contains("COWD.md") && first.render().contains("skipped (already exists)"));
         let second = initialize_repo(&root).expect("second init should succeed");
         let second_rendered = second.render();
         assert!(second_rendered.contains(".cowd/"));
         assert!(second_rendered.contains(".cowd.json"));
         assert!(second_rendered.contains("skipped (already exists)"));
         assert!(second_rendered.contains(".gitignore       skipped (already exists)"));
-        assert!(second_rendered.contains("CLAUDE.md        skipped (already exists)"));
+        assert!(second_rendered.contains("COWD.md"));
         assert_eq!(
-            fs::read_to_string(root.join("CLAUDE.md")).expect("read existing claude md"),
+            fs::read_to_string(root.join("COWD.md")).expect("read existing claude md"),
             "custom guidance\n"
         );
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");

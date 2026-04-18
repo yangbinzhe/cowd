@@ -122,11 +122,43 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         },
     ),
+    (
+        "kimi",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "MOONSHOT_API_KEY",
+            base_url_env: "MOONSHOT_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_MOONSHOT_BASE_URL,
+        },
+    ),
+    (
+        "kimi-latest",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "MOONSHOT_API_KEY",
+            base_url_env: "MOONSHOT_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_MOONSHOT_BASE_URL,
+        },
+    ),
 ];
+
+/// Strip a known routing prefix (e.g. `"kimi:"`) from a model name so that
+/// `kimi:kimi-latest` resolves to the `kimi-latest` alias while still
+/// selecting the Moonshot provider via prefix routing.
+#[must_use]
+pub fn strip_routing_prefix(model: &str) -> String {
+    let trimmed = model.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(stripped) = lower.strip_prefix("kimi:") {
+        return stripped.to_string();
+    }
+    trimmed.to_string()
+}
 
 #[must_use]
 pub fn resolve_model_alias(model: &str) -> String {
-    let trimmed = model.trim();
+    let stripped = strip_routing_prefix(model);
+    let trimmed = stripped.trim();
     let lower = trimmed.to_ascii_lowercase();
     MODEL_REGISTRY
         .iter()
@@ -144,7 +176,10 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi => trimmed,
+                ProviderKind::OpenAi => match *alias {
+                    "kimi" | "kimi-latest" => "kimi-latest",
+                    _ => trimmed,
+                },
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -192,6 +227,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             auth_env: "DASHSCOPE_API_KEY",
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        });
+    }
+    // Moonshot / Kimi models. Routes kimi* model names to the OpenAI-compat
+    // client pointed at Moonshot's v1 endpoint.
+    if canonical.starts_with("kimi") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "MOONSHOT_API_KEY",
+            base_url_env: "MOONSHOT_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_MOONSHOT_BASE_URL,
         });
     }
     None
@@ -267,6 +312,10 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
         }),
+        "kimi-latest" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 128_000,
+        }),
         _ => None,
     }
 }
@@ -305,6 +354,32 @@ fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
         .map_or(0, |bytes| (bytes.len() / 4 + 1) as u32)
 }
 
+/// Estimate the serialized byte size of a message request body.
+#[must_use]
+pub fn estimate_request_body_size(request: &MessageRequest) -> usize {
+    serde_json::to_vec(request).map_or(0, |bytes| bytes.len())
+}
+
+/// Check whether a request body exceeds the given per-provider byte limit.
+/// Returns `Ok(())` when no limit is configured or the body fits.
+pub fn check_request_body_size(
+    request: &MessageRequest,
+    max_bytes: Option<usize>,
+) -> Result<(), ApiError> {
+    let Some(limit) = max_bytes else {
+        return Ok(());
+    };
+    let size = estimate_request_body_size(request);
+    if size > limit {
+        return Err(ApiError::RequestBodyTooLarge {
+            model: resolve_model_alias(&request.model),
+            estimated_bytes: size,
+            limit_bytes: limit,
+        });
+    }
+    Ok(())
+}
+
 /// Env var names used by other provider backends. When Anthropic auth
 /// resolution fails we sniff these so we can hint the user that their
 /// credentials probably belong to a different provider and suggest the
@@ -324,6 +399,11 @@ const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
         "DASHSCOPE_API_KEY",
         "Alibaba DashScope",
         "prefix your model name with `qwen/` or `qwen-` (e.g. `--model qwen-plus`) so prefix routing selects the DashScope backend",
+    ),
+    (
+        "MOONSHOT_API_KEY",
+        "Moonshot / Kimi",
+        "use a kimi model alias (e.g. `--model kimi` or `--model kimi-latest`) so prefix routing selects the Moonshot backend",
     ),
 ];
 

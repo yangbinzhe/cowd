@@ -21,7 +21,7 @@ use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
-const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "COWD_AUTO_COMPACT_INPUT_TOKENS";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -910,7 +910,7 @@ where
 /// Reads the automatic compaction threshold from the environment.
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
-    // CC_AUTO_COMPACT_INPUT_TOKENS takes priority, then legacy CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS
+    // CC_AUTO_COMPACT_INPUT_TOKENS takes priority, then legacy COWD_AUTO_COMPACT_INPUT_TOKENS
     let value = std::env::var("CC_AUTO_COMPACT_INPUT_TOKENS")
         .ok()
         .or_else(|| std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR).ok());

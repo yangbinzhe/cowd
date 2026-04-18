@@ -167,6 +167,8 @@ pub struct LaneEvent {
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<LaneEventMetadata>,
 }
 
 impl LaneEvent {
@@ -183,6 +185,7 @@ impl LaneEvent {
             failure_class: None,
             detail: None,
             data: None,
+            metadata: None,
         }
     }
 
@@ -268,6 +271,162 @@ impl LaneEvent {
         self.data = Some(data);
         self
     }
+
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: LaneEventMetadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LaneEventBuilder — fluent builder for events with rich metadata
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct LaneEventBuilder {
+    event: LaneEventName,
+    status: LaneEventStatus,
+    emitted_at: String,
+    failure_class: Option<LaneFailureClass>,
+    detail: Option<String>,
+    data: Option<Value>,
+    seq: u64,
+    provenance: EventProvenance,
+    session_identity: Option<SessionIdentity>,
+    ownership: Option<LaneOwnership>,
+    nudge_id: Option<String>,
+    event_fingerprint: Option<String>,
+}
+
+impl LaneEventBuilder {
+    #[must_use]
+    pub fn new(
+        event: LaneEventName,
+        status: LaneEventStatus,
+        emitted_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            event,
+            status,
+            emitted_at: emitted_at.into(),
+            failure_class: None,
+            detail: None,
+            data: None,
+            seq: 0,
+            provenance: EventProvenance::LiveLane,
+            session_identity: None,
+            ownership: None,
+            nudge_id: None,
+            event_fingerprint: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_failure_class(mut self, failure_class: LaneFailureClass) -> Self {
+        self.failure_class = Some(failure_class);
+        self
+    }
+
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    #[must_use]
+    pub fn with_seq(mut self, seq: u64) -> Self {
+        self.seq = seq;
+        self
+    }
+
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: EventProvenance) -> Self {
+        self.provenance = provenance;
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_identity(mut self, identity: SessionIdentity) -> Self {
+        self.session_identity = Some(identity);
+        self
+    }
+
+    #[must_use]
+    pub fn with_ownership(mut self, ownership: LaneOwnership) -> Self {
+        self.ownership = Some(ownership);
+        self
+    }
+
+    #[must_use]
+    pub fn with_nudge_id(mut self, nudge_id: impl Into<String>) -> Self {
+        self.nudge_id = Some(nudge_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_event_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.event_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> LaneEvent {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let metadata = LaneEventMetadata {
+            seq: self.seq,
+            provenance: self.provenance,
+            session_identity: self.session_identity,
+            ownership: self.ownership,
+            nudge_id: self.nudge_id,
+            event_fingerprint: self.event_fingerprint,
+            timestamp_ms: now_ms,
+        };
+
+        LaneEvent {
+            event: self.event,
+            status: self.status,
+            emitted_at: self.emitted_at,
+            failure_class: self.failure_class,
+            detail: self.detail,
+            data: self.data,
+            metadata: Some(metadata),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal event deduplication (US-002)
+// ---------------------------------------------------------------------------
+
+/// Remove duplicate terminal events based on their event fingerprint.
+/// Events without a fingerprint are always retained.
+#[must_use]
+pub fn dedupe_terminal_events(events: &[LaneEvent]) -> Vec<LaneEvent> {
+    let mut seen_fingerprints = std::collections::HashSet::new();
+    events
+        .iter()
+        .cloned()
+        .filter(|event| {
+            let Some(ref metadata) = event.metadata else {
+                return true; // no metadata → always keep
+            };
+            let Some(ref fp) = metadata.event_fingerprint else {
+                return true; // no fingerprint → always keep
+            };
+            seen_fingerprints.insert(fp.clone())
+        })
+        .collect()
 }
 
 #[must_use]
@@ -315,8 +474,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-        LaneEventName, LaneEventStatus, LaneFailureClass,
+        dedupe_superseded_commit_events, dedupe_terminal_events, EventProvenance,
+        LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventBuilder, LaneEventMetadata,
+        LaneEventName, LaneEventStatus, LaneFailureClass, LaneOwnership, SessionIdentity,
+        WatcherAction,
     };
 
     #[test]
@@ -480,5 +641,144 @@ mod tests {
         ]);
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].detail.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn event_provenance_serializes_to_snake_case() {
+        let cases = [
+            (EventProvenance::LiveLane, "live_lane"),
+            (EventProvenance::Test, "test"),
+            (EventProvenance::Healthcheck, "healthcheck"),
+            (EventProvenance::Replay, "replay"),
+            (EventProvenance::Transport, "transport"),
+        ];
+        for (provenance, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(provenance).expect("provenance should serialize"),
+                json!(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn lane_event_builder_produces_event_with_metadata() {
+        let event = LaneEventBuilder::new(
+            LaneEventName::Started,
+            LaneEventStatus::Running,
+            "2026-04-18T00:00:00Z",
+        )
+        .with_seq(1)
+        .with_provenance(EventProvenance::LiveLane)
+        .with_session_identity(SessionIdentity {
+            title: Some("test-session".to_string()),
+            workspace: Some("/tmp/repo".to_string()),
+            purpose: None,
+            placeholder_reason: None,
+        })
+        .with_ownership(LaneOwnership {
+            owner: "agent-1".to_string(),
+            workflow_scope: "ci".to_string(),
+            watcher_action: WatcherAction::Observe,
+        })
+        .with_nudge_id("nudge-123")
+        .with_event_fingerprint("fp-abc")
+        .build();
+
+        assert_eq!(event.event, LaneEventName::Started);
+        assert!(event.metadata.is_some());
+        let metadata = event.metadata.as_ref().expect("metadata should be set");
+        assert_eq!(metadata.seq, 1);
+        assert_eq!(metadata.provenance, EventProvenance::LiveLane);
+        assert!(metadata.session_identity.is_some());
+        assert!(metadata.ownership.is_some());
+        assert_eq!(metadata.nudge_id.as_deref(), Some("nudge-123"));
+        assert_eq!(metadata.event_fingerprint.as_deref(), Some("fp-abc"));
+    }
+
+    #[test]
+    fn lane_event_with_metadata_extends_existing_event() {
+        let event = LaneEvent::started("2026-04-18T00:00:00Z")
+            .with_metadata(LaneEventMetadata {
+                seq: 42,
+                provenance: EventProvenance::Replay,
+                session_identity: None,
+                ownership: None,
+                nudge_id: None,
+                event_fingerprint: None,
+                timestamp_ms: 0,
+            });
+        assert!(event.metadata.is_some());
+        assert_eq!(event.metadata.as_ref().expect("metadata").seq, 42);
+        assert_eq!(
+            event.metadata.as_ref().expect("metadata").provenance,
+            EventProvenance::Replay
+        );
+    }
+
+    #[test]
+    fn dedupe_terminal_events_removes_duplicate_fingerprints() {
+        let events = vec![
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-18T00:00:01Z",
+            )
+            .with_seq(1)
+            .with_event_fingerprint("fp-unique")
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-18T00:00:02Z",
+            )
+            .with_seq(2)
+            .with_event_fingerprint("fp-dup")
+            .build(),
+            LaneEventBuilder::new(
+                LaneEventName::Finished,
+                LaneEventStatus::Completed,
+                "2026-04-18T00:00:03Z",
+            )
+            .with_seq(3)
+            .with_event_fingerprint("fp-dup")
+            .build(),
+        ];
+
+        let deduped = dedupe_terminal_events(&events);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(
+            deduped[0].metadata.as_ref().expect("metadata").seq,
+            1
+        );
+        assert_eq!(
+            deduped[1].metadata.as_ref().expect("metadata").seq,
+            2
+        );
+    }
+
+    #[test]
+    fn dedupe_terminal_events_keeps_events_without_fingerprints() {
+        let events = vec![
+            LaneEvent::started("2026-04-18T00:00:00Z"),
+            LaneEvent::started("2026-04-18T00:00:01Z"),
+        ];
+        let deduped = dedupe_terminal_events(&events);
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn lane_event_without_metadata_round_trips_via_json() {
+        let event = LaneEvent::blocked(
+            "2026-04-18T00:00:00Z",
+            &LaneEventBlocker {
+                failure_class: LaneFailureClass::McpStartup,
+                detail: "broken server".to_string(),
+            },
+        );
+        let serialized = serde_json::to_value(&event).expect("should serialize");
+        let deserialized: LaneEvent =
+            serde_json::from_value(serialized).expect("should deserialize");
+        assert_eq!(deserialized.event, LaneEventName::Blocked);
+        assert_eq!(deserialized.metadata, None);
     }
 }

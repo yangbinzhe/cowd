@@ -1622,7 +1622,7 @@ fn detect_claude_code_manifest_contract_gaps(
     for (field, detail) in [
         (
             "skills",
-            "plugin manifest field `skills` uses the Claude Code plugin contract; `claw` does not load plugin-managed skills and instead discovers skills from local roots such as `.cowd/skills`, `.cowd/skills`, `.agents/skills`, `~/.cowd/skills`, and `~/.claude/skills/omc-learned`.",
+            "plugin manifest field `skills` uses the Claude Code plugin contract; `cowd` does not load plugin-managed skills and instead discovers skills from local roots such as `.cowd/skills`, `.agents/skills`, `~/.cowd/skills`, and `~/.cowd/skills/omc-learned`.",
         ),
         (
             "mcpServers",

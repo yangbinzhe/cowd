@@ -25,7 +25,6 @@ impl EnvLock {
         // Set up isolated environment
         std::fs::create_dir_all(&temp_home).ok();
         std::fs::create_dir_all(temp_home.join(".cowd/plugins/installed")).ok();
-        std::fs::create_dir_all(temp_home.join(".claude/plugins/installed")).ok();
         std::fs::create_dir_all(temp_home.join(".config")).ok();
 
         // Redirect HOME and XDG_CONFIG_HOME to temp directory

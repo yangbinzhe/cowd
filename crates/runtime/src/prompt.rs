@@ -212,10 +212,13 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
     let mut files = Vec::new();
     for dir in directories {
         for candidate in [
+            dir.join("COWD.md"),
+            dir.join("COWD.local.md"),
+            dir.join(".cowd").join("COWD.md"),
+            dir.join(".cowd").join("instructions.md"),
+            // Migration: discover legacy CLAUDE.md if COWD.md does not exist
             dir.join("CLAUDE.md"),
             dir.join("CLAUDE.local.md"),
-            dir.join(".cowd").join("CLAUDE.md"),
-            dir.join(".cowd").join("instructions.md"),
         ] {
             push_context_file(&mut files, candidate)?;
         }
@@ -553,19 +556,19 @@ mod tests {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(nested.join(".cowd")).expect("nested cc dir");
-        fs::write(root.join("CLAUDE.md"), "root instructions").expect("write root instructions");
-        fs::write(root.join("CLAUDE.local.md"), "local instructions")
+        fs::write(root.join("COWD.md"), "root instructions").expect("write root instructions");
+        fs::write(root.join("COWD.local.md"), "local instructions")
             .expect("write local instructions");
         fs::create_dir_all(root.join("apps")).expect("apps dir");
         fs::create_dir_all(root.join("apps").join(".cowd")).expect("apps cc dir");
-        fs::write(root.join("apps").join("CLAUDE.md"), "apps instructions")
+        fs::write(root.join("apps").join("COWD.md"), "apps instructions")
             .expect("write apps instructions");
         fs::write(
             root.join("apps").join(".cowd").join("instructions.md"),
             "apps dot cc instructions",
         )
         .expect("write apps dot cc instructions");
-        fs::write(nested.join(".cowd").join("CLAUDE.md"), "nested rules")
+        fs::write(nested.join(".cowd").join("COWD.md"), "nested rules")
             .expect("write nested rules");
         fs::write(
             nested.join(".cowd").join("instructions.md"),
@@ -599,8 +602,8 @@ mod tests {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(&nested).expect("nested dir");
-        fs::write(root.join("CLAUDE.md"), "same rules\n\n").expect("write root");
-        fs::write(nested.join("CLAUDE.md"), "same rules\n").expect("write nested");
+        fs::write(root.join("COWD.md"), "same rules\n\n").expect("write root");
+        fs::write(nested.join("COWD.md"), "same rules\n").expect("write nested");
 
         let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
         assert_eq!(context.instruction_files.len(), 1);
@@ -628,8 +631,8 @@ mod tests {
     #[test]
     fn displays_context_paths_compactly() {
         assert_eq!(
-            display_context_path(Path::new("/tmp/project/.cowd/CLAUDE.md")),
-            "CLAUDE.md"
+            display_context_path(Path::new("/tmp/project/.cowd/COWD.md")),
+            "COWD.md"
         );
     }
 
@@ -644,7 +647,7 @@ mod tests {
             .current_dir(&root)
             .status()
             .expect("git init should run");
-        fs::write(root.join("CLAUDE.md"), "rules").expect("write instructions");
+        fs::write(root.join("COWD.md"), "rules").expect("write instructions");
         fs::write(root.join("tracked.txt"), "hello").expect("write tracked file");
 
         let context =
@@ -652,7 +655,7 @@ mod tests {
 
         let status = context.git_status.expect("git status should be present");
         assert!(status.contains("## No commits yet on") || status.contains("## "));
-        assert!(status.contains("?? CLAUDE.md"));
+        assert!(status.contains("?? COWD.md"));
         assert!(status.contains("?? tracked.txt"));
         assert!(context.git_diff.is_none());
 
@@ -789,7 +792,7 @@ mod tests {
     fn load_system_prompt_reads_claude_files_and_config() {
         let root = temp_dir();
         fs::create_dir_all(root.join(".cowd")).expect("cc dir");
-        fs::write(root.join("CLAUDE.md"), "Project rules").expect("write instructions");
+        fs::write(root.join("COWD.md"), "Project rules").expect("write instructions");
         fs::write(
             root.join(".cowd").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
@@ -832,7 +835,7 @@ mod tests {
     fn renders_claude_code_style_sections_with_project_context() {
         let root = temp_dir();
         fs::create_dir_all(root.join(".cowd")).expect("cc dir");
-        fs::write(root.join("CLAUDE.md"), "Project rules").expect("write CLAUDE.md");
+        fs::write(root.join("COWD.md"), "Project rules").expect("write COWD.md");
         fs::write(
             root.join(".cowd").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
@@ -895,7 +898,7 @@ mod tests {
     #[test]
     fn renders_instruction_file_metadata() {
         let rendered = render_instruction_files(&[ContextFile {
-            path: PathBuf::from("/tmp/project/CLAUDE.md"),
+            path: PathBuf::from("/tmp/project/COWD.md"),
             content: "Project rules".to_string(),
         }]);
         assert!(rendered.contains("# Claude instructions"));

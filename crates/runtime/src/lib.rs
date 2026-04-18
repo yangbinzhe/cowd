@@ -85,11 +85,13 @@ pub use file_ops::{
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
-    HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
+    format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
+    HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
 };
 pub use lane_events::{
-    dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-    LaneEventName, LaneEventStatus, LaneFailureClass,
+    dedupe_superseded_commit_events, dedupe_terminal_events, EventProvenance, LaneCommitProvenance,
+    LaneEvent, LaneEventBlocker, LaneEventBuilder, LaneEventMetadata, LaneEventName,
+    LaneEventStatus, LaneFailureClass, LaneOwnership, SessionIdentity, WatcherAction,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
@@ -164,15 +166,16 @@ pub use stale_branch::{
     apply_policy, check_freshness, BranchFreshness, StaleBranchAction, StaleBranchEvent,
     StaleBranchPolicy,
 };
-pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
+pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket};
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
 pub use worker_boot::{
-    Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,
-    WorkerPromptTarget, WorkerReadySnapshot, WorkerRegistry, WorkerStatus, WorkerTrustResolution,
+    StartupEvidenceBundle, StartupFailureClassification, Worker, WorkerEvent, WorkerEventKind,
+    WorkerEventPayload, WorkerFailure, WorkerFailureKind, WorkerPromptTarget, WorkerReadySnapshot,
+    WorkerRegistry, WorkerStatus, WorkerTrustResolution,
 };
 
 #[cfg(test)]

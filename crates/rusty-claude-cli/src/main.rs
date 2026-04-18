@@ -1112,7 +1112,7 @@ fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode
 }
 
 fn default_permission_mode() -> PermissionMode {
-    env::var("RUSTY_CLAUDE_PERMISSION_MODE")
+    env::var("COWD_PERMISSION_MODE")
         .ok()
         .as_deref()
         .and_then(normalize_permission_mode)
@@ -2033,7 +2033,7 @@ fn dump_manifests(
 }
 
 const DUMP_MANIFESTS_OVERRIDE_HINT: &str =
-    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `claw dump-manifests --manifests-dir /path/to/upstream`.";
+    "Hint: set COWD_UPSTREAM=/path/to/upstream or pass `cowd dump-manifests --manifests-dir /path/to/upstream`.";
 
 // Internal function for testing that accepts a workspace directory path.
 fn dump_manifests_at_path(
@@ -5357,7 +5357,7 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     if project_context.instruction_files.is_empty() {
         lines.push("Discovered files".to_string());
         lines.push(
-            "  No CLAUDE instruction files discovered in the current directory ancestry."
+            "  No instruction files discovered in the current directory ancestry."
                 .to_string(),
         );
     } else {
@@ -8393,6 +8393,7 @@ mod tests {
             request_id: Some("req_jobdori_789".to_string()),
             body: String::new(),
             retryable: true,
+            suggested_action: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
@@ -8415,6 +8416,7 @@ mod tests {
                 request_id: Some("req_jobdori_790".to_string()),
                 body: String::new(),
                 retryable: true,
+                suggested_action: None,
             }),
         };
 
@@ -8478,6 +8480,7 @@ mod tests {
             request_id: Some("req_ctx_456".to_string()),
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -8509,6 +8512,7 @@ mod tests {
                 request_id: Some("req_ctx_retry_789".to_string()),
                 body: String::new(),
                 retryable: false,
+                suggested_action: None,
             }),
         };
 
@@ -8656,7 +8660,7 @@ mod tests {
     fn defaults_to_repl_when_no_args() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
         assert_eq!(
             parse_args(&[]).expect("args should parse"),
             CliAction::Repl {
@@ -8687,10 +8691,10 @@ mod tests {
 
         let original_config_home = std::env::var("COWD_CONFIG_HOME").ok();
         let original_cc_config_home = std::env::var("COWD_CONFIG_HOME").ok();
-        let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
+        let original_permission_mode = std::env::var("COWD_PERMISSION_MODE").ok();
         std::env::set_var("COWD_CONFIG_HOME", &config_home);
         std::env::set_var("COWD_CONFIG_HOME", &config_home);
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
 
         let resolved = with_current_dir(&cwd, super::default_permission_mode);
 
@@ -8703,8 +8707,8 @@ mod tests {
             None => std::env::remove_var("COWD_CONFIG_HOME"),
         }
         match original_permission_mode {
-            Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
-            None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
+            Some(value) => std::env::set_var("COWD_PERMISSION_MODE", value),
+            None => std::env::remove_var("COWD_PERMISSION_MODE"),
         }
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
@@ -8728,10 +8732,10 @@ mod tests {
 
         let original_config_home = std::env::var("COWD_CONFIG_HOME").ok();
         let original_cc_config_home = std::env::var("COWD_CONFIG_HOME").ok();
-        let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
+        let original_permission_mode = std::env::var("COWD_PERMISSION_MODE").ok();
         std::env::set_var("COWD_CONFIG_HOME", &config_home);
         std::env::set_var("COWD_CONFIG_HOME", &config_home);
-        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+        std::env::set_var("COWD_PERMISSION_MODE", "read-only");
 
         let resolved = with_current_dir(&cwd, super::default_permission_mode);
 
@@ -8744,8 +8748,8 @@ mod tests {
             None => std::env::remove_var("COWD_CONFIG_HOME"),
         }
         match original_permission_mode {
-            Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
-            None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
+            Some(value) => std::env::set_var("COWD_PERMISSION_MODE", value),
+            None => std::env::remove_var("COWD_PERMISSION_MODE"),
         }
         std::fs::remove_dir_all(root).expect("temp config root should clean up");
 
@@ -8797,7 +8801,7 @@ mod tests {
     fn parses_prompt_subcommand() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
         let args = vec![
             "prompt".to_string(),
             "hello".to_string(),
@@ -8887,7 +8891,7 @@ mod tests {
     fn parses_bare_prompt_and_json_output_flag() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
         let args = vec![
             "--output-format=json".to_string(),
             "--model".to_string(),
@@ -8916,7 +8920,7 @@ mod tests {
         // given a bare prompt invocation that includes the --compact flag
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
         let args = vec![
             "--compact".to_string(),
             "summarize".to_string(),
@@ -8947,7 +8951,7 @@ mod tests {
     fn prompt_subcommand_defaults_compact_to_false() {
         // given a `prompt` subcommand invocation without --compact
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
         let args = vec!["prompt".to_string(), "hello".to_string()];
 
         // when parse_args runs
@@ -8964,7 +8968,7 @@ mod tests {
     fn resolves_model_aliases_in_args() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
         let args = vec![
             "--model".to_string(),
             "opus".to_string(),
@@ -9077,10 +9081,10 @@ mod tests {
     fn dangerously_skip_permissions_flag_forces_danger_full_access_in_repl() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
-        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+        std::env::set_var("COWD_PERMISSION_MODE", "read-only");
         let args = vec!["--dangerously-skip-permissions".to_string()];
         let parsed = parse_args(&args).expect("args should parse");
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
 
         assert_eq!(
             parsed,
@@ -9098,7 +9102,7 @@ mod tests {
     #[test]
     fn dangerously_skip_permissions_flag_applies_to_prompt_subcommand() {
         let _guard = env_lock();
-        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+        std::env::set_var("COWD_PERMISSION_MODE", "read-only");
         let args = vec![
             "--dangerously-skip-permissions".to_string(),
             "prompt".to_string(),
@@ -9107,7 +9111,7 @@ mod tests {
             "thing".to_string(),
         ];
         let parsed = parse_args(&args).expect("args should parse");
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
 
         assert_eq!(
             parsed,
@@ -9129,7 +9133,7 @@ mod tests {
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
         let args = vec![
             "--allowedTools".to_string(),
             "read,glob".to_string(),
@@ -9315,7 +9319,7 @@ mod tests {
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
         let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["help".to_string()]).expect("help should parse"),
             CliAction::Help {
@@ -9348,7 +9352,7 @@ mod tests {
     fn parses_bare_export_subcommand_targeting_latest_session() {
         // given
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
         let args = vec!["export".to_string()];
 
         // when
@@ -9649,7 +9653,7 @@ mod tests {
     #[test]
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         let _guard = env_lock();
-        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("COWD_PERMISSION_MODE");
         // Input is ["help", "me", "debug"] so the joined prompt shorthand
         // must be "help me debug". A previous batch accidentally rewrote
         // the expected string to "$help overview" (copy-paste slip).
@@ -10790,7 +10794,7 @@ UU conflicted.rs",
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let rendered = crate::init::render_init_claude_md(&workspace_root);
-        assert!(rendered.contains("# CLAUDE.md"));
+        assert!(rendered.contains("# COWD.md"));
         assert!(rendered.contains("cargo clippy --workspace --all-targets -- -D warnings"));
     }
 
@@ -11820,7 +11824,7 @@ mod dump_manifests_tests {
             "error message should mention missing commands.ts: {error_msg}"
         );
         assert!(
-            error_msg.contains("CLAUDE_CODE_UPSTREAM"),
+            error_msg.contains("COWD_UPSTREAM"),
             "error message should explain how to supply the upstream path: {error_msg}"
         );
 

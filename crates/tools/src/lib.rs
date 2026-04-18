@@ -26,7 +26,7 @@ use runtime::{
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
     LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
     PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor,
+    TaskScope, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -3283,21 +3283,21 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         push_home_skill_lookup_roots(&mut roots, std::path::Path::new(&home));
     }
-    if let Ok(claude_config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        let claude_config_dir = std::path::PathBuf::from(claude_config_dir);
+    if let Ok(cowd_config_home) = std::env::var("COWD_CONFIG_HOME") {
+        let cowd_config_home = std::path::PathBuf::from(cowd_config_home);
         push_skill_lookup_root(
             &mut roots,
-            claude_config_dir.join("skills"),
+            cowd_config_home.join("skills"),
             SkillLookupOrigin::SkillsDir,
         );
         push_skill_lookup_root(
             &mut roots,
-            claude_config_dir.join("skills").join("omc-learned"),
+            cowd_config_home.join("skills").join("omc-learned"),
             SkillLookupOrigin::SkillsDir,
         );
         push_skill_lookup_root(
             &mut roots,
-            claude_config_dir.join("commands"),
+            cowd_config_home.join("commands"),
             SkillLookupOrigin::LegacyCommandsDir,
         );
     }
@@ -3318,17 +3318,17 @@ fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
 fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::path::Path) {
     for ancestor in cwd.ancestors() {
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".cowd"));
-        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".cowd"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".agents"));
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".codex"));
+        // Migration: also discover skills from .claude if the directory exists
         push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claude"));
     }
 }
 
 fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::path::Path) {
     push_prefixed_skill_lookup_roots(roots, &home.join(".cowd"));
-    push_prefixed_skill_lookup_roots(roots, &home.join(".cowd"));
     push_prefixed_skill_lookup_roots(roots, &home.join(".codex"));
+    // Migration: also discover skills from .claude if the directory exists
     push_prefixed_skill_lookup_roots(roots, &home.join(".claude"));
     push_skill_lookup_root(
         roots,
@@ -3340,9 +3340,16 @@ fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::pa
         home.join(".config").join("opencode").join("skills"),
         SkillLookupOrigin::SkillsDir,
     );
+    // Migration: discover omc-learned skills from .claude if present
     push_skill_lookup_root(
         roots,
         home.join(".claude").join("skills").join("omc-learned"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    // Primary omc-learned location is now under .cowd
+    push_skill_lookup_root(
+        roots,
+        home.join(".cowd").join("skills").join("omc-learned"),
         SkillLookupOrigin::SkillsDir,
     );
 }
@@ -5746,7 +5753,7 @@ mod tests {
     use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, TaskScope, ToolExecutor,
     };
     use serde_json::json;
 
@@ -7115,11 +7122,11 @@ mod tests {
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("COWD_CONFIG_HOME").ok();
         let original_codex_home = std::env::var("CODEX_HOME").ok();
-        let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        let original_claude_config_dir = std::env::var("COWD_CONFIG_HOME").ok();
         std::env::set_var("HOME", &home);
         std::env::remove_var("COWD_CONFIG_HOME");
         std::env::remove_var("CODEX_HOME");
-        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
+        std::env::set_var("COWD_CONFIG_HOME", &claude_config_dir);
 
         let result = execute_tool("Skill", &json!({ "skill": "learned" }))
             .expect("learned skill should resolve");
@@ -7144,8 +7151,8 @@ mod tests {
             None => std::env::remove_var("CODEX_HOME"),
         }
         match original_claude_config_dir {
-            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
-            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
+            None => std::env::remove_var("COWD_CONFIG_HOME"),
         }
         fs::remove_dir_all(root).expect("temp tree should clean up");
     }
@@ -7174,11 +7181,11 @@ mod tests {
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("COWD_CONFIG_HOME").ok();
         let original_codex_home = std::env::var("CODEX_HOME").ok();
-        let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        let original_claude_config_dir = std::env::var("COWD_CONFIG_HOME").ok();
         std::env::set_var("HOME", &home);
         std::env::remove_var("COWD_CONFIG_HOME");
         std::env::remove_var("CODEX_HOME");
-        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
+        std::env::set_var("COWD_CONFIG_HOME", &claude_config_dir);
 
         let direct_skill =
             execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
@@ -7216,8 +7223,8 @@ mod tests {
             None => std::env::remove_var("CODEX_HOME"),
         }
         match original_claude_config_dir {
-            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
-            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
+            None => std::env::remove_var("COWD_CONFIG_HOME"),
         }
         fs::remove_dir_all(root).expect("temp tree should clean up");
     }
@@ -8902,7 +8909,9 @@ printf 'pwsh:%s' "$1"
     fn run_task_packet_creates_packet_backed_task() {
         let result = run_task_packet(TaskPacket {
             objective: "Ship packetized runtime task".to_string(),
-            scope: "runtime/task system".to_string(),
+            scope: TaskScope::Custom("runtime/task system".to_string()),
+            scope_path: None,
+            worktree: None,
             repo: "cowd-code-parity".to_string(),
             branch_policy: "origin/main only".to_string(),
             acceptance_tests: vec![

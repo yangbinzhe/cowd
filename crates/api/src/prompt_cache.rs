@@ -465,18 +465,18 @@ fn hash_string(value: &str) -> u64 {
 }
 
 fn base_cache_root() -> PathBuf {
-    if let Some(config_home) = std::env::var_os("CLAUDE_CONFIG_HOME") {
+    if let Some(config_home) = std::env::var_os("COWD_CONFIG_HOME") {
         return PathBuf::from(config_home)
             .join("cache")
             .join("prompt-cache");
     }
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home)
-            .join(".claude")
+            .join(".cowd")
             .join("cache")
             .join("prompt-cache");
     }
-    std::env::temp_dir().join("claude-prompt-cache")
+    std::env::temp_dir().join("cowd-prompt-cache")
 }
 
 fn now_unix_secs() -> u64 {
@@ -596,7 +596,7 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ));
-        std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
+        std::env::set_var("COWD_CONFIG_HOME", &temp_root);
         let cache = PromptCache::new("unit-test-session");
         let request = sample_request("cache me");
         let response = sample_response(42, 12, "cached");
@@ -620,7 +620,7 @@ mod tests {
         assert_eq!(persisted.completion_cache_hits, 1);
 
         std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
-        std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::env::remove_var("COWD_CONFIG_HOME");
     }
 
     #[test]
@@ -634,7 +634,7 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ));
-        std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
+        std::env::set_var("COWD_CONFIG_HOME", &temp_root);
         let cache = PromptCache::new("distinct-request-session");
         let first_request = sample_request("first");
         let second_request = sample_request("second");
@@ -645,7 +645,7 @@ mod tests {
         assert!(cache.lookup_completion(&second_request).is_none());
 
         std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
-        std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::env::remove_var("COWD_CONFIG_HOME");
     }
 
     #[test]
@@ -659,7 +659,7 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ));
-        std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
+        std::env::set_var("COWD_CONFIG_HOME", &temp_root);
         let cache = PromptCache::with_config(PromptCacheConfig {
             session_id: "expired-session".to_string(),
             completion_ttl: Duration::ZERO,
@@ -676,7 +676,7 @@ mod tests {
         assert_eq!(stats.completion_cache_misses, 1);
 
         std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
-        std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::env::remove_var("COWD_CONFIG_HOME");
     }
 
     #[test]

@@ -51,6 +51,8 @@ impl FailureScenario {
             WorkerFailureKind::PromptDelivery => Self::PromptMisdelivery,
             WorkerFailureKind::Protocol => Self::McpHandshakeFailure,
             WorkerFailureKind::Provider => Self::ProviderFailure,
+            WorkerFailureKind::StartupNoEvidence => Self::PromptMisdelivery,
+            WorkerFailureKind::Unknown => Self::ProviderFailure,
         }
     }
 }

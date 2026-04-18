@@ -192,7 +192,7 @@ fn dump_manifests_and_init_emit_json_when_requested() {
     fs::create_dir_all(&workspace).expect("workspace should exist");
     let init = assert_json_command(&workspace, &["--output-format", "json", "init"]);
     assert_eq!(init["kind"], "init");
-    assert!(workspace.join("CLAUDE.md").exists());
+    assert!(workspace.join("COWD.md").exists());
 }
 
 #[test]
@@ -363,7 +363,7 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
         ],
     );
     assert_eq!(init["kind"], "init");
-    assert!(root.join("CLAUDE.md").exists());
+    assert!(root.join("COWD.md").exists());
 }
 
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {

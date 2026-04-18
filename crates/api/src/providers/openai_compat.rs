@@ -19,6 +19,7 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.cn/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -36,6 +37,7 @@ pub struct OpenAiCompatConfig {
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+const MOONSHOT_ENV_VARS: &[&str] = &["MOONSHOT_API_KEY"];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -72,12 +74,25 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// Moonshot AI (Kimi family models) compatible endpoint.
+    /// Uses the OpenAI-compatible REST shape at /v1.
+    #[must_use]
+    pub const fn moonshot() -> Self {
+        Self {
+            provider_name: "Moonshot",
+            api_key_env: "MOONSHOT_API_KEY",
+            base_url_env: "MOONSHOT_BASE_URL",
+            default_base_url: DEFAULT_MOONSHOT_BASE_URL,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
+            "Moonshot" => MOONSHOT_ENV_VARS,
             _ => &[],
         }
     }
@@ -183,6 +198,7 @@ impl OpenAiCompatClient {
                     request_id,
                     body,
                     retryable: false,
+                    suggested_action: None,
                 });
             }
         }
@@ -1186,6 +1202,7 @@ fn parse_sse_frame(
                 request_id: None,
                 body: payload.clone(),
                 retryable: false,
+                suggested_action: None,
             });
         }
     }
@@ -1254,6 +1271,7 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
         request_id,
         body,
         retryable,
+        suggested_action: ApiError::suggested_action_for_status(status),
     })
 }
 

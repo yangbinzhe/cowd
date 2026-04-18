@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{validate_packet, TaskPacket, TaskPacketValidationError};
+use crate::{validate_packet, TaskPacket, TaskPacketValidationError, TaskScope};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,7 +87,7 @@ impl TaskRegistry {
         let packet = validate_packet(packet)?.into_inner();
         Ok(self.create_task(
             packet.objective.clone(),
-            Some(packet.scope.clone()),
+            Some(packet.scope.to_string()),
             Some(packet),
         ))
     }
@@ -252,7 +252,9 @@ mod tests {
         let registry = TaskRegistry::new();
         let packet = TaskPacket {
             objective: "Ship task packet support".to_string(),
-            scope: "runtime/task system".to_string(),
+            scope: TaskScope::Custom("runtime/task system".to_string()),
+            scope_path: None,
+            worktree: None,
             repo: "cowd-code-parity".to_string(),
             branch_policy: "origin/main only".to_string(),
             acceptance_tests: vec!["cargo test --workspace".to_string()],

@@ -53,6 +53,13 @@ pub enum ApiError {
         request_id: Option<String>,
         body: String,
         retryable: bool,
+        /// Suggested user-facing action to resolve the error, if known.
+        suggested_action: Option<String>,
+    },
+    RequestBodyTooLarge {
+        model: String,
+        estimated_bytes: usize,
+        limit_bytes: usize,
     },
     RetriesExhausted {
         attempts: u32,
@@ -115,6 +122,17 @@ impl ApiError {
         }
     }
 
+    /// Return a human-readable suggested action for common HTTP status codes.
+    #[must_use]
+    pub fn suggested_action_for_status(status: reqwest::StatusCode) -> Option<String> {
+        match status.as_u16() {
+            401 | 403 => Some("check your API key and permissions".to_string()),
+            429 => Some("wait a moment and retry, or switch to a different model".to_string()),
+            500 | 502 | 503 => Some("the provider is experiencing issues; retry after a brief wait".to_string()),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -123,6 +141,7 @@ impl ApiError {
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
+            | Self::RequestBodyTooLarge { .. }
             | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
@@ -140,6 +159,7 @@ impl ApiError {
             Self::RetriesExhausted { last_error, .. } => last_error.request_id(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
+            | Self::RequestBodyTooLarge { .. }
             | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
@@ -171,6 +191,7 @@ impl ApiError {
             Self::Http(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
                 "provider_transport"
             }
+            Self::RequestBodyTooLarge { .. } => "request_too_large",
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
         }
     }
@@ -187,6 +208,7 @@ impl ApiError {
             Self::RetriesExhausted { last_error, .. } => last_error.is_generic_fatal_wrapper(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
+            | Self::RequestBodyTooLarge { .. }
             | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
@@ -216,6 +238,7 @@ impl ApiError {
             }
             Self::RetriesExhausted { last_error, .. } => last_error.is_context_window_failure(),
             Self::MissingCredentials { .. }
+            | Self::RequestBodyTooLarge { .. }
             | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
@@ -276,6 +299,14 @@ impl Display for ApiError {
                 )
             }
             Self::Auth(message) => write!(f, "auth error: {message}"),
+            Self::RequestBodyTooLarge {
+                model,
+                estimated_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "request_body_too_large for {model}: estimated {estimated_bytes} bytes exceeds the {limit_bytes}-byte limit; reduce request size before retrying"
+            ),
             Self::InvalidApiKeyEnv(error) => {
                 write!(f, "failed to read credential environment variable: {error}")
             }
@@ -469,6 +500,7 @@ mod tests {
             request_id: Some("req_jobdori_123".to_string()),
             body: String::new(),
             retryable: true,
+            suggested_action: None,
         };
 
         assert!(error.is_generic_fatal_wrapper());
@@ -491,6 +523,7 @@ mod tests {
                 request_id: Some("req_nested_456".to_string()),
                 body: String::new(),
                 retryable: true,
+                suggested_action: None,
             }),
         };
 
@@ -511,6 +544,7 @@ mod tests {
             request_id: Some("req_ctx_123".to_string()),
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         assert!(error.is_context_window_failure());

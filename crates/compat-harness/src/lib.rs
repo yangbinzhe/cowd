@@ -71,7 +71,7 @@ fn resolve_upstream_repo_root(primary_repo_root: &Path) -> PathBuf {
 fn upstream_repo_candidates(primary_repo_root: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![primary_repo_root.to_path_buf()];
 
-    if let Some(explicit) = std::env::var_os("CLAUDE_CODE_UPSTREAM") {
+    if let Some(explicit) = std::env::var_os("COWD_UPSTREAM") {
         candidates.push(PathBuf::from(explicit));
     }
 

@@ -56,6 +56,91 @@ pub enum WorkerFailureKind {
     PromptDelivery,
     Protocol,
     Provider,
+    StartupNoEvidence,
+    Unknown,
+}
+
+// ---------------------------------------------------------------------------
+// Startup evidence bundle + classification (US-001)
+// When a worker times out during boot with no clear failure signal, the
+// registry collects a diagnostic snapshot so downstream systems can classify
+// the root cause instead of treating it as an opaque timeout.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupFailureClassification {
+    TrustRequired,
+    PromptMisdelivery,
+    PromptAcceptanceTimeout,
+    TransportDead,
+    WorkerCrashed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartupEvidenceBundle {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_lifecycle_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_sent_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_acceptance_state: Option<String>,
+    pub trust_prompt_detected: bool,
+    pub transport_healthy: bool,
+    pub mcp_healthy: bool,
+    pub elapsed_seconds: u64,
+}
+
+impl StartupEvidenceBundle {
+    /// Collect evidence from a worker that failed to reach Ready within the
+    /// expected timeout window. Returns a snapshot of the worker's observable
+    /// state at the time of the timeout.
+    #[must_use]
+    pub fn collect_from_worker(worker: &Worker) -> Self {
+        let elapsed = now_secs().saturating_sub(worker.created_at);
+        Self {
+            last_lifecycle_state: worker.events.last().map(|event| {
+                format!("{:?}", event.kind)
+            }),
+            pane_command: None,
+            prompt_sent_at: worker.last_prompt.as_ref().map(|_| worker.updated_at),
+            prompt_acceptance_state: if worker.prompt_in_flight {
+                Some("in_flight".to_string())
+            } else {
+                None
+            },
+            trust_prompt_detected: !worker.trust_gate_cleared,
+            transport_healthy: !worker.prompt_in_flight,
+            mcp_healthy: true, // MCP health not yet observable at this layer
+            elapsed_seconds: elapsed,
+        }
+    }
+
+    /// Classify the root cause of a startup timeout based on the collected
+    /// evidence. Maps observable symptoms to a structured taxonomy so
+    /// downstream systems (clawhip, recovery recipes) can take targeted action.
+    #[must_use]
+    pub fn classify(&self) -> StartupFailureClassification {
+        if self.trust_prompt_detected {
+            return StartupFailureClassification::TrustRequired;
+        }
+        if self.prompt_sent_at.is_some() && self.prompt_acceptance_state.is_none() {
+            return StartupFailureClassification::PromptMisdelivery;
+        }
+        if self.prompt_acceptance_state.as_deref() == Some("in_flight") {
+            return StartupFailureClassification::PromptAcceptanceTimeout;
+        }
+        if !self.transport_healthy {
+            return StartupFailureClassification::TransportDead;
+        }
+        if self.last_lifecycle_state.as_deref() == Some("Spawning") && self.elapsed_seconds > 120 {
+            return StartupFailureClassification::WorkerCrashed;
+        }
+        StartupFailureClassification::Unknown
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +163,7 @@ pub enum WorkerEventKind {
     Restarted,
     Finished,
     Failed,
+    StartupNoEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,6 +645,48 @@ impl WorkerRegistry {
         }
 
         Ok(worker.clone())
+    }
+
+    /// Observe a startup timeout: collect diagnostic evidence, classify the
+    /// root cause, and transition the worker to Failed with a structured
+    /// StartupNoEvidence event. Returns the classification for downstream
+    /// systems (recovery recipes, clawhip) to act on.
+    pub fn observe_startup_timeout(
+        &self,
+        worker_id: &str,
+    ) -> Result<(Worker, StartupFailureClassification), String> {
+        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let worker = inner
+            .workers
+            .get_mut(worker_id)
+            .ok_or_else(|| format!("worker not found: {worker_id}"))?;
+
+        let evidence = StartupEvidenceBundle::collect_from_worker(worker);
+        let classification = evidence.classify();
+
+        worker.last_error = Some(WorkerFailure {
+            kind: WorkerFailureKind::StartupNoEvidence,
+            message: format!(
+                "worker startup timed out after {}s — classified as {:?}",
+                evidence.elapsed_seconds, classification
+            ),
+            created_at: now_secs(),
+        });
+        worker.status = WorkerStatus::Failed;
+        worker.prompt_in_flight = false;
+
+        push_event(
+            worker,
+            WorkerEventKind::StartupNoEvidence,
+            WorkerStatus::Failed,
+            Some(format!(
+                "startup timeout classified as {:?}",
+                classification
+            )),
+            None,
+        );
+
+        Ok((worker.clone(), classification))
     }
 }
 

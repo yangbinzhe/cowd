@@ -69,7 +69,7 @@ pub const SESSION_EXT: &str = ".jsonl";
 ///
 /// # Example
 /// ```
-/// assert_eq!(cowd_dirs::env_var("CONFIG_HOME"), "COWD_CONFIG_HOME");
+/// assert_eq!(runtime::cowd_dirs::env_var("CONFIG_HOME"), "COWD_CONFIG_HOME");
 /// ```
 pub fn env_var(key: &str) -> String {
     let mut buf = String::with_capacity(ENV_PREFIX.len() + key.len());
