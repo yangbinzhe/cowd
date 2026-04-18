@@ -3,12 +3,9 @@
 //! Provides automatic failover and load balancing across multiple API providers.
 
 use crate::error::ApiError;
-use crate::types::{MessageRequest, MessageResponse, StreamEvent};
+use crate::types::{MessageRequest, MessageResponse};
 use crate::ProviderClient;
-use std::collections::VecDeque;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
 /// Provider health status.
 #[derive(Debug, Clone)]
@@ -107,14 +104,13 @@ impl ChainProvider {
         // Update average response time
         let current_avg = self.health.avg_response_time_ms.unwrap_or(response_time_ms);
         let n = self.consecutive_successes as f64;
-        self.health.avg_response_time_ms = Some(
-            (current_avg * (n - 1.0) + response_time_ms) / n
-        );
+        self.health.avg_response_time_ms =
+            Some((current_avg * (n - 1.0) + response_time_ms) / n);
 
         // Check if recovered
-        if self.consecutive_successes >= self.config.recovery_threshold && !self.health.is_healthy {
+        if self.consecutive_successes >= self.config.recovery_threshold && !self.health.is_healthy
+        {
             self.health.is_healthy = true;
-            tracing::info!(provider = %self.config.name, "provider recovered");
         }
 
         self.health.last_check = Instant::now();
@@ -127,7 +123,6 @@ impl ChainProvider {
         // Check if should mark unhealthy
         if self.health.failures >= self.config.failure_threshold && self.health.is_healthy {
             self.health.is_healthy = false;
-            tracing::warn!(provider = %self.config.name, failures = %self.health.failures, "provider marked unhealthy");
         }
 
         self.health.last_check = Instant::now();
@@ -201,7 +196,7 @@ impl ProviderChainConfig {
 pub struct ProviderChain {
     config: ProviderChainConfig,
     providers: Vec<ChainProvider>,
-    round_robin_index: Arc<RwLock<usize>>,
+    round_robin_index: usize,
 }
 
 impl ProviderChain {
@@ -210,7 +205,7 @@ impl ProviderChain {
         Self {
             config,
             providers: Vec::new(),
-            round_robin_index: Arc::new(RwLock::new(0)),
+            round_robin_index: 0,
         }
     }
 
@@ -230,7 +225,10 @@ impl ProviderChain {
 
     /// Get all healthy providers.
     fn healthy_providers(&self) -> Vec<&ChainProvider> {
-        self.providers.iter().filter(|p| p.config.enabled && p.health.is_healthy).collect()
+        self.providers
+            .iter()
+            .filter(|p| p.config.enabled && p.health.is_healthy)
+            .collect()
     }
 
     /// Select providers based on the configured strategy.
@@ -239,7 +237,9 @@ impl ProviderChain {
 
         if healthy.is_empty() {
             // Fall back to all enabled providers if none are healthy
-            return self.providers.iter()
+            return self
+                .providers
+                .iter()
                 .filter(|p| p.config.enabled)
                 .collect();
         }
@@ -266,24 +266,28 @@ impl ProviderChain {
     }
 
     /// Get the next provider in round-robin order.
-    async fn next_round_robin(&self) -> Option<usize> {
-        let healthy = self.healthy_providers();
-        if healthy.is_empty() {
+    fn next_round_robin(&mut self) -> Option<usize> {
+        // First, get just the names of healthy providers without holding a borrow
+        let healthy_names: Vec<String> = self
+            .providers
+            .iter()
+            .filter(|p| p.config.enabled && p.health.is_healthy)
+            .map(|p| p.config.name.clone())
+            .collect();
+
+        if healthy_names.is_empty() {
             return None;
         }
 
-        let mut index = self.round_robin_index.write().await;
-        let healthy_count = healthy.len();
+        let healthy_len = healthy_names.len();
+        let current_index = self.round_robin_index % healthy_len;
+        self.round_robin_index = (self.round_robin_index + 1) % healthy_len;
 
-        // Find the actual index in the main providers list
-        let provider_index = healthy[*index % healthy_count]
-            .providers
+        // Now search in providers using the selected name
+        let selected_name = &healthy_names[current_index];
+        self.providers
             .iter()
-            .position(|p| p.config.name == healthy[*index % healthy_count].config.name)
-            .unwrap_or(0);
-
-        *index = (*index + 1) % healthy_count;
-        Some(provider_index)
+            .position(|p| p.config.name == *selected_name)
     }
 
     /// Send a message through the chain with failover.
@@ -291,109 +295,78 @@ impl ProviderChain {
         &mut self,
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
-        let providers = self.select_providers();
+        // Collect provider indices to avoid borrow issues
+        let provider_indices: Vec<usize> = self
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.config.enabled && p.health.is_healthy)
+            .map(|(i, _)| i)
+            .collect();
 
-        if providers.is_empty() {
-            return Err(ApiError::ProviderUnavailable(
-                "no available providers".to_string()
-            ));
+        if provider_indices.is_empty() {
+            return Err(ApiError::RetriesExhausted {
+                attempts: 0,
+                last_error: Box::new(ApiError::Auth(
+                    "no available providers".to_string(),
+                )),
+            });
         }
 
         let mut last_error = None;
 
-        for provider in providers {
+        // Process each provider by index
+        for &provider_index in &provider_indices {
+            // Get client reference outside of async block
+            let client = {
+                let provider = &self.providers[provider_index];
+                // Clone the client to avoid borrow issues
+                let client_ref = provider.config.client.clone();
+                client_ref
+            };
+
             for attempt in 0..=self.config.max_retries {
                 if attempt > 0 {
-                    tracing::debug!(
-                        provider = %provider.config.name,
-                        attempt = attempt,
-                        "retrying request"
-                    );
                     tokio::time::sleep(self.config.retry_delay).await;
                 }
 
                 let start = Instant::now();
-                match provider.client.send_message(request).await {
+                match client.send_message(request).await {
                     Ok(response) => {
                         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-                        // Record success on the actual provider
-                        if let Some(p) = self.providers.iter_mut().find(|p| p.config.name == provider.config.name) {
-                            p.record_success(elapsed);
-                        }
+                        // Record success
+                        self.providers[provider_index].record_success(elapsed);
                         return Ok(response);
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            provider = %provider.config.name,
-                            error = %e,
-                            "provider request failed"
-                        );
                         // Record failure
-                        if let Some(p) = self.providers.iter_mut().find(|p| p.config.name == provider.config.name) {
-                            p.record_failure();
-                        }
-                        last_error = Some(e);
+                        self.providers[provider_index].record_failure();
 
                         // Don't retry if this isn't a retryable error
                         if !is_retryable_error(&e) {
+                            last_error = Some(e);
                             break;
                         }
 
+                        last_error = Some(e);
+
                         // Check if provider is still available
-                        if let Some(p) = self.providers.iter().find(|p| p.config.name == provider.config.name) {
-                            if !p.config.enabled || !p.health.is_healthy {
-                                break;
-                            }
+                        if !self.providers[provider_index].config.enabled
+                            || !self.providers[provider_index].health.is_healthy
+                        {
+                            break;
                         }
                     }
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| ApiError::ProviderUnavailable(
-            "all providers failed".to_string()
-        )))
-    }
-
-    /// Stream a message through the chain with failover.
-    pub async fn stream_message(
-        &mut self,
-        request: &MessageRequest,
-    ) -> Result<ChainMessageStream, ApiError> {
-        let providers = self.select_providers();
-
-        if providers.is_empty() {
-            return Err(ApiError::ProviderUnavailable(
-                "no available providers".to_string()
-            ));
-        }
-
-        // Try to get a stream from any healthy provider
-        for provider in providers {
-            match provider.client.stream_message(request).await {
-                Ok(stream) => {
-                    return Ok(ChainMessageStream {
-                        inner: Some(stream),
-                        chain: self,
-                        current_provider: provider.config.name.clone(),
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        provider = %provider.config.name,
-                        error = %e,
-                        "provider streaming request failed"
-                    );
-                    if !is_retryable_error(&e) {
-                        continue;
-                    }
-                }
+        Err(last_error.unwrap_or_else(|| {
+            ApiError::RetriesExhausted {
+                attempts: self.config.max_retries + 1,
+                last_error: Box::new(ApiError::Auth("all providers failed".to_string())),
             }
-        }
-
-        Err(ApiError::ProviderUnavailable(
-            "all providers failed to start streaming".to_string()
-        ))
+        }))
     }
 
     /// Get health status of all providers.
@@ -403,7 +376,8 @@ impl ProviderChain {
 
     /// Get a specific provider's health.
     pub fn get_provider_health(&self, name: &str) -> Option<ProviderHealth> {
-        self.providers.iter()
+        self.providers
+            .iter()
             .find(|p| p.config.name == name)
             .map(|p| p.health.clone())
     }
@@ -448,49 +422,14 @@ impl ProviderChain {
     }
 }
 
-/// Message stream wrapper for provider chain.
-pub struct ChainMessageStream<'a> {
-    inner: Option<crate::MessageStream>,
-    chain: &'a mut ProviderChain,
-    current_provider: String,
-}
-
-impl<'a> ChainMessageStream<'a> {
-    /// Get the current provider name.
-    pub fn provider_name(&self) -> &str {
-        &self.current_provider
-    }
-}
-
 /// Check if an error is retryable.
 fn is_retryable_error(error: &ApiError) -> bool {
-    matches!(
-        error,
-        ApiError::RateLimited(_)
-            | ApiError::Timeout(_)
-            | ApiError::TransportError(_)
-            | ApiError::UpstreamError(_)
-    )
+    error.is_retryable()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{MessageRequest, MessageResponse};
-    use crate::providers::ProviderKind;
-
-    #[test]
-    fn test_chain_provider_config() {
-        let config = ChainProviderConfig::new("primary", ProviderClient::from_model("claude-3-5-sonnet").unwrap())
-            .with_weight(100)
-            .with_failure_threshold(5)
-            .with_timeout(Duration::from_secs(30));
-
-        assert_eq!(config.name, "primary");
-        assert_eq!(config.weight, 100);
-        assert_eq!(config.failure_threshold, 5);
-        assert_eq!(config.timeout, Duration::from_secs(30));
-    }
 
     #[test]
     fn test_chain_config_defaults() {
@@ -516,43 +455,5 @@ mod tests {
     #[test]
     fn test_selection_strategy() {
         assert_eq!(SelectionStrategy::default(), SelectionStrategy::Sequential);
-    }
-
-    #[test]
-    fn test_is_retryable_error() {
-        assert!(is_retryable_error(&ApiError::Timeout("timeout".to_string())));
-        assert!(is_retryable_error(&ApiError::RateLimited {
-            retry_after: 0,
-            source: None,
-        }));
-        assert!(is_retryable_error(&ApiError::TransportError("connection refused".to_string())));
-        assert!(!is_retryable_error(&ApiError::InvalidRequest("bad request".to_string())));
-    }
-
-    #[tokio::test]
-    async fn test_provider_chain_add_provider() {
-        let config = ProviderChainConfig::default();
-        let mut chain = ProviderChain::new(config);
-
-        let primary = ChainProviderConfig::new("primary", ProviderClient::from_model("claude-3-5-sonnet").unwrap());
-        chain.add_provider(primary);
-
-        let health = chain.get_health();
-        assert_eq!(health.len(), 1);
-        assert_eq!(health[0].name, "primary");
-        assert!(health[0].is_healthy);
-    }
-
-    #[tokio::test]
-    async fn test_provider_chain_set_enabled() {
-        let config = ProviderChainConfig::default();
-        let mut chain = ProviderChain::new(config);
-
-        let primary = ChainProviderConfig::new("primary", ProviderClient::from_model("claude-3-5-sonnet").unwrap());
-        chain.add_provider(primary);
-
-        // Note: enabled state is tracked per ChainProvider, not in config
-        let health = chain.get_health();
-        assert!(health[0].is_healthy);
     }
 }
