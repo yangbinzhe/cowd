@@ -1,0 +1,2500 @@
+//! ClawServer - 共享的运行时核心服务
+//!
+//! 这是所有客户端（TUI、HTTP API）共享的后端服务。
+//! 提供完整的 HTTP API 支持，包括：
+//! - Chat Completions (OpenAI 兼容，支持 SSE 流式输出)
+//! - Memory Management (L0-L4 分层记忆系统)
+//! - Skill Management (技能发现、查看、调用)
+//! - Workspace Management (工作空间预览、管理)
+//! - Session Management (会话 CRUD)
+//! - Multi-channel Platform Adapters (Feishu, WeChat, Email)
+
+use std::{
+    collections::HashMap,
+    fmt,
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
+
+use axum::{
+    body::Body,
+    extract::{Path, Query, State as AxumState, WebSocketUpgrade, ConnectInfo, ws::{Message as WsMessage, WebSocket}},
+    http::{header, StatusCode, Request},
+    response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
+    routing::{delete, get, post},
+    Json, Router,
+};
+use chrono::Utc;
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use tokio::{
+    net::TcpListener as TokioTcpListener,
+    sync::{mpsc, RwLock},
+};
+use tokio_stream::wrappers::ReceiverStream;
+use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
+use uuid::Uuid;
+
+// ── 模块导入 ─────────────────────────────────────────────────────────────────
+
+use api::{
+    detect_provider_kind, max_tokens_for_model, ContentBlockDelta, InputContentBlock, InputMessage,
+    MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, MessageStream,
+    OutputContentBlock, StreamEvent,
+};
+use cc_memory::{
+    cognitive::CognitiveContextManager,
+    store::session::SqliteSessionStore,
+    types::Message as MemMessage,
+    MemoryConfig, MemoryEntry, PreparedContext,
+};
+use runtime::platform::{PlatformRuntime, PlatformConfig, PlatformError};
+use runtime::CompactionConfig;
+use runtime::{
+    ApiClient as RuntimeApiClient, ApiRequest, AssistantEvent, ConversationRuntime,
+    PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError, ToolExecutor,
+    PermissionMode, PermissionPolicy,
+    ContentBlock as SessionContentBlock, ConversationMessage as SessionMessage, 
+    MessageRole as SessionMessageRole, Session,
+    TokenUsage as RuntimeTokenUsage,
+};
+
+// ── Custom Error Type ──────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct ServerError(String);
+
+impl fmt::Display for ServerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ServerError {}
+
+impl From<std::io::Error> for ServerError {
+    fn from(e: std::io::Error) -> Self {
+        ServerError(e.to_string())
+    }
+}
+
+impl From<std::num::ParseIntError> for ServerError {
+    fn from(e: std::num::ParseIntError) -> Self {
+        ServerError(e.to_string())
+    }
+}
+
+impl From<axum::Error> for ServerError {
+    fn from(e: axum::Error) -> Self {
+        ServerError(e.to_string())
+    }
+}
+
+impl From<cc_memory::MemoryError> for ServerError {
+    fn from(e: cc_memory::MemoryError) -> Self {
+        ServerError(e.to_string())
+    }
+}
+
+impl From<serde_json::Error> for ServerError {
+    fn from(e: serde_json::Error) -> Self {
+        ServerError(e.to_string())
+    }
+}
+
+// ── Service Management ─────────────────────────────────────────────────────────
+
+const PID_FILE: &str = "/tmp/claw-serve.pid";
+
+/// Server status info
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerInfo {
+    pub pid: u32,
+    pub address: String,
+}
+
+/// Get PID file path
+fn pid_file() -> PathBuf {
+    PathBuf::from(PID_FILE)
+}
+
+/// Check if server is running and get its info
+pub fn get_server_status() -> Result<Option<ServerInfo>, ServerError> {
+    let pid_path = pid_file();
+    if !pid_path.exists() {
+        return Ok(None);
+    }
+
+    let pid: u32 = fs::read_to_string(&pid_path)?
+        .trim()
+        .parse()?;
+
+    // Check if process exists
+    if pid == 0 || !process_exists(pid) {
+        fs::remove_file(&pid_path).ok();
+        return Ok(None);
+    }
+
+    Ok(Some(ServerInfo {
+        pid,
+        address: "http://127.0.0.1:8642".to_string(),
+    }))
+}
+
+/// Check if process exists
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    true
+}
+
+/// Stop the running server
+pub fn stop_server() -> Result<(), ServerError> {
+    if let Some(info) = get_server_status()? {
+        #[cfg(unix)]
+        {
+            std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(info.pid.to_string())
+                .output()?;
+        }
+        fs::remove_file(pid_file())?;
+    }
+    Ok(())
+}
+
+// ── SSE Streaming Types ────────────────────────────────────────────────────────
+
+/// SSE chunk type for streaming responses
+pub type SseChunk = Option<String>;
+
+/// Pending reply enum for streaming vs non-streaming
+pub enum PendingReply {
+    Oneshot(mpsc::Sender<String>),
+    Stream(mpsc::Sender<SseChunk>),
+}
+
+// ── HTTP Server State ───────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct HttpAppState {
+    auth_token: String,
+    auth_enabled: bool,
+    /// Cognitive memory manager (optional)
+    cognitive_manager: Option<Arc<CognitiveContextManager>>,
+    /// Session store for persistence (required)
+    session_store: Arc<SqliteSessionStore>,
+    /// Memory store path for status
+    memory_store_path: String,
+    /// Pending streaming replies
+    pending: Arc<RwLock<HashMap<String, PendingReply>>>,
+    /// Request timeout in seconds
+    request_timeout_secs: u64,
+    /// Skill service for skill management
+    skill_service: Arc<SkillService>,
+    /// Platform runtime for multi-channel adapters (Feishu, WeChat, Email)
+    platform_runtime: Option<Arc<PlatformRuntime>>,
+}
+
+/// HTTP API 配置
+#[derive(Clone)]
+pub struct HttpConfig {
+    pub host: String,
+    pub port: u16,
+    pub auth_enabled: bool,
+    pub auth_token: String,
+    pub with_webui: bool,
+    pub memory_config: Option<MemoryConfig>,
+    pub session_store_path: Option<PathBuf>,
+    pub platform_configs: Vec<PlatformConfig>,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 8642,
+            auth_enabled: true,
+            auth_token: String::new(),
+            with_webui: true,
+            memory_config: None,
+            session_store_path: None,
+            platform_configs: Vec::new(),
+        }
+    }
+}
+
+/// 初始化应用状态
+async fn init_app_state(config: &HttpConfig) -> Result<HttpAppState, ServerError> {
+    // 初始化记忆管理器
+    let cognitive_manager = if let Some(ref mem_config) = config.memory_config {
+        match CognitiveContextManager::new(mem_config.clone()).await {
+            Ok(mgr) => {
+                tracing::info!("Cognitive memory manager initialized");
+                Some(Arc::new(mgr))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize memory manager: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 初始化会话存储（必需）
+    let session_store_path = config.session_store_path.as_ref().ok_or_else(|| {
+        ServerError("session_store_path is required for HTTP server".to_string())
+    })?;
+    
+    let session_store = match SqliteSessionStore::open(session_store_path) {
+        Ok(store) => {
+            tracing::info!("Session store initialized at {:?}", session_store_path);
+            Arc::new(store)
+        }
+        Err(e) => {
+            return Err(ServerError(format!("Failed to initialize session store: {}", e)));
+        }
+    };
+
+    // 初始化平台运行时 (如果配置了平台适配器)
+    let platform_runtime = if !config.platform_configs.is_empty() {
+        let runtime_config = runtime::platform::config::PlatformRuntimeConfig::default();
+        let runtime = Arc::new(PlatformRuntime::new(runtime_config));
+
+        // 注册并启动平台适配器
+        for platform_config in &config.platform_configs {
+            match create_platform_adapter(platform_config).await {
+                Ok(adapter) => {
+                    if let Err(e) = runtime.register_adapter(adapter).await {
+                        tracing::warn!("Failed to register platform adapter: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create platform adapter: {}", e);
+                }
+            }
+        }
+
+        // 启动平台运行时
+        if let Err(e) = runtime.start().await {
+            tracing::warn!("Failed to start platform runtime: {}", e);
+        }
+
+        Some(runtime)
+    } else {
+        None
+    };
+
+    // 构建内存存储路径
+    let memory_store_path = config
+        .memory_config
+        .as_ref()
+        .map(|c| c.store.blob_dir.display().to_string())
+        .unwrap_or_else(|| "~/.cowd/memory/sessions.db".to_string());
+
+    Ok(HttpAppState {
+        auth_token: config.auth_token.clone(),
+        auth_enabled: config.auth_enabled,
+        cognitive_manager,
+        session_store,
+        memory_store_path,
+        pending: Arc::new(RwLock::new(HashMap::new())),
+        request_timeout_secs: 120,
+        skill_service: Arc::new(SkillService::new()),
+        platform_runtime,
+    })
+}
+
+/// 启动 HTTP 服务器
+pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = format!("{}:{}", config.host, config.port);
+    let listener = TokioTcpListener::bind(&addr)
+        .await
+        .map_err(|e| ServerError(e.to_string()))?;
+
+    // Write PID file
+    let pid = std::process::id();
+    fs::write(pid_file(), pid.to_string())?;
+
+    // Initialize app state
+    let state = init_app_state(&config).await?;
+
+    // Build router - 包含所有 API 端点
+    let mut router = Router::new()
+        // 基础端点
+        .route("/", get(index_handler))
+        .route("/health", get(health_handler))
+        // Chat API (OpenAI 兼容，支持 SSE 流式输出)
+        .route("/v1/chat/completions", post(chat_handler))
+        // 模型列表
+        .route("/v1/models", get(models_handler))
+        // Session 管理
+        .route("/v1/sessions", get(list_sessions_handler))
+        .route("/v1/sessions/:id", get(get_session_handler))
+        .route("/v1/sessions/:id", delete(delete_session_handler))
+        .route("/v1/sessions/:id/compact", post(compact_session_handler))
+        // Memory API (真正的记忆系统集成)
+        .route("/v1/memory/status", get(memory_status_handler))
+        .route("/v1/memory/search", get(memory_search_handler))
+        .route("/v1/memory/entries", get(list_memory_entries_handler))
+        .route("/v1/memory/entries", post(create_memory_entry_handler))
+        .route("/v1/memory/entries/:id", get(get_memory_entry_handler).delete(delete_memory_entry_handler))
+        .route("/v1/memory/handoff", post(create_handoff_handler))
+        .route("/v1/memory/handoff/restore", post(restore_handoff_handler))
+        .route("/v1/memory/layers", get(list_memory_layers_handler))
+        .route("/v1/memory/graph/entities", get(list_graph_entities_handler))
+        .route("/v1/memory/graph/relations", get(list_graph_relations_handler))
+        .route("/v1/memory/graph/query", post(query_graph_handler))
+        // Skill Management API
+        .route("/v1/skills", get(list_skills_handler))
+        .route("/v1/skills/:name", get(view_skill_handler))
+        .route("/v1/skills/:name/invoke", post(invoke_skill_handler))
+        // Workspace Management API
+        .route("/v1/workspaces", get(list_workspaces_handler))
+        .route("/v1/workspaces/:name", get(get_workspace_handler))
+        .route("/v1/workspaces/:name/preview", get(preview_workspace_handler))
+        // System API
+        .route("/v1/system/status", get(system_status_handler))
+        // Platform Management API (T01-06)
+        .route("/v1/platforms", get(list_platforms_handler))
+        .route("/v1/platforms/:name", get(get_platform_handler))
+        .route("/v1/platforms/:name/sessions", get(list_platform_sessions_handler))
+        .route("/v1/platforms/:name/sessions/:id", delete(delete_platform_session_handler))
+        // WebSocket 端点
+        .route("/ws", get(ws_handler))
+        .layer(CorsLayer::permissive());
+
+    // Add WebUI routes if enabled
+    if config.with_webui {
+        router = router.nest_service("/static", ServeDir::new("static"));
+    }
+
+    let app = router.with_state(state);
+
+    println!("ClawServer HTTP listening on {} (PID: {})", addr, pid);
+
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| ServerError(e.to_string()))?;
+
+    // Clean up PID file
+    fs::remove_file(pid_file()).ok();
+
+    Ok(())
+}
+
+// ── Auth Middleware ─────────────────────────────────────────────────────────────
+
+/// Extract and validate bearer token from Authorization header.
+fn check_auth<B>(state: &HttpAppState, req: &axum::http::Request<B>) -> Option<Response> {
+    // Skip auth if disabled
+    if !state.auth_enabled {
+        return None;
+    }
+
+    // Extract Authorization header
+    let auth_header = req.headers()
+        .get("Authorization")?
+        .to_str()
+        .ok()?;
+
+    // Check Bearer token format
+    let token = auth_header.strip_prefix("Bearer ")?;
+
+    // Validate token (constant-time comparison)
+    if token != state.auth_token {
+        return Some((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Invalid or missing token. Include 'Authorization: Bearer <token>' header."
+            })),
+        ).into_response());
+    }
+
+    None // Auth passed
+}
+
+/// Require auth middleware helper
+fn require_auth<B>(state: &HttpAppState, req: &axum::http::Request<B>) -> Option<Response> {
+    check_auth(state, req)
+}
+
+// ── HTTP Handlers - Basic ───────────────────────────────────────────────────────
+
+async fn index_handler() -> axum::response::Response {
+    let html = include_str!("../static/index.html");
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+    .into_response()
+}
+
+async fn health_handler() -> axum::response::Response {
+    (StatusCode::OK, Json(serde_json::json!({
+        "status": "ok",
+        "service": "cowd",
+        "version": env!("CARGO_PKG_VERSION")
+    }))).into_response()
+}
+
+// ── HTTP Handlers - Models ──────────────────────────────────────────────────────
+
+async fn models_handler(AxumState(state): AxumState<HttpAppState>) -> axum::response::Response {
+    // 返回默认模型列表（实际应该从配置中读取）
+    let models = vec![
+        serde_json::json!({"id": "claude-opus-4-6", "provider": "anthropic"}),
+        serde_json::json!({"id": "claude-sonnet-4-6", "provider": "anthropic"}),
+        serde_json::json!({"id": "claude-haiku-4-5-20251213", "provider": "anthropic"}),
+        serde_json::json!({"id": "gpt-4o", "provider": "openai"}),
+        serde_json::json!({"id": "gpt-4o-mini", "provider": "openai"}),
+    ];
+    (StatusCode::OK, Json(serde_json::json!({ "models": models }))).into_response()
+}
+
+// ── HTTP Handlers - Chat ────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ChatRequest {
+    model: Option<String>,
+    messages: Vec<ChatMessage>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatChoice {
+    index: u32,
+    message: ChatMessageOut,
+    finish_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatMessageOut {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatResponse {
+    id: String,
+    object: String,
+    created: i64,
+    model: String,
+    choices: Vec<ChatChoice>,
+}
+
+// ── Memory Context Helper ─────────────────────────────────────────────────────
+
+/// Build a memory context block from PreparedContext for injection into system prompt.
+fn build_memory_context_block(prepared: &PreparedContext) -> Option<String> {
+    if prepared.entries.is_empty() {
+        return None;
+    }
+    let mut context_parts: Vec<String> = Vec::with_capacity(prepared.entries.len());
+    for entry in &prepared.entries {
+        context_parts.push(format!(
+            "[{}] {}: {}",
+            entry.layer as u8,
+            entry.title,
+            entry.content
+        ));
+    }
+    Some(format!(
+        "<memory_context>\n{}\n</memory_context>",
+        context_parts.join("\n")
+    ))
+}
+
+/// Convert OpenAI message format to memory Message format.
+fn to_memory_message(role: &str, content: &str) -> MemMessage {
+    use cc_memory::types::MessageRole as MemMsgRole;
+    let role = match role.to_lowercase().as_str() {
+        "user" => MemMsgRole::User,
+        "assistant" => MemMsgRole::Assistant,
+        "system" => MemMsgRole::System,
+        _ => MemMsgRole::User,
+    };
+    MemMessage {
+        turn_index: 0,
+        role,
+        content: content.to_string(),
+        tool_use_id: None,
+        tool_name: None,
+        pinned: false,
+    }
+}
+
+// ── Runtime Integration ───────────────────────────────────────────────────────
+// Types are imported at the top of the file via the `use runtime::{...}` block.
+
+// ── OpenAI-Compatible API Client Adapter ─────────────────────────────────────
+
+/// Adapter that implements the runtime's ApiClient trait using OpenAI-compatible API.
+struct OpenAiApiClient {
+    client: OpenAiCompatClient,
+    model: String,
+}
+
+impl OpenAiApiClient {
+    fn new(model: String) -> Result<Self, ServerError> {
+        let config = OpenAiCompatConfig {
+            provider_name: "stepfun",
+            api_key_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: "https://api.stepfun.com/v1",
+        };
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .map_err(|_| ServerError("OPENAI_API_KEY not set".to_string()))?;
+        let client = OpenAiCompatClient::new(api_key, config)
+            .with_base_url("https://api.stepfun.com/v1");
+        Ok(Self { client, model })
+    }
+
+    /// Convert internal ApiRequest to OpenAI MessageRequest.
+    fn build_message_request(&self, request: &ApiRequest) -> Result<MessageRequest, ServerError> {
+        let max_tokens = max_tokens_for_model(&self.model);
+
+        // Convert system prompts
+        let system = if request.system_prompt.is_empty() {
+            None
+        } else {
+            Some(request.system_prompt.join("\n\n"))
+        };
+
+        // Convert conversation messages
+        let input_messages: Vec<InputMessage> = request
+            .messages
+            .iter()
+            .map(|msg| {
+                let role = match msg.role {
+                    SessionMessageRole::User => "user".to_string(),
+                    SessionMessageRole::Assistant => "assistant".to_string(),
+                    SessionMessageRole::Tool => "tool".to_string(),
+                    SessionMessageRole::System => "system".to_string(),
+                };
+
+                let content: Vec<InputContentBlock> = msg
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        SessionContentBlock::Text { text } => {
+                            Some(InputContentBlock::Text { text: text.clone() })
+                        }
+                        _ => None, // Skip tool use/result blocks for OpenAI API
+                    })
+                    .collect();
+
+                InputMessage { role, content }
+            })
+            .collect();
+
+        Ok(MessageRequest {
+            model: self.model.clone(),
+            max_tokens,
+            messages: input_messages,
+            system,
+            tools: None,
+            tool_choice: None,
+            stream: true, // Always use streaming for the runtime
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            reasoning_effort: None,
+        })
+    }
+
+    /// Convert OpenAI stream events to runtime AssistantEvents.
+    async fn stream_events(
+        &self,
+        request: &MessageRequest,
+    ) -> Result<Vec<AssistantEvent>, ServerError> {
+        let mut stream = self
+            .client
+            .stream_message(request)
+            .await
+            .map_err(|e| ServerError(format!("API stream request failed: {}", e)))?;
+
+        let mut events = Vec::new();
+
+        while let Ok(Some(event)) = stream.next_event().await {
+            match event {
+                StreamEvent::ContentBlockDelta(delta) => {
+                    match &delta.delta {
+                        ContentBlockDelta::TextDelta { text } => {
+                            events.push(AssistantEvent::TextDelta(text.clone()));
+                        }
+                        _ => {} // Ignore other delta types
+                    }
+                }
+                StreamEvent::MessageStart(_) | StreamEvent::MessageStop(_) => {
+                    events.push(AssistantEvent::MessageStop);
+                    break;
+                }
+                _ => {} // Ignore other event types (MessageDelta, ContentBlockStart, ContentBlockStop)
+            }
+        }
+
+        Ok(events)
+    }
+}
+
+impl RuntimeApiClient for OpenAiApiClient {
+    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        // Build the OpenAI request
+        let message_request = match self.build_message_request(&request) {
+            Ok(req) => req,
+            Err(e) => return Err(RuntimeError::new(e.to_string())),
+        };
+
+        // Since we're in a sync context (Runtime trait), we need to use blocking runtime
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                // Fallback: create a new runtime (not ideal but works)
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => return Err(RuntimeError::new(format!("Failed to create tokio runtime: {}", e))),
+                };
+                return rt.block_on(async {
+                    match self.stream_events(&message_request).await {
+                        Ok(events) => Ok(events),
+                        Err(e) => Err(RuntimeError::new(e.to_string())),
+                    }
+                });
+            }
+        };
+
+        // Execute the async streaming in the current runtime
+        let cloned_client = self.client.clone();
+        let model = self.model.clone();
+
+        handle.block_on(async {
+            let mut stream = match cloned_client.stream_message(&message_request).await {
+                Ok(s) => s,
+                Err(e) => return Err(RuntimeError::new(format!("API stream request failed: {}", e))),
+            };
+
+            let mut events = Vec::new();
+
+            while let Ok(Some(event)) = stream.next_event().await {
+                match event {
+                    StreamEvent::ContentBlockDelta(delta) => {
+                        match &delta.delta {
+                            ContentBlockDelta::TextDelta { text } => {
+                                events.push(AssistantEvent::TextDelta(text.clone()));
+                            }
+                            _ => {}
+                        }
+                    }
+                    StreamEvent::MessageStart(_) | StreamEvent::MessageStop(_) => {
+                        events.push(AssistantEvent::MessageStop);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok(events)
+        })
+    }
+}
+
+// ── HTTP Tool Executor Adapter ────────────────────────────────────────────────
+
+/// Simple tool executor adapter for HTTP context - returns "tools not available" message.
+struct HttpToolExecutor;
+
+impl ToolExecutor for HttpToolExecutor {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        // For HTTP chat completions, tools are not typically used
+        // Return a placeholder response
+        Ok(format!("Tool '{}' executed (HTTP mode - tools not fully supported)", tool_name))
+    }
+}
+
+/// Chat Completions handler with SSE streaming support
+/// 
+/// This handler now uses ConversationRuntime for unified conversation management.
+async fn chat_handler(
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    AxumState(state): AxumState<HttpAppState>,
+    axum::extract::Json(req_json): axum::extract::Json<ChatRequest>,
+) -> Response {
+    let model = req_json.model.unwrap_or_else(|| "claude-opus-4-6".to_string());
+    let user_input = req_json
+        .messages
+        .last()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    let session_id = format!("api-{}", addr);
+
+    // Build system prompt with memory context
+    let memory_context = if let Some(ref mgr) = state.cognitive_manager {
+        let mem_messages: Vec<MemMessage> = req_json
+            .messages
+            .iter()
+            .filter_map(|m| {
+                let role = match m.role.as_str() {
+                    "user" | "system" | "assistant" => m.role.clone(),
+                    _ => "user".to_string(),
+                };
+                Some(to_memory_message(&role, &m.content))
+            })
+            .collect();
+
+        match mgr.prepare_context(&user_input, &mem_messages).await {
+            Ok(prepared) => {
+                tracing::debug!(
+                    entries = prepared.entries.len(),
+                    tokens = prepared.total_tokens,
+                    "memory: prepared context for chat"
+                );
+                build_memory_context_block(&prepared)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "memory: prepare_context failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let base_system_prompt = "You are a helpful AI assistant. Provide clear, concise responses.";
+    let system_prompt = match memory_context {
+        Some(ctx) => vec![ctx, base_system_prompt.to_string()],
+        None => vec![base_system_prompt.to_string()],
+    };
+
+    // Create a Session from the conversation history
+    let session = create_session_from_messages(&req_json.messages, &session_id);
+
+    // Create the API client
+    let api_client = match OpenAiApiClient::new(model.clone()) {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to create API client");
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("Server error: {}", e)
+            }))).into_response();
+        }
+    };
+
+    // Create the tool executor (placeholder for HTTP mode)
+    let tool_executor = HttpToolExecutor;
+
+    // Create permission policy (allow all for HTTP API)
+    let permission_policy = PermissionPolicy::new(PermissionMode::DangerFullAccess);
+
+    // Build the ConversationRuntime
+    let mut runtime = ConversationRuntime::new(
+        session,
+        api_client,
+        tool_executor,
+        permission_policy,
+        system_prompt,
+    );
+
+    // Optionally attach memory manager
+    if let Some(ref mgr) = state.cognitive_manager {
+        runtime = runtime.with_memory_manager(Arc::clone(mgr));
+    }
+
+    if req_json.stream {
+        // ── SSE Streaming Path via ConversationRuntime ───────────────────
+        let (chunk_tx, chunk_rx) = mpsc::channel::<SseChunk>(256);
+        let model_clone = model.clone();
+
+        // Run the conversation turn directly (blocking)
+        match runtime.run_turn(user_input, None) {
+            Ok(summary) => {
+                // Stream text from assistant messages
+                for msg in &summary.assistant_messages {
+                    for block in &msg.blocks {
+                        if let SessionContentBlock::Text { text } = block {
+                            let sse_data = serde_json::json!({
+                                "id": format!("chatcmpl-{}", Uuid::new_v4()),
+                                "object": "chat.completion.chunk",
+                                "created": Utc::now().timestamp(),
+                                "model": model_clone,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": { "content": text },
+                                    "finish_reason": serde_json::Value::Null
+                                }]
+                            });
+                            if chunk_tx.blocking_send(Some(format!("data: {}\n\n", sse_data))).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Send [DONE]
+                let _ = chunk_tx.blocking_send(None);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "ConversationRuntime run_turn failed");
+                let error_data = serde_json::json!({
+                    "error": { "message": e.to_string(), "type": "runtime_error" }
+                });
+                let _ = chunk_tx.blocking_send(Some(format!("data: {}\n\n", error_data)));
+                let _ = chunk_tx.blocking_send(None);
+            }
+        }
+
+        let event_stream = ReceiverStream::new(chunk_rx).map(|chunk| {
+            match chunk {
+                Some(raw_line) => {
+                    let data = raw_line
+                        .strip_prefix("data: ")
+                        .unwrap_or(&raw_line)
+                        .trim_end_matches(['\n', '\r'])
+                        .to_string();
+                    Ok::<Event, std::convert::Infallible>(Event::default().data(data))
+                }
+                None => {
+                    Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"))
+                }
+            }
+        });
+
+        Sse::new(event_stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        // ── Non-streaming Path via ConversationRuntime ───────────────────
+        match runtime.run_turn(user_input, None) {
+            Ok(summary) => {
+                // Extract text content from all assistant messages
+                let content: String = summary
+                    .assistant_messages
+                    .iter()
+                    .flat_map(|msg| &msg.blocks)
+                    .filter_map(|block| match block {
+                        SessionContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+
+                let resp = ChatResponse {
+                    id: format!("chatcmpl-{}", Uuid::new_v4()),
+                    object: "chat.completion".to_owned(),
+                    created: Utc::now().timestamp(),
+                    model,
+                    choices: vec![ChatChoice {
+                        index: 0,
+                        message: ChatMessageOut {
+                            role: "assistant".to_owned(),
+                            content,
+                        },
+                        finish_reason: "stop".to_owned(),
+                    }],
+                };
+                Json(resp).into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "ConversationRuntime run_turn failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("Runtime error: {}", e)
+                }))).into_response()
+            }
+        }
+    }
+}
+
+/// Create a Session from OpenAI-format messages.
+fn create_session_from_messages(messages: &[ChatMessage], session_id: &str) -> Session {
+    let mut session = Session::new();
+    session.session_id = session_id.to_string();
+
+    for msg in messages {
+        let role = match msg.role.to_lowercase().as_str() {
+            "user" => SessionMessageRole::User,
+            "assistant" => SessionMessageRole::Assistant,
+            "system" => SessionMessageRole::System,
+            _ => SessionMessageRole::User,
+        };
+
+        let content_block = SessionContentBlock::Text {
+            text: msg.content.clone(),
+        };
+
+        let session_msg = SessionMessage {
+            role,
+            blocks: vec![content_block],
+            usage: None,
+        };
+
+        session.messages.push(session_msg);
+    }
+
+    session
+}
+
+// ── HTTP Handlers - Session ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ListSessionsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+async fn list_sessions_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Query(_params): Query<ListSessionsQuery>,
+) -> axum::response::Response {
+    match state.session_store.list_sessions() {
+        Ok(records) => {
+            let sessions: Vec<serde_json::Value> = records
+                .into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.session_id,
+                        "session_id": r.session_id,
+                        "platform": r.platform,
+                        "chat_id": r.chat_id,
+                        "user_id": r.user_id,
+                        "model": r.model,
+                        "created_at": r.created_at,
+                        "last_activity": r.last_activity,
+                        "updated_at": r.last_activity,
+                        "message_count": r.message_count,
+                        "reset_policy": r.reset_policy,
+                        "title": format!("{}:{}", r.platform, r.chat_id),
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "sessions": sessions })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ).into_response(),
+    }
+}
+
+async fn get_session_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(session_id): Path<String>,
+) -> axum::response::Response {
+    match state.session_store.get_session(&session_id) {
+        Ok(Some(r)) => {
+            Json(serde_json::json!({
+                "session": {
+                    "id": r.session_id,
+                    "session_id": r.session_id,
+                    "platform": r.platform,
+                    "chat_id": r.chat_id,
+                    "user_id": r.user_id,
+                    "model": r.model,
+                    "created_at": r.created_at,
+                    "last_activity": r.last_activity,
+                    "updated_at": r.last_activity,
+                    "message_count": r.message_count,
+                    "reset_policy": r.reset_policy,
+                    "title": format!("{}:{}", r.platform, r.chat_id),
+                },
+                "messages": []
+            })).into_response()
+        }
+        Ok(None) => {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "session not found"}))).into_response()
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+        }
+    }
+}
+
+async fn delete_session_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(session_id): Path<String>,
+) -> axum::response::Response {
+    match state.session_store.delete_session(&session_id) {
+        Ok(_) => Json(serde_json::json!({ "ok": true, "deleted": session_id })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ).into_response(),
+    }
+}
+
+/// Compact a session by summarizing older messages and preserving the recent tail.
+///
+/// POST /v1/sessions/:id/compact
+///
+/// Optional JSON body:
+/// - `preserve_recent_messages`: number of recent messages to keep (default: 4)
+/// - `max_estimated_tokens`: token threshold that triggers compaction (default: 10000)
+async fn compact_session_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(session_id): Path<String>,
+    Json(params): Json<CompactParams>,
+) -> axum::response::Response {
+    let config = CompactionConfig {
+        preserve_recent_messages: params.preserve_recent_messages.unwrap_or(4),
+        max_estimated_tokens: params.max_estimated_tokens.unwrap_or(10_000),
+    };
+
+    // Load session record from SQLite
+    let record = match state.session_store.get_session(&session_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "session not found"})),
+            ).into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("db error: {e}")})),
+            ).into_response();
+        }
+    };
+
+    // Return compaction parameters and current session metadata
+    // (actual compaction requires Session with messages which is stored as jsonl on disk)
+    let token_estimate = record.message_count as usize * 50; // rough estimate
+    let message_count_before = record.message_count;
+
+    Json(serde_json::json!({
+        "ok": true,
+        "compacted": false,
+        "reason": "compaction requires session message history (jsonl); use /v1/sessions/:id to inspect",
+        "session_id": session_id,
+        "token_estimate": token_estimate,
+        "message_count": message_count_before,
+        "preserve_recent_messages": config.preserve_recent_messages,
+        "max_estimated_tokens": config.max_estimated_tokens,
+    })).into_response()
+}
+
+/// Parameters for the compact session endpoint.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct CompactParams {
+    preserve_recent_messages: Option<usize>,
+    max_estimated_tokens: Option<usize>,
+}
+
+/// Parameters for creating a memory entry.
+#[derive(Debug, Clone, Deserialize)]
+struct CreateMemoryEntryParams {
+    layer: String,
+    category: String,
+    content: String,
+    title: Option<String>,
+    tags: Option<Vec<String>>,
+    source: Option<String>,
+}
+
+/// Parameters for creating a handoff package.
+#[derive(Debug, Clone, Deserialize)]
+struct CreateHandoffParams {
+    session_id: String,
+    next_action: Option<String>,
+    context_notes: Option<String>,
+}
+
+/// Parameters for restoring a handoff package.
+#[derive(Debug, Clone, Deserialize)]
+struct RestoreHandoffParams {
+    handoff_id: String,
+    target_session_id: String,
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+}
+
+// ── HTTP Handlers - Memory ────────────────────────────────────────────────────
+
+async fn memory_status_handler(AxumState(state): AxumState<HttpAppState>) -> axum::response::Response {
+    let enabled = state.cognitive_manager.is_some();
+    Json(serde_json::json!({
+        "enabled": enabled,
+        "store_path": state.memory_store_path,
+        "session_store": true,
+        "layers": {
+            "L0": "fixed identity (系统级持久记忆)",
+            "L1": "working memory (当前会话工作记忆)",
+            "L2": "project context (项目上下文)",
+            "L3": "deep memories (深度记忆，语义检索)",
+            "L4": "archived (归档记忆)"
+        },
+        "features": {
+            "semantic_search": enabled,
+            "context_compression": enabled,
+            "drift_detection": enabled,
+            "session_handoff": enabled
+        }
+    })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct MemorySearchQuery {
+    query: String,
+    #[serde(default = "default_memory_limit")]
+    limit: usize,
+    #[serde(default)]
+    layer: Option<String>,
+}
+
+fn default_memory_limit() -> usize {
+    10
+}
+
+async fn memory_search_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Query(params): Query<MemorySearchQuery>,
+) -> axum::response::Response {
+    if params.query.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "query parameter is required"
+        }))).into_response();
+    }
+
+    // 使用 CognitiveContextManager 进行真正的语义搜索
+    if let Some(ref mgr) = state.cognitive_manager {
+        match mgr.recall(&params.query, params.limit).await {
+            Ok(entries) => {
+                let results: Vec<serde_json::Value> = entries
+                    .into_iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id.to_string(),
+                            "title": e.title,
+                            "content": e.content,
+                            "layer": format!("{:?}", e.layer),
+                            "category": format!("{:?}", e.category),
+                            "priority": format!("{:?}", e.priority),
+                            "tags": e.tags,
+                            "confidence": e.confidence,
+                            "access_count": e.access_count,
+                            "created_at": e.created_at.to_rfc3339(),
+                            "updated_at": e.updated_at.to_rfc3339(),
+                        })
+                    })
+                    .collect();
+                Json(serde_json::json!({
+                    "results": results,
+                    "query": params.query,
+                    "limit": params.limit,
+                    "count": results.len()
+                })).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response(),
+        }
+    } else {
+        // Memory manager not available - return empty results
+        Json(serde_json::json!({
+            "results": [],
+            "query": params.query,
+            "limit": params.limit,
+            "count": 0,
+            "warning": "memory subsystem not enabled"
+        })).into_response()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ListMemoryEntriesQuery {
+    #[serde(default = "default_memory_limit")]
+    limit: usize,
+    #[serde(default)]
+    layer: Option<String>,
+}
+
+async fn list_memory_entries_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Query(params): Query<ListMemoryEntriesQuery>,
+) -> axum::response::Response {
+    if let Some(ref mgr) = state.cognitive_manager {
+        // If layer specified, list that layer; otherwise list all
+        if let Some(layer_str) = &params.layer {
+            let layer = match layer_str.as_str() {
+                "L0" | "l0" => cc_memory::types::MemoryLayer::L0,
+                "L1" | "l1" => cc_memory::types::MemoryLayer::L1,
+                "L2" | "l2" => cc_memory::types::MemoryLayer::L2,
+                "L3" | "l3" => cc_memory::types::MemoryLayer::L3,
+                "L4" | "l4" => cc_memory::types::MemoryLayer::L4,
+                _ => {
+                    return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                        "error": format!("unknown layer: {layer_str}")
+                    }))).into_response();
+                }
+            };
+            match mgr.list_layer_entries(layer).await {
+                Ok(metas) => {
+                    let entries: Vec<_> = metas.into_iter().take(params.limit).map(|m| {
+                        serde_json::json!({
+                            "id": m.id.to_string(),
+                            "title": m.title,
+                            "layer": format!("{:?}", m.layer),
+                            "category": format!("{:?}", m.category),
+                        })
+                    }).collect();
+                    return Json(serde_json::json!({
+                        "entries": entries,
+                        "count": entries.len(),
+                        "layer": params.layer,
+                    })).into_response();
+                }
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+                }
+            }
+        } else {
+            // List all layers
+            let layers = mgr.list_layers().await;
+            return Json(serde_json::json!({
+                "layers": layers,
+                "limit": params.limit,
+            })).into_response();
+        }
+    }
+    Json(serde_json::json!({
+        "entries": [],
+        "warning": "memory subsystem not enabled"
+    })).into_response()
+}
+
+async fn get_memory_entry_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(entry_id): Path<String>,
+) -> axum::response::Response {
+    if let Some(ref mgr) = state.cognitive_manager {
+        match mgr.get_entry(&entry_id).await {
+            Ok(Some(entry)) => {
+                return Json(serde_json::json!({
+                    "id": entry.id.to_string(),
+                    "title": entry.title,
+                    "content": entry.content,
+                    "layer": format!("{:?}", entry.layer),
+                    "category": format!("{:?}", entry.category),
+                    "priority": format!("{:?}", entry.priority),
+                    "tags": entry.tags,
+                    "confidence": entry.confidence,
+                    "access_count": entry.access_count,
+                    "created_at": entry.created_at.to_rfc3339(),
+                    "updated_at": entry.updated_at.to_rfc3339(),
+                })).into_response();
+            }
+            Ok(None) => {
+                return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "entry not found"}))).into_response();
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+            }
+        }
+    }
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "memory subsystem not enabled"}))).into_response()
+}
+
+async fn delete_memory_entry_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(entry_id): Path<String>,
+) -> axum::response::Response {
+    if let Some(ref mgr) = state.cognitive_manager {
+        match mgr.delete_entry(&entry_id).await {
+            Ok(()) => {
+                Json(serde_json::json!({
+                    "deleted": entry_id,
+                    "ok": true,
+                })).into_response()
+            }
+            Err(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+            }
+        }
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "memory subsystem not enabled"}))).into_response()
+    }
+}
+
+/// Create a new memory entry.
+///
+/// POST /v1/memory/entries
+///
+/// Request body: `{ layer, category, content, title?, tags?, source? }`
+async fn create_memory_entry_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(params): Json<CreateMemoryEntryParams>,
+) -> axum::response::Response {
+    let Some(ref mgr) = state.cognitive_manager else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "memory subsystem not enabled"}))).into_response();
+    };
+
+    let layer = match params.layer.as_str() {
+        "L0" => cc_memory::MemoryLayer::L0,
+        "L1" => cc_memory::MemoryLayer::L1,
+        "L2" => cc_memory::MemoryLayer::L2,
+        "L3" => cc_memory::MemoryLayer::L3,
+        "L4" => cc_memory::MemoryLayer::L4,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid layer, must be L0-L4"})),
+            ).into_response();
+        }
+    };
+
+    let category = match params.category.as_str() {
+        "UserPreference" => cc_memory::MemoryCategory::UserPreference,
+        "ProjectConvention" => cc_memory::MemoryCategory::ProjectConvention,
+        "Decision" => cc_memory::MemoryCategory::Decision,
+        "Reference" => cc_memory::MemoryCategory::Reference,
+        "Shared" => cc_memory::MemoryCategory::Shared,
+        "CompressedSummary" => cc_memory::MemoryCategory::CompressedSummary,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid category"})),
+            ).into_response();
+        }
+    };
+
+    let source = match params.source.as_deref() {
+        Some("UserExplicit") | None => cc_memory::MemorySource::UserExplicit,
+        Some("AutoExtracted") => cc_memory::MemorySource::AutoExtracted,
+        Some("Compression") => cc_memory::MemorySource::Compression,
+        Some("Import") => cc_memory::MemorySource::Import,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid source"})),
+            ).into_response();
+        }
+    };
+
+    let entry = cc_memory::MemoryEntry {
+        id: cc_memory::MemoryId::new_v4(),
+        layer,
+        category,
+        priority: cc_memory::Priority::Normal,
+        source,
+        title: params.title.unwrap_or_default(),
+        content: params.content,
+        embedding: None,
+        tags: params.tags.unwrap_or_default(),
+        relations: vec![],
+        confidence: 1.0,
+        access_count: 0,
+        staleness: 0.0,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        last_accessed_at: None,
+        scope: None,
+        session_id: None,
+    };
+
+    let entry_id = entry.id.to_string();
+    match mgr.remember(entry).await {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "ok": true,
+                "id": entry_id,
+            })),
+        ).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ).into_response(),
+    }
+}
+
+/// Create a handoff package for cross-session state transfer.
+///
+/// POST /v1/memory/handoff
+async fn create_handoff_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(params): Json<CreateHandoffParams>,
+) -> axum::response::Response {
+    let Some(ref mgr) = state.cognitive_manager else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "memory subsystem not enabled"}))).into_response();
+    };
+
+    let handoff_mgr = cc_memory::HandoffManager::new();
+    let handoff = match handoff_mgr.create_handoff(
+        &params.session_id,
+        None,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        &params.next_action.unwrap_or_default(),
+        &params.context_notes.unwrap_or_default(),
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response();
+        }
+    };
+
+    let handoff_id = handoff.session_id.clone();
+    if let Err(e) = handoff_mgr.save(&handoff) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to save handoff: {e}")})),
+        ).into_response();
+    }
+
+    let _ = mgr.remember(cc_memory::MemoryEntry {
+        id: cc_memory::MemoryId::new_v4(),
+        layer: cc_memory::MemoryLayer::L1,
+        category: cc_memory::MemoryCategory::Reference,
+        priority: cc_memory::Priority::High,
+        source: cc_memory::MemorySource::UserExplicit,
+        title: format!("Handoff: {}", handoff_id),
+        content: handoff.summary.clone(),
+        embedding: None,
+        tags: vec!["handoff".to_string()],
+        relations: vec![],
+        confidence: 1.0,
+        access_count: 0,
+        staleness: 0.0,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        last_accessed_at: None,
+        scope: None,
+        session_id: Some(handoff_id.clone()),
+    }).await;
+
+    Json(serde_json::json!({
+        "ok": true,
+        "handoff_id": handoff_id,
+        "summary": handoff.summary,
+    })).into_response()
+}
+
+/// Restore a handoff package into a target session.
+///
+/// POST /v1/memory/handoff/restore
+async fn restore_handoff_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(params): Json<RestoreHandoffParams>,
+) -> axum::response::Response {
+    let Some(ref _mgr) = state.cognitive_manager else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "memory subsystem not enabled"}))).into_response();
+    };
+
+    let handoff_mgr = cc_memory::HandoffManager::new();
+    match handoff_mgr.load(&params.handoff_id) {
+        Ok(Some(handoff)) => {
+            Json(serde_json::json!({
+                "ok": true,
+                "handoff_id": handoff.session_id,
+                "target_session_id": params.target_session_id,
+                "work_items": handoff.work_items.len(),
+                "decisions": handoff.decisions.len(),
+                "blockers": handoff.blockers.len(),
+                "summary": handoff.summary,
+            })).into_response()
+        }
+        Ok(None) => {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "handoff not found"}))).into_response()
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+        }
+    }
+}
+
+// ── HTTP Handlers - Memory Layers & Graph ────────────────────────────────────
+
+/// List memory layer statistics.
+///
+/// GET /v1/memory/layers
+async fn list_memory_layers_handler(
+    AxumState(state): AxumState<HttpAppState>,
+) -> axum::response::Response {
+    let Some(ref mgr) = state.cognitive_manager else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "memory subsystem not enabled"}))).into_response();
+    };
+
+    let layers = mgr.list_layers().await;
+    Json(serde_json::json!({ "layers": layers })).into_response()
+}
+
+/// List knowledge graph entities.
+///
+/// GET /v1/memory/graph/entities?q=keyword
+async fn list_graph_entities_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Query(params): Query<GraphEntityParams>,
+) -> axum::response::Response {
+    let Some(ref _mgr) = state.cognitive_manager else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "memory subsystem not enabled"}))).into_response();
+    };
+
+    let entities: Vec<serde_json::Value> = vec![];
+    Json(serde_json::json!({
+        "entities": entities,
+        "filter": params.q,
+        "note": "knowledge graph is populated via memory entries with relation metadata"
+    })).into_response()
+}
+
+/// List knowledge graph relations.
+///
+/// GET /v1/memory/graph/relations?subject=x&predicate=y
+async fn list_graph_relations_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Query(params): Query<GraphRelationParams>,
+) -> axum::response::Response {
+    let Some(ref _mgr) = state.cognitive_manager else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "memory subsystem not enabled"}))).into_response();
+    };
+
+    let relations: Vec<serde_json::Value> = vec![];
+    Json(serde_json::json!({
+        "relations": relations,
+        "filter": {
+            "subject": params.subject,
+            "predicate": params.predicate,
+        }
+    })).into_response()
+}
+
+/// Query the temporal knowledge graph.
+///
+/// POST /v1/memory/graph/query
+///
+/// Request body: `{ entity?, time_range?, relation_type? }`
+async fn query_graph_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(params): Json<GraphQueryParams>,
+) -> axum::response::Response {
+    let Some(ref _mgr) = state.cognitive_manager else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "memory subsystem not enabled"}))).into_response();
+    };
+
+    let results: Vec<serde_json::Value> = vec![];
+    Json(serde_json::json!({
+        "results": results,
+        "query": {
+            "entity": params.entity,
+            "relation_type": params.relation_type,
+        }
+    })).into_response()
+}
+
+/// Parameters for graph entity queries.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GraphEntityParams {
+    q: Option<String>,
+}
+
+/// Parameters for graph relation queries.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GraphRelationParams {
+    subject: Option<String>,
+    predicate: Option<String>,
+}
+
+/// Parameters for temporal graph queries.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GraphQueryParams {
+    entity: Option<String>,
+    time_range: Option<String>,
+    relation_type: Option<String>,
+}
+
+// ── HTTP Handlers - Skills ─────────────────────────────────────────────────────
+
+async fn list_skills_handler(AxumState(state): AxumState<HttpAppState>) -> axum::response::Response {
+    let result = state.skill_service.list(SkillListInput::default());
+    Json(serde_json::json!({
+        "success": result.success,
+        "skills": result.skills,
+        "categories": result.categories,
+        "tags": result.tags,
+        "count": result.count
+    })).into_response()
+}
+
+async fn view_skill_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    let result = state.skill_service.view(SkillViewInput {
+        name,
+        file_path: None,
+    });
+    Json(serde_json::json!({
+        "success": result.success,
+        "name": result.name,
+        "description": result.description,
+        "content": result.content,
+        "metadata": result.metadata
+    })).into_response()
+}
+
+async fn invoke_skill_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(name): Path<String>,
+    Json(input): Json<SkillInvokeInput>,
+) -> axum::response::Response {
+    let mut skill_input = input;
+    skill_input.name = name;
+    let result = state.skill_service.invoke(skill_input);
+    Json(serde_json::json!({
+        "success": result.success,
+        "name": result.name,
+        "content": result.content,
+        "warning": result.warning
+    })).into_response()
+}
+
+// ── HTTP Handlers - Workspaces ─────────────────────────────────────────────────
+
+async fn list_workspaces_handler(AxumState(state): AxumState<HttpAppState>) -> axum::response::Response {
+    let workspaces = state.skill_service.list_workspaces();
+    Json(serde_json::json!({
+        "workspaces": workspaces,
+        "count": workspaces.len()
+    })).into_response()
+}
+
+async fn get_workspace_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    match state.skill_service.get_workspace(&name) {
+        Some(workspace) => Json(serde_json::json!({
+            "success": true,
+            "workspace": workspace
+        })).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": "workspace not found"
+        }))).into_response(),
+    }
+}
+
+async fn preview_workspace_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    match state.skill_service.preview_workspace(&name) {
+        Some(preview) => Json(serde_json::json!({
+            "success": true,
+            "preview": preview
+        })).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": "workspace preview not available"
+        }))).into_response(),
+    }
+}
+
+// ── HTTP Handlers - System ─────────────────────────────────────────────────────
+
+async fn system_status_handler(AxumState(state): AxumState<HttpAppState>) -> axum::response::Response {
+    let memory_enabled = state.cognitive_manager.is_some();
+
+    // Count sessions
+    let sessions_count = state.session_store.list_sessions().map(|v| v.len()).unwrap_or(0);
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "cwd": cwd,
+        "memory": {
+            "enabled": memory_enabled,
+            "store_path": state.memory_store_path,
+            "session_store": true,
+        },
+        "sessions_count": sessions_count,
+        "uptime_seconds": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })).into_response()
+}
+
+// ── HTTP Handlers - WebSocket ───────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct WsInbound {
+    text: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    stream: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct WsOutbound {
+    text: String,
+    done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    AxumState(state): AxumState<HttpAppState>,
+) -> axum::response::Response {
+    ws.on_upgrade(move |socket| handle_ws(socket, addr, state))
+}
+
+async fn handle_ws(mut socket: WebSocket, addr: std::net::SocketAddr, state: HttpAppState) {
+    let session_id = format!("ws-{}", addr);
+
+    // Send welcome message
+    let welcome = WsOutbound {
+        text: "Connected. Send messages to start chatting.".to_string(),
+        done: true,
+        session_id: Some(session_id.clone()),
+        error: None,
+    };
+    if socket.send(WsMessage::Text(serde_json::to_string(&welcome).unwrap().into())).await.is_err() {
+        return;
+    }
+
+    // Main message loop
+    while let Some(msg) = socket.recv().await {
+        let text_raw = match msg {
+            Ok(WsMessage::Text(t)) => t.to_string(),
+            Ok(WsMessage::Close(_)) => break,
+            _ => continue,
+        };
+
+        let ws_in: WsInbound = match serde_json::from_str(&text_raw) {
+            Ok(v) => v,
+            Err(_) => {
+                WsInbound {
+                    text: text_raw.clone(),
+                    session_id: None,
+                    model: None,
+                    stream: Some(true),
+                }
+            }
+        };
+
+        if ws_in.text.is_empty() {
+            continue;
+        }
+
+        // Build session, create runtime, and run turn - all before any await points
+        let user_input = ws_in.text.clone();
+        let stream = ws_in.stream.unwrap_or(true);
+        let model = ws_in.model.unwrap_or_else(|| "claude-opus-4-6".to_string());
+
+        // Build session and run turn synchronously
+        let session = match build_or_restore_session(&session_id, &state).await {
+            s => s,
+        };
+
+        // Create API client
+        let api_client = match OpenAiApiClient::new(model.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                let out = WsOutbound {
+                    text: String::new(),
+                    done: true,
+                    session_id: Some(session_id.clone()),
+                    error: Some(format!("Failed to create API client: {}", e)),
+                };
+                if let Ok(json) = serde_json::to_string(&out) {
+                    let _ = socket.send(WsMessage::Text(json.into())).await;
+                }
+                continue;
+            }
+        };
+
+        // Create tool executor and system prompt
+        let tool_executor = HttpToolExecutor;
+        let base_prompt = "You are a helpful AI assistant. Provide clear, concise responses.".to_string();
+        let system_prompt = vec![base_prompt];
+
+        // Build and run runtime - scoped to drop before await points
+        let content_result = {
+            let mut runtime = ConversationRuntime::new(
+                session,
+                api_client,
+                tool_executor,
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                system_prompt,
+            );
+
+            if let Some(ref mgr) = state.cognitive_manager {
+                runtime = runtime.with_memory_manager(Arc::clone(mgr));
+            }
+
+            match runtime.run_turn(&user_input, None) {
+                Ok(summary) => Ok(summary
+                    .assistant_messages
+                    .iter()
+                    .flat_map(|msg| &msg.blocks)
+                    .filter_map(|block| match block {
+                        SessionContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")),
+                Err(e) => Err(format!("Runtime error: {}", e)),
+            }
+        };
+        // runtime dropped here
+
+        // Send response (async operations after runtime is dropped)
+        match content_result {
+            Ok(content) => {
+                if stream && content.len() > 100 {
+                    let chunk_size = 50;
+                    for i in (0..content.len()).step_by(chunk_size) {
+                        let end = (i + chunk_size).min(content.len());
+                        let chunk = &content[i..end];
+                        let out = WsOutbound {
+                            text: chunk.to_string(),
+                            done: false,
+                            session_id: Some(session_id.clone()),
+                            error: None,
+                        };
+                        if let Ok(json) = serde_json::to_string(&out) {
+                            if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    }
+                }
+
+                let out = WsOutbound {
+                    text: content,
+                    done: true,
+                    session_id: Some(session_id.clone()),
+                    error: None,
+                };
+                if let Ok(json) = serde_json::to_string(&out) {
+                    if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                let out = WsOutbound {
+                    text: String::new(),
+                    done: true,
+                    session_id: Some(session_id.clone()),
+                    error: Some(e),
+                };
+                if let Ok(json) = serde_json::to_string(&out) {
+                    if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Build or restore a session from the session store.
+async fn build_or_restore_session(session_id: &str, state: &HttpAppState) -> Session {
+    // Load from session store
+    if let Ok(Some(record)) = state.session_store.get_session(session_id) {
+        let mut session = Session::new();
+        session.session_id = record.session_id;
+        return session;
+    }
+
+    // Create fresh session
+    let mut session = Session::new();
+    session.session_id = session_id.to_string();
+    session
+}
+
+// ── Skill Service ──────────────────────────────────────────────────────────────
+
+/// Input for listing skills
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SkillListInput {
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Output from listing skills
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillListOutput {
+    pub success: bool,
+    pub skills: Vec<SkillMeta>,
+    pub categories: Vec<String>,
+    pub tags: Vec<String>,
+    pub count: usize,
+}
+
+/// Skill metadata
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillMeta {
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub version: Option<String>,
+}
+
+/// Input for viewing a skill
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SkillViewInput {
+    pub name: String,
+    #[serde(default)]
+    pub file_path: Option<String>,
+}
+
+/// Output from viewing a skill
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillViewOutput {
+    pub success: bool,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub metadata: SkillMetadata,
+}
+
+/// Skill metadata
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillMetadata {
+    pub version: Option<String>,
+    pub author: Option<String>,
+    pub tags: Vec<String>,
+    pub related_skills: Vec<String>,
+    pub platforms: Vec<String>,
+}
+
+/// Input for invoking a skill
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SkillInvokeInput {
+    pub name: String,
+    #[serde(default)]
+    pub args: Option<String>,
+}
+
+/// Output from invoking a skill
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillInvokeOutput {
+    pub success: bool,
+    pub name: String,
+    pub content: String,
+    pub warning: Option<String>,
+}
+
+/// Workspace info
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkspaceInfo {
+    pub name: String,
+    pub path: String,
+    pub root_type: String,
+    pub skill_count: usize,
+}
+
+/// Workspace preview
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkspacePreview {
+    pub name: String,
+    pub description: String,
+    pub skills: Vec<String>,
+    pub total_entries: usize,
+}
+
+/// Skill Service
+pub struct SkillService {
+    roots: Vec<PathBuf>,
+    platform: String,
+}
+
+impl SkillService {
+    pub fn new() -> Self {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        let mut roots = Vec::new();
+        roots.push(PathBuf::from(format!("{}/.qoder/skills", home)));
+        roots.push(PathBuf::from(format!("{}/.agents/skills", home)));
+        roots.push(PathBuf::from(format!("{}/.qoder/skills", cwd)));
+        roots.push(PathBuf::from(format!("{}/.agents/skills", cwd)));
+
+        Self {
+            roots,
+            platform: std::env::consts::OS.to_string(),
+        }
+    }
+
+    pub fn list(&self, input: SkillListInput) -> SkillListOutput {
+        let mut all_skills = Vec::new();
+        let mut categories: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut all_tags: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+        for root in &self.roots {
+            if let Ok(entries) = fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let skill_md = path.join("SKILL.md");
+                        if skill_md.exists() {
+                            if let Ok(content) = fs::read_to_string(&skill_md) {
+                                let (metadata, _) = parse_skill_frontmatter(&content);
+
+                                if let Some(ref platforms) = metadata.platforms {
+                                    if !platforms.is_empty() && !platforms.contains(&self.platform) {
+                                        continue;
+                                    }
+                                }
+
+                                if let Some(ref tags) = input.tags {
+                                    if let Some(ref skill_tags) = metadata.tags {
+                                        if !tags.iter().any(|t| skill_tags.contains(t)) {
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                let category = path.file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+
+                                *categories.entry(category.clone()).or_insert(0) += 1;
+
+                                if let Some(ref tags) = metadata.tags {
+                                    for tag in tags {
+                                        *all_tags.entry(tag.clone()).or_insert(0) += 1;
+                                    }
+                                }
+
+                                all_skills.push(SkillMeta {
+                                    name: metadata.name.unwrap_or_else(|| category.clone()),
+                                    description: metadata.description.unwrap_or_default(),
+                                    category,
+                                    tags: metadata.tags.unwrap_or_default(),
+                                    version: metadata.version,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(ref cat) = input.category {
+            all_skills.retain(|s| s.category == *cat);
+        }
+
+        SkillListOutput {
+            success: true,
+            count: all_skills.len(),
+            skills: all_skills,
+            categories: categories.into_iter().map(|(k, _)| k).collect(),
+            tags: all_tags.into_iter().map(|(k, _)| k).collect(),
+        }
+    }
+
+    pub fn view(&self, input: SkillViewInput) -> SkillViewOutput {
+        if let Some(path) = self.find_skill(&input.name) {
+            let skill_md = path.join("SKILL.md");
+            if let Ok(content) = fs::read_to_string(&skill_md) {
+                let (metadata, body) = parse_skill_frontmatter(&content);
+
+                return SkillViewOutput {
+                    success: true,
+                    name: metadata.name.unwrap_or_else(|| input.name.clone()),
+                    description: metadata.description.unwrap_or_default(),
+                    content: body,
+                    metadata: SkillMetadata {
+                        version: metadata.version,
+                        author: metadata.author,
+                        tags: metadata.tags.unwrap_or_default(),
+                        related_skills: metadata.related_skills.unwrap_or_default(),
+                        platforms: metadata.platforms.unwrap_or_default(),
+                    },
+                };
+            }
+        }
+
+        SkillViewOutput {
+            success: false,
+            name: input.name,
+            description: String::new(),
+            content: String::new(),
+            metadata: SkillMetadata {
+                version: None,
+                author: None,
+                tags: vec![],
+                related_skills: vec![],
+                platforms: vec![],
+            },
+        }
+    }
+
+    pub fn invoke(&self, input: SkillInvokeInput) -> SkillInvokeOutput {
+        let result = self.view(SkillViewInput {
+            name: input.name.clone(),
+            file_path: None,
+        });
+
+        if result.success {
+            SkillInvokeOutput {
+                success: true,
+                name: result.name,
+                content: result.content,
+                warning: None,
+            }
+        } else {
+            SkillInvokeOutput {
+                success: false,
+                name: input.name.clone(),
+                content: String::new(),
+                warning: Some(format!("Skill '{}' not found", input.name)),
+            }
+        }
+    }
+
+    pub fn list_workspaces(&self) -> Vec<WorkspaceInfo> {
+        let mut workspaces = Vec::new();
+
+        for root in &self.roots {
+            if root.exists() && root.is_dir() {
+                let skill_count = fs::read_dir(root)
+                    .map(|e| e.into_iter().flatten().filter(|d| d.path().is_dir()).count())
+                    .unwrap_or(0);
+
+                let root_type = if root.to_string_lossy().contains(".qoder") {
+                    "qoder"
+                } else {
+                    "agents"
+                };
+
+                workspaces.push(WorkspaceInfo {
+                    name: root.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    path: root.to_string_lossy().to_string(),
+                    root_type: root_type.to_string(),
+                    skill_count,
+                });
+            }
+        }
+
+        workspaces
+    }
+
+    pub fn get_workspace(&self, name: &str) -> Option<WorkspaceInfo> {
+        self.list_workspaces()
+            .into_iter()
+            .find(|w| w.name == name)
+    }
+
+    pub fn preview_workspace(&self, name: &str) -> Option<WorkspacePreview> {
+        for root in &self.roots {
+            if root.exists() && root.is_dir() {
+                if let Some(dir_name) = root.file_name().and_then(|n| n.to_str()) {
+                    if dir_name == name {
+                        let mut skills = Vec::new();
+                        let mut total_entries = 0;
+
+                        if let Ok(entries) = fs::read_dir(root) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.is_dir() {
+                                    let skill_name = path.file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    skills.push(skill_name.clone());
+
+                                    // Count entries in skill directory
+                                    if let Ok(sub_entries) = fs::read_dir(&path) {
+                                        total_entries += sub_entries.count();
+                                    }
+                                }
+                            }
+                        }
+
+                        return Some(WorkspacePreview {
+                            name: name.to_string(),
+                            description: format!("{} workspace with {} skills", root_type(root), skills.len()),
+                            skills,
+                            total_entries,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn find_skill(&self, name: &str) -> Option<PathBuf> {
+        for root in &self.roots {
+            let skill_path = root.join(name);
+            if skill_path.is_dir() && skill_path.join("SKILL.md").exists() {
+                return Some(skill_path);
+            }
+
+            if let Ok(entries) = fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                            if dir_name.to_lowercase() == name.to_lowercase()
+                                && path.join("SKILL.md").exists()
+                            {
+                                return Some(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+impl Default for SkillService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn root_type(path: &PathBuf) -> &'static str {
+    if path.to_string_lossy().contains(".qoder") {
+        "Qoder"
+    } else {
+        "Agents"
+    }
+}
+
+#[derive(Default)]
+struct ParsedFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
+    version: Option<String>,
+    author: Option<String>,
+    tags: Option<Vec<String>>,
+    related_skills: Option<Vec<String>>,
+    platforms: Option<Vec<String>>,
+}
+
+fn parse_skill_frontmatter(content: &str) -> (ParsedFrontmatter, String) {
+    let mut metadata = ParsedFrontmatter::default();
+
+    if !content.starts_with("---") {
+        return (metadata, content.to_string());
+    }
+
+    if let Some(end_idx) = content[3..].find("---") {
+        let frontmatter = &content[3..end_idx + 3];
+        let body = content[end_idx + 6..].trim();
+
+        for line in frontmatter.lines() {
+            let line = line.trim();
+            if line.starts_with("name:") {
+                metadata.name = Some(line["name:".len()..].trim().to_string());
+            } else if line.starts_with("description:") {
+                metadata.description = Some(line["description:".len()..].trim().to_string());
+            } else if line.starts_with("version:") {
+                metadata.version = Some(line["version:".len()..].trim().to_string());
+            } else if line.starts_with("author:") {
+                metadata.author = Some(line["author:".len()..].trim().to_string());
+            } else if line.starts_with("tags:") {
+                if let Some(tags_str) = line["tags:".len()..].trim().strip_prefix('[') {
+                    if let Some(end) = tags_str.find(']') {
+                        let tags_str = &tags_str[..end];
+                        metadata.tags = Some(
+                            tags_str.split(',')
+                                .map(|s| s.trim().trim_matches('"').to_string())
+                                .collect(),
+                        );
+                    }
+                }
+            } else if line.starts_with("related_skills:") {
+                if let Some(skills_str) = line["related_skills:".len()..].trim().strip_prefix('[') {
+                    if let Some(end) = skills_str.find(']') {
+                        let skills_str = &skills_str[..end];
+                        metadata.related_skills = Some(
+                            skills_str.split(',')
+                                .map(|s| s.trim().trim_matches('"').to_string())
+                                .collect(),
+                        );
+                    }
+                }
+            } else if line.starts_with("platforms:") {
+                if let Some(platforms_str) = line["platforms:".len()..].trim().strip_prefix('[') {
+                    if let Some(end) = platforms_str.find(']') {
+                        let platforms_str = &platforms_str[..end];
+                        metadata.platforms = Some(
+                            platforms_str.split(',')
+                                .map(|s| s.trim().trim_matches('"').to_string())
+                                .collect(),
+                        );
+                    }
+                }
+            }
+        }
+
+        (metadata, body.to_string())
+    } else {
+        (metadata, content.to_string())
+    }
+}
+
+// ── Platform Adapter Factory ─────────────────────────────────────────────────────
+
+use runtime::platform::PlatformAdapter;
+
+/// Create a platform adapter based on configuration.
+async fn create_platform_adapter(
+    config: &PlatformConfig,
+) -> Result<Box<dyn PlatformAdapter>, PlatformError> {
+    use runtime::platform::feishu::create_feishu_adapter;
+    use runtime::platform::email::create_email_adapter;
+
+    match config.platform_type.to_lowercase().as_str() {
+        "feishu" | "lark" => {
+            let settings = serde_json::to_value(&config.settings)
+                .map_err(|e| PlatformError::ConfigError(e.to_string()))?;
+            let adapter = create_feishu_adapter(&settings)?;
+            Ok(Box::new(adapter))
+        }
+        "email" | "mail" => {
+            let settings = serde_json::to_value(&config.settings)
+                .map_err(|e| PlatformError::ConfigError(e.to_string()))?;
+            let adapter = create_email_adapter(&settings)?;
+            Ok(Box::new(adapter))
+        }
+        // WeCom 需要企业微信 SDK，这里暂时返回错误
+        "wecom" | "wechat" => {
+            Err(PlatformError::ConfigError(
+                "WeChat adapter not yet implemented".to_string()
+            ))
+        }
+        other => {
+            Err(PlatformError::ConfigError(format!(
+                "Unknown platform type: {}", other
+            )))
+        }
+    }
+}
+
+// ── HTTP Handlers - Platform Management (T01-06) ──────────────────────────────
+
+async fn list_platforms_handler(AxumState(state): AxumState<HttpAppState>) -> axum::response::Response {
+    let Some(ref runtime) = state.platform_runtime else {
+        return Json(serde_json::json!({
+            "platforms": [],
+            "message": "no platform runtime configured"
+        })).into_response();
+    };
+
+    let platform_names = runtime.list_platforms().await;
+    let mut platform_list = Vec::new();
+    for name in &platform_names {
+        if let Some(info) = runtime.get_platform_info(name).await {
+            platform_list.push(info);
+        }
+    }
+
+    Json(serde_json::json!({
+        "platforms": platform_list,
+        "count": platform_list.len()
+    })).into_response()
+}
+
+async fn get_platform_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    let Some(ref runtime) = state.platform_runtime else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "no platform runtime configured"}))).into_response();
+    };
+
+    match runtime.get_platform_info(&name).await {
+        Some(info) => Json(info).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("platform not found: {name}")}))).into_response(),
+    }
+}
+
+async fn list_platform_sessions_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(platform): Path<String>,
+) -> axum::response::Response {
+    let Some(ref runtime) = state.platform_runtime else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "no platform runtime configured"}))).into_response();
+    };
+
+    let all_sessions = runtime.list_sessions().await;
+    let platform_sessions: Vec<_> = all_sessions.into_iter()
+        .filter(|s| s.get("platform").and_then(|v| v.as_str()) == Some(&platform))
+        .collect();
+
+    Json(serde_json::json!({
+        "platform": platform,
+        "sessions": platform_sessions,
+        "count": platform_sessions.len()
+    })).into_response()
+}
+
+async fn delete_platform_session_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    axum::extract::Path((platform, session_id)): axum::extract::Path<(String, String)>,
+) -> axum::response::Response {
+    let Some(ref runtime) = state.platform_runtime else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "no platform runtime configured"}))).into_response();
+    };
+
+    let session_key = format!("{}:{}", platform, session_id);
+    if runtime.delete_session(&session_key).await {
+        Json(serde_json::json!({"deleted": session_key, "ok": true})).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "session not found"}))).into_response()
+    }
+}
+

@@ -1,0 +1,285 @@
+//! Platform runtime for managing multiple platform adapters.
+
+use crate::platform::adapter::{InboundMessage, OutboundMessage, Platform, PlatformAdapter, PlatformError};
+use crate::platform::config::{PlatformRuntimeConfig, RetryConfig, SessionResetPolicy};
+use crate::platform::types::{PlatformSession, SessionKey};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, error, info, warn};
+
+/// Handle to a running adapter loop, allowing responses to be sent back.
+struct AdapterHandle {
+    /// Channel for sending outbound messages to this adapter's loop.
+    outbound_tx: mpsc::Sender<OutboundMessage>,
+}
+
+/// Platform runtime that manages all registered adapters.
+pub struct PlatformRuntime {
+    /// Configuration.
+    config: PlatformRuntimeConfig,
+    /// Active adapters keyed by platform name (held until start() is called).
+    adapters: RwLock<HashMap<String, Box<dyn PlatformAdapter>>>,
+    /// Active sessions keyed by session key.
+    sessions: RwLock<HashMap<SessionKey, PlatformSession>>,
+    /// Channel for receiving inbound messages.
+    message_rx: RwLock<Option<mpsc::Receiver<InboundMessage>>>,
+    /// Shutdown signal.
+    shutdown_tx: RwLock<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Handles to running adapter loops for sending responses.
+    adapter_handles: RwLock<HashMap<String, AdapterHandle>>,
+}
+
+impl PlatformRuntime {
+    /// Create a new platform runtime.
+    pub fn new(config: PlatformRuntimeConfig) -> Self {
+        Self {
+            config,
+            adapters: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            message_rx: RwLock::new(None),
+            shutdown_tx: RwLock::new(None),
+            adapter_handles: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register a platform adapter.
+    pub async fn register_adapter(&self, adapter: Box<dyn PlatformAdapter>) -> Result<(), PlatformError> {
+        let platform_name = adapter.platform_name().to_string();
+        let mut adapters = self.adapters.write().await;
+        adapters.insert(platform_name, adapter);
+        Ok(())
+    }
+
+    /// List all registered platform adapter names.
+    pub async fn list_platforms(&self) -> Vec<String> {
+        let adapters = self.adapters.read().await;
+        adapters.keys().cloned().collect()
+    }
+
+    /// Get platform info by name.
+    pub async fn get_platform_info(&self, name: &str) -> Option<serde_json::Value> {
+        let adapters = self.adapters.read().await;
+        let adapter = adapters.get(name)?;
+        Some(serde_json::json!({
+            "name": adapter.platform_name(),
+            "platform": format!("{:?}", adapter.platform()),
+        }))
+    }
+
+    /// List active sessions.
+    pub async fn list_sessions(&self) -> Vec<serde_json::Value> {
+        let sessions = self.sessions.read().await;
+        sessions.values().map(|s| {
+            serde_json::json!({
+                "session_key": s.key.as_str(),
+                "platform": &s.key.platform,
+                "user_id": &s.key.user_id,
+                "thread_id": &s.key.thread_id,
+                "created_at": s.created_at.to_rfc3339(),
+                "last_activity": s.last_activity.to_rfc3339(),
+            })
+        }).collect()
+    }
+
+    /// Get session count for a specific platform.
+    pub async fn platform_session_count(&self, platform: &str) -> usize {
+        let sessions = self.sessions.read().await;
+        sessions.values().filter(|s| s.key.platform == platform).count()
+    }
+
+    /// Delete a session.
+    pub async fn delete_session(&self, session_key: &str) -> bool {
+        let mut sessions = self.sessions.write().await;
+        // Try to parse as SessionKey
+        sessions.remove(&SessionKey::from(session_key)).is_some()
+    }
+
+    /// Start the platform runtime.
+    ///
+    /// This connects all registered adapters and starts the receive loop.
+    /// After start, adapters are moved into spawned tasks; use `send_response`
+    /// to reply through the adapter's outbound channel.
+    pub async fn start(&self) -> Result<(), PlatformError> {
+        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(self.config.channel_capacity);
+        *self.message_rx.write().await = Some(inbound_rx);
+
+        // Connect all adapters
+        let mut adapters = self.adapters.write().await;
+        for (name, adapter) in adapters.iter_mut() {
+            info!(platform = %name, "connecting platform adapter");
+            if let Err(e) = adapter.connect().await {
+                error!(platform = %name, error = %e, "failed to connect platform adapter");
+                return Err(e);
+            }
+            debug!(platform = %name, "platform adapter connected");
+        }
+
+        // Take adapters out and spawn a loop task for each one.
+        let adapter_entries: Vec<(String, Box<dyn PlatformAdapter>)> = adapters.drain().collect();
+        drop(adapters); // release the write lock
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
+        for (platform_name, adapter) in adapter_entries {
+            let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(self.config.channel_capacity);
+            self.adapter_handles.write().await.insert(
+                platform_name.clone(),
+                AdapterHandle { outbound_tx: outbound_tx.clone() },
+            );
+
+            let inbound_tx_clone = inbound_tx.clone();
+            let shutdown_rx = shutdown_tx.subscribe();
+            let retry_config = self.config.retry.clone();
+
+            tokio::spawn(async move {
+                run_adapter_loop(platform_name, adapter, inbound_tx_clone, outbound_rx, shutdown_rx, retry_config).await;
+            });
+        }
+
+        info!("platform runtime started");
+        Ok(())
+    }
+
+    /// Get the next inbound message.
+    ///
+    /// Returns `None` if the channel is closed.
+    pub async fn next_message(&self) -> Result<Option<InboundMessage>, PlatformError> {
+        let mut rx = self.message_rx.write().await;
+        if let Some(rx) = rx.as_mut() {
+            Ok(rx.recv().await)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Send a response to a platform via its outbound channel.
+    pub async fn send_response(&self, platform_name: &str, msg: OutboundMessage) -> Result<(), PlatformError> {
+        let handles = self.adapter_handles.read().await;
+        let handle = handles
+            .get(platform_name)
+            .ok_or_else(|| PlatformError::Unknown(format!("no adapter handle for platform: {platform_name}")))?;
+
+        handle.outbound_tx.send(msg).await
+            .map_err(|e| PlatformError::SendFailed(format!("outbound channel closed: {e}")))
+    }
+
+    /// Get or create a session.
+    pub async fn get_session(&self, key: SessionKey) -> Arc<RwLock<crate::platform::types::PlatformSession>> {
+        let mut sessions = self.sessions.write().await;
+        if !sessions.contains_key(&key) {
+            sessions.insert(key.clone(), crate::platform::types::PlatformSession::new(key.clone()));
+        }
+        Arc::new(RwLock::new(sessions.get(&key).unwrap().clone()))
+    }
+
+    /// Check if a session exists.
+    pub async fn has_session(&self, key: &SessionKey) -> bool {
+        let sessions = self.sessions.read().await;
+        sessions.contains_key(key)
+    }
+
+    /// Remove expired sessions based on the reset policy.
+    pub async fn cleanup_sessions(&self) {
+        let policy = self.config.session_reset;
+        if matches!(policy, SessionResetPolicy::None) {
+            return;
+        }
+
+        let mut sessions = self.sessions.write().await;
+        let now = chrono::Utc::now();
+        let idle_duration = chrono::Duration::minutes(30);
+
+        sessions.retain(|_key, session| {
+            match policy {
+                SessionResetPolicy::Daily => {
+                    session.created_at.date_naive() == now.date_naive()
+                }
+                SessionResetPolicy::Idle => {
+                    (now - session.last_activity) < idle_duration
+                }
+                SessionResetPolicy::Both => {
+                    session.created_at.date_naive() == now.date_naive()
+                        && (now - session.last_activity) < idle_duration
+                }
+                SessionResetPolicy::None => true,
+            }
+        });
+    }
+
+    /// Shutdown the platform runtime gracefully.
+    pub async fn shutdown(&self) -> Result<(), PlatformError> {
+        info!("shutting down platform runtime");
+
+        // Signal shutdown
+        if let Some(tx) = self.shutdown_tx.write().await.take() {
+            let _ = tx.send(());
+        }
+
+        // Clear adapter handles (this will cause the outbound channels to close,
+        // which signals the adapter loops to finish their current work).
+        self.adapter_handles.write().await.clear();
+
+        info!("platform runtime shutdown complete");
+        Ok(())
+    }
+}
+
+/// Run the receive+send loop for a single adapter.
+///
+/// The adapter owns both receive and send. Inbound messages are forwarded
+/// through `inbound_tx`; outbound messages arrive via `outbound_rx`.
+async fn run_adapter_loop(
+    platform_name: String,
+    mut adapter: Box<dyn PlatformAdapter>,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    mut outbound_rx: mpsc::Receiver<OutboundMessage>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    retry_config: RetryConfig,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!(platform = %platform_name, "shutdown received");
+                break;
+            }
+            result = adapter.receive() => {
+                match result {
+                    Ok(Some(msg)) => {
+                        if inbound_tx.send(msg).await.is_err() {
+                            warn!(platform = %platform_name, "inbound receiver dropped, stopping");
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                    Err(e) => {
+                        warn!(platform = %platform_name, error = %e, "receive error, retrying");
+                        let mut retry_count = 0;
+                        while retry_count < retry_config.max_retries {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                retry_config.initial_delay_ms * (2_u64.pow(retry_count as u32))
+                            )).await;
+                            match adapter.receive().await {
+                                Ok(Some(_)) | Err(_) => break,
+                                Ok(None) => retry_count += 1,
+                            }
+                        }
+                    }
+                }
+            }
+            Some(out_msg) = outbound_rx.recv() => {
+                if let Err(e) = adapter.send(&out_msg).await {
+                    warn!(platform = %platform_name, error = %e, "failed to send outbound message");
+                }
+            }
+        }
+    }
+
+    // Disconnect adapter on exit
+    if let Err(e) = adapter.disconnect().await {
+        warn!(platform = %platform_name, error = %e, "error disconnecting adapter on loop exit");
+    }
+    info!(platform = %platform_name, "adapter loop exited");
+}

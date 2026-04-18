@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cc — AI 助手</title>
+<script>(function(){var t=localStorage.getItem('cc-theme');if(t)document.documentElement.dataset.theme=t;})()</script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="layout">
+  <!-- 左侧面板：会话列表 -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">
+        <svg width="28" height="28" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="32" height="32" rx="8" fill="url(#cc-grad)"/>
+          <path d="M10 16a6 6 0 1 1 12 0" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+          <circle cx="16" cy="22" r="3" fill="#fff"/>
+          <defs>
+            <linearGradient id="cc-grad" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#00d2ff"/>
+              <stop offset="100%" stop-color="#0052cc"/>
+            </linearGradient>
+          </defs>
+        </svg>
+      </div>
+      <div>
+        <h1 class="app-name">cc</h1>
+        <div class="app-tagline">AI 助手</div>
+      </div>
+    </div>
+
+    <div class="sidebar-toolbar">
+      <button class="new-chat-btn" id="btnNewChat" onclick="newSession()" title="新建会话 (Ctrl+K)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        新建会话
+      </button>
+    </div>
+
+    <div class="session-search-wrap">
+      <svg class="search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+      <input id="sessionSearch" class="session-search" placeholder="搜索会话…" oninput="filterSessions(this.value)">
+    </div>
+
+    <div class="session-list" id="sessionList">
+      <div class="sessions-loading" id="sessionsLoading">加载中…</div>
+    </div>
+
+    <div class="sidebar-bottom">
+      <div class="model-section">
+        <div class="field-label">模型</div>
+        <select id="modelSelect" onchange="onModelChange(this.value)">
+          <optgroup label="Anthropic">
+            <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet</option>
+            <option value="claude-3-5-haiku-20241022">Claude 3.5 Haiku</option>
+            <option value="claude-3-opus-20240229">Claude 3 Opus</option>
+          </optgroup>
+          <optgroup label="OpenAI">
+            <option value="gpt-4o">GPT-4o</option>
+            <option value="gpt-4o-mini">GPT-4o Mini</option>
+          </optgroup>
+          <optgroup label="其他">
+            <option value="deepseek-chat">DeepSeek Chat</option>
+            <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+          </optgroup>
+        </select>
+      </div>
+      <div class="sidebar-actions">
+        <button class="sm-btn" onclick="toggleSettings()" title="设置">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          设置
+        </button>
+        <button class="sm-btn" onclick="toggleRightPanel()" title="右侧面板">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="15" y1="3" x2="15" y2="21"/></svg>
+          面板
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 中间：聊天区 -->
+  <main class="main">
+    <div class="topbar">
+      <button class="hamburger" id="btnHamburger" onclick="toggleMobileSidebar()">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <div class="topbar-info">
+        <div class="topbar-title" id="topbarTitle">cc — AI 助手</div>
+        <div class="topbar-meta" id="topbarMeta">开始新会话</div>
+      </div>
+      <div class="topbar-actions">
+        <!-- 顶栏模型选择器 -->
+        <div class="topbar-model-wrap" id="topbarModelWrap">
+          <select class="topbar-model-select" id="topbarModelSelect" onchange="onModelChange(this.value)" title="切换模型">
+            <optgroup label="Anthropic">
+              <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet</option>
+            </optgroup>
+          </select>
+        </div>
+        <span class="model-chip" id="modelChip">Claude 3.5 Sonnet</span>
+        <button class="chip-btn" id="btnDeleteSession" onclick="deleteCurrentSession()" title="删除会话" style="display:none">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+        </button>
+        <button class="chip-btn" onclick="toggleSettings()" title="设置">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="empty-state" id="emptyState">
+        <div class="empty-logo">
+          <svg width="72" height="72" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect width="64" height="64" rx="16" fill="url(#eg-grad)"/>
+            <path d="M20 32a12 12 0 1 1 24 0" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+            <circle cx="32" cy="44" r="5" fill="#fff"/>
+            <circle cx="22" cy="30" r="2.5" fill="rgba(255,255,255,0.5)"/>
+            <circle cx="42" cy="30" r="2.5" fill="rgba(255,255,255,0.5)"/>
+            <defs>
+              <linearGradient id="eg-grad" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#00d2ff"/>
+                <stop offset="100%" stop-color="#0052cc"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <h2>有什么我可以帮助的？</h2>
+        <p>随时提问 — 代码、分析、写作或各种问题。</p>
+        <div class="suggestion-grid">
+          <button class="suggestion" onclick="usesuggestion(this)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+            写一个 Python 函数
+          </button>
+          <button class="suggestion" onclick="usesuggestion(this)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+            解释这段代码
+          </button>
+          <button class="suggestion" onclick="usesuggestion(this)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            调试我的代码
+          </button>
+          <button class="suggestion" onclick="usesuggestion(this)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+            设计系统架构
+          </button>
+        </div>
+      </div>
+      <div class="messages-inner" id="msgInner"></div>
+    </div>
+
+    <!-- 活动状态栏 -->
+    <div class="activity-bar" id="activityBar" style="display:none">
+      <div class="activity-inner">
+        <span class="activity-icon">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/></svg>
+        </span>
+        <span class="activity-text" id="activityText">思考中…</span>
+        <span class="activity-dots">
+          <span></span><span></span><span></span>
+        </span>
+        <button class="cancel-btn" id="btnCancel" onclick="cancelCurrentStream()">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+          取消
+        </button>
+      </div>
+    </div>
+
+    <!-- 输入框（带命令自动完成） -->
+    <div class="composer-wrap">
+      <!-- 命令自动完成下拉 -->
+      <div class="cmd-dropdown" id="cmdDropdown"></div>
+
+      <div class="composer-box" id="composerBox">
+        <textarea id="msg" rows="1" placeholder="发消息给 cc… (/ 触发命令)"></textarea>
+        <div class="composer-footer">
+          <div class="composer-left">
+            <!-- 参数快捷控制 -->
+            <button class="composer-param-btn" id="btnParams" onclick="toggleParamPanel()" title="参数设置">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="20" y2="12"/><line x1="12" y1="18" x2="20" y2="18"/></svg>
+              参数
+            </button>
+          </div>
+          <div class="composer-right">
+            <button class="send-btn" id="btnSend" onclick="handleSend()" title="发送 (Enter)">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 参数快捷面板 -->
+      <div class="param-panel" id="paramPanel" style="display:none">
+        <div class="param-row">
+          <label class="param-label">Temperature <span class="param-val" id="tempVal">0.7</span></label>
+          <input type="range" class="param-slider" id="paramTemp" min="0" max="2" step="0.1" value="0.7"
+            oninput="document.getElementById('tempVal').textContent=this.value">
+        </div>
+        <div class="param-row">
+          <label class="param-label">Max Tokens</label>
+          <input type="number" class="param-number" id="paramMaxTokens" min="1" max="32000" value="4096" placeholder="4096">
+        </div>
+        <div class="param-row">
+          <label class="param-label">Top P <span class="param-val" id="topPVal">0.9</span></label>
+          <input type="range" class="param-slider" id="paramTopP" min="0" max="1" step="0.05" value="0.9"
+            oninput="document.getElementById('topPVal').textContent=this.value">
+        </div>
+      </div>
+
+      <div class="composer-hint">按 <kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行 · <kbd>/</kbd> 命令</div>
+    </div>
+  </main>
+
+  <!-- 右侧面板（可折叠，带 Tab 切换） -->
+  <aside class="right-panel" id="rightPanel">
+    <div class="tab-bar" id="tabBar">
+      <button class="tab-btn active" data-tab="files" onclick="switchRightTab('files')" title="文件浏览">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        文件
+      </button>
+      <button class="tab-btn" data-tab="skills" onclick="switchRightTab('skills')" title="技能">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+        技能
+      </button>
+      <button class="tab-btn" data-tab="memory" onclick="switchRightTab('memory')" title="记忆">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a7 7 0 0 1 7 7c0 2.5-1.3 4.7-3.2 6H8.2C6.3 13.7 5 11.5 5 9a7 7 0 0 1 7-7z"/><line x1="9" y1="17" x2="15" y2="17"/><line x1="10" y1="20" x2="14" y2="20"/></svg>
+        记忆
+      </button>
+      <button class="tab-btn" data-tab="settings" onclick="switchRightTab('settings')" title="设置">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        设置
+      </button>
+      <button class="panel-icon-btn tab-close-btn" onclick="toggleRightPanel()" title="关闭面板">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+
+    <!-- 文件浏览 Tab -->
+    <div class="tab-content active" id="tabFiles">
+      <div class="file-tree-header">
+        <span class="file-tree-path" id="fileTreePath">~/</span>
+        <div class="file-tree-actions">
+          <button class="panel-icon-btn" onclick="loadFileTree()" title="刷新">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          </button>
+          <button class="panel-icon-btn" id="btnNavUp" onclick="navigateUp()" style="display:none" title="返回上级">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="file-tree" id="fileTree">
+        <div style="padding:12px;color:var(--muted);font-size:12px">加载文件树…</div>
+      </div>
+      <div class="file-preview" id="filePreview" style="display:none">
+        <div class="file-preview-header">
+          <span class="file-preview-name" id="filePreviewName"></span>
+          <button class="panel-icon-btn" onclick="closeFilePreview()" title="关闭预览">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <pre class="file-preview-code" id="filePreviewCode"></pre>
+      </div>
+    </div>
+
+    <!-- 技能 Tab -->
+    <div class="tab-content" id="tabSkills">
+      <div class="tab-section-header">
+        <span>已安装技能</span>
+        <span class="skill-count" id="skillCount">0</span>
+      </div>
+      <div class="skill-list" id="skillList">
+        <div style="padding:12px;color:var(--muted);font-size:12px">加载技能中…</div>
+      </div>
+    </div>
+
+    <!-- 记忆 Tab -->
+    <div class="tab-content" id="tabMemory">
+      <div class="tab-section-header">
+        <span>记忆系统状态</span>
+        <button class="sm-btn" onclick="refreshMemoryStatus()" title="刷新">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        </button>
+      </div>
+      <div class="memory-status" id="memoryStatus">
+        <div style="padding:12px;color:var(--muted);font-size:12px">加载记忆状态…</div>
+      </div>
+    </div>
+
+    <!-- 设置 Tab -->
+    <div class="tab-content" id="tabSettings">
+      <div class="tab-section-header">
+        <span>参数设置</span>
+      </div>
+      <div class="right-settings-body">
+        <div class="settings-field">
+          <label>模型</label>
+          <select id="rightPanelModel" onchange="onModelChange(this.value)" style="width:100%"></select>
+        </div>
+        <div class="settings-field">
+          <label>Temperature <span class="param-val" id="settingsTempVal">0.7</span></label>
+          <input type="range" class="param-slider" id="settingsTemp" min="0" max="2" step="0.1" value="0.7"
+            oninput="document.getElementById('settingsTempVal').textContent=this.value">
+        </div>
+        <div class="settings-field">
+          <label>Max Tokens</label>
+          <input type="number" class="settings-input" id="settingsMaxTokens" min="1" max="32000" value="4096" placeholder="4096">
+        </div>
+        <div class="settings-field">
+          <label>Top P <span class="param-val" id="settingsTopPVal">0.9</span></label>
+          <input type="range" class="param-slider" id="settingsTopP" min="0" max="1" step="0.05" value="0.9"
+            oninput="document.getElementById('settingsTopPVal').textContent=this.value">
+        </div>
+        <div class="settings-field">
+          <label>系统提示词</label>
+          <textarea class="settings-textarea" id="settingsSystemPrompt" rows="4" placeholder="输入系统提示词…"></textarea>
+        </div>
+        <div class="settings-field">
+          <label>主题</label>
+          <select id="settingsTheme" onchange="applyTheme(this.value)" style="width:100%">
+            <option value="dark">深色（默认）</option>
+            <option value="light">浅色</option>
+            <option value="oled">OLED 黑色</option>
+          </select>
+        </div>
+        <div class="settings-field">
+          <label>发送快捷键</label>
+          <select id="settingsSendKey" style="width:100%">
+            <option value="enter">Enter（Shift+Enter 换行）</option>
+            <option value="ctrl+enter">Ctrl+Enter（Enter 换行）</option>
+          </select>
+        </div>
+        <div class="settings-field">
+          <label>网关地址</label>
+          <input type="text" class="settings-input" id="settingsGatewayUrl" placeholder="http://127.0.0.1:8642/v1/chat/completions">
+          <div class="settings-hint">重启服务器后生效</div>
+        </div>
+        <button class="save-settings-btn" onclick="saveRightPanelSettings()">保存设置</button>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<!-- 设置浮层（保留兼容） -->
+<div class="overlay" id="settingsOverlay" style="display:none" onclick="if(event.target===this)toggleSettings()">
+  <div class="settings-panel">
+    <div class="settings-header">
+      <h3>设置</h3>
+      <button class="panel-icon-btn" onclick="toggleSettings()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="settings-body">
+      <div class="settings-field">
+        <label>默认模型</label>
+        <select id="settingsModel" style="width:100%;padding:8px;background:var(--input-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px"></select>
+      </div>
+      <div class="settings-field">
+        <label>主题</label>
+        <select id="overlaySettingsTheme" onchange="applyTheme(this.value)">
+          <option value="dark">深色（默认）</option>
+          <option value="light">浅色</option>
+          <option value="oled">OLED 黑色</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>发送快捷键</label>
+        <select id="overlaySettingsSendKey">
+          <option value="enter">Enter（Shift+Enter 换行）</option>
+          <option value="ctrl+enter">Ctrl+Enter（Enter 换行）</option>
+        </select>
+      </div>
+      <div class="settings-field">
+        <label>网关地址</label>
+        <input type="text" id="settingsGatewayUrlOverlay" placeholder="http://127.0.0.1:8642/v1/chat/completions"
+          style="width:100%;padding:8px;background:var(--input-bg);color:var(--text);border:1px solid var(--border2);border-radius:6px;font-size:12px">
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">重启服务器后生效。</div>
+      </div>
+      <button class="sm-btn" onclick="saveSettings()" style="margin-top:12px;width:100%;padding:9px;font-weight:600">保存设置</button>
+    </div>
+  </div>
+</div>
+
+<!-- 移动端遮罩 -->
+<div class="mobile-overlay" id="mobileOverlay" onclick="closeMobileSidebar()"></div>
+<div class="toast" id="toast"></div>
+
+<script src="/static/ui.js"></script>
+<script src="/static/sessions.js"></script>
+<script src="/static/messages.js"></script>
+<script src="/static/boot.js"></script>
+</body>
+</html>

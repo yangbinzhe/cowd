@@ -1,0 +1,1195 @@
+//! SQLite-backed `MemoryStore` implementation.
+//!
+//! Uses `rusqlite` with the bundled `SQLite` library.  Full-text search is
+//! provided via `SQLite`'s built-in FTS5 extension.
+//!
+//! ## Thread-safety strategy
+//!
+//! `rusqlite::Connection` is not `Send`, so we cannot store it directly inside
+//! an `Arc<Mutex<…>>` and also be `Send + Sync` without `unsafe`.  Instead the
+//! store holds the **path** to the database file (or the special sentinel
+//! `":memory:"` for in-memory databases), and each blocking operation opens a
+//! fresh connection inside `tokio::task::spawn_blocking`.  With `PRAGMA
+//! journal_mode=WAL` `SQLite` handles concurrent readers/writers safely via
+//! file-level locking at the OS layer.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::path::Path;
+use uuid::Uuid;
+
+use crate::{
+    config::StoreConfig,
+    error::MemoryError,
+    store::{FtsSearchOptions, FtsSearchResult, MemoryStore, Result},
+    types::{
+        MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta, MemorySource, Priority,
+        Relation,
+    },
+};
+
+// ---------------------------------------------------------------------------
+// Sentinel path for in-memory databases
+// ---------------------------------------------------------------------------
+
+const IN_MEMORY_PATH: &str = ":memory:";
+
+// ---------------------------------------------------------------------------
+// Helper: open a connection and return a MemoryError on failure
+// ---------------------------------------------------------------------------
+
+fn open_conn(db_path: &str) -> Result<Connection> {
+    let conn = if db_path == IN_MEMORY_PATH {
+        Connection::open_in_memory()
+    } else {
+        Connection::open(db_path)
+    }
+    .map_err(sql_err)?;
+    // Enable WAL journal mode.
+    // PRAGMA journal_mode=WAL returns a result row ("wal"), so we must use
+    // query_row instead of execute_batch to avoid the "Execute returned
+    // results - did you mean to call query?" error from rusqlite.
+    conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+        .map_err(sql_err)?;
+    // Enable foreign-key constraints (no result returned).
+    conn.execute_batch("PRAGMA foreign_keys=ON;")
+        .map_err(sql_err)?;
+    Ok(conn)
+}
+
+fn sql_err(e: rusqlite::Error) -> MemoryError {
+    MemoryError::Store(e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Helper: enum ↔ integer / string conversions
+// ---------------------------------------------------------------------------
+
+fn layer_to_int(l: MemoryLayer) -> i32 {
+    match l {
+        MemoryLayer::L0 => 0,
+        MemoryLayer::L1 => 1,
+        MemoryLayer::L2 => 2,
+        MemoryLayer::L3 => 3,
+        MemoryLayer::L4 => 4,
+    }
+}
+
+fn int_to_layer(v: i32) -> std::result::Result<MemoryLayer, MemoryError> {
+    match v {
+        0 => Ok(MemoryLayer::L0),
+        1 => Ok(MemoryLayer::L1),
+        2 => Ok(MemoryLayer::L2),
+        3 => Ok(MemoryLayer::L3),
+        4 => Ok(MemoryLayer::L4),
+        _ => Err(MemoryError::Store(format!("unknown layer int: {v}"))),
+    }
+}
+
+fn category_to_str(c: MemoryCategory) -> &'static str {
+    match c {
+        MemoryCategory::UserPreference => "UserPreference",
+        MemoryCategory::ProjectConvention => "ProjectConvention",
+        MemoryCategory::Decision => "Decision",
+        MemoryCategory::Reference => "Reference",
+        MemoryCategory::Shared => "Shared",
+        MemoryCategory::CompressedSummary => "CompressedSummary",
+    }
+}
+
+fn str_to_category(s: &str) -> std::result::Result<MemoryCategory, MemoryError> {
+    match s {
+        "UserPreference" => Ok(MemoryCategory::UserPreference),
+        "ProjectConvention" => Ok(MemoryCategory::ProjectConvention),
+        "Decision" => Ok(MemoryCategory::Decision),
+        "Reference" => Ok(MemoryCategory::Reference),
+        "Shared" => Ok(MemoryCategory::Shared),
+        "CompressedSummary" => Ok(MemoryCategory::CompressedSummary),
+        _ => Err(MemoryError::Store(format!("unknown category: {s}"))),
+    }
+}
+
+fn priority_to_int(p: Priority) -> i32 {
+    match p {
+        Priority::Critical => 0,
+        Priority::High => 1,
+        Priority::Normal => 2,
+        Priority::Low => 3,
+    }
+}
+
+fn int_to_priority(v: i32) -> std::result::Result<Priority, MemoryError> {
+    match v {
+        0 => Ok(Priority::Critical),
+        1 => Ok(Priority::High),
+        2 => Ok(Priority::Normal),
+        3 => Ok(Priority::Low),
+        _ => Err(MemoryError::Store(format!("unknown priority int: {v}"))),
+    }
+}
+
+fn source_to_str(s: MemorySource) -> &'static str {
+    match s {
+        MemorySource::UserExplicit => "UserExplicit",
+        MemorySource::AutoExtracted => "AutoExtracted",
+        MemorySource::Compression => "Compression",
+        MemorySource::Import => "Import",
+    }
+}
+
+fn str_to_source(s: &str) -> std::result::Result<MemorySource, MemoryError> {
+    match s {
+        "UserExplicit" => Ok(MemorySource::UserExplicit),
+        "AutoExtracted" => Ok(MemorySource::AutoExtracted),
+        "Compression" => Ok(MemorySource::Compression),
+        "Import" => Ok(MemorySource::Import),
+        _ => Err(MemoryError::Store(format!("unknown source: {s}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row → MemoryEntry mapper
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct SqlConvError(String);
+
+impl std::fmt::Display for SqlConvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SqlConvError {}
+
+fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
+    let id_str: String = row.get(0)?;
+    let layer_int: i32 = row.get(1)?;
+    let category_str: String = row.get(2)?;
+    let priority_int: i32 = row.get(3)?;
+    let source_str: String = row.get(4)?;
+    let title: String = row.get(5)?;
+    let content: String = row.get(6)?;
+    let embedding_json: Option<String> = row.get(7)?;
+    let tags_json: String = row.get(8)?;
+    let relations_json: String = row.get(9)?;
+    let confidence: f32 = row.get(10)?;
+    let access_count: i64 = row.get(11)?;
+    let staleness: f32 = row.get(12)?;
+    let created_at_str: String = row.get(13)?;
+    let updated_at_str: String = row.get(14)?;
+    let last_accessed_str: Option<String> = row.get(15)?;
+    let scope: Option<String> = row.get(16)?;
+    let session_id: Option<String> = row.get(17)?;
+
+    let id = Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let layer = int_to_layer(layer_int).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Integer,
+            Box::new(SqlConvError(e.to_string())),
+        )
+    })?;
+    let category = str_to_category(&category_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(SqlConvError(e.to_string())),
+        )
+    })?;
+    let priority = int_to_priority(priority_int).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Integer,
+            Box::new(SqlConvError(e.to_string())),
+        )
+    })?;
+    let source = str_to_source(&source_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            Box::new(SqlConvError(e.to_string())),
+        )
+    })?;
+
+    let embedding: Option<Vec<f32>> = embedding_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok());
+    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+    let relations: Vec<Relation> = serde_json::from_str(&relations_json).unwrap_or_default();
+
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+    let last_accessed_at = last_accessed_str
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    Ok(MemoryEntry {
+        id,
+        layer,
+        category,
+        priority,
+        source,
+        title,
+        content,
+        embedding,
+        tags,
+        relations,
+        confidence,
+        access_count: access_count as u64,
+        staleness,
+        created_at,
+        updated_at,
+        last_accessed_at,
+        scope,
+        session_id,
+    })
+}
+
+fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryMeta> {
+    let id_str: String = row.get(0)?;
+    let layer_int: i32 = row.get(1)?;
+    let category_str: String = row.get(2)?;
+    let priority_int: i32 = row.get(3)?;
+    let title: String = row.get(4)?;
+    let tags_json: String = row.get(5)?;
+    let confidence: f32 = row.get(6)?;
+    let access_count: i64 = row.get(7)?;
+    let staleness: f32 = row.get(8)?;
+    let created_at_str: String = row.get(9)?;
+    let updated_at_str: String = row.get(10)?;
+    let scope: Option<String> = row.get(11)?;
+
+    let id = Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let layer = int_to_layer(layer_int).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Integer,
+            Box::new(SqlConvError(e.to_string())),
+        )
+    })?;
+    let category = str_to_category(&category_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(SqlConvError(e.to_string())),
+        )
+    })?;
+    let priority = int_to_priority(priority_int).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Integer,
+            Box::new(SqlConvError(e.to_string())),
+        )
+    })?;
+    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+
+    Ok(MemoryMeta {
+        id,
+        layer,
+        category,
+        priority,
+        title,
+        tags,
+        confidence,
+        access_count: access_count as u64,
+        staleness,
+        created_at,
+        updated_at,
+        scope,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Schema DDL
+// ---------------------------------------------------------------------------
+
+fn init_schema(conn: &Connection) -> Result<()> {
+    // Execute each DDL statement individually to avoid rusqlite's execute_batch
+    // returning "Execute returned results" errors when FTS5 virtual tables or
+    // triggers are involved in a multi-statement batch.
+    let statements: &[&str] = &[
+        r"CREATE TABLE IF NOT EXISTS memories (
+    id               TEXT    PRIMARY KEY,
+    layer            INTEGER NOT NULL,
+    category         TEXT    NOT NULL,
+    priority         INTEGER NOT NULL,
+    source           TEXT    NOT NULL,
+    title            TEXT    NOT NULL DEFAULT '',
+    content          TEXT    NOT NULL,
+    embedding_json   TEXT,
+    tags_json        TEXT    NOT NULL DEFAULT '[]',
+    relations_json   TEXT    NOT NULL DEFAULT '[]',
+    confidence       REAL    NOT NULL DEFAULT 1.0,
+    access_count     INTEGER NOT NULL DEFAULT 0,
+    staleness        REAL    NOT NULL DEFAULT 0.0,
+    created_at       TEXT    NOT NULL,
+    updated_at       TEXT    NOT NULL,
+    last_accessed_at TEXT,
+    scope            TEXT,
+    session_id       TEXT
+)",
+        r"CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    id      UNINDEXED,
+    title,
+    content,
+    tags,
+    content=memories,
+    content_rowid=rowid
+)",
+        r"CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, id, title, content, tags)
+        VALUES (new.rowid, new.id, new.title, new.content, new.tags_json);
+END",
+        r"CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, content, tags)
+        VALUES ('delete', old.rowid, old.id, old.title, old.content, old.tags_json);
+END",
+        r"CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, content, tags)
+        VALUES ('delete', old.rowid, old.id, old.title, old.content, old.tags_json);
+    INSERT INTO memories_fts(rowid, id, title, content, tags)
+        VALUES (new.rowid, new.id, new.title, new.content, new.tags_json);
+END",
+        r"CREATE TABLE IF NOT EXISTS memory_meta (
+    memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+    requires  TEXT,
+    provides  TEXT,
+    affects   TEXT
+)",
+        r"CREATE TABLE IF NOT EXISTS relations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_id  TEXT    NOT NULL,
+    predicate   TEXT    NOT NULL,
+    object_id   TEXT    NOT NULL,
+    valid_from  TEXT,
+    valid_to    TEXT,
+    created_at  TEXT    NOT NULL
+)",
+        r"CREATE TABLE IF NOT EXISTS entities (
+    id          TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    metadata    TEXT
+)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_layer    ON memories(layer)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_priority ON memories(priority)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_created  ON memories(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations(subject_id)",
+        "CREATE INDEX IF NOT EXISTS idx_relations_object  ON relations(object_id)",
+        "CREATE INDEX IF NOT EXISTS idx_entities_type     ON entities(entity_type)",
+    ];
+
+    for stmt in statements {
+        conn.execute_batch(stmt).map_err(sql_err)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SqliteStore definition
+// ---------------------------------------------------------------------------
+
+/// SQLite-backed persistent store.
+///
+/// The database path (or `":memory:"`) is stored and a fresh [`Connection`] is
+/// opened for each blocking operation inside `tokio::task::spawn_blocking`.
+/// `WAL` mode is enabled on every connection so `SQLite` handles concurrent
+/// access safely via file-level locking without requiring `unsafe` code.
+#[derive(Debug, Clone)]
+pub struct SqliteStore {
+    /// Filesystem path or `":memory:"`.
+    db_path: String,
+}
+
+impl SqliteStore {
+    /// Open (or create) the `SQLite` database at the path specified in `config`.
+    pub fn open(config: &StoreConfig) -> Result<Self> {
+        let db_path = config
+            .sqlite_path
+            .to_str()
+            .ok_or_else(|| MemoryError::Store("non-UTF-8 sqlite path".to_string()))?
+            .to_owned();
+        let store = Self { db_path };
+        // Verify we can open a connection and initialise the schema.
+        let conn = store.conn()?;
+        init_schema(&conn)?;
+        Ok(store)
+    }
+
+    /// Open a database at an arbitrary `path`.
+    pub fn open_path(path: &Path) -> Result<Self> {
+        let db_path = path
+            .to_str()
+            .ok_or_else(|| MemoryError::Store("non-UTF-8 sqlite path".to_string()))?
+            .to_owned();
+        let store = Self { db_path };
+        let conn = store.conn()?;
+        init_schema(&conn)?;
+        Ok(store)
+    }
+
+    /// Create an in-memory database (useful for testing).
+    ///
+    /// Note: because every call opens a new connection and `SQLite`
+    /// in-memory databases are connection-scoped, the in-memory store
+    /// cannot share state between calls.  Use a file-backed store for
+    /// production use.
+    pub fn open_in_memory() -> Result<Self> {
+        let store = Self {
+            db_path: IN_MEMORY_PATH.to_string(),
+        };
+        let conn = store.conn()?;
+        init_schema(&conn)?;
+        Ok(store)
+    }
+
+    /// Open a fresh connection (and WAL/FK pragmas).
+    fn conn(&self) -> Result<Connection> {
+        open_conn(&self.db_path)
+    }
+
+    // -----------------------------------------------------------------------
+    // Synchronous core operations (called inside spawn_blocking)
+    // -----------------------------------------------------------------------
+
+    fn do_insert(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
+        let tags_json = serde_json::to_string(&entry.tags)?;
+        let relations_json = serde_json::to_string(&entry.relations)?;
+        let embedding_json = entry
+            .embedding
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        conn.execute(
+            r"INSERT OR REPLACE INTO memories
+               (id, layer, category, priority, source, title, content,
+                embedding_json, tags_json, relations_json, confidence,
+                access_count, staleness, created_at, updated_at,
+                last_accessed_at, scope, session_id)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            params![
+                entry.id.to_string(),
+                layer_to_int(entry.layer),
+                category_to_str(entry.category),
+                priority_to_int(entry.priority),
+                source_to_str(entry.source),
+                entry.title,
+                entry.content,
+                embedding_json,
+                tags_json,
+                relations_json,
+                entry.confidence,
+                entry.access_count as i64,
+                entry.staleness,
+                entry.created_at.to_rfc3339(),
+                entry.updated_at.to_rfc3339(),
+                entry.last_accessed_at.map(|dt| dt.to_rfc3339()),
+                entry.scope.as_deref(),
+                entry.session_id.as_deref(),
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn do_get(conn: &Connection, id: &MemoryId) -> Result<Option<MemoryEntry>> {
+        let id_str = id.to_string();
+        let entry = conn
+            .query_row(
+                r"SELECT id, layer, category, priority, source, title, content,
+                          embedding_json, tags_json, relations_json, confidence,
+                          access_count, staleness, created_at, updated_at,
+                          last_accessed_at, scope, session_id
+                   FROM memories WHERE id = ?1",
+                params![id_str],
+                row_to_entry,
+            )
+            .optional()
+            .map_err(sql_err)?;
+
+        if entry.is_some() {
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE memories SET last_accessed_at = ?1, access_count = access_count + 1 WHERE id = ?2",
+                params![now, id_str],
+            )
+            .map_err(sql_err)?;
+        }
+        Ok(entry)
+    }
+
+    fn do_update(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
+        let tags_json = serde_json::to_string(&entry.tags)?;
+        let relations_json = serde_json::to_string(&entry.relations)?;
+        let embedding_json = entry
+            .embedding
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        conn.execute(
+            r"UPDATE memories SET
+               layer = ?2, category = ?3, priority = ?4, source = ?5,
+               title = ?6, content = ?7, embedding_json = ?8, tags_json = ?9,
+               relations_json = ?10, confidence = ?11, access_count = ?12,
+               staleness = ?13, updated_at = ?14, last_accessed_at = ?15,
+               scope = ?16, session_id = ?17
+               WHERE id = ?1",
+            params![
+                entry.id.to_string(),
+                layer_to_int(entry.layer),
+                category_to_str(entry.category),
+                priority_to_int(entry.priority),
+                source_to_str(entry.source),
+                entry.title,
+                entry.content,
+                embedding_json,
+                tags_json,
+                relations_json,
+                entry.confidence,
+                entry.access_count as i64,
+                entry.staleness,
+                entry.updated_at.to_rfc3339(),
+                entry.last_accessed_at.map(|dt| dt.to_rfc3339()),
+                entry.scope.as_deref(),
+                entry.session_id.as_deref(),
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn do_delete(conn: &Connection, id: &MemoryId) -> Result<()> {
+        conn.execute(
+            "DELETE FROM memories WHERE id = ?1",
+            params![id.to_string()],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn do_search_fts(conn: &Connection, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+        let sql = r"
+            SELECT m.id, m.layer, m.category, m.priority, m.source, m.title, m.content,
+                   m.embedding_json, m.tags_json, m.relations_json, m.confidence,
+                   m.access_count, m.staleness, m.created_at, m.updated_at,
+                   m.last_accessed_at, m.scope, m.session_id
+            FROM memories m
+            JOIN memories_fts fts ON m.id = fts.id
+            WHERE memories_fts MATCH ?1
+            ORDER BY rank
+            LIMIT ?2
+        ";
+        let mut stmt = conn.prepare(sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![query, limit as i64], row_to_entry)
+            .map_err(sql_err)?;
+        let mut entries = Vec::new();
+        for r in rows {
+            entries.push(r.map_err(sql_err)?);
+        }
+        Ok(entries)
+    }
+
+    /// Advanced FTS5 search with category/layer filtering and snippets.
+    fn do_search_fts_advanced(
+        conn: &Connection,
+        query: &str,
+        category: Option<&str>,
+        layer: Option<i32>,
+        limit: usize,
+        with_snippets: bool,
+    ) -> Result<(Vec<MemoryEntry>, Vec<Option<String>>, usize)> {
+        // Build dynamic WHERE clause
+        let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
+
+        if let Some(cat) = category {
+            conditions.push("m.category = ?".to_string());
+            params.push(Box::new(cat.to_string()));
+        }
+        if let Some(l) = layer {
+            conditions.push("m.layer = ?".to_string());
+            params.push(Box::new(l));
+        }
+
+        let where_clause = conditions.join(" AND ");
+        let sql = format!(
+            r"SELECT m.id, m.layer, m.category, m.priority, m.source, m.title, m.content,
+                      m.embedding_json, m.tags_json, m.relations_json, m.confidence,
+                      m.access_count, m.staleness, m.created_at, m.updated_at,
+                      m.last_accessed_at, m.scope, m.session_id
+               FROM memories m
+               JOIN memories_fts fts ON m.id = fts.id
+               WHERE {}
+               ORDER BY rank
+               LIMIT ?",
+            where_clause
+        );
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
+
+        let limit_param: Box<dyn rusqlite::ToSql> = Box::new(limit as i64);
+        let all_params: Vec<&dyn rusqlite::ToSql> = param_refs.iter().map(|p| *p).chain(std::iter::once(limit_param.as_ref())).collect();
+
+        let rows = stmt.query_map(all_params.as_slice(), row_to_entry).map_err(sql_err)?;
+        let mut entries = Vec::new();
+        for r in rows {
+            entries.push(r.map_err(sql_err)?);
+        }
+
+        // Get total count
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM memories m JOIN memories_fts fts ON m.id = fts.id WHERE {}",
+            where_clause
+        );
+        let count_params: Vec<&dyn rusqlite::ToSql> = param_refs.iter().map(|p| *p).collect();
+        let total: i64 = conn
+            .query_row(&count_sql, count_params.as_slice(), |row| row.get(0))
+            .map_err(sql_err)?;
+
+        // Generate snippets if requested
+        let snippets = if with_snippets {
+            let snippet_sql = format!(
+                r"SELECT snippet(memories_fts, 2, '<mark>', '</mark>', '...', 32)
+                  FROM memories_fts
+                  WHERE memories_fts MATCH ?1
+                  LIMIT ?2"
+            );
+            let mut stmt = conn.prepare(&snippet_sql).map_err(sql_err)?;
+            let snippet_rows = stmt
+                .query_map(params![query, limit as i64], |row| row.get::<_, Option<String>>(0))
+                .map_err(sql_err)?;
+            let mut result = Vec::new();
+            for r in snippet_rows {
+                match r {
+                    Ok(s) => result.push(s),
+                    Err(_) => result.push(None),
+                }
+            }
+            result
+        } else {
+            vec![None; entries.len()]
+        };
+
+        Ok((entries, snippets, total as usize))
+    }
+
+    /// Extract unique keywords from an FTS5 query.
+    fn do_extract_keywords(conn: &Connection, query: &str) -> Result<Vec<(String, i64)>> {
+        // Use FTS5 auxiliary function to get match info
+        let sql = r"
+            SELECT fts.id,
+                   highlight(memories_fts, 1, '[[', ']]') as title_hl,
+                   highlight(memories_fts, 2, '[[', ']]') as content_hl
+            FROM memories_fts
+            WHERE memories_fts MATCH ?1
+            LIMIT 50
+        ";
+        let mut stmt = conn.prepare(sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![query], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                ))
+            })
+            .map_err(sql_err)?;
+
+        let mut keyword_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+        for r in rows {
+            let (_, title_hl, content_hl) = r.map_err(sql_err)?;
+            let all_text = format!("{} {}", title_hl, content_hl);
+
+            // Extract words between [[ and ]]
+            for segment in all_text.split("[[") {
+                if let Some(end) = segment.find("]]") {
+                    let word = segment[..end].trim().to_lowercase();
+                    if !word.is_empty() && word.len() > 2 {
+                        *keyword_counts.entry(word).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        let mut keywords: Vec<(String, i64)> = keyword_counts.into_iter().collect();
+        keywords.sort_by(|a, b| b.1.cmp(&a.1));
+        keywords.truncate(20);
+        Ok(keywords)
+    }
+
+    fn do_search_by_layer(conn: &Connection, layer: MemoryLayer) -> Result<Vec<MemoryEntry>> {
+        let mut stmt = conn
+            .prepare(
+                r"SELECT id, layer, category, priority, source, title, content,
+                          embedding_json, tags_json, relations_json, confidence,
+                          access_count, staleness, created_at, updated_at,
+                          last_accessed_at, scope, session_id
+                   FROM memories WHERE layer = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![layer_to_int(layer)], row_to_entry)
+            .map_err(sql_err)?;
+        let mut entries = Vec::new();
+        for r in rows {
+            entries.push(r.map_err(sql_err)?);
+        }
+        Ok(entries)
+    }
+
+    fn do_search_by_category(
+        conn: &Connection,
+        category: MemoryCategory,
+    ) -> Result<Vec<MemoryEntry>> {
+        let mut stmt = conn
+            .prepare(
+                r"SELECT id, layer, category, priority, source, title, content,
+                          embedding_json, tags_json, relations_json, confidence,
+                          access_count, staleness, created_at, updated_at,
+                          last_accessed_at, scope, session_id
+                   FROM memories WHERE category = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![category_to_str(category)], row_to_entry)
+            .map_err(sql_err)?;
+        let mut entries = Vec::new();
+        for r in rows {
+            entries.push(r.map_err(sql_err)?);
+        }
+        Ok(entries)
+    }
+
+    fn do_get_meta(conn: &Connection, id: &MemoryId) -> Result<Option<MemoryMeta>> {
+        conn.query_row(
+            r"SELECT id, layer, category, priority, title, tags_json,
+                      confidence, access_count, staleness, created_at,
+                      updated_at, scope
+               FROM memories WHERE id = ?1",
+            params![id.to_string()],
+            row_to_meta,
+        )
+        .optional()
+        .map_err(sql_err)
+    }
+
+    fn do_list_metas(conn: &Connection, layer: Option<MemoryLayer>) -> Result<Vec<MemoryMeta>> {
+        let mut metas = Vec::new();
+        if let Some(l) = layer {
+            let mut stmt = conn
+                .prepare(
+                    r"SELECT id, layer, category, priority, title, tags_json,
+                              confidence, access_count, staleness, created_at,
+                              updated_at, scope
+                       FROM memories WHERE layer = ?1 ORDER BY created_at DESC",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![layer_to_int(l)], row_to_meta)
+                .map_err(sql_err)?;
+            for r in rows {
+                metas.push(r.map_err(sql_err)?);
+            }
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    r"SELECT id, layer, category, priority, title, tags_json,
+                              confidence, access_count, staleness, created_at,
+                              updated_at, scope
+                       FROM memories ORDER BY created_at DESC",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt.query_map([], row_to_meta).map_err(sql_err)?;
+            for r in rows {
+                metas.push(r.map_err(sql_err)?);
+            }
+        }
+        Ok(metas)
+    }
+
+    fn do_list_all(conn: &Connection) -> Result<Vec<MemoryEntry>> {
+        let mut entries = Vec::new();
+        let mut stmt = conn
+            .prepare(
+                r"SELECT id, layer, category, priority, source, title, content,
+                         embedding_json, tags_json, relations_json,
+                         confidence, access_count, staleness,
+                         created_at, updated_at, last_accessed_at,
+                         scope, session_id
+                  FROM memories ORDER BY created_at DESC",
+            )
+            .map_err(sql_err)?;
+
+        let rows = stmt.query_map([], row_to_entry).map_err(sql_err)?;
+        for r in rows {
+            entries.push(r.map_err(sql_err)?);
+        }
+        Ok(entries)
+    }
+
+    // -----------------------------------------------------------------------
+    // Knowledge-graph synchronous helpers
+    // -----------------------------------------------------------------------
+
+    fn do_create_entity(
+        conn: &Connection,
+        id: &str,
+        entity_type: &str,
+        name: &str,
+        metadata: Option<&str>,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO entities (id, entity_type, name, metadata) VALUES (?1,?2,?3,?4)",
+            params![id, entity_type, name, metadata],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn do_create_relation(
+        conn: &Connection,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r"INSERT INTO relations (subject_id, predicate, object_id, created_at)
+               VALUES (?1, ?2, ?3, ?4)",
+            params![subject, predicate, object, now],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn do_query_relations(
+        conn: &Connection,
+        entity_id: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT subject_id, predicate, object_id FROM relations \
+                 WHERE subject_id = ?1 OR object_id = ?1",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![entity_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sql_err)?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r.map_err(sql_err)?);
+        }
+        Ok(result)
+    }
+
+    fn do_query_relations_at(
+        conn: &Connection,
+        entity_id: &str,
+        at: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = conn
+            .prepare(
+                r"SELECT subject_id, predicate, object_id FROM relations
+                   WHERE (subject_id = ?1 OR object_id = ?1)
+                     AND (valid_from IS NULL OR valid_from <= ?2)
+                     AND (valid_to   IS NULL OR valid_to   >  ?2)",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![entity_id, at], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sql_err)?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r.map_err(sql_err)?);
+        }
+        Ok(result)
+    }
+
+    fn do_invalidate_relation(conn: &Connection, relation_id: i64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE relations SET valid_to = ?1 WHERE id = ?2",
+            params![now, relation_id],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn do_traverse(
+        conn: &Connection,
+        start_id: &str,
+        max_hops: u32,
+    ) -> Result<Vec<String>> {
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut frontier: Vec<String> = vec![start_id.to_string()];
+        visited.insert(start_id.to_string());
+
+        for _ in 0..max_hops {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next_frontier = Vec::new();
+            for node in &frontier {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT subject_id, object_id FROM relations \
+                         WHERE subject_id = ?1 OR object_id = ?1",
+                    )
+                    .map_err(sql_err)?;
+                let rows = stmt
+                    .query_map(params![node], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(sql_err)?;
+                for r in rows {
+                    let (subj, obj) = r.map_err(sql_err)?;
+                    for neighbour in [subj, obj] {
+                        if !visited.contains(&neighbour) {
+                            visited.insert(neighbour.clone());
+                            next_frontier.push(neighbour);
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+        }
+        visited.remove(start_id);
+        Ok(visited.into_iter().collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge-graph public API
+// ---------------------------------------------------------------------------
+
+impl SqliteStore {
+    /// Create or replace an entity node in the knowledge graph.
+    pub fn create_entity(
+        &self,
+        id: &str,
+        entity_type: &str,
+        name: &str,
+        metadata: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        Self::do_create_entity(&conn, id, entity_type, name, metadata)
+    }
+
+    /// Add a directed triple `(subject, predicate, object)`.
+    pub fn create_relation(&self, subject: &str, predicate: &str, object: &str) -> Result<()> {
+        let conn = self.conn()?;
+        Self::do_create_relation(&conn, subject, predicate, object)
+    }
+
+    /// Return all triples where `entity_id` is either subject or object.
+    pub fn query_relations(&self, entity_id: &str) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn()?;
+        Self::do_query_relations(&conn, entity_id)
+    }
+
+    /// Return triples that are valid at the given ISO-8601 timestamp `at`.
+    pub fn query_relations_at(
+        &self,
+        entity_id: &str,
+        at: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn()?;
+        Self::do_query_relations_at(&conn, entity_id, at)
+    }
+
+    /// Expire a relation by setting its `valid_to` to *now*.
+    pub fn invalidate_relation(&self, relation_id: i64) -> Result<()> {
+        let conn = self.conn()?;
+        Self::do_invalidate_relation(&conn, relation_id)
+    }
+
+    /// BFS graph traversal starting at `start_id`, up to `max_hops` edges away.
+    pub fn traverse(&self, start_id: &str, max_hops: u32) -> Result<Vec<String>> {
+        let conn = self.conn()?;
+        Self::do_traverse(&conn, start_id, max_hops)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async MemoryStore implementation
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl MemoryStore for SqliteStore {
+    async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryId> {
+        let store = self.clone();
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_insert(&conn, &entry)?;
+            Ok(entry.id)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn get(&self, id: &MemoryId) -> Result<Option<MemoryEntry>> {
+        let store = self.clone();
+        let id = *id;
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_get(&conn, &id)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn update(&self, entry: &MemoryEntry) -> Result<()> {
+        let store = self.clone();
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_update(&conn, &entry)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn delete(&self, id: &MemoryId) -> Result<()> {
+        let store = self.clone();
+        let id = *id;
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_delete(&conn, &id)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+        let store = self.clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_search_fts(&conn, &query, limit)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn search_fts_advanced(
+        &self,
+        query: &str,
+        options: FtsSearchOptions,
+        limit: usize,
+    ) -> Result<FtsSearchResult> {
+        let store = self.clone();
+        let query = query.to_string();
+        let category_str = options.category.map(category_to_str);
+        let layer_int = options.layer.map(layer_to_int);
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let (entries, snippets, total) = Self::do_search_fts_advanced(
+                &conn,
+                &query,
+                category_str.as_deref(),
+                layer_int,
+                limit,
+                options.with_snippets,
+            )?;
+
+            let keywords = if options.with_keywords {
+                Self::do_extract_keywords(&conn, &query).unwrap_or_default()
+            } else {
+                vec![]
+            };
+
+            Ok(FtsSearchResult {
+                entries,
+                snippets,
+                total_matches: total,
+                keywords,
+            })
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    /// Vector search is not supported by this backend; always returns an empty
+    /// list.  Use a dedicated `VectorIndex` backend for ANN queries.
+    async fn search_vector(&self, _embedding: &[f32], _limit: usize) -> Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
+
+    async fn search_by_layer(&self, layer: MemoryLayer) -> Result<Vec<MemoryEntry>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_search_by_layer(&conn, layer)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn search_by_category(&self, category: MemoryCategory) -> Result<Vec<MemoryEntry>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_search_by_category(&conn, category)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn get_meta(&self, id: &MemoryId) -> Result<Option<MemoryMeta>> {
+        let store = self.clone();
+        let id = *id;
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_get_meta(&conn, &id)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn list_metas(&self, layer: Option<MemoryLayer>) -> Result<Vec<MemoryMeta>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_list_metas(&conn, layer)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn list_all(&self) -> Result<Vec<MemoryEntry>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_list_all(&conn)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+}
