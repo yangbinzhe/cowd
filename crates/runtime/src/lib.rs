@@ -14,6 +14,7 @@ mod config;
 pub mod config_validate;
 mod conversation;
 pub mod doc_ingestion;
+pub mod gates;
 mod file_ops;
 mod git_context;
 pub mod green_contract;
@@ -87,6 +88,11 @@ pub use file_ops::{
 pub use doc_ingestion::{
     ClassificationResult, ConflictStrategy, DocumentCategory, DocumentClassifier, DocumentIngestor,
     DocumentMetadata, IngestionResult,
+};
+pub use gates::{
+    AbortGate, EscalationGate, Gate, GateContext, GateError, GateEvaluator, GateResult,
+    HardStop, PreFlightGate, PreFlightCheck, RevisionCheck, RevisionGate, ViolationSeverity,
+    ViolationType,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
