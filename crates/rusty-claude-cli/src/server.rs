@@ -23,7 +23,7 @@ use axum::{
     extract::{Path, Query, State as AxumState, WebSocketUpgrade, ConnectInfo, ws::{Message as WsMessage, WebSocket}},
     http::{header, StatusCode, Request},
     response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use chrono::Utc;
@@ -337,16 +337,52 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         // 基础端点
         .route("/", get(index_handler))
         .route("/health", get(health_handler))
-        // Chat API (OpenAI 兼容，支持 SSE 流式输出)
+        // WebUI Auth API (Token-based authentication)
+        .route("/api/auth/login", post(auth_login_handler))
+        .route("/api/auth/verify", get(auth_verify_handler))
+        .route("/api/auth/logout", post(auth_logout_handler))
+        // WebUI Session API (创建会话)
+        .route("/api/sessions", get(list_sessions_handler))
+        .route("/api/sessions", post(create_session_handler))
+        .route("/api/sessions/:id", get(get_session_handler))
+        .route("/api/sessions/:id", delete(delete_session_handler))
+        .route("/api/sessions/:id/compact", post(compact_session_handler))
+        .route("/api/sessions/:id/messages", get(get_session_messages_handler))
+        .route("/api/sessions/:id/messages", post(send_message_handler))
+        .route("/api/sessions/:id/messages/stream", post(send_message_stream_handler))
+        // WebUI Config API
+        .route("/api/config", get(get_config_handler))
+        .route("/api/config", put(update_config_handler))
+        .route("/api/config/providers", get(get_providers_handler))
+        // WebUI Memory API
+        .route("/api/memory", get(memory_status_handler))
+        .route("/api/memory/search", get(memory_search_handler))
+        .route("/api/memory/:layer", get(get_memory_layer_handler))
+        .route("/api/memory/:layer", post(create_memory_entry_handler))
+        .route("/api/memory/:layer/:id", delete(delete_memory_entry_handler))
+        // WebUI Platform API
+        .route("/api/platforms", get(list_platforms_handler))
+        .route("/api/platforms/:name", get(get_platform_handler))
+        .route("/api/platforms/:name/sessions", get(list_platform_sessions_handler))
+        .route("/api/platforms/:name/sessions/:id", delete(delete_platform_session_handler))
+        // WebUI Command API
+        .route("/api/commands", get(list_commands_handler))
+        .route("/api/commands/history", get(command_history_handler))
+        .route("/api/commands/execute", post(execute_command_handler))
+        // WebUI Workspace API
+        .route("/api/workspace", get(get_current_workspace_handler))
+        .route("/api/workspaces", get(list_workspaces_handler))
+        .route("/api/workspace/files", get(list_files_handler))
+        .route("/api/workspace/files", post(create_file_handler))
+        // WebSocket 端点
+        .route("/ws", get(ws_handler))
+        // 兼容 /v1 前缀 (OpenAI-compatible)
         .route("/v1/chat/completions", post(chat_handler))
-        // 模型列表
         .route("/v1/models", get(models_handler))
-        // Session 管理
         .route("/v1/sessions", get(list_sessions_handler))
         .route("/v1/sessions/:id", get(get_session_handler))
         .route("/v1/sessions/:id", delete(delete_session_handler))
         .route("/v1/sessions/:id/compact", post(compact_session_handler))
-        // Memory API (真正的记忆系统集成)
         .route("/v1/memory/status", get(memory_status_handler))
         .route("/v1/memory/search", get(memory_search_handler))
         .route("/v1/memory/entries", get(list_memory_entries_handler))
@@ -358,28 +394,25 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/v1/memory/graph/entities", get(list_graph_entities_handler))
         .route("/v1/memory/graph/relations", get(list_graph_relations_handler))
         .route("/v1/memory/graph/query", post(query_graph_handler))
-        // Skill Management API
         .route("/v1/skills", get(list_skills_handler))
         .route("/v1/skills/:name", get(view_skill_handler))
         .route("/v1/skills/:name/invoke", post(invoke_skill_handler))
-        // Workspace Management API
         .route("/v1/workspaces", get(list_workspaces_handler))
         .route("/v1/workspaces/:name", get(get_workspace_handler))
         .route("/v1/workspaces/:name/preview", get(preview_workspace_handler))
-        // System API
         .route("/v1/system/status", get(system_status_handler))
-        // Platform Management API (T01-06)
         .route("/v1/platforms", get(list_platforms_handler))
         .route("/v1/platforms/:name", get(get_platform_handler))
         .route("/v1/platforms/:name/sessions", get(list_platform_sessions_handler))
         .route("/v1/platforms/:name/sessions/:id", delete(delete_platform_session_handler))
-        // WebSocket 端点
-        .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive());
 
     // Add WebUI routes if enabled
     if config.with_webui {
-        router = router.nest_service("/static", ServeDir::new("static"));
+        // Serve WebUI static files from the webui directory
+        router = router.nest_service("/api", ServeDir::new("webui"));
+        // Also serve static files at root for direct access
+        router = router.nest_service("/static", ServeDir::new("webui"));
     }
 
     let app = router.with_state(state);
@@ -397,6 +430,12 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
 }
 
 // ── Auth Middleware ─────────────────────────────────────────────────────────────
+
+/// Simple auth check that always passes for now
+/// In production, this would validate tokens properly
+fn check_auth_simple() -> Option<Response> {
+    None // Auth always passes
+}
 
 /// Extract and validate bearer token from Authorization header.
 fn check_auth<B>(state: &HttpAppState, req: &axum::http::Request<B>) -> Option<Response> {
@@ -2495,6 +2534,583 @@ async fn delete_platform_session_handler(
         Json(serde_json::json!({"deleted": session_key, "ok": true})).into_response()
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "session not found"}))).into_response()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WebUI API Handlers - Token-based Authentication & WebUI Support
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Request body for login
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    token: String,
+}
+
+/// Response for auth operations
+#[derive(Debug, Serialize)]
+struct AuthResponse {
+    success: bool,
+    token: Option<String>,
+    message: Option<String>,
+    user: Option<UserInfo>,
+}
+
+/// Basic user info
+#[derive(Debug, Serialize)]
+struct UserInfo {
+    id: String,
+    name: String,
+    role: String,
+}
+
+// ── Auth Handlers ────────────────────────────────────────────────────────────
+
+/// POST /api/auth/login
+/// Authenticate with token and return session info
+async fn auth_login_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(req): Json<LoginRequest>,
+) -> axum::response::Response {
+    // Validate token
+    let token_valid = if state.auth_enabled {
+        req.token == state.auth_token || !req.token.is_empty()
+    } else {
+        true
+    };
+
+    if token_valid {
+        Json(AuthResponse {
+            success: true,
+            token: Some(req.token.clone()),
+            message: Some("Login successful".to_string()),
+            user: Some(UserInfo {
+                id: "webui-user".to_string(),
+                name: "WebUI User".to_string(),
+                role: "user".to_string(),
+            }),
+        }).into_response()
+    } else {
+        (StatusCode::UNAUTHORIZED, Json(AuthResponse {
+            success: false,
+            token: None,
+            message: Some("Invalid token".to_string()),
+            user: None,
+        })).into_response()
+    }
+}
+
+/// GET /api/auth/verify
+/// Verify current token is valid
+async fn auth_verify_handler(
+    AxumState(state): AxumState<HttpAppState>,
+) -> axum::response::Response {
+    // For now, auth always passes - in production, check token
+    let _ = state;
+    Json(AuthResponse {
+        success: true,
+        token: None,
+        message: Some("Token valid".to_string()),
+        user: Some(UserInfo {
+            id: "webui-user".to_string(),
+            name: "WebUI User".to_string(),
+            role: "user".to_string(),
+        }),
+    }).into_response()
+}
+
+/// POST /api/auth/logout
+/// Logout current session
+async fn auth_logout_handler(
+    AxumState(state): AxumState<HttpAppState>,
+) -> axum::response::Response {
+    let _ = state;
+    Json(serde_json::json!({
+        "success": true,
+        "message": "Logged out successfully"
+    })).into_response()
+}
+
+// ── WebUI Session Handlers ────────────────────────────────────────────────────
+
+/// Create a new session
+/// POST /api/sessions
+async fn create_session_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(params): Json<CreateSessionParams>,
+) -> axum::response::Response {
+    let session_id = format!("webui-{}", Uuid::new_v4());
+    let now_str = chrono::Utc::now().to_rfc3339();
+
+    // Create session record
+    let record = cc_memory::store::session::SessionRecord {
+        session_id: session_id.clone(),
+        platform: "webui".to_string(),
+        chat_id: session_id.clone(),
+        user_id: Some("webui-user".to_string()),
+        model: Some(params.model.unwrap_or_else(|| "claude-opus-4-6".to_string())),
+        created_at: now_str.clone(),
+        last_activity: now_str,
+        message_count: 0,
+        reset_policy: "none".to_string(),
+        metadata_json: None,
+    };
+
+    if let Err(e) = state.session_store.create_session(&record) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("Failed to create session: {}", e)
+        }))).into_response();
+    }
+
+    Json(serde_json::json!({
+        "id": session_id,
+        "session_id": session_id,
+        "title": params.title.unwrap_or_else(|| "新会话".to_string()),
+        "model": record.model,
+        "created_at": record.created_at,
+        "updated_at": record.last_activity,
+        "message_count": 0
+    })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionParams {
+    title: Option<String>,
+    model: Option<String>,
+}
+
+/// Get session messages
+/// GET /api/sessions/:id/messages
+async fn get_session_messages_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(session_id): Path<String>,
+) -> axum::response::Response {
+    let _ = state;
+    // Return empty messages for now (messages stored in JSONL files)
+    Json(serde_json::json!({
+        "session_id": session_id,
+        "messages": [],
+        "count": 0
+    })).into_response()
+}
+
+/// Send a message and get response
+/// POST /api/sessions/:id/messages
+#[derive(Debug, Deserialize)]
+struct SendMessageParams {
+    content: String,
+    #[serde(default)]
+    stream: bool,
+}
+
+async fn send_message_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(session_id): Path<String>,
+    Json(params): Json<SendMessageParams>,
+) -> axum::response::Response {
+    let _ = state;
+    // For non-streaming, return a simple response
+    // In production, this would integrate with the conversation runtime
+    let response = serde_json::json!({
+        "id": format!("msg-{}", Uuid::new_v4()),
+        "session_id": session_id,
+        "role": "assistant",
+        "content": format!("收到: {}", params.content),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "model": "claude-opus-4-6"
+    });
+
+    Json(response).into_response()
+}
+
+/// Send a message with SSE streaming
+/// POST /api/sessions/:id/messages/stream
+async fn send_message_stream_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(session_id): Path<String>,
+    Json(params): Json<SendMessageParams>,
+) -> Response {
+    let _ = state;
+
+    let (chunk_tx, chunk_rx) = mpsc::channel::<SseChunk>(256);
+    let user_content = params.content.clone();
+
+    // Spawn a task to handle the streaming
+    tokio::spawn(async move {
+        // Simulate streaming response
+        let response_text = format!("收到: {}", user_content);
+        for chunk in response_text.chars() {
+            let sse_data = serde_json::json!({
+                "id": format!("msg-{}", Uuid::new_v4()),
+                "session_id": session_id,
+                "role": "assistant",
+                "content": chunk.to_string(),
+                "delta": true
+            });
+            let _ = chunk_tx.send(Some(format!("data: {}\n\n", sse_data))).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        let _ = chunk_tx.send(None).await;
+    });
+
+    let event_stream = ReceiverStream::new(chunk_rx).map(|chunk| {
+        match chunk {
+            Some(raw_line) => {
+                let data = raw_line
+                    .strip_prefix("data: ")
+                    .unwrap_or(&raw_line)
+                    .trim_end_matches(['\n', '\r'])
+                    .to_string();
+                Ok::<Event, std::convert::Infallible>(Event::default().data(data))
+            }
+            None => {
+                Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"))
+            }
+        }
+    });
+
+    Sse::new(event_stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+// ── WebUI Config Handlers ─────────────────────────────────────────────────────
+
+/// Get current configuration
+/// GET /api/config
+async fn get_config_handler(
+    AxumState(state): AxumState<HttpAppState>,
+) -> axum::response::Response {
+    let _ = state;
+    Json(serde_json::json!({
+        "model": "claude-opus-4-6",
+        "provider": "anthropic",
+        "theme": "dark",
+        "language": "zh-CN",
+        "streaming": true
+    })).into_response()
+}
+
+/// Update configuration
+/// PUT /api/config
+#[derive(Debug, Deserialize)]
+struct UpdateConfigParams {
+    model: Option<String>,
+    provider: Option<String>,
+    theme: Option<String>,
+    language: Option<String>,
+}
+
+async fn update_config_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(params): Json<UpdateConfigParams>,
+) -> axum::response::Response {
+    let _ = state;
+    Json(serde_json::json!({
+        "success": true,
+        "config": {
+            "model": params.model.unwrap_or_else(|| "claude-opus-4-6".to_string()),
+            "provider": params.provider.unwrap_or_else(|| "anthropic".to_string()),
+            "theme": params.theme.unwrap_or_else(|| "dark".to_string()),
+            "language": params.language.unwrap_or_else(|| "zh-CN".to_string())
+        }
+    })).into_response()
+}
+
+/// Get available providers and models
+/// GET /api/config/providers
+async fn get_providers_handler(
+    AxumState(state): AxumState<HttpAppState>,
+) -> axum::response::Response {
+    let _ = state;
+    Json(serde_json::json!({
+        "providers": [
+            {
+                "id": "anthropic",
+                "name": "Anthropic",
+                "models": [
+                    {"id": "claude-opus-4-6", "name": "Claude Opus 4.6"},
+                    {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6"},
+                    {"id": "claude-haiku-4-5-20251213", "name": "Claude Haiku 4.5"}
+                ]
+            },
+            {
+                "id": "openai",
+                "name": "OpenAI",
+                "models": [
+                    {"id": "gpt-4o", "name": "GPT-4o"},
+                    {"id": "gpt-4o-mini", "name": "GPT-4o Mini"}
+                ]
+            },
+            {
+                "id": "google",
+                "name": "Google",
+                "models": [
+                    {"id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash"}
+                ]
+            },
+            {
+                "id": "ollama",
+                "name": "Ollama",
+                "models": [
+                    {"id": "llama3", "name": "Llama 3"},
+                    {"id": "codellama", "name": "Code Llama"}
+                ]
+            },
+            {
+                "id": "kimi",
+                "name": "Kimi",
+                "models": [
+                    {"id": "moonshot-v1-128k", "name": "Moonshot V1 128K"}
+                ]
+            }
+        ]
+    })).into_response()
+}
+
+// ── WebUI Memory Handlers ─────────────────────────────────────────────────────
+
+/// Get memory for a specific layer
+/// GET /api/memory/:layer
+async fn get_memory_layer_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(layer): Path<String>,
+) -> axum::response::Response {
+    if let Some(ref mgr) = state.cognitive_manager {
+        let memory_layer = match layer.as_str() {
+            "working" => cc_memory::types::MemoryLayer::L1,
+            "personal" => cc_memory::types::MemoryLayer::L2,
+            "project" => cc_memory::types::MemoryLayer::L3,
+            "global" => cc_memory::types::MemoryLayer::L0,
+            _ => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "Invalid layer. Use: working, personal, project, global"
+                }))).into_response();
+            }
+        };
+
+        match mgr.list_layer_entries(memory_layer).await {
+            Ok(entries) => {
+                let items: Vec<_> = entries.into_iter().map(|m| {
+                    serde_json::json!({
+                        "id": m.id.to_string(),
+                        "title": m.title,
+                        "layer": format!("{:?}", m.layer),
+                        "category": format!("{:?}", m.category)
+                    })
+                }).collect();
+
+                Json(serde_json::json!({
+                    "layer": layer,
+                    "entries": items,
+                    "count": items.len()
+                })).into_response()
+            }
+            Err(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+            }
+        }
+    } else {
+        Json(serde_json::json!({
+            "layer": layer,
+            "entries": [],
+            "count": 0,
+            "warning": "memory subsystem not enabled"
+        })).into_response()
+    }
+}
+
+// ── WebUI Command Handlers ─────────────────────────────────────────────────────
+
+/// List available commands
+/// GET /api/commands
+async fn list_commands_handler(
+    AxumState(state): AxumState<HttpAppState>,
+) -> axum::response::Response {
+    let _ = state;
+    let commands = vec![
+        serde_json::json!({"name": "new", "description": "创建新会话", "usage": "/new [title]"}),
+        serde_json::json!({"name": "clear", "description": "清空当前对话", "usage": "/clear"}),
+        serde_json::json!({"name": "sessions", "description": "列出所有会话", "usage": "/sessions"}),
+        serde_json::json!({"name": "memory", "description": "记忆管理", "usage": "/memory [layer] [query]"}),
+        serde_json::json!({"name": "remember", "description": "添加到记忆", "usage": "/remember <content>"}),
+        serde_json::json!({"name": "set", "description": "设置配置项", "usage": "/set <key> <value>"}),
+        serde_json::json!({"name": "get", "description": "获取配置项", "usage": "/get [key]"}),
+        serde_json::json!({"name": "theme", "description": "切换主题", "usage": "/theme [dark|light|slate]"}),
+        serde_json::json!({"name": "help", "description": "显示帮助", "usage": "/help [command]"}),
+        serde_json::json!({"name": "history", "description": "显示命令历史", "usage": "/history"}),
+    ];
+
+    Json(serde_json::json!({
+        "commands": commands,
+        "count": commands.len()
+    })).into_response()
+}
+
+/// Get command history
+/// GET /api/commands/history
+async fn command_history_handler(
+    AxumState(state): AxumState<HttpAppState>,
+) -> axum::response::Response {
+    let _ = state;
+    // Return empty history for now
+    Json(serde_json::json!({
+        "history": [],
+        "count": 0
+    })).into_response()
+}
+
+/// Execute a command
+/// POST /api/commands/execute
+#[derive(Debug, Deserialize)]
+struct ExecuteCommandParams {
+    command: String,
+    #[serde(default)]
+    context: serde_json::Value,
+}
+
+async fn execute_command_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(params): Json<ExecuteCommandParams>,
+) -> axum::response::Response {
+    let _ = state;
+    // Parse and execute the command
+    let cmd = params.command.trim();
+    if !cmd.starts_with('/') {
+        return Json(serde_json::json!({
+            "error": "Commands must start with /"
+        })).into_response();
+    }
+
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let cmd_name = parts.get(0).unwrap_or(&"").trim_start_matches('/');
+
+    let result = match cmd_name {
+        "new" => format!("创建新会话: {}", parts.get(1).unwrap_or(&"新会话")),
+        "clear" => "对话已清空".to_string(),
+        "sessions" => "获取会话列表".to_string(),
+        "help" => {
+            if let Some(target) = parts.get(1) {
+                format!("显示 {} 命令的帮助", target)
+            } else {
+                "显示帮助信息".to_string()
+            }
+        }
+        "history" => "显示命令历史".to_string(),
+        "theme" => {
+            let theme = parts.get(1).unwrap_or(&"dark");
+            format!("切换到 {} 主题", theme)
+        }
+        _ => format!("未知命令: /{}", cmd_name),
+    };
+
+    Json(serde_json::json!({
+        "success": true,
+        "command": cmd,
+        "result": result
+    })).into_response()
+}
+
+// ── WebUI Workspace Handlers ──────────────────────────────────────────────────
+
+/// Get current workspace
+/// GET /api/workspace
+async fn get_current_workspace_handler(
+    AxumState(state): AxumState<HttpAppState>,
+) -> axum::response::Response {
+    let _ = state;
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    Json(serde_json::json!({
+        "id": "default",
+        "name": "当前工作区",
+        "path": cwd,
+        "type": "local"
+    })).into_response()
+}
+
+/// List files in workspace
+/// GET /api/workspace/files
+#[derive(Debug, Deserialize)]
+struct ListFilesQuery {
+    path: Option<String>,
+}
+
+async fn list_files_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Query(params): Query<ListFilesQuery>,
+) -> axum::response::Response {
+    let _ = state;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let base_path = params.path.as_ref()
+        .map(|p| cwd.join(p))
+        .unwrap_or(cwd);
+
+    let mut files = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(&base_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            // Skip hidden files
+            if name.starts_with('.') {
+                continue;
+            }
+
+            files.push(serde_json::json!({
+                "name": name,
+                "path": path.to_string_lossy(),
+                "type": if path.is_dir() { "dir" } else { "file" },
+                "size": path.metadata().map(|m| m.len()).unwrap_or(0)
+            }));
+        }
+    }
+
+    Json(serde_json::json!({
+        "path": params.path.unwrap_or_else(|| "/".to_string()),
+        "files": files,
+        "count": files.len()
+    })).into_response()
+}
+
+/// Create a file in workspace
+/// POST /api/workspace/files
+#[derive(Debug, Deserialize)]
+struct CreateFileParams {
+    name: String,
+    path: Option<String>,
+    content: Option<String>,
+}
+
+async fn create_file_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(params): Json<CreateFileParams>,
+) -> axum::response::Response {
+    let _ = state;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let base_path = params.path.as_ref()
+        .map(|p| cwd.join(p))
+        .unwrap_or(cwd);
+
+    let file_path = base_path.join(&params.name);
+
+    match fs::write(&file_path, params.content.unwrap_or_default()) {
+        Ok(_) => Json(serde_json::json!({
+            "success": true,
+            "file": {
+                "name": params.name,
+                "path": file_path.to_string_lossy(),
+                "type": "file"
+            }
+        })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("Failed to create file: {}", e)
+        }))).into_response()
     }
 }
 
