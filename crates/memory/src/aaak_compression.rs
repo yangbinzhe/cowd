@@ -514,7 +514,7 @@ impl AaakCompressor {
             score_b.cmp(&score_a)
         });
 
-        for (token, freq) in candidates {
+        for (token, _freq) in candidates {
             let short = self.create_abbreviation(token, &mut used_shorts);
             let entity_type = self.entity_types.get(token).copied().unwrap_or(EntityType::Generic);
             dict.add_abbreviation(token.clone(), short, entity_type);

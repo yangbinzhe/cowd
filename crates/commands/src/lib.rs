@@ -2432,7 +2432,7 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
         Some(args) if args.starts_with("create ") => {
             let input = parse_skill_create_args(args["create ".len()..].trim());
             let paths = discover_skill_root_paths(cwd);
-            let mut manager = SkillManager::new(paths);
+            let manager = SkillManager::new(paths);
             let result = manager.create_skill(input);
             Ok(render_skill_create_report(&result))
         }
@@ -2443,7 +2443,7 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
                 return Ok(render_skills_usage(Some("view")));
             }
             let paths = discover_skill_root_paths(cwd);
-            let mut manager = SkillManager::new(paths);
+            let manager = SkillManager::new(paths);
             let input = SkillViewInput {
                 name: name.to_string(),
                 file_path: None,
@@ -2456,7 +2456,7 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
         Some(args) if args.starts_with("edit ") => {
             let input = parse_skill_edit_args(args["edit ".len()..].trim());
             let paths = discover_skill_root_paths(cwd);
-            let mut manager = SkillManager::new(paths);
+            let manager = SkillManager::new(paths);
             let result = manager.edit_skill(input);
             Ok(render_skill_edit_report(&result))
         }
@@ -2469,7 +2469,7 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
                 return Ok(render_skills_usage(Some("delete")));
             }
             let paths = discover_skill_root_paths(cwd);
-            let mut manager = SkillManager::new(paths);
+            let manager = SkillManager::new(paths);
             let input = SkillDeleteInput {
                 name: name.to_string(),
                 force,
@@ -2484,7 +2484,7 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
                 return Ok(render_skills_usage(Some("generate")));
             }
             let paths = discover_skill_root_paths(cwd);
-            let mut manager = SkillManager::new(paths);
+            let manager = SkillManager::new(paths);
             let input = SkillGenerateInput {
                 task_description: Some(task.to_string()),
                 tool_call_count: None,
@@ -2557,7 +2557,7 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
         Some(args) if args.starts_with("create ") => {
             let input = parse_skill_create_args(args["create ".len()..].trim());
             let paths = discover_skill_root_paths(cwd);
-            let mut manager = SkillManager::new(paths);
+            let manager = SkillManager::new(paths);
             let result = manager.create_skill(input);
             Ok(json!({
                 "kind": "skills",
@@ -2575,7 +2575,7 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 return Ok(render_skills_usage_json(Some("view")));
             }
             let paths = discover_skill_root_paths(cwd);
-            let mut manager = SkillManager::new(paths);
+            let manager = SkillManager::new(paths);
             let input = SkillViewInput {
                 name: name.to_string(),
                 file_path: None,
@@ -2605,7 +2605,7 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
         Some(args) if args.starts_with("edit ") => {
             let input = parse_skill_edit_args(args["edit ".len()..].trim());
             let paths = discover_skill_root_paths(cwd);
-            let mut manager = SkillManager::new(paths);
+            let manager = SkillManager::new(paths);
             let result = manager.edit_skill(input);
             Ok(json!({
                 "kind": "skills",
@@ -2625,7 +2625,7 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 return Ok(render_skills_usage_json(Some("delete")));
             }
             let paths = discover_skill_root_paths(cwd);
-            let mut manager = SkillManager::new(paths);
+            let manager = SkillManager::new(paths);
             let input = SkillDeleteInput {
                 name: name.to_string(),
                 force,
@@ -2646,7 +2646,7 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 return Ok(render_skills_usage_json(Some("generate")));
             }
             let paths = discover_skill_root_paths(cwd);
-            let mut manager = SkillManager::new(paths);
+            let manager = SkillManager::new(paths);
             let input = SkillGenerateInput {
                 task_description: Some(task.to_string()),
                 tool_call_count: None,
@@ -3810,7 +3810,7 @@ fn parse_skill_create_args(input: &str) -> SkillCreateInput {
     let mut description = String::new();
     let mut category = None;
     let mut tags = None;
-    let mut content = None;
+    let content = None;
 
     let parts: Vec<&str> = input.split_whitespace().collect();
     let mut i = 0;

@@ -16,7 +16,6 @@
 use std::{collections::HashSet, path::PathBuf, sync::Mutex};
 
 use chrono::Utc;
-use serde::Deserialize;
 
 use crate::{
     compression::{
@@ -639,7 +638,7 @@ impl CognitiveContextManager {
 
         // Collect unique categories found in results
         use std::collections::HashSet;
-        let mut categories_found_set: HashSet<_> = fts_result
+        let categories_found_set: HashSet<_> = fts_result
             .entries
             .iter()
             .map(|e| e.category)

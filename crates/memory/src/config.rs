@@ -101,6 +101,40 @@ impl Default for VectorConfig {
     }
 }
 
+/// LLM summarization configuration for compression pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmSummarizerConfig {
+    /// Enable LLM-powered summarization (stage 2 & 3).
+    pub enabled: bool,
+    /// OpenAI-compatible API URL (e.g., "https://api.openai.com/v1").
+    /// Can also be provided via CC_LLM_API_URL environment variable.
+    pub api_url: String,
+    /// API key for the LLM service.
+    /// Can also be provided via CC_LLM_API_KEY environment variable.
+    pub api_key: String,
+    /// Model name for summarization (e.g., "gpt-4o-mini").
+    /// Can also be provided via CC_LLM_MODEL environment variable.
+    pub model: String,
+}
+
+impl Default for LlmSummarizerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: String::new(),
+            api_key: String::new(),
+            model: "gpt-4o-mini".to_string(),
+        }
+    }
+}
+
+impl LlmSummarizerConfig {
+    /// Check if LLM summarization is properly configured.
+    pub fn is_configured(&self) -> bool {
+        self.enabled && !self.api_url.is_empty() && !self.api_key.is_empty()
+    }
+}
+
 /// Compression pipeline configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionConfig {
@@ -112,6 +146,9 @@ pub struct CompressionConfig {
     pub enable_deep_compression: bool,
     /// How aggressively to compress (0.0 = lossless, 1.0 = maximum).
     pub aggressiveness: f32,
+    /// LLM summarization configuration for semantic compression.
+    #[serde(default)]
+    pub llm: LlmSummarizerConfig,
 }
 
 impl Default for CompressionConfig {
@@ -121,6 +158,7 @@ impl Default for CompressionConfig {
             session_threshold: 10,
             enable_deep_compression: true,
             aggressiveness: 0.5,
+            llm: LlmSummarizerConfig::default(),
         }
     }
 }
@@ -468,6 +506,52 @@ impl MemoryConfig {
     /// Set the target model name for adaptive compression.
     pub fn set_model(&mut self, model_name: String) {
         self.model = Some(model_name);
+    }
+
+    /// Override configuration from environment variables.
+    ///
+    /// Supported environment variables:
+    /// - `CC_LLM_API_URL`: LLM API URL for summarization
+    /// - `CC_LLM_API_KEY`: LLM API key
+    /// - `CC_LLM_MODEL`: LLM model name
+    /// - `CC_VECTOR_API_URL`: Vector embedding API URL
+    /// - `CC_VECTOR_API_KEY`: Vector embedding API key
+    pub fn with_env_overrides(mut self) -> Self {
+        // LLM summarization overrides
+        if let Ok(url) = std::env::var("CC_LLM_API_URL") {
+            if !url.is_empty() {
+                self.compression.llm.api_url = url;
+            }
+        }
+        if let Ok(key) = std::env::var("CC_LLM_API_KEY") {
+            if !key.is_empty() {
+                self.compression.llm.api_key = key;
+            }
+        }
+        if let Ok(model) = std::env::var("CC_LLM_MODEL") {
+            if !model.is_empty() {
+                self.compression.llm.model = model;
+            }
+        }
+        if let Ok(enabled) = std::env::var("CC_LLM_ENABLED") {
+            self.compression.llm.enabled = enabled.eq_ignore_ascii_case("true")
+                || enabled.eq_ignore_ascii_case("1")
+                || enabled.eq_ignore_ascii_case("yes");
+        }
+
+        // Vector embedding overrides
+        if let Ok(url) = std::env::var("CC_VECTOR_API_URL") {
+            if !url.is_empty() {
+                self.store.vector.api_url = url;
+            }
+        }
+        if let Ok(key) = std::env::var("CC_VECTOR_API_KEY") {
+            if !key.is_empty() {
+                self.store.vector.api_key = key;
+            }
+        }
+
+        self
     }
 }
 

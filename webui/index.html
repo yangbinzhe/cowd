@@ -4,9 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Cowd - AI Coding Assistant">
+  <!--
+    Cowd 配置 (通过 URL 参数或 JavaScript 覆盖):
+    - window.COWD_API_BASE: API 基础地址 (如 http://localhost:8642)
+    - window.COWD_WS_URL: WebSocket 地址
+    - window.COWD_WS_SESSIONS_URL: 会话事件 WebSocket 地址
+    - window.COWD_GATEWAY_URL: Gateway 地址
+    - window.COWD_API_TIMEOUT: API 超时 (毫秒)
+    - window.COWD_API_RETRIES: 重试次数
+  -->
   <title>Cowd</title>
   <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="assets/style.css">
   <!-- Prism.js 语法高亮 -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
 </head>
@@ -286,17 +295,17 @@
   <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-yaml.min.js"></script>
 
   <!-- 应用脚本 -->
-  <script src="js/i18n.js"></script>
-  <script src="js/api.js"></script>
-  <script src="js/state.js"></script>
-  <script src="js/sessions.js"></script>
-  <script src="js/messages.js"></script>
-  <script src="js/config.js"></script>
-  <script src="js/memory.js"></script>
-  <script src="js/platform.js"></script>
-  <script src="js/panels.js"></script>
-  <script src="js/commands.js"></script>
-  <script src="js/workspace.js"></script>
-  <script src="js/boot.js"></script>
+  <script src="assets/js/i18n.js"></script>
+  <script src="assets/js/api.js"></script>
+  <script src="assets/js/state.js"></script>
+  <script src="assets/js/sessions.js"></script>
+  <script src="assets/js/messages.js"></script>
+  <script src="assets/js/config.js"></script>
+  <script src="assets/js/memory.js"></script>
+  <script src="assets/js/platform.js"></script>
+  <script src="assets/js/panels.js"></script>
+  <script src="assets/js/commands.js"></script>
+  <script src="assets/js/workspace.js"></script>
+  <script src="assets/js/boot.js"></script>
 </body>
 </html>

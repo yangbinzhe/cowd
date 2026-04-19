@@ -25,6 +25,7 @@ use crate::{
     compression::{
         deep::DeepCompactor,
         guard::CompressionGuard,
+        llm_summarizer::{OpenAiSummarizer, LlmSummarizer},
         micro::MicroCompactor,
         session::SessionCompactor,
     },
@@ -33,6 +34,7 @@ use crate::{
     orchestrator::MemoryOrchestrator,
     types::{CompactionResult, Message, PreparedContext},
 };
+use std::sync::Arc;
 
 /// Result alias for compression operations.
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -74,13 +76,38 @@ impl CompressionPipeline {
     /// Create from the global compression config.
     #[must_use]
     pub fn from_config(config: &CompressionConfig) -> Self {
-        Self {
+        // Create LLM summarizer if configured
+        let llm_summarizer: Option<Arc<dyn LlmSummarizer>> = if config.llm.is_configured() {
+            let summarizer = OpenAiSummarizer::new(
+                config.llm.api_url.clone(),
+                config.llm.api_key.clone(),
+                config.llm.model.clone(),
+            );
+            tracing::info!(
+                "LLM summarization enabled: {}",
+                config.llm.model
+            );
+            Some(Arc::new(summarizer))
+        } else {
+            tracing::debug!("LLM summarization not configured, using template fallback");
+            None
+        };
+
+        let mut pipeline = Self {
             micro: MicroCompactor::from_config(config),
             session: SessionCompactor::from_config(config),
             deep: DeepCompactor::from_config(config),
             guard: CompressionGuard::new(),
             enable_deep: config.enable_deep_compression,
+        };
+
+        // Attach LLM summarizer to compactors that support it
+        if let Some(ref summarizer) = llm_summarizer {
+            pipeline.session = pipeline.session.with_llm_summarizer(summarizer.clone());
+            pipeline.deep = pipeline.deep.with_llm_summarizer(summarizer.clone());
         }
+
+        pipeline
     }
 
     // -----------------------------------------------------------------------

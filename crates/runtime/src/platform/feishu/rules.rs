@@ -135,7 +135,7 @@ impl RuleCondition {
                     .map(|t| t == chat_type)
                     .unwrap_or(false)
             }
-            RuleCondition::Mentioned { mention_all } => {
+            RuleCondition::Mentioned { mention_all: _ } => {
                 // Check if @all or @someone is present
                 message.text.contains("@all") ||
                 message.text.contains("@someone") ||

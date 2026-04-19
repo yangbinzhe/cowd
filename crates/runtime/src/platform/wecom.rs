@@ -262,7 +262,7 @@ impl WeComAdapter {
     }
 
     /// Verify a callback request.
-    pub fn verify_callback(&self, msg_signature: &str, timestamp: &str, nonce: &str, echostr: Option<&str>) -> PlatformResult<bool> {
+    pub fn verify_callback(&self, _msg_signature: &str, _timestamp: &str, _nonce: &str, echostr: Option<&str>) -> PlatformResult<bool> {
         if let Some(_echo) = echostr {
             tracing::debug!("wecom callback verification");
             return Ok(true);

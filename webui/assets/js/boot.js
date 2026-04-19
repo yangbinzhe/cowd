@@ -131,7 +131,7 @@ class App {
     // Setup theme toggle
     const themeToggle = document.getElementById('themeToggle');
     if (themeToggle) {
-      themeToggle.addEventListener('click', () => themeManager.toggle());
+      themeToggle.addEventListener('click', () => window.ThemeManager.cycleTheme());
     }
 
     // Setup sidebar toggle
@@ -145,8 +145,8 @@ class App {
    * Initialize theme
    */
   initTheme() {
-    const savedTheme = localStorage.getItem('theme') || 'dark';
-    themeManager.apply(savedTheme);
+    const savedTheme = localStorage.getItem('cowd-theme') || 'dark';
+    window.ThemeManager.setTheme(savedTheme);
   }
 
   /**
@@ -162,7 +162,7 @@ class App {
    * Check authentication status
    */
   async checkAuth() {
-    const token = localStorage.getItem('cowd_token');
+    const token = localStorage.getItem('cowd-token');
     if (!token) {
       this.showLoginModal();
       return false;
@@ -171,7 +171,7 @@ class App {
     api.setToken(token);
 
     try {
-      const user = await api.verify();
+      const user = await api.verifyToken();
       appState.set('authenticated', true);
       appState.set('user', user);
       this.hideLoginModal();

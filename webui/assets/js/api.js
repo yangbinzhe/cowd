@@ -3,10 +3,67 @@
  * 处理与后端的所有 API 通信
  */
 
+// =============================================================================
+// API 配置 - 支持多层配置
+// =============================================================================
+
+const API_CONFIG = {
+    // API 基础地址
+    get baseUrl() {
+        // 1. 最高优先级：窗口变量
+        if (window.COWD_API_BASE) {
+            return window.COWD_API_BASE.replace(/\/$/, '');
+        }
+        // 2. 默认：同源
+        return '';
+    },
+
+    // WebSocket 地址
+    get wsUrl() {
+        // 1. 窗口变量
+        if (window.COWD_WS_URL) {
+            return window.COWD_WS_URL;
+        }
+        // 2. 自动构建
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = window.COWD_WS_HOST || location.host;
+        return `${proto}//${host}/ws`;
+    },
+
+    // Session 事件 WebSocket 地址
+    get wsSessionsUrl() {
+        // 1. 窗口变量
+        if (window.COWD_WS_SESSIONS_URL) {
+            return window.COWD_WS_SESSIONS_URL;
+        }
+        // 2. 自动构建
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = window.COWD_WS_HOST || location.host;
+        return `${proto}//${host}/ws/sessions`;
+    },
+
+    // Gateway 地址 (带协议)
+    get gatewayUrl() {
+        if (window.COWD_GATEWAY_URL) {
+            return window.COWD_GATEWAY_URL;
+        }
+        return `${location.protocol}//${location.host}`;
+    },
+
+    // 超时配置 (毫秒)
+    timeout: window.COWD_API_TIMEOUT || 30000,
+
+    // 重试次数
+    retries: window.COWD_API_RETRIES || 3,
+
+    // 认证 Token 存储键
+    tokenStorageKey: 'cowd-token',
+};
+
 class CowdApi {
   constructor() {
-    this.baseUrl = '/api';
-    this.token = localStorage.getItem('cowd-token') || '';
+    this.baseUrl = API_CONFIG.baseUrl + '/api';
+    this.token = localStorage.getItem(API_CONFIG.tokenStorageKey) || '';
     this._listeners = {};
   }
 
@@ -15,7 +72,7 @@ class CowdApi {
    */
   setToken(token) {
     this.token = token;
-    localStorage.setItem('cowd-token', token);
+    localStorage.setItem(API_CONFIG.tokenStorageKey, token);
   }
 
   /**
@@ -23,7 +80,7 @@ class CowdApi {
    */
   clearToken() {
     this.token = '';
-    localStorage.removeItem('cowd-token');
+    localStorage.removeItem(API_CONFIG.tokenStorageKey);
   }
 
   /**
@@ -408,6 +465,46 @@ class CowdApi {
     if (!this._listeners[event]) return;
     this._listeners[event].forEach(cb => cb(data));
   }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // WebSocket Connections
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Connect to session events WebSocket
+   * @param {Object} callbacks - Event callbacks
+   * @returns {WebSocket} WebSocket instance
+   */
+  connectSessionEvents(callbacks = {}) {
+    const { onMessage, onOpen, onClose, onError } = callbacks;
+    const ws = new WebSocket(API_CONFIG.wsSessionsUrl);
+
+    ws.onopen = () => {
+      console.log('Session events WebSocket connected');
+      onOpen?.();
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        onMessage?.(data);
+      } catch (e) {
+        console.error('Failed to parse WebSocket message:', e);
+      }
+    };
+
+    ws.onclose = () => {
+      console.log('Session events WebSocket disconnected');
+      onClose?.();
+    };
+
+    ws.onerror = (error) => {
+      console.error('Session events WebSocket error:', error);
+      onError?.(error);
+    };
+
+    return ws;
+  }
 }
 
 /**
@@ -425,3 +522,13 @@ class ApiError extends Error {
 // Create global instance
 window.api = new CowdApi();
 window.ApiError = ApiError;
+
+// Debug info
+console.log('Cowd API Client initialized:', {
+    baseUrl: API_CONFIG.baseUrl + '/api',
+    wsUrl: API_CONFIG.wsUrl,
+    wsSessionsUrl: API_CONFIG.wsSessionsUrl,
+    gatewayUrl: API_CONFIG.gatewayUrl,
+    timeout: API_CONFIG.timeout,
+    retries: API_CONFIG.retries,
+});

@@ -79,9 +79,9 @@ const Config = {
             <p class="description">选择界面主题</p>
           </div>
           <select id="configTheme">
-            <option value="dark" ${ThemeManager.getTheme() === 'dark' ? 'selected' : ''}>${t('config.theme.dark')}</option>
-            <option value="light" ${ThemeManager.getTheme() === 'light' ? 'selected' : ''}>${t('config.theme.light')}</option>
-            <option value="slate" ${ThemeManager.getTheme() === 'slate' ? 'selected' : ''}>${t('config.theme.slate')}</option>
+            <option value="dark" ${window.ThemeManager.getTheme() === 'dark' ? 'selected' : ''}>${t('config.theme.dark')}</option>
+            <option value="light" ${window.ThemeManager.getTheme() === 'light' ? 'selected' : ''}>${t('config.theme.light')}</option>
+            <option value="slate" ${window.ThemeManager.getTheme() === 'slate' ? 'selected' : ''}>${t('config.theme.slate')}</option>
           </select>
         </div>
 
@@ -119,7 +119,7 @@ const Config = {
     const themeSelect = document.getElementById('configTheme');
     if (themeSelect) {
       themeSelect.addEventListener('change', (e) => {
-        ThemeManager.setTheme(e.target.value);
+        window.ThemeManager.setTheme(e.target.value);
       });
     }
 

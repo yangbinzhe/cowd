@@ -31,7 +31,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener as TokioTcpListener,
-    sync::{mpsc, RwLock},
+    sync::{broadcast, mpsc, RwLock},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
@@ -45,7 +45,7 @@ use api::{
     MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, MessageStream,
     OutputContentBlock, StreamEvent,
 };
-use cc_memory::{
+use memory::{
     cognitive::CognitiveContextManager,
     store::session::SqliteSessionStore,
     types::Message as MemMessage,
@@ -61,6 +61,7 @@ use runtime::{
     MessageRole as SessionMessageRole, Session,
     TokenUsage as RuntimeTokenUsage,
 };
+use tools;
 
 // ── Custom Error Type ──────────────────────────────────────────────────────────
 
@@ -93,8 +94,8 @@ impl From<axum::Error> for ServerError {
     }
 }
 
-impl From<cc_memory::MemoryError> for ServerError {
-    fn from(e: cc_memory::MemoryError) -> Self {
+impl From<memory::MemoryError> for ServerError {
+    fn from(e: memory::MemoryError) -> Self {
         ServerError(e.to_string())
     }
 }
@@ -103,6 +104,20 @@ impl From<serde_json::Error> for ServerError {
     fn from(e: serde_json::Error) -> Self {
         ServerError(e.to_string())
     }
+}
+
+/// Helper function to return a 404 Not Found response
+fn not_found() -> Response {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(Body::from("Not Found"))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap()
+        })
 }
 
 // ── Service Management ─────────────────────────────────────────────────────────
@@ -186,6 +201,26 @@ pub enum PendingReply {
     Stream(mpsc::Sender<SseChunk>),
 }
 
+// ── Session Events for Real-time Sync ───────────────────────────────────────────
+
+/// Session events for WebSocket broadcasting
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data")]
+pub enum SessionEvent {
+    #[serde(rename = "session_created")]
+    SessionCreated { session_id: String, title: Option<String> },
+    #[serde(rename = "session_updated")]
+    SessionUpdated { session_id: String },
+    #[serde(rename = "session_deleted")]
+    SessionDeleted { session_id: String },
+    #[serde(rename = "message_added")]
+    MessageAdded { session_id: String, message_count: u32 },
+    #[serde(rename = "runtime_started")]
+    RuntimeStarted { session_id: String },
+    #[serde(rename = "runtime_finished")]
+    RuntimeFinished { session_id: String },
+}
+
 // ── HTTP Server State ───────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -206,6 +241,8 @@ struct HttpAppState {
     skill_service: Arc<SkillService>,
     /// Platform runtime for multi-channel adapters (Feishu, WeChat, Email)
     platform_runtime: Option<Arc<PlatformRuntime>>,
+    /// Broadcast channel for session events (WebSocket sync)
+    session_broadcast: broadcast::Sender<SessionEvent>,
 }
 
 /// HTTP API 配置
@@ -315,6 +352,7 @@ async fn init_app_state(config: &HttpConfig) -> Result<HttpAppState, ServerError
         request_timeout_secs: 120,
         skill_service: Arc::new(SkillService::new()),
         platform_runtime,
+        session_broadcast: broadcast::channel(100).0,
     })
 }
 
@@ -376,6 +414,7 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/api/workspace/files", post(create_file_handler))
         // WebSocket 端点
         .route("/ws", get(ws_handler))
+        .route("/ws/sessions", get(ws_sessions_handler))
         // 兼容 /v1 前缀 (OpenAI-compatible)
         .route("/v1/chat/completions", post(chat_handler))
         .route("/v1/models", get(models_handler))
@@ -409,10 +448,109 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
 
     // Add WebUI routes if enabled
     if config.with_webui {
+        // Get the directory containing the binary for locating webui assets
+        // Use current working directory as fallback since server should be started from project root
+        let base_dir = if let Ok(cwd) = std::env::current_dir() {
+            cwd.clone()
+        } else {
+            PathBuf::from(".")
+        };
+        let webui_dir = base_dir.join("webui");
+        let assets_dir = webui_dir.join("assets");
+        
+        eprintln!("Serving WebUI from: {}", webui_dir.display());
+        
+        // Create clone for fallback closure
+        let webui_dir_fallback = webui_dir.clone();
+        let assets_dir_fallback = assets_dir.clone();
+        let base_dir_fallback = base_dir.clone();
+        
         // Serve WebUI static files from the webui directory
-        router = router.nest_service("/api", ServeDir::new("webui"));
-        // Also serve static files at root for direct access
-        router = router.nest_service("/static", ServeDir::new("webui"));
+        // Use fallback for root path to avoid conflicts with existing routes
+        router = router.fallback(move |req: Request<Body>| {
+            let webui_dir = webui_dir_fallback.clone();
+            let assets_dir = assets_dir_fallback.clone();
+            let base_dir = base_dir_fallback.clone();
+            async move {
+                let path = req.uri().path().to_string();
+                
+                // Handle root path
+                if path == "/" || path.is_empty() {
+                    let html_path = base_dir.join("webui").join("index.html");
+                    if html_path.exists() {
+                        if let Ok(html) = fs::read_to_string(&html_path) {
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                                .body(Body::from(html))
+                                .unwrap_or_else(|_| not_found());
+                        }
+                    }
+                    return not_found();
+                }
+                
+                // Handle /assets/ paths
+                if path.starts_with("/assets/") || path.starts_with("/static/") {
+                    // Map /static/xxx or /assets/xxx to assets/xxx
+                    let asset_file = path.trim_start_matches("/assets/").trim_start_matches("/static/");
+                    let asset_path = assets_dir.join(asset_file);
+                    if asset_path.exists() && asset_path.is_file() {
+                        let content_type = if asset_file.ends_with(".css") {
+                            "text/css"
+                        } else if asset_file.ends_with(".js") {
+                            "application/javascript"
+                        } else if asset_file.ends_with(".svg") {
+                            "image/svg+xml"
+                        } else if asset_file.ends_with(".png") {
+                            "image/png"
+                        } else {
+                            "application/octet-stream"
+                        };
+                        if let Ok(content) = fs::read(&asset_path) {
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, content_type)
+                                .body(Body::from(content))
+                                .unwrap_or_else(|_| not_found());
+                        }
+                    }
+                    return not_found();
+                }
+                
+                // Handle other static files (css, images, etc.)
+                let file_path = webui_dir.join(path.trim_start_matches("/"));
+                if file_path.exists() && file_path.is_file() {
+                    let content_type = if path.ends_with(".css") {
+                        "text/css"
+                    } else if path.ends_with(".js") {
+                        "application/javascript"
+                    } else if path.ends_with(".html") {
+                        "text/html; charset=utf-8"
+                    } else if path.ends_with(".svg") {
+                        "image/svg+xml"
+                    } else if path.ends_with(".png") {
+                        "image/png"
+                    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+                        "image/jpeg"
+                    } else {
+                        "application/octet-stream"
+                    };
+                    
+                    if let Ok(content) = fs::read(&file_path) {
+                        return Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, content_type)
+                            .body(Body::from(content))
+                            .unwrap_or_else(|_| not_found());
+                    }
+                }
+                
+                not_found()
+            }
+        });
+        
+        // Also serve at /api for compatibility
+        router = router.nest_service("/api", ServeDir::new(&webui_dir));
     }
 
     let app = router.with_state(state);
@@ -474,7 +612,23 @@ fn require_auth<B>(state: &HttpAppState, req: &axum::http::Request<B>) -> Option
 // ── HTTP Handlers - Basic ───────────────────────────────────────────────────────
 
 async fn index_handler() -> axum::response::Response {
-    let html = include_str!("../static/index.html");
+    // Read index.html from webui directory at runtime
+    let base_dir = if let Ok(cwd) = std::env::current_dir() {
+        cwd.clone()
+    } else {
+        PathBuf::from(".")
+    };
+    let html_path = base_dir.join("webui").join("index.html");
+    
+    // Fallback to embedded content if runtime path doesn't exist
+    // Path: crates/rusty-claude-cli/src/ -> ../../../webui/
+    let fallback_html = include_str!("../../../webui/index.html");
+    let html = if html_path.exists() {
+        fs::read_to_string(&html_path).unwrap_or_else(|_| fallback_html.to_string())
+    } else {
+        fallback_html.to_string()
+    };
+    
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -571,7 +725,7 @@ fn build_memory_context_block(prepared: &PreparedContext) -> Option<String> {
 
 /// Convert OpenAI message format to memory Message format.
 fn to_memory_message(role: &str, content: &str) -> MemMessage {
-    use cc_memory::types::MessageRole as MemMsgRole;
+    use memory::types::MessageRole as MemMsgRole;
     let role = match role.to_lowercase().as_str() {
         "user" => MemMsgRole::User,
         "assistant" => MemMsgRole::Assistant,
@@ -767,14 +921,19 @@ impl RuntimeApiClient for OpenAiApiClient {
 
 // ── HTTP Tool Executor Adapter ────────────────────────────────────────────────
 
-/// Simple tool executor adapter for HTTP context - returns "tools not available" message.
+/// Tool executor adapter for HTTP context.
+/// Implements the runtime ToolExecutor trait by delegating to the tools crate.
 struct HttpToolExecutor;
 
 impl ToolExecutor for HttpToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        // For HTTP chat completions, tools are not typically used
-        // Return a placeholder response
-        Ok(format!("Tool '{}' executed (HTTP mode - tools not fully supported)", tool_name))
+        // Parse the input JSON
+        let input_value: serde_json::Value = serde_json::from_str(input)
+            .map_err(|e| ToolError::new(format!("invalid input JSON: {}", e)))?;
+
+        // Call the tools crate execute_tool function
+        tools::execute_tool(tool_name, &input_value)
+            .map_err(|e| ToolError::new(format!("tool execution failed: {}", e)))
     }
 }
 
@@ -870,10 +1029,38 @@ async fn chat_handler(
         // ── SSE Streaming Path via ConversationRuntime ───────────────────
         let (chunk_tx, chunk_rx) = mpsc::channel::<SseChunk>(256);
         let model_clone = model.clone();
+        let cognitive_manager = state.cognitive_manager.clone();
+
+        // Clone user_input for post-processing
+        let user_input_for_mem = user_input.clone();
 
         // Run the conversation turn directly (blocking)
         match runtime.run_turn(user_input, None) {
             Ok(summary) => {
+                // Build messages for memory post-processing
+                let mem_messages: Vec<MemMessage> = summary
+                    .assistant_messages
+                    .iter()
+                    .map(|msg| {
+                        let role = match msg.role {
+                            SessionMessageRole::User => "user",
+                            SessionMessageRole::Assistant => "assistant",
+                            SessionMessageRole::System => "system",
+                            _ => "assistant",
+                        };
+                        let content = msg
+                            .blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                SessionContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        to_memory_message(role, &content)
+                    })
+                    .collect();
+
                 // Stream text from assistant messages
                 for msg in &summary.assistant_messages {
                     for block in &msg.blocks {
@@ -897,6 +1084,23 @@ async fn chat_handler(
                 }
                 // Send [DONE]
                 let _ = chunk_tx.blocking_send(None);
+
+                // ── Post-processing: Memory on_turn_end ────────────────────
+                if let Some(ref mgr) = cognitive_manager {
+                    let mut mem_messages = mem_messages;
+                    // Add user message at the beginning
+                    mem_messages.insert(0, to_memory_message("user", &user_input_for_mem));
+                    tracing::debug!("SSE stream ended, triggering on_turn_end for chat");
+
+                    let mgr_clone = Arc::clone(mgr);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        match mgr_clone.on_turn_end(&mut mem_messages).await {
+                            Ok(_) => tracing::debug!("on_turn_end completed for chat"),
+                            Err(e) => tracing::warn!("on_turn_end failed: {}", e),
+                        }
+                    });
+                }
             }
             Err(e) => {
                 tracing::error!(error = %e, "ConversationRuntime run_turn failed");
@@ -929,6 +1133,9 @@ async fn chat_handler(
             .into_response()
     } else {
         // ── Non-streaming Path via ConversationRuntime ───────────────────
+        let cognitive_manager = state.cognitive_manager.clone();
+        let user_input_for_mem = user_input.clone();
+
         match runtime.run_turn(user_input, None) {
             Ok(summary) => {
                 // Extract text content from all assistant messages
@@ -952,11 +1159,49 @@ async fn chat_handler(
                         index: 0,
                         message: ChatMessageOut {
                             role: "assistant".to_owned(),
-                            content,
+                            content: content.clone(),
                         },
                         finish_reason: "stop".to_owned(),
                     }],
                 };
+
+                // ── Post-processing: Memory on_turn_end ────────────────────
+                if let Some(ref mgr) = cognitive_manager {
+                    let mut mem_messages: Vec<MemMessage> = summary
+                        .assistant_messages
+                        .iter()
+                        .map(|msg| {
+                            let role = match msg.role {
+                                SessionMessageRole::User => "user",
+                                SessionMessageRole::Assistant => "assistant",
+                                SessionMessageRole::System => "system",
+                                _ => "assistant",
+                            };
+                            let text = msg
+                                .blocks
+                                .iter()
+                                .filter_map(|b| match b {
+                                    SessionContentBlock::Text { text } => Some(text.clone()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("");
+                            to_memory_message(role, &text)
+                        })
+                        .collect();
+                    // Add user message at the beginning
+                    mem_messages.insert(0, to_memory_message("user", &user_input_for_mem));
+
+                    tracing::debug!("Non-streaming chat complete, triggering on_turn_end");
+                    let mgr_clone = Arc::clone(mgr);
+                    tokio::spawn(async move {
+                        match mgr_clone.on_turn_end(&mut mem_messages).await {
+                            Ok(_) => tracing::debug!("on_turn_end completed for chat"),
+                            Err(e) => tracing::warn!("on_turn_end failed: {}", e),
+                        }
+                    });
+                }
+
                 Json(resp).into_response()
             }
             Err(e) => {
@@ -1080,7 +1325,13 @@ async fn delete_session_handler(
     Path(session_id): Path<String>,
 ) -> axum::response::Response {
     match state.session_store.delete_session(&session_id) {
-        Ok(_) => Json(serde_json::json!({ "ok": true, "deleted": session_id })).into_response(),
+        Ok(_) => {
+            // Broadcast SessionDeleted event for real-time sync
+            let _ = state.session_broadcast.send(SessionEvent::SessionDeleted {
+                session_id: session_id.clone(),
+            });
+            Json(serde_json::json!({ "ok": true, "deleted": session_id })).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -1285,11 +1536,11 @@ async fn list_memory_entries_handler(
         // If layer specified, list that layer; otherwise list all
         if let Some(layer_str) = &params.layer {
             let layer = match layer_str.as_str() {
-                "L0" | "l0" => cc_memory::types::MemoryLayer::L0,
-                "L1" | "l1" => cc_memory::types::MemoryLayer::L1,
-                "L2" | "l2" => cc_memory::types::MemoryLayer::L2,
-                "L3" | "l3" => cc_memory::types::MemoryLayer::L3,
-                "L4" | "l4" => cc_memory::types::MemoryLayer::L4,
+                "L0" | "l0" => memory::types::MemoryLayer::L0,
+                "L1" | "l1" => memory::types::MemoryLayer::L1,
+                "L2" | "l2" => memory::types::MemoryLayer::L2,
+                "L3" | "l3" => memory::types::MemoryLayer::L3,
+                "L4" | "l4" => memory::types::MemoryLayer::L4,
                 _ => {
                     return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
                         "error": format!("unknown layer: {layer_str}")
@@ -1398,11 +1649,11 @@ async fn create_memory_entry_handler(
     };
 
     let layer = match params.layer.as_str() {
-        "L0" => cc_memory::MemoryLayer::L0,
-        "L1" => cc_memory::MemoryLayer::L1,
-        "L2" => cc_memory::MemoryLayer::L2,
-        "L3" => cc_memory::MemoryLayer::L3,
-        "L4" => cc_memory::MemoryLayer::L4,
+        "L0" => memory::MemoryLayer::L0,
+        "L1" => memory::MemoryLayer::L1,
+        "L2" => memory::MemoryLayer::L2,
+        "L3" => memory::MemoryLayer::L3,
+        "L4" => memory::MemoryLayer::L4,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1412,12 +1663,12 @@ async fn create_memory_entry_handler(
     };
 
     let category = match params.category.as_str() {
-        "UserPreference" => cc_memory::MemoryCategory::UserPreference,
-        "ProjectConvention" => cc_memory::MemoryCategory::ProjectConvention,
-        "Decision" => cc_memory::MemoryCategory::Decision,
-        "Reference" => cc_memory::MemoryCategory::Reference,
-        "Shared" => cc_memory::MemoryCategory::Shared,
-        "CompressedSummary" => cc_memory::MemoryCategory::CompressedSummary,
+        "UserPreference" => memory::MemoryCategory::UserPreference,
+        "ProjectConvention" => memory::MemoryCategory::ProjectConvention,
+        "Decision" => memory::MemoryCategory::Decision,
+        "Reference" => memory::MemoryCategory::Reference,
+        "Shared" => memory::MemoryCategory::Shared,
+        "CompressedSummary" => memory::MemoryCategory::CompressedSummary,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1427,10 +1678,10 @@ async fn create_memory_entry_handler(
     };
 
     let source = match params.source.as_deref() {
-        Some("UserExplicit") | None => cc_memory::MemorySource::UserExplicit,
-        Some("AutoExtracted") => cc_memory::MemorySource::AutoExtracted,
-        Some("Compression") => cc_memory::MemorySource::Compression,
-        Some("Import") => cc_memory::MemorySource::Import,
+        Some("UserExplicit") | None => memory::MemorySource::UserExplicit,
+        Some("AutoExtracted") => memory::MemorySource::AutoExtracted,
+        Some("Compression") => memory::MemorySource::Compression,
+        Some("Import") => memory::MemorySource::Import,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1439,11 +1690,11 @@ async fn create_memory_entry_handler(
         }
     };
 
-    let entry = cc_memory::MemoryEntry {
-        id: cc_memory::MemoryId::new_v4(),
+    let entry = memory::MemoryEntry {
+        id: memory::MemoryId::new_v4(),
         layer,
         category,
-        priority: cc_memory::Priority::Normal,
+        priority: memory::Priority::Normal,
         source,
         title: params.title.unwrap_or_default(),
         content: params.content,
@@ -1487,7 +1738,7 @@ async fn create_handoff_handler(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "memory subsystem not enabled"}))).into_response();
     };
 
-    let handoff_mgr = cc_memory::HandoffManager::new();
+    let handoff_mgr = memory::HandoffManager::new();
     let handoff = match handoff_mgr.create_handoff(
         &params.session_id,
         None,
@@ -1515,12 +1766,12 @@ async fn create_handoff_handler(
         ).into_response();
     }
 
-    let _ = mgr.remember(cc_memory::MemoryEntry {
-        id: cc_memory::MemoryId::new_v4(),
-        layer: cc_memory::MemoryLayer::L1,
-        category: cc_memory::MemoryCategory::Reference,
-        priority: cc_memory::Priority::High,
-        source: cc_memory::MemorySource::UserExplicit,
+    let _ = mgr.remember(memory::MemoryEntry {
+        id: memory::MemoryId::new_v4(),
+        layer: memory::MemoryLayer::L1,
+        category: memory::MemoryCategory::Reference,
+        priority: memory::Priority::High,
+        source: memory::MemorySource::UserExplicit,
         title: format!("Handoff: {}", handoff_id),
         content: handoff.summary.clone(),
         embedding: None,
@@ -1554,7 +1805,7 @@ async fn restore_handoff_handler(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "memory subsystem not enabled"}))).into_response();
     };
 
-    let handoff_mgr = cc_memory::HandoffManager::new();
+    let handoff_mgr = memory::HandoffManager::new();
     match handoff_mgr.load(&params.handoff_id) {
         Ok(Some(handoff)) => {
             Json(serde_json::json!({
@@ -1824,8 +2075,132 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, addr, state))
 }
 
+/// WebSocket handler for session event subscriptions
+/// GET /ws/sessions - Subscribe to session events (created, updated, deleted, messages added)
+async fn ws_sessions_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    AxumState(state): AxumState<HttpAppState>,
+) -> axum::response::Response {
+    ws.on_upgrade(move |socket| handle_ws_sessions(socket, addr, state))
+}
+
+/// Handle WebSocket connections for session event subscriptions
+async fn handle_ws_sessions(
+    mut socket: WebSocket,
+    addr: std::net::SocketAddr,
+    state: HttpAppState,
+) {
+    let subscriber_id = format!("sub-{}", addr);
+    tracing::info!(subscriber_id = %subscriber_id, "Session events WebSocket connected");
+
+    // Subscribe to session events
+    let mut rx = state.session_broadcast.subscribe();
+
+    // Send welcome message with subscription info
+    let welcome = serde_json::json!({
+        "type": "subscribed",
+        "subscriber_id": subscriber_id,
+        "message": "Subscribed to session events. Events: session_created, session_updated, session_deleted, message_added, runtime_started, runtime_finished"
+    });
+    if socket.send(WsMessage::Text(welcome.to_string().into())).await.is_err() {
+        return;
+    }
+
+    // Send initial session list
+    match state.session_store.list_sessions() {
+        Ok(sessions) => {
+            let init_msg = serde_json::json!({
+                "type": "sessions_list",
+                "sessions": sessions.iter().map(|s| {
+                    serde_json::json!({
+                        "session_id": s.session_id,
+                        "platform": s.platform,
+                        "message_count": s.message_count
+                    })
+                }).collect::<Vec<_>>(),
+                "count": sessions.len()
+            });
+            if socket.send(WsMessage::Text(init_msg.to_string().into())).await.is_err() {
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to load session list for subscription");
+        }
+    }
+
+    // Event forwarding loop
+    loop {
+        tokio::select! {
+            // Forward session events to client
+            event = rx.recv() => {
+                match event {
+                    Ok(session_event) => {
+                        let event_json = serde_json::json!({
+                            "type": "session_event",
+                            "event": session_event
+                        });
+                        if socket.send(WsMessage::Text(event_json.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        // Check error type by matching on Debug output
+                        let err_str = format!("{:?}", e);
+                        if err_str.contains("Lagged") {
+                            tracing::warn!("Session event channel lagged, missed events");
+                            let sync_msg = serde_json::json!({
+                                "type": "sync_needed",
+                                "reason": "channel_lagged"
+                            });
+                            if socket.send(WsMessage::Text(sync_msg.to_string().into())).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            // Channel closed
+                            tracing::info!(subscriber_id = %subscriber_id, "Session event channel closed");
+                            break;
+                        }
+                    }
+                }
+            }
+            // Handle client messages (for ping/pong or unsubscribe)
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(WsMessage::Text(t))) => {
+                        let text = t.to_string();
+                        // Handle ping
+                        if text == "ping" {
+                            if socket.send(WsMessage::Text("pong".into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        // Handle unsubscribe
+                        else if text == "unsubscribe" {
+                            let bye = serde_json::json!({
+                                "type": "unsubscribed",
+                                "subscriber_id": subscriber_id
+                            });
+                            let _ = socket.send(WsMessage::Text(bye.to_string().into())).await;
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(_))) | None => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    tracing::info!(subscriber_id = %subscriber_id, "Session events WebSocket disconnected");
+}
+
 async fn handle_ws(mut socket: WebSocket, addr: std::net::SocketAddr, state: HttpAppState) {
     let session_id = format!("ws-{}", addr);
+    let broadcast_tx = state.session_broadcast.clone();
 
     // Send welcome message
     let welcome = WsOutbound {
@@ -2643,7 +3018,7 @@ async fn create_session_handler(
     let now_str = chrono::Utc::now().to_rfc3339();
 
     // Create session record
-    let record = cc_memory::store::session::SessionRecord {
+    let record = memory::store::session::SessionRecord {
         session_id: session_id.clone(),
         platform: "webui".to_string(),
         chat_id: session_id.clone(),
@@ -2662,10 +3037,17 @@ async fn create_session_handler(
         }))).into_response();
     }
 
+    // Broadcast SessionCreated event for real-time sync
+    let title = params.title.clone().unwrap_or_else(|| "新会话".to_string());
+    let _ = state.session_broadcast.send(SessionEvent::SessionCreated {
+        session_id: session_id.clone(),
+        title: Some(title.clone()),
+    });
+
     Json(serde_json::json!({
         "id": session_id,
         "session_id": session_id,
-        "title": params.title.unwrap_or_else(|| "新会话".to_string()),
+        "title": title,
         "model": record.model,
         "created_at": record.created_at,
         "updated_at": record.last_activity,
@@ -2708,7 +3090,6 @@ async fn send_message_handler(
     Path(session_id): Path<String>,
     Json(params): Json<SendMessageParams>,
 ) -> axum::response::Response {
-    let _ = state;
     // For non-streaming, return a simple response
     // In production, this would integrate with the conversation runtime
     let response = serde_json::json!({
@@ -2718,6 +3099,12 @@ async fn send_message_handler(
         "content": format!("收到: {}", params.content),
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "model": "claude-opus-4-6"
+    });
+
+    // Broadcast MessageAdded event for real-time sync
+    let _ = state.session_broadcast.send(SessionEvent::MessageAdded {
+        session_id: session_id.clone(),
+        message_count: 1,
     });
 
     Json(response).into_response()
@@ -2730,19 +3117,26 @@ async fn send_message_stream_handler(
     Path(session_id): Path<String>,
     Json(params): Json<SendMessageParams>,
 ) -> Response {
-    let _ = state;
+    let session_id_clone = session_id.clone();
+    let broadcast_tx = state.session_broadcast.clone();
+    let cognitive_manager = state.cognitive_manager.clone();
 
     let (chunk_tx, chunk_rx) = mpsc::channel::<SseChunk>(256);
     let user_content = params.content.clone();
 
     // Spawn a task to handle the streaming
     tokio::spawn(async move {
+        // Broadcast RuntimeStarted event
+        let _ = broadcast_tx.send(SessionEvent::RuntimeStarted {
+            session_id: session_id_clone.clone(),
+        });
+
         // Simulate streaming response
         let response_text = format!("收到: {}", user_content);
         for chunk in response_text.chars() {
             let sse_data = serde_json::json!({
                 "id": format!("msg-{}", Uuid::new_v4()),
-                "session_id": session_id,
+                "session_id": session_id_clone.clone(),
                 "role": "assistant",
                 "content": chunk.to_string(),
                 "delta": true
@@ -2751,6 +3145,37 @@ async fn send_message_stream_handler(
             tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         }
         let _ = chunk_tx.send(None).await;
+
+        // Broadcast RuntimeFinished and MessageAdded events
+        let _ = broadcast_tx.send(SessionEvent::RuntimeFinished {
+            session_id: session_id_clone.clone(),
+        });
+        let _ = broadcast_tx.send(SessionEvent::MessageAdded {
+            session_id: session_id_clone.clone(),
+            message_count: 1,
+        });
+
+        // ── Post-processing: Memory on_turn_end ─────────────────────────────
+        if let Some(ref mgr) = cognitive_manager {
+            tracing::debug!("SSE stream ended, triggering on_turn_end for session {}", session_id_clone);
+
+            // Build message list for memory processing
+            let user_msg = to_memory_message("user", &user_content);
+            let assistant_msg = to_memory_message("assistant", &response_text);
+            let mut mem_messages = vec![user_msg, assistant_msg];
+
+            // Wait a short moment to ensure SSE is fully sent
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            match mgr.on_turn_end(&mut mem_messages).await {
+                Ok(_) => {
+                    tracing::debug!("on_turn_end completed successfully for session {}", session_id_clone);
+                }
+                Err(e) => {
+                    tracing::warn!("on_turn_end failed for session {}: {}", session_id_clone, e);
+                }
+            }
+        }
     });
 
     let event_stream = ReceiverStream::new(chunk_rx).map(|chunk| {
@@ -2878,10 +3303,10 @@ async fn get_memory_layer_handler(
 ) -> axum::response::Response {
     if let Some(ref mgr) = state.cognitive_manager {
         let memory_layer = match layer.as_str() {
-            "working" => cc_memory::types::MemoryLayer::L1,
-            "personal" => cc_memory::types::MemoryLayer::L2,
-            "project" => cc_memory::types::MemoryLayer::L3,
-            "global" => cc_memory::types::MemoryLayer::L0,
+            "working" => memory::types::MemoryLayer::L1,
+            "personal" => memory::types::MemoryLayer::L2,
+            "project" => memory::types::MemoryLayer::L3,
+            "global" => memory::types::MemoryLayer::L0,
             _ => {
                 return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
                     "error": "Invalid layer. Use: working, personal, project, global"

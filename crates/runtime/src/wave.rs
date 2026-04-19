@@ -428,6 +428,7 @@ impl WaveOrchestrator {
         self.detect_cycles()?;
 
         // Calculate in-degree for each task
+        // For "task B depends on A", the edge is A -> B, so B's in-degree should increase
         let mut in_degree: HashMap<TaskId, usize> = self
             .tasks
             .keys()
@@ -435,10 +436,11 @@ impl WaveOrchestrator {
             .collect();
 
         for task in self.tasks.values() {
-            for dep in &task.dependencies {
-                if let Some(degree) = in_degree.get_mut(dep) {
-                    *degree += 1;
-                }
+            // Each task's in-degree = number of dependencies (how many tasks it waits on)
+            // If task B depends on [A, C], then B has in-degree 2 (waits for 2 tasks)
+            let dep_count = task.dependencies.len();
+            if let Some(degree) = in_degree.get_mut(&task.id) {
+                *degree = dep_count;
             }
         }
 
@@ -748,7 +750,7 @@ impl WaveOrchestrator {
         context: &TaskContext,
         timeout: Duration,
     ) -> Vec<TaskResult> {
-        use std::sync::Arc;
+        
         let mut handles: Vec<tokio::task::JoinHandle<TaskResult>> = Vec::new();
 
         for task_id in task_ids {

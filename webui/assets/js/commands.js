@@ -467,12 +467,12 @@ class CommandManager {
   }
 
   async cmdTheme(args) {
-    const theme = args[0] || themeManager.get();
+    const theme = args[0] || window.ThemeManager.getTheme();
     const themes = ['dark', 'light', 'slate'];
     if (!themes.includes(theme)) {
       return `可用主题: ${themes.join(', ')}`;
     }
-    themeManager.apply(theme);
+    window.ThemeManager.setTheme(theme);
     return `已切换到 ${theme} 主题`;
   }
 

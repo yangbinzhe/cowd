@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-use cc_memory::cognitive::CognitiveContextManager;
-use cc_memory::config::MemoryConfig as CcMemoryConfig;
-use cc_memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
+use memory::cognitive::CognitiveContextManager;
+use memory::config::MemoryConfig as CcMemoryConfig;
+use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 use tracing;
@@ -271,7 +271,7 @@ where
     /// Create a cross-session handoff packet from the current memory state.
     ///
     /// Returns `None` if the memory subsystem is disabled.
-    pub fn create_memory_handoff(&self) -> Option<cc_memory::types::HandoffData> {
+    pub fn create_memory_handoff(&self) -> Option<memory::types::HandoffData> {
         let mgr = self.memory_manager.as_ref()?;
         match mgr.create_handoff() {
             Ok(data) => Some(data),
@@ -283,7 +283,7 @@ where
     }
 
     /// Restore memory state from a previously created handoff packet.
-    pub fn restore_memory_handoff(&self, data: cc_memory::types::HandoffData) {
+    pub fn restore_memory_handoff(&self, data: memory::types::HandoffData) {
         let Some(mgr) = self.memory_manager.as_ref() else {
             return;
         };
@@ -922,7 +922,7 @@ pub fn auto_compaction_threshold_from_env() -> u32 {
 #[doc(alias = "memory")]
 #[doc(alias = "CognitiveContextManager")]
 pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemoryConfig {
-    use cc_memory::config::{BudgetConfig, CompressionConfig, DriftConfig, ExtractorConfig, StoreConfig};
+    use memory::config::{BudgetConfig, CompressionConfig, DriftConfig, ExtractorConfig, StoreConfig};
     use std::path::PathBuf;
 
     let mem = feature_config.memory();
@@ -944,7 +944,7 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
             blob_dir,
             enable_vector_index: mem.vector.enabled,
             cache_capacity: 512,
-            vector: cc_memory::config::VectorConfig {
+            vector: memory::config::VectorConfig {
                 enabled: mem.vector.enabled,
                 model: mem.vector.embedding_model.clone(),
                 api_url: mem.vector.api_url.clone(),
@@ -959,6 +959,7 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
             session_threshold: 10,
             enable_deep_compression: false,
             aggressiveness: 0.5,
+            llm: Default::default(),
         },
         budget: BudgetConfig {
             context_window: 200_000,

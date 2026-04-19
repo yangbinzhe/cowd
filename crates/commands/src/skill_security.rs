@@ -8,7 +8,6 @@
 //! - Data exfiltration patterns
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::path::Path;
 use std::fs;
 

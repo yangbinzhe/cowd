@@ -1099,9 +1099,8 @@ fn generate_skill_name(description: &str) -> String {
 
 // ─── Handoff Command Handler ───────────────────────────────────────────────────
 
-use cc_memory::HandoffManager;
-use cc_memory::types::{HandoffData, WorkItem, WorkItemStatus, Decision, Blocker};
-use chrono::Utc;
+use memory::HandoffManager;
+use memory::types::{HandoffData, WorkItem, WorkItemStatus, Decision, Blocker};
 
 /// Handle /handoff slash command
 pub fn handle_handoff_command(
@@ -1405,7 +1404,7 @@ mod handoff_tests {
     }
 }
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_truncate_content() {

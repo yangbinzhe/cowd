@@ -143,7 +143,7 @@ fn compute_density(text: &str) -> f64 {
     if text.is_empty() {
         return 0.0;
     }
-    let total_chars = text.len();
+    let _total_chars = text.len();
     let non_ws: String = text.chars().filter(|c| !c.is_whitespace()).collect();
     if non_ws.is_empty() {
         return 0.0;

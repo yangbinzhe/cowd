@@ -937,7 +937,7 @@ impl UnifiedConfig {
 
 // ── Convenience Re-exports ───────────────────────────────────────────────────
 
-pub use cc_memory::types::{MemoryEntry, MemoryLayer, Priority};
+pub use memory::types::{MemoryEntry, MemoryLayer, Priority};
 
 /// Simple directory helper for config paths.
 mod dirs {

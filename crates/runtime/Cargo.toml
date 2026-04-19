@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-cc-memory = { path = "../memory" }
+memory = { path = "../memory" }
 async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
@@ -23,6 +23,8 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 telemetry = { path = "../telemetry" }
 walkdir = "2"
+# Email support
+native-tls = "0.2"
 
 [lints]
 workspace = true

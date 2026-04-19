@@ -1,6 +1,6 @@
 //! Platform runtime for managing multiple platform adapters.
 
-use crate::platform::adapter::{InboundMessage, OutboundMessage, Platform, PlatformAdapter, PlatformError};
+use crate::platform::adapter::{InboundMessage, OutboundMessage, PlatformAdapter, PlatformError};
 use crate::platform::config::{PlatformRuntimeConfig, RetryConfig, SessionResetPolicy};
 use crate::platform::types::{PlatformSession, SessionKey};
 use std::collections::HashMap;

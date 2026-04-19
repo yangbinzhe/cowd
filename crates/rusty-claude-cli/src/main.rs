@@ -6,6 +6,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod bootstrap;
 mod init;
 mod input;
 mod render;
@@ -179,6 +180,16 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // 检查是否需要引导配置
+    if bootstrap::needs_bootstrap() {
+        bootstrap::run_bootstrap()?;
+        // 引导完成后询问是否继续启动
+        print!("按 Enter 键启动 Cowd 或 Ctrl+C 退出... ");
+        io::stdout().flush().unwrap();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).ok();
+    }
+
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
         CliAction::DumpManifests {
@@ -252,6 +263,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Serve { host, port, auth_enabled, output_format: _ } => {
+            // 获取默认 session store 路径
+            let session_store_path = if let Ok(cwd) = std::env::current_dir() {
+                let store_dir = cwd.join(".cowd").join("sessions");
+                std::fs::create_dir_all(&store_dir).ok();
+                Some(store_dir.join("sessions.db"))
+            } else {
+                Some(PathBuf::from("/tmp/cowd-sessions.db"))
+            };
+
             let config = server::HttpConfig {
                 host,
                 port,
@@ -259,7 +279,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 auth_token: String::new(),
                 with_webui: true,
                 memory_config: None,
-                session_store_path: None,
+                session_store_path,
                 platform_configs: Vec::new(),
             };
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;

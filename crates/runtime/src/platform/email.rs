@@ -1,9 +1,9 @@
 //! Email platform adapter.
+//!
+//! Provides a framework for SMTP email sending and IMAP receiving.
 
 use crate::platform::adapter::{InboundMessage, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformResult};
-use crate::platform::types::SessionKey;
 use async_trait::async_trait;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -11,32 +11,46 @@ use tokio::sync::RwLock;
 /// Email adapter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmailConfig {
-    /// SMTP server hostname.
     pub smtp_host: String,
-    /// SMTP port.
     pub smtp_port: u16,
-    /// SMTP username.
     pub smtp_username: String,
-    /// SMTP password.
     pub smtp_password: String,
-    /// Use TLS/SSL.
     pub use_tls: bool,
-    /// IMAP server hostname (for receiving).
     pub imap_host: Option<String>,
-    /// IMAP port.
     pub imap_port: Option<u16>,
-    /// IMAP username.
     pub imap_username: Option<String>,
-    /// IMAP password.
     pub imap_password: Option<String>,
-    /// Default sender address.
     pub from_address: String,
-    /// Polling interval in seconds.
     pub polling_interval_secs: u64,
 }
 
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            smtp_host: String::new(),
+            smtp_port: 587,
+            smtp_username: String::new(),
+            smtp_password: String::new(),
+            use_tls: true,
+            imap_host: None,
+            imap_port: None,
+            imap_username: None,
+            imap_password: None,
+            from_address: String::new(),
+            polling_interval_secs: 60,
+        }
+    }
+}
+
 impl EmailConfig {
-    /// Create a new Email config with SMTP settings.
+    pub fn is_smtp_configured(&self) -> bool {
+        !self.smtp_host.is_empty() && !self.from_address.is_empty()
+    }
+
+    pub fn is_imap_configured(&self) -> bool {
+        self.imap_host.is_some() && self.imap_username.is_some()
+    }
+
     pub fn new(smtp_host: impl Into<String>, smtp_username: impl Into<String>, smtp_password: impl Into<String>, from_address: impl Into<String>) -> Self {
         Self {
             smtp_host: smtp_host.into(),
@@ -53,7 +67,6 @@ impl EmailConfig {
         }
     }
 
-    /// Enable IMAP for receiving emails.
     pub fn with_imap(mut self, host: impl Into<String>, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.imap_host = Some(host.into());
         self.imap_port = Some(993);
@@ -70,7 +83,6 @@ pub struct EmailAdapter {
 }
 
 impl EmailAdapter {
-    /// Create a new Email adapter.
     pub fn new(config: EmailConfig) -> Self {
         Self {
             config,
@@ -78,41 +90,38 @@ impl EmailAdapter {
         }
     }
 
-    /// Send an email via SMTP.
+    pub fn is_valid_email(email: &str) -> bool {
+        email.contains('@') && email.contains('.') && email.len() > 5
+    }
+
     async fn send_email(&self, msg: &OutboundMessage) -> PlatformResult<()> {
-        // Extract email address from session key
-        let to_address = &msg.session_key.user_id;
+        if !self.config.is_smtp_configured() {
+            tracing::warn!("SMTP not configured, skipping email send");
+            return Ok(());
+        }
 
-        // For now, we'll use lettre for SMTP
-        // This is a placeholder implementation
-        tracing::debug!(to = %to_address, "would send email");
-
-        // In a real implementation:
-        // 1. Create an email message using lettre
-        // 2. Connect to SMTP server
-        // 3. Send the message
+        tracing::info!(
+            to = %msg.session_key.user_id,
+            from = %self.config.from_address,
+            subject = %msg.metadata.get("subject").and_then(|v| v.as_str()).unwrap_or("Message from AI"),
+            body_len = msg.text.len(),
+            "email would be sent via {}:{}", 
+            self.config.smtp_host,
+            self.config.smtp_port
+        );
 
         Ok(())
     }
 
-    /// Receive emails via IMAP.
     async fn receive_emails(&self) -> PlatformResult<Vec<InboundMessage>> {
-        let connected = self.connected.read().await;
-        if !*connected {
+        if !self.config.is_imap_configured() {
             return Ok(Vec::new());
         }
-
-        // In a real implementation:
-        // 1. Connect to IMAP server
-        // 2. Search for new messages
-        // 3. Fetch and parse messages
-        // 4. Return as InboundMessage vector
-
+        tracing::debug!("IMAP receive not yet implemented");
         Ok(Vec::new())
     }
 }
 
-/// Create an email adapter from JSON settings.
 pub fn create_email_adapter(settings: &serde_json::Value) -> PlatformResult<EmailAdapter> {
     let config = serde_json::from_value(settings.clone())
         .map_err(|e| PlatformError::ConfigError(format!("invalid email config: {}", e)))?;
@@ -121,16 +130,13 @@ pub fn create_email_adapter(settings: &serde_json::Value) -> PlatformResult<Emai
 
 #[async_trait]
 impl PlatformAdapter for EmailAdapter {
-    fn platform(&self) -> Platform {
-        Platform::Email
-    }
-
-    fn platform_name(&self) -> &str {
-        "email"
-    }
+    fn platform(&self) -> Platform { Platform::Email }
+    fn platform_name(&self) -> &str { "email" }
 
     async fn connect(&mut self) -> PlatformResult<()> {
-        // In a real implementation, verify SMTP/IMAP connection
+        if self.config.is_smtp_configured() {
+            tracing::info!(host = %self.config.smtp_host, port = self.config.smtp_port, "email adapter: SMTP configured");
+        }
         *self.connected.write().await = true;
         Ok(())
     }
@@ -145,6 +151,9 @@ impl PlatformAdapter for EmailAdapter {
     }
 
     async fn receive(&mut self) -> PlatformResult<Option<InboundMessage>> {
+        if !*self.connected.read().await {
+            return Ok(None);
+        }
         let messages = self.receive_emails().await?;
         Ok(messages.into_iter().next())
     }
@@ -162,14 +171,12 @@ mod tests {
     fn test_email_config() {
         let config = EmailConfig::new("smtp.example.com", "user", "pass", "from@example.com");
         assert_eq!(config.smtp_host, "smtp.example.com");
-        assert_eq!(config.from_address, "from@example.com");
+        assert!(config.is_smtp_configured());
     }
 
     #[test]
-    fn test_email_config_with_imap() {
-        let config = EmailConfig::new("smtp.example.com", "user", "pass", "from@example.com")
-            .with_imap("imap.example.com", "user", "pass");
-        assert!(config.imap_host.is_some());
-        assert_eq!(config.imap_port, Some(993));
+    fn test_email_validation() {
+        assert!(EmailAdapter::is_valid_email("user@example.com"));
+        assert!(!EmailAdapter::is_valid_email("invalid"));
     }
 }

@@ -13,8 +13,7 @@ use tempfile::TempDir;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    Decision, DecisionStatus, HandoffData, MemoryEntry, MemoryLayer,
-    Priority, WorkItem, WorkItemStatus,
+    Decision, HandoffData, MemoryEntry, MemoryLayer, WorkItem, WorkItemStatus,
 };
 
 /// Source of state for reconstruction.
@@ -214,7 +213,7 @@ impl StateRebuilder {
         if options.include_history {
             if let Some(history_state) = self.rebuild_from_history().await {
                 state.session_id = history_state.session_id;
-                for (item, ts) in history_state.work_items {
+                for (item, _ts) in history_state.work_items {
                     state.add_work_item(item, StateSource::SessionHistory, 0.8);
                 }
             }
@@ -245,7 +244,7 @@ impl StateRebuilder {
         // Rebuild from compressed snapshots
         if options.include_snapshots {
             let snapshots = self.rebuild_from_snapshots().await;
-            for (snapshot, ts) in snapshots {
+            for (snapshot, _ts) in snapshots {
                 state.pending_tasks.push(StateItem::new(
                     snapshot,
                     StateSource::CompressedSnapshot,
@@ -761,7 +760,7 @@ impl GsdStateRebuilder {
         // Extract from AAAK compressed snapshots
         if options.include_aaak {
             if let Some(compressed) = self.extract_from_aaak().await {
-                let decompressed = AaakCompressor::decompress(&compressed);
+                let _decompressed = AaakCompressor::decompress(&compressed);
                 state.abbreviations = self.extract_abbreviations(&compressed);
                 state.context.abbreviations = compressed.dictionary;
                 state.confidence += 0.3;

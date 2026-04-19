@@ -1,4 +1,4 @@
-//! `cc-memory` – unified memory framework for the claw AI assistant.
+//! `memory` – unified memory framework for the claw AI assistant.
 //!
 //! # Architecture
 //!
@@ -11,7 +11,7 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use cc_memory::{MemoryOrchestrator, MemoryConfig};
+//! use memory::{MemoryOrchestrator, MemoryConfig};
 //!
 //! #[tokio::main]
 //! async fn main() {

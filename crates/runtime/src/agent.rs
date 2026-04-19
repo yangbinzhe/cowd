@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::tool_orchestrator::{ToolResultBudget, TruncationStrategy};
+use crate::tool_orchestrator::ToolResultBudget;
 
 // ---------------------------------------------------------------------------
 // SubAgentConfig
