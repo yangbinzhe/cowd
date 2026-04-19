@@ -209,6 +209,26 @@ function updateAllTranslations() {
   });
 }
 
+// I18n Instance
+class I18nInstance {
+  constructor() {
+    this.currentLocale = 'zh-CN';
+  }
+
+  setLocale(locale) {
+    this.currentLocale = locale;
+    updateAllTranslations();
+  }
+
+  t(key) {
+    return t(key);
+  }
+
+  updateAll() {
+    updateAllTranslations();
+  }
+}
+
 // Export for use in other modules
 window.i18n = {
   t,
@@ -216,3 +236,6 @@ window.i18n = {
   setLanguage,
   updateAllTranslations
 };
+
+// Create global instance
+window.i18nInstance = new I18nInstance();

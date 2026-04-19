@@ -586,3 +586,6 @@ const commandManager = new CommandManager();
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { CommandManager, commandManager };
 }
+
+// Export to window
+window.commandManager = commandManager;

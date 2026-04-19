@@ -75,3 +75,4 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Export
 window.Panels = Panels;
+window.panelManager = Panels;

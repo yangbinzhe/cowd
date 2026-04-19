@@ -78,7 +78,7 @@ class App {
       messageInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
-          chatInput.send();
+          window.Messages.send();
         }
       });
     }

@@ -397,10 +397,11 @@ const Messages = {
   }
 };
 
-// Initialize when DOM is ready
+// Initialize When DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
   Messages.init();
 });
 
 // Export
 window.Messages = Messages;
+window.messageRenderer = Messages;

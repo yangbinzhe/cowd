@@ -200,5 +200,6 @@ const Toast = {
 // ═══════════════════════════════════════════════════════════════════════════
 
 window.state = new AppState();
+window.appState = window.state;
 window.ThemeManager = ThemeManager;
 window.Toast = Toast;

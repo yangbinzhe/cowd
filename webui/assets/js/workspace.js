@@ -446,3 +446,6 @@ const workspaceManager = new WorkspaceManager();
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { WorkspaceManager, workspaceManager };
 }
+
+// Export to window
+window.workspaceManager = workspaceManager;
