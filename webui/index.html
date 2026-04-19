@@ -24,30 +24,32 @@
     <!-- 登录模态框 -->
     <div class="modal" id="loginModal">
       <div class="modal-content">
-        <div class="modal-header">
-          <svg class="modal-logo" viewBox="0 0 32 32" width="48" height="48">
-            <defs>
-              <linearGradient id="logoBg" x1="0%" y1="0%" x2="100%" y2="100%">
-                <stop offset="0%" style="stop-color:#e94560"/>
-                <stop offset="100%" style="stop-color:#16213e"/>
-              </linearGradient>
-            </defs>
-            <rect width="32" height="32" rx="6" fill="url(#logoBg)"/>
-            <text x="16" y="22" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="white" text-anchor="middle">C</text>
-          </svg>
-          <h2>登录 Cowd</h2>
-        </div>
-        <div class="form-group">
-          <label for="loginToken">访问令牌</label>
-          <input type="password" id="loginToken" placeholder="输入访问令牌..." autocomplete="current-password">
-        </div>
-        <div class="error-message" id="loginError"></div>
-        <div class="form-actions">
-          <button class="btn primary" id="loginBtn">登录</button>
-        </div>
-        <div class="modal-footer">
-          <p>通过设置中的令牌管理生成访问令牌</p>
-        </div>
+        <form id="loginForm">
+          <div class="modal-header">
+            <svg class="modal-logo" viewBox="0 0 32 32" width="48" height="48">
+              <defs>
+                <linearGradient id="logoBg" x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" style="stop-color:#e94560"/>
+                  <stop offset="100%" style="stop-color:#16213e"/>
+                </linearGradient>
+              </defs>
+              <rect width="32" height="32" rx="6" fill="url(#logoBg)"/>
+              <text x="16" y="22" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="white" text-anchor="middle">C</text>
+            </svg>
+            <h2>登录 Cowd</h2>
+          </div>
+          <div class="form-group">
+            <label for="tokenInput">访问令牌</label>
+            <input type="password" id="tokenInput" placeholder="输入访问令牌..." autocomplete="current-password">
+          </div>
+          <div class="error-message" id="loginError"></div>
+          <div class="form-actions">
+            <button class="btn primary" type="submit" id="loginBtn">登录</button>
+          </div>
+          <div class="modal-footer">
+            <p>通过设置中的令牌管理生成访问令牌</p>
+          </div>
+        </form>
       </div>
     </div>
 
