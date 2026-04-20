@@ -490,6 +490,48 @@ impl CognitiveContextManager {
         self.orchestrator.forget(&mem_id).await
     }
 
+    /// Update a memory entry's content, tags, and/or priority.
+    pub async fn update_entry(
+        &self,
+        id: &str,
+        content: Option<String>,
+        tags: Option<Vec<String>>,
+        priority: Option<crate::types::Priority>,
+    ) -> Result<()> {
+        let mem_id = match uuid::Uuid::try_parse(id) {
+            Ok(id) => id,
+            Err(_) => {
+                return Err(crate::MemoryError::InvalidArgument(format!("invalid memory id: {id}")));
+            }
+        };
+
+        let mut entry = self.orchestrator.recall(&mem_id).await?
+            .ok_or_else(|| crate::MemoryError::Store(format!("entry {} not found", id)))?;
+
+        // Write guard check
+        let policy = self.check_write_access(entry.layer);
+        if !policy.is_allowed() {
+            return Err(MemoryError::WriteDenied {
+                layer: format!("{:?}", entry.layer),
+                write_source: self.write_guard.as_ref().map(|g| format!("{:?}", g.source())).unwrap_or_default(),
+            });
+        }
+
+        if let Some(c) = content {
+            entry.content = c;
+        }
+        if let Some(t) = tags {
+            entry.tags = t;
+        }
+        if let Some(p) = priority {
+            entry.priority = p;
+        }
+        entry.updated_at = chrono::Utc::now();
+        entry.staleness = 0.0;
+
+        self.orchestrator.update(&entry).await
+    }
+
     /// List all layers with their entry counts.
     pub async fn list_layers(&self) -> Vec<serde_json::Value> {
         use crate::types::MemoryLayer;

@@ -3,11 +3,16 @@
 //!
 //! Provides TeamCreate/Delete and CronCreate/Delete/List runtime backing
 //! to replace the stub implementations in the tools crate.
+//!
+//! P1-5 enhancement: 4 schedule formats (Relative/Interval/Cron/Timestamp),
+//! grace window, inactivity timeout, next_run_at computation, async scheduler loop.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 
 fn now_secs() -> u64 {
@@ -226,6 +231,434 @@ impl CronRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Enable a cron entry (resume).
+    pub fn enable(&self, cron_id: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().expect("cron registry lock poisoned");
+        let entry = inner
+            .entries
+            .get_mut(cron_id)
+            .ok_or_else(|| format!("cron not found: {cron_id}"))?;
+        entry.enabled = true;
+        entry.updated_at = now_secs();
+        Ok(())
+    }
+
+    /// Update an existing cron entry's schedule or prompt.
+    pub fn update(&self, cron_id: &str, schedule: Option<&str>, prompt: Option<&str>) -> Result<CronEntry, String> {
+        let mut inner = self.inner.lock().expect("cron registry lock poisoned");
+        let entry = inner
+            .entries
+            .get_mut(cron_id)
+            .ok_or_else(|| format!("cron not found: {cron_id}"))?;
+        if let Some(s) = schedule {
+            entry.schedule = s.to_owned();
+        }
+        if let Some(p) = prompt {
+            entry.prompt = p.to_owned();
+        }
+        entry.updated_at = now_secs();
+        Ok(entry.clone())
+    }
+}
+
+// ── P1-5: Enhanced Cron Scheduler ────────────────────────────────────────────
+
+/// Flexible schedule format (borrowed from hermes scheduler).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "value")]
+pub enum ScheduleFormat {
+    /// "30m" - one-shot, 30 minutes from now
+    Relative(String),
+    /// "every 2h" - recurring interval
+    Interval(String),
+    /// "0 9 * * *" - standard 5-field cron expression
+    Cron(String),
+    /// ISO8601 timestamp for exact execution time
+    Timestamp(String),
+}
+
+impl std::fmt::Display for ScheduleFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Relative(s) => write!(f, "{}", s),
+            Self::Interval(s) => write!(f, "every {}", s),
+            Self::Cron(s) => write!(f, "{}", s),
+            Self::Timestamp(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+/// Enhanced cron job with grace window and next_run_at (P1-5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronJob {
+    pub id: String,
+    pub name: String,
+    pub schedule: ScheduleFormat,
+    pub prompt: String,
+    pub enabled: bool,
+    pub last_run_at: Option<String>,   // ISO8601
+    pub next_run_at: Option<String>,   // ISO8601
+    pub grace_window_secs: u64,        // Grace window (borrowed from hermes)
+    pub run_count: u64,
+    pub created_at: String,            // ISO8601
+    pub updated_at: String,            // ISO8601
+}
+
+/// Parse a schedule string into ScheduleFormat.
+pub fn parse_schedule(input: &str) -> Result<ScheduleFormat, String> {
+    let trimmed = input.trim();
+
+    // Try ISO8601 timestamp first: "2026-04-20T09:00:00Z" or "2026-04-20 09:00:00"
+    if trimmed.contains('T') || (trimmed.len() >= 16 && trimmed.chars().filter(|c| *c == '-' || *c == ':').count() >= 3) {
+        if DateTime::parse_from_rfc3339(trimmed).is_ok() || chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S").is_ok() || chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S").is_ok() {
+            return Ok(ScheduleFormat::Timestamp(trimmed.to_string()));
+        }
+    }
+
+    // "every Xh/Xm/Xs" → Interval
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("every ") {
+        let dur_str = trimmed.strip_prefix("every ").unwrap_or("").trim();
+        if parse_duration_secs(dur_str).is_some() {
+            return Ok(ScheduleFormat::Interval(dur_str.to_string()));
+        }
+        return Err(format!("Invalid interval format: '{}'. Use e.g. 'every 2h', 'every 30m'", dur_str));
+    }
+
+    // Standard cron: 5 fields separated by spaces
+    let fields: Vec<&str> = trimmed.split_whitespace().collect();
+    if fields.len() == 5 {
+        // Basic validation: each field should be a valid cron token
+        let valid_chars = fields.iter().all(|f| {
+            f.chars().all(|c| c.is_ascii_digit() || c == '*' || c == ',' || c == '-' || c == '/' || c == '?')
+        });
+        if valid_chars {
+            return Ok(ScheduleFormat::Cron(trimmed.to_string()));
+        }
+    }
+
+    // Relative: "30m", "2h", "1d" → one-shot
+    if parse_duration_secs(trimmed).is_some() {
+        return Ok(ScheduleFormat::Relative(trimmed.to_string()));
+    }
+
+    Err(format!(
+        "Cannot parse schedule: '{}'. Use: '30m' (relative), 'every 2h' (interval), '0 9 * * *' (cron), or ISO timestamp",
+        trimmed
+    ))
+}
+
+/// Parse a human duration string ("30m", "2h", "1d", "90s") into seconds.
+pub fn parse_duration_secs(input: &str) -> Option<u64> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+
+    // Try number+unit pairs: "2h30m", "1d12h"
+    let mut total: u64 = 0;
+    let mut num_buf = String::new();
+    let mut parsed_something = false;
+
+    for ch in input.chars() {
+        if ch.is_ascii_digit() {
+            num_buf.push(ch);
+        } else {
+            let num: u64 = num_buf.parse().ok()?;
+            num_buf.clear();
+            match ch {
+                's' => total += num,
+                'm' => total += num * 60,
+                'h' => total += num * 3600,
+                'd' => total += num * 86400,
+                'w' => total += num * 86400 * 7,
+                _ => return None,
+            }
+            parsed_something = true;
+        }
+    }
+
+    if parsed_something && num_buf.is_empty() {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+/// Compute the next run time for a schedule, starting from `from`.
+pub fn compute_next_run(schedule: &ScheduleFormat, from: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    match schedule {
+        ScheduleFormat::Relative(dur_str) => {
+            // One-shot: from + duration
+            let secs = parse_duration_secs(dur_str)?;
+            Some(from + ChronoDuration::seconds(secs as i64))
+        }
+        ScheduleFormat::Interval(dur_str) => {
+            // Recurring: from + interval
+            let secs = parse_duration_secs(dur_str)?;
+            Some(from + ChronoDuration::seconds(secs as i64))
+        }
+        ScheduleFormat::Cron(expr) => {
+            // Simplified cron: parse the 5-field expression
+            compute_next_cron(expr, from)
+        }
+        ScheduleFormat::Timestamp(ts_str) => {
+            // Exact timestamp
+            if let Ok(dt) = ts_str.parse::<DateTime<Utc>>() {
+                if dt > from { Some(dt) } else { None }
+            } else if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S") {
+                let dt = DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc);
+                if dt > from { Some(dt) } else { None }
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Simplified cron next-run computation.
+/// Supports: minute hour day-of-month month day-of-week
+/// Each field: *, specific values, ranges (1-5), steps (*/5)
+fn compute_next_cron(expr: &str, from: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return None;
+    }
+
+    let minute = cron_field_values(fields[0], 0, 59)?;
+    let hour = cron_field_values(fields[1], 0, 23)?;
+    let day_of_month = cron_field_values(fields[2], 1, 31)?;
+    let month = cron_field_values(fields[3], 1, 12)?;
+    let day_of_week = cron_field_values(fields[4], 0, 6)?;
+
+    // Search for next matching time, up to 366 days ahead
+    let mut candidate = from + ChronoDuration::minutes(1);
+    candidate = candidate.with_second(0)?.with_nanosecond(0)?;
+
+    let limit = from + ChronoDuration::days(366);
+    while candidate < limit {
+        if !month.contains(&(candidate.month() as u8)) {
+            candidate = candidate.with_day(1)?
+                + ChronoDuration::days(31); // Skip to next month
+            continue;
+        }
+        if !day_of_month.contains(&(candidate.day() as u8)) {
+            candidate = candidate + ChronoDuration::days(1);
+            candidate = candidate.with_hour(0)?.with_minute(0)?;
+            continue;
+        }
+        if !day_of_week.contains(&(candidate.weekday().num_days_from_sunday() as u8)) {
+            candidate = candidate + ChronoDuration::days(1);
+            candidate = candidate.with_hour(0)?.with_minute(0)?;
+            continue;
+        }
+        if !hour.contains(&(candidate.hour() as u8)) {
+            candidate = candidate + ChronoDuration::hours(1);
+            candidate = candidate.with_minute(0)?;
+            continue;
+        }
+        if !minute.contains(&(candidate.minute() as u8)) {
+            candidate = candidate + ChronoDuration::minutes(1);
+            continue;
+        }
+
+        // All fields match
+        return Some(candidate);
+    }
+
+    None
+}
+
+/// Expand a cron field (e.g. "*/5", "1-5", "0,30") into a set of matching values.
+fn cron_field_values(field: &str, min: u8, max: u8) -> Option<Vec<u8>> {
+    let mut values = Vec::new();
+
+    for part in field.split(',') {
+        if part == "*" || part == "?" {
+            values.extend(min..=max);
+        } else if part.contains('/') {
+            let parts: Vec<&str> = part.split('/').collect();
+            if parts.len() != 2 { return None; }
+            let step: u8 = parts[1].parse().ok()?;
+            let base: Vec<u8> = if parts[0] == "*" {
+                (min..=max).collect()
+            } else {
+                cron_field_values(parts[0], min, max)?
+            };
+            let start = *base.first()?;
+            values.extend((start..=max).step_by(step as usize));
+        } else if part.contains('-') {
+            let parts: Vec<&str> = part.split('-').collect();
+            if parts.len() != 2 { return None; }
+            let start: u8 = parts[0].parse().ok()?;
+            let end: u8 = parts[1].parse().ok()?;
+            values.extend(start..=end);
+        } else {
+            let val: u8 = part.parse().ok()?;
+            values.push(val);
+        }
+    }
+
+    values.sort();
+    values.dedup();
+    Some(values)
+}
+
+/// Async cron scheduler with persistence.
+pub struct CronScheduler {
+    jobs: Arc<tokio::sync::RwLock<Vec<CronJob>>>,
+    storage_path: PathBuf,
+}
+
+impl CronScheduler {
+    pub fn new(storage_path: PathBuf) -> Self {
+        let jobs = Self::load_from_disk(&storage_path).unwrap_or_default();
+        Self {
+            jobs: Arc::new(tokio::sync::RwLock::new(jobs)),
+            storage_path,
+        }
+    }
+
+    /// Load cron jobs from JSON file.
+    fn load_from_disk(path: &PathBuf) -> Result<Vec<CronJob>, String> {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let jobs: Vec<CronJob> = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        Ok(jobs)
+    }
+
+    /// Save cron jobs to JSON file.
+    async fn save_to_disk(&self) -> Result<(), String> {
+        let jobs = self.jobs.read().await;
+        let content = serde_json::to_string_pretty(&*jobs).map_err(|e| e.to_string())?;
+        // Ensure parent directory exists
+        if let Some(parent) = self.storage_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&self.storage_path, content).map_err(|e| e.to_string())
+    }
+
+    /// Create a new cron job.
+    pub async fn create_job(&self, name: &str, schedule: &str, prompt: &str, grace_window_secs: u64) -> Result<CronJob, String> {
+        let sched = parse_schedule(schedule)?;
+        let now = Utc::now();
+        let next_run = compute_next_run(&sched, now);
+
+        let job = CronJob {
+            id: format!("cron_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]),
+            name: name.to_string(),
+            schedule: sched,
+            prompt: prompt.to_string(),
+            enabled: true,
+            last_run_at: None,
+            next_run_at: next_run.map(|dt| dt.to_rfc3339()),
+            grace_window_secs,
+            run_count: 0,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        };
+
+        self.jobs.write().await.push(job.clone());
+        self.save_to_disk().await?;
+        Ok(job)
+    }
+
+    /// List all cron jobs.
+    pub async fn list_jobs(&self) -> Vec<CronJob> {
+        self.jobs.read().await.clone()
+    }
+
+    /// Get a single cron job by ID.
+    pub async fn get_job(&self, id: &str) -> Option<CronJob> {
+        let jobs = self.jobs.read().await;
+        jobs.iter().find(|j| j.id == id).cloned()
+    }
+
+    /// Delete a cron job.
+    pub async fn delete_job(&self, id: &str) -> Result<CronJob, String> {
+        let mut jobs = self.jobs.write().await;
+        let idx = jobs.iter().position(|j| j.id == id)
+            .ok_or_else(|| format!("cron not found: {id}"))?;
+        let removed = jobs.remove(idx);
+        drop(jobs);
+        self.save_to_disk().await?;
+        Ok(removed)
+    }
+
+    /// Pause (disable) a cron job.
+    pub async fn pause_job(&self, id: &str) -> Result<CronJob, String> {
+        let mut jobs = self.jobs.write().await;
+        let job = jobs.iter_mut().find(|j| j.id == id)
+            .ok_or_else(|| format!("cron not found: {id}"))?;
+        job.enabled = false;
+        job.updated_at = Utc::now().to_rfc3339();
+        let result = job.clone();
+        drop(jobs);
+        self.save_to_disk().await?;
+        Ok(result)
+    }
+
+    /// Resume (enable) a cron job.
+    pub async fn resume_job(&self, id: &str) -> Result<CronJob, String> {
+        let mut jobs = self.jobs.write().await;
+        let job = jobs.iter_mut().find(|j| j.id == id)
+            .ok_or_else(|| format!("cron not found: {id}"))?;
+        job.enabled = true;
+        job.updated_at = Utc::now().to_rfc3339();
+        // Recompute next_run_at
+        job.next_run_at = compute_next_run(&job.schedule, Utc::now()).map(|dt| dt.to_rfc3339());
+        let result = job.clone();
+        drop(jobs);
+        self.save_to_disk().await?;
+        Ok(result)
+    }
+
+    /// Record a run (manual or scheduled).
+    pub async fn record_run(&self, id: &str) -> Result<CronJob, String> {
+        let mut jobs = self.jobs.write().await;
+        let job = jobs.iter_mut().find(|j| j.id == id)
+            .ok_or_else(|| format!("cron not found: {id}"))?;
+        let now = Utc::now();
+        job.last_run_at = Some(now.to_rfc3339());
+        job.run_count += 1;
+        job.updated_at = now.to_rfc3339();
+        // Compute next run
+        job.next_run_at = compute_next_run(&job.schedule, now).map(|dt| dt.to_rfc3339());
+        let result = job.clone();
+        drop(jobs);
+        self.save_to_disk().await?;
+        Ok(result)
+    }
+
+    /// Check which jobs are due for execution.
+    pub async fn get_due_jobs(&self) -> Vec<CronJob> {
+        let now = Utc::now();
+        let jobs = self.jobs.read().await;
+        jobs.iter()
+            .filter(|j| {
+                if !j.enabled {
+                    return false;
+                }
+                if let Some(next_str) = &j.next_run_at {
+                    if let Ok(next) = next_str.parse::<DateTime<Utc>>() {
+                        if now >= next {
+                            // Grace window check
+                            if let Some(last_str) = &j.last_run_at {
+                                if let Ok(last) = last_str.parse::<DateTime<Utc>>() {
+                                    if last + ChronoDuration::seconds(j.grace_window_secs as i64) > now {
+                                        return false;
+                                    }
+                                }
+                            }
+                            return true;
+                        }
+                    }
+                }
+                false
+            })
+            .cloned()
+            .collect()
     }
 }
 

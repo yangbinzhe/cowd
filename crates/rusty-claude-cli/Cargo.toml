@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 api = { path = "../api" }
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.7", features = ["ws", "multipart"] }
 memory = { path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
 commands = { path = "../commands" }

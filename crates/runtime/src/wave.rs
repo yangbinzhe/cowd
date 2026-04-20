@@ -219,6 +219,24 @@ pub struct WaveResult {
     pub error: Option<String>,
 }
 
+/// Error recovery policy for wave execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorPolicy {
+    /// Retry failed tasks up to a limit before giving up.
+    Retry { max_retries: usize },
+    /// Skip failed tasks and continue with remaining waves.
+    Skip,
+    /// Abort the entire plan on first failure.
+    Abort,
+}
+
+impl Default for ErrorPolicy {
+    fn default() -> Self {
+        ErrorPolicy::Skip
+    }
+}
+
 /// Wave execution configuration.
 #[derive(Debug, Clone)]
 pub struct WaveConfig {
@@ -232,6 +250,8 @@ pub struct WaveConfig {
     pub task_timeout_ms: u64,
     /// Timeout per wave in milliseconds.
     pub wave_timeout_ms: u64,
+    /// Error recovery policy.
+    pub error_policy: ErrorPolicy,
 }
 
 impl Default for WaveConfig {
@@ -242,6 +262,7 @@ impl Default for WaveConfig {
             stop_on_wave_failure: false,
             task_timeout_ms: 300000, // 5 minutes
             wave_timeout_ms: 1800000, // 30 minutes
+            error_policy: ErrorPolicy::default(),
         }
     }
 }
@@ -274,6 +295,12 @@ impl WaveConfig {
     /// Set wave timeout.
     pub fn with_wave_timeout(mut self, timeout_ms: u64) -> Self {
         self.wave_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Set error recovery policy.
+    pub fn with_error_policy(mut self, policy: ErrorPolicy) -> Self {
+        self.error_policy = policy;
         self
     }
 }
@@ -666,7 +693,7 @@ impl WaveOrchestrator {
         Ok(wave_results)
     }
 
-    /// Execute a single wave with parallel task execution.
+    /// Execute a single wave with parallel task execution and error recovery.
     async fn execute_wave(
         &self,
         executor: std::sync::Arc<dyn WaveExecutor>,
@@ -696,7 +723,6 @@ impl WaveOrchestrator {
         for chunk in tasks.chunks(max_parallel) {
             // Check cancellation
             if state.is_cancelled().await {
-                // Mark remaining tasks as cancelled
                 for task_id in chunk {
                     let result = TaskResult {
                         task_id: task_id.clone(),
@@ -711,7 +737,6 @@ impl WaveOrchestrator {
                 continue;
             }
 
-            // Execute chunk in parallel
             let chunk_results = self
                 .execute_task_chunk(executor.clone(), chunk, &context, task_timeout)
                 .await;
@@ -724,9 +749,68 @@ impl WaveOrchestrator {
                 state.record_result(result);
             }
 
-            // Check if we should stop due to failure
             if failed && self.config.stop_on_wave_failure {
                 break;
+            }
+        }
+
+        // Apply error recovery policy for failed tasks
+        let failed_tasks: Vec<(TaskId, Option<String>)> = task_results
+            .iter()
+            .filter(|r| !r.success)
+            .map(|r| (r.task_id.clone(), r.error.clone()))
+            .collect();
+
+        if !failed_tasks.is_empty() {
+            match &self.config.error_policy {
+                ErrorPolicy::Retry { max_retries } => {
+                    tracing::info!(
+                        wave = wave.number,
+                        failed = failed_tasks.len(),
+                        max_retries = max_retries,
+                        "applying retry policy for failed tasks"
+                    );
+                    let retry_results = self
+                        .retry_failed_tasks(
+                            executor.clone(),
+                            &failed_tasks,
+                            &context,
+                            task_timeout,
+                            *max_retries,
+                        )
+                        .await;
+
+                    // Replace failed results with retry results
+                    let failed_ids: std::collections::HashSet<TaskId> =
+                        failed_tasks.iter().map(|(id, _)| id.clone()).collect();
+                    task_results.retain(|r| !failed_ids.contains(&r.task_id));
+                    for result in retry_results {
+                        state.record_result(result.clone());
+                        task_results.push(result);
+                    }
+                }
+                ErrorPolicy::Skip => {
+                    tracing::info!(
+                        wave = wave.number,
+                        skipped = failed_tasks.len(),
+                        "skipping failed tasks and continuing"
+                    );
+                }
+                ErrorPolicy::Abort => {
+                    tracing::warn!(
+                        wave = wave.number,
+                        failed = failed_tasks.len(),
+                        "aborting execution due to failed tasks"
+                    );
+                    let duration_ms = start_time.elapsed().as_millis() as u64;
+                    return WaveResult {
+                        wave_number: wave.number,
+                        success: false,
+                        task_results,
+                        duration_ms,
+                        error: Some(format!("{} tasks failed, aborting", failed_tasks.len())),
+                    };
+                }
             }
         }
 
@@ -826,6 +910,59 @@ impl WaveOrchestrator {
     /// Get wave status.
     pub fn get_wave_status(state: &WaveExecutionState, wave_number: u32) -> Option<WaveStatus> {
         state.wave_statuses.get(&wave_number).copied()
+    }
+
+    /// Retry failed tasks within a wave according to ErrorPolicy::Retry.
+    async fn retry_failed_tasks(
+        &self,
+        executor: std::sync::Arc<dyn WaveExecutor>,
+        failed_tasks: &[(TaskId, Option<String>)],
+        context: &TaskContext,
+        task_timeout: Duration,
+        max_retries: usize,
+    ) -> Vec<TaskResult> {
+        let mut retry_results = Vec::new();
+
+        for attempt in 1..=max_retries {
+            if failed_tasks.is_empty() {
+                break;
+            }
+
+            tracing::info!(
+                attempt = attempt,
+                failed_count = failed_tasks.len(),
+                "retrying failed tasks"
+            );
+
+            let retry_ids: Vec<TaskId> = failed_tasks.iter().map(|(id, _)| id.clone()).collect();
+            let chunk_results = self
+                .execute_task_chunk(executor.clone(), &retry_ids, context, task_timeout)
+                .await;
+
+            let mut still_failing = Vec::new();
+            for result in chunk_results {
+                if result.success {
+                    retry_results.push(result);
+                } else {
+                    still_failing.push((result.task_id.clone(), result.error.clone()));
+                    retry_results.push(result);
+                }
+            }
+
+            if still_failing.is_empty() {
+                break;
+            }
+
+            if attempt >= max_retries {
+                tracing::warn!(
+                    attempts = max_retries,
+                    failed_count = still_failing.len(),
+                    "retry limit exhausted, some tasks remain failed"
+                );
+            }
+        }
+
+        retry_results
     }
 }
 

@@ -9,7 +9,7 @@ pub mod doc;
 pub mod rules;
 
 // Re-export types from sibling modules
-pub use adapter::{FeishuAdapter, FeishuConfig};
+pub use adapter::{FeishuAdapter, FeishuConfig, CardAction};
 pub use comment::{CommentHandler, CommentStatus, FeishuComment, CreateCommentRequest, ReplyCommentRequest, UpdateCommentRequest, CommentFilter};
 pub use doc::{DocumentClient, DocumentContent, DocumentMetadata, DocumentType, DocumentElement, SearchDocumentsRequest, SearchResult, SearchDocumentsResponse};
 pub use rules::{RulesEngine, RoutingRule, RuleCondition, RuleAction, RuleMatch};

@@ -54,4 +54,30 @@ fn main() {
     // Rerun if git state changes
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
+
+    // Copy webui/ → static/ so the embedded frontend stays in sync
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let webui_dir = std::path::Path::new(&manifest_dir).join("../../webui");
+    let static_dir = std::path::Path::new(&manifest_dir).join("static");
+
+    if webui_dir.exists() {
+        copy_dir_recursive(&webui_dir, &static_dir);
+        println!("cargo:rerun-if-changed=../../webui");
+    }
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst).ok();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if src_path.is_dir() {
+                copy_dir_recursive(&src_path, &dst_path);
+            } else {
+                std::fs::copy(&src_path, &dst_path).ok();
+            }
+        }
+    }
 }

@@ -41,6 +41,7 @@ pub mod recovery_recipes;
 mod remote;
 pub mod sandbox;
 mod session;
+pub use session::workspace_sessions_dir;
 pub mod session_control;
 pub use session_control::SessionStore;
 mod sse;
@@ -56,6 +57,8 @@ mod usage;
 pub mod worker_boot;
 pub mod tool_orchestrator;
 pub mod agent;
+pub mod pairing;
+pub mod mirror;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
@@ -79,7 +82,7 @@ pub use config_validate::{
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
     build_cc_memory_config, ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor,
-    ToolError, ToolExecutor, TurnSummary,
+    ToolCallback, ToolError, ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
@@ -96,7 +99,7 @@ pub use gates::{
     ViolationType,
 };
 pub use wave::{
-    DependencyGraph, TaskContext, TaskId, TaskResult, TaskStatus, Wave, WaveConfig, WaveError,
+    DependencyGraph, ErrorPolicy, TaskContext, TaskId, TaskResult, TaskStatus, Wave, WaveConfig, WaveError,
     WaveExecutor, WaveOrchestrator, WaveResult, WaveStatus, WaveTask,
 };
 pub use git_context::{GitCommitEntry, GitContext};

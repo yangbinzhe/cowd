@@ -607,6 +607,166 @@ impl AaakCompressor {
     pub fn decompress(compressed: &AaakCompressed) -> String {
         compressed.decompress()
     }
+
+    // ── P1-9: Dual-Mode Compression ──────────────────────────────────────────
+
+    /// Detect content type: Code or Narrative.
+    pub fn detect_content_type(content: &str) -> CompressionMode {
+        let code_signals: &[&str] = &[
+            "fn ", "func ", "def ", "class ", "import ", "pub ",
+            "let ", "const ", "impl ", "mod ", "use ",
+            "struct ", "enum ", "trait ", "async fn",
+            "=>", "->", "::", "{}", "();",
+        ];
+        let code_ratio = code_signals.iter().filter(|s| content.contains(**s)).count();
+        if code_ratio >= 2 {
+            CompressionMode::Code
+        } else {
+            CompressionMode::Narrative
+        }
+    }
+
+    /// Compress with automatic mode detection (P1-9).
+    pub fn compress_auto(&mut self, text: &str) -> CompressedOutput {
+        let mode = Self::detect_content_type(text);
+        self.compress_dual(text, mode)
+    }
+
+    /// Dual-mode compress: code (lossless) or narrative (lossy).
+    pub fn compress_dual(&mut self, text: &str, mode: CompressionMode) -> CompressedOutput {
+        let original_len = text.len();
+        match mode {
+            CompressionMode::Code => {
+                // Lossless: only remove blank lines and non-essential comments
+                let compressed = self.compress_code(text);
+                CompressedOutput {
+                    content: compressed,
+                    mode: CompressionMode::Code,
+                    original_length: original_len,
+                    compression_ratio: 0.0, // filled below
+                    lossy: false,
+                }
+            }
+            CompressionMode::Narrative => {
+                // Lossy: key sentence extraction + entity retention
+                let compressed = self.compress_narrative(text);
+                let ratio = if original_len > 0 {
+                    (compressed.len() as f64 / original_len as f64) * 100.0
+                } else {
+                    0.0
+                };
+                CompressedOutput {
+                    content: compressed,
+                    mode: CompressionMode::Narrative,
+                    original_length: original_len,
+                    compression_ratio: ratio,
+                    lossy: true,
+                }
+            }
+        }
+    }
+
+    /// Code mode: lossless compression - preserve all semantics.
+    /// Only removes excessive blank lines and trivial comments.
+    fn compress_code(&mut self, text: &str) -> String {
+        let lines: Vec<&str> = text.lines()
+            .filter(|l| {
+                // Keep all lines except pure comment lines without TODO/FIXME/HACK
+                let trimmed = l.trim();
+                if trimmed.starts_with("//") || trimmed.starts_with('#') {
+                    trimmed.contains("TODO") || trimmed.contains("FIXME")
+                        || trimmed.contains("HACK") || trimmed.contains("NOTE")
+                        || trimmed.contains("SAFETY") || trimmed.contains("XXX")
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        // Collapse multiple blank lines into one
+        let mut result = Vec::new();
+        let mut prev_blank = false;
+        for line in &lines {
+            let is_blank = line.trim().is_empty();
+            if is_blank && prev_blank {
+                continue;
+            }
+            result.push(*line);
+            prev_blank = is_blank;
+        }
+
+        result.join("\n")
+    }
+
+    /// Narrative mode: lossy compression with key sentence extraction.
+    /// Target compression ratio: 30-50%.
+    fn compress_narrative(&self, text: &str) -> String {
+        // 1. Split into sentences
+        let sentences: Vec<&str> = text.split_inclusive(|c: char| c == '.' || c == '!' || c == '?' || c == '\n')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if sentences.is_empty() {
+            return text.to_string();
+        }
+
+        // 2. Score sentences by importance (keywords, entities, numbers)
+        let scored: Vec<(usize, &str, f64)> = sentences.iter().enumerate().map(|(i, s)| {
+            let mut score: f64 = 0.0;
+            // First and last sentences are important
+            if i == 0 || i == sentences.len() - 1 { score += 2.0; }
+            // Contains numbers → likely factual
+            if s.chars().any(|c| c.is_ascii_digit()) { score += 1.0; }
+            // Longer sentences often carry more information
+            if s.len() > 50 { score += 0.5; }
+            // Contains decision/preference signals
+            let signals = ["decided", "decision", "prefer", "important", "决定", "选择", "偏好", "关键", "重要"];
+            for sig in &signals {
+                if s.to_lowercase().contains(sig) { score += 2.0; break; }
+            }
+            // Contains entity-like patterns (CamelCase, paths)
+            if s.contains('_') || s.contains("::") || s.contains('/') { score += 0.5; }
+            (i, *s, score)
+        }).collect();
+
+        // 3. Select top sentences (target ~40% of original)
+        let mut sorted = scored.clone();
+        sorted.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        let target_count = (sentences.len() as f64 * 0.4).max(1.0) as usize;
+        let mut selected_indices: Vec<usize> = sorted.iter()
+            .take(target_count)
+            .map(|(i, _, _)| *i)
+            .collect();
+        selected_indices.sort();
+
+        // 4. Reconstruct in original order
+        selected_indices.iter()
+            .filter_map(|&i| sentences.get(i))
+            .cloned()
+            .collect::<Vec<&str>>()
+            .join(" ")
+    }
+}
+
+/// P1-9: Compression mode selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompressionMode {
+    /// Code: lossless compression (preserve all semantics)
+    Code,
+    /// Narrative: lossy compression (key sentence extraction + entity retention)
+    Narrative,
+}
+
+/// P1-9: Output of dual-mode compression.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressedOutput {
+    pub content: String,
+    pub mode: CompressionMode,
+    pub original_length: usize,
+    pub compression_ratio: f64,
+    pub lossy: bool,
 }
 
 /// Token with metadata.

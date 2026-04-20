@@ -334,6 +334,11 @@ impl MemoryOrchestrator {
         self.store.delete(id).await
     }
 
+    /// Update an existing memory entry in-place.
+    pub async fn update(&self, entry: &crate::types::MemoryEntry) -> Result<()> {
+        self.store.update(entry).await
+    }
+
     /// List metadata for all entries in a given layer.
     pub async fn list_layer(&self, layer: MemoryLayer) -> Result<Vec<MemoryMeta>> {
         self.store.list_metas(Some(layer)).await

@@ -34,6 +34,8 @@ pub struct ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
     TextDelta(String),
+    /// P1-7: Extended thinking delta (reasoning model output)
+    ThinkingDelta(String),
     ToolUse {
         id: String,
         name: String,
@@ -42,6 +44,23 @@ pub enum AssistantEvent {
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
     MessageStop,
+    /// P0-2: Tool execution lifecycle events for real-time SSE visualization
+    ToolStart {
+        id: String,
+        name: String,
+        preview: String,
+    },
+    ToolProgress {
+        id: String,
+        name: String,
+        progress: String,
+    },
+    ToolComplete {
+        id: String,
+        name: String,
+        result_summary: String,
+        exit_code: Option<i32>,
+    },
 }
 
 /// Prompt-cache telemetry captured from the provider response stream.
@@ -62,6 +81,17 @@ pub trait ApiClient {
 /// Trait implemented by tool dispatchers that execute model-requested tools.
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+}
+
+/// Tool execution lifecycle callback for real-time visualization.
+/// Inspired by hermes-agent stream_consumer.py tool_progress_callback.
+pub trait ToolCallback: Send + Sync {
+    /// Called when a tool starts executing.
+    fn on_tool_start(&self, id: &str, name: &str, preview: &str);
+    /// Called when a tool reports progress.
+    fn on_tool_progress(&self, id: &str, name: &str, progress: &str);
+    /// Called when a tool finishes executing.
+    fn on_tool_complete(&self, id: &str, name: &str, result_summary: &str, exit_code: Option<i32>);
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -143,6 +173,8 @@ pub struct ConversationRuntime<C, T> {
     session_tracer: Option<SessionTracer>,
     /// Optional cognitive memory manager – `None` when memory is disabled.
     memory_manager: Option<Arc<CognitiveContextManager>>,
+    /// Optional tool callback for real-time visualization (P0-2).
+    tool_callback: Option<Arc<dyn ToolCallback>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -215,6 +247,7 @@ where
             hook_progress_reporter: None,
             session_tracer: None,
             memory_manager,
+            tool_callback: None,
         }
     }
 
@@ -227,6 +260,13 @@ where
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
+        self
+    }
+
+    /// Set a tool callback for real-time execution visualization (P0-2).
+    #[must_use]
+    pub fn with_tool_callback(mut self, callback: Arc<dyn ToolCallback>) -> Self {
+        self.tool_callback = Some(callback);
         self
     }
 
@@ -531,12 +571,26 @@ where
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
                         self.record_tool_started(iterations, &tool_name);
+
+                        // P0-2: Notify tool callback that execution is starting
+                        if let Some(callback) = &self.tool_callback {
+                            let preview: String = effective_input.chars().take(200).collect();
+                            callback.on_tool_start(&tool_use_id, &tool_name, &preview);
+                        }
+
                         let (mut output, mut is_error) =
                             match self.tool_executor.execute(&tool_name, &effective_input) {
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             };
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
+
+                        // P0-2: Notify tool callback that execution is complete
+                        if let Some(callback) = &self.tool_callback {
+                            let summary: String = output.chars().take(500).collect();
+                            let exit_code = if is_error { Some(1) } else { Some(0) };
+                            callback.on_tool_complete(&tool_use_id, &tool_name, &summary, exit_code);
+                        }
 
                         let post_hook_result = if is_error {
                             self.run_post_tool_use_failure_hook(
@@ -998,6 +1052,7 @@ fn build_assistant_message(
     RuntimeError,
 > {
     let mut text = String::new();
+    let mut thinking = String::new();
     let mut blocks = Vec::new();
     let mut prompt_cache_events = Vec::new();
     let mut finished = false;
@@ -1006,8 +1061,15 @@ fn build_assistant_message(
     for event in events {
         match event {
             AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+            // P1-7: Collect thinking content into a Thinking block
+            AssistantEvent::ThinkingDelta(delta) => {
+                // Flush any pending text first
+                flush_text_block(&mut text, &mut blocks);
+                thinking.push_str(&delta);
+            }
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
+                flush_thinking_block(&mut thinking, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
             }
             AssistantEvent::Usage(value) => usage = Some(value),
@@ -1015,10 +1077,16 @@ fn build_assistant_message(
             AssistantEvent::MessageStop => {
                 finished = true;
             }
+            // P0-2: Tool lifecycle events are handled by the ToolCallback,
+            // not included in the conversation content blocks.
+            AssistantEvent::ToolStart { .. }
+            | AssistantEvent::ToolProgress { .. }
+            | AssistantEvent::ToolComplete { .. } => {}
         }
     }
 
     flush_text_block(&mut text, &mut blocks);
+    flush_thinking_block(&mut thinking, &mut blocks);
 
     if !finished {
         return Err(RuntimeError::new(
@@ -1040,6 +1108,15 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
             text: std::mem::take(text),
+        });
+    }
+}
+
+/// P1-7: Flush accumulated thinking content into a Thinking content block.
+fn flush_thinking_block(thinking: &mut String, blocks: &mut Vec<ContentBlock>) {
+    if !thinking.is_empty() {
+        blocks.push(ContentBlock::Thinking {
+            thinking: std::mem::take(thinking),
         });
     }
 }

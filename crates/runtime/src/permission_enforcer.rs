@@ -583,3 +583,375 @@ mod tests {
         }
     }
 }
+
+// ── P0-1: Destructive Command Detection & Approval System ────────────────────
+
+use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Risk level for dangerous commands
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RiskLevel {
+    Low,    // mv (overwrite), cp (overwrite)
+    Medium, // git reset, pip uninstall, apt remove
+    High,   // rm -rf (specified dir), git push --force, chmod 777
+    Critical, // rm -rf /, dd, mkfs, format
+}
+
+/// Approval verdict from user
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ApprovalVerdict {
+    Approved,
+    Denied { reason: String },
+    TimedOut,
+}
+
+/// 3-level approval persistence (inspired by hermes approval.py)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ApprovalPersistence {
+    Once,    // Approve this time only
+    Session, // Approve for this session
+    Always,  // Permanently approve (write to config)
+}
+
+/// Approval request sent to frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub id: String,
+    pub command: String,
+    pub normalized_command: String,
+    pub risk_level: RiskLevel,
+    pub matched_patterns: Vec<String>,
+    pub description: String,
+    pub timestamp: DateTime<Utc>,
+    pub timeout_secs: u64,
+}
+
+/// Approval response from frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalResponse {
+    pub request_id: String,
+    pub verdict: ApprovalVerdict,
+    pub persistence: ApprovalPersistence,
+}
+
+/// A single danger pattern
+struct DangerPattern {
+    name: String,
+    regex: regex::Regex,
+    risk: RiskLevel,
+    description: String,
+}
+
+/// Destructive pattern detector with 91 regex patterns
+/// (inspired by hermes-agent tools/approval.py)
+pub struct DestructivePatternDetector {
+    patterns: Vec<DangerPattern>,
+    /// Session-level approval cache (command_hash → persistence)
+    session_approved: Arc<RwLock<HashMap<String, ApprovalPersistence>>>,
+    /// Permanent approval config path
+    always_approved_path: PathBuf,
+}
+
+impl DestructivePatternDetector {
+    /// Create a new detector with all built-in patterns
+    pub fn new(config_dir: PathBuf) -> Self {
+        let patterns = Self::build_patterns();
+        Self {
+            patterns,
+            session_approved: Arc::new(RwLock::new(HashMap::new())),
+            always_approved_path: config_dir.join("always_approved.json"),
+        }
+    }
+
+    /// Build the 91 dangerous command patterns
+    fn build_patterns() -> Vec<DangerPattern> {
+        let mut patterns = Vec::new();
+
+        // File deletion (15 patterns)
+        let file_del = &[
+            (r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+/|.*--force\s+/)", RiskLevel::Critical, "rm recursive force on root"),
+            (r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|.*--force\s+)", RiskLevel::High, "rm recursive force"),
+            (r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)", RiskLevel::High, "rm recursive"),
+            (r"rmdir\s+", RiskLevel::Low, "remove directory"),
+            (r"unlink\s+", RiskLevel::Medium, "unlink file"),
+            (r"shred\s+", RiskLevel::High, "shred file contents"),
+            (r"truncate\s+", RiskLevel::Medium, "truncate file"),
+            (r">+\s*\S+", RiskLevel::Low, "overwrite file with redirect"),
+            (r"find\s+.*-delete", RiskLevel::High, "find and delete"),
+            (r"install\s+.*--unlink", RiskLevel::Medium, "install unlink"),
+            (r"git\s+clean\s+-fdx", RiskLevel::High, "git clean force"),
+            (r"git\s+rm\s+", RiskLevel::Medium, "git remove file"),
+            (r"npm\s+run\s+.*clean", RiskLevel::Low, "npm clean"),
+            (r"cargo\s+clean", RiskLevel::Low, "cargo clean"),
+            (r"make\s+clean", RiskLevel::Low, "make clean"),
+        ];
+        for (re, risk, desc) in file_del {
+            if let Ok(r) = regex::Regex::new(re) {
+                patterns.push(DangerPattern { name: format!("file_del_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+            }
+        }
+
+        // Disk operations (8 patterns)
+        let disk = &[
+            (r"dd\s+if=", RiskLevel::Critical, "dd disk copy"),
+            (r"mkfs\b", RiskLevel::Critical, "make filesystem"),
+            (r"fdisk\b", RiskLevel::Critical, "fdisk partition"),
+            (r"parted\b", RiskLevel::Critical, "parted partition editor"),
+            (r"format\s+[A-Z]:", RiskLevel::Critical, "format drive"),
+            (r"hdparm\b", RiskLevel::Critical, "hard disk parameters"),
+            (r"badblocks\s+-w", RiskLevel::Critical, "badblocks write test"),
+            (r"shred\s+/dev/", RiskLevel::Critical, "shred device"),
+        ];
+        for (re, risk, desc) in disk {
+            if let Ok(r) = regex::Regex::new(re) {
+                patterns.push(DangerPattern { name: format!("disk_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+            }
+        }
+
+        // Permission changes (10 patterns)
+        let perms = &[
+            (r"chmod\s+(777|666|000|a\+[rwx])", RiskLevel::High, "dangerous chmod"),
+            (r"chown\s+root", RiskLevel::High, "chown to root"),
+            (r"chgrp\s+root", RiskLevel::High, "chgrp to root"),
+            (r"chmod\s+-R\s+", RiskLevel::High, "recursive chmod"),
+            (r"chown\s+-R\s+", RiskLevel::High, "recursive chown"),
+            (r"setfacl\s+", RiskLevel::Medium, "set file ACL"),
+            (r"setsebool\s+", RiskLevel::Medium, "set SELinux boolean"),
+            (r"chcon\s+", RiskLevel::Medium, "change SELinux context"),
+            (r"sudo\s+chmod", RiskLevel::High, "sudo chmod"),
+            (r"sudo\s+chown", RiskLevel::High, "sudo chown"),
+        ];
+        for (re, risk, desc) in perms {
+            if let Ok(r) = regex::Regex::new(re) {
+                patterns.push(DangerPattern { name: format!("perms_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+            }
+        }
+
+        // Git destructive (12 patterns)
+        let git = &[
+            (r"git\s+push\s+.*--force", RiskLevel::High, "git force push"),
+            (r"git\s+push\s+-f\b", RiskLevel::High, "git force push short"),
+            (r"git\s+reset\s+--hard", RiskLevel::High, "git reset hard"),
+            (r"git\s+reflog\s+expire", RiskLevel::High, "git reflog expire"),
+            (r"git\s+branch\s+-D\s+", RiskLevel::Medium, "git delete branch force"),
+            (r"git\s+tag\s+-d\s+", RiskLevel::Low, "git delete tag"),
+            (r"git\s+stash\s+drop", RiskLevel::Low, "git stash drop"),
+            (r"git\s+filter-branch", RiskLevel::High, "git filter-branch"),
+            (r"git\s+submodule\s+deinit", RiskLevel::Medium, "git submodule deinit"),
+            (r"git\s+worktree\s+remove", RiskLevel::Low, "git worktree remove"),
+            (r"git\s+annex\s+drop", RiskLevel::Medium, "git annex drop"),
+            (r"git\s+rebase\b", RiskLevel::Medium, "git rebase"),
+        ];
+        for (re, risk, desc) in git {
+            if let Ok(r) = regex::Regex::new(re) {
+                patterns.push(DangerPattern { name: format!("git_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+            }
+        }
+
+        // Package management (8 patterns)
+        let pkg = &[
+            (r"apt\s+(remove|purge)", RiskLevel::Medium, "apt remove/purge"),
+            (r"apt-get\s+(remove|purge)", RiskLevel::Medium, "apt-get remove/purge"),
+            (r"yum\s+remove", RiskLevel::Medium, "yum remove"),
+            (r"dnf\s+remove", RiskLevel::Medium, "dnf remove"),
+            (r"pip\s+uninstall", RiskLevel::Medium, "pip uninstall"),
+            (r"npm\s+uninstall\s+-g", RiskLevel::Medium, "npm global uninstall"),
+            (r"cargo\s+uninstall", RiskLevel::Low, "cargo uninstall"),
+            (r"brew\s+uninstall", RiskLevel::Low, "brew uninstall"),
+        ];
+        for (re, risk, desc) in pkg {
+            if let Ok(r) = regex::Regex::new(re) {
+                patterns.push(DangerPattern { name: format!("pkg_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+            }
+        }
+
+        // Network dangerous (10 patterns)
+        let net = &[
+            (r"iptables\s+-F", RiskLevel::Critical, "flush iptables"),
+            (r"curl.*\|.*(sh|bash)", RiskLevel::Critical, "pipe curl to shell"),
+            (r"wget.*\|.*sh", RiskLevel::Critical, "pipe wget to shell"),
+            (r"nc\s+-l\s+", RiskLevel::High, "netcat listen"),
+            (r"socat\s+", RiskLevel::High, "socat relay"),
+            (r"ssh\s+.*-R\s+", RiskLevel::High, "SSH remote port forward"),
+            (r"ssh\s+.*-L\s+", RiskLevel::Medium, "SSH local port forward"),
+            (r"tcpdump\s+-w", RiskLevel::Medium, "tcpdump write capture"),
+            (r"nmap\s+.*--script", RiskLevel::High, "nmap script scan"),
+            (r"airmon-ng\s+", RiskLevel::Critical, "WiFi monitor mode"),
+        ];
+        for (re, risk, desc) in net {
+            if let Ok(r) = regex::Regex::new(re) {
+                patterns.push(DangerPattern { name: format!("net_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+            }
+        }
+
+        // Process/System (12 patterns)
+        let sys = &[
+            (r"kill\s+-9\s+1\b", RiskLevel::Critical, "kill init process"),
+            (r"killall\s+", RiskLevel::High, "kill all by name"),
+            (r"pkill\s+", RiskLevel::High, "kill by pattern"),
+            (r"shutdown\b", RiskLevel::Critical, "system shutdown"),
+            (r"reboot\b", RiskLevel::Critical, "system reboot"),
+            (r"init\s+[06]", RiskLevel::Critical, "init shutdown/reboot"),
+            (r"systemctl\s+stop\s+ssh", RiskLevel::Critical, "stop SSH service"),
+            (r"systemctl\s+disable\s+ssh", RiskLevel::High, "disable SSH service"),
+            (r"systemctl\s+mask\s+", RiskLevel::High, "mask service"),
+            (r"journalctl\s+--vacuum", RiskLevel::Medium, "journal vacuum"),
+            (r"sysctl\s+-w\s+", RiskLevel::High, "write kernel parameter"),
+            (r"modprobe\s+-r\s+", RiskLevel::High, "remove kernel module"),
+        ];
+        for (re, risk, desc) in sys {
+            if let Ok(r) = regex::Regex::new(re) {
+                patterns.push(DangerPattern { name: format!("sys_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+            }
+        }
+
+        // Docker (6 patterns)
+        let docker = &[
+            (r"docker\s+rm\s+-f", RiskLevel::High, "docker force remove container"),
+            (r"docker\s+system\s+prune", RiskLevel::High, "docker system prune"),
+            (r"docker\s+rmi\s+", RiskLevel::Medium, "docker remove image"),
+            (r"docker\s+volume\s+rm", RiskLevel::Medium, "docker remove volume"),
+            (r"docker\s+network\s+rm", RiskLevel::Low, "docker remove network"),
+            (r"docker\s+compose\s+down\s+.*--rmi", RiskLevel::High, "docker compose down remove images"),
+        ];
+        for (re, risk, desc) in docker {
+            if let Ok(r) = regex::Regex::new(re) {
+                patterns.push(DangerPattern { name: format!("docker_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+            }
+        }
+
+        // Database (10 patterns)
+        let db = &[
+            (r"DROP\s+(DATABASE|TABLE|SCHEMA)", RiskLevel::Critical, "DROP database/table"),
+            (r"TRUNCATE\s+", RiskLevel::Critical, "TRUNCATE table"),
+            (r"DELETE\s+FROM\s+\w+\s*;?\s*$", RiskLevel::High, "DELETE all rows"),
+            (r"ALTER\s+DATABASE\s+", RiskLevel::High, "ALTER database"),
+            (r"DROP\s+INDEX\s+", RiskLevel::High, "DROP index"),
+            (r"DROP\s+USER\s+", RiskLevel::Critical, "DROP user"),
+            (r"GRANT\s+ALL\s+", RiskLevel::High, "GRANT all privileges"),
+            (r"REVOKE\s+ALL\s+", RiskLevel::Medium, "REVOKE all privileges"),
+            (r"pg_dump\s+.*--clean", RiskLevel::High, "pg_dump with clean"),
+            (r"mysqldump\s+.*--add-drop-table", RiskLevel::Medium, "mysqldump drop table"),
+        ];
+        for (re, risk, desc) in db {
+            if let Ok(r) = regex::Regex::new(re) {
+                patterns.push(DangerPattern { name: format!("db_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+            }
+        }
+
+        patterns
+    }
+
+    /// Normalize command: remove null bytes, strip ANSI escapes, compact whitespace
+    fn normalize_command(cmd: &str) -> String {
+        // Step 1: Remove null bytes
+        let no_null: String = cmd.chars().filter(|c| *c != '\0').collect();
+
+        // Step 2: Strip ANSI escape sequences
+        let ansi_re = regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07").unwrap();
+        let no_ansi = ansi_re.replace_all(&no_null, "").to_string();
+
+        // Step 3: Compact consecutive whitespace
+        let compact: String = no_ansi.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        compact
+    }
+
+    /// Generate a cache key for a normalized command
+    fn command_cache_key(&self, normalized: &str) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        normalized.hash(&mut hasher);
+        format!("{:x}", hasher.finish())
+    }
+
+    /// Check if command is permanently approved
+    fn is_always_approved(&self, _normalized: &str) -> bool {
+        // Check the always_approved config file
+        if let Ok(data) = std::fs::read_to_string(&self.always_approved_path) {
+            if let Ok(patterns) = serde_json::from_str::<Vec<String>>(&data) {
+                return patterns.iter().any(|p| _normalized.contains(p));
+            }
+        }
+        false
+    }
+
+    /// Detect if a command is dangerous and requires approval
+    pub fn detect(&self, raw_cmd: &str) -> Option<ApprovalRequest> {
+        let normalized = Self::normalize_command(raw_cmd);
+
+        // Check session-level approval cache
+        let cache_key = self.command_cache_key(&normalized);
+        if let Ok(cache) = self.session_approved.try_read() {
+            if let Some(persistence) = cache.get(&cache_key) {
+                match persistence {
+                    ApprovalPersistence::Session | ApprovalPersistence::Always => return None,
+                    ApprovalPersistence::Once => {}
+                }
+            }
+        }
+
+        // Check permanent approval
+        if self.is_always_approved(&normalized) {
+            return None;
+        }
+
+        // Pattern matching
+        let mut matched = Vec::new();
+        let mut highest_risk = RiskLevel::Low;
+        let mut descriptions = Vec::new();
+
+        for pattern in &self.patterns {
+            if pattern.regex.is_match(&normalized) {
+                matched.push(pattern.name.clone());
+                descriptions.push(pattern.description.clone());
+                if pattern.risk > highest_risk {
+                    highest_risk = pattern.risk;
+                }
+            }
+        }
+
+        if matched.is_empty() {
+            return None;
+        }
+
+        Some(ApprovalRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            command: raw_cmd.to_string(),
+            normalized_command: normalized,
+            risk_level: highest_risk,
+            matched_patterns: matched,
+            description: descriptions.join("; "),
+            timestamp: Utc::now(),
+            timeout_secs: 120,
+        })
+    }
+
+    /// Record an approval decision in the session cache
+    pub async fn record_approval(&self, command: &str, persistence: ApprovalPersistence) {
+        let normalized = Self::normalize_command(command);
+        let cache_key = self.command_cache_key(&normalized);
+
+        match &persistence {
+            ApprovalPersistence::Session | ApprovalPersistence::Once => {
+                let mut cache = self.session_approved.write().await;
+                cache.insert(cache_key, persistence);
+            }
+            ApprovalPersistence::Always => {
+                // Write to permanent config file
+                let mut patterns: Vec<String> = std::fs::read_to_string(&self.always_approved_path)
+                    .ok()
+                    .and_then(|d| serde_json::from_str(&d).ok())
+                    .unwrap_or_default();
+                patterns.push(normalized);
+                if let Ok(data) = serde_json::to_string_pretty(&patterns) {
+                    let _ = std::fs::write(&self.always_approved_path, data);
+                }
+            }
+        }
+    }
+}

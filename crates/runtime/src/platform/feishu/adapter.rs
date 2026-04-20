@@ -295,7 +295,19 @@ impl FeishuAdapter {
     }
 
     /// Verify and decrypt a webhook request.
+    ///
+    /// Handles challenge verification for initial webhook setup and
+    /// decrypts encrypted event payloads when encryption is enabled.
     pub fn verify_webhook(&self, payload: &[u8], timestamp: &str, signature: &str) -> PlatformResult<Vec<u8>> {
+        // First, try to parse as JSON to check for challenge verification
+        if let Ok(data) = serde_json::from_slice::<serde_json::Value>(payload) {
+            // Handle challenge verification (initial webhook setup)
+            if data.get("challenge").map_or(false, |v| v.is_string()) {
+                tracing::info!("feishu webhook challenge verification, returning challenge response");
+                return Ok(payload.to_vec());
+            }
+        }
+
         // If encryption is enabled, decrypt the payload
         if let Some(encrypt_key) = &self.config.encrypt_key {
             let decrypted = self.decrypt_payload(payload, encrypt_key)?;
@@ -341,13 +353,217 @@ impl FeishuAdapter {
     }
 
     /// Receive messages via long-polling.
+    ///
+    /// Calls Feishu's event long-polling endpoint to fetch pending messages.
+    /// Requires `enable_events` to be true and an active connection.
     pub async fn receive_messages(&self) -> PlatformResult<Vec<InboundMessage>> {
         let connected = self.connected.read().await;
         if !*connected {
             return Ok(Vec::new());
         }
-        // Long-polling would be implemented here for event subscription
-        Ok(Vec::new())
+
+        if !self.config.enable_events {
+            return Ok(Vec::new());
+        }
+
+        let token = self.ensure_token().await?;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get("https://open.feishu.cn/open-apis/im/v1/events")
+            .header("Authorization", format!("Bearer {}", token))
+            .timeout(std::time::Duration::from_secs(self.config.long_polling_timeout))
+            .send()
+            .await
+            .map_err(|e| PlatformError::ReceiveFailed(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(%status, %body, "feishu long-polling request failed");
+            return Err(PlatformError::ReceiveFailed(format!(
+                "feishu events API {}: {}", status, body
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct EventsResponse {
+            code: i32,
+            data: Option<EventsData>,
+        }
+
+        #[derive(Deserialize)]
+        struct EventsData {
+            items: Option<Vec<serde_json::Value>>,
+        }
+
+        let events_resp: EventsResponse = response
+            .json()
+            .await
+            .map_err(|e| PlatformError::ReceiveFailed(e.to_string()))?;
+
+        if events_resp.code != 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut messages = Vec::new();
+        if let Some(items) = events_resp.data.and_then(|d| d.items) {
+            for item in items {
+                if item.get("type").and_then(|t| t.as_str()) == Some("im.message.receive_v1") {
+                    if let Some(msg) = self.parse_event_message(&item) {
+                        messages.push(msg);
+                    }
+                }
+            }
+        }
+
+        Ok(messages)
+    }
+
+    /// Parse a single event item into an InboundMessage.
+    fn parse_event_message(&self, item: &serde_json::Value) -> Option<InboundMessage> {
+        let event_data = item.get("event")?;
+
+        let msg = event_data.get("message")?;
+        let sender = event_data.get("sender")?;
+        let sender_id = sender.get("sender_id")?;
+
+        let open_id = sender_id
+            .get("open_id")
+            .or_else(|| sender_id.get("user_id"))
+            .and_then(|v| v.as_str())?;
+
+        let chat_id = msg.get("chat_id").and_then(|v| v.as_str())?;
+        let message_id = msg.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Parse the message content JSON
+        let content_str = msg.get("content").and_then(|v| v.as_str()).unwrap_or("{}");
+        let text = serde_json::from_str::<serde_json::Value>(content_str)
+            .ok()
+            .and_then(|v| v.get("text").and_then(|t| t.as_str().map(|s| s.to_string())))
+            .unwrap_or_default();
+
+        let session_key = SessionKey::with_thread("feishu", open_id, chat_id);
+
+        Some(InboundMessage {
+            platform: Platform::Feishu,
+            session_key,
+            text,
+            sender_name: None,
+            timestamp: Utc::now(),
+            metadata: serde_json::json!({
+                "message_id": message_id,
+                "chat_id": chat_id,
+            }),
+        })
+    }
+
+    /// Send a card (interactive) message via Feishu API.
+    ///
+    /// Returns the message ID of the sent card message on success.
+    pub async fn send_card_message(
+        &self,
+        session_key: &SessionKey,
+        title: &str,
+        content: &str,
+        actions: Vec<CardAction>,
+    ) -> PlatformResult<String> {
+        let token = self.ensure_token().await?;
+        let client = reqwest::Client::new();
+
+        let card = serde_json::json!({
+            "config": {"wide_screen_mode": true},
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": "blue"
+            },
+            "elements": [
+                {"tag": "markdown", "content": content},
+                {"tag": "action", "actions": actions.iter().map(|a| serde_json::json!({
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": a.label},
+                    "type": a.style.as_deref().unwrap_or("primary"),
+                    "value": {"action": a.action_id}
+                })).collect::<Vec<_>>()}
+            ]
+        });
+
+        #[derive(Serialize)]
+        struct SendCardRequest {
+            receive_id: String,
+            msg_type: String,
+            content: String,
+        }
+
+        let request = SendCardRequest {
+            receive_id: session_key.user_id.clone(),
+            msg_type: "interactive".to_string(),
+            content: card.to_string(),
+        };
+
+        let response = client
+            .post("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id")
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+        #[derive(Deserialize)]
+        struct CardSendResponse {
+            code: i32,
+            msg: String,
+            data: Option<CardSendData>,
+        }
+
+        #[derive(Deserialize)]
+        struct CardSendData {
+            message_id: Option<String>,
+        }
+
+        let resp: CardSendResponse = response
+            .json()
+            .await
+            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+        if resp.code != 0 {
+            return Err(PlatformError::SendFailed(resp.msg));
+        }
+
+        let msg_id = resp.data
+            .and_then(|d| d.message_id)
+            .unwrap_or_default();
+
+        tracing::debug!(to = %session_key.user_id, %msg_id, "feishu card message sent");
+        Ok(msg_id)
+    }
+}
+
+/// A card action button for interactive card messages.
+#[derive(Debug, Clone)]
+pub struct CardAction {
+    /// Button label text.
+    pub label: String,
+    /// Action identifier returned in callback.
+    pub action_id: String,
+    /// Button style: "primary", "default", "danger".
+    pub style: Option<String>,
+}
+
+impl CardAction {
+    /// Create a new card action.
+    pub fn new(label: impl Into<String>, action_id: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            action_id: action_id.into(),
+            style: None,
+        }
+    }
+
+    /// Set the button style.
+    pub fn with_style(mut self, style: impl Into<String>) -> Self {
+        self.style = Some(style.into());
+        self
     }
 }
 

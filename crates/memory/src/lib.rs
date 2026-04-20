@@ -27,6 +27,7 @@ pub mod compression;
 pub mod config;
 pub mod drift;
 pub mod embedding;
+pub mod entity;
 pub mod error;
 pub mod extractor;
 pub mod handoff;
@@ -38,12 +39,15 @@ pub mod seeds;
 pub mod session_manager;
 pub mod state_rebuilder;
 pub mod store;
+pub mod search;
 pub mod types;
 pub mod aaak_compression;
 pub mod context_fence;
 pub mod fresh_context;
 pub mod temporal_graph;
 pub mod write_guard;
+pub mod closet;
+pub mod miner;
 
 // --- Convenience re-exports ---
 
@@ -99,6 +103,7 @@ pub use types::{
     WorkItem,
     WorkItemStatus,
 };
+pub use search::{BM25Scorer, HybridSearcher, SearchResult as HybridSearchResult};
 pub use aaak_compression::{
     AaakCompressor, AaakCompressed, AaakDictionary, Abbreviation,
     EntityType, GsdContext, GsdState, PriorityItem,

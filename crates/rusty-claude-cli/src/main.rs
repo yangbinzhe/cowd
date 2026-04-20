@@ -5928,6 +5928,7 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Thinking { thinking } => lines.push(format!("[thinking] {thinking}")),
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -6113,6 +6114,10 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                         lines.push(trimmed.to_string());
                         lines.push(String::new());
                     }
+                }
+                ContentBlock::Thinking { thinking } => {
+                    lines.push(format!("> **Thinking:** {}", thinking.chars().take(200).collect::<String>()));
+                    lines.push(String::new());
                 }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!(
@@ -8136,6 +8141,7 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Thinking { .. } => InputContentBlock::Text { text: String::new() },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),

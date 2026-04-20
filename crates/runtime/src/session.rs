@@ -29,6 +29,10 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    /// P1-7: Extended thinking content (reasoning model output)
+    Thinking {
+        thinking: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -736,6 +740,10 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
+            Self::Thinking { thinking } => {
+                object.insert("type".to_string(), JsonValue::String("thinking".to_string()));
+                object.insert("thinking".to_string(), JsonValue::String(thinking.clone()));
+            }
             Self::ToolUse { id, name, input } => {
                 object.insert(
                     "type".to_string(),
@@ -781,6 +789,9 @@ impl ContentBlock {
         {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
+            }),
+            "thinking" => Ok(Self::Thinking {
+                thinking: required_string(object, "thinking")?,
             }),
             "tool_use" => Ok(Self::ToolUse {
                 id: required_string(object, "id")?,
