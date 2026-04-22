@@ -94,6 +94,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--output-format",
     "--permission-mode",
     "--dangerously-skip-permissions",
+    "--yolo",
     "--allowedTools",
     "--allowed-tools",
     "--resume",
@@ -638,7 +639,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode_override = Some(parse_permission_mode_arg(&flag[18..])?);
                 index += 1;
             }
-            "--dangerously-skip-permissions" => {
+            "--dangerously-skip-permissions" | "--yolo" => {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
                 index += 1;
             }
@@ -8386,6 +8387,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --dangerously-skip-permissions  Skip all permission checks"
+    )?;
+    writeln!(
+        out,
+        "  --yolo                       Alias for --dangerously-skip-permissions"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(
