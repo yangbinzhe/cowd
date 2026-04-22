@@ -169,12 +169,14 @@ pub struct ConversationRuntime<C, T> {
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
     hook_abort_signal: HookAbortSignal,
-    hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
+    hook_progress_reporter: Option<Box<dyn HookProgressReporter + Send>>,
     session_tracer: Option<SessionTracer>,
     /// Optional cognitive memory manager – `None` when memory is disabled.
     memory_manager: Option<Arc<CognitiveContextManager>>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
+    /// Optional smart approval gate for intelligent command approval (P0-1).
+    approval_gate: Option<Arc<crate::approval_gate::SmartApprovalGate>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -248,6 +250,7 @@ where
             session_tracer: None,
             memory_manager,
             tool_callback: None,
+            approval_gate: None,
         }
     }
 
@@ -270,6 +273,13 @@ where
         self
     }
 
+    /// Set the smart approval gate for intelligent command approval (P0-1).
+    #[must_use]
+    pub fn with_approval_gate(mut self, gate: Arc<crate::approval_gate::SmartApprovalGate>) -> Self {
+        self.approval_gate = Some(gate);
+        self
+    }
+
     #[must_use]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
         self.hook_abort_signal = hook_abort_signal;
@@ -279,7 +289,7 @@ where
     #[must_use]
     pub fn with_hook_progress_reporter(
         mut self,
-        hook_progress_reporter: Box<dyn HookProgressReporter>,
+        hook_progress_reporter: Box<dyn HookProgressReporter + Send>,
     ) -> Self {
         self.hook_progress_reporter = Some(hook_progress_reporter);
         self
@@ -570,6 +580,52 @@ where
 
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
+                        // P0-1: Smart approval gate — check if command needs approval
+                        let mut gate_denied: Option<ConversationMessage> = None;
+                        if let Some(gate) = &self.approval_gate {
+                            let gate_result = match tokio::runtime::Handle::try_current() {
+                                Ok(handle) => handle.block_on(gate.evaluate(&tool_name, &effective_input)),
+                                Err(_) => {
+                                    // No async runtime available; auto-pass
+                                    crate::approval_gate::ApprovalGateResult::AutoPass {
+                                        reason: crate::permission_enforcer::AutoPassReason::NoPatternMatch,
+                                    }
+                                }
+                            };
+
+                            match gate_result {
+                                crate::approval_gate::ApprovalGateResult::Denied { reason } => {
+                                    gate_denied = Some(ConversationMessage::tool_result(
+                                        tool_use_id.clone(),
+                                        tool_name.clone(),
+                                        reason,
+                                        true,
+                                    ));
+                                }
+                                crate::approval_gate::ApprovalGateResult::TimedOut => {
+                                    gate_denied = Some(ConversationMessage::tool_result(
+                                        tool_use_id.clone(),
+                                        tool_name.clone(),
+                                        "Approval request timed out".to_string(),
+                                        true,
+                                    ));
+                                }
+                                crate::approval_gate::ApprovalGateResult::AutoPass { .. }
+                                | crate::approval_gate::ApprovalGateResult::Approved { .. } => {
+                                    // Continue to execution
+                                }
+                            }
+                        }
+
+                        if let Some(denied_msg) = gate_denied {
+                            self.session
+                                .push_message(denied_msg.clone())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            self.record_tool_finished(iterations, &denied_msg);
+                            tool_results.push(denied_msg);
+                            break; // skip remaining tools in this batch
+                        }
+
                         self.record_tool_started(iterations, &tool_name);
 
                         // P0-2: Notify tool callback that execution is starting

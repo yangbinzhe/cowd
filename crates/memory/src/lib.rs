@@ -43,6 +43,7 @@ pub mod search;
 pub mod types;
 pub mod aaak_compression;
 pub mod context_fence;
+pub mod fact_checker;
 pub mod fresh_context;
 pub mod temporal_graph;
 pub mod write_guard;
@@ -108,6 +109,7 @@ pub use aaak_compression::{
     AaakCompressor, AaakCompressed, AaakDictionary, Abbreviation,
     EntityType, GsdContext, GsdState, PriorityItem,
 };
+pub use fact_checker::{FactChecker, FactCheckResult};
 pub use context_fence::{
     ContextFence, FenceConfig, FenceRegistry, filter_through_fence,
     fence_from_session, build_memory_context_block, MemoryContextBlock,

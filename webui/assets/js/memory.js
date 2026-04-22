@@ -6,6 +6,7 @@ const Memory = {
   statsContainer: null,
   layersContainer: null,
   searchMode: 'hybrid', // P0-3: Default search mode
+  currentView: 'layers', // 3C-2: layers or graph
 
   init() {
     this.statsContainer = document.getElementById('memoryStats');
@@ -19,6 +20,14 @@ const Memory = {
 
     // P0-3: Initialize memory search
     this.initSearch();
+
+    // 3C-2: Bind view tabs
+    document.querySelectorAll('[data-memview]').forEach(tab => {
+      tab.addEventListener('click', () => {
+        const view = tab.dataset.memview;
+        this.switchView(view);
+      });
+    });
 
     // P1-1: Event delegation for entry edit/delete buttons
     document.addEventListener('click', (e) => {
@@ -210,6 +219,14 @@ const Memory = {
         <div class="value">${layers.l2?.count || 0}</div>
         <div class="label">L2</div>
       </div>
+      <div class="memory-stat">
+        <div class="value">${layers.l3?.count || 0}</div>
+        <div class="label">L3</div>
+      </div>
+      <div class="memory-stat">
+        <div class="value">${layers.l4?.count || 0}</div>
+        <div class="label">L4</div>
+      </div>
     `;
   },
 
@@ -221,10 +238,11 @@ const Memory = {
       l0: _t('memory.layer0', 'L0 - Identity'),
       l1: _t('memory.layer1', 'L1 - Essential'),
       l2: _t('memory.layer2', 'L2 - Project'),
-      l3: _t('memory.layer3', 'L3 - Session')
+      l3: _t('memory.layer3', 'L3 - Session'),
+      l4: _t('memory.layer4', 'L4 - Deep Archive')
     };
 
-    this.layersContainer.innerHTML = ['l0', 'l1', 'l2', 'l3'].map(layer => `
+    this.layersContainer.innerHTML = ['l0', 'l1', 'l2', 'l3', 'l4'].map(layer => `
       <div class="memory-layer">
         <h3>${layerNames[layer]}</h3>
         <div class="layer-content" id="layer${layer.charAt(1)}Content">
@@ -359,6 +377,51 @@ const Memory = {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+  },
+
+  // ═══════════════════════════════════════════════════════════════════
+  // 3C-2: View switching (layers / graph)
+  // ═══════════════════════════════════════════════════════════════════
+
+  switchView(view) {
+    this.currentView = view;
+
+    // Update tab active states
+    document.querySelectorAll('[data-memview]').forEach(tab => {
+      tab.classList.toggle('active', tab.dataset.memview === view);
+    });
+
+    const layersView = document.getElementById('memoryLayersView');
+    const graphView = document.getElementById('memoryGraphView');
+
+    if (view === 'graph') {
+      if (layersView) layersView.style.display = 'none';
+      if (graphView) graphView.style.display = '';
+      this.loadGraph();
+    } else {
+      if (layersView) layersView.style.display = '';
+      if (graphView) graphView.style.display = 'none';
+    }
+  },
+
+  async loadGraph() {
+    if (!window.KnowledgeGraph) {
+      const container = document.getElementById('memoryGraphContainer');
+      if (container) {
+        container.innerHTML = '<div style="padding:20px;color:var(--text-dim);">知识图谱模块未加载</div>';
+      }
+      return;
+    }
+    try {
+      const graph = await window.api?.getKnowledgeGraph();
+      window.KnowledgeGraph.render('memoryGraphContainer', graph);
+    } catch (e) {
+      console.error('[Cowd Memory] Graph load failed:', e);
+      const container = document.getElementById('memoryGraphContainer');
+      if (container) {
+        container.innerHTML = '<div style="padding:20px;color:var(--text-dim);">加载知识图谱失败</div>';
+      }
+    }
   }
 };
 

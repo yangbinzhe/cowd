@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-pub type GreenLevel = u8;
+use crate::green_contract::GreenLevel;
 
 const STALE_BRANCH_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 
@@ -170,7 +170,7 @@ impl LaneContext {
     pub fn reconciled(lane_id: impl Into<String>) -> Self {
         Self {
             lane_id: lane_id.into(),
-            green_level: 0,
+            green_level: GreenLevel::TargetedTests,
             branch_freshness: Duration::from_secs(0),
             blocker: LaneBlocker::None,
             review_status: ReviewStatus::Pending,
@@ -220,14 +220,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        evaluate, DiffScope, LaneBlocker, LaneContext, PolicyAction, PolicyCondition, PolicyEngine,
-        PolicyRule, ReconcileReason, ReviewStatus, STALE_BRANCH_THRESHOLD,
+        evaluate, DiffScope, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
+        PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus, STALE_BRANCH_THRESHOLD,
     };
 
     fn default_context() -> LaneContext {
         LaneContext::new(
             "lane-7",
-            0,
+            GreenLevel::TargetedTests,
             Duration::from_secs(0),
             LaneBlocker::None,
             ReviewStatus::Pending,
@@ -242,7 +242,7 @@ mod tests {
         let engine = PolicyEngine::new(vec![PolicyRule::new(
             "merge-to-dev",
             PolicyCondition::And(vec![
-                PolicyCondition::GreenAt { level: 2 },
+                PolicyCondition::GreenAt { level: GreenLevel::Workspace },
                 PolicyCondition::ScopedDiff,
                 PolicyCondition::ReviewPassed,
             ]),
@@ -251,7 +251,7 @@ mod tests {
         )]);
         let context = LaneContext::new(
             "lane-7",
-            3,
+            GreenLevel::MergeReady,
             Duration::from_secs(5),
             LaneBlocker::None,
             ReviewStatus::Approved,
@@ -277,7 +277,7 @@ mod tests {
         )]);
         let context = LaneContext::new(
             "lane-7",
-            1,
+            GreenLevel::Package,
             STALE_BRANCH_THRESHOLD,
             LaneBlocker::None,
             ReviewStatus::Pending,
@@ -308,7 +308,7 @@ mod tests {
         )]);
         let context = LaneContext::new(
             "lane-7",
-            0,
+            GreenLevel::TargetedTests,
             Duration::from_secs(0),
             LaneBlocker::Startup,
             ReviewStatus::Pending,
@@ -345,7 +345,7 @@ mod tests {
         )]);
         let context = LaneContext::new(
             "lane-7",
-            0,
+            GreenLevel::TargetedTests,
             Duration::from_secs(0),
             LaneBlocker::None,
             ReviewStatus::Pending,
@@ -442,7 +442,7 @@ mod tests {
                 PolicyCondition::Or(vec![
                     PolicyCondition::StartupBlocked,
                     PolicyCondition::And(vec![
-                        PolicyCondition::GreenAt { level: 2 },
+                        PolicyCondition::GreenAt { level: GreenLevel::Workspace },
                         PolicyCondition::TimedOut {
                             duration: Duration::from_secs(5),
                         },
@@ -462,7 +462,7 @@ mod tests {
         ]);
         let context = LaneContext::new(
             "lane-7",
-            2,
+            GreenLevel::Workspace,
             Duration::from_secs(10),
             LaneBlocker::External,
             ReviewStatus::Pending,
@@ -545,7 +545,7 @@ mod tests {
         assert!(ctx.completed);
         assert!(ctx.reconciled);
         assert_eq!(ctx.blocker, LaneBlocker::None);
-        assert_eq!(ctx.green_level, 0);
+        assert_eq!(ctx.green_level, GreenLevel::TargetedTests);
     }
 
     #[test]
@@ -561,7 +561,7 @@ mod tests {
         // Normal completed lane — not reconciled
         let context = LaneContext::new(
             "lane-7",
-            0,
+            GreenLevel::TargetedTests,
             Duration::from_secs(0),
             LaneBlocker::None,
             ReviewStatus::Pending,

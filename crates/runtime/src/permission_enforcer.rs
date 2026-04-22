@@ -191,7 +191,11 @@ fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
 }
 
 /// Conservative heuristic: is this bash command read-only?
-fn is_read_only_command(command: &str) -> bool {
+///
+/// Returns true for commands that are known to not modify the system state.
+/// Commands that include dangerous flags (`--force`, `-i`, `push`, etc.) or
+/// redirections (`>`, `>>`) are excluded even if their base command is safe.
+pub fn is_read_only_command(command: &str) -> bool {
     let first_token = command
         .split_whitespace()
         .next()
@@ -265,10 +269,25 @@ fn is_read_only_command(command: &str) -> bool {
             | "rustc"
             | "git"
             | "gh"
+            | "docker"
+            | "kubectl"
+            | "helm"
+            | "systemctl"
+            | "journalctl"
+            | "npm"
+            | "pnpm"
+            | "yarn"
+            | "pip"
+            | "pip3"
     ) && !command.contains("-i ")
         && !command.contains("--in-place")
         && !command.contains(" > ")
         && !command.contains(" >> ")
+        && !command.contains("--force")
+        && !command.contains(" push ")
+        && !command.contains(" clean -fdx")
+        && !command.contains(" rm ")
+        && !command.contains(" reset --hard")
 }
 
 #[cfg(test)]
@@ -953,5 +972,122 @@ impl DestructivePatternDetector {
                 }
             }
         }
+    }
+}
+
+// ── Smart Approval Verdict (intelligent approval decision) ──────────────────
+
+use crate::config::ApprovalConfig;
+
+/// Reason a command was automatically allowed without user approval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AutoPassReason {
+    /// Command did not match any destructive pattern.
+    NoPatternMatch,
+    /// Command was detected as read-only (ls, cat, grep, etc.).
+    ReadOnlyCommand,
+    /// Command matched a Low-risk pattern but auto-pass is enabled.
+    LowRiskAutoPass,
+    /// YOLO mode is active; non-critical commands bypass approval.
+    YoloBypass,
+    /// Command was previously approved with Session/Always persistence.
+    CachedApproval { persistence: ApprovalPersistence },
+}
+
+/// Intelligent approval verdict combining pattern detection with approval config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SmartApprovalVerdict {
+    /// Command is allowed without user interaction.
+    AutoPass { reason: AutoPassReason },
+    /// Command requires explicit user approval via the frontend card.
+    NeedsApproval(ApprovalRequest),
+}
+
+impl DestructivePatternDetector {
+    /// Intelligent detection that considers approval configuration.
+    ///
+    /// This method applies the smart approval policy:
+    /// - Read-only commands auto-pass
+    /// - YOLO mode bypasses non-critical approvals
+    /// - Low-risk patterns auto-pass when configured
+    /// - Everything else requires explicit approval
+    pub fn detect_with_config(
+        &self,
+        raw_cmd: &str,
+        config: &ApprovalConfig,
+    ) -> SmartApprovalVerdict {
+        let normalized = Self::normalize_command(raw_cmd);
+
+        // Step 1: Check if this is a read-only command (auto-pass)
+        if config.auto_pass_read_only && is_read_only_command(&normalized) {
+            return SmartApprovalVerdict::AutoPass {
+                reason: AutoPassReason::ReadOnlyCommand,
+            };
+        }
+
+        // Step 2: Check session-level and permanent approval cache
+        let cache_key = self.command_cache_key(&normalized);
+        if let Ok(cache) = self.session_approved.try_read() {
+            if let Some(persistence) = cache.get(&cache_key) {
+                match persistence {
+                    ApprovalPersistence::Session | ApprovalPersistence::Always => {
+                        return SmartApprovalVerdict::AutoPass {
+                            reason: AutoPassReason::CachedApproval {
+                                persistence: persistence.clone(),
+                            },
+                        };
+                    }
+                    ApprovalPersistence::Once => {}
+                }
+            }
+        }
+
+        // Step 3: Check permanent approval file
+        if self.is_always_approved(&normalized) {
+            return SmartApprovalVerdict::AutoPass {
+                reason: AutoPassReason::CachedApproval {
+                    persistence: ApprovalPersistence::Always,
+                },
+            };
+        }
+
+        // Step 4: Run pattern detection
+        let Some(approval_req) = self.detect(raw_cmd) else {
+            return SmartApprovalVerdict::AutoPass {
+                reason: AutoPassReason::NoPatternMatch,
+            };
+        };
+
+        // Step 5: YOLO mode logic
+        if config.yolo_mode {
+            // In YOLO mode, Critical-risk commands may still require approval
+            if approval_req.risk_level == RiskLevel::Critical && config.yolo_honor_critical {
+                // Fall through to NeedsApproval
+            } else {
+                tracing::info!(
+                    command = %raw_cmd,
+                    risk_level = ?approval_req.risk_level,
+                    "YOLO mode: auto-passing command"
+                );
+                return SmartApprovalVerdict::AutoPass {
+                    reason: AutoPassReason::YoloBypass,
+                };
+            }
+        }
+
+        // Step 6: Low-risk auto-pass
+        if approval_req.risk_level == RiskLevel::Low && config.auto_pass_low_risk {
+            tracing::info!(
+                command = %raw_cmd,
+                patterns = ?approval_req.matched_patterns,
+                "Low-risk command auto-passed"
+            );
+            return SmartApprovalVerdict::AutoPass {
+                reason: AutoPassReason::LowRiskAutoPass,
+            };
+        }
+
+        // Step 7: Requires explicit approval
+        SmartApprovalVerdict::NeedsApproval(approval_req)
     }
 }

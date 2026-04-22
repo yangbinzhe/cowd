@@ -2506,3 +2506,239 @@ body {
 .ob-success { color: #22c55e; }
 .ob-error { color: #ef4444; }
 .ob-pending { color: #eab308; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   3C: Enhanced UI Styles
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* 3C-1: Model selector */
+.model-select {
+  appearance: none;
+  background: var(--surface, #16213e);
+  color: var(--text, #e8e8f0);
+  border: 1px solid var(--border, #2a2a4e);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  min-width: 80px;
+}
+.model-select:focus { outline: none; border-color: var(--accent); }
+
+/* 3C-1: Stop button */
+.stop-btn {
+  background: var(--red, #ef4444);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+.stop-btn:hover { background: #dc2626; }
+.stop-btn svg { fill: white; }
+
+/* 3C-2: Memory view tabs */
+.memory-view-tabs {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+  margin-right: 8px;
+}
+.view-tab {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.view-tab.active {
+  background: var(--accent-bg);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.view-tab:hover:not(.active) {
+  background: var(--surface);
+  color: var(--text);
+}
+
+/* 3C-2: Memory graph container */
+.memory-graph-container {
+  width: 100%;
+  height: 450px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+}
+
+/* 3C-3: Knowledge graph tooltip */
+.kg-tooltip {
+  position: fixed;
+  background: var(--surface, #16213e);
+  border: 1px solid var(--border, #2a2a4e);
+  border-radius: 8px;
+  padding: 12px;
+  max-width: 300px;
+  z-index: 1000;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  display: none;
+  font-size: 12px;
+}
+.kg-tooltip-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.kg-tooltip-color {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.kg-tooltip-meta {
+  display: flex;
+  gap: 12px;
+  color: var(--text-dim);
+  font-size: 11px;
+  margin-bottom: 6px;
+}
+.kg-tooltip-edges {
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+  margin-top: 4px;
+}
+.kg-tooltip-edge {
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 1px 0;
+}
+.kg-tooltip-more {
+  color: var(--text-dim);
+  font-size: 10px;
+  font-style: italic;
+}
+
+/* 3C-4: Cron logs section */
+.cron-logs-section {
+  margin: 16px 0;
+  padding: 12px;
+  background: var(--surface);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+.cron-logs-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.cron-logs-header h3 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text);
+}
+.cron-logs-list {
+  max-height: 200px;
+  overflow-y: auto;
+}
+.cron-logs-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 8px 0;
+}
+.cron-log-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.cron-log-item:last-child { border-bottom: none; }
+.cron-log-icon { font-size: 14px; }
+.cron-log-name { color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cron-log-time { color: var(--text-dim); font-size: 11px; white-space: nowrap; }
+.cron-log-status { font-size: 11px; font-weight: 500; }
+.cron-log-duration { color: var(--text-dim); font-size: 11px; }
+.cron-log-error { color: var(--red); font-size: 11px; cursor: help; }
+.log-success .cron-log-status { color: #22c55e; }
+.log-success .cron-log-icon { color: #22c55e; }
+.log-failed .cron-log-status { color: #ef4444; }
+.log-failed .cron-log-icon { color: #ef4444; }
+.log-running .cron-log-status { color: #eab308; }
+.log-running .cron-log-icon { color: #eab308; }
+.log-unknown .cron-log-status { color: var(--text-dim); }
+.log-unknown .cron-log-icon { color: var(--text-dim); }
+
+/* 3C-5: Responsive layout */
+@media (max-width: 768px) {
+  .sidebar {
+    position: fixed;
+    left: -280px;
+    z-index: 100;
+    transition: left 0.3s ease;
+    width: 280px;
+    height: 100vh;
+  }
+  .sidebar.open { left: 0; }
+  .main-content {
+    margin-left: 0 !important;
+    width: 100% !important;
+  }
+  .sidebar-toggle { display: block !important; }
+  .memory-view-tabs { flex-wrap: wrap; }
+  .memory-graph-container { height: 300px; }
+  .composer-inner { flex-wrap: wrap; }
+  .model-select { width: 100%; order: -1; }
+  .cron-item-actions { flex-wrap: wrap; }
+  .cron-log-item { flex-wrap: wrap; gap: 4px; }
+  .panel-header { flex-wrap: wrap; gap: 8px; }
+  .chat-toolbar { flex-wrap: wrap; }
+}
+
+@media (max-width: 480px) {
+  .suggestions { flex-direction: column; }
+  .memory-stat { min-width: 60px; }
+  .cron-logs-section { padding: 8px; }
+  .memory-graph-container { height: 250px; }
+}
+
+/* 3C-5: Theme transition */
+:root {
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* 3C-5: System preference detection */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --bg: #f5f5f7;
+    --surface: #ffffff;
+    --text: #1d1d1f;
+    --text-muted: #6e6e73;
+    --text-dim: #86868b;
+    --accent: #b5451b;
+    --accent-hover: #d4653b;
+    --accent-bg: rgba(181, 69, 27, 0.1);
+    --border: #d2d2d7;
+    --red: #ef4444;
+    --green: #22c55e;
+    --gold: #eab308;
+    --blue: #3b82f6;
+  }
+}
+
+/* Print styles */
+@media print {
+  .sidebar, .composer, .chat-toolbar, .panel-header button,
+  .message-actions, .approval-container { display: none !important; }
+  .main-content { margin: 0 !important; width: 100% !important; }
+  .message { border: 1px solid #ccc; margin: 4px 0; padding: 8px; }
+}

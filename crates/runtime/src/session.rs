@@ -1048,9 +1048,9 @@ fn current_time_millis() -> u64 {
 }
 
 fn generate_session_id() -> String {
-    let millis = current_time_millis();
-    let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("session-{millis}-{counter}")
+    // 3A-6 fix: use UUID v4 instead of timestamp+counter to ensure
+    // stable, globally unique session IDs across process restarts.
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {

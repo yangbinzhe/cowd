@@ -63,6 +63,19 @@ fn main() {
     if webui_dir.exists() {
         copy_dir_recursive(&webui_dir, &static_dir);
         println!("cargo:rerun-if-changed=../../webui");
+
+        // Also copy webui/ → target/{profile}/webui/ so the binary can find it
+        // relative to its own location at runtime.
+        let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+        let target_dir = env::var("CARGO_TARGET_DIR")
+            .map(|p| p.to_string())
+            .unwrap_or_else(|_| {
+                let manifest = std::path::Path::new(&manifest_dir);
+                let workspace_root = manifest.parent().and_then(|p| p.parent()).unwrap_or(manifest);
+                workspace_root.join("target").to_string_lossy().to_string()
+            });
+        let target_webui = std::path::Path::new(&target_dir).join(&profile).join("webui");
+        copy_dir_recursive(&webui_dir, &target_webui);
     }
 }
 

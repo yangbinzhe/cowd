@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+
 use api::{
     max_tokens_for_model, resolve_model_alias, ApiError, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
@@ -1167,6 +1169,34 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
+        // 3B-4: Built-in vision analysis tool (requires multimodal LLM support)
+        ToolSpec {
+            name: "vision_analyze",
+            description: "Analyze an image using multimodal LLM vision capabilities. \
+                Requires the configured LLM to support image inputs (e.g., Claude 3.5+ with vision). \
+                If the LLM does not support vision, this tool will return an error.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "Path to the image file to analyze (PNG, JPG, GIF, WebP supported)"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "What to analyze or describe about the image"
+                    },
+                    "detail": {
+                        "type": "string",
+                        "enum": ["low", "high", "auto"],
+                        "description": "Level of detail for image analysis (default: auto)"
+                    }
+                },
+                "required": ["image_path", "prompt"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
     ]
 }
 
@@ -1284,6 +1314,10 @@ fn execute_tool_with_enforcer(
         "MCP" => from_value::<McpToolInput>(input).and_then(run_mcp_tool),
         "TestingPermission" => {
             from_value::<TestingPermissionInput>(input).and_then(run_testing_permission)
+        }
+        "vision_analyze" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            run_vision_analyze(input)
         }
         _ => Err(format!("unsupported tool: {name}")),
     }
@@ -1859,6 +1893,68 @@ fn run_testing_permission(input: TestingPermissionInput) -> Result<String, Strin
         "message": "Testing permission tool stub"
     }))
 }
+
+// ── 3B-4: Vision Analyze Tool ──────────────────────────────────────────────────
+
+/// Execute the vision_analyze tool. This tool reads an image file and returns
+/// a base64-encoded representation along with metadata, suitable for passing
+/// to a multimodal LLM. The actual LLM vision call is handled by the
+/// ConversationRuntime, not this tool — this tool prepares the image data.
+fn run_vision_analyze(input: &Value) -> Result<String, String> {
+    let image_path = input.get("image_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "vision_analyze requires 'image_path' parameter".to_string())?;
+
+    let prompt = input.get("prompt")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "vision_analyze requires 'prompt' parameter".to_string())?;
+
+    let detail = input.get("detail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
+
+    // Validate the image file exists and is a supported format
+    let path = std::path::Path::new(image_path);
+    if !path.exists() {
+        return Err(format!("Image file not found: {}", image_path));
+    }
+
+    let extension = path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let media_type = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => return Err(format!(
+            "Unsupported image format: '{}'. Supported: PNG, JPG, GIF, WebP",
+            extension
+        )),
+    };
+
+    // Read and base64-encode the image
+    let image_data = std::fs::read(path)
+        .map_err(|e| format!("Failed to read image file '{}': {}", image_path, e))?;
+
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&image_data);
+
+    // Return the prepared vision request payload
+    to_pretty_json(json!({
+        "tool": "vision_analyze",
+        "status": "prepared",
+        "image_path": image_path,
+        "media_type": media_type,
+        "detail": detail,
+        "prompt": prompt,
+        "image_base64": base64_data,
+        "size_bytes": image_data.len(),
+        "message": "Image prepared for multimodal LLM analysis. The conversation runtime will include this as a vision content block."
+    }))
+}
+
 fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> {
     serde_json::from_value(input.clone()).map_err(|error| error.to_string())
 }

@@ -21,7 +21,7 @@ fn stale_branch_detection_flows_into_policy_engine() {
     // given — a stale branch context (2 hours behind main, threshold is 1 hour)
     let stale_context = LaneContext::new(
         "stale-lane",
-        0,
+        GreenLevel::TargetedTests,
         Duration::from_secs(2 * 60 * 60), // 2 hours stale
         LaneBlocker::None,
         ReviewStatus::Pending,
@@ -48,7 +48,7 @@ fn stale_branch_detection_flows_into_policy_engine() {
 fn fresh_branch_does_not_trigger_stale_policy() {
     let fresh_context = LaneContext::new(
         "fresh-lane",
-        0,
+        GreenLevel::TargetedTests,
         Duration::from_secs(30 * 60), // 30 min stale — under 1 hour threshold
         LaneBlocker::None,
         ReviewStatus::Pending,
@@ -88,7 +88,7 @@ fn green_contract_satisfied_allows_merge() {
 fn green_contract_unsatisfied_blocks_merge() {
     let context = LaneContext::new(
         "partial-green-lane",
-        1, // GreenLevel::Package as u8
+        GreenLevel::Package,
         Duration::from_secs(0),
         LaneBlocker::None,
         ReviewStatus::Pending,
@@ -96,18 +96,16 @@ fn green_contract_unsatisfied_blocks_merge() {
         false,
     );
 
-    // This is a conceptual test — we need a way to express "requires workspace green"
-    // Currently LaneContext has raw green_level: u8, not a contract
-    // For now we just verify the policy condition works
+    // LaneContext now uses the GreenLevel enum from green_contract
     let engine = PolicyEngine::new(vec![PolicyRule::new(
         "workspace-green-required",
-        PolicyCondition::GreenAt { level: 3 }, // GreenLevel::Workspace
+        PolicyCondition::GreenAt { level: GreenLevel::Workspace },
         PolicyAction::MergeToDev,
         10,
     )]);
 
     let actions = engine.evaluate(&context);
-    assert!(actions.is_empty()); // level 1 < 3, so no merge
+    assert!(actions.is_empty()); // Package < Workspace, so no merge
 }
 
 /// reconciliation + policy_engine integration:
@@ -212,7 +210,7 @@ fn end_to_end_stale_lane_gets_merge_forward_action() {
     // when: build context and evaluate policy
     let context = LaneContext::new(
         "lane-9411",
-        3,                                // Workspace green
+        GreenLevel::Workspace,
         Duration::from_secs(5 * 60 * 60), // 5 hours stale, definitely over threshold
         LaneBlocker::None,
         ReviewStatus::Approved,
@@ -261,7 +259,7 @@ fn end_to_end_stale_lane_gets_merge_forward_action() {
 fn fresh_approved_lane_gets_merge_action() {
     let context = LaneContext::new(
         "fresh-approved-lane",
-        3,                            // Workspace green
+        GreenLevel::Workspace,
         Duration::from_secs(30 * 60), // 30 min — under 1 hour threshold = fresh
         LaneBlocker::None,
         ReviewStatus::Approved,
@@ -272,7 +270,7 @@ fn fresh_approved_lane_gets_merge_action() {
     let engine = PolicyEngine::new(vec![PolicyRule::new(
         "merge-if-green-approved-not-stale",
         PolicyCondition::And(vec![
-            PolicyCondition::GreenAt { level: 3 },
+            PolicyCondition::GreenAt { level: GreenLevel::Workspace },
             PolicyCondition::ReviewPassed,
             // NOT PolicyCondition::StaleBranch — fresh lanes bypass this
         ]),
@@ -346,7 +344,7 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
     // Policy integration: recovery success + green status = merge-ready
     // (Simulating the policy check that would happen after successful recovery)
     let recovery_success = matches!(result, RecoveryResult::Recovered { .. });
-    let green_level = 3; // Workspace green
+    let green_level = GreenLevel::Workspace;
     let not_stale = Duration::from_secs(30 * 60); // 30 min — fresh
 
     let post_recovery_context = LaneContext::new(
@@ -364,7 +362,7 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
         PolicyRule::new(
             "merge-after-successful-recovery",
             PolicyCondition::And(vec![
-                PolicyCondition::GreenAt { level: 3 },
+                PolicyCondition::GreenAt { level: GreenLevel::Workspace },
                 PolicyCondition::ReviewPassed,
             ]),
             PolicyAction::MergeToDev,

@@ -33,6 +33,11 @@ pub struct MirrorRule {
     pub source_platform: String,
     /// Source session key string.
     pub source_session: String,
+    /// Target platform name (e.g., "webui", "api_server").
+    /// 3A-7 fix: added target_platform — needed to route mirrored messages
+    /// to the correct platform adapter.
+    #[serde(default)]
+    pub target_platform: Option<String>,
     /// Target session key string.
     pub target_session: String,
     /// Mirror direction.
@@ -200,6 +205,7 @@ impl MessageMirror {
                 id: format!("{}_a2b", id),
                 source_platform: platform_a.clone(),
                 source_session: session_a.clone(),
+                target_platform: None,
                 target_session: session_b.clone(),
                 direction: MirrorDirection::OneWay,
                 enabled: true,
@@ -209,6 +215,7 @@ impl MessageMirror {
                 id: format!("{}_b2a", id),
                 source_platform: platform_a,
                 source_session: session_b,
+                target_platform: None,
                 target_session: session_a,
                 direction: MirrorDirection::OneWay,
                 enabled: true,
@@ -236,6 +243,7 @@ mod tests {
             id: "test1".to_string(),
             source_platform: "feishu".to_string(),
             source_session: "feishu:user1".to_string(),
+            target_platform: None,
             target_session: "webui:session1".to_string(),
             direction: MirrorDirection::OneWay,
             enabled: true,
@@ -285,6 +293,7 @@ mod tests {
             id: "disabled1".to_string(),
             source_platform: "feishu".to_string(),
             source_session: "feishu:user1".to_string(),
+            target_platform: None,
             target_session: "webui:session1".to_string(),
             direction: MirrorDirection::OneWay,
             enabled: false,
@@ -314,6 +323,7 @@ mod tests {
             id: "wildcard1".to_string(),
             source_platform: "feishu".to_string(),
             source_session: "*".to_string(),
+            target_platform: None,
             target_session: "webui:all".to_string(),
             direction: MirrorDirection::OneWay,
             enabled: true,

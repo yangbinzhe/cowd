@@ -109,7 +109,51 @@ pub enum SubAgentError {
 }
 
 // ---------------------------------------------------------------------------
-// SubAgentRuntime (stub)
+// SubAgentExecutor trait (3A-4)
+// ---------------------------------------------------------------------------
+
+/// Trait for executing a single sub-agent turn.
+///
+/// Implemented by the caller (typically `ConversationRuntime`) to provide
+/// the actual LLM call + tool execution capability.
+pub trait SubAgentExecutor: Send + Sync {
+    /// Execute one turn of the sub-agent loop.
+    fn execute_turn(
+        &self,
+        prompt: &str,
+        allowed_tools: &[String],
+        system_prompt: Option<&str>,
+    ) -> Result<TurnOutput, SubAgentError>;
+}
+
+/// Output from a single sub-agent turn.
+#[derive(Debug, Clone)]
+pub struct TurnOutput {
+    /// The text content produced by the model in this turn.
+    pub text: String,
+    /// Tool calls made during this turn.
+    pub tool_calls: Vec<ToolCallRecord>,
+    /// Input tokens consumed.
+    pub input_tokens: usize,
+    /// Output tokens consumed.
+    pub output_tokens: usize,
+    /// Why the model stopped generating (e.g. "end_turn", "tool_use").
+    pub stop_reason: String,
+}
+
+/// Record of a single tool call within a sub-agent turn.
+#[derive(Debug, Clone)]
+pub struct ToolCallRecord {
+    /// Name of the tool invoked.
+    pub tool_name: String,
+    /// Input provided to the tool.
+    pub tool_input: String,
+    /// Output returned by the tool.
+    pub tool_output: String,
+}
+
+// ---------------------------------------------------------------------------
+// SubAgentRuntime
 // ---------------------------------------------------------------------------
 
 /// Runtime for executing sub-agents.
@@ -195,8 +239,11 @@ impl SubAgentRuntime {
             output,
             tool_call_count: 0, // caller should track
             tokens_used: self.tokens_consumed,
-            completed_normally: self.turns_executed < self.config.max_turns
-                && self.tokens_consumed < self.config.budget_tokens,
+            // 3A-4 fix: use <= instead of < — using exactly max_turns or
+            // exactly budget_tokens is still within budget and counts as
+            // normal completion.
+            completed_normally: self.turns_executed <= self.config.max_turns
+                && self.tokens_consumed <= self.config.budget_tokens,
             memory_write_attempts: 0,
             memory_writes_denied: 0,
         }
@@ -210,6 +257,96 @@ impl SubAgentRuntime {
     /// Get remaining turns.
     pub fn remaining_turns(&self) -> usize {
         self.config.max_turns.saturating_sub(self.turns_executed)
+    }
+
+    /// Run the sub-agent loop until completion or budget exhaustion.
+    ///
+    /// Requires an executor that can drive individual LLM turns. This method
+    /// handles the loop control: budget checks, tool-result chaining, and
+    /// stop-reason handling.
+    pub fn run_loop(
+        &mut self,
+        initial_prompt: &str,
+        executor: &dyn SubAgentExecutor,
+    ) -> SubAgentResult {
+        let mut output_parts: Vec<String> = Vec::new();
+        let mut tool_call_count: usize = 0;
+        let mut memory_write_attempts: usize = 0;
+        let mut memory_writes_denied: usize = 0;
+        let mut current_prompt = initial_prompt.to_string();
+
+        loop {
+            if let Err(e) = self.check_budget() {
+                tracing::warn!("SubAgent budget exhausted: {}", e);
+                break;
+            }
+
+            let turn = match executor.execute_turn(
+                &current_prompt,
+                &self.config.allowed_tools,
+                Some(&self.config.task_description),
+            ) {
+                Ok(t) => t,
+                Err(SubAgentError::ToolNotAllowed(tool)) => {
+                    tracing::warn!("SubAgent tool not allowed: {}", tool);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!("SubAgent turn failed: {}", e);
+                    break;
+                }
+            };
+
+            self.record_turn(turn.input_tokens + turn.output_tokens);
+            tool_call_count += turn.tool_calls.len();
+
+            // Collect output
+            output_parts.push(turn.text.clone());
+
+            // If model says it's done, break
+            if turn.stop_reason == "end_turn" || turn.stop_reason == "stop" {
+                break;
+            }
+
+            // Build next prompt from tool results if any
+            if !turn.tool_calls.is_empty() {
+                let tool_summaries: Vec<String> = turn
+                    .tool_calls
+                    .iter()
+                    .map(|tc| {
+                        format!(
+                            "Tool {} returned: {}",
+                            tc.tool_name,
+                            truncate_str(&tc.tool_output, 500)
+                        )
+                    })
+                    .collect();
+                current_prompt =
+                    format!("Continue based on tool results:\n{}", tool_summaries.join("\n"));
+            } else {
+                break;
+            }
+        }
+
+        SubAgentResult {
+            output: output_parts.join("\n"),
+            tool_call_count,
+            tokens_used: self.tokens_consumed,
+            completed_normally: self.turns_executed <= self.config.max_turns
+                && self.tokens_consumed <= self.config.budget_tokens,
+            memory_write_attempts,
+            memory_writes_denied,
+        }
+    }
+}
+
+/// Truncate a string to at most `max_len` characters, appending "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -300,5 +437,159 @@ mod tests {
         let long_output = "x".repeat(100_000);
         let truncated = runtime.truncate_result(&long_output);
         assert!(truncated.len() < long_output.len());
+    }
+
+    #[test]
+    fn completed_normally_true_when_within_budget() {
+        // 3A-4 fix: using exactly max_turns turns is still normal completion
+        let config = SubAgentConfig {
+            max_turns: 3,
+            budget_tokens: 1000,
+            ..SubAgentConfig::default()
+        };
+        let mut runtime = SubAgentRuntime::new(config);
+        runtime.record_turn(100);
+        runtime.record_turn(100);
+        runtime.record_turn(100);
+        // turns_executed == max_turns, but that's still within budget
+        let result = runtime.build_result("done".to_string());
+        assert!(result.completed_normally);
+    }
+
+    #[test]
+    fn completed_normally_false_when_over_budget() {
+        let config = SubAgentConfig {
+            max_turns: 3,
+            budget_tokens: 100,
+            ..SubAgentConfig::default()
+        };
+        let mut runtime = SubAgentRuntime::new(config);
+        runtime.record_turn(200); // exceeds budget_tokens
+        let result = runtime.build_result("done".to_string());
+        assert!(!result.completed_normally);
+    }
+
+    // -- Stub executor for run_loop tests --
+
+    struct StubExecutor {
+        turns: Vec<TurnOutput>,
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubExecutor {
+        fn new(turns: Vec<TurnOutput>) -> Self {
+            Self {
+                turns,
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SubAgentExecutor for StubExecutor {
+        fn execute_turn(
+            &self,
+            _prompt: &str,
+            _allowed_tools: &[String],
+            _system_prompt: Option<&str>,
+        ) -> Result<TurnOutput, SubAgentError> {
+            let idx = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.turns
+                .get(idx)
+                .cloned()
+                .ok_or_else(|| SubAgentError::ExecutionError("no more stub turns".to_string()))
+        }
+    }
+
+    #[test]
+    fn run_loop_completes_on_end_turn() {
+        let executor = StubExecutor::new(vec![TurnOutput {
+            text: "task done".to_string(),
+            tool_calls: vec![],
+            input_tokens: 50,
+            output_tokens: 50,
+            stop_reason: "end_turn".to_string(),
+        }]);
+        let config = SubAgentConfig {
+            max_turns: 5,
+            budget_tokens: 10_000,
+            ..SubAgentConfig::default()
+        };
+        let mut runtime = SubAgentRuntime::new(config);
+        let result = runtime.run_loop("do something", &executor);
+        assert!(result.completed_normally);
+        assert_eq!(result.output, "task done");
+        assert_eq!(result.tool_call_count, 0);
+    }
+
+    #[test]
+    fn run_loop_chains_tool_calls() {
+        let executor = StubExecutor::new(vec![
+            TurnOutput {
+                text: "using tool".to_string(),
+                tool_calls: vec![ToolCallRecord {
+                    tool_name: "read".to_string(),
+                    tool_input: "/tmp/file".to_string(),
+                    tool_output: "file contents".to_string(),
+                }],
+                input_tokens: 50,
+                output_tokens: 50,
+                stop_reason: "tool_use".to_string(),
+            },
+            TurnOutput {
+                text: "final answer".to_string(),
+                tool_calls: vec![],
+                input_tokens: 50,
+                output_tokens: 50,
+                stop_reason: "end_turn".to_string(),
+            },
+        ]);
+        let config = SubAgentConfig {
+            max_turns: 5,
+            budget_tokens: 10_000,
+            ..SubAgentConfig::default()
+        };
+        let mut runtime = SubAgentRuntime::new(config);
+        let result = runtime.run_loop("read a file", &executor);
+        assert!(result.completed_normally);
+        assert_eq!(result.tool_call_count, 1);
+        assert!(result.output.contains("using tool"));
+        assert!(result.output.contains("final answer"));
+    }
+
+    #[test]
+    fn run_loop_stops_on_budget_exhaustion() {
+        let executor = StubExecutor::new(vec![
+            TurnOutput {
+                text: "turn 1".to_string(),
+                tool_calls: vec![ToolCallRecord {
+                    tool_name: "read".to_string(),
+                    tool_input: "/tmp/file".to_string(),
+                    tool_output: "contents".to_string(),
+                }],
+                input_tokens: 8000,
+                output_tokens: 8000,
+                stop_reason: "tool_use".to_string(),
+            },
+            TurnOutput {
+                text: "turn 2".to_string(),
+                tool_calls: vec![ToolCallRecord {
+                    tool_name: "read".to_string(),
+                    tool_input: "/tmp/other".to_string(),
+                    tool_output: "more contents".to_string(),
+                }],
+                input_tokens: 5000,
+                output_tokens: 5000,
+                stop_reason: "tool_use".to_string(),
+            },
+        ]);
+        let config = SubAgentConfig {
+            max_turns: 5,
+            budget_tokens: 20_000, // turn 1: 16000, turn 2: 26000 > budget
+            ..SubAgentConfig::default()
+        };
+        let mut runtime = SubAgentRuntime::new(config);
+        let result = runtime.run_loop("expensive task", &executor);
+        // After turn 2: tokens_consumed = 26000 > budget_tokens = 20000
+        assert!(!result.completed_normally);
     }
 }

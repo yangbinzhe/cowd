@@ -122,6 +122,86 @@ fn not_found() -> Response {
         })
 }
 
+// ── Global Usage Tracker ───────────────────────────────────────────────────────
+
+/// Per-model usage accumulation for the /api/usage endpoint.
+#[derive(Debug, Default)]
+struct ModelUsageAccum {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    turns: u64,
+}
+
+/// Thread-safe global usage tracker that records token usage per model.
+#[derive(Debug, Default)]
+struct GlobalUsageTracker {
+    by_model: std::sync::Mutex<HashMap<String, ModelUsageAccum>>,
+    total_sessions: std::sync::atomic::AtomicU64,
+}
+
+impl GlobalUsageTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn record(&self, model: &str, usage: runtime::TokenUsage) {
+        self.total_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut map = self.by_model.lock().unwrap();
+        let accum = map.entry(model.to_string()).or_default();
+        accum.input_tokens += usage.input_tokens as u64;
+        accum.output_tokens += usage.output_tokens as u64;
+        accum.cache_creation_input_tokens += usage.cache_creation_input_tokens as u64;
+        accum.cache_read_input_tokens += usage.cache_read_input_tokens as u64;
+        accum.turns += 1;
+    }
+
+    fn snapshot(&self) -> UsageResponse {
+        let map = self.by_model.lock().unwrap();
+        let mut by_model = HashMap::new();
+        for (model, accum) in map.iter() {
+            let pricing = runtime::pricing_for_model(model);
+            let tu = runtime::TokenUsage {
+                input_tokens: accum.input_tokens as u32,
+                output_tokens: accum.output_tokens as u32,
+                cache_creation_input_tokens: accum.cache_creation_input_tokens as u32,
+                cache_read_input_tokens: accum.cache_read_input_tokens as u32,
+            };
+            let cost = pricing.map_or_else(
+                || tu.estimate_cost_usd(),
+                |p| tu.estimate_cost_usd_with_pricing(p),
+            );
+            by_model.insert(model.clone(), ModelUsageResponse {
+                model: model.clone(),
+                input_tokens: accum.input_tokens,
+                output_tokens: accum.output_tokens,
+                cost_usd: runtime::format_usd(cost.total_cost_usd()),
+                turns: accum.turns,
+            });
+        }
+        UsageResponse {
+            total_sessions: self.total_sessions.load(std::sync::atomic::Ordering::Relaxed),
+            by_model,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct UsageResponse {
+    total_sessions: u64,
+    by_model: HashMap<String, ModelUsageResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelUsageResponse {
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: String,
+    turns: u64,
+}
+
 // ── Service Management ─────────────────────────────────────────────────────────
 
 // B8: PID file in user-local directory with restricted permissions
@@ -247,14 +327,16 @@ struct HttpAppState {
     platform_runtime: Option<Arc<PlatformRuntime>>,
     /// Broadcast channel for session events (WebSocket sync)
     session_broadcast: broadcast::Sender<SessionEvent>,
-    /// P0-1: Destructive command detector
-    destructive_detector: Arc<runtime::permission_enforcer::DestructivePatternDetector>,
-    /// P0-1: Pending approval requests (approval_id → (request, oneshot sender))
-    pending_approvals: Arc<RwLock<HashMap<String, (runtime::permission_enforcer::ApprovalRequest, tokio::sync::oneshot::Sender<runtime::permission_enforcer::ApprovalVerdict>)>>>,
+    /// P0-1: Smart approval gate (combines destructive detection + approval config + pending map)
+    approval_gate: Arc<runtime::approval_gate::SmartApprovalGate>,
     /// Sessions directory for JSONL files (splice operations)
     sessions_dir: PathBuf,
     /// P1-5: Cron scheduler
     cron_scheduler: Arc<CronScheduler>,
+    /// Global usage tracker for /api/usage
+    usage_tracker: Arc<GlobalUsageTracker>,
+    /// 3B-3: Fact checker for knowledge graph validation
+    fact_checker: Arc<tokio::sync::Mutex<memory::FactChecker>>,
 }
 
 /// HTTP API 配置
@@ -268,6 +350,11 @@ pub struct HttpConfig {
     pub memory_config: Option<MemoryConfig>,
     pub session_store_path: Option<PathBuf>,
     pub platform_configs: Vec<PlatformConfig>,
+    /// Additional CORS origins beyond the default local ones.
+    /// If empty, only the default local origins are allowed.
+    pub cors_origins: Vec<String>,
+    /// Approval gate configuration (loaded from config.yaml).
+    pub approval_config: Option<runtime::ApprovalConfig>,
 }
 
 impl Default for HttpConfig {
@@ -281,6 +368,8 @@ impl Default for HttpConfig {
             memory_config: None,
             session_store_path: None,
             platform_configs: Vec::new(),
+            cors_origins: Vec::new(),
+            approval_config: None,
         }
     }
 }
@@ -295,7 +384,7 @@ async fn init_app_state(config: &HttpConfig) -> Result<HttpAppState, ServerError
                 Some(Arc::new(mgr))
             }
             Err(e) => {
-                tracing::warn!("Failed to initialize memory manager: {}", e);
+                eprintln!("warn: Failed to initialize memory manager: {}", e);
                 None
             }
         }
@@ -365,12 +454,17 @@ async fn init_app_state(config: &HttpConfig) -> Result<HttpAppState, ServerError
         skill_service: Arc::new(SkillService::new()),
         platform_runtime,
         session_broadcast: broadcast::channel(1000).0,
-        destructive_detector: Arc::new(runtime::permission_enforcer::DestructivePatternDetector::new(
-            config.session_store_path.as_ref()
-                .map(|p| p.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        approval_gate: Arc::new(runtime::approval_gate::SmartApprovalGate::new(
+            Arc::new(runtime::permission_enforcer::DestructivePatternDetector::new(
+                config.session_store_path.as_ref()
+                    .map(|p| p.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            )),
+            config.approval_config.clone().unwrap_or_default(),
+            Some(runtime::cowd_dirs::project_dot_dir(
+                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            ).join("approval").join("history.json")),
         )),
-        pending_approvals: Arc::new(RwLock::new(HashMap::new())),
         sessions_dir: runtime::workspace_sessions_dir(
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         ).unwrap_or_else(|_| PathBuf::from(".")),
@@ -379,7 +473,59 @@ async fn init_app_state(config: &HttpConfig) -> Result<HttpAppState, ServerError
                 &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
             ).join("cron").join("jobs.json")
         )),
+        usage_tracker: Arc::new(GlobalUsageTracker::new()),
+        fact_checker: Arc::new(tokio::sync::Mutex::new(memory::FactChecker::new())),
     })
+}
+
+/// Get the user's home directory (Linux/macOS: HOME, Windows: USERPROFILE).
+fn home_dir() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(PathBuf::from)
+}
+
+/// Locate the webui directory using a priority-based search:
+/// 1. <binary_dir>/webui/  (local build: target/release/webui/)
+/// 2. ~/.cowd/webui/       (system install)
+/// 3. <cwd>/webui/         (legacy compat)
+/// Falls back to <binary_dir>/webui/ (will use embedded index.html if missing).
+fn find_webui_dir() -> PathBuf {
+    // Priority 1: next to the running binary
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let dir = exe_dir.join("webui");
+            if dir.join("index.html").exists() {
+                return dir;
+            }
+        }
+    }
+
+    // Priority 2: ~/.cowd/webui/
+    if let Some(home) = home_dir() {
+        let dir = home.join(".cowd").join("webui");
+        if dir.join("index.html").exists() {
+            return dir;
+        }
+    }
+
+    // Priority 3: cwd/webui/ (legacy behavior)
+    if let Ok(cwd) = std::env::current_dir() {
+        let dir = cwd.join("webui");
+        if dir.join("index.html").exists() {
+            return dir;
+        }
+    }
+
+    // Fallback: return binary-dir-based path (embedded index.html will be used)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            return exe_dir.join("webui");
+        }
+    }
+
+    PathBuf::from("webui")
 }
 
 /// 启动 HTTP 服务器
@@ -452,16 +598,28 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         // P0-1: Approval API
         .route("/api/approval/pending", get(get_pending_approvals_handler))
         .route("/api/approval/respond", post(respond_to_approval_handler))
+        .route("/api/approval/config", get(get_approval_config_handler))
+        .route("/api/approval/config", put(update_approval_config_handler))
+        .route("/api/approval/yolo", post(toggle_yolo_handler))
+        .route("/api/approval/history", get(list_approval_history_handler))
         // P0-4: File upload
         .route("/api/upload", post(upload_file_handler))
         .route("/api/file/raw", get(get_raw_file_handler))
         // P1-5: Cron scheduler API
         .route("/api/crons", get(list_crons_handler))
         .route("/api/crons", post(create_cron_handler))
+        .route("/api/crons/logs", get(list_cron_logs_handler))
+        .route("/api/crons/:id/logs", get(list_cron_job_logs_handler))
         .route("/api/crons/:id", delete(delete_cron_handler))
         .route("/api/crons/:id/run", post(run_cron_handler))
         .route("/api/crons/:id/pause", post(pause_cron_handler))
         .route("/api/crons/:id/resume", post(resume_cron_handler))
+        // 3B-5: Usage & cost API
+        .route("/api/usage", get(usage_handler))
+        // 3B-3: FactChecker API
+        .route("/api/memory/facts/check", post(check_facts_handler))
+        .route("/api/memory/facts/register", post(register_facts_handler))
+        .route("/api/memory/facts/audit", get(audit_facts_handler))
         // P1-8: Onboarding
         .route("/api/onboarding/status", get(onboarding_status_handler))
         .route("/api/onboarding/test", post(onboarding_test_handler))
@@ -487,8 +645,10 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/v1/memory/graph/relations", get(list_graph_relations_handler))
         .route("/v1/memory/graph/query", post(query_graph_handler))
         .route("/v1/skills", get(list_skills_handler))
-        .route("/v1/skills/:name", get(view_skill_handler))
+        .route("/v1/skills/install", post(install_skill_handler))
+        .route("/v1/skills/:name", get(view_skill_handler).delete(uninstall_skill_handler))
         .route("/v1/skills/:name/invoke", post(invoke_skill_handler))
+        .route("/v1/skills/:name/toggle", post(toggle_skill_handler))
         .route("/v1/workspaces", get(list_workspaces_handler))
         .route("/v1/workspaces/:name", get(get_workspace_handler))
         .route("/v1/workspaces/:name/preview", get(preview_workspace_handler))
@@ -499,14 +659,21 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/v1/platforms/:name/sessions/:id", delete(delete_platform_session_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
-    // B9: Restrictive CORS - only allow local origins
+    // B9: Restrictive CORS - default local origins + configurable extra origins
+    let mut cors_origin_values: Vec<HeaderValue> = vec![
+        "http://localhost:8642".parse::<HeaderValue>().unwrap(),
+        "http://127.0.0.1:8642".parse::<HeaderValue>().unwrap(),
+        "http://localhost:8080".parse::<HeaderValue>().unwrap(),
+        "http://127.0.0.1:8080".parse::<HeaderValue>().unwrap(),
+    ];
+    for origin in &config.cors_origins {
+        match origin.parse::<HeaderValue>() {
+            Ok(hv) => cors_origin_values.push(hv),
+            Err(e) => tracing::warn!("Invalid CORS origin '{}': {}", origin, e),
+        }
+    }
     let cors = CorsLayer::new()
-        .allow_origin([
-            "http://localhost:8642".parse::<HeaderValue>().unwrap(),
-            "http://127.0.0.1:8642".parse::<HeaderValue>().unwrap(),
-            "http://localhost:8080".parse::<HeaderValue>().unwrap(),
-            "http://127.0.0.1:8080".parse::<HeaderValue>().unwrap(),
-        ])
+        .allow_origin(cors_origin_values)
         .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::PATCH, axum::http::Method::DELETE])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
@@ -517,35 +684,28 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
 
     // Add WebUI routes if enabled
     if config.with_webui {
-        // Get the directory containing the binary for locating webui assets
-        // Use current working directory as fallback since server should be started from project root
-        let base_dir = if let Ok(cwd) = std::env::current_dir() {
-            cwd.clone()
-        } else {
-            PathBuf::from(".")
-        };
-        let webui_dir = base_dir.join("webui");
+        // Locate webui directory using priority-based search
+        // (binary dir > ~/.cowd/ > cwd)
+        let webui_dir = find_webui_dir();
         let assets_dir = webui_dir.join("assets");
-        
+
         eprintln!("Serving WebUI from: {}", webui_dir.display());
         
         // Create clone for fallback closure
         let webui_dir_fallback = webui_dir.clone();
         let assets_dir_fallback = assets_dir.clone();
-        let base_dir_fallback = base_dir.clone();
-        
+
         // Serve WebUI static files from the webui directory
         // Use fallback for root path to avoid conflicts with existing routes
         router = router.fallback(move |req: Request<Body>| {
             let webui_dir = webui_dir_fallback.clone();
             let assets_dir = assets_dir_fallback.clone();
-            let base_dir = base_dir_fallback.clone();
             async move {
                 let path = req.uri().path().to_string();
-                
+
                 // Handle root path
                 if path == "/" || path.is_empty() {
-                    let html_path = base_dir.join("webui").join("index.html");
+                    let html_path = webui_dir.join("index.html");
                     if html_path.exists() {
                         if let Ok(html) = fs::read_to_string(&html_path) {
                             return Response::builder()
@@ -646,19 +806,39 @@ fn check_auth_simple() -> Option<Response> {
 
 /// Extract and validate bearer token from Authorization header.
 fn check_auth<B>(state: &HttpAppState, req: &axum::http::Request<B>) -> Option<Response> {
-    // Skip auth if disabled
-    if !state.auth_enabled {
+    // Skip auth if disabled or no token configured (auto-disable when auth_token is empty)
+    if !state.auth_enabled || state.auth_token.is_empty() {
         return None;
     }
 
     // Extract Authorization header
-    let auth_header = req.headers()
-        .get("Authorization")?
-        .to_str()
-        .ok()?;
+    let auth_header = match req.headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(h) => h,
+        None => {
+            return Some((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Missing Authorization header. Include 'Authorization: Bearer <token>' header."
+                })),
+            ).into_response());
+        }
+    };
 
     // Check Bearer token format
-    let token = auth_header.strip_prefix("Bearer ")?;
+    let token = match auth_header.strip_prefix("Bearer ") {
+        Some(t) => t,
+        None => {
+            return Some((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Invalid Authorization header format. Use 'Bearer <token>'."
+                })),
+            ).into_response());
+        }
+    };
 
     // Validate token (constant-time comparison)
     if token != state.auth_token {
@@ -709,23 +889,17 @@ fn sanitize_path(base: &std::path::Path, requested: &str) -> Result<PathBuf, Ser
 // ── HTTP Handlers - Basic ───────────────────────────────────────────────────────
 
 async fn index_handler() -> axum::response::Response {
-    // Read index.html from webui directory at runtime
-    let base_dir = if let Ok(cwd) = std::env::current_dir() {
-        cwd.clone()
-    } else {
-        PathBuf::from(".")
-    };
-    let html_path = base_dir.join("webui").join("index.html");
-    
+    // Locate index.html using the same priority-based search
+    let html_path = find_webui_dir().join("index.html");
+
     // Fallback to embedded content if runtime path doesn't exist
-    // Path: crates/rusty-claude-cli/src/ -> ../../../webui/
     let fallback_html = include_str!("../../../webui/index.html");
     let html = if html_path.exists() {
         fs::read_to_string(&html_path).unwrap_or_else(|_| fallback_html.to_string())
     } else {
         fallback_html.to_string()
     };
-    
+
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -1171,8 +1345,8 @@ async fn chat_handler(
     // Create the tool executor (placeholder for HTTP mode)
     let tool_executor = HttpToolExecutor;
 
-    // Create permission policy (allow all for HTTP API)
-    let permission_policy = PermissionPolicy::new(PermissionMode::DangerFullAccess);
+    // Create permission policy with approval gate support
+    let permission_policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite);
 
     // Build the ConversationRuntime
     let mut runtime = ConversationRuntime::new(
@@ -1182,6 +1356,9 @@ async fn chat_handler(
         permission_policy,
         system_prompt,
     );
+
+    // P0-1: Attach smart approval gate for intelligent command approval
+    runtime = runtime.with_approval_gate(state.approval_gate.clone());
 
     // Optionally attach memory manager
     if let Some(ref mgr) = state.cognitive_manager {
@@ -1201,9 +1378,14 @@ async fn chat_handler(
         // Clone user_input for post-processing
         let user_input_for_mem = user_input.clone();
 
-        // Run the conversation turn directly (blocking)
-        match runtime.run_turn(user_input, None) {
-            Ok(summary) => {
+        // Run the conversation turn in a blocking thread to avoid
+        // blocking the tokio worker thread (3A-1 fix).
+        let run_result = tokio::task::spawn_blocking(move || {
+            runtime.run_turn(user_input, None)
+        }).await;
+
+        match run_result {
+            Ok(Ok(summary)) => {
                 // Build messages for memory post-processing
                 let mem_messages: Vec<MemMessage> = summary
                     .assistant_messages
@@ -1275,6 +1457,9 @@ async fn chat_handler(
                 });
                 let _ = chunk_tx.blocking_send(Some(format!("event: context_usage\ndata: {}\n\n", context_event)));
 
+                // Record usage in global tracker
+                state.usage_tracker.record(&model_clone, summary.usage);
+
                 // Send [DONE]
                 let _ = chunk_tx.blocking_send(None);
 
@@ -1295,10 +1480,18 @@ async fn chat_handler(
                     });
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::error!(error = %e, "ConversationRuntime run_turn failed");
                 let error_data = serde_json::json!({
                     "error": { "message": e.to_string(), "type": "runtime_error" }
+                });
+                let _ = chunk_tx.blocking_send(Some(format!("data: {}\n\n", error_data)));
+                let _ = chunk_tx.blocking_send(None);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "spawn_blocking task panicked");
+                let error_data = serde_json::json!({
+                    "error": { "message": "Internal server error: task panic", "type": "runtime_error" }
                 });
                 let _ = chunk_tx.blocking_send(Some(format!("data: {}\n\n", error_data)));
                 let _ = chunk_tx.blocking_send(None);
@@ -1329,8 +1522,14 @@ async fn chat_handler(
         let cognitive_manager = state.cognitive_manager.clone();
         let user_input_for_mem = user_input.clone();
 
-        match runtime.run_turn(user_input, None) {
-            Ok(summary) => {
+        // Run the conversation turn in a blocking thread to avoid
+        // blocking the tokio worker thread (3A-1 fix).
+        let run_result = tokio::task::spawn_blocking(move || {
+            runtime.run_turn(user_input, None)
+        }).await;
+
+        match run_result {
+            Ok(Ok(summary)) => {
                 // Extract text content from all assistant messages
                 let content: String = summary
                     .assistant_messages
@@ -1347,7 +1546,7 @@ async fn chat_handler(
                     id: format!("chatcmpl-{}", Uuid::new_v4()),
                     object: "chat.completion".to_owned(),
                     created: Utc::now().timestamp(),
-                    model,
+                    model: model.clone(),
                     choices: vec![ChatChoice {
                         index: 0,
                         message: ChatMessageOut {
@@ -1357,6 +1556,9 @@ async fn chat_handler(
                         finish_reason: "stop".to_owned(),
                     }],
                 };
+
+                // Record usage in global tracker
+                state.usage_tracker.record(&model, summary.usage);
 
                 // ── Post-processing: Memory on_turn_end ────────────────────
                 if let Some(ref mgr) = cognitive_manager {
@@ -1397,10 +1599,16 @@ async fn chat_handler(
 
                 Json(resp).into_response()
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::error!(error = %e, "ConversationRuntime run_turn failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                     "error": format!("Runtime error: {}", e)
+                }))).into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "spawn_blocking task panicked");
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": "Internal server error: task panic"
                 }))).into_response()
             }
         }
@@ -1577,18 +1785,64 @@ async fn compact_session_handler(
         }
     };
 
-    // Return compaction parameters and current session metadata
-    // (actual compaction requires Session with messages which is stored as jsonl on disk)
-    let token_estimate = record.message_count as usize * 50; // rough estimate
-    let message_count_before = record.message_count;
+    // 3A-5 fix: Load session from JSONL, run compaction, write back
+    let session_path = state.sessions_dir.join(format!("{session_id}.jsonl"));
+    if !session_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "compacted": false,
+                "reason": "session JSONL file not found",
+                "session_id": session_id,
+            })),
+        ).into_response();
+    }
+
+    let session = match runtime::Session::load_from_path(&session_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "compacted": false,
+                    "reason": format!("failed to load session: {e}"),
+                    "session_id": session_id,
+                })),
+            ).into_response();
+        }
+    };
+
+    let message_count_before = session.messages.len();
+    let token_estimate = runtime::estimate_session_tokens(&session);
+
+    let result = runtime::compact_session(&session, config);
+
+    if result.removed_message_count > 0 {
+        // Write compacted session back to disk
+        if let Err(e) = result.compacted_session.save_to_path(&session_path) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "compacted": false,
+                    "reason": format!("failed to save compacted session: {e}"),
+                    "session_id": session_id,
+                })),
+            ).into_response();
+        }
+    }
 
     Json(serde_json::json!({
         "ok": true,
-        "compacted": false,
-        "reason": "compaction requires session message history (jsonl); use /v1/sessions/:id to inspect",
+        "compacted": result.removed_message_count > 0,
+        "removed_message_count": result.removed_message_count,
+        "message_count_before": message_count_before,
+        "message_count_after": result.compacted_session.messages.len(),
+        "token_estimate_before": token_estimate,
+        "token_estimate_after": runtime::estimate_session_tokens(&result.compacted_session),
         "session_id": session_id,
-        "token_estimate": token_estimate,
-        "message_count": message_count_before,
         "preserve_recent_messages": config.preserve_recent_messages,
         "max_estimated_tokens": config.max_estimated_tokens,
     })).into_response()
@@ -2277,6 +2531,68 @@ async fn invoke_skill_handler(
     })).into_response()
 }
 
+// ── 3B-4: Skill Management API (install/uninstall/toggle) ──────────────────────
+
+#[derive(Debug, Deserialize)]
+struct InstallSkillRequest {
+    source_path: String,
+}
+
+async fn install_skill_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(req): Json<InstallSkillRequest>,
+) -> Response {
+    let source = PathBuf::from(&req.source_path);
+    match state.skill_service.install(&source) {
+        Ok(msg) => Json(serde_json::json!({
+            "success": true,
+            "message": msg
+        })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": e
+        }))).into_response(),
+    }
+}
+
+async fn uninstall_skill_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(name): Path<String>,
+) -> Response {
+    match state.skill_service.uninstall(&name) {
+        Ok(msg) => Json(serde_json::json!({
+            "success": true,
+            "message": msg
+        })).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": e
+        }))).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ToggleSkillRequest {
+    enabled: bool,
+}
+
+async fn toggle_skill_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(name): Path<String>,
+    Json(req): Json<ToggleSkillRequest>,
+) -> Response {
+    match state.skill_service.toggle(&name, req.enabled) {
+        Ok(msg) => Json(serde_json::json!({
+            "success": true,
+            "message": msg
+        })).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "success": false,
+            "error": e
+        }))).into_response(),
+    }
+}
+
 // ── HTTP Handlers - Workspaces ─────────────────────────────────────────────────
 
 async fn list_workspaces_handler(AxumState(state): AxumState<HttpAppState>) -> axum::response::Response {
@@ -2579,13 +2895,16 @@ async fn handle_ws(mut socket: WebSocket, addr: std::net::SocketAddr, state: Htt
                 session,
                 api_client,
                 tool_executor,
-                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
                 system_prompt,
             );
 
             if let Some(ref mgr) = state.cognitive_manager {
                 runtime = runtime.with_memory_manager(Arc::clone(mgr));
             }
+
+            // P0-1: Attach smart approval gate
+            runtime = runtime.with_approval_gate(state.approval_gate.clone());
 
             match runtime.run_turn(&user_input, None) {
                 Ok(summary) => Ok(summary
@@ -3014,6 +3333,85 @@ impl SkillService {
         }
         None
     }
+
+    // ── 3B-4: Skill dynamic management ────────────────────────────────────
+
+    /// Install a skill by copying from a source directory into the user's
+    /// skill root (`~/.qoder/skills/{name}/`).
+    pub fn install(&self, source: &std::path::Path) -> Result<String, String> {
+        let skill_md = source.join("SKILL.md");
+        if !skill_md.exists() {
+            return Err(format!("Source directory does not contain SKILL.md: {}", source.display()));
+        }
+
+        let name = source.file_name()
+            .and_then(|n: &std::ffi::OsStr| n.to_str())
+            .ok_or_else(|| "Cannot determine skill name from source path".to_string())?
+            .to_string();
+
+        // Install to the first writable root (user's home .qoder/skills)
+        let target_root = self.roots.first()
+            .ok_or_else(|| "No skill roots configured".to_string())?;
+
+        if !target_root.exists() {
+            std::fs::create_dir_all(target_root)
+                .map_err(|e| format!("Failed to create skill root: {}", e))?;
+        }
+
+        let target = target_root.join(&name);
+        if target.exists() {
+            return Err(format!("Skill '{}' is already installed at {}", name, target.display()));
+        }
+
+        // Copy the directory recursively
+        copy_dir_recursive(source, &target)?;
+
+        Ok(format!("Skill '{}' installed to {}", name, target.display()))
+    }
+
+    /// Uninstall (remove) a skill by name.
+    pub fn uninstall(&self, name: &str) -> Result<String, String> {
+        if let Some(path) = self.find_skill(name) {
+            std::fs::remove_dir_all(&path)
+                .map_err(|e| format!("Failed to remove skill '{}': {}", name, e))?;
+            Ok(format!("Skill '{}' uninstalled", name))
+        } else {
+            Err(format!("Skill '{}' not found", name))
+        }
+    }
+
+    /// Toggle a skill's enabled state by renaming its SKILL.md file.
+    /// When disabled, the file is renamed to SKILL.md.disabled.
+    pub fn toggle(&self, name: &str, enabled: bool) -> Result<String, String> {
+        if let Some(path) = self.find_skill(name) {
+            let skill_md = path.join("SKILL.md");
+            let disabled_md = path.join("SKILL.md.disabled");
+
+            if enabled {
+                // Enable: rename SKILL.md.disabled → SKILL.md
+                if disabled_md.exists() && !skill_md.exists() {
+                    std::fs::rename(&disabled_md, &skill_md)
+                        .map_err(|e| format!("Failed to enable skill: {}", e))?;
+                    Ok(format!("Skill '{}' enabled", name))
+                } else if skill_md.exists() {
+                    Ok(format!("Skill '{}' is already enabled", name))
+                } else {
+                    Err(format!("Skill '{}' has no SKILL.md or SKILL.md.disabled file", name))
+                }
+            } else {
+                // Disable: rename SKILL.md → SKILL.md.disabled
+                if skill_md.exists() {
+                    std::fs::rename(&skill_md, &disabled_md)
+                        .map_err(|e| format!("Failed to disable skill: {}", e))?;
+                    Ok(format!("Skill '{}' disabled", name))
+                } else {
+                    Ok(format!("Skill '{}' is already disabled", name))
+                }
+            }
+        } else {
+            Err(format!("Skill '{}' not found", name))
+        }
+    }
 }
 
 impl Default for SkillService {
@@ -3028,6 +3426,23 @@ fn root_type(path: &PathBuf) -> &'static str {
     } else {
         "Agents"
     }
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst)
+        .map_err(|e| format!("Failed to create directory {}: {}", dst.display(), e))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("Failed to read dir: {}", e))? {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)
+                .map_err(|e| format!("Failed to copy {}: {}", src_path.display(), e))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -3252,10 +3667,11 @@ async fn auth_login_handler(
     Json(req): Json<LoginRequest>,
 ) -> axum::response::Response {
     // Validate token - B1 fix: must match configured auth_token exactly
-    let token_valid = if state.auth_enabled {
-        !state.auth_token.is_empty() && req.token == state.auth_token
-    } else {
+    // When auth_token is empty, auth is effectively disabled (auto-pass)
+    let token_valid = if !state.auth_enabled || state.auth_token.is_empty() {
         true
+    } else {
+        req.token == state.auth_token
     };
 
     if token_valid {
@@ -3367,19 +3783,19 @@ struct CreateSessionParams {
 
 /// Get session messages
 /// GET /api/sessions/:id/messages
-/// B3 fix: Load messages from session store instead of returning empty array
+/// 3A-2 fix: Load messages from JSONL file instead of returning empty array
 async fn get_session_messages_handler(
     AxumState(state): AxumState<HttpAppState>,
     Path(session_id): Path<String>,
 ) -> axum::response::Response {
     match state.session_store.get_session(&session_id) {
         Ok(Some(record)) => {
-            // Session exists; messages are stored in JSONL files managed by Session runtime.
-            // The session_store only stores metadata, so we return the record info.
-            // Full message loading would require the Session struct from runtime.
+            // 3A-2: Load actual messages from the JSONL session file
+            let messages = load_messages_from_jsonl(&state.sessions_dir, &session_id);
+
             Json(serde_json::json!({
                 "session_id": session_id,
-                "messages": [],
+                "messages": messages,
                 "count": record.message_count,
                 "session": {
                     "id": record.session_id,
@@ -3401,6 +3817,38 @@ async fn get_session_messages_handler(
             }))).into_response()
         }
     }
+}
+
+/// 3A-2: Load messages from a session's JSONL file.
+/// Each line is a JSON object with a "type" field; messages have type="message"
+/// and the payload is under the "message" key.
+fn load_messages_from_jsonl(sessions_dir: &std::path::Path, session_id: &str) -> Vec<serde_json::Value> {
+    let path = sessions_dir.join(format!("{session_id}.jsonl"));
+    if !path.exists() {
+        return Vec::new();
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "Failed to read JSONL session file");
+            return Vec::new();
+        }
+    };
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let record: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+            if record.get("type").and_then(|v| v.as_str()) == Some("message") {
+                record.get("message").cloned()
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Send a message and get response
@@ -3911,8 +4359,7 @@ async fn create_file_handler(
 async fn get_pending_approvals_handler(
     AxumState(state): AxumState<HttpAppState>,
 ) -> axum::response::Response {
-    let approvals = state.pending_approvals.read().await;
-    let list: Vec<&runtime::permission_enforcer::ApprovalRequest> = approvals.values().map(|(req, _)| req).collect();
+    let list = state.approval_gate.get_pending_requests().await;
     Json(serde_json::json!({"pending": list, "count": list.len()})).into_response()
 }
 
@@ -3929,31 +4376,93 @@ async fn respond_to_approval_handler(
     AxumState(state): AxumState<HttpAppState>,
     Json(payload): Json<ApprovalResponsePayload>,
 ) -> axum::response::Response {
-    let mut approvals = state.pending_approvals.write().await;
-    if let Some((req, sender)) = approvals.remove(&payload.request_id) {
-        let verdict = if payload.approved {
-            runtime::permission_enforcer::ApprovalVerdict::Approved
-        } else {
-            runtime::permission_enforcer::ApprovalVerdict::Denied {
-                reason: payload.reason.unwrap_or_else(|| "Denied by user".to_string()),
-            }
-        };
-
-        let persistence = match payload.persistence.as_deref() {
-            Some("session") => runtime::permission_enforcer::ApprovalPersistence::Session,
-            Some("always") => runtime::permission_enforcer::ApprovalPersistence::Always,
-            _ => runtime::permission_enforcer::ApprovalPersistence::Once,
-        };
-
-        state.destructive_detector.record_approval(&req.command, persistence).await;
-
-        let _ = sender.send(verdict);
-        Json(serde_json::json!({"status": "ok", "request_id": payload.request_id})).into_response()
+    let verdict = if payload.approved {
+        runtime::permission_enforcer::ApprovalVerdict::Approved
     } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({
+        runtime::permission_enforcer::ApprovalVerdict::Denied {
+            reason: payload.reason.unwrap_or_else(|| "Denied by user".to_string()),
+        }
+    };
+
+    let persistence = match payload.persistence.as_deref() {
+        Some("session") => runtime::permission_enforcer::ApprovalPersistence::Session,
+        Some("always") => runtime::permission_enforcer::ApprovalPersistence::Always,
+        _ => runtime::permission_enforcer::ApprovalPersistence::Once,
+    };
+
+    match state.approval_gate.resolve_approval(&payload.request_id, verdict, persistence).await {
+        Some(_) => Json(serde_json::json!({"status": "ok", "request_id": payload.request_id})).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
             "error": "Approval not found or expired"
-        }))).into_response()
+        }))).into_response(),
     }
+}
+
+/// GET /api/approval/config - Get current approval configuration
+async fn get_approval_config_handler(
+    AxumState(state): AxumState<HttpAppState>,
+) -> axum::response::Response {
+    let config = state.approval_gate.config().read().await;
+    Json(serde_json::json!({
+        "yolo_mode": config.yolo_mode,
+        "yolo_honor_critical": config.yolo_honor_critical,
+        "auto_pass_read_only": config.auto_pass_read_only,
+        "auto_pass_low_risk": config.auto_pass_low_risk,
+    })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateApprovalConfigPayload {
+    yolo_mode: Option<bool>,
+    yolo_honor_critical: Option<bool>,
+    auto_pass_read_only: Option<bool>,
+    auto_pass_low_risk: Option<bool>,
+}
+
+/// PUT /api/approval/config - Update approval configuration
+async fn update_approval_config_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(payload): Json<UpdateApprovalConfigPayload>,
+) -> axum::response::Response {
+    let mut config = state.approval_gate.config().read().await.clone();
+    if let Some(v) = payload.yolo_mode { config.yolo_mode = v; }
+    if let Some(v) = payload.yolo_honor_critical { config.yolo_honor_critical = v; }
+    if let Some(v) = payload.auto_pass_read_only { config.auto_pass_read_only = v; }
+    if let Some(v) = payload.auto_pass_low_risk { config.auto_pass_low_risk = v; }
+    state.approval_gate.update_config(config).await;
+
+    let config = state.approval_gate.config().read().await;
+    Json(serde_json::json!({
+        "yolo_mode": config.yolo_mode,
+        "yolo_honor_critical": config.yolo_honor_critical,
+        "auto_pass_read_only": config.auto_pass_read_only,
+        "auto_pass_low_risk": config.auto_pass_low_risk,
+    })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ToggleYoloPayload {
+    enabled: bool,
+    honor_critical: Option<bool>,
+}
+
+/// POST /api/approval/yolo - Toggle YOLO mode
+async fn toggle_yolo_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(payload): Json<ToggleYoloPayload>,
+) -> axum::response::Response {
+    let mut config = state.approval_gate.config().read().await.clone();
+    config.yolo_mode = payload.enabled;
+    if let Some(honor) = payload.honor_critical {
+        config.yolo_honor_critical = honor;
+    }
+    state.approval_gate.update_config(config).await;
+
+    let config = state.approval_gate.config().read().await;
+    Json(serde_json::json!({
+        "yolo_mode": config.yolo_mode,
+        "yolo_honor_critical": config.yolo_honor_critical,
+    })).into_response()
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4359,7 +4868,15 @@ async fn run_cron_handler(
     AxumState(state): AxumState<HttpAppState>,
     Path(id): Path<String>,
 ) -> axum::response::Response {
-    match state.cron_scheduler.record_run(&id).await {
+    let start = std::time::Instant::now();
+    match state.cron_scheduler.record_run_with_log(
+        &id,
+        runtime::team_cron_registry::CronExecutionStatus::Success,
+        None,  // output — filled by actual execution in the future
+        None,  // error
+        start.elapsed().as_millis() as u64,
+        "manual",
+    ).await {
         Ok(job) => Json(serde_json::json!({
             "status": "ok",
             "job": job,
@@ -4395,6 +4912,78 @@ async fn resume_cron_handler(
         })).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e}))).into_response(),
     }
+}
+
+// ── Cron Logs & Approval History Handlers ──────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ListCronLogsQuery {
+    #[serde(default = "default_query_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+fn default_query_limit() -> usize {
+    20
+}
+
+/// GET /api/crons/logs - List all cron execution logs
+async fn list_cron_logs_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Query(params): Query<ListCronLogsQuery>,
+) -> axum::response::Response {
+    let log_store = state.cron_scheduler.log_store();
+    let (logs, total) = log_store.list_all_logs(params.limit, params.offset).await;
+    Json(serde_json::json!({
+        "status": "ok",
+        "logs": logs,
+        "total": total,
+        "limit": params.limit,
+        "offset": params.offset,
+    })).into_response()
+}
+
+/// GET /api/crons/:id/logs - List execution logs for a specific cron job
+async fn list_cron_job_logs_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Path(id): Path<String>,
+    Query(params): Query<ListCronLogsQuery>,
+) -> axum::response::Response {
+    let log_store = state.cron_scheduler.log_store();
+    let (logs, total) = log_store.list_logs(&id, params.limit, params.offset).await;
+    Json(serde_json::json!({
+        "status": "ok",
+        "cron_job_id": id,
+        "logs": logs,
+        "total": total,
+        "limit": params.limit,
+        "offset": params.offset,
+    })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ListApprovalHistoryQuery {
+    #[serde(default = "default_query_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+/// GET /api/approval/history - List approval decision history
+async fn list_approval_history_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Query(params): Query<ListApprovalHistoryQuery>,
+) -> axum::response::Response {
+    let history = state.approval_gate.history();
+    let (entries, total) = history.list_history(params.limit, params.offset).await;
+    Json(serde_json::json!({
+        "status": "ok",
+        "history": entries,
+        "total": total,
+        "limit": params.limit,
+        "offset": params.offset,
+    })).into_response()
 }
 
 // ── P1-8: Onboarding Handlers ────────────────────────────────────────────────
@@ -4456,5 +5045,79 @@ async fn onboarding_test_handler(
         "message": "API key format validated. Save configuration to complete setup.",
         "provider": provider,
         "model": params.model
+    })).into_response()
+}
+
+// ── 3B-5: Usage & Cost API ────────────────────────────────────────────────────
+
+async fn usage_handler(
+    AxumState(state): AxumState<HttpAppState>,
+) -> Response {
+    let snapshot = state.usage_tracker.snapshot();
+    Json(snapshot).into_response()
+}
+
+// ── 3B-3: FactChecker API ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct RegisterFactsRequest {
+    entity: String,
+    facts: memory::temporal_graph::EntityFacts,
+}
+
+async fn register_facts_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(req): Json<RegisterFactsRequest>,
+) -> Response {
+    let mut checker = state.fact_checker.lock().await;
+    checker.register_facts(&req.entity, req.facts);
+    Json(serde_json::json!({
+        "success": true,
+        "message": format!("Facts registered for entity '{}'", req.entity)
+    })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckFactsRequest {
+    subject: String,
+    predicate: String,
+    object: String,
+}
+
+async fn check_facts_handler(
+    AxumState(state): AxumState<HttpAppState>,
+    Json(req): Json<CheckFactsRequest>,
+) -> Response {
+    let checker = state.fact_checker.lock().await;
+    // Create a temporary triple to check
+    let triple = memory::temporal_graph::Triple {
+        id: format!("check_{}", chrono::Utc::now().timestamp()),
+        subject: req.subject,
+        predicate: req.predicate,
+        object: req.object,
+        valid_from: None,
+        valid_until: None,
+        confidence: 1.0,
+        source_memory_id: None,
+        source_file: None,
+    };
+    let result = checker.check_triple(&triple);
+    Json(result).into_response()
+}
+
+async fn audit_facts_handler(
+    AxumState(state): AxumState<HttpAppState>,
+) -> Response {
+    // Returns the list of registered entities and their facts
+    let checker = state.fact_checker.lock().await;
+    // FactChecker doesn't expose entity_facts directly, so return summary
+    Json(serde_json::json!({
+        "message": "Fact checker is active. Use /api/memory/facts/check to validate triples.",
+        "supported_predicates": {
+            "person": ["child_of", "parent_of", "partner_of", "sibling_of", "born_on", "works_for", "manages"],
+            "organization": ["located_in", "subsidiary_of", "owns", "employs"],
+            "project": ["uses", "depends_on", "belongs_to", "has_member"],
+            "universal": ["related_to", "has_property", "contains", "part_of", "known_as"]
+        }
     })).into_response()
 }

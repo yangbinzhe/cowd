@@ -306,6 +306,30 @@ pub struct CronJob {
     pub updated_at: String,            // ISO8601
 }
 
+/// Execution status of a cron job run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CronExecutionStatus {
+    Success,
+    Failed,
+    Timeout,
+}
+
+/// A single cron job execution log entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronExecutionLog {
+    pub id: String,
+    pub cron_job_id: String,
+    pub cron_job_name: String,
+    pub status: CronExecutionStatus,
+    pub output: Option<String>,
+    pub error: Option<String>,
+    pub duration_ms: u64,
+    pub triggered_by: String,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
 /// Parse a schedule string into ScheduleFormat.
 pub fn parse_schedule(input: &str) -> Result<ScheduleFormat, String> {
     let trimmed = input.trim();
@@ -510,15 +534,27 @@ fn cron_field_values(field: &str, min: u8, max: u8) -> Option<Vec<u8>> {
 pub struct CronScheduler {
     jobs: Arc<tokio::sync::RwLock<Vec<CronJob>>>,
     storage_path: PathBuf,
+    log_store: Arc<CronLogStore>,
 }
 
 impl CronScheduler {
     pub fn new(storage_path: PathBuf) -> Self {
         let jobs = Self::load_from_disk(&storage_path).unwrap_or_default();
+        let logs_path = storage_path
+            .parent()
+            .map(|p| p.join("logs.json"))
+            .unwrap_or_else(|| storage_path.with_file_name("logs.json"));
+        let log_store = Arc::new(CronLogStore::new(logs_path));
         Self {
             jobs: Arc::new(tokio::sync::RwLock::new(jobs)),
             storage_path,
+            log_store,
         }
+    }
+
+    /// Get a reference to the cron log store.
+    pub fn log_store(&self) -> &Arc<CronLogStore> {
+        &self.log_store
     }
 
     /// Load cron jobs from JSON file.
@@ -631,6 +667,57 @@ impl CronScheduler {
         Ok(result)
     }
 
+    /// Record a run with an execution log entry.
+    pub async fn record_run_with_log(
+        &self,
+        id: &str,
+        status: CronExecutionStatus,
+        output: Option<String>,
+        error: Option<String>,
+        duration_ms: u64,
+        triggered_by: &str,
+    ) -> Result<CronJob, String> {
+        // Update job metadata (same as record_run)
+        let mut jobs = self.jobs.write().await;
+        let job = jobs.iter_mut().find(|j| j.id == id)
+            .ok_or_else(|| format!("cron not found: {id}"))?;
+        let now = Utc::now();
+        let started_at = now.to_rfc3339();
+        job.last_run_at = Some(started_at.clone());
+        job.run_count += 1;
+        job.updated_at = started_at.clone();
+        job.next_run_at = compute_next_run(&job.schedule, now).map(|dt| dt.to_rfc3339());
+        let result = job.clone();
+        let job_name = job.name.clone();
+        drop(jobs);
+        self.save_to_disk().await?;
+
+        // Append execution log
+        let log_id = format!("cronlog_{:08x}", rand::random::<u32>());
+        // Truncate output/error to 10KB
+        let truncated_output = output.map(|o| {
+            if o.len() > 10240 { o[..10240].to_string() } else { o }
+        });
+        let truncated_error = error.map(|e| {
+            if e.len() > 10240 { e[..10240].to_string() } else { e }
+        });
+        let log = CronExecutionLog {
+            id: log_id,
+            cron_job_id: id.to_string(),
+            cron_job_name: job_name,
+            status,
+            output: truncated_output,
+            error: truncated_error,
+            duration_ms,
+            triggered_by: triggered_by.to_string(),
+            started_at: started_at.clone(),
+            finished_at: now.to_rfc3339(),
+        };
+        self.log_store.append_log(log).await?;
+
+        Ok(result)
+    }
+
     /// Check which jobs are due for execution.
     pub async fn get_due_jobs(&self) -> Vec<CronJob> {
         let now = Utc::now();
@@ -659,6 +746,98 @@ impl CronScheduler {
             })
             .cloned()
             .collect()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Cron Execution Log Store
+// ═══════════════════════════════════════════════════════════════════════
+
+const CRON_LOG_MAX_PER_JOB: usize = 100;
+
+/// Persistent store for cron execution logs.
+pub struct CronLogStore {
+    logs: Arc<tokio::sync::RwLock<HashMap<String, Vec<CronExecutionLog>>>>,
+    storage_path: PathBuf,
+}
+
+impl CronLogStore {
+    pub fn new(storage_path: PathBuf) -> Self {
+        let logs = Self::load_from_disk(&storage_path).unwrap_or_default();
+        Self {
+            logs: Arc::new(tokio::sync::RwLock::new(logs)),
+            storage_path,
+        }
+    }
+
+    fn load_from_disk(path: &PathBuf) -> Result<HashMap<String, Vec<CronExecutionLog>>, String> {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let logs: HashMap<String, Vec<CronExecutionLog>> =
+            serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        Ok(logs)
+    }
+
+    async fn save_to_disk(&self) -> Result<(), String> {
+        let logs = self.logs.read().await;
+        let content = serde_json::to_string_pretty(&*logs).map_err(|e| e.to_string())?;
+        if let Some(parent) = self.storage_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&self.storage_path, content).map_err(|e| e.to_string())
+    }
+
+    /// Append an execution log entry and persist.
+    pub async fn append_log(&self, log: CronExecutionLog) -> Result<(), String> {
+        let mut logs = self.logs.write().await;
+        let entries = logs.entry(log.cron_job_id.clone()).or_default();
+        entries.insert(0, log);
+        // Enforce per-job cap
+        if entries.len() > CRON_LOG_MAX_PER_JOB {
+            entries.truncate(CRON_LOG_MAX_PER_JOB);
+        }
+        drop(logs);
+        self.save_to_disk().await
+    }
+
+    /// List logs for a specific cron job with pagination.
+    pub async fn list_logs(
+        &self,
+        cron_job_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> (Vec<CronExecutionLog>, usize) {
+        let logs = self.logs.read().await;
+        if let Some(entries) = logs.get(cron_job_id) {
+            let total = entries.len();
+            let page: Vec<CronExecutionLog> = entries
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .cloned()
+                .collect();
+            (page, total)
+        } else {
+            (vec![], 0)
+        }
+    }
+
+    /// List all logs across all jobs with pagination (sorted by started_at desc).
+    pub async fn list_all_logs(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> (Vec<CronExecutionLog>, usize) {
+        let logs = self.logs.read().await;
+        let mut all: Vec<&CronExecutionLog> = logs.values().flatten().collect();
+        all.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        let total = all.len();
+        let page: Vec<CronExecutionLog> = all
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
+        (page, total)
     }
 }
 

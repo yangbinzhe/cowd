@@ -39,6 +39,28 @@ use std::sync::Arc;
 /// Result alias for compression operations.
 pub type Result<T> = std::result::Result<T, MemoryError>;
 
+/// Code markers used to estimate how "code-heavy" a set of messages is.
+const CODE_MARKERS: &[&str] = &[
+    "fn ", "let ", "impl ", "pub ", "use ", "struct ", "enum ", "mod ",
+    "def ", "class ", "import ", "const ", "trait ", "async fn",
+    "=>", "->", "::", "();",
+];
+
+/// Estimate the ratio of code lines to total lines in the given messages.
+///
+/// Returns a value in `[0.0, 1.0]`. Values above 0.5 suggest that AAAK
+/// (lossless, entity-aware) compression would be more effective than the
+/// default micro-compaction.
+fn code_ratio(messages: &[Message]) -> f32 {
+    let content: String = messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
+    let total_lines = content.lines().count().max(1);
+    let code_lines = content
+        .lines()
+        .filter(|line| CODE_MARKERS.iter().any(|m| line.contains(m)))
+        .count();
+    code_lines as f32 / total_lines as f32
+}
+
 // ---------------------------------------------------------------------------
 // CompressionPipeline
 // ---------------------------------------------------------------------------
@@ -123,6 +145,42 @@ impl CompressionPipeline {
     }
 
     // -----------------------------------------------------------------------
+    // AAAK code-mode compact
+    // -----------------------------------------------------------------------
+
+    /// Compress messages using AAAK (Adaptive Abbreviation with Association Knowledge).
+    ///
+    /// AAAK is an entity-aware, lossless compression format that excels on
+    /// code-heavy content. It extracts repeated entities (function names, file
+    /// paths, variable names) and replaces them with short abbreviations while
+    /// preserving full decompressibility.
+    ///
+    /// When `code_ratio(messages) > 0.5`, this method is preferred over
+    /// `micro_compact` because the entity repetition in code yields much
+    /// higher compression ratios.
+    pub fn aaak_compact(&self, messages: &mut Vec<Message>) {
+        let mut compressor = crate::aaak_compression::AaakCompressor::default_compressor();
+        for msg in messages.iter_mut() {
+            if msg.pinned {
+                continue;
+            }
+            let output = compressor.compress_auto(&msg.content);
+            // Only replace content if compression actually reduced size
+            // and the result is lossless (code mode).
+            if !output.lossy && output.content.len() < msg.content.len() {
+                msg.content = output.content;
+            }
+        }
+    }
+
+    /// Returns `true` when the message content is code-heavy enough to
+    /// benefit from AAAK compression rather than the default micro stage.
+    #[must_use]
+    pub fn should_use_aaak(messages: &[Message]) -> bool {
+        code_ratio(messages) > 0.5
+    }
+
+    // -----------------------------------------------------------------------
     // Stage 2 – Session compact
     // -----------------------------------------------------------------------
 
@@ -201,8 +259,12 @@ impl CompressionPipeline {
         messages: &mut Vec<Message>,
         orchestrator: &MemoryOrchestrator,
     ) -> Result<PreparedContext> {
-        // Stage 1 – always run.
-        self.micro_compact(messages);
+        // Stage 1 – choose AAAK for code-heavy content, micro otherwise.
+        if Self::should_use_aaak(messages) {
+            self.aaak_compact(messages);
+        } else {
+            self.micro_compact(messages);
+        }
 
         // Stage 2 – only if needed.
         if self.should_session_compact(messages) {

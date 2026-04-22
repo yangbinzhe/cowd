@@ -218,7 +218,9 @@ fi
 
 ok "built ${COWD_BIN}"
 
-# ── Step 5: post-build verification ──────────────────────────────────────────
+# ── Step 5: post-build verification & webui installation ─────────────────────
+
+CONFIG_DIR="${HOME}/.cowd"
 
 step "Verifying the installed binary"
 
@@ -228,11 +230,21 @@ else
     warn "cowd --help returned an error — check build output"
 fi
 
+# Install webui assets to ~/.cowd/webui/
+info "installing webui assets to ${CONFIG_DIR}/webui/"
+WEBUI_SRC="${SCRIPT_DIR}/webui"
+if [ -d "${WEBUI_SRC}" ]; then
+    rm -rf "${CONFIG_DIR}/webui"
+    cp -r "${WEBUI_SRC}" "${CONFIG_DIR}/webui"
+    ok "webui assets installed to ${CONFIG_DIR}/webui/"
+else
+    warn "webui source directory not found at ${WEBUI_SRC} — web UI may not be available"
+fi
+
 # ── Step 6: interactive configuration ────────────────────────────────────────
 
 step "Interactive configuration"
 
-CONFIG_DIR="${HOME}/.cowd"
 CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 
 if [ "${SKIP_CONFIG}" = "1" ]; then

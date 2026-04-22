@@ -109,6 +109,93 @@ type RuntimePluginStateBuildOutput = (
     Vec<RuntimeToolDefinition>,
 );
 
+/// Expand `~` at the start of a path to the user's home directory.
+fn expand_home(path: &std::path::Path) -> std::path::PathBuf {
+    if path.starts_with("~") {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            return std::path::PathBuf::from(path.to_string_lossy().replacen("~", &home, 1));
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Convert `runtime::MemoryConfig` → `memory::MemoryConfig`.
+/// Returns None if memory is disabled in the config.
+fn build_memory_config(
+    src: &runtime::MemoryConfig,
+    cwd: &std::path::Path,
+) -> Option<memory::MemoryConfig> {
+    if !src.enabled {
+        return None;
+    }
+    let store_path = src
+        .store_path
+        .as_ref()
+        .map(|p| expand_home(p))
+        .unwrap_or_else(|| cwd.join(".cowd").join("memory"));
+
+    // Ensure the store directory exists before SQLite tries to open the database.
+    if let Err(e) = std::fs::create_dir_all(&store_path) {
+        eprintln!("warn: failed to create memory store dir {:?}: {e}", store_path);
+    }
+
+    let mut mc = memory::MemoryConfig::default();
+    mc.store.sqlite_path = store_path.join("memory.db");
+    mc.store.blob_dir = store_path.join("blobs");
+    mc.store.enable_vector_index = src.vector.enabled;
+    mc.store.vector.enabled = src.vector.enabled;
+    mc.store.vector.model = src.vector.embedding_model.clone();
+    mc.store.vector.api_url = src.vector.api_url.clone();
+    mc.store.vector.api_key = src.vector.api_key.clone();
+    mc.store.vector.dimension = src.vector.dimension as usize;
+    mc.store.vector.timeout_secs = src.vector.timeout_secs;
+    mc.store.vector.batch_size = src.vector.batch_size;
+    Some(mc)
+}
+
+/// Convert `runtime::GatewayConfig` → `Vec<runtime::platform::PlatformConfig>`.
+/// Filters out `api_server` (handled by serve itself) and disabled platforms.
+fn build_platform_configs(
+    gw: &runtime::GatewayConfig,
+) -> Vec<runtime::platform::PlatformConfig> {
+    if !gw.enabled {
+        return Vec::new();
+    }
+    gw.platforms
+        .iter()
+        .filter(|p| p.enabled && p.platform_type != "api_server")
+        .map(|p| {
+            let mut pc = runtime::platform::PlatformConfig::new(&p.platform_type);
+            pc.enabled = p.enabled;
+            for (k, v) in &p.extra {
+                pc = pc.with_setting(k, json_value_to_serde(v));
+            }
+            pc
+        })
+        .collect()
+}
+
+/// Convert `runtime::JsonValue` → `serde_json::Value` for use with
+/// `runtime::platform::PlatformConfig::with_setting()`.
+fn json_value_to_serde(v: &runtime::JsonValue) -> serde_json::Value {
+    match v {
+        runtime::JsonValue::Null => serde_json::Value::Null,
+        runtime::JsonValue::Bool(b) => serde_json::Value::Bool(*b),
+        runtime::JsonValue::Number(n) => serde_json::json!(*n),
+        runtime::JsonValue::String(s) => serde_json::Value::String(s.clone()),
+        runtime::JsonValue::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(json_value_to_serde).collect())
+        }
+        runtime::JsonValue::Object(map) => {
+            serde_json::Value::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), json_value_to_serde(v)))
+                    .collect(),
+            )
+        }
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
         let message = error.to_string();
@@ -262,25 +349,63 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
-        CliAction::Serve { host, port, auth_enabled, output_format: _ } => {
-            // 获取默认 session store 路径
-            let session_store_path = if let Ok(cwd) = std::env::current_dir() {
+        CliAction::Serve { host, port, auth_enabled, cors_origins, output_format: _ } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            // ── 加载统一配置 ──
+            let loader = runtime::ConfigLoader::default_for(&cwd);
+            let runtime_config = match loader.load() {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("warn: failed to load config, using defaults: {e}");
+                    runtime::RuntimeConfig::empty()
+                }
+            };
+
+            // ── 从统一配置提取各字段 ──
+
+            // session store path
+            let session_store_path = {
                 let store_dir = cwd.join(".cowd").join("sessions");
                 std::fs::create_dir_all(&store_dir).ok();
                 Some(store_dir.join("sessions.db"))
-            } else {
-                Some(PathBuf::from("/tmp/cowd-sessions.db"))
             };
+
+            // auth token: 从 gateway.platforms[api_server].auth.token 提取
+            // PlatformConfig.extra is BTreeMap<String, JsonValue>, JsonValue has no .get(),
+            // so we use .as_object() to traverse nested objects.
+            let auth_token = runtime_config
+                .gateway()
+                .platforms
+                .iter()
+                .find(|p| p.platform_type == "api_server" && p.enabled)
+                .and_then(|p| p.extra.get("auth"))
+                .and_then(|a| a.as_object())
+                .and_then(|obj| obj.get("token"))
+                .and_then(|t| t.as_str())
+                .map(String::from)
+                .unwrap_or_default();
+
+            // memory config: runtime::config::MemoryConfig → memory::MemoryConfig
+            let memory_config = build_memory_config(runtime_config.memory(), &cwd);
+
+            // platform configs: runtime::config::PlatformConfig → runtime::platform::PlatformConfig
+            let platform_configs = build_platform_configs(runtime_config.gateway());
+
+            // approval config
+            let approval_config = runtime_config.approval().clone();
 
             let config = server::HttpConfig {
                 host,
                 port,
                 auth_enabled,
-                auth_token: String::new(),
+                auth_token,
                 with_webui: true,
-                memory_config: None,
+                memory_config,
                 session_store_path,
-                platform_configs: Vec::new(),
+                platform_configs,
+                cors_origins,
+                approval_config: Some(approval_config),
             };
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
             rt.block_on(async {
@@ -384,6 +509,7 @@ enum CliAction {
         host: String,
         port: u16,
         auth_enabled: bool,
+        cors_origins: Vec<String>,
         output_format: CliOutputFormat,
     },
     Export {
@@ -710,16 +836,21 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let mut host = "127.0.0.1".to_string();
             let mut port: u16 = 8642;
             let mut auth_enabled = true;
+            let mut cors_origins: Vec<String> = Vec::new();
             let mut i = 1;
             while i < rest.len() {
                 match rest[i].as_str() {
                     "--host" if i + 1 < rest.len() => { host = rest[i + 1].clone(); i += 2; }
                     "--port" if i + 1 < rest.len() => { port = rest[i + 1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?; i += 2; }
                     "--no-auth" => { auth_enabled = false; i += 1; }
+                    "--cors-origins" if i + 1 < rest.len() => {
+                        cors_origins = rest[i + 1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                        i += 2;
+                    }
                     other => return Err(format!("unknown serve flag: {other}")),
                 }
             }
-            Ok(CliAction::Serve { host, port, auth_enabled, output_format })
+            Ok(CliAction::Serve { host, port, auth_enabled, cors_origins, output_format })
         }
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {

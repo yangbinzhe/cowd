@@ -284,6 +284,8 @@ const ApprovalManager = {
 
     const card = new ApprovalCard(request, (requestId, verdict, persistence) => {
       this._sendResponse(requestId, verdict, persistence);
+      // 3C-4: Record to history
+      this.recordHistory(requestId, verdict, persistence, request.command, request.risk_level);
     });
 
     this.cards.set(request.id, card);
@@ -350,6 +352,47 @@ const ApprovalManager = {
    */
   getPendingCount() {
     return this.cards.size;
+  },
+
+  // ═══════════════════════════════════════════════════════════════════
+  // 3C-4: Approval History
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** @type {Array} Historical approval records */
+  history: [],
+
+  /** Record an approval response into history */
+  recordHistory(requestId, verdict, persistence, command, riskLevel) {
+    this.history.unshift({
+      id: requestId,
+      verdict,
+      persistence,
+      command: command || '',
+      risk_level: riskLevel || 0,
+      timestamp: new Date().toISOString()
+    });
+
+    // Keep last 50 entries
+    if (this.history.length > 50) {
+      this.history = this.history.slice(0, 50);
+    }
+  },
+
+  /** Get approval history */
+  getHistory() {
+    return this.history;
+  },
+
+  /** Get approval statistics */
+  getStats() {
+    const total = this.history.length;
+    const approved = this.history.filter(h => h.verdict === 'Approved').length;
+    const denied = total - approved;
+    const byRisk = [0, 1, 2, 3].map(level => ({
+      level,
+      count: this.history.filter(h => h.risk_level === level).length
+    }));
+    return { total, approved, denied, byRisk };
   }
 };
 

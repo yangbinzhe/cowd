@@ -1,6 +1,7 @@
 /**
- * Cowd Cron - Cron Job Management Module (P1-5)
+ * Cowd Cron - Cron Job Management Module (P1-5 + 3C-4)
  * Provides CRUD UI for scheduled tasks with 4 time format support.
+ * 3C-4: Added execution logs and approval history.
  */
 
 const Cron = {
@@ -22,6 +23,12 @@ const Cron = {
       });
     }
 
+    // 3C-4: Refresh logs button
+    const refreshLogsBtn = document.getElementById('refreshCronLogs');
+    if (refreshLogsBtn) {
+      refreshLogsBtn.addEventListener('click', () => this.loadLogs());
+    }
+
     // Delegated clicks for job actions
     this.container.addEventListener('click', (e) => {
       const btn = e.target.closest('[data-action]');
@@ -35,6 +42,7 @@ const Cron = {
         case 'pause': this.pauseCron(id); break;
         case 'resume': this.resumeCron(id); break;
         case 'delete': this.deleteCron(id); break;
+        case 'view-log': this.viewCronLog(id); break;
       }
     });
   },
@@ -44,6 +52,8 @@ const Cron = {
     try {
       const result = await window.api.listCrons();
       this.renderCrons(result.jobs || []);
+      // 3C-4: Also load logs
+      this.loadLogs();
     } catch (e) {
       console.error('Failed to load cron jobs:', e);
       this.renderError('Failed to load cron jobs');
@@ -87,6 +97,80 @@ const Cron = {
         </div>
       </div>
     `).join('');
+  },
+
+  // ═══════════════════════════════════════════════════════════════════
+  // 3C-4: Execution Logs
+  // ═══════════════════════════════════════════════════════════════════
+
+  async loadLogs() {
+    const logsContainer = document.getElementById('cron-logs-list');
+    if (!logsContainer) return;
+
+    try {
+      const result = await window.api?.getCronLogs?.();
+      const logs = result?.logs || result || [];
+      this.renderLogs(logs);
+    } catch (e) {
+      console.error('Failed to load cron logs:', e);
+      logsContainer.innerHTML = '<div class="cron-logs-empty">无法加载执行日志</div>';
+    }
+  },
+
+  renderLogs(logs) {
+    const logsContainer = document.getElementById('cron-logs-list');
+    if (!logsContainer) return;
+
+    if (!logs || logs.length === 0) {
+      logsContainer.innerHTML = '<div class="cron-logs-empty">暂无执行记录</div>';
+      return;
+    }
+
+    logsContainer.innerHTML = logs.slice(0, 20).map(log => {
+      const status = log.status || log.outcome || 'unknown';
+      const statusClass = status === 'success' || status === 'completed' ? 'log-success'
+        : status === 'failed' || status === 'error' ? 'log-failed'
+        : status === 'running' ? 'log-running' : 'log-unknown';
+      const icon = statusClass === 'log-success' ? '&#10003;'
+        : statusClass === 'log-failed' ? '&#10007;'
+        : statusClass === 'log-running' ? '&#9203;' : '&#8226;';
+
+      return `
+        <div class="cron-log-item ${statusClass}">
+          <span class="cron-log-icon">${icon}</span>
+          <span class="cron-log-name">${this.escapeHtml(log.name || log.cron_name || log.cron_id || 'unknown')}</span>
+          <span class="cron-log-time">${this.formatTime(log.started_at || log.created_at || '')}</span>
+          <span class="cron-log-status">${this.escapeHtml(status)}</span>
+          ${log.duration_ms ? `<span class="cron-log-duration">${log.duration_ms}ms</span>` : ''}
+          ${log.error ? `<span class="cron-log-error" title="${this.escapeHtml(log.error)}">Error</span>` : ''}
+        </div>
+      `;
+    }).join('');
+  },
+
+  async viewCronLog(cronId) {
+    try {
+      const result = await window.api?.getCronJobLogs?.(cronId);
+      const log = result?.log || result;
+
+      const modal = document.createElement('div');
+      modal.className = 'modal active';
+      modal.innerHTML = `
+        <div class="modal-content" style="max-width:700px;">
+          <div class="modal-header">
+            <h2>执行日志详情</h2>
+          </div>
+          <pre style="max-height:400px;overflow:auto;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:12px;">${this.escapeHtml(typeof log === 'string' ? log : JSON.stringify(log, null, 2))}</pre>
+          <div class="form-actions">
+            <button class="btn secondary" id="closeCronLogModal">关闭</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(modal);
+      modal.querySelector('#closeCronLogModal').addEventListener('click', () => modal.remove());
+    } catch (e) {
+      window.Toast?.error('加载日志失败: ' + (e.message || ''));
+    }
   },
 
   async createCron() {

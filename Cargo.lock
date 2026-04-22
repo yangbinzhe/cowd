@@ -2056,6 +2056,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "serde_yaml",
  "syntect",
  "thiserror 2.0.18",
  "tokio",
@@ -2616,6 +2617,7 @@ name = "tools"
 version = "0.1.0"
 dependencies = [
  "api",
+ "base64 0.22.1",
  "commands",
  "flate2",
  "plugins",

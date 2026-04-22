@@ -65,6 +65,7 @@ pub struct RuntimeFeatureConfig {
     aliases: BTreeMap<String, String>,
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
+    approval: ApprovalConfig,
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     providers: ProvidersConfig,
@@ -153,6 +154,72 @@ pub struct RuntimePermissionRuleConfig {
     allow: Vec<String>,
     deny: Vec<String>,
     ask: Vec<String>,
+}
+
+/// Smart approval configuration for the intelligent command approval gate.
+///
+/// Controls which commands auto-pass vs. require approval, and YOLO mode
+/// for bypassing approvals during long-running autonomous tasks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalConfig {
+    /// When true, all non-critical commands bypass the approval flow.
+    pub yolo_mode: bool,
+    /// When true, even in YOLO mode, Critical-risk commands still require approval.
+    pub yolo_honor_critical: bool,
+    /// Auto-pass commands detected as read-only (ls, cat, grep, git status, etc.).
+    pub auto_pass_read_only: bool,
+    /// Auto-pass commands that match Low-risk destructive patterns (cargo clean, etc.).
+    pub auto_pass_low_risk: bool,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            yolo_mode: false,
+            yolo_honor_critical: true,
+            auto_pass_read_only: true,
+            auto_pass_low_risk: true,
+        }
+    }
+}
+
+impl ApprovalConfig {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_yolo_mode(mut self, enabled: bool) -> Self {
+        self.yolo_mode = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_yolo_honor_critical(mut self, honor: bool) -> Self {
+        self.yolo_honor_critical = honor;
+        self
+    }
+
+    #[must_use]
+    pub fn yolo_mode(&self) -> bool {
+        self.yolo_mode
+    }
+
+    #[must_use]
+    pub fn yolo_honor_critical(&self) -> bool {
+        self.yolo_honor_critical
+    }
+
+    #[must_use]
+    pub fn auto_pass_read_only(&self) -> bool {
+        self.auto_pass_read_only
+    }
+
+    #[must_use]
+    pub fn auto_pass_low_risk(&self) -> bool {
+        self.auto_pass_low_risk
+    }
 }
 
 /// Collection of configured MCP servers after scope-aware merging.
@@ -672,6 +739,7 @@ impl ConfigLoader {
             aliases: parse_optional_aliases(&merged_value)?,
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             permission_rules: parse_optional_permission_rules(&merged_value)?,
+            approval: parse_optional_approval_config(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             providers: parse_optional_providers_config(&merged_value)?,
@@ -765,6 +833,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn approval(&self) -> &ApprovalConfig {
+        &self.feature_config.approval
+    }
+
+    #[must_use]
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.feature_config.sandbox
     }
@@ -851,6 +924,17 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn permission_rules(&self) -> &RuntimePermissionRuleConfig {
         &self.permission_rules
+    }
+
+    #[must_use]
+    pub fn approval(&self) -> &ApprovalConfig {
+        &self.approval
+    }
+
+    #[must_use]
+    pub fn with_approval(mut self, approval: ApprovalConfig) -> Self {
+        self.approval = approval;
+        self
     }
 
     #[must_use]
@@ -1409,6 +1493,25 @@ fn parse_optional_permission_rules(
             .unwrap_or_default(),
         ask: optional_string_array(permissions, "ask", "merged settings.permissions")?
             .unwrap_or_default(),
+    })
+}
+
+fn parse_optional_approval_config(root: &JsonValue) -> Result<ApprovalConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(ApprovalConfig::default());
+    };
+    let Some(permissions) = object.get("permissions").and_then(JsonValue::as_object) else {
+        return Ok(ApprovalConfig::default());
+    };
+    let Some(approval) = permissions.get("approval").and_then(JsonValue::as_object) else {
+        return Ok(ApprovalConfig::default());
+    };
+
+    Ok(ApprovalConfig {
+        yolo_mode: optional_bool(approval, "yolo_mode", "merged settings.permissions.approval")?.unwrap_or(false),
+        yolo_honor_critical: optional_bool(approval, "yolo_honor_critical", "merged settings.permissions.approval")?.unwrap_or(true),
+        auto_pass_read_only: optional_bool(approval, "auto_pass_read_only", "merged settings.permissions.approval")?.unwrap_or(true),
+        auto_pass_low_risk: optional_bool(approval, "auto_pass_low_risk", "merged settings.permissions.approval")?.unwrap_or(true),
     })
 }
 

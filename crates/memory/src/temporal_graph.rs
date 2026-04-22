@@ -276,6 +276,11 @@ impl KnowledgeGraph {
         }
     }
 
+    /// Return a reference to all triples in the graph.
+    pub fn all_triples(&self) -> &[Triple] {
+        &self.triples
+    }
+
     /// Query all relationships for an entity.
     ///
     /// Similar to MemPalace's `query_entity()`:

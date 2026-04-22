@@ -204,9 +204,11 @@ class CowdApi {
 
   /**
    * Create new session
+   * @param {Object|string} options - Title string or { title, model }
    */
-  async createSession(title = null) {
-    return this._request('POST', '/sessions', { title });
+  async createSession(options = null) {
+    const data = typeof options === 'string' ? { title: options } : (options || {});
+    return this._request('POST', '/sessions', data);
   }
 
   /**
@@ -689,6 +691,66 @@ class CowdApi {
   /** Resume a cron job */
   async resumeCron(id) {
     return this._request('POST', `/crons/${id}/resume`);
+  }
+
+  // ── 3C-3/3C-4: Knowledge Graph, Cron Logs & Approval History API ─────────
+
+  /**
+   * Get knowledge graph data for visualization.
+   * Backend exposes /memory/entities and /memory/triples;
+   * we combine them into the { nodes, edges } format the frontend expects.
+   */
+  async getKnowledgeGraph() {
+    const [entitiesRes, triplesRes] = await Promise.all([
+      this._request('GET', '/memory/entities').catch(() => ({ entities: [] })),
+      this._request('GET', '/memory/triples').catch(() => ({ triples: [] }))
+    ]);
+
+    const entities = entitiesRes.entities || entitiesRes || [];
+    const triples = triplesRes.triples || triplesRes || [];
+
+    const nodes = entities.map(e => ({
+      id: e.id,
+      label: e.name || e.label || e.id,
+      layer: e.layer || 'default',
+      type: e.type || 'entity',
+      ...e
+    }));
+
+    const edges = triples.map(t => ({
+      source: t.subject || t.source,
+      target: t.object || t.target,
+      label: t.predicate || t.label || t.relation || '',
+      ...t
+    }));
+
+    return { nodes, edges };
+  }
+
+  /**
+   * Get cron execution logs.
+   * NOTE: Backend does not yet expose /crons/logs.
+   * Returns empty data gracefully so the UI shows "暂无执行记录".
+   */
+  async getCronLogs(params = {}) {
+    const query = new URLSearchParams({ limit: params.limit || 20, offset: params.offset || 0 }).toString();
+    return this._request('GET', `/crons/logs?${query}`);
+  }
+
+  /**
+   * Get execution logs for a specific cron job.
+   */
+  async getCronJobLogs(cronId, params = {}) {
+    const query = new URLSearchParams({ limit: params.limit || 20, offset: params.offset || 0 }).toString();
+    return this._request('GET', `/crons/${cronId}/logs?${query}`);
+  }
+
+  /**
+   * Get approval history.
+   */
+  async getApprovalHistory(params = {}) {
+    const query = new URLSearchParams({ limit: params.limit || 20, offset: params.offset || 0 }).toString();
+    return this._request('GET', `/approval/history?${query}`);
   }
 }
 

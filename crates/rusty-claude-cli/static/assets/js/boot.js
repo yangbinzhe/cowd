@@ -497,6 +497,162 @@ class App {
       menu.remove();
     });
   }
+
+  // ── P1-8: Onboarding Wizard ──────────────────────────────────────────────────
+
+  async checkOnboarding() {
+    try {
+      const resp = await fetch('/api/onboarding/status', {
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('cowd_token') || ''}` }
+      });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data.needs_onboarding) {
+        this.showOnboardingWizard();
+      }
+    } catch (e) {
+      console.warn('[Cowd] Onboarding check failed:', e);
+    }
+  }
+
+  showOnboardingWizard() {
+    if (document.getElementById('onboardingModal')) return;
+
+    const modal = document.createElement('div');
+    modal.id = 'onboardingModal';
+    modal.className = 'modal';
+    modal.style.display = 'flex';
+    modal.innerHTML = `
+    <div class="modal-content onboarding-content">
+      <div class="modal-header">
+        <h2>Welcome to Cowd</h2>
+        <p>Let's set up your AI assistant in a few steps.</p>
+      </div>
+      <div id="onboarding-steps">
+        <div class="onboarding-step active" data-step="1">
+          <h3>Step 1: Choose Provider</h3>
+          <div class="form-group">
+            <label>AI Provider</label>
+            <select id="ob-provider" class="onboarding-input">
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="custom">Custom (OpenAI-compatible)</option>
+            </select>
+          </div>
+          <div class="form-group" id="ob-custom-url-group" style="display:none">
+            <label>API Base URL</label>
+            <input type="text" id="ob-base-url" placeholder="https://api.example.com/v1" class="onboarding-input">
+          </div>
+          <button class="btn primary" onclick="window.app.onboardingNext(1)">Next</button>
+        </div>
+        <div class="onboarding-step" data-step="2">
+          <h3>Step 2: API Key</h3>
+          <div class="form-group">
+            <label>API Key</label>
+            <input type="password" id="ob-api-key" placeholder="sk-..." class="onboarding-input">
+          </div>
+          <div class="form-group">
+            <label>Default Model (optional)</label>
+            <input type="text" id="ob-model" placeholder="gpt-4o / claude-sonnet-4-20250514" class="onboarding-input">
+          </div>
+          <div id="ob-test-result" class="onboarding-test-result"></div>
+          <button class="btn secondary" onclick="window.app.onboardingPrev(2)">Back</button>
+          <button class="btn primary" onclick="window.app.onboardingTest()">Test & Continue</button>
+        </div>
+        <div class="onboarding-step" data-step="3">
+          <h3>Step 3: Ready!</h3>
+          <p>Your configuration will be saved. You can always change it later in Settings.</p>
+          <button class="btn secondary" onclick="window.app.onboardingPrev(3)">Back</button>
+          <button class="btn primary" onclick="window.app.onboardingSave()">Save & Start</button>
+        </div>
+      </div>
+      <div class="onboarding-progress">
+        <div class="progress-bar"><div class="progress-fill" id="ob-progress" style="width:33%"></div></div>
+      </div>
+    </div>
+  `;
+    document.body.appendChild(modal);
+
+    document.getElementById('ob-provider').addEventListener('change', (e) => {
+      document.getElementById('ob-custom-url-group').style.display = e.target.value === 'custom' ? 'block' : 'none';
+    });
+  }
+
+  onboardingNext(fromStep) {
+    document.querySelectorAll('.onboarding-step').forEach(s => s.classList.remove('active'));
+    const next = document.querySelector(`.onboarding-step[data-step="${fromStep + 1}"]`);
+    if (next) next.classList.add('active');
+    document.getElementById('ob-progress').style.width = `${((fromStep) / 3) * 100}%`;
+  }
+
+  onboardingPrev(fromStep) {
+    document.querySelectorAll('.onboarding-step').forEach(s => s.classList.remove('active'));
+    const prev = document.querySelector(`.onboarding-step[data-step="${fromStep - 1}"]`);
+    if (prev) prev.classList.add('active');
+    document.getElementById('ob-progress').style.width = `${((fromStep - 2) / 3) * 100}%`;
+  }
+
+  async onboardingTest() {
+    const provider = document.getElementById('ob-provider').value;
+    const apiKey = document.getElementById('ob-api-key').value.trim();
+    const model = document.getElementById('ob-model').value.trim();
+    const baseUrl = document.getElementById('ob-base-url')?.value?.trim();
+    const resultEl = document.getElementById('ob-test-result');
+
+    if (!apiKey) {
+      resultEl.innerHTML = '<span class="ob-error">Please enter an API key.</span>';
+      return;
+    }
+
+    resultEl.innerHTML = '<span class="ob-pending">Validating...</span>';
+
+    try {
+      const resp = await fetch('/api/onboarding/test', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('cowd_token') || ''}`
+        },
+        body: JSON.stringify({ provider, api_key: apiKey, model: model || undefined, base_url: baseUrl || undefined })
+      });
+      const data = await resp.json();
+      if (data.success) {
+        resultEl.innerHTML = '<span class="ob-success">Key format validated!</span>';
+        this.onboardingNext(2);
+      } else {
+        resultEl.innerHTML = `<span class="ob-error">${escapeHtml(data.error || 'Validation failed')}</span>`;
+      }
+    } catch (e) {
+      resultEl.innerHTML = `<span class="ob-error">Test failed: ${escapeHtml(e.message)}</span>`;
+    }
+  }
+
+  async onboardingSave() {
+    const provider = document.getElementById('ob-provider').value;
+    const apiKey = document.getElementById('ob-api-key').value.trim();
+    const model = document.getElementById('ob-model').value.trim() || (provider === 'anthropic' ? 'claude-sonnet-4-20250514' : 'gpt-4o');
+    const baseUrl = document.getElementById('ob-base-url')?.value?.trim();
+
+    try {
+      await window.api.updateConfig({
+        providers: {
+          default: provider,
+          [provider]: {
+            api_key: apiKey,
+            model: model,
+            ...(baseUrl ? { base_url: baseUrl } : {})
+          }
+        }
+      });
+    } catch (e) {
+      console.warn('[Cowd] Onboarding save failed:', e);
+    }
+
+    const modal = document.getElementById('onboardingModal');
+    if (modal) modal.remove();
+
+    await this.loadConfig();
+  }
 }
 
 // Helper functions for rendering panels
@@ -582,178 +738,6 @@ async function selectSession(session) {
   } finally {
     window.appState.setLoading('messages', false);
   }
-}
-
-// ── P1-8: Onboarding Wizard ──────────────────────────────────────────────────
-
-/**
- * Check if onboarding is needed and show wizard
- */
-async checkOnboarding() {
-  try {
-    const resp = await fetch('/api/onboarding/status', {
-      headers: { 'Authorization': `Bearer ${localStorage.getItem('cowd_token') || ''}` }
-    });
-    if (!resp.ok) return;
-    const data = await resp.json();
-    if (data.needs_onboarding) {
-      this.showOnboardingWizard();
-    }
-  } catch (e) {
-    console.warn('[Cowd] Onboarding check failed:', e);
-  }
-}
-
-/**
- * Show the onboarding wizard modal
- */
-showOnboardingWizard() {
-  // Don't show if already visible
-  if (document.getElementById('onboardingModal')) return;
-
-  const modal = document.createElement('div');
-  modal.id = 'onboardingModal';
-  modal.className = 'modal';
-  modal.style.display = 'flex';
-  modal.innerHTML = `
-    <div class="modal-content onboarding-content">
-      <div class="modal-header">
-        <h2>Welcome to Cowd</h2>
-        <p>Let's set up your AI assistant in a few steps.</p>
-      </div>
-      <div id="onboarding-steps">
-        <div class="onboarding-step active" data-step="1">
-          <h3>Step 1: Choose Provider</h3>
-          <div class="form-group">
-            <label>AI Provider</label>
-            <select id="ob-provider" class="onboarding-input">
-              <option value="openai">OpenAI</option>
-              <option value="anthropic">Anthropic</option>
-              <option value="custom">Custom (OpenAI-compatible)</option>
-            </select>
-          </div>
-          <div class="form-group" id="ob-custom-url-group" style="display:none">
-            <label>API Base URL</label>
-            <input type="text" id="ob-base-url" placeholder="https://api.example.com/v1" class="onboarding-input">
-          </div>
-          <button class="btn primary" onclick="window.app.onboardingNext(1)">Next</button>
-        </div>
-        <div class="onboarding-step" data-step="2">
-          <h3>Step 2: API Key</h3>
-          <div class="form-group">
-            <label>API Key</label>
-            <input type="password" id="ob-api-key" placeholder="sk-..." class="onboarding-input">
-          </div>
-          <div class="form-group">
-            <label>Default Model (optional)</label>
-            <input type="text" id="ob-model" placeholder="gpt-4o / claude-sonnet-4-20250514" class="onboarding-input">
-          </div>
-          <div id="ob-test-result" class="onboarding-test-result"></div>
-          <button class="btn secondary" onclick="window.app.onboardingPrev(2)">Back</button>
-          <button class="btn primary" onclick="window.app.onboardingTest()">Test & Continue</button>
-        </div>
-        <div class="onboarding-step" data-step="3">
-          <h3>Step 3: Ready!</h3>
-          <p>Your configuration will be saved. You can always change it later in Settings.</p>
-          <button class="btn secondary" onclick="window.app.onboardingPrev(3)">Back</button>
-          <button class="btn primary" onclick="window.app.onboardingSave()">Save & Start</button>
-        </div>
-      </div>
-      <div class="onboarding-progress">
-        <div class="progress-bar"><div class="progress-fill" id="ob-progress" style="width:33%"></div></div>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(modal);
-
-  // Toggle custom URL field
-  document.getElementById('ob-provider').addEventListener('change', (e) => {
-    document.getElementById('ob-custom-url-group').style.display = e.target.value === 'custom' ? 'block' : 'none';
-  });
-}
-
-onboardingNext(fromStep) {
-  document.querySelectorAll('.onboarding-step').forEach(s => s.classList.remove('active'));
-  const next = document.querySelector(`.onboarding-step[data-step="${fromStep + 1}"]`);
-  if (next) next.classList.add('active');
-  document.getElementById('ob-progress').style.width = `${((fromStep) / 3) * 100}%`;
-}
-
-onboardingPrev(fromStep) {
-  document.querySelectorAll('.onboarding-step').forEach(s => s.classList.remove('active'));
-  const prev = document.querySelector(`.onboarding-step[data-step="${fromStep - 1}"]`);
-  if (prev) prev.classList.add('active');
-  document.getElementById('ob-progress').style.width = `${((fromStep - 2) / 3) * 100}%`;
-}
-
-async onboardingTest() {
-  const provider = document.getElementById('ob-provider').value;
-  const apiKey = document.getElementById('ob-api-key').value.trim();
-  const model = document.getElementById('ob-model').value.trim();
-  const baseUrl = document.getElementById('ob-base-url')?.value?.trim();
-  const resultEl = document.getElementById('ob-test-result');
-
-  if (!apiKey) {
-    resultEl.innerHTML = '<span class="ob-error">Please enter an API key.</span>';
-    return;
-  }
-
-  resultEl.innerHTML = '<span class="ob-pending">Validating...</span>';
-
-  try {
-    const resp = await fetch('/api/onboarding/test', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${localStorage.getItem('cowd_token') || ''}`
-      },
-      body: JSON.stringify({ provider, api_key: apiKey, model: model || undefined, base_url: baseUrl || undefined })
-    });
-    const data = await resp.json();
-    if (data.success) {
-      resultEl.innerHTML = '<span class="ob-success">Key format validated!</span>';
-      this.onboardingNext(2);
-    } else {
-      resultEl.innerHTML = `<span class="ob-error">${this.escapeHtml(data.error || 'Validation failed')}</span>`;
-    }
-  } catch (e) {
-    resultEl.innerHTML = `<span class="ob-error">Test failed: ${this.escapeHtml(e.message)}</span>`;
-  }
-}
-
-async onboardingSave() {
-  const provider = document.getElementById('ob-provider').value;
-  const apiKey = document.getElementById('ob-api-key').value.trim();
-  const model = document.getElementById('ob-model').value.trim() || (provider === 'anthropic' ? 'claude-sonnet-4-20250514' : 'gpt-4o');
-  const baseUrl = document.getElementById('ob-base-url')?.value?.trim();
-
-  try {
-    await window.api.updateConfig({
-      providers: {
-        default: provider,
-        [provider]: {
-          api_key: apiKey,
-          model: model,
-          ...(baseUrl ? { base_url: baseUrl } : {})
-        }
-      }
-    });
-  } catch (e) {
-    console.warn('[Cowd] Onboarding save failed:', e);
-  }
-
-  // Close modal
-  const modal = document.getElementById('onboardingModal');
-  if (modal) modal.remove();
-
-  // Reload config
-  await this.loadConfig();
-}
-
-escapeHtml(str) {
-  const d = document.createElement('div');
-  d.textContent = str;
-  return d.innerHTML;
 }
 
 // Export for module usage

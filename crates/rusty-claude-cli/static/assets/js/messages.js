@@ -17,9 +17,15 @@ const Messages = {
     // Bind send button
     const sendBtn = document.getElementById('sendBtn');
     const inputArea = document.getElementById('inputArea');
+    const stopBtn = document.getElementById('stopBtn');
 
     if (sendBtn) {
       sendBtn.addEventListener('click', () => this.send());
+    }
+
+    // 3C-1: Stop generation button
+    if (stopBtn) {
+      stopBtn.addEventListener('click', () => this.stopGeneration());
     }
 
     if (inputArea) {
@@ -58,10 +64,26 @@ const Messages = {
     // Update send button state
     window.appState?.subscribe('isStreaming', (isStreaming) => {
       const sendBtn = document.getElementById('sendBtn');
+      const stopBtn = document.getElementById('stopBtn');
       if (sendBtn) {
         sendBtn.disabled = isStreaming;
+        sendBtn.style.display = isStreaming ? 'none' : '';
+      }
+      if (stopBtn) {
+        stopBtn.style.display = isStreaming ? '' : 'none';
       }
     });
+  },
+
+  // 3C-1: Stop generation
+  stopGeneration() {
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
+    }
+    this.hideThinking();
+    window.appState?.set('isStreaming', false);
+    window.Toast?.info('已停止生成');
   },
 
   async send() {
@@ -84,7 +106,10 @@ const Messages = {
     let session = window.appState?.get('currentSession');
     if (!session) {
       try {
-        session = await window.api?.createSession();
+        // 3C-1: Include model selection
+        const modelSelect = document.getElementById('modelSelect');
+        const selectedModel = modelSelect?.value || 'auto';
+        session = await window.api?.createSession(selectedModel !== 'auto' ? { model: selectedModel } : undefined);
         window.appState?.set('currentSession', session);
         window.appState?.update('sessions', sessions => [session, ...(sessions || [])]);
         if (window.Sessions) window.Sessions.renderSessions();
@@ -658,7 +683,7 @@ const Messages = {
     const modal = document.getElementById('loginModal');
     if (modal) {
       modal.classList.add('active');
-      const tokenInput = document.getElementById('loginToken');
+      const tokenInput = document.getElementById('tokenInput');
       if (tokenInput) {
         tokenInput.focus();
       }
