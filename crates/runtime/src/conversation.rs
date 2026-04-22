@@ -223,12 +223,14 @@ where
                         Some(Arc::new(mgr))
                     }
                     Err(err) => {
-                        tracing::warn!(%err, "memory: failed to initialise CognitiveContextManager, disabling");
+                        // Memory is a core subsystem — emit a clear error so the user knows
+                        // context will NOT be extracted or persisted across turns.
+                        tracing::error!(%err, "memory: failed to initialise CognitiveContextManager — memory features (extraction, compaction, persistence) are DISABLED. Check your memory configuration (store paths, vector API credentials, etc.)");
                         None
                     }
                 },
                 Err(_) => {
-                    tracing::warn!("memory: no tokio runtime available, disabling CognitiveContextManager");
+                    tracing::error!("memory: no tokio runtime available — CognitiveContextManager disabled. Memory features will NOT work.");
                     None
                 }
             }
@@ -750,9 +752,12 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
+        // Use the session's estimated token count directly, not the cumulative
+        // usage tracker which spans across multiple sessions and doesn't
+        // reflect the current conversation window pressure.
+        let session_tokens = estimate_session_tokens(&self.session);
+
+        if session_tokens < self.auto_compaction_input_tokens_threshold as usize {
             return None;
         }
 

@@ -350,7 +350,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
-        CliAction::Serve { host, port, auth_enabled, cors_origins, output_format: _ } => {
+        CliAction::Serve { host, port, auth_enabled, cors_origins, output_format: _, yolo_mode } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
             // ── 加载统一配置 ──
@@ -393,8 +393,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // platform configs: runtime::config::PlatformConfig → runtime::platform::PlatformConfig
             let platform_configs = build_platform_configs(runtime_config.gateway());
 
-            // approval config
-            let approval_config = runtime_config.approval().clone();
+            // approval config: 如果 --yolo 启用，强制设置 yolo_mode=true
+            let mut approval_config = runtime_config.approval().clone();
+            if yolo_mode {
+                approval_config.yolo_mode = true;
+                approval_config.yolo_honor_critical = false; // 完全跳过审批，包括 Critical
+                eprintln!("🚀 YOLO mode enabled: all command approvals bypassed");
+            }
 
             let config = server::HttpConfig {
                 host,
@@ -512,6 +517,7 @@ enum CliAction {
         auth_enabled: bool,
         cors_origins: Vec<String>,
         output_format: CliOutputFormat,
+        yolo_mode: bool,
     },
     Export {
         session_reference: String,
@@ -838,12 +844,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let mut port: u16 = 8642;
             let mut auth_enabled = true;
             let mut cors_origins: Vec<String> = Vec::new();
+            let mut yolo_mode = false;
             let mut i = 1;
             while i < rest.len() {
                 match rest[i].as_str() {
                     "--host" if i + 1 < rest.len() => { host = rest[i + 1].clone(); i += 2; }
                     "--port" if i + 1 < rest.len() => { port = rest[i + 1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?; i += 2; }
                     "--no-auth" => { auth_enabled = false; i += 1; }
+                    "--yolo" => { yolo_mode = true; i += 1; }
                     "--cors-origins" if i + 1 < rest.len() => {
                         cors_origins = rest[i + 1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
                         i += 2;
@@ -851,7 +859,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     other => return Err(format!("unknown serve flag: {other}")),
                 }
             }
-            Ok(CliAction::Serve { host, port, auth_enabled, cors_origins, output_format })
+            Ok(CliAction::Serve { host, port, auth_enabled, cors_origins, output_format, yolo_mode })
         }
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
