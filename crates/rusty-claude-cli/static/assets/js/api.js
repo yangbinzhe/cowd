@@ -559,6 +559,9 @@ class CowdApi {
    * Get workspace details
    */
   async getWorkspace(name) {
+    if (!name) {
+      return this._request('GET', '/workspace');
+    }
     return this._request('GET', `/workspaces/${encodeURIComponent(name)}`);
   }
 

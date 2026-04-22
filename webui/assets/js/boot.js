@@ -468,7 +468,7 @@ class App {
       window.messageRenderer?.clearMessages();
 
       // Add to sessions list
-      const sessions = [session, ...window.appState.get('sessions')];
+      const sessions = [session, ...(window.appState.get('sessions') || [])];
       window.appState.set('sessions', sessions);
       await renderSessions(sessions);
 

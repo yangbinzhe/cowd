@@ -570,6 +570,8 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/api/config/providers", get(get_providers_handler))
         // WebUI Memory API
         .route("/api/memory", get(memory_status_handler))
+        .route("/api/memory/stats", get(memory_stats_handler))
+        .route("/api/memory/layers", get(list_memory_layers_handler))
         .route("/api/memory/search", get(memory_search_handler))
         .route("/api/memory/:layer", get(get_memory_layer_handler))
         .route("/api/memory/:layer", post(create_memory_entry_handler))
@@ -1909,6 +1911,37 @@ async fn memory_status_handler(AxumState(state): AxumState<HttpAppState>) -> axu
     })).into_response()
 }
 
+/// GET /api/memory/stats — Statistics summary for the WebUI.
+async fn memory_stats_handler(AxumState(state): AxumState<HttpAppState>) -> axum::response::Response {
+    let Some(ref mgr) = state.cognitive_manager else {
+        return Json(serde_json::json!({
+            "total_entries": 0,
+            "total_tokens": 0,
+            "layers": {},
+            "warning": "memory subsystem not enabled"
+        })).into_response();
+    };
+
+    let l0 = mgr.list_layer_entries(memory::types::MemoryLayer::L0).await.unwrap_or_default();
+    let l1 = mgr.list_layer_entries(memory::types::MemoryLayer::L1).await.unwrap_or_default();
+    let l2 = mgr.list_layer_entries(memory::types::MemoryLayer::L2).await.unwrap_or_default();
+    let l3 = mgr.list_layer_entries(memory::types::MemoryLayer::L3).await.unwrap_or_default();
+
+    let total = l0.len() + l1.len() + l2.len() + l3.len();
+
+    Json(serde_json::json!({
+        "total_entries": total,
+        "total_tokens": 0,
+        "layers": {
+            "l0": { "count": l0.len() },
+            "l1": { "count": l1.len() },
+            "l2": { "count": l2.len() },
+            "l3": { "count": l3.len() },
+            "l4": { "count": 0 }
+        }
+    })).into_response()
+}
+
 #[derive(Debug, Deserialize)]
 struct MemorySearchQuery {
     query: String,
@@ -3097,8 +3130,10 @@ impl SkillService {
             .unwrap_or_else(|_| ".".to_string());
 
         let mut roots = Vec::new();
+        roots.push(PathBuf::from(format!("{}/.cowd/skills", home)));
         roots.push(PathBuf::from(format!("{}/.qoder/skills", home)));
         roots.push(PathBuf::from(format!("{}/.agents/skills", home)));
+        roots.push(PathBuf::from(format!("{}/.cowd/skills", cwd)));
         roots.push(PathBuf::from(format!("{}/.qoder/skills", cwd)));
         roots.push(PathBuf::from(format!("{}/.agents/skills", cwd)));
 
@@ -3245,7 +3280,9 @@ impl SkillService {
                     .map(|e| e.into_iter().flatten().filter(|d| d.path().is_dir()).count())
                     .unwrap_or(0);
 
-                let root_type = if root.to_string_lossy().contains(".qoder") {
+                let root_type = if root.to_string_lossy().contains(".cowd") {
+                    "cowd"
+                } else if root.to_string_lossy().contains(".qoder") {
                     "qoder"
                 } else {
                     "agents"
