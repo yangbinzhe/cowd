@@ -26,6 +26,7 @@ use crate::{
     config::MemoryConfig,
     drift::DriftDetector,
     error::MemoryError,
+    extractor::MemoryExtractor,
     handoff::HandoffManager,
     orchestrator::MemoryOrchestrator,
     relevance::DynamicLoader,
@@ -34,8 +35,8 @@ use crate::{
     store::vector::VectorIndex,
     types::{
         DecisionEntry, HandoffData, MatchedKeyword, MemoryEntry, MemoryId, Message,
-        PreparedContext, SearchMemoriesRequest, SearchMemoriesResult, SearchMode,
-        SearchSnippet, TokenBudget,
+        MessageRole, PreparedContext, SearchMemoriesRequest, SearchMemoriesResult,
+        SearchMode, SearchSnippet, TokenBudget,
     },
     write_guard::{AuditLog, AuditOperation, AuditEntry, MemoryWriteGuard, WriteSource},
     embedding::EmbeddingCapability,
@@ -95,6 +96,8 @@ pub struct CognitiveContextManager {
     audit_log: Option<AuditLog>,
     /// Embedding capability level (Remote/Local/FTS5Only).
     embedding_capability: EmbeddingCapability,
+    /// Heuristic memory extractor.
+    extractor: MemoryExtractor,
 }
 
 impl CognitiveContextManager {
@@ -139,6 +142,9 @@ impl CognitiveContextManager {
         // Determine embedding capability before moving config.
         let embedding_capability = EmbeddingCapability::from_config(&config.store.vector);
 
+        // Build the memory extractor.
+        let extractor = MemoryExtractor::new(config.extractor.clone());
+
         Ok(Self {
             drift: DriftDetector::new(config.drift.clone()),
             config,
@@ -153,6 +159,7 @@ impl CognitiveContextManager {
             write_guard: None,
             audit_log: None,
             embedding_capability,
+            extractor,
         })
     }
 
@@ -315,6 +322,58 @@ impl CognitiveContextManager {
     /// 4. Checks seed trigger conditions for turn-end keywords.
     /// 5. Persists vector index for durability.
     pub async fn on_turn_end(&self, messages: &mut Vec<Message>) -> Result<()> {
+        // ── 0. Extract and persist memories ──────────────────────────────────
+        // Only extract if we have enough messages (requirement from extractor).
+        if messages.len() >= 2 {
+            // Record pre-extraction state for debugging.
+            tracing::debug!(
+                messages_count = messages.len(),
+                has_user = messages.iter().any(|m| matches!(m.role, MessageRole::User)),
+                has_assistant = messages.iter().any(|m| matches!(m.role, MessageRole::Assistant)),
+                has_tool = messages.iter().any(|m| matches!(m.role, MessageRole::Tool)),
+                user_content_total = messages
+                    .iter()
+                    .filter(|m| matches!(m.role, MessageRole::User))
+                    .map(|m| m.content.len())
+                    .sum::<usize>(),
+                "on_turn_end: pre-extraction state"
+            );
+
+            match self.extractor.extract(messages) {
+                Ok(entries) => {
+                    tracing::info!(
+                        entries_count = entries.len(),
+                        "on_turn_end: extracted {} memory entries",
+                        entries.len()
+                    );
+                    for entry in entries {
+                        match self.orchestrator.remember(entry).await {
+                            Ok(_) => {
+                                tracing::debug!("on_turn_end: memory persisted successfully");
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "on_turn_end: memory persistence failed"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "on_turn_end: extraction failed (non-fatal)"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!(
+                messages_count = messages.len(),
+                "on_turn_end: skipped (insufficient messages)"
+            );
+        }
+
         // ── 1. Micro compact ────────────────────────────────────────────────
         self.pipeline.micro_compact(messages);
 

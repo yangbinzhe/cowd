@@ -193,7 +193,9 @@ impl MemoryExtractor {
         }
 
         // Consider worth extracting if there is at least one tool call/result
-        // OR the total user-content length exceeds a threshold (200 chars).
+        // OR the total user-content length exceeds a threshold.
+        // Threshold: 200 chars → 50 chars to cover most daily conversations.
+        // Reference: hermes-agent supermemory uses 10 chars.
         let has_tool_activity = messages
             .iter()
             .any(|m| m.role == MessageRole::Tool || m.tool_use_id.is_some());
@@ -204,7 +206,7 @@ impl MemoryExtractor {
             .map(|m| m.content.len())
             .sum();
 
-        has_tool_activity || user_content_len > 200
+        has_tool_activity || user_content_len >= 50
     }
 
     /// Extract meaningful [`MemoryEntry`] items from `messages`.

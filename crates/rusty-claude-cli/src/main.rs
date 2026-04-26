@@ -576,6 +576,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
+    let mut global_yolo_mode = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -647,6 +648,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--dangerously-skip-permissions" | "--yolo" => {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
+                global_yolo_mode = true;
                 index += 1;
             }
             "--compact" => {
@@ -859,7 +861,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     other => return Err(format!("unknown serve flag: {other}")),
                 }
             }
-            Ok(CliAction::Serve { host, port, auth_enabled, cors_origins, output_format, yolo_mode })
+            Ok(CliAction::Serve { host, port, auth_enabled, cors_origins, output_format, yolo_mode: yolo_mode || global_yolo_mode })
         }
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
