@@ -4063,7 +4063,13 @@ impl LiveCli {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(match command {
             SlashCommand::Help => {
-                println!("{}", render_repl_help());
+                println!("## Cowd Commands\n");
+                println!("**Session**: /status /cost /resume /session /new /clear /compact /retry /undo");
+                println!("**Memory**: /memory /closet /sandbox");
+                println!("**Agent**: /subagent /pipeline /agents");
+                println!("**Project**: /state /diff /commit /init /config /title");
+                println!("**Model**: use --model or config aliases (main/fast/coder/reasoning)");
+                println!("Type /<command> --help for details.");
                 false
             }
             SlashCommand::Status => {
