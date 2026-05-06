@@ -40,6 +40,14 @@ pub struct App {
     pub picker_sessions: Vec<SessionSummary>,
     pub picker_idx: usize,
     pub theme: Theme,
+    pub approval: Option<ApprovalRequest>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    pub tool_name: String,
+    pub input_preview: String,
+    pub approved: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +90,7 @@ impl App {
             picker_sessions: Vec::new(),
             picker_idx: 0,
             theme: Theme::Dark,
+            approval: None,
         }
     }
 

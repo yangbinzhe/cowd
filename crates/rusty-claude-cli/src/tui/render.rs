@@ -16,6 +16,25 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_messages(frame, chunks[1], app);
     draw_input(frame, chunks[2], app);
     if app.picker_active { draw_session_picker(frame, area, app); }
+    if app.approval.is_some() { draw_approval_modal(frame, area, app); }
+}
+
+fn draw_approval_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let req = app.approval.as_ref().unwrap();
+    let w = 60u16.min(area.width - 4);
+    let h = 6u16;
+    let x = (area.width - w) / 2;
+    let y = (area.height - h) / 2;
+    let pa = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, pa);
+
+    let text = format!(
+        "Tool: {}\nInput: {}\n\n[Y] Approve  [N] Deny",
+        req.tool_name,
+        req.input_preview.chars().take(40).collect::<String>()
+    );
+    let block = Block::default().borders(Borders::ALL).title("Approval Required").fg(Color::Yellow);
+    frame.render_widget(Paragraph::new(text).block(block), pa);
 }
 
 fn draw_session_picker(frame: &mut Frame, area: Rect, app: &App) {

@@ -20,6 +20,7 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
     match crossterm::event::read()? {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             if app.picker_active { return handle_picker(app, key.code); }
+            if app.approval.is_some() { return handle_approval(app, key.code); }
             match key.code {
                 KeyCode::Esc => Ok(InputResult::Exit),
                 KeyCode::Enter => {
@@ -48,6 +49,20 @@ fn handle_picker(app: &mut App, code: KeyCode) -> io::Result<InputResult> {
             let id = app.picker_selected_id().map(String::from);
             app.close_session_picker();
             Ok(id.map(InputResult::ResumeSession).unwrap_or(InputResult::Nothing))
+        }
+        _ => Ok(InputResult::Nothing),
+    }
+}
+
+fn handle_approval(app: &mut App, code: KeyCode) -> io::Result<InputResult> {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.approval = None;
+            Ok(InputResult::Submit("__approval_approved__".into()))
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.approval = None;
+            Ok(InputResult::Submit("__approval_denied__".into()))
         }
         _ => Ok(InputResult::Nothing),
     }

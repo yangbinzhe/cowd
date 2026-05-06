@@ -5,6 +5,7 @@ pub mod closet;
 pub mod sandbox;
 pub mod display;
 pub mod bm25;
+pub mod knowledge_graph;
 
 pub use store::{MemoryStore, MemoryEntry, MemoryLayer, MemoryCategory, Priority};
 pub use layers::{IdentityLayer, EssentialLayer, SearchLayer, MemoryManager};
