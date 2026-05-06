@@ -147,6 +147,52 @@ impl SeedRegistry {
     pub fn is_empty(&self) -> bool {
         self.seeds.is_empty()
     }
+
+    // ─── Bootstrapping ──────────────────────────────────────────────────────
+
+    /// Bootstrap the registry with common system seeds.
+    ///
+    /// Should be called once during initialisation. Returns the number of
+    /// seeds planted.
+    #[must_use]
+    pub fn bootstrap_system_seeds(&mut self) -> usize {
+        let mut count = 0;
+
+        // Think-in-Code analysis paradigm (triggers on Executing phase)
+        self.plant(
+            "think-in-code-analysis",
+            THINK_IN_CODE_SYSTEM_SEED,
+            SeedTrigger::Phase("Executing".to_string()),
+            Priority::High,
+        );
+        count += 1;
+
+        // Terse output style (manually managed, always available)
+        self.plant(
+            "terse-output-style",
+            TERSE_OUTPUT_SYSTEM_SEED,
+            SeedTrigger::Manual,
+            Priority::High,
+        );
+        count += 1;
+
+        // Surgical changes reminder (triggers on refactor/edit keywords)
+        self.plant(
+            "surgical-changes",
+            SURGICAL_CHANGES_SEED,
+            SeedTrigger::Keyword(vec![
+                "refactor".into(),
+                "modify".into(),
+                "edit".into(),
+                "change".into(),
+                "update".into(),
+            ]),
+            Priority::Normal,
+        );
+        count += 1;
+
+        count
+    }
 }
 
 impl Default for SeedRegistry {
@@ -304,6 +350,51 @@ impl Default for DecisionThreadStore {
         Self::new()
     }
 }
+
+// ─── System seed content constants ────────────────────────────────────────────
+
+/// Think-in-Code analysis paradigm seed.
+///
+/// Instructs the model to prefer code execution over reading raw data
+/// files into the context window. Based on context-mode's "Think in Code"
+/// principle.
+const THINK_IN_CODE_SYSTEM_SEED: &str = r#"## Analysis Rule — MANDATORY
+
+When you need to count, filter, compare, search, parse, or transform data:
+1. Write code via the Bash tool and output ONLY the answer with console.log / print.
+2. NEVER read raw data files into context for manual analysis.
+3. One script replaces ten Read tool calls.
+
+Rationale: Each file read fills the limited context window directly.
+Programmatic analysis consumes ~0.1% of the tokens that text dumping does.
+"#;
+
+/// Terse output style seed.
+///
+/// Encourages the model to produce concise responses by removing filler
+/// phrases, pleasantries, and redundant summaries. Inspired by context-mode's
+/// output compression approach.
+const TERSE_OUTPUT_SYSTEM_SEED: &str = r#"## Output Style — Terse
+
+- Delete filler phrases ("Sure!", "Let me...", "I'll go ahead and...").
+- Delete pleasantries ("Great question!", "Thanks for asking!").
+- Delete summaries that repeat what was just done verbatim.
+- Use bullet lists for multi-item answers.
+- When one sentence suffices, output ONLY that sentence.
+"#;
+
+/// Surgical changes reminder seed.
+///
+/// Reminds the model to make minimal, focused edits without touching
+/// adjacent code or comments. Based on karpathy-guidelines principle #3.
+const SURGICAL_CHANGES_SEED: &str = r#"## Surgical Changes Reminder
+
+- Touch only what you must change.
+- Don't "improve" adjacent code, comments, or formatting.
+- Match existing style, even if you'd do it differently.
+- Every changed line should trace directly to the user's request.
+- If you notice unrelated dead code, mention it — don't delete it.
+"#;
 
 // ─── Free helpers ─────────────────────────────────────────────────────────────
 

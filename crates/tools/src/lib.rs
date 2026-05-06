@@ -529,7 +529,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TodoWrite",
-            description: "Update the structured task list for the current session.",
+            description: "Update the structured task list with priorities and status tracking.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -543,6 +543,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed"]
+                                },
+                                "priority": {
+                                    "type": "string",
+                                    "enum": ["low", "medium", "high", "critical"],
+                                    "description": "Task priority level (default: medium)"
                                 }
                             },
                             "required": ["content", "activeForm", "status"],
@@ -554,6 +559,20 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "Question",
+            description: "Ask the user a clarifying question. Use when ambiguous or need decision.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "The question to ask" },
+                    "options": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["question"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "Skill",
@@ -571,15 +590,24 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Agent",
-            description: "Launch a specialized agent task and persist its handoff metadata.",
+            description: "Launch a specialized sub-agent (reasoner|executor|reviewer|general).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "description": { "type": "string" },
                     "prompt": { "type": "string" },
                     "subagent_type": { "type": "string" },
+                    "role": {
+                        "type": "string",
+                        "enum": ["reasoner", "executor", "reviewer", "general"],
+                        "description": "Agent role. reasoner=analyze only, executor=implement, reviewer=check quality"
+                    },
                     "name": { "type": "string" },
-                    "model": { "type": "string" }
+                    "model": { "type": "string" },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run in background. Results available via /tasks."
+                    }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -1197,6 +1225,29 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::ReadOnly,
         },
+        ToolSpec {
+            name: "execute_code",
+            description: "Execute code in a sandboxed interpreter. Use to analyze data programmatically instead of reading raw data into context. \
+                Supported: python, javascript, bash, ruby, lua. \
+                Only stdout/stderr returned. 30s timeout.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "language": {
+                        "type": "string",
+                        "enum": ["python", "javascript", "bash", "ruby", "lua"],
+                        "description": "Programming language to execute"
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "Code to execute. Use console.log/print to output results. Only stdout enters context."
+                    }
+                },
+                "required": ["language", "code"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
     ]
 }
 
@@ -1255,6 +1306,17 @@ fn execute_tool_with_enforcer(
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
+        "Question" => {
+            let q = input.get("question").and_then(|v| v.as_str()).unwrap_or("");
+            let opts = input.get("options").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "));
+            Ok(format!("[QUESTION] {q}{}", opts.map(|o| format!("\nOptions: {o}")).unwrap_or_default()))
+        },
+        "ast_search" => {
+            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let lang = input.get("language").and_then(|v| v.as_str()).unwrap_or("rust");
+            Ok(format!("AST search: {pattern} in {lang}\nUse ast_grep_search tool for structured code patterns."))
+        },
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
@@ -1318,6 +1380,17 @@ fn execute_tool_with_enforcer(
         "vision_analyze" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             run_vision_analyze(input)
+        }
+        "execute_code" => {
+            use crate::sandbox_exec::execute_code;
+            let lang = input.get("language").and_then(|v| v.as_str()).unwrap_or("python");
+            let code = input.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            let result = execute_code(lang, code);
+            Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "exit_code": result.exit_code,
+            })).unwrap_or_default())
         }
         _ => Err(format!("unsupported tool: {name}")),
     }
@@ -2407,6 +2480,18 @@ struct TodoItem {
     #[serde(rename = "activeForm")]
     active_form: String,
     status: TodoStatus,
+    #[serde(default)]
+    priority: TodoPriority,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum TodoPriority {
+    #[default]
+    Medium,
+    Low,
+    High,
+    Critical,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -2430,6 +2515,8 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4461,8 +4548,12 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    // P1-7: Thinking blocks are not sent back to the model
-                    ContentBlock::Thinking { .. } => InputContentBlock::Text { text: String::new() },
+                    // Thinking blocks contain reasoning_content that must be passed back
+                    // to providers like DeepSeek in subsequent requests.
+                    ContentBlock::Thinking { thinking } => InputContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: None,
+                    },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
@@ -5251,7 +5342,7 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
 
 struct ReplRuntime {
     program: &'static str,
-    args: &'static [&'static str],
+    args: &'static [&'static str    ]
 }
 
 fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
@@ -5823,6 +5914,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 
 pub mod lane_completion;
 pub mod pdf_extract;
+pub mod sandbox_exec;
 pub mod web_tools;
 
 #[cfg(test)]

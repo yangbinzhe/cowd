@@ -1215,6 +1215,24 @@ pub enum SlashCommand {
         action: Option<String>,
         session_id: Option<String>,
     },
+    Closet {
+        topic: Option<String>,
+    },
+    SandboxSearch {
+        query: Option<String>,
+    },
+    Retry,
+    Undo,
+    NewSession,
+    Title {
+        name: Option<String>,
+    },
+    Compress,
+    State,
+    SubAgent {
+        role: Option<String>,
+        task: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -1317,6 +1335,15 @@ impl SlashCommand {
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
             Self::Handoff { .. } => "/handoff",
+            Self::Closet { .. } => "/closet",
+            Self::SandboxSearch { .. } => "/sandbox-search",
+            Self::Retry => "/retry",
+            Self::Undo => "/undo",
+            Self::NewSession => "/new",
+            Self::Title { .. } => "/title",
+            Self::Compress => "/compress",
+            Self::State => "/state",
+            Self::SubAgent { .. } => "/subagent",
             #[allow(unreachable_patterns)]
             _ => "/unknown",
         }
@@ -1533,6 +1560,23 @@ pub fn validate_slash_command_input(
             let session_id = args.get(1).map(|s| s.to_string());
             SlashCommand::Handoff { action, session_id }
         }
+        "subagent" => {
+            let role = args.first().map(|s| s.to_string());
+            let task = args.get(1..).map(|s| s.join(" ")).filter(|t| !t.is_empty());
+            SlashCommand::SubAgent { role, task }
+        }
+        "closet" | "rooms" | "memory-rooms" => {
+            SlashCommand::Closet { topic: args.first().map(|s| s.to_string()) }
+        }
+        "sandbox" | "sandbox-search" => {
+            SlashCommand::SandboxSearch { query: args.first().map(|s| s.to_string()) }
+        }
+        "retry" => SlashCommand::Retry,
+        "undo" => SlashCommand::Undo,
+        "new" | "reset" => SlashCommand::NewSession,
+        "title" => SlashCommand::Title { name: args.first().map(|s| s.to_string()) },
+        "compress" => SlashCommand::Compress,
+        "state" => SlashCommand::State,
         other => SlashCommand::Unknown(other.to_string()),
     }))
 }
@@ -4780,6 +4824,15 @@ pub fn handle_slash_command(
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
         | SlashCommand::Handoff { .. }
+        | SlashCommand::Closet { .. }
+        | SlashCommand::SandboxSearch { .. }
+        | SlashCommand::Retry
+        | SlashCommand::Undo
+        | SlashCommand::NewSession
+        | SlashCommand::Title { .. }
+        | SlashCommand::Compress
+        | SlashCommand::State
+        | SlashCommand::SubAgent { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }

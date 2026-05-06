@@ -168,6 +168,8 @@ pub struct ConversationRuntime<C, T> {
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
+    model_context_window: u32,
+    cached_prompt: crate::cached_prompt::CachedSystemPrompt,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter + Send>>,
     session_tracer: Option<SessionTracer>,
@@ -247,6 +249,11 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            model_context_window: 0,
+            cached_prompt: crate::cached_prompt::CachedSystemPrompt::new(
+                std::path::PathBuf::from(".cowd/config.yaml"),
+                std::path::PathBuf::from(".cowd/identity.md"),
+            ),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
@@ -265,6 +272,19 @@ where
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
+        self
+    }
+
+    pub fn with_model_context_window(mut self, ctx_window: u32) -> Self {
+        self.model_context_window = ctx_window;
+        if self.auto_compaction_input_tokens_threshold == 0 {
+            self.auto_compaction_input_tokens_threshold = resolve_compact_threshold(ctx_window);
+        }
+        self
+    }
+
+    pub fn with_cached_prompt(mut self, config_path: std::path::PathBuf, identity_path: std::path::PathBuf) -> Self {
+        self.cached_prompt = crate::cached_prompt::CachedSystemPrompt::new(config_path, identity_path);
         self
     }
 
@@ -483,6 +503,15 @@ where
                 );
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
+            }
+
+            if self.auto_compaction_input_tokens_threshold > 0
+                && estimate_session_tokens(&self.session) > self.auto_compaction_input_tokens_threshold as usize
+            {
+                let result = compact_session(&self.session, CompactionConfig::default());
+                if result.removed_message_count > 0 {
+                    self.session = result.compacted_session;
+                }
             }
 
             let request = ApiRequest {
@@ -896,8 +925,14 @@ where
     /// Returns a clone of `self.system_prompt` when memory is disabled so the
     /// hot path has zero cost.
     fn prepare_memory_context(&self, user_input: &str) -> Vec<String> {
+        let memory_high = 0usize;
+        if !self.cached_prompt.needs_rebuild(memory_high) {
+            return self.cached_prompt.get();
+        }
         let Some(mgr) = self.memory_manager.as_ref() else {
-            return self.system_prompt.clone();
+            let prompt = self.system_prompt.clone();
+            self.cached_prompt.rebuild(prompt.clone(), 0);
+            return prompt;
         };
 
         // Convert session messages to memory's Message type for context scoring.
@@ -955,11 +990,7 @@ where
                 );
                 let mut prompt = self.system_prompt.clone();
                 prompt.insert(0, memory_block);
-                tracing::debug!(
-                    entry_count = prepared.entries.len(),
-                    total_tokens = prepared.total_tokens,
-                    "memory: injected context into system prompt"
-                );
+                self.cached_prompt.rebuild(prompt.clone(), 0);
                 prompt
             }
             Err(err) => {
@@ -1025,11 +1056,21 @@ where
 /// Reads the automatic compaction threshold from the environment.
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
-    // CC_AUTO_COMPACT_INPUT_TOKENS takes priority, then legacy COWD_AUTO_COMPACT_INPUT_TOKENS
     let value = std::env::var("CC_AUTO_COMPACT_INPUT_TOKENS")
         .ok()
         .or_else(|| std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR).ok());
     parse_auto_compaction_threshold(value.as_deref())
+}
+
+fn resolve_compact_threshold(model_ctx_window: u32) -> u32 {
+    let env_val = auto_compaction_threshold_from_env();
+    if env_val > 0 { return env_val; }
+    if let Ok(pct_str) = std::env::var("COWD_COMPACT_THRESHOLD_PERCENT") {
+        if let Ok(pct) = pct_str.parse::<u32>() {
+            return (model_ctx_window * pct / 100).min(model_ctx_window.saturating_sub(8_000));
+        }
+    }
+    (model_ctx_window * 80 / 100).min(model_ctx_window.saturating_sub(8_000))
 }
 
 /// Convert a [`RuntimeFeatureConfig`] memory section into a [`CcMemoryConfig`]

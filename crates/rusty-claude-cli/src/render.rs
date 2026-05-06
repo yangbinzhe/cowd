@@ -10,6 +10,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColorTheme {
@@ -577,8 +578,21 @@ impl TerminalRenderer {
         for line in LinesWithEndings::from(code) {
             match syntax_highlighter.highlight_line(line, &self.syntax_set) {
                 Ok(ranges) => {
-                    let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
-                    colored_output.push_str(&apply_code_block_background(&escaped));
+                    // syntect 的 as_24_bit_terminal_escaped 在遇到非标准 Unicode /
+                    // byte 偏移不对齐时可能 panic。用 catch_unwind 隔离，回退到原始文本。
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        as_24_bit_terminal_escaped(&ranges[..], false)
+                    }));
+                    match result {
+                        Ok(escaped) => {
+                            colored_output
+                                .push_str(&apply_code_block_background(&escaped));
+                        }
+                        Err(_) => {
+                            colored_output
+                                .push_str(&apply_code_block_background(line));
+                        }
+                    }
                 }
                 Err(_) => colored_output.push_str(&apply_code_block_background(line)),
             }
@@ -600,16 +614,32 @@ impl TerminalRenderer {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MarkdownStreamState {
     pending: String,
+    chars_since_flush: usize,
 }
 
 impl MarkdownStreamState {
     #[must_use]
     pub fn push(&mut self, renderer: &TerminalRenderer, delta: &str) -> Option<String> {
         self.pending.push_str(delta);
-        let split = find_stream_safe_boundary(&self.pending)?;
-        let ready = self.pending[..split].to_string();
-        self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi(&ready))
+        self.chars_since_flush += delta.len();
+
+        if let Some(split) = find_stream_safe_boundary(&self.pending) {
+            let ready = self.pending[..split].to_string();
+            self.pending.drain(..split);
+            self.chars_since_flush = 0;
+            return Some(renderer.markdown_to_ansi(&ready));
+        }
+
+        if self.chars_since_flush > 200
+            && !self.pending.trim_start().starts_with("```")
+            && !self.pending.contains('\n')
+        {
+            let ready = std::mem::take(&mut self.pending);
+            self.chars_since_flush = 0;
+            return Some(renderer.markdown_to_ansi(&ready));
+        }
+
+        None
     }
 
     #[must_use]
@@ -885,7 +915,7 @@ fn line_closes_fence(line: &str, opener: FenceMarker) -> bool {
 }
 
 fn visible_width(input: &str) -> usize {
-    strip_ansi(input).chars().count()
+    UnicodeWidthStr::width(strip_ansi(input).as_str())
 }
 
 fn strip_ansi(input: &str) -> String {

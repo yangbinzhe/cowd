@@ -435,6 +435,10 @@ struct StreamState {
     message_started: bool,
     text_started: bool,
     text_finished: bool,
+    /// Whether the reasoning/thinking block has been started (DeepSeek thinking mode).
+    reasoning_started: bool,
+    /// Whether the reasoning/thinking block has finished.
+    reasoning_finished: bool,
     finished: bool,
     stop_reason: Option<String>,
     usage: Option<Usage>,
@@ -448,6 +452,8 @@ impl StreamState {
             message_started: false,
             text_started: false,
             text_finished: false,
+            reasoning_started: false,
+            reasoning_finished: false,
             finished: false,
             stop_reason: None,
             usage: None,
@@ -489,18 +495,44 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
+            // DeepSeek thinking mode: reasoning_content comes before the final answer.
+            // Emit a Thinking content block to preserve it for subsequent requests.
+            if let Some(reasoning) = choice.delta.reasoning_content.filter(|value| !value.is_empty()) {
+                if !self.reasoning_started {
+                    self.reasoning_started = true;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: 0,
+                        content_block: OutputContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: None,
+                        },
+                    }));
+                }
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::ThinkingDelta { thinking: reasoning },
+                }));
+            }
+
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+                // Close the reasoning block if it was started before the visible content.
+                if self.reasoning_started && !self.reasoning_finished {
+                    self.reasoning_finished = true;
+                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: 0,
+                    }));
+                }
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: 0,
+                        index: self.reasoning_started as u32,
                         content_block: OutputContentBlock::Text {
                             text: String::new(),
                         },
                     }));
                 }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
+                    index: self.reasoning_started as u32,
                     delta: ContentBlockDelta::TextDelta { text: content },
                 }));
             }
@@ -553,10 +585,17 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+        // Close reasoning block if started but not yet finished.
+        if self.reasoning_started && !self.reasoning_finished {
+            self.reasoning_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: 0,
+            }));
+        }
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: 0,
+                index: self.reasoning_started as u32,
             }));
         }
 
@@ -687,6 +726,10 @@ struct ChatMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
+    /// DeepSeek thinking-mode reasoning content.
+    /// Must be passed back verbatim in subsequent requests.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -733,6 +776,9 @@ struct ChunkDelta {
     content: Option<String>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+    /// DeepSeek thinking-mode reasoning content (streaming).
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -889,6 +935,7 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
         "assistant" => {
             let mut text = String::new();
             let mut tool_calls = Vec::new();
+            let mut reasoning = String::new();
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
@@ -901,15 +948,24 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                         }
                     })),
                     InputContentBlock::ToolResult { .. } => {}
+                    InputContentBlock::Thinking { thinking: value, .. } => {
+                        reasoning.push_str(value);
+                    }
+                    InputContentBlock::RedactedThinking { .. } => {}
                 }
             }
-            if text.is_empty() && tool_calls.is_empty() {
+            if text.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
                 Vec::new()
             } else {
                 let mut msg = serde_json::json!({
                     "role": "assistant",
                     "content": (!text.is_empty()).then_some(text),
                 });
+                // DeepSeek requires reasoning_content to be passed back in
+                // subsequent requests when thinking mode is enabled.
+                if !reasoning.is_empty() {
+                    msg["reasoning_content"] = json!(reasoning);
+                }
                 // Only include tool_calls when non-empty: some providers reject
                 // assistant messages with an explicit empty tool_calls array.
                 if !tool_calls.is_empty() {
@@ -937,6 +993,8 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                     "is_error": is_error,
                 })),
                 InputContentBlock::ToolUse { .. } => None,
+                InputContentBlock::Thinking { .. } => None,
+                InputContentBlock::RedactedThinking { .. } => None,
             })
             .collect(),
     }
@@ -1091,6 +1149,14 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
+    // DeepSeek thinking mode: reasoning_content must be preserved and
+    // passed back in subsequent requests. Convert to Thinking block.
+    if let Some(reasoning) = choice.message.reasoning_content.filter(|value| !value.is_empty()) {
+        content.push(OutputContentBlock::Thinking {
+            thinking: reasoning,
+            signature: None,
+        });
+    }
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Text { text });
     }

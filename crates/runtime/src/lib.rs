@@ -202,6 +202,12 @@ pub use worker_boot::{
     WorkerRegistry, WorkerStatus, WorkerTrustResolution,
 };
 
+pub mod cached_prompt;
+pub mod memory_provider;
+
+pub use cached_prompt::CachedSystemPrompt;
+pub use memory_provider::{MemoryProvider, BuiltinMemoryProvider, MemoryProviderManager};
+
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();

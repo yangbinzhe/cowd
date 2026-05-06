@@ -41,20 +41,13 @@ const IN_MEMORY_PATH: &str = ":memory:";
 
 fn open_conn(db_path: &str) -> Result<Connection> {
     let conn = if db_path == IN_MEMORY_PATH {
-        Connection::open_in_memory()
+        let tmp = std::env::temp_dir().join(format!("cowd_memory_{}.db", Uuid::new_v4()));
+        Connection::open(&tmp).map_err(sql_err)?
     } else {
-        Connection::open(db_path)
-    }
-    .map_err(sql_err)?;
-    // Enable WAL journal mode.
-    // PRAGMA journal_mode=WAL returns a result row ("wal"), so we must use
-    // query_row instead of execute_batch to avoid the "Execute returned
-    // results - did you mean to call query?" error from rusqlite.
-    conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
-        .map_err(sql_err)?;
-    // Enable foreign-key constraints (no result returned).
-    conn.execute_batch("PRAGMA foreign_keys=ON;")
-        .map_err(sql_err)?;
+        Connection::open(db_path).map_err(sql_err)?
+    };
+    conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())).map_err(sql_err)?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(sql_err)?;
     Ok(conn)
 }
 

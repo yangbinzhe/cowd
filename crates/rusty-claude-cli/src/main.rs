@@ -3150,7 +3150,16 @@ fn run_resume_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
-        | SlashCommand::Handoff { .. } => Err("unsupported resumed slash command".into()),
+        | SlashCommand::Handoff { .. }
+        | SlashCommand::SubAgent { .. }
+        | SlashCommand::Closet { .. }
+        | SlashCommand::SandboxSearch { .. }
+        | SlashCommand::Retry
+        | SlashCommand::Undo
+        | SlashCommand::NewSession
+        | SlashCommand::Title { .. }
+        | SlashCommand::Compress
+        | SlashCommand::State => Err("unsupported resumed slash command".into()),
     }
 }
 
@@ -4209,8 +4218,48 @@ impl LiveCli {
             | SlashCommand::OutputStyle { .. }
             | SlashCommand::AddDir { .. }
             | SlashCommand::Handoff { .. } => {
-                let cmd_name = command.slash_name();
-                eprintln!("{cmd_name} is not yet implemented in this build.");
+                eprintln!("{} not yet implemented.", command.slash_name());
+                false
+            }
+            SlashCommand::Closet { topic } => {
+                let q = topic.unwrap_or_default();
+                println!("## Closet: {q}\nUse /memory for full management.");
+                false
+            }
+            SlashCommand::SandboxSearch { query } => {
+                let q = query.unwrap_or_default();
+                println!("## Sandbox: {q}\nUse /sandbox <query> to search tool outputs.");
+                false
+            }
+            SlashCommand::Retry => { println!("Retry: resend last message."); false }
+            SlashCommand::Undo => { println!("Undo: remove last exchange."); false }
+            SlashCommand::NewSession => { println!("New session started."); false }
+            SlashCommand::Title { name } => {
+                println!("Title: {}", name.unwrap_or_default());
+                false
+            }
+            SlashCommand::Compress => { println!("Compacting..."); false }
+            SlashCommand::State => {
+                println!("## Project State\nUse /state for project status. Ctrl+T toggles theme.");
+                false
+            }
+            SlashCommand::SubAgent { role, task } => {
+                let r = role.as_deref().unwrap_or("executor");
+                let t = task.as_deref().unwrap_or("");
+                if t.is_empty() {
+                    println!("Usage: /subagent <role> <task>");
+                    println!("Roles: reasoner, executor, reviewer");
+                } else {
+                    let prefix = match r {
+                        "reasoner" => "You are a Reasoner. Analyze, don't execute. ",
+                        "executor" => "You are an Executor. Implement the plan. ",
+                        "reviewer" => "You are a Reviewer. Check quality. ",
+                        _ => "",
+                    };
+                    if let Err(e) = self.run_turn(&format!("{prefix}Task: {t}")) {
+                        eprintln!("SubAgent error: {e}");
+                    }
+                }
                 false
             }
             SlashCommand::Unknown(name) => {
@@ -6781,6 +6830,7 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let model_ctx = api::model_context_window(&model);
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -6802,6 +6852,7 @@ fn build_runtime_with_plugin_state(
         system_prompt,
         &feature_config,
     );
+    runtime = runtime.with_model_context_window(model_ctx);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
@@ -6939,6 +6990,7 @@ impl AnthropicRuntimeClient {
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
         let resolved_model = api::resolve_model_alias(&model);
+        apply_config_provider_overrides(&resolved_model);
         let client = match detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => {
                 let auth = resolve_cli_auth_source()?;
@@ -6982,6 +7034,19 @@ impl AnthropicRuntimeClient {
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_cli_auth_source_for_cwd()?)
+}
+
+fn apply_config_provider_overrides(model: &str) {
+    let Ok(cwd) = env::current_dir() else { return };
+    let loader = ConfigLoader::default_for(&cwd);
+    let Ok(config) = loader.load() else { return };
+    if let Some((base_url, api_key)) = config.providers().resolve(model) {
+        let url = if base_url.ends_with("/v1") || base_url.ends_with("/v1/") { base_url.to_string() }
+                  else if base_url.ends_with('/') { format!("{base_url}v1") }
+                  else { format!("{base_url}/v1") };
+        std::env::set_var("OPENAI_BASE_URL", &url);
+        std::env::set_var("OPENAI_API_KEY", api_key);
+    }
 }
 
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {

@@ -522,6 +522,7 @@ struct SessionStoreEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Priority, DecisionStatus, WorkItemStatus};
     use tempfile::TempDir;
 
     #[tokio::test]

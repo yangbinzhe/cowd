@@ -49,6 +49,7 @@ pub mod temporal_graph;
 pub mod write_guard;
 pub mod closet;
 pub mod miner;
+pub mod tool_sandbox;
 
 // --- Convenience re-exports ---
 
@@ -127,6 +128,8 @@ pub use write_guard::{
     MemoryWriteGuard, WriteSource, WritePolicy, AuditLog, AuditEntry,
     AuditOperation, IntegrityChecker, Anomaly, AnomalyReport,
 };
+pub use tool_sandbox::{ToolOutputSandbox, ToolOutputSummary};
+pub use closet::{Closet, ClosetPointer, ClosetEntry, ClosetManager, RANK_BOOSTS, CHAR_LIMIT};
 pub use compression::token_estimation::{
     TokenEstimator, HeuristicEstimator, SimpleTokenEstimator,
     estimate_tokens_text, estimate_tokens_messages,

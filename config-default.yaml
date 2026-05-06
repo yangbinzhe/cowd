@@ -1,0 +1,125 @@
+# Cowd 默认配置文件
+# 安装后自动复制到 ~/.cowd/config.yaml
+# 本文件包含所有可配置项及说明
+
+# =============================================================================
+# 基础配置
+# =============================================================================
+
+# 默认模型（可通过 --model 覆盖）
+model: "claude-sonnet-4-6"
+
+# 模型别名（快捷切换: cowd --model fast）
+aliases:
+  main: "claude-sonnet-4-6"
+  fast: "claude-haiku-4-5-20251213"
+
+# Provider 配置（多Provider自动路由）
+# cowd 根据 model 名自动匹配 Provider 的 base_url 和 api_key
+providers:
+  # deepseek:
+  #   base_url: "https://api.deepseek.com"
+  #   api_key: "sk-..."
+  #   models: ["deepseek-v4-pro", "deepseek-v4-flash"]
+  # bailian:
+  #   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  #   api_key: "sk-..."
+  #   models: ["qwen3-max", "qwen3-coder-next"]
+
+# =============================================================================
+# 上下文压缩
+# =============================================================================
+
+# 自动压缩配置
+# COWD_AUTO_COMPACT_INPUT_TOKENS: 绝对token阈值（设置此项后百分比失效）
+# COWD_COMPACT_THRESHOLD_PERCENT: 百分比阈值（默认80%，即context window的80%时触发）
+# 压缩发生在每次模型调用前（预检），防止工具输出撑爆上下文
+# compression:
+#   threshold_percent: 80
+#   buffer_tokens: 8000
+
+# =============================================================================
+# System Prompt 缓存
+# =============================================================================
+
+# 感知配置文件和身份文件变更，自动重建缓存
+# 大幅降低 API 输入成本（Anthropic prompt caching 兼容）
+# prompt_cache:
+#   check_interval: 5       # 每N轮检查文件变更（默认5）
+#   max_age: 50             # 最大缓存轮数（默认50）
+#   memory_delta: 3         # 记忆增量阈值（新增N条High记忆后重建）
+
+# =============================================================================
+# 记忆系统
+# =============================================================================
+
+# 3层记忆架构（L0 Identity + L1 Essential + L3 Deep Recall）
+# 记忆自动提取，后台异步，零token消耗
+memory:
+  enabled: true
+  # 提取批处理大小（积累N轮后批量写入，默认3）
+  # extract_batch_size: 3
+  # L1最大token数（默认800）
+  # l1_max_tokens: 800
+  # L1最大条目数（默认15）
+  # l1_max_entries: 15
+
+# =============================================================================
+# 输出风格
+# =============================================================================
+
+# output_style: "terse"  # terse(极简) | standard(标准) | 不设置(默认)
+
+# =============================================================================
+# 沙箱执行
+# =============================================================================
+
+# execute_code 工具配置
+# sandbox:
+#   timeout_secs: 30       # 执行超时（默认30秒）
+#   max_output_kib: 100    # 输出上限（默认100KB）
+#   max_entries: 50        # FTS5沙箱条目上限
+
+# =============================================================================
+# 权限
+# =============================================================================
+
+permissions:
+  defaultMode: "acceptEdits"   # plan(只读) | acceptEdits(可写工作区) | dontAsk(危险全访问)
+  allow: []
+  deny: []
+  ask: []
+
+# =============================================================================
+# 网关
+# =============================================================================
+
+gateway:
+  enabled: true
+  platforms:
+    # Web API Server
+    - type: api_server
+      enabled: true
+      host: "127.0.0.1"
+      port: 8642
+      auth:
+        enabled: false
+        token: ""
+    # 飞书机器人
+    # - type: feishu
+    #   enabled: false
+    #   app_id: ""
+    #   app_secret: ""
+    # 企业微信
+    # - type: wechat
+    #   enabled: false
+    #   corpid: ""
+    #   corpsecret: ""
+    #   agentid: ""
+    # 邮箱
+    # - type: email
+    #   enabled: false
+    #   smtp_host: "smtp.gmail.com"
+    #   smtp_port: 587
+    #   username: ""
+    #   password: ""

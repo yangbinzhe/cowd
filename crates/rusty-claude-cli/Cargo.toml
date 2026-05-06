@@ -13,6 +13,7 @@ path = "src/main.rs"
 api = { path = "../api" }
 axum = { version = "0.7", features = ["ws", "multipart"] }
 memory = { path = "../memory" }
+memory-light = { path = "../memory-light" }
 chrono = { version = "0.4", features = ["serde"] }
 commands = { path = "../commands" }
 compat-harness = { path = "../compat-harness" }
@@ -20,6 +21,8 @@ crossterm = "0.28"
 futures = "0.3"
 pulldown-cmark = "0.13"
 rustyline = "15"
+ratatui = "0.29"
+tui-textarea = "0.7"
 runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +35,7 @@ tokio-stream = "0.1"
 tools = { path = "../tools" }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 tracing = "0.1"
+unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
 [lints]

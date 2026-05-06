@@ -1,0 +1,17 @@
+[
+  {
+    "content": "修改 conversation.rs 的转换逻辑，明确排除工具块",
+    "activeForm": "修改 conversation.rs 的转换逻辑",
+    "status": "in_progress"
+  },
+  {
+    "content": "修改 extractor.rs 的 should_extract 方法，检测并跳过含工具的轮次",
+    "activeForm": "修改 extractor.rs 的 should_extract 方法",
+    "status": "pending"
+  },
+  {
+    "content": "运行测试验证修复",
+    "activeForm": "运行测试验证修复",
+    "status": "pending"
+  }
+]

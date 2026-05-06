@@ -136,8 +136,134 @@ impl Closet {
 #[derive(Debug, Clone)]
 pub struct ClosetEntry {
     pub id: String,
+    /// Human-readable title (used for display).
+    pub title: String,
+    /// Full text content (used for keyword extraction).
     pub content: String,
+    /// Named entities associated with this entry.
     pub entities: Vec<String>,
+}
+
+// ─── ClosetManager ───────────────────────────────────────────────────────────
+
+use crate::orchestrator::MemoryOrchestrator;
+use crate::types::MemoryLayer;
+
+/// High-level manager that builds a [`Closet`] from the memory orchestrator
+/// and provides topic-oriented query methods.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let manager = ClosetManager::build_from_orchestrator(&orchestrator).await?;
+/// for topic in manager.list_topics() {
+///     println!("{} ({} drawers)", topic.topic, topic.drawer_ids.len());
+/// }
+/// ```
+pub struct ClosetManager {
+    closet: Closet,
+}
+
+impl ClosetManager {
+    /// Build a [`Closet`] index from L2 (project) and L3 (deep) memory layers.
+    ///
+    /// Extracts memory metadata, converts to [`ClosetEntry`] items, and runs
+    /// [`Closet::build`] to create the pointer-row index.
+    pub async fn build_from_orchestrator(
+        orchestrator: &MemoryOrchestrator,
+    ) -> Result<Self, crate::error::MemoryError> {
+        // Collect entries from L2 and L3 layers.
+        let l2_metas = orchestrator.list_layer(MemoryLayer::L2).await?;
+        let l3_metas = orchestrator.list_layer(MemoryLayer::L3).await?;
+
+        let entries: Vec<ClosetEntry> = l2_metas
+            .into_iter()
+            .chain(l3_metas)
+            .map(|meta| ClosetEntry {
+                id: meta.id.to_string(),
+                title: meta.title.clone(),
+                content: format!(
+                    "{} (category: {:?}, priority: {:?})",
+                    meta.title, meta.category, meta.priority
+                ),
+                entities: meta.tags,
+            })
+            .collect();
+
+        Ok(Self {
+            closet: Closet::build(&entries),
+        })
+    }
+
+    /// Create a [`ClosetManager`] from an already-built [`Closet`].
+    #[must_use]
+    pub fn from_closet(closet: Closet) -> Self {
+        Self { closet }
+    }
+
+    /// List all topic pointers ordered by relevance score (descending).
+    #[must_use]
+    pub fn list_topics(&self) -> Vec<&ClosetPointer> {
+        self.closet.pointers.iter().collect()
+    }
+
+    /// Get pointers whose topic or entities match `query` (case-insensitive
+    /// substring). Results are sorted by relevance score.
+    #[must_use]
+    pub fn search_topics(&self, query: &str) -> Vec<&ClosetPointer> {
+        let q = query.to_lowercase();
+        let mut matched: Vec<&ClosetPointer> = self
+            .closet
+            .pointers
+            .iter()
+            .filter(|p| {
+                p.topic.to_lowercase().contains(&q)
+                    || p.entities.iter().any(|e| e.to_lowercase().contains(&q))
+            })
+            .collect();
+        matched.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        matched
+    }
+
+    /// Get all pointers for a specific topic (case-insensitive substring match).
+    #[must_use]
+    pub fn get_pointers_for_topic(&self, topic: &str) -> Vec<&ClosetPointer> {
+        let t = topic.to_lowercase();
+        let mut matched: Vec<&ClosetPointer> = self
+            .closet
+            .pointers
+            .iter()
+            .filter(|p| p.topic.to_lowercase().contains(&t))
+            .collect();
+        matched.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        matched
+    }
+
+    /// Return the total number of pointer rows in the closet.
+    #[must_use]
+    pub fn topic_count(&self) -> usize {
+        self.closet.pointers.len()
+    }
+
+    /// Return `true` if the closet contains no pointers.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.closet.is_empty()
+    }
+
+    /// Get a reference to the inner [`Closet`].
+    #[must_use]
+    pub fn closet(&self) -> &Closet {
+        &self.closet
+    }
 }
 
 /// Extract keyword tokens from content for closet indexing.
@@ -187,11 +313,13 @@ mod tests {
         let entries = vec![
             ClosetEntry {
                 id: "e1".to_string(),
+                title: "React Frontend".to_string(),
                 content: "Using React framework for the frontend project".to_string(),
                 entities: vec!["React".to_string()],
             },
             ClosetEntry {
                 id: "e2".to_string(),
+                title: "Rust Backend".to_string(),
                 content: "Rust backend with Axum web framework".to_string(),
                 entities: vec!["Rust".to_string(), "Axum".to_string()],
             },
@@ -210,11 +338,13 @@ mod tests {
         let entries = vec![
             ClosetEntry {
                 id: "e1".to_string(),
+                title: "React Components".to_string(),
                 content: "React frontend components".to_string(),
                 entities: vec!["React".to_string()],
             },
             ClosetEntry {
                 id: "e2".to_string(),
+                title: "React State".to_string(),
                 content: "React state management patterns".to_string(),
                 entities: vec!["React".to_string()],
             },

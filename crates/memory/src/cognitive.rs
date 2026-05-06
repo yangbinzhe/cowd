@@ -154,7 +154,11 @@ impl CognitiveContextManager {
             vector_index,
             monitor,
             handoff_mgr: HandoffManager::new(),
-            seeds: Mutex::new(SeedRegistry::new()),
+            seeds: {
+                let mut registry = SeedRegistry::new();
+                let _ = registry.bootstrap_system_seeds();
+                Mutex::new(registry)
+            },
             decisions: Mutex::new(DecisionThreadStore::new()),
             write_guard: None,
             audit_log: None,

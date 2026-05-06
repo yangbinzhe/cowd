@@ -320,6 +320,11 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     }
 }
 
+#[must_use]
+pub fn model_context_window(model: &str) -> u32 {
+    model_token_limit(model).map_or(200_000, |l| l.context_window_tokens)
+}
+
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
     let Some(limit) = model_token_limit(&request.model) else {
         return Ok(());

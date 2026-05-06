@@ -574,7 +574,7 @@ mod tests {
         let mut session = Session::new();
         session.messages = vec![ConversationMessage::user_text("hello")];
 
-        let result = compact_session(&session, CompactionConfig::default());
+        let result = compact_session(&session, CompactionConfig::default(), 0);
         assert_eq!(result.removed_message_count, 0);
         assert_eq!(result.compacted_session, session);
         assert!(result.summary.is_empty());
@@ -660,7 +660,7 @@ mod tests {
             max_estimated_tokens: 1,
         };
 
-        let first = compact_session(&initial_session, config);
+        let first = compact_session(&initial_session, config, 0);
         let mut follow_up_messages = first.compacted_session.messages.clone();
         follow_up_messages.extend([
             ConversationMessage::user_text("Please add regression tests for compaction."),
@@ -671,7 +671,7 @@ mod tests {
 
         let mut second_session = Session::new();
         second_session.messages = follow_up_messages;
-        let second = compact_session(&second_session, config);
+        let second = compact_session(&second_session, config, 0);
 
         assert!(second
             .formatted_summary
@@ -789,7 +789,7 @@ mod tests {
             preserve_recent_messages: 1,
             ..CompactionConfig::default()
         };
-        let result = compact_session(&session, config);
+        let result = compact_session(&session, config, 0);
         // After compaction, no two consecutive messages should have the pattern
         // tool_result immediately following a non-assistant message (i.e. an
         // orphaned tool result without a preceding assistant ToolUse).

@@ -563,7 +563,6 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/api/sessions/:id/messages", get(get_session_messages_handler))
         .route("/api/sessions/:id/messages", post(send_message_handler))
         .route("/api/sessions/:id/messages/stream", post(send_message_stream_handler))
-        .route("/api/sessions/:id/messages/:index", delete(splice_messages_handler))
         // WebUI Config API
         .route("/api/config", get(get_config_handler))
         .route("/api/config", put(update_config_handler))
@@ -1194,7 +1193,8 @@ impl RuntimeApiClient for OpenAiApiClient {
                             _ => {}
                         }
                     }
-                    StreamEvent::MessageStart(_) | StreamEvent::MessageStop(_) => {
+                    StreamEvent::MessageStart(_) => {} // skip, wait for content
+                    StreamEvent::MessageStop(_) => {
                         events.push(AssistantEvent::MessageStop);
                         break;
                     }
@@ -1280,7 +1280,6 @@ impl ToolCallback for SseToolCallback {
 /// 
 /// This handler now uses ConversationRuntime for unified conversation management.
 async fn chat_handler(
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     AxumState(state): AxumState<HttpAppState>,
     axum::extract::Json(req_json): axum::extract::Json<ChatRequest>,
 ) -> Response {
@@ -1290,7 +1289,7 @@ async fn chat_handler(
         .last()
         .map(|m| m.content.clone())
         .unwrap_or_default();
-    let session_id = format!("api-{}", addr);
+    let session_id = format!("api-{}", uuid::Uuid::new_v4());
 
     // Build system prompt with memory context
     let memory_context = if let Some(ref mgr) = state.cognitive_manager {
@@ -1332,6 +1331,9 @@ async fn chat_handler(
 
     // Create a Session from the conversation history
     let session = create_session_from_messages(&req_json.messages, &session_id);
+
+    // Resolve provider config for the requested model (DeepSeek etc.)
+    crate::apply_config_provider_overrides(&model);
 
     // Create the API client
     let api_client = match OpenAiApiClient::new(model.clone()) {
@@ -2722,9 +2724,9 @@ struct WsOutbound {
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     AxumState(state): AxumState<HttpAppState>,
 ) -> axum::response::Response {
+    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0);
     ws.on_upgrade(move |socket| handle_ws(socket, addr, state))
 }
 
@@ -2732,9 +2734,9 @@ async fn ws_handler(
 /// GET /ws/sessions - Subscribe to session events (created, updated, deleted, messages added)
 async fn ws_sessions_handler(
     ws: WebSocketUpgrade,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     AxumState(state): AxumState<HttpAppState>,
 ) -> axum::response::Response {
+    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0);
     ws.on_upgrade(move |socket| handle_ws_sessions(socket, addr, state))
 }
 
