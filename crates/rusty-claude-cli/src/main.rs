@@ -3152,6 +3152,7 @@ fn run_resume_command(
         | SlashCommand::AddDir { .. }
         | SlashCommand::Handoff { .. }
         | SlashCommand::SubAgent { .. }
+        | SlashCommand::Pipeline { .. }
         | SlashCommand::Closet { .. }
         | SlashCommand::SandboxSearch { .. }
         | SlashCommand::Retry
@@ -4240,7 +4241,12 @@ impl LiveCli {
             }
             SlashCommand::Compress => { println!("Compacting..."); false }
             SlashCommand::State => {
-                println!("## Project State\nUse /state for project status. Ctrl+T toggles theme.");
+                println!("## Project State\nCtrl+T toggles theme. /state for status.");
+                false
+            }
+            SlashCommand::Pipeline { task } => {
+                let t = task.unwrap_or_default();
+                println!("## Pipeline: {t}\nReasoner→Executor→Reviewer");
                 false
             }
             SlashCommand::SubAgent { role, task } => {

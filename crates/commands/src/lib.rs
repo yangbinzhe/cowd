@@ -1233,6 +1233,9 @@ pub enum SlashCommand {
         role: Option<String>,
         task: Option<String>,
     },
+    Pipeline {
+        task: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -1344,6 +1347,7 @@ impl SlashCommand {
             Self::Compress => "/compress",
             Self::State => "/state",
             Self::SubAgent { .. } => "/subagent",
+            Self::Pipeline { .. } => "/pipeline",
             #[allow(unreachable_patterns)]
             _ => "/unknown",
         }
@@ -1577,6 +1581,9 @@ pub fn validate_slash_command_input(
         "title" => SlashCommand::Title { name: args.first().map(|s| s.to_string()) },
         "compress" => SlashCommand::Compress,
         "state" => SlashCommand::State,
+        "pipeline" => {
+            SlashCommand::Pipeline { task: args.first().map(|s| s.to_string()) }
+        }
         other => SlashCommand::Unknown(other.to_string()),
     }))
 }
@@ -4833,6 +4840,7 @@ pub fn handle_slash_command(
         | SlashCommand::Compress
         | SlashCommand::State
         | SlashCommand::SubAgent { .. }
+        | SlashCommand::Pipeline { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }
