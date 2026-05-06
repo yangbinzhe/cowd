@@ -123,3 +123,15 @@ fn new_entry(layer: MemoryLayer, cat: MemoryCategory, prio: Priority, title: &st
         created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), access_count: 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test] fn test_decision() { assert!(detect_decision("I'll use tokio").is_some()); }
+    #[test] fn test_no_decision() { assert!(detect_decision("hello").is_none()); }
+    #[test] fn test_pref_cn() { assert!(detect_preference("建议使用PG").is_some()); }
+    #[test] fn test_pref_en() { assert!(detect_preference("always use async").is_some()); }
+    #[test] fn test_conv() { assert!(detect_convention("cargo build").is_some()); }
+    #[test] fn test_conv_docker() { assert!(detect_convention("docker compose up").is_some()); }
+    #[test] fn test_no_conv() { assert!(detect_convention("hello world").is_none()); }
+}
