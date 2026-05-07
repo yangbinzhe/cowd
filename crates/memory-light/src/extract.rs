@@ -134,4 +134,7 @@ mod tests {
     #[test] fn test_conv() { assert!(detect_convention("cargo build").is_some()); }
     #[test] fn test_conv_docker() { assert!(detect_convention("docker compose up").is_some()); }
     #[test] fn test_no_conv() { assert!(detect_convention("hello world").is_none()); }
+    #[test] fn test_pref_multi_cn() { assert!(detect_preference("最好用Rust").is_some()); assert!(detect_preference("千万别用sudo").is_some()); }
+    #[test] fn test_conv_new() { assert!(detect_convention("kubectl apply").is_some()); assert!(detect_convention("terraform plan").is_some()); }
+    #[test] fn test_batch_empty() { let store = std::sync::Arc::new(crate::MemoryStore::open("/tmp/test_batch.db").unwrap()); process_batch(&store, &[]); let _ = std::fs::remove_file("/tmp/test_batch.db"); }
 }

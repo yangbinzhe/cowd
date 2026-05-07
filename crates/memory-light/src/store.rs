@@ -83,3 +83,28 @@ impl MemoryStore {
         Ok(self.conn.lock().unwrap().execute("DELETE FROM memories WHERE id=?1", params![id])? > 0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn temp_store() -> MemoryStore {
+        let path = format!("/tmp/cowd_test_{}.db", uuid::Uuid::new_v4());
+        MemoryStore::open(&path).unwrap()
+    }
+    #[test] fn test_store_open() {
+        let _store = temp_store();
+    }
+    #[test] fn test_empty_search() {
+        let store = temp_store();
+        let results = store.search_fts("nonexistent", 5).unwrap();
+        assert!(results.is_empty());
+    }
+    #[test] fn test_delete() {
+        let store = temp_store();
+        let id = "test_delete_id".to_string();
+        let entry = MemoryEntry { id: id.clone(), layer: MemoryLayer::L1, category: MemoryCategory::Reference, priority: Priority::Normal, title: "x".into(), content: "y".into(), tags: vec![], created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(), access_count: 0 };
+        store.insert(&entry).unwrap();
+        assert!(store.delete_entry(&id).unwrap());
+        assert!(!store.delete_entry(&id).unwrap());
+    }
+}
