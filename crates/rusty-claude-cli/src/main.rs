@@ -4252,7 +4252,14 @@ impl LiveCli {
             }
             SlashCommand::Pipeline { task } => {
                 let t = task.unwrap_or_default();
-                println!("## Pipeline: {t}\nReasoner→Executor→Reviewer");
+                if !t.is_empty() {
+                    println!("## Pipeline: Reasoner→Executor→Reviewer");
+                    let _ = self.run_turn(&format!("[Reasoner] Analyze this task and propose approach: {t}"));
+                    let _ = self.run_turn("[Executor] Implement the proposed approach. Write code and commit.");
+                    let _ = self.run_turn("[Reviewer] Review the implementation. Check correctness and completeness.");
+                } else {
+                    println!("Usage: /pipeline <task description>");
+                }
                 false
             }
             SlashCommand::SubAgent { role, task } => {

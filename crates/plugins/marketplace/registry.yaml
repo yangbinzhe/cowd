@@ -1,0 +1,33 @@
+# Cowd Plugin Marketplace
+
+name: cowd-plugin-marketplace
+version: 1.0.0
+description: Official plugin registry for Cowd AI coding agent
+
+plugins:
+  memory-honcho:
+    name: Honcho Memory Provider
+    version: 0.1.0
+    description: External memory backend using Honcho
+    type: memory-provider
+    repository: https://github.com/cowd-plugins/memory-honcho
+
+  context-engine:
+    name: Context Engine
+    version: 0.1.0
+    description: Advanced context analysis and compression
+    type: context-engine
+
+  feishu-enhance:
+    name: Feishu Enhanced
+    version: 0.1.0
+    description: Enhanced Feishu bot with rich cards
+    type: gateway-platform
+
+hooks:
+  pre_tool_call: []
+  post_tool_call: []
+  on_session_start: []
+  on_session_end: []
+  pre_compact: []
+  post_compact: []

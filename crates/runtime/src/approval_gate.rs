@@ -5,7 +5,7 @@
 //! approval configuration (YOLO mode, auto-pass settings) and managing
 //! the blocking approval flow with the frontend via SSE + oneshot channels.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -163,6 +163,7 @@ pub struct SmartApprovalGate {
     sse_sender: Option<Arc<dyn ApprovalSseSender>>,
     /// Persistent approval history store.
     history: Arc<ApprovalHistoryStore>,
+    session_approved: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 /// Tools that are inherently read-only and never need approval.
@@ -188,6 +189,7 @@ impl SmartApprovalGate {
             pending: Arc::new(RwLock::new(HashMap::new())),
             sse_sender: None,
             history: Arc::new(ApprovalHistoryStore::new(history_path)),
+            session_approved: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -242,6 +244,11 @@ impl SmartApprovalGate {
     /// For read-only tools, it auto-passes.
     /// For other tools, it auto-passes (they have their own permission checks).
     pub async fn evaluate(&self, tool_name: &str, input: &str) -> ApprovalGateResult {
+        // Step 0: Same-session auto-approve
+        let key = format!("{tool_name}:{}", &input[..input.len().min(80)]);
+        if self.session_approved.lock().await.contains(&key) {
+            return ApprovalGateResult::AutoPass { reason: AutoPassReason::ReadOnlyCommand };
+        }
         // Step 1: Read-only tools always auto-pass
         if READ_ONLY_TOOLS.contains(&tool_name) {
             return ApprovalGateResult::AutoPass {
