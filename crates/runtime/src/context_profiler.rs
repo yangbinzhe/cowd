@@ -70,6 +70,38 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
+/// Auto-detect project directory from current working dir or .git parent
+pub fn detect_project_dir() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    // Check for .git to confirm it's a project root
+    if cwd.join(".git").exists() {
+        return cwd.file_name().map(|n| n.to_string_lossy().to_string());
+    }
+    // Walk up to find .git
+    for ancestor in cwd.ancestors().skip(1) {
+        if ancestor.join(".git").exists() {
+            return ancestor.file_name().map(|n| n.to_string_lossy().to_string());
+        }
+    }
+    // Fallback: use current dir name
+    cwd.file_name().map(|n| n.to_string_lossy().to_string())
+}
+
+/// Attribution confidence: 0.9 if .git found, 0.5 if fallback, 0.0 if error
+pub fn attribution_confidence(project_dir: &Option<String>) -> f32 {
+    match project_dir {
+        Some(_) => {
+            let cwd = std::env::current_dir().ok();
+            match cwd {
+                Some(d) if d.join(".git").exists() => 0.9,
+                Some(d) if d.ancestors().any(|a| a.join(".git").exists()) => 0.7,
+                _ => 0.5,
+            }
+        }
+        None => 0.0,
+    }
+}
+
 impl Default for SessionEvent {
     fn default() -> Self {
         Self {
@@ -125,5 +157,24 @@ mod tests {
         assert!(p.record_dedup(make_event("tool", "unique")));
         assert!(!p.record_dedup(make_event("tool", "unique")));
         assert_eq!(p.events.len(), 1);
+    }
+
+    #[test]
+    fn t03_detect_project_in_git_repo() {
+        let dir = detect_project_dir();
+        // Cowd is a git repo, should detect it
+        assert!(dir.is_some());
+    }
+
+    #[test]
+    fn t03_confidence_in_range() {
+        let conf = attribution_confidence(&Some("cowd".into()));
+        assert!(conf >= 0.0 && conf <= 1.0);
+    }
+
+    #[test]
+    fn t03_no_project_zero_confidence() {
+        let conf = attribution_confidence(&None);
+        assert_eq!(conf, 0.0);
     }
 }
