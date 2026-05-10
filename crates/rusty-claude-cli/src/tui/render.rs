@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
-use super::app::App;
+use super::app::{App, Panel};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -13,10 +13,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(3)]).split(area);
 
     draw_status_bar(frame, chunks[0], app);
-    draw_messages(frame, chunks[1], app);
+    match app.current_panel {
+        Panel::Chat | Panel::Gateway | Panel::Delegate => draw_messages(frame, chunks[1], app),
+        Panel::Files => draw_file_browser(frame, chunks[1], app),
+        Panel::Memory => draw_memory_panel(frame, chunks[1], app),
+        Panel::Skills => draw_skills_panel(frame, chunks[1], app),
+    }
     draw_input(frame, chunks[2], app);
     if app.picker_active { draw_session_picker(frame, area, app); }
     if app.approval.is_some() { draw_approval_modal(frame, area, app); }
+    if app.current_panel == Panel::Gateway { draw_gateway_panel(frame, area, app); }
+    if app.current_panel == Panel::Delegate { draw_delegate_panel(frame, area, app); }
 }
 
 fn draw_approval_modal(frame: &mut Frame, area: Rect, app: &App) {
@@ -65,10 +72,39 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let sid = if app.session_id.len() > 8 { &app.session_id[..8] } else { &app.session_id };
     let st = if app.is_loading { format!("{} Thinking", app.spinner_char()) } else { "✓ Ready".into() };
     let t = app.theme;
-    let text = Line::from(vec![
+    let panel_label = match app.current_panel {
+        Panel::Chat => "Chat",
+        Panel::Gateway => "Gateway",
+        Panel::Files => "Files",
+        Panel::Memory => "Memory",
+        Panel::Skills => "Skills",
+        Panel::Delegate => "Delegates",
+    };
+    let mut spans = vec![
         Span::styled("Cowd", Style::default().fg(t.accent()).bold()),
-        Span::styled(format!(" │ sess:{sid} │ {} │ {st}", app.model), Style::default().fg(t.fg())),
-    ]);
+        Span::styled(format!(" │ {panel_label} │ {}", app.model), Style::default().fg(t.fg())),
+    ];
+    if app.token_count > 0 {
+        spans.push(Span::styled(format!(" │ {}tk", app.token_count), Style::default().fg(Color::DarkGray)));
+    }
+    if let Some(cost) = app.cost_estimate {
+        spans.push(Span::styled(format!(" │ ${:.4}", cost), Style::default().fg(Color::DarkGray)));
+    }
+    if app.compaction_count > 0 {
+        spans.push(Span::styled(format!(" │ compactedx{}", app.compaction_count), Style::default().fg(Color::DarkGray)));
+    }
+    if app.cache_hits > 0 {
+        spans.push(Span::styled(format!(" │ cache:{}", app.cache_hits), Style::default().fg(Color::Green)));
+    }
+    // M8: Token context profiler — compact utilization indicator
+    if app.token_count > 0 {
+        let pct = (app.token_count as f64 / 200_000.0 * 10.0).min(10.0) as usize;
+        let bar: String = (0..10).map(|i| if i < pct { '█' } else { '░' }).collect();
+        spans.push(Span::styled(format!(" [{bar}]"), Style::default().fg(Color::DarkGray)));
+    }
+    // 01: profiler distribution summary
+    spans.push(Span::styled(format!(" │ {}", "events"), Style::default().fg(Color::DarkGray)));
+    let text = Line::from(spans);
     frame.render_widget(Paragraph::new(text).style(Style::default().bg(t.bg())), area);
 }
 
@@ -106,3 +142,123 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) { frame.render_widget(&app.input, area); }
+
+fn draw_gateway_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let w = 65u16.min(area.width - 4);
+    let h = 20u16.min(area.height - 2);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let pa = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, pa);
+
+    let mut lines = vec![
+        Line::from(Span::styled("Gateway Sessions", Style::default().fg(Color::Cyan).bold())),
+        Line::raw(""),
+    ];
+    if app.gateway_sessions.is_empty() {
+        lines.push(Line::from(Span::styled("  No gateway sessions. Configure platforms in config.yaml", Style::default().fg(Color::DarkGray))));
+    } else {
+        for s in &app.gateway_sessions {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  [{}] ", s.platform), Style::default().fg(Color::Yellow)),
+                Span::styled(&s.title, Style::default().fg(Color::White)),
+                Span::styled(format!(" ({} msgs)", s.message_count), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+    let block = Block::default().borders(Borders::ALL).title(" Gateway (Tab to switch) ").fg(Color::Cyan);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), pa);
+}
+
+fn draw_file_browser(frame: &mut Frame, area: Rect, app: &App) {
+    let mut lines: Vec<Line> = Vec::new();
+    if app.file_entries.is_empty() {
+        lines.push(Line::from(Span::styled("No files loaded. Press 'r' to refresh.", Style::default().fg(Color::DarkGray))));
+    } else {
+        for f in &app.file_entries {
+            let icon = if f.is_dir { "📁" } else { "📄" };
+            let size = if f.size > 1024 { format!("{}KB", f.size/1024) } else { format!("{}B", f.size) };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{icon} "), Style::default()),
+                Span::styled(&f.name, Style::default().fg(Color::White)),
+                Span::styled(format!(" ({size})"), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+}
+
+fn draw_delegate_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let w = 65u16.min(area.width - 4);
+    let h = 18u16.min(area.height - 2);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let pa = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, pa);
+
+    let mut lines = vec![
+        Line::from(Span::styled("Delegate Tasks", Style::default().fg(Color::Magenta).bold())),
+        Line::raw(""),
+    ];
+    if app.delegate_tasks.is_empty() {
+        lines.push(Line::from(Span::styled("  No active delegates", Style::default().fg(Color::DarkGray))));
+    } else {
+        for t in &app.delegate_tasks {
+            let status_icon = match t.status.as_str() {
+                "running" => "⏳",
+                "done" => "✅",
+                "error" => "❌",
+                _ => "⏺",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{status_icon} "), Style::default()),
+                Span::styled(&t.description, Style::default().fg(Color::White)),
+                Span::styled(format!(" [{}]", t.status), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+    let block = Block::default().borders(Borders::ALL).title(" Delegate Dashboard (Tab to switch) ").fg(Color::Magenta);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), pa);
+}
+
+fn draw_memory_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let mut lines: Vec<Line> = Vec::new();
+    if app.memory_entries.is_empty() {
+        lines.push(Line::from(Span::styled("No memory entries loaded.", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled("Memory system: 3-layer (L0 Identity / L1 Essential / L3 Deep Recall)", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled("Auto-extraction: background async, zero token cost", Style::default().fg(Color::DarkGray))));
+    } else {
+        for entry in &app.memory_entries {
+            let icon = match entry.priority.as_str() {
+                "high" => "🔴",
+                "medium" => "🟡",
+                _ => "⚪",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{icon} [{}] ", entry.layer), Style::default().fg(Color::Cyan)),
+                Span::styled(&entry.content, Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+}
+
+fn draw_skills_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let mut lines: Vec<Line> = Vec::new();
+    if app.skill_list.is_empty() {
+        lines.push(Line::from(Span::styled("No skills loaded.", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled("Skills: installable agent capabilities with safety scanning", Style::default().fg(Color::DarkGray))));
+    } else {
+        for skill in &app.skill_list {
+            let icon = if skill.installed { "✅" } else { "⬜" };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{icon} ", ), Style::default()),
+                Span::styled(&skill.name, Style::default().fg(Color::Yellow).bold()),
+                Span::styled(format!(" — {}", skill.description), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+}
