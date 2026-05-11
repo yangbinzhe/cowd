@@ -1372,10 +1372,23 @@ self.record_turn_completed(&summary);
                         if rel_count == 0 { context.push_str("\n<knowledge_graph>\n"); }
                         rel_count += 1;
                         if rel_count > 15 { break; }
-                        context.push_str(&format!(
-                            "  <relation subject=\"{}\" kind=\"{:?}\" strength=\"{:.2}\"/>\n",
-                            entry.title, rel.kind, rel.strength
-                        ));
+                        // 09: skip expired temporal relations
+                        if let Some(ref tm) = rel.temporal {
+                            if let Some(until) = tm.valid_until {
+                                if until < chrono::Utc::now() { continue; }
+                            }
+                        }
+                        let mut attrs = format!("subject=\"{}\" kind=\"{:?}\" strength=\"{:.2}\"",
+                            entry.title, rel.kind, rel.strength);
+                        if let Some(ref tm) = rel.temporal {
+                            if let Some(from) = tm.valid_from {
+                                attrs.push_str(&format!(" valid_from=\"{}\"", from.format("%Y-%m-%d")));
+                            }
+                            if let Some(until) = tm.valid_until {
+                                attrs.push_str(&format!(" valid_until=\"{}\"", until.format("%Y-%m-%d")));
+                            }
+                        }
+                        context.push_str(&format!("  <relation {}/>\n", attrs));
                     }
                     if rel_count > 15 { break; }
                 }
