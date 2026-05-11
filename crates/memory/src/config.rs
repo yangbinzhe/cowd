@@ -16,6 +16,7 @@ pub struct MemoryConfig {
     pub budget: BudgetConfig,
     pub extractor: ExtractorConfig,
     pub drift: DriftConfig,
+    pub perf: PerfBudget,
     /// Target model name for adaptive compression thresholds.
     /// When set, compression parameters auto-adjust based on model profile.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30,6 +31,7 @@ impl Default for MemoryConfig {
             budget: BudgetConfig::default(),
             extractor: ExtractorConfig::default(),
             drift: DriftConfig::default(),
+            perf: PerfBudget::default(),
             model: None,
         }
     }
@@ -274,6 +276,21 @@ impl Default for DriftConfig {
             review_threshold: 0.7,
             prune_threshold: 0.95,
         }
+    }
+}
+
+/// P0-05 Performance budget for memory operations.
+/// Derived from mempalace: Hook<500ms, injection<100ms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfBudget {
+    pub hook_max_ms: u64,
+    pub inject_max_ms: u64,
+    pub warn_threshold_pct: f64,
+}
+
+impl Default for PerfBudget {
+    fn default() -> Self {
+        Self { hook_max_ms: 500, inject_max_ms: 100, warn_threshold_pct: 0.8 }
     }
 }
 

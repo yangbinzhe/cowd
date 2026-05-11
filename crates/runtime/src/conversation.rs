@@ -1507,6 +1507,7 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
             min_confidence: 0.6,
         },
         drift: DriftConfig::default(),
+        perf: memory::config::PerfBudget::default(),
         model: None,
     }
 }
