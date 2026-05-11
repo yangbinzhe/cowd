@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub fn ensure_planning_dir(cwd: &Path) -> PathBuf {
-    let dir = cwd.join(".planning");
+    let dir = cwd.join(".cowd").join("planning");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
