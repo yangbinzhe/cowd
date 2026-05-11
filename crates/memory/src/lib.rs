@@ -47,6 +47,7 @@ pub mod types;
 pub mod aaak_compression;
 pub mod aaak_index;
 pub mod context_fence;
+pub mod context_sync;
 pub mod fact_checker;
 pub mod fresh_context;
 pub mod temporal_graph;
