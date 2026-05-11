@@ -10,6 +10,8 @@ const COMPACT_DIRECT_RESUME_INSTRUCTION: &str = "Continue the conversation from 
 pub struct CompactionConfig {
     pub preserve_recent_messages: usize,
     pub max_estimated_tokens: usize,
+    pub priority_threshold: u8,
+    pub keep_high_priority: bool,
 }
 
 impl Default for CompactionConfig {
@@ -17,6 +19,8 @@ impl Default for CompactionConfig {
         Self {
             preserve_recent_messages: 4,
             max_estimated_tokens: 10_000,
+            priority_threshold: 3,
+            keep_high_priority: true,
         }
     }
 }
@@ -603,7 +607,7 @@ mod tests {
             &session,
             CompactionConfig {
                 preserve_recent_messages: 2,
-                max_estimated_tokens: 1,
+                max_estimated_tokens: 1, priority_threshold: 3, keep_high_priority: true,
             },
         );
 
@@ -629,7 +633,7 @@ mod tests {
             &session,
             CompactionConfig {
                 preserve_recent_messages: 2,
-                max_estimated_tokens: 1,
+                max_estimated_tokens: 1, priority_threshold: 3, keep_high_priority: true,
             }
         ));
         // Note: with the tool-use/tool-result boundary guard the compacted session
@@ -657,7 +661,7 @@ mod tests {
         ];
         let config = CompactionConfig {
             preserve_recent_messages: 2,
-            max_estimated_tokens: 1,
+            max_estimated_tokens: 1, priority_threshold: 3, keep_high_priority: true,
         };
 
         let first = compact_session(&initial_session, config);
@@ -719,7 +723,7 @@ mod tests {
             &session,
             CompactionConfig {
                 preserve_recent_messages: 2,
-                max_estimated_tokens: 1,
+                max_estimated_tokens: 1, priority_threshold: 3, keep_high_priority: true,
             }
         ));
     }

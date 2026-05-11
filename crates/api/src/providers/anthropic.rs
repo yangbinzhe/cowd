@@ -1014,9 +1014,8 @@ mod tests {
     use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::{Mutex, OnceLock};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use runtime::{clear_oauth_credentials, save_oauth_credentials, OAuthConfig};
 
@@ -1025,24 +1024,7 @@ mod tests {
         resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet,
     };
     use crate::types::{ContentBlockDelta, MessageRequest};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn temp_config_home() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "api-oauth-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ))
-    }
+    use crate::test_utils::{env_lock, temp_config_home};
 
     fn cleanup_temp_config_home(config_home: &std::path::Path) {
         match std::fs::remove_dir_all(config_home) {

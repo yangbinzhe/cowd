@@ -20,6 +20,7 @@ pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.cn/v1";
+pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -38,6 +39,7 @@ const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
 const MOONSHOT_ENV_VARS: &[&str] = &["MOONSHOT_API_KEY"];
+const DEEPSEEK_ENV_VARS: &[&str] = &["DEEPSEEK_API_KEY"];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -86,6 +88,18 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// DeepSeek (DeepSeek-V3, DeepSeek-R1 family models) compatible endpoint.
+    /// Uses the OpenAI-compatible REST shape at /v1.
+    #[must_use]
+    pub const fn deepseek() -> Self {
+        Self {
+            provider_name: "DeepSeek",
+            api_key_env: "DEEPSEEK_API_KEY",
+            base_url_env: "DEEPSEEK_BASE_URL",
+            default_base_url: DEFAULT_DEEPSEEK_BASE_URL,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
@@ -93,6 +107,7 @@ impl OpenAiCompatConfig {
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
             "Moonshot" => MOONSHOT_ENV_VARS,
+            "DeepSeek" => DEEPSEEK_ENV_VARS,
             _ => &[],
         }
     }

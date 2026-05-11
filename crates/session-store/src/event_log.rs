@@ -1,5 +1,6 @@
-use rusqlite::{params, Connection};
+use rusqlite::params;
 
+#[deprecated(since = "0.2.0", note = "use crate::unified::UnifiedSessionStore")]
 pub struct SessionStore;
 
 pub struct StructuredEvent {

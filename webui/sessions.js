@@ -1,87 +1,91 @@
-const Sessions = (() => {
-    const listEl = document.getElementById('session-list');
-    const searchEl = document.getElementById('session-search');
-    let sessions = [];
-    let activeId = null;
+window.Sessions = (()=>{
+  let sessions=[];
+  let activeId=null;
+  let totalTokens=0;
 
-    async function load() {
-        try {
-            const data = await API.listSessions();
-            sessions = data.sessions || [];
-            render();
-        } catch (e) {
-            console.warn('Failed to load sessions:', e);
+  async function load(){
+    try{
+      const data=await Api.listSessions();
+      sessions=data.sessions||[];
+      render();
+    }catch(e){UI.showToast('Failed to load sessions','error')}
+  }
+
+  function render(){
+    const list=UI.$('session-list');
+    list.innerHTML='';
+    sessions.forEach(s=>{
+      const li=UI.el('li','session-item'+(s.id===activeId?' active':''));
+      const title=UI.el('span','si-title');
+      title.textContent=s.title||'Untitled';
+      const model=UI.el('span','si-model');
+      model.textContent=s.model||'';
+      const menu=UI.el('span','si-menu');
+      const delBtn=UI.el('button');
+      delBtn.innerHTML='&xutrif;';
+      delBtn.title='Delete';
+      delBtn.onclick=e=>{e.stopPropagation();deleteSession(s.id)};
+      menu.appendChild(delBtn);
+      li.appendChild(title);li.appendChild(model);li.appendChild(menu);
+      li.onclick=()=>selectSession(s.id);
+      list.appendChild(li);
+    });
+  }
+
+  async function selectSession(id){
+    activeId=id;Api.sid=id;
+    render();
+    UI.$('chat-messages').innerHTML='';
+    Messages.disconnect();
+    try{
+      const msgs=await Api.getMessages(id);
+      if(msgs&&msgs.length)msgs.forEach(m=>{
+        if(m.role==='user')Messages.addUserMessage(m.content);
+        else if(m.role==='assistant'){
+          const el=UI.el('div','message assistant');
+          const body=UI.el('div','msg-body');
+          body.innerHTML=UI.renderMd(m.content||'');
+          el.appendChild(body);
+          UI.$('chat-messages').appendChild(el);
         }
+      });
+    }catch(e){}
+    Messages.connect();
+  }
+
+  async function deleteSession(id){
+    try{await Api.deleteSession(id);sessions=sessions.filter(s=>s.id!==id);if(id===activeId){activeId=null;Api.sid=null}render()}catch(e){UI.showToast(e.message,'error')}
+  }
+
+  async function createSession(model){
+    try{
+      const d=await Api.createSession(model||UI.$('model-selector').value||'claude-sonnet-4-6');
+      activeId=d.id||d.session_id;
+      Api.sid=activeId;
+      UI.$('chat-messages').innerHTML='';
+      Messages.disconnect();
+      Messages.addSystemMessage('New session: '+(activeId||'').slice(0,8)+'...');
+      load();
+      Messages.connect();
+    }catch(e){UI.showToast(e.message,'error')}
+  }
+
+  function addTokens(n){
+    totalTokens+=n;
+    var el=document.getElementById('token-usage');
+    if(el)el.textContent=totalTokens+' tk';
+    var costEl=document.getElementById('cost-display');
+    if(costEl&&totalTokens>0){
+      var est=(totalTokens/1000000*15).toFixed(4);
+      costEl.textContent='~$'+est;
     }
+  }
 
-    function render() {
-        const q = (searchEl.value || '').toLowerCase();
-        const filtered = sessions.filter(s =>
-            !q || (s.title || '').toLowerCase().includes(q) || s.id.toLowerCase().includes(q));
+  async function searchSessions(q){
+    if(!q){load();return}
+    sessions=sessions.filter(s=>(s.title||'').toLowerCase().includes(q.toLowerCase()));
+    render();
+  }
 
-        listEl.innerHTML = '';
-        filtered.forEach(s => {
-            const li = document.createElement('li');
-            li.className = `session-item${s.id === activeId ? ' active' : ''}`;
-            li.innerHTML = `
-                <span class="session-title">${s.title || 'Untitled'}</span>
-                <div class="session-meta">
-                    <span>${new Date(s.started_at * 1000).toLocaleDateString()}</span>
-                    <span>${formatTokens(s.input_tokens + s.output_tokens)}</span>
-                </div>
-                <div class="session-actions">
-                    <button class="btn-resume" data-id="${s.id}">Resume</button>
-                    <button class="btn-delete" data-id="${s.id}">Delete</button>
-                </div>`;
-            li.addEventListener('click', e => {
-                if (e.target.classList.contains('btn-resume')) resume(s.id);
-                else if (e.target.classList.contains('btn-delete')) remove(s.id);
-                else resume(s.id);
-            });
-            listEl.appendChild(li);
-        });
-    }
-
-    async function resume(id) {
-        try {
-            Stream.disconnect();
-            Chat.clearMessages();
-            Chat.setLoading(true);
-            const d = await API.resumeSession(id);
-            activeId = id;
-            render();
-            Chat.setLoading(false);
-            Chat.addMessage('system', `Resumed session: ${id.slice(0, 8)}...`);
-            Stream.connect();
-            showToast('Session resumed', 'success');
-        } catch (e) {
-            Chat.setLoading(false);
-            showToast(e.message, 'error');
-        }
-    }
-
-    async function remove(id) {
-        if (!confirm('Delete this session?')) return;
-        try {
-            await API.deleteSession(id);
-            sessions = sessions.filter(s => s.id !== id);
-            if (activeId === id) activeId = null;
-            render();
-            showToast('Session deleted', 'success');
-        } catch (e) {
-            showToast(e.message, 'error');
-        }
-    }
-
-    function setActive(id) { activeId = id; render(); }
-
-    searchEl.addEventListener('input', render);
-
-    function formatTokens(n) {
-        if (n > 1000000) return `${(n/1e6).toFixed(1)}M tk`;
-        if (n > 1000) return `${(n/1e3).toFixed(1)}K tk`;
-        return `${n} tk`;
-    }
-
-    return { load, setActive };
+  return{load,render,selectSession,deleteSession,createSession,addTokens,searchSessions,sessions:()=>sessions};
 })();

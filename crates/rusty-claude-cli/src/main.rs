@@ -8,9 +8,10 @@
 )]
 mod bootstrap;
 mod init;
-mod input;
+mod engine;
 mod render;
 mod server;
+mod tui;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -19,6 +20,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -3268,59 +3270,158 @@ fn run_repl(
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
-    let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
-    println!("{}", cli.startup_banner());
-    println!("{}", format_connected_line(&cli.model));
+    let eng = engine::Engine::new(std::env::current_dir().unwrap_or_default());
+    run_tui_repl(cli, eng)
+}
 
-    loop {
-        editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        match editor.read_line()? {
-            input::ReadOutcome::Submit(input) => {
-                let trimmed = input.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if matches!(trimmed.as_str(), "/exit" | "/quit") {
-                    cli.persist_session()?;
-                    break;
-                }
-                match SlashCommand::parse(&trimmed) {
-                    Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
-                        }
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("{error}");
-                        continue;
-                    }
-                }
-                // Bare-word skill dispatch: if the first token of the input
-                // matches a known skill name, invoke it as `/skills <input>`
-                // rather than forwarding raw text to the LLM (ROADMAP #36).
-                let cwd = std::env::current_dir().unwrap_or_default();
-                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
-                    editor.push_history(input);
-                    cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
-                    continue;
-                }
-                editor.push_history(input);
-                cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
-            }
-            input::ReadOutcome::Cancel => {}
-            input::ReadOutcome::Exit => {
-                cli.persist_session()?;
-                break;
-            }
+fn refresh_panels(app: &mut tui::App, engine: &engine::Engine, runtime: &BuiltRuntime) {
+    app.file_entries = engine.list_files().into_iter().map(|f| tui::FileEntry {
+        name: f.name, is_dir: f.is_dir, size: f.size,
+    }).collect();
+
+    app.delegate_tasks.clear();
+    if let Some(handoff) = engine::Engine::memory_handoff(runtime) {
+        for task in &handoff.task_states {
+            app.delegate_tasks.push(tui::DelegateTask {
+                id: task.task_id.clone(),
+                description: task.last_checkpoint.clone(),
+                status: format!("{}%", task.progress_percent),
+            });
+        }
+        for item in &handoff.work_items {
+            app.delegate_tasks.push(tui::DelegateTask {
+                id: item.id.clone(),
+                description: item.title.clone(),
+                status: format!("{:?}", item.status).to_lowercase(),
+            });
         }
     }
 
-    Ok(())
+    app.memory_entries.clear();
+    if let Some(handoff) = engine::Engine::memory_handoff(runtime) {
+        if !handoff.summary.is_empty() {
+            app.memory_entries.push(tui::MemoryEntry {
+                layer: "handoff".to_string(),
+                content: handoff.summary.clone(),
+                priority: "high".to_string(),
+            });
+        }
+    }
+
+    // P1: Skills data pipeline
+    app.skill_list.clear();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let skill_roots = [
+        PathBuf::from(format!("{}/.cowd/skills", home)),
+        PathBuf::from(format!("{}/.cowd/skills", cwd.to_string_lossy())),
+        PathBuf::from(format!("{}/.agents/skills", home)),
+        PathBuf::from(format!("{}/.agents/skills", cwd.to_string_lossy())),
+    ];
+    for root in &skill_roots {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let skill_md = path.join("SKILL.md");
+                    if skill_md.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&skill_md) {
+                            let name = path.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let desc = content.lines()
+                                .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("---"))
+                                .nth(0)
+                                .map(|l| l.trim().to_string())
+                                .unwrap_or_default();
+                            let installed = path.join("installed.json").exists()
+                                || path.join("installed").exists();
+                            app.skill_list.push(tui::SkillSummary {
+                                name,
+                                description: desc,
+                                installed,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn run_tui_repl(mut cli: LiveCli, eng: engine::Engine) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io;
+    use crossterm::{
+        execute,
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, enable_raw_mode, disable_raw_mode},
+    };
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::Terminal;
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let session_id = cli.session.id.clone();
+    let mut app = tui::App::new(&cli.model, &session_id);
+    app.add_message("system", &cli.startup_banner());
+    app.add_message("system", &format_connected_line(&cli.model));
+    refresh_panels(&mut app, &eng, &cli.runtime);
+
+    let res = (|| -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            terminal.draw(|f| tui::render::draw(f, &app))?;
+
+            match tui::input::handle_input(&mut app)? {
+                tui::input::InputResult::Submit(text) => {
+                    if text.is_empty() { continue; }
+                    if matches!(text.as_str(), "/exit" | "/quit") { break; }
+                    if text.starts_with('/') {
+                        let parsed = SlashCommand::parse(&text).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                        match parsed {
+                            Some(cmd) => {
+                                if cli.handle_repl_command(cmd)? { cli.persist_session()?; }
+                                continue;
+                            }
+                            None => {}
+                        }
+                    }
+                    app.add_message("user", &text);
+                    app.is_loading = true;
+                    terminal.draw(|f| tui::render::draw(f, &app))?;
+
+                    match cli.run_turn(&text) {
+                        Ok(()) => {
+                            app.is_loading = false;
+                            app.token_count = engine::Engine::token_count(&cli.runtime);
+                            app.cost_estimate = Some(engine::Engine::cost_usd(&cli.runtime));
+                            app.add_message("assistant", "✓ Done");
+                        }
+                        Err(e) => {
+                            app.is_loading = false;
+                            app.add_message("system", &format!("Error: {e}"));
+                        }
+                    }
+    refresh_panels(&mut app, &eng, &cli.runtime);
+                }
+                tui::input::InputResult::ResumeSession(_id) => {
+                    app.add_message("system", "Session resume via picker");
+                }
+                tui::input::InputResult::Exit => break,
+                tui::input::InputResult::Cancel => {}
+                tui::input::InputResult::Nothing => {}
+            }
+        }
+        Ok(())
+    })();
+
+    cli.persist_session()?;
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    res
 }
 
 #[derive(Debug, Clone)]
@@ -4944,7 +5045,7 @@ fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::
     runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
+pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
     Ok(Session::new().with_workspace_root(env::current_dir()?))
 }
 
@@ -6382,7 +6483,7 @@ fn short_tool_id(id: &str) -> String {
     format!("{prefix}…")
 }
 
-fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+pub(crate) fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
@@ -6796,7 +6897,7 @@ fn describe_tool_progress(name: &str, input: &str) -> String {
 
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
-fn build_runtime(
+pub(crate) fn build_runtime(
     session: Session,
     session_id: &str,
     model: String,
@@ -6911,7 +7012,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
     }
 }
 
-struct CliPermissionPrompter {
+pub(crate) struct CliPermissionPrompter {
     current_mode: PermissionMode,
 }
 
@@ -7074,7 +7175,17 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
 
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+        match self.stream_collect(request) {
+            Ok(events) => Box::pin(futures::stream::iter(events.into_iter().map(Ok))),
+            Err(e) => Box::pin(futures::stream::iter(std::iter::once(Err(e)))),
+        }
+    }
+}
+
+impl AnthropicRuntimeClient {
+    #[allow(clippy::too_many_lines)]
+    fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
@@ -12121,5 +12232,60 @@ mod dump_manifests_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod skill_pipeline_tests {
+    use super::tui::{App, SkillSummary};
+    use std::path::PathBuf;
+
+    #[test]
+    fn skill_summary_fields_populate_correctly() {
+        let s = SkillSummary {
+            name: "test-skill".to_string(),
+            description: "A test skill".to_string(),
+            installed: true,
+        };
+        assert_eq!(s.name, "test-skill");
+        assert_eq!(s.description, "A test skill");
+        assert!(s.installed);
+    }
+
+    #[test]
+    fn app_skill_list_initializes_empty() {
+        let app = App::new("test-model", "test-session");
+        assert!(app.skill_list.is_empty());
+    }
+
+    #[test]
+    fn skill_scan_from_temp_dir() {
+        let tmp = std::env::temp_dir().join(format!("cowd_skill_test_{}", std::process::id()));
+        let skill_dir = tmp.join("my-skill");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(skill_dir.join("SKILL.md"), "# My Skill\nDoes things").expect("write SKILL.md");
+
+        let mut app = App::new("test-model", "test-session");
+        if let Ok(entries) = std::fs::read_dir(&tmp) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.join("SKILL.md").exists() {
+                    if let Ok(content) = std::fs::read_to_string(path.join("SKILL.md")) {
+                        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        let desc = content.lines()
+                            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("---"))
+                            .nth(0)
+                            .map(|l| l.trim().to_string())
+                            .unwrap_or_default();
+                        app.skill_list.push(SkillSummary { name, description: desc, installed: false });
+                    }
+                }
+            }
+        }
+        assert_eq!(app.skill_list.len(), 1);
+        assert_eq!(app.skill_list[0].name, "my-skill");
+        assert_eq!(app.skill_list[0].description, "# My Skill");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

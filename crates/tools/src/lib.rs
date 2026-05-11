@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -119,6 +120,23 @@ pub struct RuntimeToolDefinition {
     pub description: Option<String>,
     pub input_schema: Value,
     pub required_permission: PermissionMode,
+}
+
+/// M4: Global registry for self-registered tools (populated via register_tool! macro)
+pub static REGISTERED_TOOLS: std::sync::LazyLock<std::sync::Mutex<Vec<(String, String, std::sync::Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>)>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// M4: Self-registering tool macro. Usage: `register_tool!("my_tool", "Does X", my_handler);`
+#[macro_export]
+macro_rules! register_tool {
+    ($name:expr, $description:expr, $handler:expr) => {
+        #[ctor::ctor]
+        fn __register_tool() {
+            $crate::REGISTERED_TOOLS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(($name.to_string(), $description.to_string(), std::sync::Arc::new($handler)));
+        }
+    };
 }
 
 impl GlobalToolRegistry {
@@ -4361,7 +4379,16 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
 }
 
 impl ApiClient for ProviderRuntimeClient {
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+        match self.stream_collect_inner(request) {
+            Ok(events) => Box::pin(futures::stream::iter(events.into_iter().map(Ok))),
+            Err(e) => Box::pin(futures::stream::iter(std::iter::once(Err(e)))),
+        }
+    }
+}
+
+impl ProviderRuntimeClient {
+    fn stream_collect_inner(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
             .map(|spec| ToolDefinition {
@@ -5925,6 +5952,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
     use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
@@ -7519,6 +7547,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+            
+                role: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -7600,6 +7630,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+            
+                role: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -7657,6 +7689,8 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+            
+                role: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -7704,6 +7738,8 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+            
+                role: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -7749,6 +7785,8 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+            
+                role: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -7935,9 +7973,9 @@ mod tests {
     }
 
     impl runtime::ApiClient for MockSubagentApiClient {
-        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
             self.calls += 1;
-            match self.calls {
+            let events: Result<Vec<AssistantEvent>, RuntimeError> = match self.calls {
                 1 => {
                     assert_eq!(request.messages.len(), 1);
                     Ok(vec![
@@ -7957,7 +7995,8 @@ mod tests {
                     ])
                 }
                 _ => unreachable!("extra mock stream call"),
-            }
+            };
+            Box::pin(futures::stream::iter(events.into_iter().flat_map(|v| v.into_iter().map(Ok))))
         }
     }
 

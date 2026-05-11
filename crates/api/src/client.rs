@@ -144,20 +144,9 @@ pub fn read_xai_base_url() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
-
     use super::ProviderClient;
     use crate::providers::{detect_provider_kind, resolve_model_alias, ProviderKind};
-
-    /// Serializes every test in this module that mutates process-wide
-    /// environment variables so concurrent test threads cannot observe
-    /// each other's partially-applied state.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    use crate::test_utils::{env_lock, EnvVarGuard};
 
     #[test]
     fn resolves_existing_and_grok_aliases() {
@@ -175,55 +164,20 @@ mod tests {
         );
     }
 
-    /// Snapshot-restore guard for a single environment variable. Mirrors
-    /// the pattern used in `providers/mod.rs` tests: captures the original
-    /// value on construction, applies the override, and restores on drop so
-    /// tests leave the process env untouched even when they panic.
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: Option<&str>) -> Self {
-            let original = std::env::var_os(key);
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
     #[test]
     fn dashscope_model_uses_dashscope_config_not_openai() {
-        // Regression: qwen-plus was being routed to OpenAiCompatConfig::openai()
-        // which reads OPENAI_API_KEY and points at api.openai.com, when it should
-        // use OpenAiCompatConfig::dashscope() which reads DASHSCOPE_API_KEY and
-        // points at dashscope.aliyuncs.com.
         let _lock = env_lock();
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("test-dashscope-key"));
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
 
         let client = ProviderClient::from_model("qwen-plus");
 
-        // Must succeed (not fail with "missing OPENAI_API_KEY")
         assert!(
             client.is_ok(),
             "qwen-plus with DASHSCOPE_API_KEY set should build successfully, got: {:?}",
             client.err()
         );
 
-        // Verify it's the OpenAi variant pointed at the DashScope base URL.
         match client.unwrap() {
             ProviderClient::OpenAi(openai_client) => {
                 assert!(

@@ -1007,7 +1007,7 @@ fn extract_prerequisites(description: &str) -> Vec<String> {
 
 // Helper functions
 
-fn truncate_content(content: &str, max_len: usize) -> String {
+pub(crate) fn truncate_content(content: &str, max_len: usize) -> String {
     if content.len() <= max_len {
         content.to_string()
     } else {
@@ -1080,7 +1080,7 @@ fn get_platforms(parsed: &crate::skill_manifest::ParsedSkill) -> Vec<String> {
     Vec::new()
 }
 
-fn generate_skill_name(description: &str) -> String {
+pub(crate) fn generate_skill_name(description: &str) -> String {
     let words: Vec<&str> = description.split_whitespace().take(3).collect();
     let base = if words.is_empty() {
         "generated-skill".to_string()
@@ -1296,7 +1296,7 @@ pub async fn resume_from_handoff(
     Ok(data)
 }
 
-fn generate_session_id() -> String {
+pub(crate) fn generate_session_id() -> String {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -1362,7 +1362,7 @@ fn render_handoff_data(data: &HandoffData) -> String {
     output
 }
 
-fn render_handoff_help() -> String {
+pub(crate) fn render_handoff_help() -> String {
     r#"Handoff Commands
 
 Save and resume session state across sessions.
@@ -1404,7 +1404,8 @@ mod handoff_tests {
     }
 }
 mod tests {
-    
+    #[allow(unused_imports)]
+    use super::*;
 
     #[test]
     fn test_truncate_content() {

@@ -5,7 +5,7 @@
 use crate::platform::adapter::{InboundMessage, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformResult};
 use crate::platform::types::SessionKey;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use lettre::Transport;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

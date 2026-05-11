@@ -918,7 +918,7 @@ impl UnifiedConfig {
 
     /// Resolve a provider for a given model name.
     pub fn resolve_provider(&self, model: &str) -> Option<(&str, &str)> {
-        for (name, provider) in &self.providers.providers {
+        for (_name, provider) in &self.providers.providers {
             if provider.models.iter().any(|m| m == model) {
                 return Some((&provider.base_url, &provider.api_key));
             }
@@ -947,6 +947,88 @@ mod dirs {
         std::env::var("HOME")
             .ok()
             .map(PathBuf::from)
-            .or_else(|| std::env::var("USERPROFILE").ok().map(PathBuf::from))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_error_display_is_meaningful() {
+        let err = ConfigError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"));
+        assert!(format!("{}", err).contains("not found"));
+
+        let err = ConfigError::Parse("bad yaml".to_string());
+        assert!(format!("{}", err).contains("bad yaml"));
+    }
+
+    #[test]
+    fn config_source_is_serializable() {
+        let json = serde_json::to_value(&ConfigSource::User).unwrap();
+        assert_eq!(json, "user");
+        let json = serde_json::to_value(&ConfigSource::Project).unwrap();
+        assert_eq!(json, "project");
+    }
+
+    #[test]
+    fn config_entry_source_and_path() {
+        let entry = ConfigEntry {
+            source: ConfigSource::User,
+            path: "/home/user/.cowd/config.yaml".into(),
+            exists: true,
+        };
+        assert_eq!(entry.source, ConfigSource::User);
+        assert!(entry.exists);
+    }
+
+    #[test]
+    fn config_loader_defaults() {
+        let loader = ConfigLoader::new();
+        assert!(loader.discovery.home_dir.to_string_lossy().is_empty());
+    }
+
+    #[test]
+    fn config_loader_with_home_and_cwd() {
+        let loader = ConfigLoader::new()
+            .with_home_dir(std::path::PathBuf::from("/tmp/home"))
+            .with_cwd(std::path::PathBuf::from("/tmp/cwd"));
+        assert_eq!(
+            loader.discovery.home_dir.to_string_lossy(),
+            "/tmp/home"
+        );
+    }
+
+    #[test]
+    fn config_discovery_new() {
+        let discovery = ConfigDiscovery::new();
+        assert!(discovery.home_dir.to_string_lossy().is_empty());
+    }
+
+    #[test]
+    fn runtime_config_default_is_sane() {
+        let cfg = RuntimeConfig::default();
+        assert!(cfg.model.is_none());
+        assert!(cfg.model_aliases.is_empty());
+        assert!(!cfg.auto_compact);
+    }
+
+    #[test]
+    fn gateway_config_default_is_sane() {
+        let cfg = GatewayConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.session_reset_policy == SessionResetPolicy::Always);
+    }
+
+    #[test]
+    fn sandbox_config_default() {
+        let cfg = SandboxConfig::default();
+        assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn auth_config_default() {
+        let cfg = AuthConfig::default();
+        assert!(!cfg.enabled);
     }
 }

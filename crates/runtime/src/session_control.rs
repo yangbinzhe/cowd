@@ -16,6 +16,7 @@ use crate::session::{Session, SessionError};
 /// explicit `--data-dir` flag).  Both constructors produce a directory layout
 /// of `<data_dir>/sessions/<workspace_hash>/` where `<workspace_hash>` is a
 /// stable hex digest of the canonical workspace root.
+#[deprecated(since = "0.2.0", note = "use crate::session_store::UnifiedSessionStore")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStore {
     /// Resolved root of the session namespace, e.g.

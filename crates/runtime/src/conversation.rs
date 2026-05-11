@@ -1113,7 +1113,7 @@ self.record_turn_completed(&summary);
         let result = compact_session(
             &self.session,
             CompactionConfig {
-                max_estimated_tokens: 0,
+                max_estimated_tokens: 0, priority_threshold: 3, keep_high_priority: true,
                 ..CompactionConfig::default()
             },
         );
@@ -2230,7 +2230,7 @@ mod tests {
 
         let result = runtime.compact(CompactionConfig {
             preserve_recent_messages: 2,
-            max_estimated_tokens: 1,
+            max_estimated_tokens: 1, priority_threshold: 3, keep_high_priority: true,
         });
         assert!(result.summary.contains("Conversation summary"));
         assert_eq!(

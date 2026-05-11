@@ -271,8 +271,8 @@ impl SubAgentRuntime {
     ) -> SubAgentResult {
         let mut output_parts: Vec<String> = Vec::new();
         let mut tool_call_count: usize = 0;
-        let mut memory_write_attempts: usize = 0;
-        let mut memory_writes_denied: usize = 0;
+        let memory_write_attempts: usize = 0;
+        let memory_writes_denied: usize = 0;
         let mut current_prompt = initial_prompt.to_string();
 
         loop {

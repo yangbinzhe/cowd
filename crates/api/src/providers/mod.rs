@@ -229,6 +229,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         });
     }
+    // DeepSeek models. Routes deepseek* and deep-seek* model names to the
+    // OpenAI-compatible client pointed at DeepSeek's v1 endpoint.
+    if canonical.starts_with("deepseek") || canonical.starts_with("deep-seek") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DEEPSEEK_API_KEY",
+            base_url_env: "DEEPSEEK_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
+        });
+    }
     // Moonshot / Kimi models. Routes kimi* model names to the OpenAI-compat
     // client pointed at Moonshot's v1 endpoint.
     if canonical.starts_with("kimi") {
@@ -264,6 +274,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     if openai_compat::has_api_key("XAI_API_KEY") {
         return ProviderKind::Xai;
+    }
+    if openai_compat::has_api_key("DEEPSEEK_API_KEY") {
+        return ProviderKind::OpenAi;
     }
     // Last resort: if OPENAI_BASE_URL is set without OPENAI_API_KEY (some
     // local providers like Ollama don't require auth), still route there.
@@ -514,12 +527,10 @@ pub(crate) fn dotenv_value(key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
-
     use serde_json::json;
 
     use crate::error::ApiError;
+    use crate::test_utils::{env_lock, EnvVarGuard};
     use crate::types::{
         InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
     };
@@ -530,46 +541,6 @@ mod tests {
         model_token_limit, parse_dotenv, preflight_message_request, resolve_model_alias,
         ProviderKind,
     };
-
-    /// Serializes every test in this module that mutates process-wide
-    /// environment variables so concurrent test threads cannot observe
-    /// each other's partially-applied state while probing the foreign
-    /// provider credential sniffer.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Snapshot-restore guard for a single environment variable. Captures
-    /// the original value on construction, applies the requested override
-    /// (set or remove), and restores the original on drop so tests leave
-    /// the process env untouched even when they panic mid-assertion.
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: Option<&str>) -> Self {
-            let original = std::env::var_os(key);
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
 
     #[test]
     fn resolves_grok_aliases() {

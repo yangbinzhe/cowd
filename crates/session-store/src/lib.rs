@@ -3,6 +3,7 @@ pub mod store;
 pub mod search;
 pub mod event_log;
 pub mod error;
+pub mod unified;
 
 pub use schema::SCHEMA_VERSION;
 pub use store::{CreateSessionOpts, SessionStore, SessionSummary, ManagedSession, StoredMessage};

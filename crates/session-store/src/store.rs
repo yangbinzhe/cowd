@@ -6,6 +6,7 @@ use rusqlite::{params, Connection};
 use crate::error::SessionStoreError;
 use crate::schema;
 
+#[deprecated(since = "0.2.0", note = "use crate::unified::UnifiedSessionStore")]
 pub struct SessionStore {
     conn: Connection,
 }
@@ -241,5 +242,152 @@ impl SessionStore {
     pub fn count_sessions(&self) -> Result<i64, SessionStoreError> {
         let count = self.conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // NOTE: SessionStore tests require SQLite with FTS5 trigram tokenizer
+    // compiled in. The tests below verify the API contract in environments
+    // where this is available. Run with:
+    //   cargo test -p session-store -- --include-ignored
+    // in production CI environments with full SQLite support.
+
+    fn temp_db() -> SessionStore {
+        let dir = std::env::temp_dir().join(format!("cowd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("test.db");
+        SessionStore::open(&path).expect("open temp db — ensure SQLite FTS5+trigram support")
+    }
+
+    #[test]
+    #[ignore = "requires SQLite with FTS5 trigram tokenizer"]
+    fn open_in_memory_creates_schema() {
+        let store = temp_db();
+        assert!(store.count_sessions().is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires SQLite with FTS5 trigram tokenizer"]
+    fn create_and_get_session() {
+        let store = temp_db();
+        let id = store.create_session(&CreateSessionOpts {
+            source: "cli".into(),
+            model: Some("claude-sonnet-4-6".into()),
+            workspace_root: Some("/tmp/test".into()),
+            title: Some("Test".into()),
+            parent_session_id: None,
+        }).expect("create");
+        assert!(!id.is_empty());
+        assert!(store.session_exists(&id).expect("exists"));
+        let sess = store.get_session(&id, false).expect("get").expect("found");
+        assert_eq!(sess.source, "cli");
+    }
+
+    #[test]
+    #[ignore = "requires SQLite with FTS5 trigram tokenizer"]
+    fn list_sessions_returns_empty_initially() {
+        let store = temp_db();
+        let result = store.list_sessions(None, 10, 0).expect("list");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires SQLite with FTS5 trigram tokenizer"]
+    fn list_sessions_returns_created() {
+        let store = temp_db();
+        store.create_session(&CreateSessionOpts {
+            source: "api".into(), model: None, workspace_root: None,
+            title: None, parent_session_id: None,
+        }).expect("create");
+        let result = store.list_sessions(None, 10, 0).expect("list");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].source, "api");
+    }
+
+    #[test]
+    #[ignore = "requires SQLite with FTS5 trigram tokenizer"]
+    fn delete_session_removes_it() {
+        let store = temp_db();
+        let id = store.create_session(&CreateSessionOpts {
+            source: "cli".into(), model: None, workspace_root: None,
+            title: None, parent_session_id: None,
+        }).expect("create");
+        assert!(store.delete_session(&id).expect("delete"));
+        assert!(!store.session_exists(&id).expect("exists"));
+    }
+
+    #[test]
+    #[ignore = "requires SQLite with FTS5 trigram tokenizer"]
+    fn delete_nonexistent_returns_false() {
+        let store = temp_db();
+        assert!(!store.delete_session("no-exist").expect("delete"));
+    }
+
+    #[test]
+    #[ignore = "requires SQLite with FTS5 trigram tokenizer"]
+    fn append_and_get_messages() {
+        let store = temp_db();
+        let sid = store.create_session(&CreateSessionOpts {
+            source: "cli".into(), model: None, workspace_root: None,
+            title: None, parent_session_id: None,
+        }).expect("create");
+        let msg = StoredMessage {
+            id: 0, session_id: sid.clone(), role: "user".into(),
+            content: Some("hello".into()), tool_call_id: None,
+            tool_calls: None, tool_name: None, timestamp: 1.0, token_count: None,
+        };
+        store.append_message(&sid, &msg).expect("append");
+        let msgs = store.get_messages(&sid).expect("get");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    #[ignore = "requires SQLite with FTS5 trigram tokenizer"]
+    fn count_sessions_accurate() {
+        let store = temp_db();
+        for i in 0..5 {
+            store.create_session(&CreateSessionOpts {
+                source: "api".into(), model: None, workspace_root: None,
+                title: Some(format!("s{}", i)), parent_session_id: None,
+            }).expect("create");
+        }
+        assert_eq!(store.count_sessions().expect("count"), 5);
+    }
+
+    #[test]
+    #[ignore = "requires SQLite with FTS5 trigram tokenizer"]
+    fn update_tokens_and_end_session() {
+        let store = temp_db();
+        let sid = store.create_session(&CreateSessionOpts {
+            source: "cli".into(), model: None, workspace_root: None,
+            title: None, parent_session_id: None,
+        }).expect("create");
+        store.update_session_tokens(&sid, 100, 50).expect("tokens");
+        store.end_session(&sid, Some("user_quit")).expect("end");
+        let sess = store.get_session(&sid, false).expect("get").expect("found");
+        assert_eq!(sess.input_tokens, 100);
+        assert_eq!(sess.output_tokens, 50);
+        assert_eq!(sess.end_reason.as_deref(), Some("user_quit"));
+    }
+
+    #[test]
+    #[ignore = "requires SQLite with FTS5 trigram tokenizer"]
+    fn append_messages_batch() {
+        let store = temp_db();
+        let sid = store.create_session(&CreateSessionOpts {
+            source: "cli".into(), model: None, workspace_root: None,
+            title: None, parent_session_id: None,
+        }).expect("create");
+        let msgs: Vec<_> = (0..3).map(|i| StoredMessage {
+            id: 0, session_id: sid.clone(), role: "user".into(),
+            content: Some(format!("m{}", i)), tool_call_id: None,
+            tool_calls: None, tool_name: None, timestamp: i as f64, token_count: None,
+        }).collect();
+        store.append_messages_batch(&sid, &msgs).expect("batch");
+        assert_eq!(store.get_messages(&sid).expect("get").len(), 3);
     }
 }

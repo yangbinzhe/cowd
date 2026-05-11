@@ -29,7 +29,7 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                     app.input.set_block(Block::default().borders(Borders::ALL).title(" Input (Enter=send, Esc=quit, / for commands) "));
                     Ok(InputResult::Submit(text))
                 }
-                KeyCode::Tab => { for card in &mut app.tool_cards { card.expanded = !card.expanded; } Ok(InputResult::Nothing) }
+                KeyCode::Tab => { app.next_panel(); Ok(InputResult::Nothing) }
                 KeyCode::Char('t') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
                     app.theme.toggle(); Ok(InputResult::Nothing)
                 }

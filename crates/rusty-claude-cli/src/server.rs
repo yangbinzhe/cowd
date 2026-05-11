@@ -14,6 +14,7 @@ use std::{
     fmt,
     fs,
     path::PathBuf,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -553,8 +554,8 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/api/auth/verify", get(auth_verify_handler))
         .route("/api/auth/logout", post(auth_logout_handler));
 
-    let protected_routes = Router::new()
-        // WebUI Session API
+    // M3: Domain-grouped routes (was monolithic protected_routes)
+    let session_routes = Router::new()
         .route("/api/sessions", get(list_sessions_handler))
         .route("/api/sessions", post(create_session_handler))
         .route("/api/sessions/:id", get(get_session_handler))
@@ -562,12 +563,14 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/messages", get(get_session_messages_handler))
         .route("/api/sessions/:id/messages", post(send_message_handler))
-        .route("/api/sessions/:id/messages/stream", post(send_message_stream_handler))
-        // WebUI Config API
+        .route("/api/sessions/:id/messages/stream", post(send_message_stream_handler));
+
+    let config_routes = Router::new()
         .route("/api/config", get(get_config_handler))
         .route("/api/config", put(update_config_handler))
-        .route("/api/config/providers", get(get_providers_handler))
-        // WebUI Memory API
+        .route("/api/config/providers", get(get_providers_handler));
+
+    let memory_routes = Router::new()
         .route("/api/memory", get(memory_status_handler))
         .route("/api/memory/stats", get(memory_stats_handler))
         .route("/api/memory/layers", get(list_memory_layers_handler))
@@ -577,36 +580,40 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/api/memory/:layer/:id", delete(delete_memory_entry_handler))
         .route("/api/memory/entry/:id", patch(update_memory_entry_handler))
         .route("/api/memory/entry/:id", get(get_memory_entry_handler))
-        // P1-2: Entity & Knowledge Graph API
         .route("/api/memory/entities", get(list_entities_handler))
         .route("/api/memory/entities/detect", post(detect_entities_handler))
         .route("/api/memory/triples", get(list_triples_handler))
         .route("/api/memory/triples", post(add_triple_handler))
-        // WebUI Platform API
+        .route("/api/memory/facts/check", post(check_facts_handler))
+        .route("/api/memory/facts/register", post(register_facts_handler))
+        .route("/api/memory/facts/audit", get(audit_facts_handler));
+
+    let platform_routes = Router::new()
         .route("/api/platforms", get(list_platforms_handler))
         .route("/api/platforms/:name", get(get_platform_handler))
         .route("/api/platforms/:name/sessions", get(list_platform_sessions_handler))
-        .route("/api/platforms/:name/sessions/:id", delete(delete_platform_session_handler))
-        // WebUI Command API
+        .route("/api/platforms/:name/sessions/:id", delete(delete_platform_session_handler));
+
+    let command_routes = Router::new()
         .route("/api/commands", get(list_commands_handler))
         .route("/api/commands/history", get(command_history_handler))
-        .route("/api/commands/execute", post(execute_command_handler))
-        // WebUI Workspace API
+        .route("/api/commands/execute", post(execute_command_handler));
+
+    let workspace_routes = Router::new()
         .route("/api/workspace", get(get_current_workspace_handler))
         .route("/api/workspaces", get(list_workspaces_handler))
         .route("/api/workspace/files", get(list_files_handler))
-        .route("/api/workspace/files", post(create_file_handler))
-        // P0-1: Approval API
+        .route("/api/workspace/files", post(create_file_handler));
+
+    let approval_routes = Router::new()
         .route("/api/approval/pending", get(get_pending_approvals_handler))
         .route("/api/approval/respond", post(respond_to_approval_handler))
         .route("/api/approval/config", get(get_approval_config_handler))
         .route("/api/approval/config", put(update_approval_config_handler))
         .route("/api/approval/yolo", post(toggle_yolo_handler))
-        .route("/api/approval/history", get(list_approval_history_handler))
-        // P0-4: File upload
-        .route("/api/upload", post(upload_file_handler))
-        .route("/api/file/raw", get(get_raw_file_handler))
-        // P1-5: Cron scheduler API
+        .route("/api/approval/history", get(list_approval_history_handler));
+
+    let cron_routes = Router::new()
         .route("/api/crons", get(list_crons_handler))
         .route("/api/crons", post(create_cron_handler))
         .route("/api/crons/logs", get(list_cron_logs_handler))
@@ -614,20 +621,9 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/api/crons/:id", delete(delete_cron_handler))
         .route("/api/crons/:id/run", post(run_cron_handler))
         .route("/api/crons/:id/pause", post(pause_cron_handler))
-        .route("/api/crons/:id/resume", post(resume_cron_handler))
-        // 3B-5: Usage & cost API
-        .route("/api/usage", get(usage_handler))
-        // 3B-3: FactChecker API
-        .route("/api/memory/facts/check", post(check_facts_handler))
-        .route("/api/memory/facts/register", post(register_facts_handler))
-        .route("/api/memory/facts/audit", get(audit_facts_handler))
-        // P1-8: Onboarding
-        .route("/api/onboarding/status", get(onboarding_status_handler))
-        .route("/api/onboarding/test", post(onboarding_test_handler))
-        // WebSocket endpoints
-        .route("/ws", get(ws_handler))
-        .route("/ws/sessions", get(ws_sessions_handler))
-        // /v1 prefix (OpenAI-compatible)
+        .route("/api/crons/:id/resume", post(resume_cron_handler));
+
+    let v1_routes = Router::new()
         .route("/v1/chat/completions", post(chat_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/sessions", get(list_sessions_handler))
@@ -657,7 +653,28 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/v1/platforms", get(list_platforms_handler))
         .route("/v1/platforms/:name", get(get_platform_handler))
         .route("/v1/platforms/:name/sessions", get(list_platform_sessions_handler))
-        .route("/v1/platforms/:name/sessions/:id", delete(delete_platform_session_handler))
+        .route("/v1/platforms/:name/sessions/:id", delete(delete_platform_session_handler));
+
+    let other_routes = Router::new()
+        .route("/api/upload", post(upload_file_handler))
+        .route("/api/file/raw", get(get_raw_file_handler))
+        .route("/api/usage", get(usage_handler))
+        .route("/api/onboarding/status", get(onboarding_status_handler))
+        .route("/api/onboarding/test", post(onboarding_test_handler))
+        .route("/ws", get(ws_handler))
+        .route("/ws/sessions", get(ws_sessions_handler));
+
+    let protected_routes = Router::new()
+        .merge(session_routes)
+        .merge(config_routes)
+        .merge(memory_routes)
+        .merge(platform_routes)
+        .merge(command_routes)
+        .merge(workspace_routes)
+        .merge(approval_routes)
+        .merge(cron_routes)
+        .merge(v1_routes)
+        .merge(other_routes)
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // B9: Restrictive CORS - default local origins + configurable extra origins
@@ -1143,7 +1160,16 @@ impl OpenAiApiClient {
 }
 
 impl RuntimeApiClient for OpenAiApiClient {
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+        match self.stream_collect(request) {
+            Ok(events) => Box::pin(futures::stream::iter(events.into_iter().map(Ok))),
+            Err(e) => Box::pin(futures::stream::iter(std::iter::once(Err(e)))),
+        }
+    }
+}
+
+impl OpenAiApiClient {
+    fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         // Build the OpenAI request
         let message_request = match self.build_message_request(&request) {
             Ok(req) => req,
@@ -1228,21 +1254,20 @@ impl ToolExecutor for HttpToolExecutor {
 /// SSE-backed tool callback that pushes tool lifecycle events to the SSE stream.
 /// Inspired by hermes-agent stream_consumer.py tool_progress_callback.
 struct SseToolCallback {
-    // Mutex wraps the tokio Sender (which is Send but not Sync) to satisfy ToolCallback's Sync bound.
-    chunk_tx: std::sync::Mutex<mpsc::Sender<SseChunk>>,
+    chunk_tx: tokio::sync::mpsc::Sender<SseChunk>,
 }
 
 impl SseToolCallback {
-    fn new(chunk_tx: mpsc::Sender<SseChunk>) -> Self {
-        Self { chunk_tx: std::sync::Mutex::new(chunk_tx) }
+    fn new(chunk_tx: tokio::sync::mpsc::Sender<SseChunk>) -> Self {
+        Self { chunk_tx }
     }
 
-    /// Send an SSE event with a specific event type
     fn send_event(&self, event_type: &str, data: &serde_json::Value) {
         let sse_line = format!("event: {}\ndata: {}\n\n", event_type, data);
-        if let Ok(tx) = self.chunk_tx.lock() {
-            let _ = tx.blocking_send(Some(sse_line));
-        }
+        let tx = self.chunk_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(Some(sse_line)).await;
+        });
     }
 }
 
@@ -1430,16 +1455,16 @@ async fn chat_handler(
                                         "finish_reason": serde_json::Value::Null
                                     }]
                                 });
-                                if chunk_tx.blocking_send(Some(format!("data: {}\n\n", sse_data))).is_err() {
-                                    break;
-                                }
+                                let tx = chunk_tx.clone();
+                                let payload = format!("data: {}\n\n", sse_data);
+                                tokio::spawn(async move { let _ = tx.send(Some(payload)).await; });
                             }
                             // P1-7: Send thinking events for extended thinking
                             SessionContentBlock::Thinking { thinking } => {
-                                let think_event = serde_json::json!({
-                                    "content": thinking
-                                });
-                                let _ = chunk_tx.blocking_send(Some(format!("event: thinking\ndata: {}\n\n", think_event)));
+                                let think_event = serde_json::json!({"content": thinking});
+                                let tx = chunk_tx.clone();
+                                let payload = format!("event: thinking\ndata: {}\n\n", think_event);
+                                tokio::spawn(async move { let _ = tx.send(Some(payload)).await; });
                             }
                             _ => {} // ToolUse, ToolResult handled elsewhere
                         }
@@ -1459,13 +1484,14 @@ async fn chat_handler(
                     "max_tokens": max_tokens,
                     "percentage": (percentage * 10.0).round() / 10.0
                 });
-                let _ = chunk_tx.blocking_send(Some(format!("event: context_usage\ndata: {}\n\n", context_event)));
+                let tx = chunk_tx.clone();
+                let payload = format!("event: context_usage\ndata: {}\n\n", context_event);
+                tokio::spawn(async move { let _ = tx.send(Some(payload)).await; });
 
-                // Record usage in global tracker
                 state.usage_tracker.record(&model_clone, summary.usage);
 
-                // Send [DONE]
-                let _ = chunk_tx.blocking_send(None);
+                let tx = chunk_tx.clone();
+                tokio::spawn(async move { let _ = tx.send(None).await; });
 
                 // ── Post-processing: Memory on_turn_end ────────────────────
                 if let Some(ref mgr) = cognitive_manager {
@@ -1489,16 +1515,18 @@ async fn chat_handler(
                 let error_data = serde_json::json!({
                     "error": { "message": e.to_string(), "type": "runtime_error" }
                 });
-                let _ = chunk_tx.blocking_send(Some(format!("data: {}\n\n", error_data)));
-                let _ = chunk_tx.blocking_send(None);
+                let tx = chunk_tx.clone();
+                let payload = format!("data: {}\n\n", error_data);
+                tokio::spawn(async move { let _ = tx.send(Some(payload)).await; let _ = tx.send(None).await; });
             }
             Err(e) => {
                 tracing::error!(error = %e, "spawn_blocking task panicked");
                 let error_data = serde_json::json!({
                     "error": { "message": "Internal server error: task panic", "type": "runtime_error" }
                 });
-                let _ = chunk_tx.blocking_send(Some(format!("data: {}\n\n", error_data)));
-                let _ = chunk_tx.blocking_send(None);
+                let tx = chunk_tx.clone();
+                let payload = format!("data: {}\n\n", error_data);
+                tokio::spawn(async move { let _ = tx.send(Some(payload)).await; let _ = tx.send(None).await; });
             }
         }
 
@@ -3904,63 +3932,62 @@ async fn send_message_handler(
     Path(session_id): Path<String>,
     Json(params): Json<SendMessageParams>,
 ) -> axum::response::Response {
-    // B5 fix: Use SSE streaming internally and collect full response
-    // instead of echoing user input
+    let user_content = params.content.clone();
     let broadcast_tx = state.session_broadcast.clone();
     let cognitive_manager = state.cognitive_manager.clone();
-    let user_content = params.content.clone();
-
-    let (chunk_tx, mut chunk_rx) = mpsc::channel::<String>(256);
-
-    // Spawn streaming task
     let sid = session_id.clone();
-    let content_for_stream = user_content.clone();
-    tokio::spawn(async move {
-        let _ = broadcast_tx.send(SessionEvent::RuntimeStarted {
-            session_id: sid.clone(),
-        });
+    let content_for_turn = user_content.clone();
 
-        // Use the same streaming logic as send_message_stream_handler
-        // Collect SSE chunks and send through channel
-        let response_text = content_for_stream.clone(); // placeholder until runtime integration
-        let _ = chunk_tx.send(response_text).await;
+    let _ = broadcast_tx.send(SessionEvent::RuntimeStarted { session_id: sid.clone() });
 
-        let _ = broadcast_tx.send(SessionEvent::RuntimeFinished {
-            session_id: sid.clone(),
-        });
-        let _ = broadcast_tx.send(SessionEvent::MessageAdded {
-            session_id: sid.clone(),
-            message_count: 1,
-        });
-
-        // Post-processing: Memory on_turn_end
-        if let Some(ref mgr) = cognitive_manager {
-            let user_msg = to_memory_message("user", &content_for_stream);
-            let assistant_msg = to_memory_message("assistant", &content_for_stream);
-            let mut mem_messages = vec![user_msg, assistant_msg];
-            match mgr.on_turn_end(&mut mem_messages).await {
-                Ok(_) => tracing::debug!("on_turn_end completed for non-streaming session {}", sid),
-                Err(e) => tracing::warn!("on_turn_end failed for session {}: {}", sid, e),
-            }
-        }
-    });
-
-    // Wait for the full response
-    let full_content = match chunk_rx.recv().await {
-        Some(content) => content,
-        None => "Error: No response generated".to_string(),
+    let response_text = match tokio::task::spawn_blocking(move || {
+        server_execute_turn(&content_for_turn)
+    }).await {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => format!("Error: {}", e),
+        Err(e) => format!("Internal error: {}", e),
     };
+
+    let _ = broadcast_tx.send(SessionEvent::RuntimeFinished { session_id: sid.clone() });
+    let _ = broadcast_tx.send(SessionEvent::MessageAdded { session_id: sid.clone(), message_count: 1 });
+
+    if let Some(ref mgr) = cognitive_manager {
+        let user_msg = to_memory_message("user", &user_content);
+        let assistant_msg = to_memory_message("assistant", &response_text);
+        let mut mem_messages = vec![user_msg, assistant_msg];
+        let _ = mgr.on_turn_end(&mut mem_messages).await;
+    }
 
     let response = serde_json::json!({
         "id": format!("msg-{}", Uuid::new_v4()),
         "session_id": session_id,
         "role": "assistant",
-        "content": full_content,
+        "content": response_text,
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "model": "claude-opus-4-6"
     });
 
     Json(response).into_response()
+}
+
+fn server_execute_turn(input: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let system_prompt = crate::build_system_prompt().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+    let session = crate::new_cli_session().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+    let session_id = session.session_id.clone();
+    let mut runtime = crate::build_runtime(
+        session, &session_id, "claude-sonnet-4-6".to_string(), system_prompt,
+        true, false, None,
+        runtime::PermissionMode::DangerFullAccess, None,
+    ).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+    let mut prompter = crate::CliPermissionPrompter::new(runtime::PermissionMode::DangerFullAccess);
+    let summary = runtime.run_turn(input, Some(&mut prompter))
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+    let text = summary.assistant_messages.last()
+        .and_then(|m| m.blocks.iter().find_map(|b| match b {
+            runtime::ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        }))
+        .unwrap_or_else(|| "No response".to_string());
+    Ok(text)
 }
 
 /// Send a message with SSE streaming
@@ -3970,85 +3997,39 @@ async fn send_message_stream_handler(
     Path(session_id): Path<String>,
     Json(params): Json<SendMessageParams>,
 ) -> Response {
-    let session_id_clone = session_id.clone();
-    let broadcast_tx = state.session_broadcast.clone();
-    let cognitive_manager = state.cognitive_manager.clone();
-
-    let (chunk_tx, chunk_rx) = mpsc::channel::<SseChunk>(256);
     let user_content = params.content.clone();
+    let broadcast_tx = state.session_broadcast.clone();
+    let sid = session_id.clone();
 
-    // Spawn a task to handle the streaming
-    tokio::spawn(async move {
-        // Broadcast RuntimeStarted event
-        let _ = broadcast_tx.send(SessionEvent::RuntimeStarted {
-            session_id: session_id_clone.clone(),
-        });
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
+    let content_for_task = user_content.clone();
+    let sid_for_task = sid.clone();
+    let broadcast_for_task = broadcast_tx.clone();
 
-        // Simulate streaming response
-        let response_text = format!("收到: {}", user_content);
-        for chunk in response_text.chars() {
-            let sse_data = serde_json::json!({
-                "id": format!("msg-{}", Uuid::new_v4()),
-                "session_id": session_id_clone.clone(),
-                "role": "assistant",
-                "content": chunk.to_string(),
-                "delta": true
-            });
-            let _ = chunk_tx.send(Some(format!("data: {}\n\n", sse_data))).await;
-            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        }
-        let _ = chunk_tx.send(None).await;
-
-        // Broadcast RuntimeFinished and MessageAdded events
-        let _ = broadcast_tx.send(SessionEvent::RuntimeFinished {
-            session_id: session_id_clone.clone(),
-        });
-        let _ = broadcast_tx.send(SessionEvent::MessageAdded {
-            session_id: session_id_clone.clone(),
-            message_count: 1,
-        });
-
-        // ── Post-processing: Memory on_turn_end ─────────────────────────────
-        if let Some(ref mgr) = cognitive_manager {
-            tracing::debug!("SSE stream ended, triggering on_turn_end for session {}", session_id_clone);
-
-            // Build message list for memory processing
-            let user_msg = to_memory_message("user", &user_content);
-            let assistant_msg = to_memory_message("assistant", &response_text);
-            let mut mem_messages = vec![user_msg, assistant_msg];
-
-            // B7 fix: removed unnecessary 100ms sleep - SSE stream already closed before this point
-
-            match mgr.on_turn_end(&mut mem_messages).await {
-                Ok(_) => {
-                    tracing::debug!("on_turn_end completed successfully for session {}", session_id_clone);
-                }
-                Err(e) => {
-                    tracing::warn!("on_turn_end failed for session {}: {}", session_id_clone, e);
-                }
-            }
+    tokio::task::spawn_blocking(move || {
+        let text = match server_execute_turn(&content_for_task) {
+            Ok(t) => t,
+            Err(e) => format!("Error: {}", e),
+        };
+        for c in text.chars() {
+            if tx.blocking_send(c.to_string()).is_err() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     });
 
-    let event_stream = ReceiverStream::new(chunk_rx).map(|chunk| {
-        match chunk {
-            Some(raw_line) => {
-                let data = raw_line
-                    .strip_prefix("data: ")
-                    .unwrap_or(&raw_line)
-                    .trim_end_matches(['\n', '\r'])
-                    .to_string();
-                Ok::<Event, std::convert::Infallible>(Event::default().data(data))
-            }
-            None => {
-                Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"))
-            }
-        }
+    let sid_stream = sid.clone();
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(move |c| {
+        let sse = serde_json::json!({
+            "id": format!("msg-{}", Uuid::new_v4()),
+            "session_id": sid_stream,
+            "role": "assistant",
+            "content": c,
+            "delta": true
+        });
+        Ok::<_, std::convert::Infallible>(Event::default().data(sse.to_string()))
     });
 
-    Sse::new(event_stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    Sse::new(stream).into_response()
 }
 
 // ── WebUI Config Handlers ─────────────────────────────────────────────────────

@@ -25,6 +25,9 @@ pub struct SessionSummary {
     pub message_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel { Chat, Gateway, Files, Delegate, Memory, Skills }
+
 pub struct App {
     pub model: String,
     pub session_id: String,
@@ -36,11 +39,56 @@ pub struct App {
     pub tool_cards: Vec<ToolCard>,
     pub token_count: u64,
     pub cost_estimate: Option<f64>,
+    pub compaction_count: u32,
+    pub cache_hits: u64,
     pub picker_active: bool,
     pub picker_sessions: Vec<SessionSummary>,
     pub picker_idx: usize,
     pub theme: Theme,
     pub approval: Option<ApprovalRequest>,
+    pub current_panel: Panel,
+    pub gateway_sessions: Vec<GatewaySession>,
+    pub gateway_platform: String,
+    pub file_entries: Vec<FileEntry>,
+    pub delegate_tasks: Vec<DelegateTask>,
+    pub memory_entries: Vec<MemoryEntry>,
+    pub skill_list: Vec<SkillSummary>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryEntry {
+    pub layer: String,
+    pub content: String,
+    pub priority: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewaySession {
+    pub platform: String,
+    pub id: String,
+    pub title: String,
+    pub message_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillSummary {
+    pub name: String,
+    pub description: String,
+    pub installed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DelegateTask {
+    pub id: String,
+    pub description: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -86,12 +134,32 @@ impl App {
             tool_cards: Vec::new(),
             token_count: 0,
             cost_estimate: None,
+            compaction_count: 0,
+            cache_hits: 0,
             picker_active: false,
             picker_sessions: Vec::new(),
             picker_idx: 0,
             theme: Theme::Dark,
             approval: None,
+            current_panel: Panel::Chat,
+            gateway_sessions: Vec::new(),
+            gateway_platform: String::new(),
+            file_entries: Vec::new(),
+            delegate_tasks: Vec::new(),
+            memory_entries: Vec::new(),
+            skill_list: Vec::new(),
         }
+    }
+
+    pub fn next_panel(&mut self) {
+        self.current_panel = match self.current_panel {
+            Panel::Chat => Panel::Gateway,
+            Panel::Gateway => Panel::Files,
+            Panel::Files => Panel::Memory,
+            Panel::Memory => Panel::Skills,
+            Panel::Skills => Panel::Delegate,
+            Panel::Delegate => Panel::Chat,
+        };
     }
 
     pub fn spinner_char(&self) -> &'static str {

@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+futures = "0.3"
 api = { path = "../api" }
 base64 = "0.22"
 commands = { path = "../commands" }

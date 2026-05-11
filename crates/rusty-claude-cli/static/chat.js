@@ -1,4 +1,4 @@
-const Chat = (() => {
+window.Chat = (() => {
     const container = document.getElementById('chat-messages');
     const spinnerEl = document.getElementById('loading-indicator');
     const tokenEl = document.getElementById('token-usage');

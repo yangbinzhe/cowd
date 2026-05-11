@@ -16,7 +16,7 @@ use tokio::sync::{oneshot, RwLock};
 use crate::config::ApprovalConfig;
 use crate::permission_enforcer::{
     ApprovalPersistence, ApprovalRequest, ApprovalVerdict, AutoPassReason,
-    DestructivePatternDetector, RiskLevel, SmartApprovalVerdict,
+    DestructivePatternDetector, SmartApprovalVerdict,
 };
 
 /// Result of evaluating a command through the approval gate.

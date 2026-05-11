@@ -8,7 +8,6 @@
 //! Profiles are stored under `~/.cowd/profiles/{id}/`.
 //! A "default" profile is always present.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -285,8 +284,8 @@ mod tests {
         mgr.create_profile("work").unwrap();
 
         assert!(mgr.delete_profile("default").is_err());
-        assert!(mgr.delete_profile("work").is_err()); // active is default, work is not active — this should work
-        // Actually default is active, so work should be deletable
+        // work is not the active profile, so it should be deletable
+        assert!(mgr.delete_profile("work").is_ok());
     }
 
     #[test]

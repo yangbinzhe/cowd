@@ -1,4 +1,4 @@
-const Stream = (() => {
+window.Stream = (() => {
     let abortController = null;
     let reconnectTimer = null;
     let callbacks = {};

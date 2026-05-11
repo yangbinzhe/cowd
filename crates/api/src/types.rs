@@ -280,7 +280,7 @@ pub enum StreamEvent {
 mod tests {
     use runtime::format_usd;
 
-    use super::{MessageResponse, Usage};
+    use super::{InputContentBlock, InputMessage, MessageRequest, MessageResponse, Usage};
 
     #[test]
     fn usage_total_tokens_includes_cache_tokens() {
@@ -317,5 +317,96 @@ mod tests {
         let cost = response.usage.estimated_cost_usd(&response.model);
         assert_eq!(format_usd(cost.total_cost_usd()), "$54.6750");
         assert_eq!(response.total_tokens(), 1_800_000);
+    }
+
+    #[test]
+    fn input_message_thinking_block_serializes_correctly() {
+        let msg = InputMessage {
+            role: "assistant".to_string(),
+            content: vec![
+                InputContentBlock::Thinking {
+                    thinking: "deep reasoning".to_string(),
+                    signature: None,
+                },
+                InputContentBlock::Text {
+                    text: "visible response".to_string(),
+                },
+            ],
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        let content = json["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "deep reasoning");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "visible response");
+    }
+
+    #[test]
+    fn message_request_with_reasoning_effort_serializes() {
+        let req = MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 4096,
+            messages: vec![InputMessage::user_text("hello")],
+            reasoning_effort: Some("high".to_string()),
+            stream: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["reasoning_effort"], "high");
+        assert_eq!(json["stream"], true);
+    }
+
+    #[test]
+    fn message_request_omits_reasoning_effort_when_none() {
+        let req = MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 4096,
+            messages: vec![],
+            reasoning_effort: None,
+            stream: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn input_message_user_text_constructor() {
+        let msg = InputMessage::user_text("Hello world");
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content.len(), 1);
+        match &msg.content[0] {
+            InputContentBlock::Text { text } => assert_eq!(text, "Hello world"),
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    #[test]
+    fn input_message_tool_result_constructor() {
+        let msg = InputMessage::user_tool_result("tool_01", "output", false);
+        assert_eq!(msg.role, "user");
+        match &msg.content[0] {
+            InputContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "tool_01");
+                assert!(!is_error);
+            }
+            _ => panic!("expected ToolResult block"),
+        }
+    }
+
+    #[test]
+    fn tool_definition_serializes_name_and_schema() {
+        let def = super::ToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("Read a file".to_string()),
+            input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        };
+        let json = serde_json::to_value(&def).unwrap();
+        assert_eq!(json["name"], "read_file");
+        assert!(json["input_schema"].is_object());
     }
 }

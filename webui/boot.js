@@ -1,95 +1,142 @@
-function showToast(msg, type) {
-    const el = document.getElementById('toast');
-    el.textContent = msg;
-    el.className = type;
-    el.classList.add('show');
-    setTimeout(() => el.classList.remove('show'), 3000);
+window.addEventListener('DOMContentLoaded',function(){
+  applyTheme();
+  Sessions.load();
+  loadModelSelector();
+
+  document.getElementById('btn-new-session').addEventListener('click',function(){
+    Sessions.createSession();
+  });
+
+  document.getElementById('btn-send').addEventListener('click',function(){
+    const text=document.getElementById('chat-input').value.trim();
+    if(!text||!Api.sid)return;
+    if(text.startsWith('/')){
+      const parts=text.split(/\s+/);
+      const cmd=parts[0];
+      const args=parts.slice(1).join(' ');
+      Commands.execute(cmd,args);
+      document.getElementById('chat-input').value='';
+    }else{
+      Messages.send(text);
+    }
+  });
+
+  document.getElementById('chat-input').addEventListener('keydown',function(e){
+    if(e.key==='Enter'&&!e.shiftKey){
+      e.preventDefault();
+      document.getElementById('btn-send').click();
+    }
+  });
+
+  let slashTimer;
+  document.getElementById('chat-input').addEventListener('input',function(){
+    const val=this.value;
+    clearTimeout(slashTimer);
+    if(val.startsWith('/')){
+      slashTimer=setTimeout(()=>Commands.renderAutocomplete(val),100);
+    }else{
+      document.getElementById('slash-dropdown').classList.add('hidden');
+    }
+  });
+
+  document.getElementById('btn-slash').addEventListener('click',function(){
+    const input=document.getElementById('chat-input');
+    input.value='/';
+    input.focus();
+    Commands.renderAutocomplete('/');
+  });
+
+  document.getElementById('session-search').addEventListener('input',function(){
+    Sessions.searchSessions(this.value);
+  });
+
+  document.getElementById('model-selector').addEventListener('change',function(){
+    Api.sid=null;
+    Sessions.createSession(this.value);
+  });
+
+  document.querySelectorAll('#panel-tabs button[data-panel]').forEach(function(btn){
+    btn.addEventListener('click',function(){
+      const panel=this.dataset.panel;
+      if(panel==='close'){UI.switchPanel(null);return}
+      UI.switchPanel(panel);
+    });
+  });
+
+  document.getElementById('btn-toggle-panel').addEventListener('click',function(){
+    const panel=document.getElementById('right-panel');
+    panel.classList.toggle('hidden');
+    localStorage.setItem('cowd-panel-open',panel.classList.contains('hidden')?'closed':'open');
+  });
+
+  document.getElementById('btn-control-center').addEventListener('click',function(){
+    UI.openModal('control-center');
+    UI.switchCCTab('config');
+  });
+
+  document.querySelectorAll('#control-center .modal-tabs button').forEach(function(btn){
+    btn.addEventListener('click',function(){
+      UI.switchCCTab(this.dataset.cc);
+    });
+  });
+
+  restorePanelState();
+});
+
+function restorePanelState(){
+  const state=localStorage.getItem('cowd-panel-open');
+  const panel=document.getElementById('right-panel');
+  if(state==='open')panel.classList.remove('hidden');
+  else panel.classList.add('hidden');
 }
 
-const connStatus = document.createElement('span');
-connStatus.id = 'connection-status';
-connStatus.textContent = 'Not connected';
-connStatus.style.cssText = 'color:#888;font-size:11px;margin-left:12px';
-document.getElementById('chat-header').appendChild(connStatus);
-
-function updateConnStatus(connected) {
-    connStatus.textContent = connected ? 'Connected' : 'Disconnected';
-    connStatus.style.color = connected ? '#00c853' : '#e94560';
+function applyTheme(){
+  const theme=localStorage.getItem('cowd-theme')||'dark';
+  if(theme==='system'){
+    const pref=window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';
+    document.documentElement.dataset.theme=pref;
+  }else{
+    document.documentElement.dataset.theme=theme;
+  }
+  window.matchMedia('(prefers-color-scheme:dark)').addEventListener('change',function(){
+    if(localStorage.getItem('cowd-theme')==='system')applyTheme();
+  });
 }
-updateConnStatus(false);
 
-document.getElementById('btn-new-session').addEventListener('click', async () => {
-    try {
-        Chat.setLoading(true);
-        Stream.disconnect();
-        Chat.clearMessages();
-        const d = await API.newSession();
-        Sessions.setActive(d.session_id);
-        Chat.setLoading(false);
-    Chat.addMessage('system', `New session: ${d.session_id.slice(0, 8)}...`);
-    Stream.connect();
-    updateConnStatus(true);
-    showToast('New session created', 'success');
-} catch (e) {
-    Chat.setLoading(false);
-    updateConnStatus(false);
-    showToast(e.message, 'error');
+async function loadModelSelector(){
+  const sel=document.getElementById('model-selector');
+  sel.innerHTML='';
+  try{
+    const cfg=await Api.getConfig();
+    const models=[
+      cfg.model||'claude-sonnet-4-6',
+      'claude-haiku-4-5',
+      'claude-opus-4-6',
+      'deepseek-v4-pro',
+      'deepseek-v4-flash',
+      'grok-3',
+      'grok-3-mini',
+      'qwen3-max',
+      'qwen3-coder-next'
+    ];
+    models.forEach(function(m){
+      const opt=document.createElement('option');
+      opt.value=m;opt.textContent=m;
+      if(m===(cfg.model||models[0]))opt.selected=true;
+      sel.appendChild(opt);
+    });
+    if(cfg.aliases){
+      Object.entries(cfg.aliases).forEach(function(a){
+        const opt=document.createElement('option');
+        opt.value=a[1];opt.textContent=a[0]+' &rarr; '+a[1];
+        sel.appendChild(opt);
+      });
+    }
+  }catch(e){
+    ['claude-sonnet-4-6','claude-haiku-4-5','claude-opus-4-6'].forEach(function(m){
+      const opt=document.createElement('option');
+      opt.value=m;opt.textContent=m;
+      sel.appendChild(opt);
+    });
+  }
 }
-});
-
-const input = document.getElementById('chat-input');
-input.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        document.getElementById('btn-send').click();
-    }
-});
-
-document.getElementById('btn-send').addEventListener('click', async () => {
-    const text = input.value.trim();
-    if (!text || !API.sessionId) return;
-    input.value = '';
-
-    Chat.addMessage('user', text);
-    Chat.setLoading(true);
-
-    try {
-        await API.submitPrompt(text);
-    } catch (e) {
-        Chat.setLoading(false);
-        Chat.addMessage('system', `Error: ${e.message}`);
-    }
-});
-
-Stream.on('messageDelta', text => {
-    const existing = document.querySelector('.message.assistant.streaming');
-    if (existing) {
-        existing.textContent += text;
-        existing.scrollIntoView({ behavior: 'smooth' });
-    } else {
-        const el = Chat.addMessage('assistant', text);
-        el.classList.add('streaming');
-    }
-});
-
-Stream.on('toolStart', (id, name) => Chat.addToolCard(id, name));
-Stream.on('toolComplete', (id, output) => Chat.updateToolCard(id, output, true));
-
-Stream.on('promptComplete', data => {
-    const el = document.querySelector('.message.assistant.streaming');
-    if (el) el.classList.remove('streaming');
-    if (data && data.usage) Chat.addTokens(data.usage.total_tokens || 0);
-    Sessions.load();
-});
-
-document.querySelector('#panel-tabs button[data-panel="close"]')
-    .addEventListener('click', () => document.getElementById('right-panel').classList.add('hidden'));
-
-document.querySelectorAll('#panel-tabs button[data-panel]:not([data-panel="close"])')
-    .forEach(btn => btn.addEventListener('click', () => {
-        document.getElementById('right-panel').classList.remove('hidden');
-        document.querySelectorAll('#panel-tabs button[data-panel]').forEach(b => b.classList.remove('tab-active'));
-        btn.classList.add('tab-active');
-    }));
-
-Sessions.load();
