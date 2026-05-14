@@ -5,6 +5,7 @@
 )]
 mod bootstrap;
 mod init;
+mod mcp_serve;
 mod checks;
 mod render;
 mod server;
@@ -329,7 +330,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
-        CliAction::State { output_format } => run_worker_state(output_format)?,
+        CliAction::State { output_format } => mcp_serve::run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Serve { host, port, auth_enabled, cors_origins, output_format: _, yolo_mode } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1557,72 +1558,6 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     if report.has_failures() {
         return Err("doctor found failing checks".into());
     }
-    Ok(())
-}
-
-/// Starts a minimal Model Context Protocol server that exposes claw's
-/// built-in tools over stdio.
-///
-/// Tool descriptors come from [`tools::mvp_tool_specs`] and calls are
-/// dispatched through [`tools::execute_tool`], so this server exposes exactly
-/// Read `.cowd/worker-state.json` from the current working directory and print it.
-/// This is the file-based worker observability surface: `push_event()` in `worker_boot.rs`
-/// atomically writes state transitions here so external observers (clawhip, orchestrators)
-/// can poll current `WorkerStatus` without needing an HTTP route on the opencode binary.
-fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let state_path = cwd.join(".cowd").join("worker-state.json");
-    if !state_path.exists() {
-        // Emit a structured error, then return Err so the process exits 1.
-        // Callers (scripts, CI) need a non-zero exit to detect "no state" without
-        // parsing prose output.
-        // Let the error propagate to main() which will format it correctly
-        // (prose for text mode, JSON envelope for --output-format json).
-        return Err(format!(
-            "no worker state file found at {} — run a worker first",
-            state_path.display()
-        )
-        .into());
-    }
-    let raw = std::fs::read_to_string(&state_path)?;
-    match output_format {
-        CliOutputFormat::Text => println!("{raw}"),
-        CliOutputFormat::Json => {
-            // Validate it parses as JSON before re-emitting
-            let _: serde_json::Value = serde_json::from_str(&raw)?;
-            println!("{raw}");
-        }
-    }
-    Ok(())
-}
-
-/// the same surface the in-process agent loop uses.
-fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
-    let tools = mvp_tool_specs()
-        .into_iter()
-        .map(|spec| McpTool {
-            name: spec.name.to_string(),
-            description: Some(spec.description.to_string()),
-            input_schema: Some(spec.input_schema),
-            annotations: None,
-            meta: None,
-        })
-        .collect();
-
-    let spec = McpServerSpec {
-        server_name: "cowd".to_string(),
-        server_version: VERSION.to_string(),
-        tools,
-        tool_handler: Box::new(execute_tool),
-    };
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async move {
-        let mut server = McpServer::new(spec);
-        server.run().await
-    })?;
     Ok(())
 }
 
@@ -4161,7 +4096,7 @@ impl LiveCli {
         // tools. All other `mcp` subcommands fall through to the existing
         // configured-server reporter (`list`, `status`, ...).
         if matches!(args.map(str::trim), Some("serve")) {
-            return run_mcp_serve();
+            return mcp_serve::run_mcp_serve();
         }
         let cwd = env::current_dir()?;
         match output_format {
