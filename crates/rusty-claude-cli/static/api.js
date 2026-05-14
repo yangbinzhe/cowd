@@ -1,19 +1,37 @@
 window.Api = (()=>{
   const BASE = '';
   let sid = null;
+  let authToken = localStorage.getItem('cowd-auth-token') || null;
+
+  function buildHeaders(){
+    const h = {'Content-Type':'application/json'};
+    if(authToken) h['Authorization'] = 'Bearer ' + authToken;
+    return h;
+  }
 
   async function req(method, path, body){
-    const opts = {method, headers:{'Content-Type':'application/json'}};
+    const opts = {method, headers: buildHeaders()};
     if(body)opts.body=JSON.stringify(body);
     const r=await fetch(BASE+path,opts);
+    if(r.status===401){
+      authToken=null;
+      localStorage.removeItem('cowd-auth-token');
+      if(typeof window.showLoginModal==='function')window.showLoginModal();
+      throw new Error('Authentication required. Please login.');
+    }
     if(!r.ok){const t=await r.text();throw new Error(t||`${r.status} ${r.statusText}`)}
     return r.json();
   }
 
   async function reqRaw(method,path,body){
-    const opts={method,headers:{'Content-Type':'application/json'}};
+    const opts={method,headers:buildHeaders()};
     if(body)opts.body=JSON.stringify(body);
     const r=await fetch(BASE+path,opts);
+    if(r.status===401){
+      authToken=null;
+      localStorage.removeItem('cowd-auth-token');
+      throw new Error('Authentication required');
+    }
     if(!r.ok){const t=await r.text();throw new Error(t||`${r.status} ${r.statusText}`)}
     return r;
   }
@@ -22,6 +40,8 @@ window.Api = (()=>{
     get base(){return BASE},
     get sid(){return sid},
     set sid(v){sid=v},
+    get token(){return authToken},
+    set token(v){authToken=v;if(v)localStorage.setItem('cowd-auth-token',v);else localStorage.removeItem('cowd-auth-token')},
 
     // ── Sessions ──
     async listSessions(){const d=await req('GET','/api/sessions');return{sessions:(d||[]).map(s=>({id:s.id,title:s.title||'Session '+(s.id||'').slice(0,8),started_at:s.created_at||Date.now()/1000,model:s.model,input_tokens:s.input_tokens||0,output_tokens:s.output_tokens||0}))}},
@@ -34,9 +54,13 @@ window.Api = (()=>{
     getStreamUrl(id){return BASE+'/api/sessions/'+(id||sid)+'/messages/stream'},
 
     // ── Auth ──
-    async login(pw){return req('POST','/api/auth/login',{password:pw})},
+    async login(token){
+      const r=await req('POST','/api/auth/login',{token:token});
+      if(r.success&&r.token){authToken=r.token;localStorage.setItem('cowd-auth-token',r.token)}
+      return r;
+    },
     async verifyAuth(){return req('GET','/api/auth/verify')},
-    async logout(){return req('POST','/api/auth/logout')},
+    async logout(){authToken=null;localStorage.removeItem('cowd-auth-token');return req('POST','/api/auth/logout')},
 
     // ── Config ──
     async getConfig(){return req('GET','/api/config')},

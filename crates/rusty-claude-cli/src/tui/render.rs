@@ -2,12 +2,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
 };
 use super::app::{App, Panel};
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::default().direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(3)]).split(area);
@@ -108,7 +108,7 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(text).style(Style::default().bg(t.bg())), area);
 }
 
-fn draw_messages(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
     for msg in &app.messages {
         let (c, p) = match msg.role.as_str() { "user" => (Color::Green, "> "), "system" => (Color::DarkGray, "  "), _ => (Color::White, "") };
@@ -138,7 +138,48 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &App) {
     if app.messages.is_empty() && app.tool_cards.is_empty() {
         lines.push(Line::from(Span::styled("Type to start. /help /resume /exit", Style::default().fg(Color::DarkGray))));
     }
-    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+
+    let content_height = lines.len() as u16;
+    let viewport_height = area.height;
+
+    if app.auto_scroll && content_height > viewport_height {
+        app.scroll_offset = content_height.saturating_sub(viewport_height);
+    }
+
+    let scroll_offset = app.scroll_offset.min(content_height.saturating_sub(1));
+
+    let inner_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width.saturating_sub(1),
+        height: area.height,
+    };
+
+    let scrollbar_area = Rect {
+        x: area.right().saturating_sub(1),
+        y: area.y,
+        width: 1,
+        height: area.height,
+    };
+
+    frame.render_widget(Clear, area);
+
+    let paragraph = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset, 0));
+    frame.render_widget(paragraph, inner_area);
+
+    if content_height > viewport_height {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"))
+            .track_symbol(Some("│"))
+            .thumb_symbol("█");
+        let scroll_state = ScrollbarState::new(content_height as usize)
+            .position(scroll_offset as usize)
+            .viewport_content_length(viewport_height as usize);
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scroll_state.clone());
+    }
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) { frame.render_widget(&app.input, area); }

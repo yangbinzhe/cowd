@@ -7,6 +7,7 @@ mod bootstrap;
 mod init;
 mod render;
 mod server;
+mod suggestions;
 mod tui;
 
 use std::collections::BTreeSet;
@@ -82,24 +83,6 @@ const OFFICIAL_REPO_SLUG: &str = "ultraworkers/cowd-code";
 const DEPRECATED_INSTALL_COMMAND: &str = "cargo install cowd-code";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
-const CLI_OPTION_SUGGESTIONS: &[&str] = &[
-    "--help",
-    "-h",
-    "--version",
-    "-V",
-    "--model",
-    "--output-format",
-    "--permission-mode",
-    "--dangerously-skip-permissions",
-    "--yolo",
-    "--allowedTools",
-    "--allowed-tools",
-    "--resume",
-    "--print",
-    "--compact",
-    "--base-commit",
-    "-p",
-];
 
 type AllowedToolSet = BTreeSet<String>;
 type RuntimePluginStateBuildOutput = (
@@ -738,7 +721,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             other if rest.is_empty() && other.starts_with('-') => {
-                return Err(format_unknown_option(other))
+                return Err(suggestions::format_unknown_option(other))
             }
             other => {
                 rest.push(other.to_string());
@@ -1051,7 +1034,7 @@ fn parse_direct_slash_cli_action(
                 }),
             }
         }
-        Ok(Some(SlashCommand::Unknown(name))) => Err(format_unknown_direct_slash_command(&name)),
+        Ok(Some(SlashCommand::Unknown(name))) => Err(suggestions::format_unknown_direct_slash_command(&name)),
         Ok(Some(command)) => Err({
             let _ = command;
             format!(
@@ -1063,130 +1046,6 @@ fn parse_direct_slash_cli_action(
         Ok(None) => Err(format!("unknown subcommand: {}", rest[0])),
         Err(error) => Err(error.to_string()),
     }
-}
-
-fn format_unknown_option(option: &str) -> String {
-    let mut message = format!("unknown option: {option}");
-    if let Some(suggestion) = suggest_closest_term(option, CLI_OPTION_SUGGESTIONS) {
-        message.push_str("\nDid you mean ");
-        message.push_str(suggestion);
-        message.push('?');
-    }
-    message.push_str("\nRun `cowd --help` for usage.");
-    message
-}
-
-fn format_unknown_direct_slash_command(name: &str) -> String {
-    let mut message = format!("unknown slash command outside the REPL: /{name}");
-    if let Some(suggestions) = render_suggestion_line("Did you mean", &suggest_slash_commands(name))
-    {
-        message.push('\n');
-        message.push_str(&suggestions);
-    }
-    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
-        message.push('\n');
-        message.push_str(note);
-    }
-    message.push_str("\nRun `cowd --help` for CLI usage, or start `claw` and use /help.");
-    message
-}
-
-fn format_unknown_slash_command(name: &str) -> String {
-    let mut message = format!("Unknown slash command: /{name}");
-    if let Some(suggestions) = render_suggestion_line("Did you mean", &suggest_slash_commands(name))
-    {
-        message.push('\n');
-        message.push_str(&suggestions);
-    }
-    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
-        message.push('\n');
-        message.push_str(note);
-    }
-    message.push_str("\n  Help             /help lists available slash commands");
-    message
-}
-
-fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
-    name.starts_with("oh-my-claudecode:")
-        .then_some(
-            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
-        )
-}
-
-fn render_suggestion_line(label: &str, suggestions: &[String]) -> Option<String> {
-    (!suggestions.is_empty()).then(|| format!("  {label:<16} {}", suggestions.join(", "),))
-}
-
-fn suggest_slash_commands(input: &str) -> Vec<String> {
-    let mut candidates = slash_command_specs()
-        .iter()
-        .flat_map(|spec| {
-            std::iter::once(spec.name)
-                .chain(spec.aliases.iter().copied())
-                .map(|name| format!("/{name}"))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    let candidate_refs = candidates.iter().map(String::as_str).collect::<Vec<_>>();
-    ranked_suggestions(input.trim_start_matches('/'), &candidate_refs)
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-}
-
-fn suggest_closest_term<'a>(input: &str, candidates: &'a [&'a str]) -> Option<&'a str> {
-    ranked_suggestions(input, candidates).into_iter().next()
-}
-
-fn ranked_suggestions<'a>(input: &str, candidates: &'a [&'a str]) -> Vec<&'a str> {
-    let normalized_input = input.trim_start_matches('/').to_ascii_lowercase();
-    let mut ranked = candidates
-        .iter()
-        .filter_map(|candidate| {
-            let normalized_candidate = candidate.trim_start_matches('/').to_ascii_lowercase();
-            let distance = levenshtein_distance(&normalized_input, &normalized_candidate);
-            let prefix_bonus = usize::from(
-                !(normalized_candidate.starts_with(&normalized_input)
-                    || normalized_input.starts_with(&normalized_candidate)),
-            );
-            let score = distance + prefix_bonus;
-            (score <= 4).then_some((score, *candidate))
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| left.cmp(right).then_with(|| left.1.cmp(right.1)));
-    ranked
-        .into_iter()
-        .map(|(_, candidate)| candidate)
-        .take(3)
-        .collect()
-}
-
-fn levenshtein_distance(left: &str, right: &str) -> usize {
-    if left.is_empty() {
-        return right.chars().count();
-    }
-    if right.is_empty() {
-        return left.chars().count();
-    }
-
-    let right_chars = right.chars().collect::<Vec<_>>();
-    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
-    let mut current = vec![0; right_chars.len() + 1];
-
-    for (left_index, left_char) in left.chars().enumerate() {
-        current[0] = left_index + 1;
-        for (right_index, right_char) in right_chars.iter().enumerate() {
-            let substitution_cost = usize::from(left_char != *right_char);
-            current[right_index + 1] = (previous[right_index + 1] + 1)
-                .min(current[right_index] + 1)
-                .min(previous[right_index] + substitution_cost);
-        }
-        previous.clone_from(&current);
-    }
-
-    previous[right_chars.len()]
 }
 
 fn resolve_model_alias(model: &str) -> &str {
@@ -2552,14 +2411,14 @@ impl GitWorkspaceSummary {
 
 #[cfg(test)]
 fn format_unknown_slash_command_message(name: &str) -> String {
-    let suggestions = suggest_slash_commands(name);
+    let suggestions = suggestions::suggest_slash_commands(name);
     let mut message = format!("unknown slash command: /{name}.");
     if !suggestions.is_empty() {
         message.push_str(" Did you mean ");
         message.push_str(&suggestions.join(", "));
         message.push('?');
     }
-    if let Some(note) = omc_compatibility_note_for_unknown_slash_command(name) {
+    if let Some(note) = suggestions::omc_compatibility_note_for_unknown_slash_command(name) {
         message.push(' ');
         message.push_str(note);
     }
@@ -3077,7 +2936,7 @@ fn run_resume_command(
                 })),
             })
         }
-        SlashCommand::Unknown(name) => Err(format_unknown_slash_command(name).into()),
+        SlashCommand::Unknown(name) => Err(suggestions::format_unknown_slash_command(name).into()),
         // /session list can be served from the sessions directory without a live session.
         SlashCommand::Session {
             action: Some(ref act),
@@ -3383,7 +3242,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
     let res = (|| -> Result<(), Box<dyn std::error::Error>> {
         loop {
-            terminal.draw(|f| tui::render::draw(f, &app))?;
+            terminal.draw(|f| tui::render::draw(f, &mut app))?;
 
             match tui::input::handle_input(&mut app)? {
                 tui::input::InputResult::Submit(text) => {
@@ -3401,7 +3260,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                     }
                     app.add_message("user", &text);
                     app.is_loading = true;
-                    terminal.draw(|f| tui::render::draw(f, &app))?;
+                    terminal.draw(|f| tui::render::draw(f, &mut app))?;
 
                     match cli.run_turn(&text) {
                         Ok(()) => {
@@ -4394,7 +4253,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Unknown(name) => {
-                eprintln!("{}", format_unknown_slash_command(&name));
+                eprintln!("{}", suggestions::format_unknown_slash_command(&name));
                 false
             }
         })
@@ -8708,7 +8567,7 @@ mod tests {
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        format_ultraplan_report, suggestions::format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
@@ -11139,7 +10998,7 @@ UU conflicted.rs",
 
     #[test]
     fn unknown_slash_command_guidance_suggests_nearby_commands() {
-        let message = format_unknown_slash_command("stats");
+        let message = crate::suggestions::format_unknown_slash_command("stats");
         assert!(message.contains("Unknown slash command: /stats"));
         assert!(message.contains("/status"));
         assert!(message.contains("/help"));
@@ -11147,7 +11006,7 @@ UU conflicted.rs",
 
     #[test]
     fn unknown_omc_slash_command_guidance_explains_runtime_gap() {
-        let message = format_unknown_slash_command("oh-my-claudecode:hud");
+        let message = crate::suggestions::format_unknown_slash_command("oh-my-claudecode:hud");
         assert!(message.contains("Unknown slash command: /oh-my-claudecode:hud"));
         assert!(message.contains("Claude Code/OMC plugin command"));
         assert!(message.contains("does not yet load plugin slash commands"));

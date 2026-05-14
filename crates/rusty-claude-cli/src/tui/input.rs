@@ -30,6 +30,16 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                     Ok(InputResult::Submit(text))
                 }
                 KeyCode::Tab => { app.next_panel(); Ok(InputResult::Nothing) }
+                KeyCode::PageUp => {
+                    app.auto_scroll = false;
+                    app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                    Ok(InputResult::Nothing)
+                }
+                KeyCode::PageDown => {
+                    app.scroll_offset = app.scroll_offset.saturating_add(10);
+                    app.auto_scroll = true;
+                    Ok(InputResult::Nothing)
+                }
                 KeyCode::Char('t') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
                     app.theme.toggle(); Ok(InputResult::Nothing)
                 }

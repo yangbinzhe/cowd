@@ -159,34 +159,6 @@ window.Messages = (()=>{
     }
   }
 
-  function handleLine(line){
-    if(!line.startsWith('data: '))return;
-    const payload=line.slice(6);
-    if(payload==='[DONE]')return;
-    try{
-      const data=JSON.parse(payload);
-      dispatch(data);
-    }catch(e){}
-  }
-
-  function dispatch(data){
-    if(callbacks.all)callbacks.all(data);
-    switch(data.type||data.event){
-      case'messageDelta':case'content_block_delta':
-        handleMessageDelta(data);break;
-      case'tool_use':case'content_block_start':
-        handleToolUse(data);break;
-      case'tool_result':case'tool_complete':
-        handleToolResult(data);break;
-      case'messageStop':case'message_stop':
-        handleMessageStop(data);break;
-      case'thinking':case'reasoning':
-        handleThinking(data);break;
-      default:
-        if(callbacks.default)callbacks.default(data);
-    }
-  }
-
   function handleMessageDelta(data){
     const delta=data.delta||data.text||'';
     const el=activeStreamEl||getOrCreateStreamEl();

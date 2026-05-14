@@ -1,5 +1,18 @@
-window.addEventListener('DOMContentLoaded',function(){
+window.addEventListener('DOMContentLoaded',async function(){
   applyTheme();
+
+  if(!Api.token){
+    showLoginModal();
+    return;
+  }
+  try{
+    await Api.verifyAuth();
+  }catch(e){
+    Api.token=null;
+    showLoginModal();
+    return;
+  }
+
   Sessions.load();
   loadModelSelector();
 
@@ -140,3 +153,40 @@ async function loadModelSelector(){
     });
   }
 }
+
+window.showLoginModal = function(){
+  var modal = document.getElementById('login-modal');
+  if(!modal) return;
+  modal.classList.remove('hidden');
+  var input = document.getElementById('login-token');
+  var errEl = document.getElementById('login-error');
+  if(input) input.focus();
+  if(errEl) errEl.style.display = 'none';
+
+  var btn = document.getElementById('btn-login');
+  if(btn) btn.onclick = async function(){
+    var token = input ? input.value.trim() : '';
+    if(!token){
+      if(errEl){errEl.textContent='Token is required';errEl.style.display='block'}
+      return;
+    }
+    try{
+      var r = await Api.login(token);
+      if(r.success){
+        modal.classList.add('hidden');
+        Sessions.load();
+        loadModelSelector();
+      }else{
+        if(errEl){errEl.textContent=r.message||'Login failed';errEl.style.display='block'}
+      }
+    }catch(e){
+      if(errEl){errEl.textContent=e.message;errEl.style.display='block'}
+    }
+  };
+
+  if(input){
+    input.addEventListener('keydown', function(e){
+      if(e.key==='Enter') btn && btn.click();
+    });
+  }
+};

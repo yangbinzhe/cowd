@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 config = { path = "../config" }
-memory = { path = "../memory" }
+memory = { package = "cowd-memory", path = "../memory" }
 memory-light = { path = "../memory-light" }
 async-trait = "0.1"
 base64 = "0.22"

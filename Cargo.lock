@@ -320,7 +320,7 @@ name = "commands"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "memory",
+ "cowd-memory",
  "plugins",
  "regex",
  "runtime",
@@ -389,6 +389,27 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "cowd-memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "config",
+ "parking_lot",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+ "walkdir",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -1422,27 +1443,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "memory"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "config",
- "parking_lot",
- "regex",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "uuid",
- "walkdir",
-]
-
-[[package]]
 name = "memory-light"
 version = "0.1.0"
 dependencies = [
@@ -2083,12 +2083,12 @@ dependencies = [
  "cbc",
  "chrono",
  "config",
+ "cowd-memory",
  "futures",
  "glob",
  "imap",
  "lettre",
  "mail-parser",
- "memory",
  "memory-light",
  "native-tls",
  "plugins",
@@ -2212,9 +2212,9 @@ dependencies = [
  "chrono",
  "commands",
  "compat-harness",
+ "cowd-memory",
  "crossterm",
  "futures",
- "memory",
  "mock-anthropic-service",
  "plugins",
  "pulldown-cmark",

@@ -43,16 +43,15 @@
 
 <main id="chat">
   <div id="chat-header">
-    <div id="chat-header-left">
-      <select id="model-selector" class="model-picker" title="Select model"></select>
-      <span id="token-usage">0 tk</span>
-    </div>
-    <div id="chat-header-right">
-      <span id="token-usage" style="font-size:12px;margin-right:8px">0 tk</span>
-      <span id="cost-display" style="font-size:12px;color:var(--text3);margin-right:12px"></span>
-      <span id="connection-status" style="font-size:11px;margin-right:12px">Disconnected</span>
-      <button id="btn-toggle-panel" class="btn-icon" title="Toggle Panel">&xllcor;</button>
-    </div>
+  <div id="chat-header-left">
+    <select id="model-selector" class="model-picker" title="Select model"></select>
+    <span id="token-usage">0 tk</span>
+  </div>
+  <div id="chat-header-right">
+    <span id="cost-display" style="font-size:12px;color:var(--text3);margin-right:12px"></span>
+    <span id="connection-status" style="font-size:11px;margin-right:12px">Disconnected</span>
+    <button id="btn-toggle-panel" class="btn-icon" title="Toggle Panel">&xllcor;</button>
+  </div>
   </div>
   <div id="chat-messages"></div>
   <div id="streaming-msg" class="message assistant streaming hidden"></div>
@@ -100,6 +99,21 @@
 </div>
 
 <div id="toast"></div>
+
+<div id="login-modal" class="modal-overlay hidden">
+  <div class="modal-box" style="width:360px;max-width:90vw">
+    <div class="modal-header">
+      <h2>Cowd Login</h2>
+    </div>
+    <div style="padding:20px">
+      <p style="font-size:13px;color:var(--text2);margin-bottom:12px">Enter your auth token to connect.</p>
+      <input id="login-token" type="password" placeholder="Auth token" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:14px;margin-bottom:12px">
+      <div id="login-error" style="font-size:12px;color:var(--error);margin-bottom:8px;display:none"></div>
+      <button id="btn-login" class="btn-primary" style="width:100%">Login</button>
+      <p style="font-size:11px;color:var(--text3);margin-top:12px;text-align:center">Token is stored in config.yaml under gateway → api_server → auth</p>
+    </div>
+  </div>
+</div>
 
 <script src="api.js"></script>
 <script src="state.js"></script>

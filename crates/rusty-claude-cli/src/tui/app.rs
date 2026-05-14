@@ -55,6 +55,8 @@ pub struct App {
     pub skill_list: Vec<SkillSummary>,
     pub skin: crate::tui::skin::SkinConfig,
     pub memory_status: Option<String>,
+    pub scroll_offset: u16,
+    pub auto_scroll: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +154,8 @@ impl App {
             skill_list: Vec::new(),
             skin: crate::tui::skin::SkinConfig::default(),
             memory_status: None,
+            scroll_offset: 0,
+            auto_scroll: true,
         }
     }
 

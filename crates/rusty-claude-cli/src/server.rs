@@ -1107,6 +1107,14 @@ impl OpenAiApiClient {
                         SessionContentBlock::Text { text } => {
                             Some(InputContentBlock::Text { text: text.clone() })
                         }
+                        // DeepSeek thinking mode: reasoning_content must be passed back
+                        // in subsequent requests. Convert Thinking blocks to InputContentBlock.
+                        SessionContentBlock::Thinking { thinking } => {
+                            Some(InputContentBlock::Thinking {
+                                thinking: thinking.clone(),
+                                signature: None,
+                            })
+                        }
                         _ => None, // Skip tool use/result blocks for OpenAI API
                     })
                     .collect();

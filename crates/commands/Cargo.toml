@@ -9,7 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-memory = { path = "../memory" }
+memory = { package = "cowd-memory", path = "../memory" }
 plugins = { path = "../plugins" }
 regex = "1"
 runtime = { path = "../runtime" }
