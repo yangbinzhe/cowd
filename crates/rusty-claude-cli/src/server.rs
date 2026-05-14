@@ -134,7 +134,7 @@ struct ModelUsageAccum {
 /// Thread-safe global usage tracker that records token usage per model.
 #[derive(Debug, Default)]
 struct GlobalUsageTracker {
-    by_model: std::sync::Mutex<HashMap<String, ModelUsageAccum>>,
+    by_model: std::sync::RwLock<HashMap<String, ModelUsageAccum>>,
     total_sessions: std::sync::atomic::AtomicU64,
 }
 
@@ -145,7 +145,7 @@ impl GlobalUsageTracker {
 
     fn record(&self, model: &str, usage: runtime::TokenUsage) {
         self.total_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut map = self.by_model.lock().unwrap_or_else(|poisoned| {
+        let mut map = self.by_model.write().unwrap_or_else(|poisoned| {
             tracing::warn!("usage tracker lock poisoned; recovering");
             poisoned.into_inner()
         });
@@ -158,7 +158,7 @@ impl GlobalUsageTracker {
     }
 
     fn snapshot(&self) -> UsageResponse {
-        let map = self.by_model.lock().unwrap_or_else(|poisoned| {
+        let map = self.by_model.read().unwrap_or_else(|poisoned| {
             tracing::warn!("usage tracker lock poisoned; recovering");
             poisoned.into_inner()
         });

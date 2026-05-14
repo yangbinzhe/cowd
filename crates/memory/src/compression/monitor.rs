@@ -18,7 +18,7 @@
 //! immediately, bypassing the debounce counter.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use chrono::Utc;
 
@@ -57,7 +57,7 @@ pub struct ContextWindowMonitor {
     /// Number of tool-call ticks since the last alert was emitted.
     tool_calls_since_alert: AtomicU32,
     /// The alert level observed on the previous `check` call.
-    last_level: Mutex<AlertLevel>,
+    last_level: RwLock<AlertLevel>,
 }
 
 impl ContextWindowMonitor {
@@ -91,7 +91,7 @@ impl ContextWindowMonitor {
             critical_threshold: critical_remaining,
             debounce_interval,
             tool_calls_since_alert: AtomicU32::new(0),
-            last_level: Mutex::new(AlertLevel::Normal),
+            last_level: RwLock::new(AlertLevel::Normal),
         }
     }
 
@@ -135,7 +135,7 @@ impl ContextWindowMonitor {
         // Fetch the previous level (acquire the lock briefly).
         let mut last_guard = self
             .last_level
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| {
                 tracing::warn!("ContextWindowMonitor last_level lock poisoned; recovering");
                 poisoned.into_inner()
@@ -173,7 +173,7 @@ impl ContextWindowMonitor {
     /// Reset the debounce counter and last-level state.
     pub fn reset(&self) {
         self.tool_calls_since_alert.store(0, Ordering::Relaxed);
-        if let Ok(mut l) = self.last_level.lock() {
+        if let Ok(mut l) = self.last_level.write() {
             *l = AlertLevel::Normal;
         }
     }

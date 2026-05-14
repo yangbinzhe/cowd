@@ -1156,32 +1156,6 @@ impl MemoryStore for SqliteStore {
         .await
         .map_err(|e| MemoryError::Store(e.to_string()))?
     }
-            let conn = store.conn()?;
-            let (entries, snippets, total) = Self::do_search_fts_advanced(
-                &conn,
-                &sanitized,
-                category_str.as_deref(),
-                layer_int,
-                limit,
-                options.with_snippets,
-            )?;
-
-            let keywords = if options.with_keywords {
-                Self::do_extract_keywords(&conn, &sanitized).unwrap_or_default()
-            } else {
-                vec![]
-            };
-
-            Ok(FtsSearchResult {
-                entries,
-                snippets,
-                total_matches: total,
-                keywords,
-            })
-        })
-        .await
-        .map_err(|e| MemoryError::Store(e.to_string()))?
-    }
 
     /// Vector search is not supported by this backend; always returns an empty
     /// list.  Use a dedicated `VectorIndex` backend for ANN queries.

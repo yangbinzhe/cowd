@@ -1,9 +1,9 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::SystemTime;
 
 pub struct CachedSystemPrompt {
-    inner: Mutex<CacheInner>,
+    inner: RwLock<CacheInner>,
 }
 
 struct CacheInner {
@@ -27,7 +27,7 @@ impl CachedSystemPrompt {
             .ok().and_then(|v| v.parse().ok()).unwrap_or(50);
         let memory_delta_threshold: usize = std::env::var("COWD_PROMPT_CACHE_MEMORY_DELTA")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-        Self { inner: Mutex::new(CacheInner {
+        Self { inner: RwLock::new(CacheInner {
             cached_prompt: Vec::new(), config_path, identity_path,
             config_mtime: None, identity_mtime: None,
             memory_high_count: 0, turns_since_rebuild: 0,
@@ -36,7 +36,7 @@ impl CachedSystemPrompt {
     }
 
     pub fn needs_rebuild(&self, current_memory_high: usize) -> bool {
-        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let mut inner = self.inner.write().unwrap_or_else(|poisoned| {
             tracing::warn!("CachedSystemPrompt lock poisoned in needs_rebuild, recovering");
             poisoned.into_inner()
         });
@@ -59,7 +59,7 @@ impl CachedSystemPrompt {
     }
 
     pub fn rebuild(&self, prompt: Vec<String>, memory_high_count: usize) {
-        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let mut inner = self.inner.write().unwrap_or_else(|poisoned| {
             tracing::warn!("CachedSystemPrompt lock poisoned in rebuild, recovering");
             poisoned.into_inner()
         });
@@ -69,7 +69,7 @@ impl CachedSystemPrompt {
     }
 
     pub fn get(&self) -> Vec<String> {
-        self.inner.lock().unwrap_or_else(|poisoned| {
+        self.inner.read().unwrap_or_else(|poisoned| {
             tracing::warn!("CachedSystemPrompt lock poisoned in get, recovering");
             poisoned.into_inner()
         })
@@ -78,7 +78,7 @@ impl CachedSystemPrompt {
     }
 
     pub fn memory_high_count(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|poisoned| {
+        self.inner.read().unwrap_or_else(|poisoned| {
             tracing::warn!("CachedSystemPrompt lock poisoned in memory_high_count, recovering");
             poisoned.into_inner()
         })

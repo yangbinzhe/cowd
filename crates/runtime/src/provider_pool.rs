@@ -2,6 +2,7 @@
 // Derived from GenericAgent's next_llm() + hermes-agent's adapter pattern.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
 use std::pin::Pin;
 use futures::stream::Stream;
 use crate::conversation::{ApiClient, ApiRequest, AssistantEvent, RuntimeError};
@@ -10,11 +11,11 @@ pub struct ProviderPool {
     clients: Vec<Box<dyn ApiClient + Send>>,
     current: AtomicUsize,
     /// M5-L1-2: conversation history preserved across provider rotations
-    history: std::sync::Mutex<Vec<String>>,
+    history: RwLock<Vec<String>>,
 }
 
 impl ProviderPool {
-    pub fn new() -> Self { Self { clients: Vec::new(), current: AtomicUsize::new(0), history: std::sync::Mutex::new(Vec::new()) } }
+    pub fn new() -> Self { Self { clients: Vec::new(), current: AtomicUsize::new(0), history: RwLock::new(Vec::new()) } }
 
     pub fn add(&mut self, client: Box<dyn ApiClient + Send>) { self.clients.push(client); }
 
@@ -28,12 +29,12 @@ impl ProviderPool {
 
     /// M5-L1-2: Save history before switching providers
     pub fn save_history(&self, messages: Vec<String>) {
-        if let Ok(mut h) = self.history.lock() { *h = messages; }
+        if let Ok(mut h) = self.history.write() { *h = messages; }
     }
 
     /// M5-L1-2: Retrieve preserved history after rotation
     pub fn history_len(&self) -> usize {
-        self.history.lock().map(|h| h.len()).unwrap_or(0)
+        self.history.read().map(|h| h.len()).unwrap_or(0)
     }
     pub fn len(&self) -> usize { self.clients.len() }
     pub fn is_empty(&self) -> bool { self.clients.is_empty() }
