@@ -272,3 +272,159 @@ fn estimate_tokens(content: &str) -> u64 {
 fn rel_path<'a>(path: &'a Path, root: &Path) -> &'a Path {
     path.strip_prefix(root).unwrap_or(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DriftConfig;
+    use crate::store::sqlite::SqliteStore;
+
+    fn in_memory() -> Arc<dyn MemoryStore> {
+        Arc::new(SqliteStore::open_in_memory().unwrap())
+    }
+
+    #[tokio::test]
+    async fn new_has_no_workspace_root() {
+        let layer = ProjectLayer::new(in_memory());
+        let files = layer.discover_project_context().await.unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_workspace_can_discover_context() {
+        let drift = DriftConfig::default();
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("COWD.md"), "Test project.").unwrap();
+
+        let layer = ProjectLayer::with_workspace(in_memory(), tmp.path().to_path_buf(), 500, drift);
+        assert_eq!(layer.max_tokens, 500);
+        let files = layer.discover_project_context().await.unwrap();
+        assert!(!files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_creates_entry() {
+        let layer = ProjectLayer::new(in_memory());
+        let id = layer
+            .add(
+                MemoryCategory::ProjectConvention,
+                "coding-standard",
+                "Use 4 spaces",
+                Priority::High,
+                MemorySource::Import,
+                vec!["style".into()],
+                Some("repo-1".into()),
+            )
+            .await
+            .unwrap();
+
+        let entries = layer.load().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, id);
+        assert_eq!(entries[0].layer, MemoryLayer::L2);
+        assert_eq!(entries[0].category, MemoryCategory::ProjectConvention);
+        assert_eq!(entries[0].title, "coding-standard");
+        assert_eq!(entries[0].scope.as_deref(), Some("repo-1"));
+    }
+
+    #[tokio::test]
+    async fn insert_overrides_layer_to_l2() {
+        let layer = ProjectLayer::new(in_memory());
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4(), layer: MemoryLayer::L1, category: MemoryCategory::Decision,
+            priority: Priority::Normal, source: MemorySource::AutoExtracted,
+            title: "t".into(), content: "c".into(), embedding: None,
+            tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
+            staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            last_accessed_at: None, scope: None, session_id: None,
+        };
+        let id = layer.insert(entry).await.unwrap();
+        let loaded = layer.load().await.unwrap().into_iter().find(|e| e.id == id).unwrap();
+        assert_eq!(loaded.layer, MemoryLayer::L2);
+    }
+
+    #[tokio::test]
+    async fn discover_project_context_finds_cowd_md() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cowd_md = tmp.path().join("COWD.md");
+        std::fs::write(&cowd_md, "# Project\n\nA test project.").unwrap();
+
+        let layer = ProjectLayer::with_workspace(
+            in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
+        );
+        let files = layer.discover_project_context().await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "COWD.md");
+        assert!(files[0].1.contains("Project"));
+    }
+
+    #[tokio::test]
+    async fn discover_project_context_skips_empty_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("COWD.md"), "").unwrap();
+
+        let layer = ProjectLayer::with_workspace(
+            in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
+        );
+        let files = layer.discover_project_context().await.unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discover_project_context_returns_empty_without_workspace() {
+        let layer = ProjectLayer::new(in_memory());
+        let files = layer.discover_project_context().await.unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_project_context_creates_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("COWD.md"), "Test project.").unwrap();
+
+        let layer = ProjectLayer::with_workspace(
+            in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
+        );
+        let ids = layer.ingest_project_context(Some("p1".into())).await.unwrap();
+        assert_eq!(ids.len(), 1);
+
+        let entries = layer.load().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "project:COWD.md");
+    }
+
+    #[tokio::test]
+    async fn ingest_project_context_skips_already_ingested() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("COWD.md"), "Test.").unwrap();
+
+        let layer = ProjectLayer::with_workspace(
+            in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
+        );
+        let ids1 = layer.ingest_project_context(None).await.unwrap();
+        assert_eq!(ids1.len(), 1);
+        let ids2 = layer.ingest_project_context(None).await.unwrap();
+        assert!(ids2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_prunes_stale_low_priority() {
+        let drift = DriftConfig {
+            staleness_decay_per_day: 0.9,
+            prune_threshold: 0.5,
+            ..Default::default()
+        };
+        let layer = ProjectLayer::with_workspace(in_memory(), std::path::PathBuf::from("/tmp/test"), 3000, drift);
+        layer
+            .add(MemoryCategory::ProjectConvention, "T", "C", Priority::Low, MemorySource::Import, vec![], None)
+            .await
+            .unwrap();
+        layer.tick().await.unwrap();
+        assert!(layer.load().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn layer_returns_l2() {
+        assert_eq!(ProjectLayer::new(in_memory()).layer(), MemoryLayer::L2);
+    }
+}

@@ -1186,3 +1186,264 @@ impl MemoryStore for SqliteStore {
         .map_err(|e| MemoryError::Store(e.to_string()))?
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority};
+    use uuid::Uuid;
+
+    fn uid(s: &str) -> Uuid {
+        // Use deterministic UUIDs from known strings for stable test IDs
+        let bytes = s.as_bytes();
+        let mut buf = [0u8; 16];
+        for (i, &b) in bytes.iter().take(16).enumerate() {
+            buf[i] = b;
+        }
+        Uuid::from_bytes(buf)
+    }
+
+    fn entry(id_suffix: &str, title: &str, content: &str, layer: MemoryLayer) -> MemoryEntry {
+        use chrono::Utc;
+        MemoryEntry {
+            id: uid(id_suffix),
+            layer,
+            category: MemoryCategory::Decision,
+            priority: Priority::Normal,
+            source: MemorySource::AutoExtracted,
+            title: title.into(),
+            content: content.into(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_accessed_at: None,
+            scope: None,
+            session_id: None,
+        }
+    }
+
+    fn open_store() -> SqliteStore {
+        SqliteStore::open_in_memory().unwrap()
+    }
+
+    #[tokio::test]
+    async fn insert_and_get_roundtrip() {
+        let store = open_store();
+        let id = uid("roundtrip");
+        let e = entry("roundtrip", "Test", "Some content", MemoryLayer::L1);
+        store.insert(&e).await.unwrap();
+
+        let got = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.title, "Test");
+        assert_eq!(got.content, "Some content");
+        assert_eq!(got.layer, MemoryLayer::L1);
+    }
+
+    #[tokio::test]
+    async fn insert_or_replace() {
+        let store = open_store();
+        let id = uid("replace");
+        let e1 = entry("replace", "V1", "C1", MemoryLayer::L1);
+        store.insert(&e1).await.unwrap();
+
+        let mut e2 = entry("replace", "V2", "C2", MemoryLayer::L1);
+        e2.id = id;
+        store.insert(&e2).await.unwrap();
+
+        let got = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.title, "V2");
+        assert_eq!(got.content, "C2");
+    }
+
+    #[tokio::test]
+    async fn get_returns_none_for_missing() {
+        let store = open_store();
+        let fake = Uuid::new_v4();
+        assert!(store.get(&fake).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_modifies_existing() {
+        let store = open_store();
+        let e = entry("update", "Original", "Old", MemoryLayer::L1);
+        let id = e.id;
+        store.insert(&e).await.unwrap();
+
+        let mut updated = e.clone();
+        updated.content = "New content".into();
+        updated.staleness = 0.5;
+        store.update(&updated).await.unwrap();
+
+        let got = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.content, "New content");
+        assert_eq!(got.staleness, 0.5);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_entry() {
+        let store = open_store();
+        let e = entry("delete", "T", "C", MemoryLayer::L1);
+        let id = e.id;
+        store.insert(&e).await.unwrap();
+        assert!(store.get(&id).await.unwrap().is_some());
+
+        store.delete(&id).await.unwrap();
+        assert!(store.get(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_idempotent() {
+        let store = open_store();
+        store.delete(&Uuid::new_v4()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_by_layer_filters_correctly() {
+        let store = open_store();
+        store.insert(&entry("a", "A", "aa", MemoryLayer::L1)).await.unwrap();
+        store.insert(&entry("b", "B", "bb", MemoryLayer::L2)).await.unwrap();
+        store.insert(&entry("c", "C", "cc", MemoryLayer::L1)).await.unwrap();
+
+        let l1 = store.search_by_layer(MemoryLayer::L1).await.unwrap();
+        assert_eq!(l1.len(), 2);
+
+        let l2 = store.search_by_layer(MemoryLayer::L2).await.unwrap();
+        assert_eq!(l2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_by_category_returns_matching() {
+        let store = open_store();
+        let mut e1 = entry("cat_a", "A", "aa", MemoryLayer::L1);
+        e1.category = MemoryCategory::Decision;
+        let e1_id = e1.id;
+        let mut e2 = entry("cat_b", "B", "bb", MemoryLayer::L1);
+        e2.category = MemoryCategory::Reference;
+        store.insert(&e1).await.unwrap();
+        store.insert(&e2).await.unwrap();
+
+        let decisions = store.search_by_category(MemoryCategory::Decision).await.unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].id, e1_id);
+    }
+
+    #[tokio::test]
+    async fn search_fts_finds_by_content() {
+        let store = open_store();
+        let e1 = entry("fts1", "Rust Guide", "Learn Rust programming language", MemoryLayer::L1);
+        let e1_id = e1.id;
+        store.insert(&e1).await.unwrap();
+        store.insert(&entry("fts2", "Python Notes", "Data science with Python", MemoryLayer::L1)).await.unwrap();
+
+        let results = store.search_fts("Rust", 10).await.unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id, e1_id);
+    }
+
+    #[tokio::test]
+    async fn search_fts_returns_empty_for_no_match() {
+        let store = open_store();
+        store.insert(&entry("fts3", "Rust", "content", MemoryLayer::L1)).await.unwrap();
+
+        let results = store.search_fts("zzzzzzzzzzzz", 10).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_metas_returns_summaries() {
+        let store = open_store();
+        let e = entry("meta1", "A", "aa", MemoryLayer::L1);
+        let id = e.id;
+        store.insert(&e).await.unwrap();
+
+        let metas = store.list_metas(Some(MemoryLayer::L1)).await.unwrap();
+        assert!(!metas.is_empty());
+        assert_eq!(metas[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn list_metas_all_layers() {
+        let store = open_store();
+        store.insert(&entry("meta2", "A", "aa", MemoryLayer::L1)).await.unwrap();
+        store.insert(&entry("meta3", "B", "bb", MemoryLayer::L2)).await.unwrap();
+
+        let metas = store.list_metas(None).await.unwrap();
+        assert_eq!(metas.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_all_returns_all_entries() {
+        let store = open_store();
+        store.insert(&entry("all1", "A", "aa", MemoryLayer::L1)).await.unwrap();
+        store.insert(&entry("all2", "B", "bb", MemoryLayer::L2)).await.unwrap();
+
+        let all = store.list_all().await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_meta_returns_metadata() {
+        let store = open_store();
+        let e = entry("getmeta", "A", "aa", MemoryLayer::L1);
+        let id = e.id;
+        store.insert(&e).await.unwrap();
+
+        let meta = store.get_meta(&id).await.unwrap().unwrap();
+        assert_eq!(meta.id, id);
+    }
+
+    #[tokio::test]
+    async fn get_meta_returns_none_for_missing() {
+        let store = open_store();
+        assert!(store.get_meta(&Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn insert_preserves_all_fields() {
+        let store = open_store();
+        let now = chrono::Utc::now();
+        let id = Uuid::new_v4();
+        let e = MemoryEntry {
+            id,
+            layer: MemoryLayer::L3,
+            category: MemoryCategory::CompressedSummary,
+            priority: Priority::High,
+            source: MemorySource::Compression,
+            title: "Full Entry".into(),
+            content: "All fields present".into(),
+            embedding: Some(vec![1.0, 2.0, 3.0]),
+            tags: vec!["rust".into(), "async".into()],
+            relations: vec![],
+            confidence: 0.85,
+            access_count: 5,
+            staleness: 0.1,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: Some(now),
+            scope: Some("project-1".into()),
+            session_id: Some("session-1".into()),
+        };
+        store.insert(&e).await.unwrap();
+
+        let got = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.id, id);
+        assert_eq!(got.layer, MemoryLayer::L3);
+        assert_eq!(got.category, MemoryCategory::CompressedSummary);
+        assert_eq!(got.priority, Priority::High);
+        assert_eq!(got.source, MemorySource::Compression);
+        assert_eq!(got.title, "Full Entry");
+        assert_eq!(got.content, "All fields present");
+        assert_eq!(got.confidence, 0.85);
+        assert_eq!(got.access_count, 5);
+        assert_eq!(got.staleness, 0.1);
+        assert_eq!(got.tags, vec!["rust", "async"]);
+        assert_eq!(got.scope.as_deref(), Some("project-1"));
+        assert_eq!(got.session_id.as_deref(), Some("session-1"));
+        assert!(got.embedding.is_some());
+    }
+}

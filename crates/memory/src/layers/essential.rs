@@ -209,3 +209,182 @@ fn truncate_to_budget(mut entries: Vec<MemoryEntry>, max_tokens: u64) -> Vec<Mem
 fn estimate_tokens(content: &str) -> u64 {
     (content.len() as u64).div_ceil(4)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DriftConfig;
+    use crate::store::sqlite::SqliteStore;
+
+    fn in_memory() -> Arc<dyn MemoryStore> {
+        Arc::new(SqliteStore::open_in_memory().unwrap())
+    }
+
+    #[test]
+    fn new_uses_default_max_tokens() {
+        let layer = EssentialLayer::new(in_memory());
+        assert_eq!(layer.max_tokens, 2000);
+    }
+
+    #[test]
+    fn with_config_sets_custom_parameters() {
+        let drift = DriftConfig {
+            staleness_decay_per_day: 0.05,
+            prune_threshold: 0.5,
+            ..Default::default()
+        };
+        let layer = EssentialLayer::with_config(in_memory(), 500, drift);
+        assert_eq!(layer.max_tokens, 500);
+    }
+
+    #[tokio::test]
+    async fn add_creates_entry_with_fields() {
+        let layer = EssentialLayer::new(in_memory());
+        let id = layer
+            .add(
+                MemoryCategory::Decision,
+                "Task",
+                "Implement login",
+                Priority::High,
+                MemorySource::UserExplicit,
+                vec!["auth".into()],
+                Some("s1".into()),
+            )
+            .await
+            .unwrap();
+
+        let entries = layer.load().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.id, id);
+        assert_eq!(e.layer, MemoryLayer::L1);
+        assert_eq!(e.category, MemoryCategory::Decision);
+        assert_eq!(e.priority, Priority::High);
+        assert_eq!(e.tags, vec!["auth"]);
+        assert_eq!(e.scope.as_deref(), Some("s1"));
+    }
+
+    #[tokio::test]
+    async fn update_modifies_content_and_resets_staleness() {
+        let layer = EssentialLayer::new(in_memory());
+        let id = layer
+            .add(MemoryCategory::Decision, "T", "old", Priority::Normal, MemorySource::AutoExtracted, vec![], None)
+            .await
+            .unwrap();
+        layer.update(&id, "new content here").await.unwrap();
+        let entries = layer.load().await.unwrap();
+        assert_eq!(entries[0].content, "new content here");
+        assert_eq!(entries[0].staleness, 0.0);
+    }
+
+    #[tokio::test]
+    async fn insert_overrides_layer_to_l1() {
+        let layer = EssentialLayer::new(in_memory());
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4(), layer: MemoryLayer::L3, category: MemoryCategory::Decision,
+            priority: Priority::Normal, source: MemorySource::AutoExtracted,
+            title: "t".into(), content: "c".into(), embedding: None,
+            tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
+            staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            last_accessed_at: None, scope: None, session_id: None,
+        };
+        let id = layer.insert(entry).await.unwrap();
+        let loaded = layer.load().await.unwrap().into_iter().find(|e| e.id == id).unwrap();
+        assert_eq!(loaded.layer, MemoryLayer::L1);
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_entry() {
+        let layer = EssentialLayer::new(in_memory());
+        let id = layer
+            .add(MemoryCategory::Decision, "T", "C", Priority::Normal, MemorySource::AutoExtracted, vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(layer.load().await.unwrap().len(), 1);
+        layer.remove(&id).await.unwrap();
+        assert_eq!(layer.load().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tick_applies_staleness_decay() {
+        let drift = DriftConfig {
+            staleness_decay_per_day: 0.1,
+            prune_threshold: 0.9,
+            ..Default::default()
+        };
+        let layer = EssentialLayer::with_config(in_memory(), 2000, drift);
+        layer
+            .add(MemoryCategory::Decision, "T", "C", Priority::High, MemorySource::AutoExtracted, vec![], None)
+            .await
+            .unwrap();
+        layer.tick().await.unwrap();
+        let entries = layer.load().await.unwrap();
+        assert_eq!(entries[0].staleness, 0.1);
+    }
+
+    #[tokio::test]
+    async fn tick_prunes_stale_low_priority_entries() {
+        let drift = DriftConfig {
+            staleness_decay_per_day: 0.9,
+            prune_threshold: 0.5,
+            ..Default::default()
+        };
+        let layer = EssentialLayer::with_config(in_memory(), 2000, drift);
+        layer
+            .add(MemoryCategory::Decision, "T", "C", Priority::Low, MemorySource::AutoExtracted, vec![], None)
+            .await
+            .unwrap();
+        layer.tick().await.unwrap(); // staleness now 0.9 >= 0.8 threshold
+        assert!(layer.load().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_keeps_high_priority_entries() {
+        let drift = DriftConfig {
+            staleness_decay_per_day: 0.9,
+            prune_threshold: 0.5,
+            ..Default::default()
+        };
+        let layer = EssentialLayer::with_config(in_memory(), 2000, drift);
+        layer
+            .add(MemoryCategory::Decision, "T", "C", Priority::High, MemorySource::AutoExtracted, vec![], None)
+            .await
+            .unwrap();
+        layer.tick().await.unwrap();
+        assert_eq!(layer.load().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_truncates_to_budget() {
+        let layer = EssentialLayer::with_config(in_memory(), 10, DriftConfig::default());
+        layer
+            .add(MemoryCategory::Decision, "T", &"x".repeat(1000), Priority::Normal, MemorySource::AutoExtracted, vec![], None)
+            .await
+            .unwrap();
+        // 1000 chars → ~250 tokens, but max_tokens is 10 → entry excluded
+        let entries = layer.load().await.unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_sorts_by_priority() {
+        let layer = EssentialLayer::new(in_memory());
+        layer
+            .add(MemoryCategory::Decision, "low", "x", Priority::Low, MemorySource::AutoExtracted, vec![], None)
+            .await
+            .unwrap();
+        layer
+            .add(MemoryCategory::Decision, "critical", "x", Priority::Critical, MemorySource::AutoExtracted, vec![], None)
+            .await
+            .unwrap();
+
+        let entries = layer.load().await.unwrap();
+        assert_eq!(entries[0].priority, Priority::Critical);
+        assert_eq!(entries[1].priority, Priority::Low);
+    }
+
+    #[test]
+    fn layer_returns_l1() {
+        assert_eq!(EssentialLayer::new(in_memory()).layer(), MemoryLayer::L1);
+    }
+}

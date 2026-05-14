@@ -162,3 +162,125 @@ impl LayerManager for IdentityLayer {
 fn estimate_tokens(content: &str) -> u64 {
     (content.len() as u64).div_ceil(4)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::sqlite::SqliteStore;
+
+    fn in_memory() -> Arc<dyn MemoryStore> {
+        Arc::new(SqliteStore::open_in_memory().unwrap())
+    }
+
+    #[tokio::test]
+    async fn set_creates_new_entry() {
+        let layer = IdentityLayer::new(in_memory());
+        let id = layer.set("Assistant", "You are helpful.").await.unwrap();
+        let loaded = layer.load().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, id);
+        assert_eq!(loaded[0].title, "Assistant");
+        assert_eq!(loaded[0].layer, MemoryLayer::L0);
+        assert_eq!(loaded[0].priority, Priority::Critical);
+    }
+
+    #[tokio::test]
+    async fn set_updates_existing_entry_by_title() {
+        let layer = IdentityLayer::new(in_memory());
+        let id1 = layer.set("Role", "V1").await.unwrap();
+        let id2 = layer.set("Role", "V2").await.unwrap();
+        assert_eq!(id1, id2);
+        let entries = layer.load().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "V2");
+    }
+
+    #[tokio::test]
+    async fn set_multiple_distinct_titles() {
+        let layer = IdentityLayer::new(in_memory());
+        layer.set("Name", "Alice").await.unwrap();
+        layer.set("Role", "Engineer").await.unwrap();
+        layer.set("Lang", "Rust").await.unwrap();
+        assert_eq!(layer.load().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn insert_overrides_layer_and_priority() {
+        let layer = IdentityLayer::new(in_memory());
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4(),
+            layer: MemoryLayer::L3,
+            category: MemoryCategory::Decision,
+            priority: Priority::Low,
+            source: MemorySource::AutoExtracted,
+            title: "test".into(),
+            content: "content".into(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed_at: None,
+            scope: None,
+            session_id: None,
+        };
+        let id = layer.insert(entry).await.unwrap();
+        let got = layer.load().await.unwrap().into_iter().find(|e| e.id == id).unwrap();
+        assert_eq!(got.layer, MemoryLayer::L0);
+        assert_eq!(got.priority, Priority::Critical);
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_entry() {
+        let layer = IdentityLayer::new(in_memory());
+        let id = layer.set("T", "C").await.unwrap();
+        assert_eq!(layer.load().await.unwrap().len(), 1);
+        layer.remove(&id).await.unwrap();
+        assert_eq!(layer.load().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_context_respects_budget() {
+        let layer = IdentityLayer::new(in_memory());
+        layer.set("T", &"x".repeat(1000)).await.unwrap(); // ~250 tokens
+
+        let budget = TokenBudget { total: 2000, reserved_system: 0, reserved_response: 0, allocated_memory: 0, allocated_conversation: 0, available: 200 };
+        let ctx = layer.prepare_context(&budget).await.unwrap();
+        // 250 tokens > 200 available, so entry should be cut
+        assert!(ctx.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_context_includes_entry_within_budget() {
+        let layer = IdentityLayer::new(in_memory());
+        layer.set("Short", "hi").await.unwrap(); // ~1 token
+
+        let budget = TokenBudget { total: 1000, reserved_system: 0, reserved_response: 0, allocated_memory: 0, allocated_conversation: 0, available: 200 };
+        let ctx = layer.prepare_context(&budget).await.unwrap();
+        assert_eq!(ctx.entries.len(), 1);
+    }
+
+    #[test]
+    fn layer_returns_l0() {
+        let layer = IdentityLayer::new(in_memory());
+        assert_eq!(layer.layer(), MemoryLayer::L0);
+    }
+
+    #[tokio::test]
+    async fn tick_is_noop() {
+        let layer = IdentityLayer::new(in_memory());
+        layer.set("T", "C").await.unwrap();
+        layer.tick().await.unwrap();
+        // Entry should still exist (L0 never prunes)
+        assert_eq!(layer.load().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_returns_empty_when_no_entries() {
+        let layer = IdentityLayer::new(in_memory());
+        assert!(layer.load().await.unwrap().is_empty());
+    }
+}

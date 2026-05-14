@@ -402,3 +402,261 @@ impl MemoryOrchestrator {
 fn estimate_tokens(content: &str) -> u64 {
     (content.len() as u64).div_ceil(4)
 }
+
+// ─── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BudgetConfig, MemoryConfig, StoreConfig};
+    use crate::store::sqlite::SqliteStore;
+    use crate::types::{MemoryCategory, MemorySource, Priority, TokenBudget};
+
+    fn in_memory_store() -> Arc<dyn MemoryStore> {
+        Arc::new(SqliteStore::open_in_memory().expect("open in-memory store"))
+    }
+
+    fn test_config() -> MemoryConfig {
+        MemoryConfig {
+            budget: BudgetConfig {
+                context_window: 8000,
+                reserved_system: 2000,
+                reserved_response: 1000,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn test_entry(layer: MemoryLayer, title: &str, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: uuid::Uuid::new_v4(),
+            layer,
+            category: MemoryCategory::Decision,
+            priority: Priority::Normal,
+            source: MemorySource::AutoExtracted,
+            title: title.to_string(),
+            content: content.to_string(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed_at: None,
+            scope: None,
+            session_id: None,
+        }
+    }
+
+    // ── Construction ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn from_store_constructs_all_layers() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None)
+            .expect("from_store");
+        let fences = orch.fence_registry().list_fences().await;
+        assert!(fences.is_empty());
+    }
+
+    #[tokio::test]
+    async fn from_store_with_workspace_uses_project_layer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = in_memory_store();
+        let orch =
+            MemoryOrchestrator::from_store(test_config(), store, Some(tmp.path().to_path_buf()))
+                .expect("from_store");
+        let ctx = orch.load_project_context().await.unwrap();
+        assert!(ctx.is_empty()); // no project context files in empty dir
+    }
+
+    // ── Write / Remember ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn remember_routes_entry_to_correct_layer() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+
+        let id = orch.remember(test_entry(MemoryLayer::L1, "T", "C")).await.unwrap();
+        let recalled = orch.recall(&id).await.unwrap().expect("should exist");
+        assert_eq!(recalled.layer, MemoryLayer::L1);
+        assert_eq!(recalled.title, "T");
+        assert_eq!(recalled.content, "C");
+    }
+
+    #[tokio::test]
+    async fn write_creates_entry_with_all_fields() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+
+        let id = orch
+            .write(
+                MemoryLayer::L2,
+                MemoryCategory::ProjectConvention,
+                "api-design",
+                "Use REST for external APIs",
+                Priority::High,
+                MemorySource::Import,
+                vec!["api".into(), "convention".into()],
+                Some("project-x".into()),
+            )
+            .await
+            .unwrap();
+
+        let recalled = orch.recall(&id).await.unwrap().unwrap();
+        assert_eq!(recalled.title, "api-design");
+        assert_eq!(recalled.layer, MemoryLayer::L2);
+        assert_eq!(recalled.category, MemoryCategory::ProjectConvention);
+        assert_eq!(recalled.priority, Priority::High);
+        assert_eq!(recalled.source, MemorySource::Import);
+        assert_eq!(recalled.tags, vec!["api", "convention"]);
+        assert_eq!(recalled.scope.as_deref(), Some("project-x"));
+        assert!(recalled.confidence > 0.0);
+    }
+
+    #[tokio::test]
+    async fn remember_all_five_layers() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+
+        for layer in &[
+            MemoryLayer::L0,
+            MemoryLayer::L1,
+            MemoryLayer::L2,
+            MemoryLayer::L3,
+            MemoryLayer::L4,
+        ] {
+            let e = test_entry(*layer, "T", "C");
+            let id = orch.remember(e).await.unwrap();
+            let got = orch.recall(&id).await.unwrap().unwrap();
+            assert_eq!(got.layer, *layer);
+        }
+    }
+
+    // ── Read ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn load_fixed_layers_returns_l0_and_l1() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+
+        orch.remember(test_entry(MemoryLayer::L0, "identity", "content")).await.unwrap();
+        orch.remember(test_entry(MemoryLayer::L1, "task", "content")).await.unwrap();
+        // L2 should NOT appear in fixed layers
+        orch.remember(test_entry(MemoryLayer::L2, "project", "content")).await.unwrap();
+
+        let fixed = orch.load_fixed_layers().await.unwrap();
+        let layers: Vec<MemoryLayer> = fixed.iter().map(|e| e.layer).collect();
+        assert!(layers.iter().any(|l| *l == MemoryLayer::L0));
+        assert!(layers.iter().any(|l| *l == MemoryLayer::L1));
+        assert!(!layers.iter().any(|l| *l == MemoryLayer::L2));
+    }
+
+    #[tokio::test]
+    async fn recall_returns_none_for_missing() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+        let fake = uuid::Uuid::new_v4();
+        assert!(orch.recall(&fake).await.unwrap().is_none());
+    }
+
+    // ── Delete ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn forget_removes_entry() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+        let id = orch.remember(test_entry(MemoryLayer::L1, "tmp", "x")).await.unwrap();
+        assert!(orch.recall(&id).await.unwrap().is_some());
+
+        orch.forget(&id).await.unwrap();
+        assert!(orch.recall(&id).await.unwrap().is_none());
+    }
+
+    // ── List ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_layer_returns_metadata() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+        orch.remember(test_entry(MemoryLayer::L1, "a", "aa")).await.unwrap();
+        orch.remember(test_entry(MemoryLayer::L1, "b", "bb")).await.unwrap();
+        orch.remember(test_entry(MemoryLayer::L2, "c", "cc")).await.unwrap();
+
+        let l1 = orch.list_layer(MemoryLayer::L1).await.unwrap();
+        assert_eq!(l1.len(), 2);
+    }
+
+    // ── Identity ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_identity_creates_l0_entry() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+        let id = orch.set_identity("Assistant Persona", "You are a helpful assistant.").await.unwrap();
+        let got = orch.recall(&id).await.unwrap().unwrap();
+        assert_eq!(got.layer, MemoryLayer::L0);
+        assert_eq!(got.title, "Assistant Persona");
+    }
+
+    #[tokio::test]
+    async fn set_identity_updates_existing() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+        let id1 = orch.set_identity("Assistant Persona", "V1").await.unwrap();
+        let id2 = orch.set_identity("Assistant Persona", "V2").await.unwrap();
+        // Same title → overwrite, same ID returned
+        assert_eq!(id1, id2);
+        let got = orch.recall(&id1).await.unwrap().unwrap();
+        assert_eq!(got.content, "V2");
+    }
+
+    // ── Tick ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tick_propagates_to_all_layers() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+        orch.tick().await.unwrap();
+    }
+
+    // ── Context Preparation ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn prepare_context_combines_layers_within_budget() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+
+        orch.set_identity("I", "ident content here").await.unwrap();
+        orch.remember(test_entry(MemoryLayer::L1, "task", "task content here today")).await.unwrap();
+        orch.remember(test_entry(MemoryLayer::L2, "proj", "project convention text")).await.unwrap();
+
+        let ctx = orch.prepare_context().await.unwrap();
+        assert!(!ctx.entries.is_empty());
+        assert!(ctx.total_tokens > 0);
+        assert_eq!(ctx.budget.total, 8000);
+    }
+
+    #[tokio::test]
+    async fn prepare_context_makes_budget_from_config() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+        let ctx = orch.prepare_context().await.unwrap();
+        // total 8000 - system 2000 - response 1000 = 5000 available
+        assert_eq!(ctx.budget.reserved_system, 2000);
+        assert_eq!(ctx.budget.reserved_response, 1000);
+        assert_eq!(ctx.budget.available, 5000);
+    }
+
+    // ── store() accessor ────────────────────────────────────────────────────
+
+    #[test]
+    fn store_returns_reference() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+        let _ = orch.store(); // must compile + return valid ref
+    }
+}

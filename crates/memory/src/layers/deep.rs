@@ -239,3 +239,124 @@ impl LayerManager for DeepLayer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DriftConfig;
+    use crate::store::sqlite::SqliteStore;
+
+    fn in_memory() -> Arc<dyn MemoryStore> {
+        Arc::new(SqliteStore::open_in_memory().unwrap())
+    }
+
+    #[tokio::test]
+    async fn store_entry_creates_l3_entry() {
+        let layer = DeepLayer::new(in_memory());
+        let id = layer
+            .store_entry("Rust patterns", "Use Result for errors", MemorySource::Compression, vec!["rust".into()], None)
+            .await
+            .unwrap();
+
+        let all = layer.store.search_by_layer(MemoryLayer::L3).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, id);
+        assert_eq!(all[0].layer, MemoryLayer::L3);
+        assert_eq!(all[0].category, MemoryCategory::CompressedSummary);
+        assert_eq!(all[0].confidence, 0.9);
+    }
+
+    #[tokio::test]
+    async fn insert_overrides_layer_to_l3() {
+        let layer = DeepLayer::new(in_memory());
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4(), layer: MemoryLayer::L0, category: MemoryCategory::Decision,
+            priority: Priority::Normal, source: MemorySource::AutoExtracted,
+            title: "t".into(), content: "c".into(), embedding: None,
+            tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
+            staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            last_accessed_at: None, scope: None, session_id: None,
+        };
+        let id = layer.insert(entry).await.unwrap();
+        let all = layer.store.search_by_layer(MemoryLayer::L3).await.unwrap();
+        let got = all.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(got.layer, MemoryLayer::L3);
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_entry() {
+        let layer = DeepLayer::new(in_memory());
+        let id = layer.store_entry("T", "C", MemorySource::Compression, vec![], None).await.unwrap();
+        assert_eq!(layer.store.search_by_layer(MemoryLayer::L3).await.unwrap().len(), 1);
+        layer.remove(&id).await.unwrap();
+        assert_eq!(layer.store.search_by_layer(MemoryLayer::L3).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn recall_excludes_already_surfaced() {
+        let layer = DeepLayer::new(in_memory());
+        let id = layer.store_entry("T", "C", MemorySource::Compression, vec![], None).await.unwrap();
+
+        let mut surf = std::collections::HashSet::new();
+        surf.insert(id);
+        let results = layer.recall("T", None, &surf).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_respects_search_limit() {
+        let layer = DeepLayer::with_config(in_memory(), 2, DriftConfig::default());
+        layer.store_entry("A", "aaa", MemorySource::Compression, vec![], None).await.unwrap();
+        layer.store_entry("B", "bbb", MemorySource::Compression, vec![], None).await.unwrap();
+        layer.store_entry("C", "ccc", MemorySource::Compression, vec![], None).await.unwrap();
+
+        let surf = std::collections::HashSet::new();
+        let results = layer.recall("aaa", None, &surf).await.unwrap();
+        assert!(results.len() <= 2);
+    }
+
+    #[tokio::test]
+    async fn recall_filters_non_l3_entries() {
+        let layer = DeepLayer::new(in_memory());
+        let entry = MemoryEntry {
+            id: uuid::Uuid::new_v4(), layer: MemoryLayer::L1, category: MemoryCategory::Decision,
+            priority: Priority::Normal, source: MemorySource::AutoExtracted,
+            title: "L1 entry".into(), content: "some L1 content".into(), embedding: None,
+            tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
+            staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            last_accessed_at: None, scope: None, session_id: None,
+        };
+        layer.insert(entry).await.unwrap();
+
+        let surf = std::collections::HashSet::new();
+        let results = layer.recall("L1", None, &surf).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_prunes_stale_entries() {
+        let drift = DriftConfig {
+            staleness_decay_per_day: 0.9,
+            prune_threshold: 0.5,
+            ..Default::default()
+        };
+        let layer = DeepLayer::with_config(in_memory(), 5, drift);
+        layer.store_entry("T", "C", MemorySource::Compression, vec![], None).await.unwrap();
+        layer.tick().await.unwrap();
+        assert_eq!(layer.store.search_by_layer(MemoryLayer::L3).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_context_returns_empty() {
+        let layer = DeepLayer::new(in_memory());
+        layer.store_entry("T", "C", MemorySource::Compression, vec![], None).await.unwrap();
+        let budget = TokenBudget { total: 1000, reserved_system: 0, reserved_response: 0, allocated_memory: 0, allocated_conversation: 0, available: 1000 };
+        let ctx = layer.prepare_context(&budget).await.unwrap();
+        assert!(ctx.entries.is_empty());
+    }
+
+    #[test]
+    fn layer_returns_l3() {
+        assert_eq!(DeepLayer::new(in_memory()).layer(), MemoryLayer::L3);
+    }
+}
