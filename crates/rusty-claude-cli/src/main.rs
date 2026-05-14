@@ -6,6 +6,7 @@
 mod bootstrap;
 mod init;
 mod mcp_serve;
+mod doctor;
 mod checks;
 mod render;
 mod server;
@@ -329,7 +330,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
-        CliAction::Doctor { output_format } => run_doctor(output_format)?,
+        CliAction::Doctor { output_format } => doctor::run_doctor(output_format)?,
         CliAction::State { output_format } => mcp_serve::run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Serve { host, port, auth_enabled, cors_origins, output_format: _, yolo_mode } => {
@@ -1355,212 +1356,6 @@ fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DiagnosticLevel {
-    Ok,
-    Warn,
-    Fail,
-}
-
-impl DiagnosticLevel {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Warn => "warn",
-            Self::Fail => "fail",
-        }
-    }
-
-    fn is_failure(self) -> bool {
-        matches!(self, Self::Fail)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DiagnosticCheck {
-    name: &'static str,
-    level: DiagnosticLevel,
-    summary: String,
-    details: Vec<String>,
-    data: Map<String, Value>,
-}
-
-impl DiagnosticCheck {
-    fn new(name: &'static str, level: DiagnosticLevel, summary: impl Into<String>) -> Self {
-        Self {
-            name,
-            level,
-            summary: summary.into(),
-            details: Vec::new(),
-            data: Map::new(),
-        }
-    }
-
-    fn with_details(mut self, details: Vec<String>) -> Self {
-        self.details = details;
-        self
-    }
-
-    fn with_data(mut self, data: Map<String, Value>) -> Self {
-        self.data = data;
-        self
-    }
-
-    fn json_value(&self) -> Value {
-        let mut value = Map::from_iter([
-            (
-                "name".to_string(),
-                Value::String(self.name.to_ascii_lowercase()),
-            ),
-            (
-                "status".to_string(),
-                Value::String(self.level.label().to_string()),
-            ),
-            ("summary".to_string(), Value::String(self.summary.clone())),
-            (
-                "details".to_string(),
-                Value::Array(
-                    self.details
-                        .iter()
-                        .cloned()
-                        .map(Value::String)
-                        .collect::<Vec<_>>(),
-                ),
-            ),
-        ]);
-        value.extend(self.data.clone());
-        Value::Object(value)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DoctorReport {
-    checks: Vec<DiagnosticCheck>,
-}
-
-impl DoctorReport {
-    fn counts(&self) -> (usize, usize, usize) {
-        (
-            self.checks
-                .iter()
-                .filter(|check| check.level == DiagnosticLevel::Ok)
-                .count(),
-            self.checks
-                .iter()
-                .filter(|check| check.level == DiagnosticLevel::Warn)
-                .count(),
-            self.checks
-                .iter()
-                .filter(|check| check.level == DiagnosticLevel::Fail)
-                .count(),
-        )
-    }
-
-    fn has_failures(&self) -> bool {
-        self.checks.iter().any(|check| check.level.is_failure())
-    }
-
-    fn render(&self) -> String {
-        let (ok_count, warn_count, fail_count) = self.counts();
-        let mut lines = vec![
-            "Doctor".to_string(),
-            format!(
-                "Summary\n  OK               {ok_count}\n  Warnings         {warn_count}\n  Failures         {fail_count}"
-            ),
-        ];
-        lines.extend(self.checks.iter().map(render_diagnostic_check));
-        lines.join("\n\n")
-    }
-
-    fn json_value(&self) -> Value {
-        let report = self.render();
-        let (ok_count, warn_count, fail_count) = self.counts();
-        json!({
-            "kind": "doctor",
-            "message": report,
-            "report": report,
-            "has_failures": self.has_failures(),
-            "summary": {
-                "total": self.checks.len(),
-                "ok": ok_count,
-                "warnings": warn_count,
-                "failures": fail_count,
-            },
-            "checks": self
-                .checks
-                .iter()
-                .map(DiagnosticCheck::json_value)
-                .collect::<Vec<_>>(),
-        })
-    }
-}
-
-fn render_diagnostic_check(check: &DiagnosticCheck) -> String {
-    let mut lines = vec![format!(
-        "{}\n  Status           {}\n  Summary          {}",
-        check.name,
-        check.level.label(),
-        check.summary
-    )];
-    if !check.details.is_empty() {
-        lines.push("  Details".to_string());
-        lines.extend(check.details.iter().map(|detail| format!("    - {detail}")));
-    }
-    lines.join("\n")
-}
-
-fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let config_loader = ConfigLoader::default_for(&cwd);
-    let config = config_loader.load();
-    let discovered_config = config_loader.discover();
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
-    let (project_root, git_branch) =
-        parse_git_status_metadata(project_context.git_status.as_deref());
-    let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
-    let empty_config = runtime::RuntimeConfig::empty();
-    let sandbox_config = config.as_ref().ok().unwrap_or(&empty_config);
-    let context = StatusContext {
-        cwd: cwd.clone(),
-        session_path: None,
-        loaded_config_files: config
-            .as_ref()
-            .ok()
-            .map_or(0, |runtime_config| runtime_config.loaded_entries().len()),
-        discovered_config_files: discovered_config.len(),
-        memory_file_count: project_context.instruction_files.len(),
-        project_root,
-        git_branch,
-        git_summary,
-        sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
-    };
-    Ok(DoctorReport {
-        checks: vec![
-            checks::check_auth_health(),
-            checks::check_config_health(&config_loader, config.as_ref()),
-            checks::check_install_source_health(),
-            checks::check_workspace_health(&context),
-            checks::check_sandbox_health(&context.sandbox_status),
-            checks::check_system_health(&cwd, config.as_ref().ok()),
-        ],
-    })
-}
-
-fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let report = render_doctor_report()?;
-    let message = report.render();
-    match output_format {
-        CliOutputFormat::Text => println!("{message}"),
-        CliOutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&report.json_value())?);
-        }
-    }
-    if report.has_failures() {
-        return Err("doctor found failing checks".into());
-    }
-    Ok(())
-}
-
 fn resume_command_can_absorb_token(current_command: &str, token: &str) -> bool {
     matches!(
         SlashCommand::parse(current_command),
@@ -2438,7 +2233,7 @@ fn run_resume_command(
             })
         }
         SlashCommand::Doctor => {
-            let report = render_doctor_report()?;
+            let report = doctor::render_doctor_report()?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(report.render()),
@@ -3688,7 +3483,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Doctor => {
-                println!("{}", render_doctor_report()?.render());
+                println!("{}", doctor::render_doctor_report()?.render());
                 false
             }
             SlashCommand::History { count } => {
