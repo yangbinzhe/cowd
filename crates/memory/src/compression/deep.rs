@@ -508,3 +508,60 @@ fn extract_questions(messages: &[Message]) -> Vec<String> {
         .take(10)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Message, MessageRole};
+
+    fn msg(role: MessageRole, content: &str) -> Message {
+        Message { turn_index: 0, role, content: content.into(), tool_use_id: None, tool_name: None, pinned: false }
+    }
+
+    #[test]
+    fn default_config_parameters() {
+        let cfg = DeepCompactConfig::default();
+        assert_eq!(cfg.aggressiveness, 0.8);
+        assert_eq!(cfg.preserve_recent, 2);
+        assert_eq!(cfg.max_summary_chars, 6000);
+    }
+
+    #[test]
+    fn from_config_reads_aggressiveness() {
+        let cc = CompressionConfig { aggressiveness: 0.5, ..Default::default() };
+        let cfg = DeepCompactConfig::from_config(&cc);
+        assert_eq!(cfg.aggressiveness, 0.5);
+    }
+
+    #[test]
+    fn new_has_no_llm() {
+        let compactor = DeepCompactor::new();
+        assert!(compactor.llm_summarizer.is_none());
+    }
+
+    #[test]
+    fn with_llm_summarizer_attaches() {
+        let summarizer = Arc::new(crate::compression::llm_summarizer::NoOpSummarizer);
+        let compactor = DeepCompactor::new().with_llm_summarizer(summarizer);
+        assert!(compactor.llm_summarizer.is_some());
+    }
+
+    #[test]
+    fn build_deep_summary_template_produces_output() {
+        let compactor = DeepCompactor::new();
+        let messages = vec![
+            msg(MessageRole::User, "We decided to refactor the auth module"),
+            msg(MessageRole::Assistant, "I'll start working on that now"),
+        ];
+        let summary = compactor.build_deep_summary_template(&messages, None);
+        assert!(!summary.is_empty());
+        assert!(summary.contains("Deep Compression Summary"));
+    }
+
+    #[test]
+    fn estimate_tokens_counts_reasonably() {
+        let messages = vec![msg(MessageRole::User, "hello world")];
+        let tokens = estimate_tokens(&messages);
+        assert!(tokens > 0);
+    }
+}

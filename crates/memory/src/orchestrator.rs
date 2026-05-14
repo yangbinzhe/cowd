@@ -413,7 +413,8 @@ mod tests {
     use crate::types::{MemoryCategory, MemorySource, Priority, TokenBudget};
 
     fn in_memory_store() -> Arc<dyn MemoryStore> {
-        Arc::new(SqliteStore::open_in_memory().expect("open in-memory store"))
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        Arc::new(SqliteStore::open_path(&tmp.path().join("test.db")).unwrap())
     }
 
     fn test_config() -> MemoryConfig {

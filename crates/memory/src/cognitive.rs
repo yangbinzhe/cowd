@@ -1016,3 +1016,87 @@ fn truncate_summary(content: &str, max_len: usize) -> String {
         format!("{}...", &content[..max_len])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BudgetConfig, MemoryConfig};
+    use crate::types::MemoryLayer;
+    use crate::write_guard::WriteSource;
+
+    fn test_config() -> MemoryConfig {
+        MemoryConfig {
+            budget: BudgetConfig { context_window: 8000, reserved_system: 2000, reserved_response: 1000, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn truncate_summary_short_content_unchanged() {
+        assert_eq!(truncate_summary("hello", 100), "hello");
+    }
+
+    #[test]
+    fn truncate_summary_long_content_cut() {
+        assert_eq!(truncate_summary(&"a".repeat(200), 10), "aaaaaaaaaa...");
+    }
+
+    #[test]
+    fn truncate_summary_exact_length() {
+        assert_eq!(truncate_summary("hello", 5), "hello");
+    }
+
+    #[tokio::test]
+    async fn new_constructs_with_default_config() {
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+        assert_eq!(mgr.search_mode_label(), "keyword");
+        assert_eq!(mgr.vector_index_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn with_write_source_configures_guard() {
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap()
+            .with_write_source(WriteSource::System);
+        let policy = mgr.check_write_access(MemoryLayer::L1);
+        assert!(policy.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn list_layers_returns_info() {
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+        let layers = mgr.list_layers().await;
+        assert!(!layers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn embedding_capability_defaults_fts5_only() {
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+        assert!(!mgr.embedding_capability().supports_semantic());
+    }
+
+    #[tokio::test]
+    async fn vector_index_stats_empty() {
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+        assert_eq!(mgr.vector_index_stats().count, 0);
+    }
+}

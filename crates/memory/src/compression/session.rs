@@ -549,3 +549,82 @@ impl SessionCompressor {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Message, MessageRole};
+
+    fn msg(role: MessageRole, content: &str) -> Message {
+        Message { turn_index: 0, role, content: content.into(), tool_use_id: None, tool_name: None, pinned: false }
+    }
+
+    #[test]
+    fn should_compact_false_below_threshold() {
+        let compactor = SessionCompactor::new();
+        let messages = vec![msg(MessageRole::User, "hi"), msg(MessageRole::Assistant, "hello")];
+        assert!(!compactor.should_compact(&messages));
+    }
+
+    #[test]
+    fn should_compact_true_exceeding_threshold() {
+        let mut compactor = SessionCompactor::new();
+        compactor.config.threshold_tokens = 1;
+        compactor.config.min_messages_to_compact = 3;
+        let messages = vec![
+            msg(MessageRole::User, &"x".repeat(100)),
+            msg(MessageRole::Assistant, &"y".repeat(100)),
+            msg(MessageRole::User, &"z".repeat(100)),
+        ];
+        assert!(compactor.should_compact(&messages));
+    }
+
+    #[test]
+    fn split_messages_preserves_recent() {
+        let compactor = SessionCompactor::new();
+        let messages: Vec<_> = (0..15).map(|i| msg(MessageRole::User, &format!("msg{i}"))).collect();
+        let (old, recent) = compactor.split_messages(messages);
+        assert_eq!(recent.len(), 10);
+        assert_eq!(old.len(), 5);
+    }
+
+    #[test]
+    fn extract_decisions_finds_keywords() {
+        let compactor = SessionCompactor::new();
+        let messages = vec![msg(MessageRole::User, "I decided to use Axum for the web framework")];
+        let decisions = compactor.extract_decisions(&messages);
+        assert!(!decisions.is_empty());
+    }
+
+    #[test]
+    fn generate_summary_template_produces_structured_output() {
+        let compactor = SessionCompactor::new();
+        let messages = vec![
+            msg(MessageRole::User, "We decided to use Rust"),
+            msg(MessageRole::Assistant, "I will implement the API"),
+        ];
+        let summary = compactor.generate_summary_template(&messages);
+        assert!(summary.contains("Compressed Session Summary"));
+        assert!(summary.contains("1. Context"));
+        assert!(summary.contains("9. Next Steps"));
+    }
+
+    #[test]
+    fn infer_current_state_uses_last_assistant() {
+        let compactor = SessionCompactor::new();
+        let messages = vec![
+            msg(MessageRole::User, "hello"),
+            msg(MessageRole::Assistant, "The server is deployed and running"),
+        ];
+        let state = compactor.infer_current_state(&messages);
+        assert!(state.contains("deployed"));
+    }
+
+    #[test]
+    fn extract_questions_detects_queries() {
+        let compactor = SessionCompactor::new();
+        let messages = vec![msg(MessageRole::User, "What is the best approach?")];
+        let questions = compactor.extract_questions(&messages);
+        assert!(!questions.contains("No open questions"));
+    }
+}

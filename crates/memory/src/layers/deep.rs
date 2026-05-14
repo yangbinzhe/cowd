@@ -247,7 +247,8 @@ mod tests {
     use crate::store::sqlite::SqliteStore;
 
     fn in_memory() -> Arc<dyn MemoryStore> {
-        Arc::new(SqliteStore::open_in_memory().unwrap())
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        Arc::new(SqliteStore::open_path(&tmp.path().join("test.db")).unwrap())
     }
 
     #[tokio::test]

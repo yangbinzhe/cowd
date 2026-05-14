@@ -266,3 +266,173 @@ impl CliSessionBridge for SharedSessionManager {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn register_and_get_session() {
+        let mgr = UnifiedSessionManager::new();
+        let meta = UnifiedSessionMeta {
+            id: "s1".into(),
+            session_type: SessionType::Cli,
+            created_at: 1000,
+            last_activity: 1000,
+            workspace: None,
+            platform_data: HashMap::new(),
+        };
+        mgr.register_session(meta).await;
+        let got = mgr.get_session("s1").await.unwrap();
+        assert_eq!(got.id, "s1");
+        assert_eq!(got.session_type, SessionType::Cli);
+    }
+
+    #[tokio::test]
+    async fn get_session_returns_none_for_missing() {
+        let mgr = UnifiedSessionManager::new();
+        assert!(mgr.get_session("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_all() {
+        let mgr = UnifiedSessionManager::new();
+        mgr.register_session(test_meta("a", SessionType::Cli)).await;
+        mgr.register_session(test_meta("b", SessionType::GatewayApi)).await;
+        assert_eq!(mgr.list_sessions().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_by_type_filters_correctly() {
+        let mgr = UnifiedSessionManager::new();
+        mgr.register_session(test_meta("a", SessionType::Cli)).await;
+        mgr.register_session(test_meta("b", SessionType::GatewayApi)).await;
+        mgr.register_session(test_meta("c", SessionType::Cli)).await;
+
+        let cli = mgr.list_sessions_by_type(SessionType::Cli).await;
+        assert_eq!(cli.len(), 2);
+        assert!(cli.iter().all(|m| m.session_type == SessionType::Cli));
+    }
+
+    #[tokio::test]
+    async fn touch_session_updates_activity() {
+        let mgr = UnifiedSessionManager::new();
+        mgr.register_session(test_meta("s1", SessionType::Cli)).await;
+
+        let before = mgr.get_session("s1").await.unwrap().last_activity;
+        assert!(mgr.touch_session("s1").await);
+        let after = mgr.get_session("s1").await.unwrap().last_activity;
+        assert!(after >= before);
+    }
+
+    #[tokio::test]
+    async fn touch_session_returns_false_for_missing() {
+        let mgr = UnifiedSessionManager::new();
+        assert!(!mgr.touch_session("missing").await);
+    }
+
+    #[tokio::test]
+    async fn remove_session_deletes_and_returns_true() {
+        let mgr = UnifiedSessionManager::new();
+        mgr.register_session(test_meta("s1", SessionType::Cli)).await;
+        assert!(mgr.remove_session("s1").await);
+        assert!(mgr.get_session("s1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_session_returns_false_for_missing() {
+        let mgr = UnifiedSessionManager::new();
+        assert!(!mgr.remove_session("missing").await);
+    }
+
+    #[tokio::test]
+    async fn default_session_set_and_get() {
+        let mgr = UnifiedSessionManager::new();
+        mgr.set_default_session("default-id".into()).await;
+        assert_eq!(mgr.get_default_session().await, Some("default-id".into()));
+    }
+
+    #[tokio::test]
+    async fn get_or_create_default_produces_id() {
+        let mgr = UnifiedSessionManager::new();
+        let id = mgr.get_or_create_default().await;
+        assert!(id.starts_with("cli_"));
+        assert!(mgr.get_session(&id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_or_create_default_returns_same_id() {
+        let mgr = UnifiedSessionManager::new();
+        let id1 = mgr.get_or_create_default().await;
+        let id2 = mgr.get_or_create_default().await;
+        assert_eq!(id1, id2);
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_removes_old_sessions() {
+        let mgr = UnifiedSessionManager::new();
+        mgr.register_session(test_meta("old", SessionType::Cli)).await;
+        // Set last_activity far in the past
+        {
+            let mut sessions = mgr.sessions.write().await;
+            if let Some(s) = sessions.get_mut("old") {
+                s.last_activity = 0;
+            }
+        }
+        let removed = mgr.cleanup_stale_sessions(3600).await;
+        assert_eq!(removed, 1);
+        assert!(mgr.get_session("old").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_keeps_recent() {
+        let mgr = UnifiedSessionManager::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut meta = test_meta("recent", SessionType::Cli);
+        meta.last_activity = now;
+        mgr.register_session(meta).await;
+
+        let removed = mgr.cleanup_stale_sessions(3600).await;
+        assert_eq!(removed, 0);
+        assert!(mgr.get_session("recent").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_counts_groups_by_type() {
+        let mgr = UnifiedSessionManager::new();
+        mgr.register_session(test_meta("a", SessionType::Cli)).await;
+        mgr.register_session(test_meta("b", SessionType::Cli)).await;
+        mgr.register_session(test_meta("c", SessionType::GatewayApi)).await;
+
+        let counts = mgr.session_counts().await;
+        assert_eq!(counts.get(&SessionType::Cli), Some(&2));
+        assert_eq!(counts.get(&SessionType::GatewayApi), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn session_type_display() {
+        assert_eq!(SessionType::Cli.to_string(), "cli");
+        assert_eq!(SessionType::GatewayApi.to_string(), "gateway_api");
+        assert_eq!(SessionType::GatewayFeishu.to_string(), "gateway_feishu");
+    }
+
+    #[test]
+    fn create_session_manager_returns_arc() {
+        let shared = create_session_manager();
+        let _ = shared.get_or_create_default(); // drops Arc
+    }
+
+    fn test_meta(id: &str, st: SessionType) -> UnifiedSessionMeta {
+        UnifiedSessionMeta {
+            id: id.into(),
+            session_type: st,
+            created_at: 1000,
+            last_activity: 1000,
+            workspace: None,
+            platform_data: HashMap::new(),
+        }
+    }
+}

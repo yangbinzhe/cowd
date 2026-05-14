@@ -12,7 +12,7 @@
 //! connect to MCP servers and invoke their capabilities.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, RwLock, OnceLock};
 
 use crate::mcp::mcp_tool_name;
 use crate::mcp_stdio::McpServerManager;
@@ -71,8 +71,8 @@ pub struct McpServerState {
 
 #[derive(Debug, Clone, Default)]
 pub struct McpToolRegistry {
-    inner: Arc<Mutex<HashMap<String, McpServerState>>>,
-    manager: Arc<OnceLock<Arc<Mutex<McpServerManager>>>>,
+    inner: Arc<RwLock<HashMap<String, McpServerState>>>,
+    manager: Arc<OnceLock<Arc<RwLock<McpServerManager>>>>,
 }
 
 impl McpToolRegistry {
@@ -83,8 +83,8 @@ impl McpToolRegistry {
 
     pub fn set_manager(
         &self,
-        manager: Arc<Mutex<McpServerManager>>,
-    ) -> Result<(), Arc<Mutex<McpServerManager>>> {
+        manager: Arc<RwLock<McpServerManager>>,
+    ) -> Result<(), Arc<RwLock<McpServerManager>>> {
         self.manager.set(manager)
     }
 
@@ -96,7 +96,7 @@ impl McpToolRegistry {
         resources: Vec<McpResourceInfo>,
         server_info: Option<String>,
     ) {
-        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let mut inner = self.inner.write().unwrap_or_else(|poisoned| {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
@@ -114,7 +114,7 @@ impl McpToolRegistry {
     }
 
     pub fn get_server(&self, server_name: &str) -> Option<McpServerState> {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let inner = self.inner.read().unwrap_or_else(|poisoned| {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
@@ -122,7 +122,7 @@ impl McpToolRegistry {
     }
 
     pub fn list_servers(&self) -> Vec<McpServerState> {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let inner = self.inner.read().unwrap_or_else(|poisoned| {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
@@ -130,7 +130,7 @@ impl McpToolRegistry {
     }
 
     pub fn list_resources(&self, server_name: &str) -> Result<Vec<McpResourceInfo>, String> {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let inner = self.inner.read().unwrap_or_else(|poisoned| {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
@@ -149,7 +149,7 @@ impl McpToolRegistry {
     }
 
     pub fn read_resource(&self, server_name: &str, uri: &str) -> Result<McpResourceInfo, String> {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let inner = self.inner.read().unwrap_or_else(|poisoned| {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
@@ -173,7 +173,7 @@ impl McpToolRegistry {
     }
 
     pub fn list_tools(&self, server_name: &str) -> Result<Vec<McpToolInfo>, String> {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let inner = self.inner.read().unwrap_or_else(|poisoned| {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
@@ -192,7 +192,7 @@ impl McpToolRegistry {
     }
 
     fn spawn_tool_call(
-        manager: Arc<Mutex<McpServerManager>>,
+        manager: Arc<RwLock<McpServerManager>>,
         qualified_tool_name: String,
         arguments: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
@@ -207,7 +207,7 @@ impl McpToolRegistry {
                 runtime.block_on(async move {
                     let response = {
                         let mut manager = manager
-                            .lock()
+                            .write()
                             .map_err(|_| "mcp server manager lock poisoned".to_string())?;
                         manager
                             .discover_tools()
@@ -260,7 +260,7 @@ impl McpToolRegistry {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let inner = self.inner.read().unwrap_or_else(|poisoned| {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
@@ -303,7 +303,7 @@ impl McpToolRegistry {
         server_name: &str,
         status: McpConnectionStatus,
     ) -> Result<(), String> {
-        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let mut inner = self.inner.write().unwrap_or_else(|poisoned| {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
@@ -316,7 +316,7 @@ impl McpToolRegistry {
 
     /// Disconnect / remove a server.
     pub fn disconnect(&self, server_name: &str) -> Option<McpServerState> {
-        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let mut inner = self.inner.write().unwrap_or_else(|poisoned| {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
@@ -326,7 +326,7 @@ impl McpToolRegistry {
     /// Number of registered servers.
     #[must_use]
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+        let inner = self.inner.read().unwrap_or_else(|poisoned| {
             tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
             poisoned.into_inner()
         });
@@ -609,7 +609,7 @@ mod tests {
             "alpha".to_string(),
             manager_server_config(&script_path, "alpha", &log_path),
         )]);
-        let manager = Arc::new(Mutex::new(McpServerManager::from_servers(&servers)));
+        let manager = Arc::new(RwLock::new(McpServerManager::from_servers(&servers)));
 
         let registry = McpToolRegistry::new();
         registry.register_server(
@@ -870,7 +870,7 @@ mod tests {
             None,
         );
         registry
-            .set_manager(Arc::new(Mutex::new(McpServerManager::from_servers(
+            .set_manager(Arc::new(RwLock::new(McpServerManager::from_servers(
                 &servers,
             ))))
             .expect("manager should only be set once");

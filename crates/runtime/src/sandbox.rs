@@ -278,8 +278,16 @@ fn normalize_mounts(mounts: &[String], cwd: &Path) -> Vec<String> {
 }
 
 fn command_exists(command: &str) -> bool {
+    // Safety: validate input to prevent path traversal via "../" patterns.
+    if command.is_empty()
+        || !command
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return false;
+    }
     env::var_os("PATH")
-        .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(command).exists()))
+        .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(command).is_file()))
 }
 
 /// Check whether `unshare --user` actually works on this system.

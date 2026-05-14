@@ -1,3 +1,4 @@
+#![deprecated(note = "use the `memory` crate instead; memory-light will be removed in a future version")]
 pub mod store;
 pub mod layers;
 pub mod extract;

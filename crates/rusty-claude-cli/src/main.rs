@@ -6051,11 +6051,20 @@ fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn command_exists(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    // Safety: validate input to prevent path traversal and command injection.
+    // Only alphanumeric characters, hyphens, underscores, and dots are allowed
+    // to prevent passing arbitrary arguments to external commands.
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return false;
+    }
+    // Search PATH directories for the executable (no shell invocation).
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+    })
 }
 
 fn write_temp_text_file(

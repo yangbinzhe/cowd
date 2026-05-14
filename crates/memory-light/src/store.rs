@@ -66,15 +66,31 @@ impl MemoryStore {
         Ok(entries)
     }
 
+    /// Sanitize user input for safe FTS5 full-text search.
+    fn sanitize_fts_query(input: &str) -> String {
+        input
+            .chars()
+            .map(|c| match c {
+                '*' | '^' | '"' | '(' | ')' | ':' | '~' | '+' | '-' | '!' | '{' | '}' | '[' | ']' => ' ',
+                _ => c,
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .filter(|w| !w.is_empty())
+            .map(|w| format!("\"{}\"", w))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
+
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>, rusqlite::Error> {
-        let fts = query.split_whitespace().filter(|w| !w.is_empty()).map(|w| format!("\"{}\"", w.replace('"', "\"\""))).collect::<Vec<_>>().join(" OR ");
-        if fts.is_empty() { return Ok(Vec::new()); }
+        let sanitized = Self::sanitize_fts_query(query);
+        if sanitized.is_empty() { return Ok(Vec::new()); }
         let c = self.conn.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("memory store lock poisoned; recovering");
             poisoned.into_inner()
         });
         let mut stmt = c.prepare("SELECT m.id,m.layer,m.category,m.priority,m.title,m.content,m.tags,m.created_at,m.updated_at,m.access_count FROM memories_fts fts JOIN memories m ON m.rowid=fts.rowid WHERE memories_fts MATCH ?1 ORDER BY rank LIMIT ?2")?;
-        let rows = stmt.query_map(params![fts, limit as i64], |row| Ok(MemoryEntry {
+        let rows = stmt.query_map(params![sanitized, limit as i64], |row| Ok(MemoryEntry {
             id: row.get(0)?, layer: MemoryLayer::L1, category: MemoryCategory::Reference,
             priority: match row.get::<_, i32>(3)? { 0 => Priority::Low, 1 => Priority::Normal, 2 => Priority::High, _ => Priority::Critical },
             title: row.get(4)?, content: row.get(5)?,
