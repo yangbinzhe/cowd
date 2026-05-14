@@ -8,7 +8,7 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
 // ── Re-export from unified config crate ──────────────────────────────
 pub use config::{ApprovalConfig, ResolvedPermissionMode, McpTransport, McpOAuthConfig, OAuthConfig};
-pub use config::{ConfigSource, ConfigEntry};
+pub use config::{ConfigSource, ConfigEntry, ConfigError};
 
 /// Prefix used for environment variable config overrides.
 const ENV_OVERRIDE_PREFIX: &str = "COWD_";
@@ -445,30 +445,6 @@ impl Default for GatewayConfig {
             platforms: Vec::new(),
             session_reset: SessionResetPolicy::default(),
         }
-    }
-}
-
-/// Errors raised while reading or parsing runtime configuration files.
-#[derive(Debug)]
-pub enum ConfigError {
-    Io(std::io::Error),
-    Parse(String),
-}
-
-impl Display for ConfigError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "{error}"),
-            Self::Parse(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
-
-impl From<std::io::Error> for ConfigError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
     }
 }
 
