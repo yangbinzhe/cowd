@@ -1,3 +1,4 @@
+#![allow(deprecated)] // memory-light is intentionally used during migration to memory crate
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
