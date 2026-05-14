@@ -56,7 +56,7 @@ use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition,
 };
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+pub(crate) const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -71,9 +71,9 @@ const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
     None => "unknown",
 };
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const BUILD_TARGET: Option<&str> = option_env!("TARGET");
-const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const BUILD_TARGET: Option<&str> = option_env!("TARGET");
+pub(crate) const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
@@ -425,7 +425,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CliAction {
+pub(crate) enum CliAction {
     DumpManifests {
         output_format: CliOutputFormat,
         manifests_dir: Option<PathBuf>,
@@ -520,14 +520,14 @@ enum CliAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalHelpTopic {
+pub(crate) enum LocalHelpTopic {
     Status,
     Sandbox,
     Doctor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CliOutputFormat {
+pub(crate) enum CliOutputFormat {
     Text,
     Json,
 }
@@ -1354,7 +1354,7 @@ fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiagnosticLevel {
+pub(crate) enum DiagnosticLevel {
     Ok,
     Warn,
     Fail,
@@ -1375,7 +1375,7 @@ impl DiagnosticLevel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DiagnosticCheck {
+pub(crate) struct DiagnosticCheck {
     name: &'static str,
     level: DiagnosticLevel,
     summary: String,
@@ -1432,7 +1432,7 @@ impl DiagnosticCheck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DoctorReport {
+pub(crate) struct DoctorReport {
     checks: Vec<DiagnosticCheck>,
 }
 
@@ -2347,7 +2347,7 @@ struct ResumeCommandOutcome {
 }
 
 #[derive(Debug, Clone)]
-struct StatusContext {
+pub(crate) struct StatusContext {
     cwd: PathBuf,
     session_path: Option<PathBuf>,
     loaded_config_files: usize,
@@ -2360,7 +2360,7 @@ struct StatusContext {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct StatusUsage {
+pub(crate) struct StatusUsage {
     message_count: usize,
     turns: u32,
     latest: TokenUsage,
@@ -2370,7 +2370,7 @@ struct StatusUsage {
 
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct GitWorkspaceSummary {
+pub(crate) struct GitWorkspaceSummary {
     changed_files: usize,
     staged_files: usize,
     unstaged_files: usize,
@@ -3311,7 +3311,7 @@ struct ManagedSessionSummary {
     branch_name: Option<String>,
 }
 
-struct LiveCli {
+pub(crate) struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
@@ -3322,7 +3322,7 @@ struct LiveCli {
 }
 
 #[derive(Debug, Clone)]
-struct PromptHistoryEntry {
+pub(crate) struct PromptHistoryEntry {
     timestamp_ms: u64,
     text: String,
 }
@@ -3341,7 +3341,7 @@ struct RuntimeMcpState {
     degraded_report: Option<runtime::McpDegradedReport>,
 }
 
-struct BuiltRuntime {
+pub(crate) struct BuiltRuntime {
     runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
@@ -6447,7 +6447,7 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct InternalPromptProgressState {
+pub(crate) struct InternalPromptProgressState {
     command_label: &'static str,
     task_label: String,
     step: usize,
@@ -8201,7 +8201,7 @@ fn prompt_cache_record_to_runtime_event(
     })
 }
 
-struct CliToolExecutor {
+pub(crate) struct CliToolExecutor {
     renderer: TerminalRenderer,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
