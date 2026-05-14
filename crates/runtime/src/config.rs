@@ -8,28 +8,13 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
 // ── Re-export from unified config crate ──────────────────────────────
 pub use config::{ApprovalConfig, ResolvedPermissionMode, McpTransport, McpOAuthConfig, OAuthConfig};
+pub use config::{ConfigSource, ConfigEntry};
 
 /// Prefix used for environment variable config overrides.
 const ENV_OVERRIDE_PREFIX: &str = "COWD_";
 
 /// Schema name advertised by generated settings files.
 pub const COWD_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
-
-/// Origin of a loaded settings file in the configuration precedence chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ConfigSource {
-    User,
-    Project,
-    Local,
-}
-
-
-/// A discovered config file and the scope it contributes to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigEntry {
-    pub source: ConfigSource,
-    pub path: PathBuf,
-}
 
 /// Fully merged runtime configuration plus parsed feature-specific views.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -530,61 +515,75 @@ impl ConfigLoader {
         vec![
             // ── Legacy: .cowd.json (lowest priority, deprecated) ─────────────────────
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::User,
                 path: user_legacy_path,
             },
             // ── User-level: ~/.cc paths (preferred config.*) ──────────────────────────
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::User,
                 path: cc_user_dir.join("settings.json"),
             },
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::User,
                 path: cc_user_dir.join("config.yaml"),
             },
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::User,
                 path: cc_user_dir.join("config.yml"),
             },
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::User,
                 path: cc_user_dir.join("config.json"),
             },
             // ── Project-level: .cowd/.claw paths ───────────────────────────────────────
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::Project,
                 path: self.cwd.join(".cowd.json"),
             },
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::Project,
                 path: self.cwd.join(".cowd").join("settings.json"),
             },
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::Project,
                 path: self.cwd.join(".cowd").join("config.yaml"),
             },
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::Project,
                 path: self.cwd.join(".cowd").join("config.yml"),
             },
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::Project,
                 path: self.cwd.join(".cowd").join("config.json"),
             },
             // ── Local overrides: .cc paths (highest priority) ─────────────────────────
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::Local,
                 path: self.cwd.join(".cowd").join("settings.local.json"),
             },
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::Local,
                 path: self.cwd.join(".cowd").join("config.local.yaml"),
             },
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::Local,
                 path: self.cwd.join(".cowd").join("config.local.yml"),
             },
             ConfigEntry {
+                exists: true,
                 source: ConfigSource::Local,
                 path: self.cwd.join(".cowd").join("config.local.json"),
             },

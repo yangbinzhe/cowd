@@ -4784,6 +4784,8 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
             ConfigSource::User => "user",
             ConfigSource::Project => "project",
             ConfigSource::Local => "local",
+            ConfigSource::Environment => "env",
+            ConfigSource::Cli => "cli",
         };
         let status = if runtime_config
             .loaded_entries()
@@ -4861,6 +4863,8 @@ fn render_config_json(
                 ConfigSource::User => "user",
                 ConfigSource::Project => "project",
                 ConfigSource::Local => "local",
+                ConfigSource::Environment => "env",
+                ConfigSource::Cli => "cli",
             };
             let is_loaded = runtime_config
                 .loaded_entries()

@@ -91,7 +91,7 @@ impl std::fmt::Display for ConfigSource {
 }
 
 /// A discovered config file and its source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigEntry {
     pub source: ConfigSource,
     pub path: PathBuf,
