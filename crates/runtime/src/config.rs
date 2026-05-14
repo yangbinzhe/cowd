@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
+// ── Re-export from unified config crate ──────────────────────────────
+pub use config::{ApprovalConfig, ResolvedPermissionMode, McpTransport, McpOAuthConfig, OAuthConfig};
+
 /// Prefix used for environment variable config overrides.
 const ENV_OVERRIDE_PREFIX: &str = "COWD_";
 
@@ -20,13 +23,6 @@ pub enum ConfigSource {
     Local,
 }
 
-/// Effective permission mode after decoding config values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolvedPermissionMode {
-    ReadOnly,
-    WorkspaceWrite,
-    DangerFullAccess,
-}
 
 /// A discovered config file and the scope it contributes to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,71 +152,6 @@ pub struct RuntimePermissionRuleConfig {
     ask: Vec<String>,
 }
 
-/// Smart approval configuration for the intelligent command approval gate.
-///
-/// Controls which commands auto-pass vs. require approval, and YOLO mode
-/// for bypassing approvals during long-running autonomous tasks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApprovalConfig {
-    /// When true, all non-critical commands bypass the approval flow.
-    pub yolo_mode: bool,
-    /// When true, even in YOLO mode, Critical-risk commands still require approval.
-    pub yolo_honor_critical: bool,
-    /// Auto-pass commands detected as read-only (ls, cat, grep, git status, etc.).
-    pub auto_pass_read_only: bool,
-    /// Auto-pass commands that match Low-risk destructive patterns (cargo clean, etc.).
-    pub auto_pass_low_risk: bool,
-}
-
-impl Default for ApprovalConfig {
-    fn default() -> Self {
-        Self {
-            yolo_mode: false,
-            yolo_honor_critical: true,
-            auto_pass_read_only: true,
-            auto_pass_low_risk: true,
-        }
-    }
-}
-
-impl ApprovalConfig {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub fn with_yolo_mode(mut self, enabled: bool) -> Self {
-        self.yolo_mode = enabled;
-        self
-    }
-
-    #[must_use]
-    pub fn with_yolo_honor_critical(mut self, honor: bool) -> Self {
-        self.yolo_honor_critical = honor;
-        self
-    }
-
-    #[must_use]
-    pub fn yolo_mode(&self) -> bool {
-        self.yolo_mode
-    }
-
-    #[must_use]
-    pub fn yolo_honor_critical(&self) -> bool {
-        self.yolo_honor_critical
-    }
-
-    #[must_use]
-    pub fn auto_pass_read_only(&self) -> bool {
-        self.auto_pass_read_only
-    }
-
-    #[must_use]
-    pub fn auto_pass_low_risk(&self) -> bool {
-        self.auto_pass_low_risk
-    }
-}
 
 /// Collection of configured MCP servers after scope-aware merging.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -235,16 +166,6 @@ pub struct ScopedMcpServerConfig {
     pub config: McpServerConfig,
 }
 
-/// Transport families supported by configured MCP servers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum McpTransport {
-    Stdio,
-    Sse,
-    Http,
-    Ws,
-    Sdk,
-    ManagedProxy,
-}
 
 /// Scope-normalized MCP server configuration variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,25 +217,7 @@ pub struct McpManagedProxyServerConfig {
     pub id: String,
 }
 
-/// OAuth overrides associated with a remote MCP server.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpOAuthConfig {
-    pub client_id: Option<String>,
-    pub callback_port: Option<u16>,
-    pub auth_server_metadata_url: Option<String>,
-    pub xaa: Option<bool>,
-}
 
-/// OAuth client configuration used by the main Claw runtime.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OAuthConfig {
-    pub client_id: String,
-    pub authorize_url: String,
-    pub token_url: String,
-    pub callback_port: Option<u16>,
-    pub manual_redirect_url: Option<String>,
-    pub scopes: Vec<String>,
-}
 
 // ---- Memory configuration ----
 
@@ -326,6 +229,13 @@ pub struct MemoryConfig {
     pub layers: LayerConfig,
     pub extraction: ExtractionConfig,
     pub vector: VectorConfig,
+    /// When true, use AAAK symbolic index instead of full entry injection
+    /// for memory context, saving 70-85% tokens.
+    pub aaak_index_enabled: bool,
+    /// Jaccard similarity threshold for coherence filtering in basis points.
+    /// 100 = 0.01, 1000 = 0.10 (default), 5000 = 0.50.
+    /// Entries with score below this are excluded from context injection.
+    pub coherence_threshold_bp: u32,
 }
 
 /// Per-layer token and search limits for the memory subsystem.
@@ -381,6 +291,8 @@ impl Default for MemoryConfig {
             layers: LayerConfig::default(),
             extraction: ExtractionConfig::default(),
             vector: VectorConfig::default(),
+            aaak_index_enabled: true,
+            coherence_threshold_bp: 1000,  // 0.10
         }
     }
 }
@@ -1788,6 +1700,10 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         layers,
         extraction,
         vector,
+        aaak_index_enabled: optional_bool(mem, "aaakIndexEnabled", "merged settings.memory")?
+            .unwrap_or(MemoryConfig::default().aaak_index_enabled),
+        coherence_threshold_bp: optional_u32(mem, "coherenceThreshold", "merged settings.memory")?
+            .unwrap_or(MemoryConfig::default().coherence_threshold_bp),
     })
 }
 

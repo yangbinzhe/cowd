@@ -296,6 +296,13 @@ impl HarnessWorkspace {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(&self.config_home)?;
         fs::create_dir_all(&self.home)?;
+        let config_content = "model: \"sonnet\"\n\
+            providers:\n  anthropic:\n    base_url: \"https://api.anthropic.com/v1\"\n    \
+            api_key: \"test-key\"\n    models: [\"sonnet\"]\n\
+            permissions:\n  defaultMode: \"acceptEdits\"\n  allow: []\n  deny: []\n  ask: []\n\
+            memory:\n  enabled: false\n\
+            gateway:\n  enabled: false\n";
+        fs::write(self.config_home.join("config.yaml"), config_content)?;
         Ok(())
     }
 }

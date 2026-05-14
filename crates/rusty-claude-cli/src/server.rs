@@ -16,12 +16,11 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::Arc,
-    time::Duration,
 };
 
 use axum::{
     body::Body,
-    extract::{Multipart, Path, Query, State as AxumState, WebSocketUpgrade, ConnectInfo, ws::{Message as WsMessage, WebSocket}},
+    extract::{Multipart, Path, Query, State as AxumState, WebSocketUpgrade, ws::{Message as WsMessage, WebSocket}},
     http::{header, StatusCode, Request, HeaderValue},
     response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
     routing::{delete, get, patch, post, put},
@@ -43,26 +42,23 @@ use uuid::Uuid;
 // ── 模块导入 ─────────────────────────────────────────────────────────────────
 
 use api::{
-    detect_provider_kind, max_tokens_for_model, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, MessageStream,
-    OutputContentBlock, StreamEvent,
+    max_tokens_for_model, ContentBlockDelta, InputContentBlock, InputMessage,
+    MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, StreamEvent,
 };
 use memory::{
     cognitive::CognitiveContextManager,
     store::session::SqliteSessionStore,
     types::Message as MemMessage,
-    MemoryConfig, MemoryEntry, PreparedContext,
+    MemoryConfig, PreparedContext,
 };
 use runtime::platform::{PlatformRuntime, PlatformConfig, PlatformError};
 use runtime::team_cron_registry::CronScheduler;
 use runtime::CompactionConfig;
 use runtime::{
-    ApiClient as RuntimeApiClient, ApiRequest, AssistantEvent, ConversationRuntime,
-    PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolCallback, ToolError, ToolExecutor,
+    ApiClient as RuntimeApiClient, ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, ToolCallback, ToolError, ToolExecutor,
     PermissionMode, PermissionPolicy,
     ContentBlock as SessionContentBlock, ConversationMessage as SessionMessage, 
     MessageRole as SessionMessageRole, Session,
-    TokenUsage as RuntimeTokenUsage,
 };
 use tools;
 
@@ -149,7 +145,10 @@ impl GlobalUsageTracker {
 
     fn record(&self, model: &str, usage: runtime::TokenUsage) {
         self.total_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut map = self.by_model.lock().unwrap();
+        let mut map = self.by_model.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("usage tracker lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let accum = map.entry(model.to_string()).or_default();
         accum.input_tokens += usage.input_tokens as u64;
         accum.output_tokens += usage.output_tokens as u64;
@@ -159,7 +158,10 @@ impl GlobalUsageTracker {
     }
 
     fn snapshot(&self) -> UsageResponse {
-        let map = self.by_model.lock().unwrap();
+        let map = self.by_model.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("usage tracker lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let mut by_model = HashMap::new();
         for (model, accum) in map.iter() {
             let pricing = runtime::pricing_for_model(model);
@@ -678,12 +680,22 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // B9: Restrictive CORS - default local origins + configurable extra origins
-    let mut cors_origin_values: Vec<HeaderValue> = vec![
-        "http://localhost:8642".parse::<HeaderValue>().unwrap(),
-        "http://127.0.0.1:8642".parse::<HeaderValue>().unwrap(),
-        "http://localhost:8080".parse::<HeaderValue>().unwrap(),
-        "http://127.0.0.1:8080".parse::<HeaderValue>().unwrap(),
+    let default_origins = [
+        "http://localhost:8642",
+        "http://127.0.0.1:8642",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
     ];
+    let mut cors_origin_values: Vec<HeaderValue> = default_origins
+        .iter()
+        .filter_map(|origin| match origin.parse::<HeaderValue>() {
+            Ok(hv) => Some(hv),
+            Err(e) => {
+                tracing::warn!("Invalid default CORS origin '{}': {}", origin, e);
+                None
+            }
+        })
+        .collect();
     for origin in &config.cors_origins {
         match origin.parse::<HeaderValue>() {
             Ok(hv) => cors_origin_values.push(hv),
@@ -936,7 +948,7 @@ async fn health_handler() -> axum::response::Response {
 
 // ── HTTP Handlers - Models ──────────────────────────────────────────────────────
 
-async fn models_handler(AxumState(state): AxumState<HttpAppState>) -> axum::response::Response {
+async fn models_handler(AxumState(_state): AxumState<HttpAppState>) -> axum::response::Response {
     // 返回默认模型列表（实际应该从配置中读取）
     let models = vec![
         serde_json::json!({"id": "claude-opus-4-6", "provider": "anthropic"}),
@@ -1196,7 +1208,7 @@ impl OpenAiApiClient {
 
         // Execute the async streaming in the current runtime
         let cloned_client = self.client.clone();
-        let model = self.model.clone();
+        let _model = self.model.clone();
 
         handle.block_on(async {
             let mut stream = match cloned_client.stream_message(&message_request).await {
@@ -1798,10 +1810,11 @@ async fn compact_session_handler(
     let config = CompactionConfig {
         preserve_recent_messages: params.preserve_recent_messages.unwrap_or(4),
         max_estimated_tokens: params.max_estimated_tokens.unwrap_or(10_000),
+        ..Default::default()
     };
 
     // Load session record from SQLite
-    let record = match state.session_store.get_session(&session_id) {
+    let _record = match state.session_store.get_session(&session_id) {
         Ok(Some(r)) => r,
         Ok(None) => {
             return (
@@ -2883,7 +2896,7 @@ async fn handle_ws_sessions(
 
 async fn handle_ws(mut socket: WebSocket, addr: std::net::SocketAddr, state: HttpAppState) {
     let session_id = format!("ws-{}", addr);
-    let broadcast_tx = state.session_broadcast.clone();
+    let _broadcast_tx = state.session_broadcast.clone();
 
     // Send welcome message
     let welcome = WsOutbound {
@@ -4003,8 +4016,8 @@ async fn send_message_stream_handler(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
     let content_for_task = user_content.clone();
-    let sid_for_task = sid.clone();
-    let broadcast_for_task = broadcast_tx.clone();
+    let _sid_for_task = sid.clone();
+    let _broadcast_for_task = broadcast_tx.clone();
 
     tokio::task::spawn_blocking(move || {
         let text = match server_execute_turn(&content_for_task) {
@@ -4598,7 +4611,7 @@ async fn upload_file_handler(
         }
 
         // Write to workspace (path traversal safety via sanitize_path)
-        let dest_path = workspace.join(&safe_name);
+        let _dest_path = workspace.join(&safe_name);
         match sanitize_path(&workspace, &safe_name) {
             Ok(safe_path) => {
                 if let Err(e) = tokio::fs::write(&safe_path, &data).await {
@@ -5129,7 +5142,7 @@ async fn audit_facts_handler(
     AxumState(state): AxumState<HttpAppState>,
 ) -> Response {
     // Returns the list of registered entities and their facts
-    let checker = state.fact_checker.lock().await;
+    let _checker = state.fact_checker.lock().await;
     // FactChecker doesn't expose entity_facts directly, so return summary
     Json(serde_json::json!({
         "message": "Fact checker is active. Use /api/memory/facts/check to validate triples.",

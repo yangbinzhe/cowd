@@ -3,15 +3,14 @@ use crate::conversation::{ConversationRuntime, RuntimeError};
 use crate::permissions::PermissionPrompter;
 
 pub struct SubAgentExecutor<C: crate::conversation::ApiClient, T: crate::conversation::ToolExecutor> {
-    config: SubAgentConfig,
     runtime: ConversationRuntime<C, T>,
 }
 
 impl<C: crate::conversation::ApiClient, T: crate::conversation::ToolExecutor> SubAgentExecutor<C, T> {
-    pub fn new(config: SubAgentConfig, runtime: ConversationRuntime<C, T>) -> Self {
-        Self { config, runtime }
+    pub fn new(_config: SubAgentConfig, runtime: ConversationRuntime<C, T>) -> Self {
+        Self { runtime }
     }
-    pub fn execute_sync(&mut self, task: &str, mut prompter: Option<&mut dyn PermissionPrompter>) -> Result<SubAgentResult, RuntimeError> {
+    pub fn execute_sync(&mut self, task: &str, prompter: Option<&mut dyn PermissionPrompter>) -> Result<SubAgentResult, RuntimeError> {
         let summary = self.runtime.run_turn(task, prompter)?;
         let output = self.runtime.session().messages.last().map(|m| m.blocks.iter().filter_map(|b| match b { crate::session::ContentBlock::Text{text}=>Some(text.clone()), _=>None }).collect::<Vec<_>>().join(" ")).unwrap_or_default();
         Ok(SubAgentResult { output, tool_call_count: summary.tool_results.len(), tokens_used: summary.usage.total_tokens() as usize, completed_normally: true, memory_write_attempts: 0, memory_writes_denied: 0 })

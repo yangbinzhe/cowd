@@ -1,14 +1,10 @@
 #![allow(
-    dead_code,
-    unused_imports,
-    unused_variables,
     clippy::unneeded_struct_pattern,
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
 mod bootstrap;
 mod init;
-mod engine;
 mod render;
 mod server;
 mod tui;
@@ -17,7 +13,6 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -37,9 +32,9 @@ use api::{
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
+    handle_skills_slash_command, handle_skills_slash_command_json,
     render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
+    slash_command_specs, SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -50,14 +45,14 @@ use runtime::{
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
+    McpServerSpec, McpTool, MessageRole, PermissionMode, PermissionPolicy,
     ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
     ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
-    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition,
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -3270,17 +3265,33 @@ fn run_repl(
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
-    let eng = engine::Engine::new(std::env::current_dir().unwrap_or_default());
-    run_tui_repl(cli, eng)
+    let workspace = std::env::current_dir().unwrap_or_default();
+    run_tui_repl(cli, workspace)
 }
 
-fn refresh_panels(app: &mut tui::App, engine: &engine::Engine, runtime: &BuiltRuntime) {
-    app.file_entries = engine.list_files().into_iter().map(|f| tui::FileEntry {
-        name: f.name, is_dir: f.is_dir, size: f.size,
-    }).collect();
+fn list_workspace_files(workspace: &PathBuf) -> Vec<tui::FileEntry> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(workspace) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if name.starts_with('.') { continue; }
+            files.push(tui::FileEntry {
+                name,
+                is_dir: path.is_dir(),
+                size: if path.is_dir() { 0 } else { path.metadata().map(|m| m.len()).unwrap_or(0) },
+            });
+        }
+    }
+    files.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+    files
+}
+
+fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntime) {
+    app.file_entries = list_workspace_files(workspace);
 
     app.delegate_tasks.clear();
-    if let Some(handoff) = engine::Engine::memory_handoff(runtime) {
+    if let Some(handoff) = runtime.create_memory_handoff() {
         for task in &handoff.task_states {
             app.delegate_tasks.push(tui::DelegateTask {
                 id: task.task_id.clone(),
@@ -3298,7 +3309,7 @@ fn refresh_panels(app: &mut tui::App, engine: &engine::Engine, runtime: &BuiltRu
     }
 
     app.memory_entries.clear();
-    if let Some(handoff) = engine::Engine::memory_handoff(runtime) {
+    if let Some(handoff) = runtime.create_memory_handoff() {
         if !handoff.summary.is_empty() {
             app.memory_entries.push(tui::MemoryEntry {
                 layer: "handoff".to_string(),
@@ -3349,7 +3360,7 @@ fn refresh_panels(app: &mut tui::App, engine: &engine::Engine, runtime: &BuiltRu
     }
 }
 
-fn run_tui_repl(mut cli: LiveCli, eng: engine::Engine) -> Result<(), Box<dyn std::error::Error>> {
+fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     use std::io;
     use crossterm::{
         execute,
@@ -3368,7 +3379,7 @@ fn run_tui_repl(mut cli: LiveCli, eng: engine::Engine) -> Result<(), Box<dyn std
     let mut app = tui::App::new(&cli.model, &session_id);
     app.add_message("system", &cli.startup_banner());
     app.add_message("system", &format_connected_line(&cli.model));
-    refresh_panels(&mut app, &eng, &cli.runtime);
+    refresh_panels(&mut app, &workspace, &cli.runtime);
 
     let res = (|| -> Result<(), Box<dyn std::error::Error>> {
         loop {
@@ -3395,8 +3406,8 @@ fn run_tui_repl(mut cli: LiveCli, eng: engine::Engine) -> Result<(), Box<dyn std
                     match cli.run_turn(&text) {
                         Ok(()) => {
                             app.is_loading = false;
-                            app.token_count = engine::Engine::token_count(&cli.runtime);
-                            app.cost_estimate = Some(engine::Engine::cost_usd(&cli.runtime));
+                            app.token_count = cli.runtime.usage().cumulative_usage().total_tokens() as u64;
+                            app.cost_estimate = Some(cli.runtime.usage().cumulative_usage().estimate_cost_usd().total_cost_usd());
                             app.add_message("assistant", "✓ Done");
                         }
                         Err(e) => {
@@ -3404,7 +3415,7 @@ fn run_tui_repl(mut cli: LiveCli, eng: engine::Engine) -> Result<(), Box<dyn std
                             app.add_message("system", &format!("Error: {e}"));
                         }
                     }
-    refresh_panels(&mut app, &eng, &cli.runtime);
+    refresh_panels(&mut app, &workspace, &cli.runtime);
                 }
                 tui::input::InputResult::ResumeSession(_id) => {
                     app.add_message("system", "Session resume via picker");

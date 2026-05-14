@@ -129,7 +129,10 @@ impl LspRegistry {
         root_path: Option<&str>,
         capabilities: Vec<String>,
     ) {
-        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("lsp registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.servers.insert(
             language.to_owned(),
             LspServerState {
@@ -143,7 +146,10 @@ impl LspRegistry {
     }
 
     pub fn get(&self, language: &str) -> Option<LspServerState> {
-        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("lsp registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.servers.get(language).cloned()
     }
 
@@ -173,7 +179,10 @@ impl LspRegistry {
 
     /// List all registered servers.
     pub fn list_servers(&self) -> Vec<LspServerState> {
-        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("lsp registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.servers.values().cloned().collect()
     }
 
@@ -183,7 +192,10 @@ impl LspRegistry {
         language: &str,
         diagnostics: Vec<LspDiagnostic>,
     ) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("lsp registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let server = inner
             .servers
             .get_mut(language)
@@ -194,7 +206,10 @@ impl LspRegistry {
 
     /// Get diagnostics for a specific file path.
     pub fn get_diagnostics(&self, path: &str) -> Vec<LspDiagnostic> {
-        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("lsp registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner
             .servers
             .values()
@@ -206,7 +221,10 @@ impl LspRegistry {
 
     /// Clear diagnostics for a language server.
     pub fn clear_diagnostics(&self, language: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("lsp registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let server = inner
             .servers
             .get_mut(language)
@@ -217,13 +235,19 @@ impl LspRegistry {
 
     /// Disconnect a server.
     pub fn disconnect(&self, language: &str) -> Option<LspServerState> {
-        let mut inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("lsp registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.servers.remove(language)
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().expect("lsp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("lsp registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.servers.len()
     }
 
@@ -256,7 +280,10 @@ impl LspRegistry {
                 }));
             }
             // All diagnostics across all servers
-            let inner = self.inner.lock().expect("lsp registry lock poisoned");
+            let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("lsp registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
             let all_diags: Vec<_> = inner
                 .servers
                 .values()

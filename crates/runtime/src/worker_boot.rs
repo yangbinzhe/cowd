@@ -267,7 +267,10 @@ impl WorkerRegistry {
         trusted_roots: &[String],
         auto_recover_prompt_misdelivery: bool,
     ) -> Worker {
-        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("worker registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.counter += 1;
         let ts = now_secs();
         let worker_id = format!("worker_{:08x}_{}", ts, inner.counter);
@@ -304,12 +307,18 @@ impl WorkerRegistry {
 
     #[must_use]
     pub fn get(&self, worker_id: &str) -> Option<Worker> {
-        let inner = self.inner.lock().expect("worker registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("worker registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.workers.get(worker_id).cloned()
     }
 
     pub fn observe(&self, worker_id: &str, screen_text: &str) -> Result<Worker, String> {
-        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("worker registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let worker = inner
             .workers
             .get_mut(worker_id)
@@ -457,7 +466,10 @@ impl WorkerRegistry {
     }
 
     pub fn resolve_trust(&self, worker_id: &str) -> Result<Worker, String> {
-        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("worker registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let worker = inner
             .workers
             .get_mut(worker_id)
@@ -492,7 +504,10 @@ impl WorkerRegistry {
         prompt: Option<&str>,
         task_receipt: Option<WorkerTaskReceipt>,
     ) -> Result<Worker, String> {
-        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("worker registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let worker = inner
             .workers
             .get_mut(worker_id)
@@ -551,7 +566,10 @@ impl WorkerRegistry {
     }
 
     pub fn restart(&self, worker_id: &str) -> Result<Worker, String> {
-        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("worker registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let worker = inner
             .workers
             .get_mut(worker_id)
@@ -574,7 +592,10 @@ impl WorkerRegistry {
     }
 
     pub fn terminate(&self, worker_id: &str) -> Result<Worker, String> {
-        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("worker registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let worker = inner
             .workers
             .get_mut(worker_id)
@@ -599,7 +620,10 @@ impl WorkerRegistry {
         finish_reason: &str,
         tokens_output: u64,
     ) -> Result<Worker, String> {
-        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("worker registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let worker = inner
             .workers
             .get_mut(worker_id)
@@ -655,7 +679,10 @@ impl WorkerRegistry {
         &self,
         worker_id: &str,
     ) -> Result<(Worker, StartupFailureClassification), String> {
-        let mut inner = self.inner.lock().expect("worker registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("worker registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let worker = inner
             .workers
             .get_mut(worker_id)

@@ -7,7 +7,10 @@
 //! Usage: Telegram messages visible in WebUI session, and vice versa.
 //! Format: In JSONL, mirrored messages are tagged with `mirror: true`.
 
-use crate::platform::adapter::{InboundMessage, Platform};
+use crate::platform::adapter::InboundMessage;
+#[cfg(test)]
+use crate::platform::adapter::Platform;
+#[cfg(test)]
 use crate::platform::types::SessionKey;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

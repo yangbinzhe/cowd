@@ -237,7 +237,6 @@ impl FeishuAdapter {
         struct SenderId {
             open_id: Option<String>,
             user_id: Option<String>,
-            union_id: Option<String>,
         }
 
         #[derive(Deserialize)]

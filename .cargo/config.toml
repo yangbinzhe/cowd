@@ -1,9 +1,3 @@
-[build]
-# Limit parallel compilation to reduce peak memory.
-# Default is number of CPU cores.  2 jobs keeps each ~2-4GB.
-# Override with: CARGO_BUILD_JOBS=N
-jobs = 4
-
 [term]
 verbose = false
 color = "auto"

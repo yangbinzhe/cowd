@@ -2,7 +2,6 @@
 // Derived from opencode's bus/ module pattern.
 
 use tokio::sync::broadcast;
-use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub enum Event {

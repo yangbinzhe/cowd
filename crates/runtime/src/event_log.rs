@@ -28,7 +28,10 @@ impl SessionEventLogger {
     }
 
     pub fn record(&self, session_id: &str, turn: u32, event_type: &str, summary: &str) {
-        let guard = self.conn.lock().unwrap();
+        let guard = self.conn.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("event log lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         if let Some(ref conn) = *guard {
             let _ = conn.execute(
                 "INSERT INTO session_events (session_id, turn_number, event_type, summary, recorded_at) VALUES (?1,?2,?3,?4,?5)",
@@ -38,7 +41,10 @@ impl SessionEventLogger {
     }
 
     pub fn rebuild_context(&self, session_id: &str, limit: usize) -> String {
-        let guard = self.conn.lock().unwrap();
+        let guard = self.conn.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("event log lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let Some(ref conn) = *guard else { return String::new(); };
         let mut stmt = match conn.prepare(
             "SELECT event_type, summary FROM session_events WHERE session_id=?1 ORDER BY turn_number DESC, id DESC LIMIT ?2"

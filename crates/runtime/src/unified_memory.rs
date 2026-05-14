@@ -29,7 +29,10 @@ impl UnifiedMemoryManager {
             if let Ok(h) = handle {
                 let mem_cfg = LegacyMemConfig::default();
                 if let Ok(mgr) = h.block_on(memory::cognitive::CognitiveContextManager::new(mem_cfg)) {
-                    *memory_legacy.write().unwrap() = Some(Arc::new(mgr));
+                    *memory_legacy.write().unwrap_or_else(|poisoned| {
+                        tracing::warn!("unified memory RwLock poisoned; recovering");
+                        poisoned.into_inner()
+                    }) = Some(Arc::new(mgr));
                 }
             }
         }
@@ -64,7 +67,10 @@ impl UnifiedMemoryManager {
 
         // L3: legacy deep semantic recall (with lazy init)
         {
-            let legacy = self.memory_legacy.read().unwrap();
+            let legacy = self.memory_legacy.read().unwrap_or_else(|poisoned| {
+                tracing::warn!("unified memory RwLock poisoned; recovering");
+                poisoned.into_inner()
+            });
             if let Some(ref mgr) = *legacy {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     let entries = handle.block_on(mgr.recall(session_id, 5)).unwrap_or_default();

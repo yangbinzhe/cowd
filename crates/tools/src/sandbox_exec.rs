@@ -72,6 +72,17 @@ pub fn execute_code(language: &str, code: &str) -> SandboxResult {
 fn execute_compiled(tool: &str, code: &str) -> SandboxResult {
     let tmp = std::env::temp_dir().join(format!("cowd_sandbox_{}", std::process::id()));
     let src = if tool == "go" { tmp.with_extension("go") } else { tmp.with_extension("rs") };
+
+    // RAII guard ensures temp files are always cleaned up.
+    struct Cleanup { src: std::path::PathBuf, bin: Option<std::path::PathBuf> }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.src);
+            if let Some(ref bin) = self.bin { let _ = std::fs::remove_file(bin); }
+        }
+    }
+    let mut cleanup = Cleanup { src: src.clone(), bin: None };
+
     if let Err(e) = std::fs::write(&src, code) {
         return SandboxResult { stdout: String::new(), stderr: format!("write: {e}"), exit_code: 1 };
     }
@@ -83,14 +94,12 @@ fn execute_compiled(tool: &str, code: &str) -> SandboxResult {
     let mut cmd = Command::new(compile_cmd);
     if let Some(sub) = run_cmd { cmd.arg(sub); }
     cmd.arg(&src);
-    if tool == "rustc" { cmd.arg("-o").arg(&tmp); }
+    if tool == "rustc" { cmd.arg("-o").arg(&tmp); cleanup.bin = Some(tmp.clone()); }
     let out = cmd.output();
-    let _ = std::fs::remove_file(&src);
     match out {
         Ok(o) if o.status.success() => {
             if tool == "rustc" {
                 let run = Command::new(&tmp).output();
-                let _ = std::fs::remove_file(&tmp);
                 match run { Ok(r) => SandboxResult { stdout: String::from_utf8_lossy(&r.stdout).to_string(), stderr: String::from_utf8_lossy(&r.stderr).to_string(), exit_code: r.status.code().unwrap_or(1) }, Err(e) => SandboxResult { stdout: String::new(), stderr: e.to_string(), exit_code: 1 } }
             } else {
                 SandboxResult { stdout: String::from_utf8_lossy(&o.stdout).to_string(), stderr: String::from_utf8_lossy(&o.stderr).to_string(), exit_code: 0 }

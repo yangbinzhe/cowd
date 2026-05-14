@@ -57,6 +57,9 @@ providers:
 # 记忆自动提取，后台异步，零token消耗
 memory:
   enabled: true
+  # AAAK 符号化记忆索引 (默认开启, 节省 70-85% tokens)
+  # 关闭后将使用全量注入模式
+  # aaakIndexEnabled: true
   # 提取批处理大小（积累N轮后批量写入，默认3）
   # extract_batch_size: 3
   # L1最大token数（默认800）

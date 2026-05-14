@@ -151,17 +151,14 @@ pub struct KnowledgeGraph {
     entities: HashMap<String, Entity>,
     /// In-memory triple cache.
     triples: Vec<Triple>,
-    /// In-memory store reference for source lookups.
-    store: Arc<dyn MemoryStore>,
 }
 
 impl KnowledgeGraph {
     /// Create a new knowledge graph.
-    pub fn new(store: Arc<dyn MemoryStore>) -> Self {
+    pub fn new(_store: Arc<dyn MemoryStore>) -> Self {
         Self {
             entities: HashMap::new(),
             triples: Vec::new(),
-            store,
         }
     }
 
@@ -676,6 +673,7 @@ pub fn temporal_relation(
             valid_until: None,
             sequence: 0,
         }),
+        entity: None,
     }
 }
 
@@ -779,6 +777,7 @@ mod tests {
                 valid_until: Some(valid_until),
                 sequence: 1,
             }),
+            entity: None,
         };
 
         assert!(rel.temporal.is_some());

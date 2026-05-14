@@ -3,13 +3,27 @@
 //! Tracks how tokens are allocated across system prompt, memory, and
 //! conversation history.  Implements depth-scale reduction when the budget
 //! is under pressure.
-//!
-//! TODO: implement budget allocation algorithm.
 
 use crate::{
     config::BudgetConfig,
     types::{AlertLevel, TokenBudget},
 };
+
+/// Which subsystem is requesting a budget allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocationPhase {
+    SystemPrompt,
+    MemoryInjection,
+    ConversationHistory,
+    ToolOutput,
+}
+
+/// Token allocation for a specific phase.
+#[derive(Debug, Clone, Copy)]
+pub struct Allocation {
+    pub max_tokens: u64,
+    pub pressure_factor: f32,
+}
 
 /// Manages token allocation and emits budget snapshots.
 pub struct BudgetManager {
@@ -68,5 +82,83 @@ impl BudgetManager {
         } else {
             1.0 - (ratio - warn) / (crit - warn)
         }
+    }
+
+    /// Dynamically allocate tokens for a given phase based on current pressure.
+    /// Under high pressure (>80%), critical phases get proportionally reduced budgets.
+    #[must_use]
+    pub fn allocate(&self, phase: AllocationPhase, used: u64) -> Allocation {
+        let total = self.config.context_window as u64;
+        let pressure = used as f32 / total as f32;
+
+        let base_pct = match phase {
+            AllocationPhase::SystemPrompt => 0.15,
+            AllocationPhase::MemoryInjection => 0.12,
+            AllocationPhase::ConversationHistory => 0.55,
+            AllocationPhase::ToolOutput => 0.18,
+        };
+
+        let pressure_factor = if pressure > 0.8 {
+            // High pressure: reduce non-critical phases
+            match phase {
+                AllocationPhase::SystemPrompt => 1.0,
+                AllocationPhase::MemoryInjection => 0.5,
+                AllocationPhase::ConversationHistory => 0.7,
+                AllocationPhase::ToolOutput => 0.5,
+            }
+        } else {
+            1.0
+        };
+
+        Allocation {
+            max_tokens: ((total as f32) * base_pct * pressure_factor) as u64,
+            pressure_factor,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a15_normal_pressure_full_allocation() {
+        let mgr = BudgetManager::new(BudgetConfig {
+            context_window: 100_000,
+            reserved_system: 10_000,
+            reserved_response: 4_000,
+            warning_threshold: 0.7,
+            critical_threshold: 0.95,
+        });
+        let alloc = mgr.allocate(AllocationPhase::MemoryInjection, 50_000);
+        assert!(alloc.max_tokens > 0);
+        assert!((alloc.pressure_factor - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a15_high_pressure_reduces_memory() {
+        let mgr = BudgetManager::new(BudgetConfig {
+            context_window: 100_000,
+            reserved_system: 10_000,
+            reserved_response: 4_000,
+            warning_threshold: 0.7,
+            critical_threshold: 0.95,
+        });
+        let alloc = mgr.allocate(AllocationPhase::MemoryInjection, 85_000);
+        assert!((alloc.pressure_factor - 0.5).abs() < 0.01,
+            "memory phase should halve under high pressure, got {}", alloc.pressure_factor);
+    }
+
+    #[test]
+    fn a15_system_prompt_never_reduced() {
+        let mgr = BudgetManager::new(BudgetConfig {
+            context_window: 100_000,
+            reserved_system: 10_000,
+            reserved_response: 4_000,
+            warning_threshold: 0.7,
+            critical_threshold: 0.95,
+        });
+        let alloc = mgr.allocate(AllocationPhase::SystemPrompt, 90_000);
+        assert!((alloc.pressure_factor - 1.0).abs() < 0.01);
     }
 }

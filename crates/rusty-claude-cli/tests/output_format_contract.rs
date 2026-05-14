@@ -382,6 +382,20 @@ fn assert_json_command_with_env(current_dir: &Path, args: &[&str], envs: &[(&str
 }
 
 fn run_cowd(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    // Pre-create minimal config to skip bootstrap when COWD_CONFIG_HOME is set
+    for (key, value) in envs {
+        if *key == "COWD_CONFIG_HOME" {
+            let config_dir = Path::new(value);
+            let _ = fs::create_dir_all(config_dir);
+            let _ = fs::write(config_dir.join("config.yaml"), "model: \"sonnet\"\n\
+                providers:\n  anthropic:\n    base_url: \"https://api.anthropic.com/v1\"\n    \
+                api_key: \"test-key\"\n    models: [\"sonnet\"]\n\
+                permissions:\n  defaultMode: \"acceptEdits\"\n  allow: []\n  deny: []\n  ask: []\n\
+                memory:\n  enabled: false\n\
+                gateway:\n  enabled: false\n");
+            break;
+        }
+    }
     let mut command = Command::new(env!("CARGO_BIN_EXE_cowd"));
     command.current_dir(current_dir).args(args);
     for (key, value) in envs {

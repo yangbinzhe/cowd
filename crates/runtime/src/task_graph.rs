@@ -1,7 +1,7 @@
 // M6: SubAgentExecutor + TaskGraph — agent delegation system.
 // Derived from GenericAgent's BaseHandler.dispatch() loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 pub type TaskId = String;

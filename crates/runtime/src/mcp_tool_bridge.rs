@@ -1,5 +1,4 @@
 #![allow(
-    clippy::await_holding_lock,
     clippy::doc_markdown,
     clippy::match_same_arms,
     clippy::must_use_candidate,
@@ -97,7 +96,10 @@ impl McpToolRegistry {
         resources: Vec<McpResourceInfo>,
         server_info: Option<String>,
     ) {
-        let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.insert(
             server_name.to_owned(),
             McpServerState {
@@ -112,17 +114,26 @@ impl McpToolRegistry {
     }
 
     pub fn get_server(&self, server_name: &str) -> Option<McpServerState> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.get(server_name).cloned()
     }
 
     pub fn list_servers(&self) -> Vec<McpServerState> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.values().cloned().collect()
     }
 
     pub fn list_resources(&self, server_name: &str) -> Result<Vec<McpResourceInfo>, String> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         match inner.get(server_name) {
             Some(state) => {
                 if state.status != McpConnectionStatus::Connected {
@@ -138,7 +149,10 @@ impl McpToolRegistry {
     }
 
     pub fn read_resource(&self, server_name: &str, uri: &str) -> Result<McpResourceInfo, String> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let state = inner
             .get(server_name)
             .ok_or_else(|| format!("server '{}' not found", server_name))?;
@@ -159,7 +173,10 @@ impl McpToolRegistry {
     }
 
     pub fn list_tools(&self, server_name: &str) -> Result<Vec<McpToolInfo>, String> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         match inner.get(server_name) {
             Some(state) => {
                 if state.status != McpConnectionStatus::Connected {
@@ -243,7 +260,10 @@ impl McpToolRegistry {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let state = inner
             .get(server_name)
             .ok_or_else(|| format!("server '{}' not found", server_name))?;
@@ -283,7 +303,10 @@ impl McpToolRegistry {
         server_name: &str,
         status: McpConnectionStatus,
     ) -> Result<(), String> {
-        let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let state = inner
             .get_mut(server_name)
             .ok_or_else(|| format!("server '{}' not found", server_name))?;
@@ -293,14 +316,20 @@ impl McpToolRegistry {
 
     /// Disconnect / remove a server.
     pub fn disconnect(&self, server_name: &str) -> Option<McpServerState> {
-        let mut inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.remove(server_name)
     }
 
     /// Number of registered servers.
     #[must_use]
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().expect("mcp registry lock poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge registry lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         inner.len()
     }
 
@@ -328,7 +357,10 @@ mod tests {
         static NEXT_TEMP_DIR_ID: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("time should be after epoch")
+            .unwrap_or_else(|e| {
+                tracing::warn!("system time error: {}, using 0 as fallback", e);
+                std::time::Duration::from_secs(0)
+            })
             .as_nanos();
         let unique_id = NEXT_TEMP_DIR_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("runtime-mcp-tool-bridge-{nanos}-{unique_id}"))

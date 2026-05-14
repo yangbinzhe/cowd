@@ -16,6 +16,7 @@ pub struct Relation {
 }
 
 pub struct KnowledgeGraph {
+    #[allow(dead_code)] // crate deprecated; field reserved during migration
     store: Arc<MemoryStore>,
 }
 

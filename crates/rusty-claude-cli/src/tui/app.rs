@@ -53,6 +53,8 @@ pub struct App {
     pub delegate_tasks: Vec<DelegateTask>,
     pub memory_entries: Vec<MemoryEntry>,
     pub skill_list: Vec<SkillSummary>,
+    pub skin: crate::tui::skin::SkinConfig,
+    pub memory_status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +150,8 @@ impl App {
             delegate_tasks: Vec::new(),
             memory_entries: Vec::new(),
             skill_list: Vec::new(),
+            skin: crate::tui::skin::SkinConfig::default(),
+            memory_status: None,
         }
     }
 

@@ -105,6 +105,7 @@ pub struct MemoryManager {
     l0: IdentityLayer,
     l1: EssentialLayer,
     l2: SearchLayer,
+    #[allow(dead_code)] // crate deprecated; field reserved during migration
     store: Arc<MemoryStore>,
     extract_tx: mpsc::UnboundedSender<TurnPayload>,
     _extract_handle: std::thread::JoinHandle<()>,

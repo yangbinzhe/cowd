@@ -442,7 +442,7 @@ impl AaakCompressor {
     fn tokenize(&self, text: &str) -> Vec<Token> {
         let mut tokens = Vec::new();
         let mut current = String::new();
-        let mut pos = 0;
+        let mut _pos = 0;
 
         for ch in text.chars() {
             if ch.is_alphanumeric() || ch == '_' || ch == '/' || ch == '.' || ch == ':' || ch == '#' || ch == '@' || ch == '-' {
@@ -453,7 +453,6 @@ impl AaakCompressor {
                     tokens.push(Token {
                         text: current.clone(),
                         entity_type,
-                        position: pos,
                     });
                     current.clear();
                 }
@@ -462,10 +461,9 @@ impl AaakCompressor {
                     tokens.push(Token {
                         text: ch.to_string(),
                         entity_type: EntityType::Generic,
-                        position: pos,
                     });
                 }
-                pos += 1;
+                _pos += 1;
             }
         }
 
@@ -474,7 +472,6 @@ impl AaakCompressor {
             tokens.push(Token {
                 text: current,
                 entity_type,
-                position: pos,
             });
         }
 
@@ -774,7 +771,6 @@ pub struct CompressedOutput {
 struct Token {
     text: String,
     entity_type: EntityType,
-    position: usize,
 }
 
 /// Merged context for GSD-style state rebuilding.

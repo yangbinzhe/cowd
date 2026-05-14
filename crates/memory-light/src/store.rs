@@ -36,7 +36,10 @@ impl MemoryStore {
     }
 
     pub fn insert(&self, entry: &MemoryEntry) -> Result<(), rusqlite::Error> {
-        let c = self.conn.lock().unwrap();
+        let c = self.conn.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("memory store lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         c.execute("INSERT INTO memories (id,layer,category,priority,title,content,tags,created_at,updated_at,access_count) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![entry.id, l2s(entry.layer), c2s(entry.category), p2i(entry.priority), entry.title, entry.content, serde_json::to_string(&entry.tags).unwrap_or_default(), entry.created_at.to_rfc3339(), entry.updated_at.to_rfc3339(), entry.access_count],
         )?;
@@ -44,7 +47,10 @@ impl MemoryStore {
     }
 
     pub fn get_top_entries(&self, layer: MemoryLayer, min_priority: Priority, limit: usize) -> Result<Vec<MemoryEntry>, rusqlite::Error> {
-        let c = self.conn.lock().unwrap();
+        let c = self.conn.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("memory store lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let mut stmt = c.prepare("SELECT id,layer,category,priority,title,content,tags,created_at,updated_at,access_count FROM memories WHERE layer=?1 AND priority>=?2 ORDER BY priority DESC, updated_at DESC LIMIT ?3")?;
         let rows = stmt.query_map(params![l2s(layer), p2i(min_priority), limit as i64], |row| Ok(MemoryEntry {
             id: row.get(0)?, layer, category: MemoryCategory::Reference,
@@ -63,7 +69,10 @@ impl MemoryStore {
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>, rusqlite::Error> {
         let fts = query.split_whitespace().filter(|w| !w.is_empty()).map(|w| format!("\"{}\"", w.replace('"', "\"\""))).collect::<Vec<_>>().join(" OR ");
         if fts.is_empty() { return Ok(Vec::new()); }
-        let c = self.conn.lock().unwrap();
+        let c = self.conn.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("memory store lock poisoned; recovering");
+            poisoned.into_inner()
+        });
         let mut stmt = c.prepare("SELECT m.id,m.layer,m.category,m.priority,m.title,m.content,m.tags,m.created_at,m.updated_at,m.access_count FROM memories_fts fts JOIN memories m ON m.rowid=fts.rowid WHERE memories_fts MATCH ?1 ORDER BY rank LIMIT ?2")?;
         let rows = stmt.query_map(params![fts, limit as i64], |row| Ok(MemoryEntry {
             id: row.get(0)?, layer: MemoryLayer::L1, category: MemoryCategory::Reference,
@@ -80,7 +89,10 @@ impl MemoryStore {
     }
 
     pub fn delete_entry(&self, id: &str) -> Result<bool, rusqlite::Error> {
-        Ok(self.conn.lock().unwrap().execute("DELETE FROM memories WHERE id=?1", params![id])? > 0)
+        Ok(self.conn.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("memory store lock poisoned; recovering");
+            poisoned.into_inner()
+        }).execute("DELETE FROM memories WHERE id=?1", params![id])? > 0)
     }
 }
 

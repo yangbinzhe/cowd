@@ -362,14 +362,35 @@ window.Panels = (()=>{
     tree.innerHTML='<b>WING: cowd</b><br>';
     try{
       const layers=await Api.listMemoryLayers();
-      (layers.layers||layers||[]).forEach((l,i)=>{
-        tree.innerHTML+='&nbsp;&nbsp;<b>ROOM:</b> '+UI.esc(l.name||'layer'+i)+'<br>';
-        tree.innerHTML+='&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--text3)">DRAWER:</span> entries<br>';
-      });
+      for(const l of (layers.layers||layers||[])){
+        tree.innerHTML+='&nbsp;&nbsp;<b>ROOM:</b> '+UI.esc(l.name||'layer'+l.index)+'<br>';
+        try{
+          const entries=await Api.listMemoryEntries(l.name||l);
+          if(entries&&entries.length){
+            entries.slice(0,8).forEach(e=>{
+              const title=UI.esc((e.title||e.content||'').substring(0,60));
+              tree.innerHTML+='&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--text3)">DRAWER:</span> '+title+'<br>';
+            });
+            if(entries.length>8) tree.innerHTML+='&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--text3)">... +'+(entries.length-8)+' more</span><br>';
+          }
+        }catch(ex){tree.innerHTML+='&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--text3)">DRAWER:</span> unavailable<br>';}
+      }
     }catch(e){tree.innerHTML+='&nbsp;&nbsp;unavailable'}
     c.appendChild(tree);
     c.appendChild(UI.el('div','panel-section','<button onclick="Panels.renderMemory()">← List View</button>'));
   }
 
-  return{renderMemory,renderMemoryLayer,showMemoryEntryForm,renderMemorySpatial,renderSkills,renderCrons,renderSettings,renderAgents,renderTools,renderGateway,renderCCConfig,renderCCProviders,renderCCApproval,renderCCHistory,renderCCUsage};
+  async function renderProgress(){
+    const c=cont();c.innerHTML='<h3>Workflow Progress</h3>';
+    try{
+      const p=await Api.getProgress();
+      const pct=Math.round((p.completed/p.total)*100)||0;
+      const bar='█'.repeat(Math.floor(pct/5))+'░'.repeat(20-Math.floor(pct/5));
+      c.appendChild(UI.el('div','panel-section',
+        `<div style="font-family:monospace;font-size:14px">${bar} ${pct}%</div>
+         <div style="font-size:12px;color:var(--text2);margin-top:4px">${p.current_phase||'idle'}</div>`));
+    }catch(e){c.appendChild(UI.el('div','panel-section','Progress unavailable'))}
+  }
+
+  return{renderMemory,renderMemoryLayer,showMemoryEntryForm,renderMemorySpatial,renderProgress,renderSkills,renderCrons,renderSettings,renderAgents,renderTools,renderGateway,renderCCConfig,renderCCProviders,renderCCApproval,renderCCHistory,renderCCUsage};
 })();

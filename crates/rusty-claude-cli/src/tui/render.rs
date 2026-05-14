@@ -69,8 +69,8 @@ fn draw_session_picker(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let sid = if app.session_id.len() > 8 { &app.session_id[..8] } else { &app.session_id };
-    let st = if app.is_loading { format!("{} Thinking", app.spinner_char()) } else { "✓ Ready".into() };
+    let _sid = if app.session_id.len() > 8 { &app.session_id[..8] } else { &app.session_id };
+    let _st = if app.is_loading { format!("{} Thinking", app.spinner_char()) } else { "✓ Ready".into() };
     let t = app.theme;
     let panel_label = match app.current_panel {
         Panel::Chat => "Chat",

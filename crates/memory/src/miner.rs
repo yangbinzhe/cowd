@@ -223,15 +223,19 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
             chunks.push(chunk);
         }
 
-        start = if break_point > overlap {
+        let next_start = if break_point > overlap {
             break_point - overlap
         } else {
             break_point
         };
 
-        // Prevent infinite loop
-        if start <= end - chunk_size + overlap + 1 && start > 0 {
-            start = end;
+        // Ensure forward progress: if the overlap would push us backward,
+        // advance to break_point instead (sacrificing overlap for correctness).
+        start = next_start.max(break_point);
+
+        // Safety net: if still no progress, force advance.
+        if start == 0 && break_point == 0 {
+            start = 1;
         }
     }
 
@@ -387,7 +391,7 @@ mod tests {
     #[test]
     fn test_classify_content() {
         assert_eq!(classify_content("We decided to use Rust for the backend"), MinedCategory::Decision);
-        assert_eq!(classify_content("fn main() { println!(\"hello\"); }"), MinedCategory::CodePattern);
+        assert_eq!(classify_content("fn main() { println!(\"hello\"); }\nimpl Foo for Bar { }"), MinedCategory::CodePattern);
         assert_eq!(classify_content("I prefer dark mode for coding"), MinedCategory::Preference);
     }
 

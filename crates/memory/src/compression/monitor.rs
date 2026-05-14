@@ -136,7 +136,10 @@ impl ContextWindowMonitor {
         let mut last_guard = self
             .last_level
             .lock()
-            .expect("ContextWindowMonitor last_level lock poisoned");
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("ContextWindowMonitor last_level lock poisoned; recovering");
+                poisoned.into_inner()
+            });
 
         if level > *last_guard {
             // Level upgraded – fire immediately.

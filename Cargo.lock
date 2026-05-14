@@ -357,7 +357,6 @@ dependencies = [
 name = "config"
 version = "0.1.0"
 dependencies = [
- "memory",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1428,6 +1427,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "config",
  "parking_lot",
  "regex",
  "reqwest",
@@ -2082,6 +2082,7 @@ dependencies = [
  "base64 0.22.1",
  "cbc",
  "chrono",
+ "config",
  "futures",
  "glob",
  "imap",

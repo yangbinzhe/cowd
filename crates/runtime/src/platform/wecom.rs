@@ -408,7 +408,6 @@ impl WeComAdapter {
             content: Option<String>,
             msg_id: Option<String>,
             from_user_name: Option<String>,
-            create_time: Option<String>,
         }
 
         let event: WeComEvent = serde_json::from_slice(payload)

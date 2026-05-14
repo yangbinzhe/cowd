@@ -75,6 +75,7 @@ pub struct CognitiveContextManager {
     /// Three-stage compression pipeline.
     pipeline: CompressionPipeline,
     /// Multi-signal relevance scorer + dynamic memory loader.
+    #[allow(dead_code)] // Design: reserved for future dynamic memory loading
     loader: DynamicLoader,
     /// In-process vector index for semantic search.
     vector_index: VectorIndex,

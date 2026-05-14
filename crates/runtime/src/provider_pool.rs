@@ -2,7 +2,6 @@
 // Derived from GenericAgent's next_llm() + hermes-agent's adapter pattern.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::pin::Pin;
 use futures::stream::Stream;
 use crate::conversation::{ApiClient, ApiRequest, AssistantEvent, RuntimeError};

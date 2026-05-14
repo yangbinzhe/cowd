@@ -1,9 +1,9 @@
-use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 pub struct CachedSystemPrompt {
-    inner: RefCell<CacheInner>,
+    inner: Mutex<CacheInner>,
 }
 
 struct CacheInner {
@@ -27,7 +27,7 @@ impl CachedSystemPrompt {
             .ok().and_then(|v| v.parse().ok()).unwrap_or(50);
         let memory_delta_threshold: usize = std::env::var("COWD_PROMPT_CACHE_MEMORY_DELTA")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-        Self { inner: RefCell::new(CacheInner {
+        Self { inner: Mutex::new(CacheInner {
             cached_prompt: Vec::new(), config_path, identity_path,
             config_mtime: None, identity_mtime: None,
             memory_high_count: 0, turns_since_rebuild: 0,
@@ -36,7 +36,10 @@ impl CachedSystemPrompt {
     }
 
     pub fn needs_rebuild(&self, current_memory_high: usize) -> bool {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("CachedSystemPrompt lock poisoned in needs_rebuild, recovering");
+            poisoned.into_inner()
+        });
         inner.turns_since_rebuild += 1;
         if inner.cached_prompt.is_empty() { return true; }
         if inner.turns_since_rebuild % inner.check_interval == 0 {
@@ -56,14 +59,30 @@ impl CachedSystemPrompt {
     }
 
     pub fn rebuild(&self, prompt: Vec<String>, memory_high_count: usize) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("CachedSystemPrompt lock poisoned in rebuild, recovering");
+            poisoned.into_inner()
+        });
         inner.cached_prompt = prompt;
         inner.memory_high_count = memory_high_count;
         inner.turns_since_rebuild = 0;
     }
 
     pub fn get(&self) -> Vec<String> {
-        self.inner.borrow().cached_prompt.clone()
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("CachedSystemPrompt lock poisoned in get, recovering");
+            poisoned.into_inner()
+        })
+        .cached_prompt
+        .clone()
+    }
+
+    pub fn memory_high_count(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("CachedSystemPrompt lock poisoned in memory_high_count, recovering");
+            poisoned.into_inner()
+        })
+        .memory_high_count
     }
 }
 

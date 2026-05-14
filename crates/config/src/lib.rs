@@ -19,7 +19,7 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use cc_config::{UnifiedConfig, ConfigSource};
+//! use config::{UnifiedConfig, ConfigSource};
 //!
 //! // Load with default settings (respects precedence)
 //! let config = UnifiedConfig::load().unwrap();
@@ -49,7 +49,9 @@ pub enum ConfigError {
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("YAML parse error: {0}")]
-   Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_yaml::Error),
+    #[error("Parse error: {0}")]
+    Parse(String),
     #[error("Missing required config: {0}")]
     Missing(String),
     #[error("Invalid value for {key}: {message}")]
@@ -93,6 +95,7 @@ impl std::fmt::Display for ConfigSource {
 pub struct ConfigEntry {
     pub source: ConfigSource,
     pub path: PathBuf,
+    pub exists: bool,
 }
 
 // ── Environment Variable Config ───────────────────────────────────────────────
@@ -169,6 +172,7 @@ impl ConfigDiscovery {
             entries.push(ConfigEntry {
                 source: ConfigSource::User,
                 path: user_config,
+                exists: true,
             });
         }
 
@@ -178,6 +182,7 @@ impl ConfigDiscovery {
             entries.push(ConfigEntry {
                 source: ConfigSource::Project,
                 path: project_config,
+                exists: true,
             });
         }
 
@@ -187,6 +192,7 @@ impl ConfigDiscovery {
             entries.push(ConfigEntry {
                 source: ConfigSource::Local,
                 path: local_config,
+                exists: true,
             });
         }
 
@@ -251,9 +257,21 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub model: Option<String>,
 
+    /// Model aliases for quick switching
+    #[serde(default)]
+    pub model_aliases: BTreeMap<String, String>,
+
     /// Permission mode
     #[serde(default)]
     pub permission_mode: Option<String>,
+
+    /// Enable auto-compaction
+    #[serde(default)]
+    pub auto_compact: bool,
+
+    /// Output style: "terse", "standard", or default
+    #[serde(default)]
+    pub output_style: Option<String>,
 
     /// Hooks configuration
     #[serde(default)]
@@ -270,6 +288,51 @@ pub struct RuntimeConfig {
     /// Sandbox configuration
     #[serde(default)]
     pub sandbox: SandboxConfig,
+
+    /// Permissions configuration
+    #[serde(default)]
+    pub permissions: PermissionConfig,
+
+    /// System prompt cache configuration
+    #[serde(default)]
+    pub prompt_cache: PromptCacheConfig,
+}
+
+/// Permission rules configuration (defaultMode, allow, deny, ask).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PermissionConfig {
+    #[serde(default)]
+    pub default_mode: Option<String>,
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+}
+
+/// System prompt cache configuration for reducing API costs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptCacheConfig {
+    /// Check interval in turns (default: 5)
+    #[serde(default = "default_cache_check_interval")]
+    pub check_interval: u32,
+    /// Maximum cache age in turns (default: 50)
+    #[serde(default = "default_cache_max_age")]
+    pub max_age: u32,
+    /// Memory delta threshold (default: 3)
+    #[serde(default = "default_cache_memory_delta")]
+    pub memory_delta: u32,
+}
+
+fn default_cache_check_interval() -> u32 { 5 }
+fn default_cache_max_age() -> u32 { 50 }
+fn default_cache_memory_delta() -> u32 { 3 }
+
+impl Default for PromptCacheConfig {
+    fn default() -> Self {
+        Self { check_interval: 5, max_age: 50, memory_delta: 3 }
+    }
 }
 
 /// Hooks configuration
@@ -295,7 +358,7 @@ pub struct McpConfig {
 pub struct McpServerConfig {
     /// Transport type: stdio, sse, http, ws
     #[serde(rename = "type")]
-    #[serde(default = "default_Transport")]
+    #[serde(default = "default_transport")]
     pub transport: String,
 
     /// Command for stdio transport
@@ -315,7 +378,7 @@ pub struct McpServerConfig {
     pub env: BTreeMap<String, String>,
 }
 
-fn default_Transport() -> String {
+fn default_transport() -> String {
     "stdio".to_string()
 }
 
@@ -332,8 +395,24 @@ pub struct PluginsConfig {
 }
 
 /// Sandbox configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
+    /// Enable sandbox
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Execution timeout in seconds
+    #[serde(default = "default_sandbox_timeout")]
+    pub timeout_secs: u32,
+
+    /// Maximum output size in KiB
+    #[serde(default = "default_sandbox_max_output")]
+    pub max_output_kib: u32,
+
+    /// Maximum FTS5 sandbox entries
+    #[serde(default = "default_sandbox_max_entries")]
+    pub max_entries: u32,
+
     /// Filesystem isolation mode
     #[serde(default)]
     pub filesystem_mode: Option<String>,
@@ -341,6 +420,23 @@ pub struct SandboxConfig {
     /// Allowed directories
     #[serde(default)]
     pub allowed_dirs: Vec<String>,
+}
+
+fn default_sandbox_timeout() -> u32 { 30 }
+fn default_sandbox_max_output() -> u32 { 100 }
+fn default_sandbox_max_entries() -> u32 { 50 }
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: 30,
+            max_output_kib: 100,
+            max_entries: 50,
+            filesystem_mode: None,
+            allowed_dirs: Vec::new(),
+        }
+    }
 }
 
 /// Gateway configuration
@@ -357,14 +453,19 @@ pub struct GatewayConfig {
     /// Session reset policy
     #[serde(default)]
     pub session_reset: SessionResetPolicy,
+
+    /// Legacy alias for session_reset
+    #[serde(default)]
+    pub session_reset_policy: SessionResetPolicy,
 }
 
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             platforms: Vec::new(),
             session_reset: SessionResetPolicy::default(),
+            session_reset_policy: SessionResetPolicy::Always,
         }
     }
 }
@@ -376,12 +477,13 @@ pub enum SessionResetPolicy {
     Daily,
     Idle,
     Both,
+    Always,
     #[default]
     None,
 }
 
 /// Authentication configuration for API server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuthConfig {
     /// Whether token authentication is enabled.
     #[serde(default)]
@@ -562,6 +664,10 @@ fn default_true() -> bool {
 /// Memory system configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
+    /// Enable memory system
+    #[serde(default = "default_true_bool")]
+    pub enabled: bool,
+
     /// Store configuration
     #[serde(default)]
     pub store: StoreConfig,
@@ -573,14 +679,47 @@ pub struct MemoryConfig {
     /// Token budget configuration
     #[serde(default)]
     pub budget: BudgetConfig,
+
+    /// Extraction configuration
+    #[serde(default)]
+    pub extractor: ExtractorConfig,
+
+    /// Drift detection configuration
+    #[serde(default)]
+    pub drift: DriftConfig,
+
+    /// Performance budget
+    #[serde(default)]
+    pub perf: PerfBudget,
+
+    /// When true, use AAAK symbolic index instead of full entry injection
+    #[serde(default = "default_true_bool")]
+    pub aaak_index_enabled: bool,
+
+    /// Coherence threshold in basis points (100 = 0.01). Entries below this are excluded.
+    #[serde(default = "default_coherence_threshold")]
+    pub coherence_threshold_bp: u32,
+
+    /// Target model name for adaptive compression thresholds.
+    #[serde(default)]
+    pub model: Option<String>,
 }
+
+fn default_coherence_threshold() -> u32 { 1000 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             store: StoreConfig::default(),
             compression: CompressionConfig::default(),
             budget: BudgetConfig::default(),
+            extractor: ExtractorConfig::default(),
+            drift: DriftConfig::default(),
+            perf: PerfBudget::default(),
+            aaak_index_enabled: true,
+            coherence_threshold_bp: 1000,
+            model: None,
         }
     }
 }
@@ -676,35 +815,37 @@ impl Default for VectorConfig {
 /// Compression configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionConfig {
-    /// Micro compression threshold
-    #[serde(default = "default_micro_threshold")]
-    pub micro_threshold: usize,
+    /// Micro compression settings (per tool-result)
+    #[serde(default)]
+    pub micro: MicroCompactConfig,
 
-    /// Session compression threshold
-    #[serde(default = "default_session_threshold")]
-    pub session_threshold: usize,
+    /// Session compression settings
+    #[serde(default)]
+    pub session: SessionCompactConfig,
 
-    /// Enable deep compression
-    #[serde(default = "default_true_bool")]
-    pub enable_deep_compression: bool,
+    /// Deep compression settings
+    #[serde(default)]
+    pub deep: DeepCompactConfig,
 
-    /// Aggressiveness (0.0-1.0)
-    #[serde(default = "default_aggressiveness")]
-    pub aggressiveness: f32,
+    /// Circuit breaker settings
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+
+    /// LLM summarization configuration for semantic compression.
+    #[serde(default)]
+    pub llm: LlmSummarizerConfig,
 }
 
 fn default_true_bool() -> bool { true }
-fn default_micro_threshold() -> usize { 50 }
-fn default_session_threshold() -> usize { 10 }
-fn default_aggressiveness() -> f32 { 0.5 }
 
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
-            micro_threshold: 50,
-            session_threshold: 10,
-            enable_deep_compression: true,
-            aggressiveness: 0.5,
+            micro: MicroCompactConfig::default(),
+            session: SessionCompactConfig::default(),
+            deep: DeepCompactConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            llm: LlmSummarizerConfig::default(),
         }
     }
 }
@@ -751,6 +892,38 @@ impl Default for BudgetConfig {
     }
 }
 
+impl BudgetConfig {
+    /// Calculate the actual available tokens for user content and memory.
+    pub fn available_tokens(&self) -> u64 {
+        self.context_window
+            .saturating_sub(self.reserved_system)
+            .saturating_sub(self.reserved_response)
+    }
+
+    /// Get the warning threshold in actual token count.
+    pub fn warning_tokens(&self) -> u64 {
+        (self.context_window as f64 * self.warning_threshold as f64) as u64
+    }
+
+    /// Get the critical threshold in actual token count.
+    pub fn critical_tokens(&self) -> u64 {
+        (self.context_window as f64 * self.critical_threshold as f64) as u64
+    }
+
+    /// Create a budget optimized for a specific context window size.
+    pub fn for_context_window(context_window: u64) -> Self {
+        let reserved_system = ((context_window as f64 * 0.05).min(20_000.0)) as u64;
+        let reserved_response = ((context_window as f64 * 0.04).min(16_000.0)) as u64;
+        Self {
+            context_window,
+            reserved_system,
+            reserved_response,
+            warning_threshold: 0.70,
+            critical_threshold: 0.90,
+        }
+    }
+}
+
 /// Model providers configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProvidersConfig {
@@ -787,6 +960,137 @@ pub struct ProviderFallbacks {
     /// Fallback provider names in order
     #[serde(default)]
     pub chain: Vec<String>,
+}
+
+impl ProvidersConfig {
+    /// Returns `true` if no providers are configured.
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    /// Resolves a model name to its provider's `(base_url, api_key)` pair.
+    pub fn resolve(&self, model_name: &str) -> Option<(&str, &str)> {
+        for provider in self.providers.values() {
+            if provider.models.iter().any(|m| m == model_name) {
+                return Some((&provider.base_url, &provider.api_key));
+            }
+        }
+        None
+    }
+
+    /// Returns the named provider if it exists.
+    pub fn get(&self, name: &str) -> Option<&ProviderConfig> {
+        self.providers.get(name)
+    }
+}
+
+impl MemoryConfig {
+    /// Update configuration based on model profile.
+    pub fn with_model_profile(mut self, model_name: &str) -> Self {
+        let profile = ModelProfile::for_model(model_name);
+        self.model = Some(model_name.to_string());
+        self.budget.context_window = profile.context_window;
+        self.budget.warning_threshold = profile.warning_threshold;
+        self.budget.critical_threshold = profile.critical_threshold;
+        self.compression.micro = MicroCompactConfig {
+            enabled: true,
+            tool_result_max_chars: 4000,
+            time_decay_factor: 0.9,
+        };
+        self
+    }
+
+    /// Override configuration from environment variables.
+    pub fn with_env_overrides(mut self) -> Self {
+        if let Ok(url) = std::env::var("CC_LLM_API_URL") {
+            if !url.is_empty() { self.compression.llm.api_url = url; }
+        }
+        if let Ok(key) = std::env::var("CC_LLM_API_KEY") {
+            if !key.is_empty() { self.compression.llm.api_key = key; }
+        }
+        if let Ok(model) = std::env::var("CC_LLM_MODEL") {
+            if !model.is_empty() { self.compression.llm.model = model; }
+        }
+        if let Ok(url) = std::env::var("CC_VECTOR_API_URL") {
+            if !url.is_empty() { self.store.vector.api_url = url; }
+        }
+        if let Ok(key) = std::env::var("CC_VECTOR_API_KEY") {
+            if !key.is_empty() { self.store.vector.api_key = key; }
+        }
+        self
+    }
+}
+
+impl ModelProfile {
+    /// Find or create a profile for a given model name.
+    pub fn for_model(model_name: &str) -> Self {
+        let name_lower = model_name.to_lowercase();
+        if name_lower.contains("haiku") || name_lower.contains("flash")
+            || name_lower.contains("04-mini") || name_lower.contains("gpt-3.5-turbo")
+        {
+            if name_lower.contains("gpt-3.5-turbo") {
+                Self {
+                    model_name: model_name.to_string(), context_window: 16_385,
+                    memory_budget_ratio: 0.15, warning_threshold: 0.50,
+                    critical_threshold: 0.75, micro_threshold: 20,
+                    session_threshold: 4, compression_aggressiveness: 0.75,
+                }
+            } else {
+                Self {
+                    model_name: model_name.to_string(), context_window: 8_192,
+                    memory_budget_ratio: 0.10, warning_threshold: 0.40,
+                    critical_threshold: 0.65, micro_threshold: 10,
+                    session_threshold: 2, compression_aggressiveness: 0.85,
+                }
+            }
+        } else if name_lower.contains("claude-3-5-sonnet") || name_lower.contains("claude-3.5") {
+            Self {
+                model_name: model_name.to_string(), context_window: 200_000,
+                memory_budget_ratio: 0.35, warning_threshold: 0.70,
+                critical_threshold: 0.90, micro_threshold: 50,
+                session_threshold: 10, compression_aggressiveness: 0.5,
+            }
+        } else if name_lower.contains("claude-3-opus") {
+            Self {
+                model_name: model_name.to_string(), context_window: 200_000,
+                memory_budget_ratio: 0.35, warning_threshold: 0.70,
+                critical_threshold: 0.90, micro_threshold: 50,
+                session_threshold: 10, compression_aggressiveness: 0.5,
+            }
+        } else if name_lower.contains("claude") {
+            Self {
+                model_name: model_name.to_string(), context_window: 200_000,
+                memory_budget_ratio: 0.35, warning_threshold: 0.70,
+                critical_threshold: 0.90, micro_threshold: 50,
+                session_threshold: 10, compression_aggressiveness: 0.5,
+            }
+        } else if name_lower.contains("gpt-4o") {
+            Self {
+                model_name: model_name.to_string(), context_window: 128_000,
+                memory_budget_ratio: 0.30, warning_threshold: 0.70,
+                critical_threshold: 0.88, micro_threshold: 45,
+                session_threshold: 9, compression_aggressiveness: 0.55,
+            }
+        } else if name_lower.contains("o1-preview") || name_lower.contains("o1-mini") {
+            Self {
+                model_name: model_name.to_string(), context_window: 128_000,
+                memory_budget_ratio: 0.20, warning_threshold: 0.60,
+                critical_threshold: 0.80, micro_threshold: 30,
+                session_threshold: 6, compression_aggressiveness: 0.7,
+            }
+        } else if name_lower.contains("gpt-4") {
+            Self {
+                model_name: model_name.to_string(), context_window: 128_000,
+                memory_budget_ratio: 0.25, warning_threshold: 0.65,
+                critical_threshold: 0.85, micro_threshold: 40,
+                session_threshold: 8, compression_aggressiveness: 0.6,
+            }
+        } else {
+            let mut profile = Self::default();
+            profile.model_name = model_name.to_string();
+            profile
+        }
+    }
 }
 
 // ── Config Loader ─────────────────────────────────────────────────────────────
@@ -836,8 +1140,9 @@ impl ConfigLoader {
     pub fn load(self) -> Result<UnifiedConfig> {
         let mut raw = BTreeMap::new();
         let mut entries = Vec::new();
+        let mut merged_root: serde_json::Value = serde_json::Value::Object(Map::new());
 
-        // 1. Load files in precedence order
+        // 1. Load files in precedence order, deep-merging each
         for entry in self.discovery.discover() {
             let content = fs::read_to_string(&entry.path)?;
             let parsed: serde_json::Value = if entry.path
@@ -850,29 +1155,37 @@ impl ConfigLoader {
                 serde_json::from_str(&content)?
             };
 
-            if let serde_json::Value::Object(map) = parsed {
+            if let serde_json::Value::Object(ref map) = parsed {
                 for (key, value) in map {
-                    raw.insert(key, value);
+                    raw.insert(key.clone(), value.clone());
                 }
             }
+
+            // Deep-merge into the accumulated root
+            deep_merge(&mut merged_root, &parsed);
 
             entries.push(entry);
         }
 
-        // 2. Apply environment variable overrides
+        // 2. Apply environment variable overrides (deep-merge)
         let env_overrides = collect_env_overrides();
+        let env_json = serde_json::Value::Object(Map::from_iter(env_overrides.clone()));
+        deep_merge(&mut merged_root, &env_json);
         for (key, value) in env_overrides {
             raw.insert(key, value);
         }
 
-        // 3. Apply CLI overrides
-        for (key, value) in self.cli_overrides {
-            raw.insert(key, value);
+        // 3. Apply CLI overrides (deep-merge)
+        if !self.cli_overrides.is_empty() {
+            let cli_json = serde_json::Value::Object(Map::from_iter(self.cli_overrides.clone()));
+            deep_merge(&mut merged_root, &cli_json);
+            for (key, value) in self.cli_overrides {
+                raw.insert(key, value);
+            }
         }
 
-        // 4. Parse into structured config
-        let raw_json = serde_json::Value::Object(Map::from_iter(raw.clone()));
-        let config: UnifiedConfig = serde_json::from_value(raw_json.clone())
+        // 4. Parse into structured config from the deep-merged result
+        let config: UnifiedConfig = serde_json::from_value(merged_root)
             .map_err(|e| ConfigError::Invalid {
                 key: "root".to_string(),
                 message: e.to_string(),
@@ -935,9 +1248,357 @@ impl UnifiedConfig {
     }
 }
 
-// ── Convenience Re-exports ───────────────────────────────────────────────────
+// ── Approval & Permission Resolution ───────────────────────────────────────
 
-pub use memory::types::{MemoryEntry, MemoryLayer, Priority};
+/// Smart approval configuration for the intelligent command approval gate.
+///
+/// Controls which commands auto-pass vs. require approval, and YOLO mode
+/// for bypassing approvals during long-running autonomous tasks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalConfig {
+    /// When true, all non-critical commands bypass the approval flow.
+    #[serde(default)]
+    pub yolo_mode: bool,
+    /// When true, even in YOLO mode, Critical-risk commands still require approval.
+    #[serde(default = "default_true_bool")]
+    pub yolo_honor_critical: bool,
+    /// Auto-pass commands detected as read-only (ls, cat, grep, git status, etc.).
+    #[serde(default = "default_true_bool")]
+    pub auto_pass_read_only: bool,
+    /// Auto-pass commands that match Low-risk destructive patterns (cargo clean, etc.).
+    #[serde(default = "default_true_bool")]
+    pub auto_pass_low_risk: bool,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            yolo_mode: false,
+            yolo_honor_critical: true,
+            auto_pass_read_only: true,
+            auto_pass_low_risk: true,
+        }
+    }
+}
+
+impl ApprovalConfig {
+    pub fn new() -> Self { Self::default() }
+    pub fn with_yolo_mode(mut self, enabled: bool) -> Self { self.yolo_mode = enabled; self }
+    pub fn with_yolo_honor_critical(mut self, honor: bool) -> Self { self.yolo_honor_critical = honor; self }
+}
+
+/// Effective permission mode after decoding config values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolvedPermissionMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+// ── Detailed Memory Sub-Configuration ─────────────────────────────────────
+
+/// Per-layer token and search limits for the memory subsystem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerConfig {
+    #[serde(default = "default_true_bool")]
+    pub l0_enabled: bool,
+    #[serde(default = "default_l1_max_tokens")]
+    pub l1_max_tokens: u32,
+    #[serde(default = "default_l2_max_tokens")]
+    pub l2_max_tokens: u32,
+    #[serde(default = "default_l3_search_limit")]
+    pub l3_search_limit: u32,
+    #[serde(default)]
+    pub l4_enabled: bool,
+}
+
+fn default_l1_max_tokens() -> u32 { 2000 }
+fn default_l2_max_tokens() -> u32 { 3000 }
+fn default_l3_search_limit() -> u32 { 5 }
+
+impl Default for LayerConfig {
+    fn default() -> Self {
+        Self {
+            l0_enabled: true,
+            l1_max_tokens: 2000,
+            l2_max_tokens: 3000,
+            l3_search_limit: 5,
+            l4_enabled: false,
+        }
+    }
+}
+
+/// Controls automatic memory extraction behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractorConfig {
+    /// Enable automatic background extraction.
+    #[serde(default = "default_true_bool")]
+    pub auto_extract: bool,
+    /// How often (in seconds) the extractor polls for new content.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+    /// Maximum number of entries extracted per poll cycle.
+    #[serde(default = "default_batch_size_usize")]
+    pub batch_size: usize,
+    /// Minimum confidence score to keep an extracted entry.
+    #[serde(default = "default_min_confidence")]
+    pub min_confidence: f32,
+}
+
+fn default_poll_interval() -> u64 { 30 }
+fn default_batch_size_usize() -> usize { 20 }
+fn default_min_confidence() -> f32 { 0.6 }
+
+impl Default for ExtractorConfig {
+    fn default() -> Self {
+        Self {
+            auto_extract: true,
+            poll_interval_secs: 30,
+            batch_size: 20,
+            min_confidence: 0.6,
+        }
+    }
+}
+
+/// Memory drift detection configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftConfig {
+    /// Staleness decay factor applied per day of inactivity.
+    #[serde(default = "default_decay")]
+    pub staleness_decay_per_day: f32,
+    /// Staleness score above which an entry is flagged for review.
+    #[serde(default = "default_review_threshold")]
+    pub review_threshold: f32,
+    /// Staleness score above which an entry is automatically pruned.
+    #[serde(default = "default_prune_threshold")]
+    pub prune_threshold: f32,
+    /// Jaccard similarity threshold for contradiction detection.
+    #[serde(default = "default_jaccard_threshold")]
+    pub contradiction_jaccard_threshold: f32,
+}
+
+fn default_decay() -> f32 { 0.02 }
+fn default_review_threshold() -> f32 { 0.7 }
+fn default_prune_threshold() -> f32 { 0.95 }
+fn default_jaccard_threshold() -> f32 { 0.6 }
+
+impl Default for DriftConfig {
+    fn default() -> Self {
+        Self {
+            staleness_decay_per_day: 0.02,
+            review_threshold: 0.7,
+            prune_threshold: 0.95,
+            contradiction_jaccard_threshold: 0.6,
+        }
+    }
+}
+
+/// Performance budget for memory operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfBudget {
+    #[serde(default = "default_hook_max_ms")]
+    pub hook_max_ms: u64,
+    #[serde(default = "default_inject_max_ms")]
+    pub inject_max_ms: u64,
+    #[serde(default = "default_warn_threshold_pct")]
+    pub warn_threshold_pct: f64,
+}
+
+fn default_hook_max_ms() -> u64 { 500 }
+fn default_inject_max_ms() -> u64 { 100 }
+fn default_warn_threshold_pct() -> f64 { 0.8 }
+
+impl Default for PerfBudget {
+    fn default() -> Self {
+        Self { hook_max_ms: 500, inject_max_ms: 100, warn_threshold_pct: 0.8 }
+    }
+}
+
+/// Model-specific profile for adaptive compression thresholds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfile {
+    pub model_name: String,
+    pub context_window: u64,
+    pub memory_budget_ratio: f32,
+    pub warning_threshold: f32,
+    pub critical_threshold: f32,
+    pub micro_threshold: usize,
+    pub session_threshold: usize,
+    pub compression_aggressiveness: f32,
+}
+
+impl Default for ModelProfile {
+    fn default() -> Self {
+        Self {
+            model_name: "default".to_string(),
+            context_window: 200_000,
+            memory_budget_ratio: 0.30,
+            warning_threshold: 0.70,
+            critical_threshold: 0.90,
+            micro_threshold: 50,
+            session_threshold: 10,
+            compression_aggressiveness: 0.5,
+        }
+    }
+}
+
+/// LLM summarization configuration for compression pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmSummarizerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+}
+
+impl LlmSummarizerConfig {
+    /// Check if LLM summarization is properly configured.
+    pub fn is_configured(&self) -> bool {
+        self.enabled && !self.api_url.is_empty() && !self.api_key.is_empty()
+    }
+}
+
+fn default_llm_model() -> String { "gpt-4o-mini".to_string() }
+
+impl Default for LlmSummarizerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: String::new(),
+            api_key: String::new(),
+            model: "gpt-4o-mini".to_string(),
+        }
+    }
+}
+
+// ── Detailed Compression Sub-Configuration ────────────────────────────────
+
+/// Micro-compaction settings (per tool-result trimming).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MicroCompactConfig {
+    #[serde(default = "default_true_bool")]
+    pub enabled: bool,
+    #[serde(default = "default_tool_result_max_chars")]
+    pub tool_result_max_chars: u32,
+    #[serde(default = "default_decay_factor")]
+    pub time_decay_factor: f32,
+}
+
+impl Eq for MicroCompactConfig {}
+
+fn default_tool_result_max_chars() -> u32 { 4000 }
+fn default_decay_factor() -> f32 { 0.9 }
+
+impl Default for MicroCompactConfig {
+    fn default() -> Self {
+        Self { enabled: true, tool_result_max_chars: 4000, time_decay_factor: 0.9 }
+    }
+}
+
+/// Session-level compaction trigger and output constraints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionCompactConfig {
+    #[serde(default = "default_session_threshold_tokens")]
+    pub threshold_tokens: u32,
+    #[serde(default = "default_preserve_recent")]
+    pub preserve_recent: u32,
+    #[serde(default = "default_summary_max")]
+    pub summary_max_tokens: u32,
+    #[serde(default = "default_buffer_tokens")]
+    pub buffer_tokens: u32,
+}
+
+fn default_session_threshold_tokens() -> u32 { 80000 }
+fn default_preserve_recent() -> u32 { 6 }
+fn default_summary_max() -> u32 { 2000 }
+fn default_buffer_tokens() -> u32 { 13000 }
+
+impl Default for SessionCompactConfig {
+    fn default() -> Self {
+        Self { threshold_tokens: 80000, preserve_recent: 6, summary_max_tokens: 2000, buffer_tokens: 13000 }
+    }
+}
+
+/// Deep iterative compaction settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeepCompactConfig {
+    #[serde(default = "default_true_bool")]
+    pub enabled: bool,
+    #[serde(default = "default_true_bool")]
+    pub iterative_update: bool,
+}
+
+impl Default for DeepCompactConfig {
+    fn default() -> Self {
+        Self { enabled: true, iterative_update: true }
+    }
+}
+
+/// Circuit-breaker limits for the compression pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CircuitBreakerConfig {
+    #[serde(default = "default_max_retries_3")]
+    pub max_retries: u32,
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u32,
+}
+
+fn default_max_retries_3() -> u32 { 3 }
+fn default_cooldown_secs() -> u32 { 30 }
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self { max_retries: 3, cooldown_secs: 30 }
+    }
+}
+
+// ── MCP & OAuth ────────────────────────────────────────────────────────────
+
+/// Transport families supported by configured MCP servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    Stdio,
+    Sse,
+    Http,
+    Ws,
+    Sdk,
+    ManagedProxy,
+}
+
+/// OAuth overrides associated with a remote MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpOAuthConfig {
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub callback_port: Option<u16>,
+    #[serde(default)]
+    pub auth_server_metadata_url: Option<String>,
+    #[serde(default)]
+    pub xaa: Option<bool>,
+}
+
+/// OAuth client configuration used by the main runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthConfig {
+    pub client_id: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    #[serde(default)]
+    pub callback_port: Option<u16>,
+    #[serde(default)]
+    pub manual_redirect_url: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+// ── Convenience Re-exports ───────────────────────────────────────────────────
 
 /// Simple directory helper for config paths.
 mod dirs {
@@ -984,8 +1645,9 @@ mod tests {
 
     #[test]
     fn config_loader_defaults() {
-        let loader = ConfigLoader::new();
-        assert!(loader.discovery.home_dir.to_string_lossy().is_empty());
+        let loader = ConfigLoader::new()
+            .with_home_dir(std::path::PathBuf::from("/tmp/test-home"));
+        assert_eq!(loader.discovery.home_dir.to_string_lossy(), "/tmp/test-home");
     }
 
     #[test]
@@ -1001,8 +1663,12 @@ mod tests {
 
     #[test]
     fn config_discovery_new() {
-        let discovery = ConfigDiscovery::new();
-        assert!(discovery.home_dir.to_string_lossy().is_empty());
+        let discovery = ConfigDiscovery::with_paths(
+            std::path::PathBuf::from("/tmp/test-home"),
+            std::path::PathBuf::from("/tmp/test-cwd"),
+        );
+        assert_eq!(discovery.home_dir.to_string_lossy(), "/tmp/test-home");
+        assert_eq!(discovery.cwd.to_string_lossy(), "/tmp/test-cwd");
     }
 
     #[test]
@@ -1024,11 +1690,178 @@ mod tests {
     fn sandbox_config_default() {
         let cfg = SandboxConfig::default();
         assert!(!cfg.enabled);
+        assert_eq!(cfg.timeout_secs, 30);
+        assert_eq!(cfg.max_output_kib, 100);
+        assert_eq!(cfg.max_entries, 50);
     }
 
     #[test]
     fn auth_config_default() {
         let cfg = AuthConfig::default();
         assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn approval_config_defaults() {
+        let cfg = ApprovalConfig::default();
+        assert!(!cfg.yolo_mode);
+        assert!(cfg.yolo_honor_critical);
+        assert!(cfg.auto_pass_read_only);
+        assert!(cfg.auto_pass_low_risk);
+    }
+
+    #[test]
+    fn resolved_permission_mode_serialization() {
+        let json = serde_json::to_value(&ResolvedPermissionMode::ReadOnly).unwrap();
+        assert_eq!(json, "readonly");
+    }
+
+    #[test]
+    fn layer_config_defaults() {
+        let cfg = LayerConfig::default();
+        assert!(cfg.l0_enabled);
+        assert_eq!(cfg.l1_max_tokens, 2000);
+        assert_eq!(cfg.l2_max_tokens, 3000);
+        assert_eq!(cfg.l3_search_limit, 5);
+        assert!(!cfg.l4_enabled);
+    }
+
+    #[test]
+    fn extractor_config_defaults() {
+        let cfg = ExtractorConfig::default();
+        assert!(cfg.auto_extract);
+        assert_eq!(cfg.poll_interval_secs, 30);
+        assert_eq!(cfg.batch_size, 20);
+        assert!((cfg.min_confidence - 0.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn drift_config_defaults() {
+        let cfg = DriftConfig::default();
+        assert!((cfg.staleness_decay_per_day - 0.02).abs() < 0.01);
+        assert!((cfg.review_threshold - 0.7).abs() < 0.01);
+        assert!((cfg.prune_threshold - 0.95).abs() < 0.01);
+    }
+
+    #[test]
+    fn perf_budget_defaults() {
+        let cfg = PerfBudget::default();
+        assert_eq!(cfg.hook_max_ms, 500);
+        assert_eq!(cfg.inject_max_ms, 100);
+    }
+
+    #[test]
+    fn model_profile_detection() {
+        let claude = ModelProfile::for_model("claude-sonnet-4-6");
+        assert_eq!(claude.context_window, 200_000);
+        let gpt4o = ModelProfile::for_model("gpt-4o");
+        assert_eq!(gpt4o.context_window, 128_000);
+    }
+
+    #[test]
+    fn llm_summarizer_config_defaults() {
+        let cfg = LlmSummarizerConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.model, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn micro_compact_config_defaults() {
+        let cfg = MicroCompactConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.tool_result_max_chars, 4000);
+    }
+
+    #[test]
+    fn session_compact_config_defaults() {
+        let cfg = SessionCompactConfig::default();
+        assert_eq!(cfg.threshold_tokens, 80000);
+        assert_eq!(cfg.preserve_recent, 6);
+    }
+
+    #[test]
+    fn deep_compact_config_defaults() {
+        let cfg = DeepCompactConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.iterative_update);
+    }
+
+    #[test]
+    fn circuit_breaker_config_defaults() {
+        let cfg = CircuitBreakerConfig::default();
+        assert_eq!(cfg.max_retries, 3);
+        assert_eq!(cfg.cooldown_secs, 30);
+    }
+
+    #[test]
+    fn mcp_transport_variants() {
+        let json = serde_json::to_value(&McpTransport::Stdio).unwrap();
+        assert_eq!(json, "stdio");
+    }
+
+    #[test]
+    fn memory_config_extended_defaults() {
+        let cfg = MemoryConfig::default();
+        assert!(cfg.aaak_index_enabled);
+        assert_eq!(cfg.coherence_threshold_bp, 1000);
+        assert!(cfg.model.is_none());
+        assert_eq!(cfg.extractor.poll_interval_secs, 30);
+    }
+
+    #[test]
+    fn compression_config_sub_types() {
+        let cfg = CompressionConfig::default();
+        assert!(cfg.micro.enabled);
+        assert!(cfg.deep.enabled);
+        assert_eq!(cfg.circuit_breaker.max_retries, 3);
+        assert!(!cfg.llm.enabled);
+    }
+
+    #[test]
+    fn budget_config_methods() {
+        let budget = BudgetConfig::for_context_window(128_000);
+        assert_eq!(budget.context_window, 128_000);
+        assert_eq!(budget.warning_threshold, 0.70);
+        let available = budget.available_tokens();
+        assert!(available > 100_000);
+    }
+
+    #[test]
+    fn providers_config_methods() {
+        let mut cfg = ProvidersConfig::default();
+        assert!(cfg.is_empty());
+        assert!(cfg.resolve("nonexistent").is_none());
+        assert!(cfg.get("none").is_none());
+    }
+
+    #[test]
+    fn memory_config_with_model_profile() {
+        let cfg = MemoryConfig::default()
+            .with_model_profile("gpt-4o");
+        assert_eq!(cfg.model, Some("gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn permission_config_defaults() {
+        let cfg = PermissionConfig::default();
+        assert!(cfg.default_mode.is_none());
+        assert!(cfg.allow.is_empty());
+        assert!(cfg.deny.is_empty());
+        assert!(cfg.ask.is_empty());
+    }
+
+    #[test]
+    fn prompt_cache_config_defaults() {
+        let cfg = PromptCacheConfig::default();
+        assert_eq!(cfg.check_interval, 5);
+        assert_eq!(cfg.max_age, 50);
+        assert_eq!(cfg.memory_delta, 3);
+    }
+
+    #[test]
+    fn runtime_config_has_new_fields() {
+        let cfg = RuntimeConfig::default();
+        assert!(cfg.output_style.is_none());
+        assert_eq!(cfg.prompt_cache.check_interval, 5);
     }
 }

@@ -124,6 +124,9 @@ pub struct Relation {
     /// Optional timestamp for temporal knowledge graphs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temporal: Option<TemporalMarker>,
+    /// Optional disambiguated entity name from EntityRegistry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

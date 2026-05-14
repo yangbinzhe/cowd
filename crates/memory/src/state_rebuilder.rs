@@ -193,6 +193,7 @@ impl Default for RebuildOptions {
 
 /// State rebuild engine.
 pub struct StateRebuilder {
+    #[allow(dead_code)] // Derived field; cc_dir is the active path
     workspace: PathBuf,
     cc_dir: PathBuf,
 }
@@ -709,8 +710,10 @@ struct HistoryExtraction {
 
 /// GSD State Rebuilder - optimized for minimal compression dependency.
 pub struct GsdStateRebuilder {
+    #[allow(dead_code)] // Derived field; cc_dir is the active path
     workspace: PathBuf,
     cc_dir: PathBuf,
+    #[allow(dead_code)] // Design: pre-allocated compressor for future use
     compressor: AaakCompressor,
 }
 

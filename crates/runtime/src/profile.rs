@@ -134,7 +134,10 @@ impl ProfileManager {
 
     /// List all available profiles.
     pub fn list_profiles(&self) -> Vec<ProfileMeta> {
-        let active = self.active_profile.read().unwrap().clone();
+        let active = self.active_profile.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("profile manager RwLock poisoned; recovering");
+            poisoned.into_inner()
+        }).clone();
         let mut result = Vec::new();
 
         if let Ok(entries) = std::fs::read_dir(&self.profiles_dir) {
@@ -197,7 +200,10 @@ impl ProfileManager {
 
     /// Get the currently active profile.
     pub fn active_profile(&self) -> Profile {
-        let active = self.active_profile.read().unwrap().clone();
+        let active = self.active_profile.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("profile manager RwLock poisoned; recovering");
+            poisoned.into_inner()
+        }).clone();
         self.get_profile(&active).unwrap_or_else(|| {
             // Fallback to default if active is somehow invalid
             self.get_profile("default").expect("default profile must exist")
@@ -209,7 +215,10 @@ impl ProfileManager {
         let profile = self.get_profile(name)
             .ok_or_else(|| format!("Profile '{}' not found", name))?;
 
-        let mut active = self.active_profile.write().unwrap();
+        let mut active = self.active_profile.write().unwrap_or_else(|poisoned| {
+            tracing::warn!("profile manager RwLock poisoned; recovering");
+            poisoned.into_inner()
+        });
         *active = profile.id.clone();
         Ok(())
     }
@@ -222,7 +231,10 @@ impl ProfileManager {
             return Err("Cannot delete the default profile".to_string());
         }
 
-        let active = self.active_profile.read().unwrap().clone();
+        let active = self.active_profile.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("profile manager RwLock poisoned; recovering");
+            poisoned.into_inner()
+        }).clone();
         if id == active {
             return Err("Cannot delete the active profile. Switch to another profile first.".to_string());
         }
@@ -236,6 +248,21 @@ impl ProfileManager {
             .map_err(|e| format!("Failed to delete profile: {}", e))?;
 
         Ok(())
+    }
+
+    /// Convenience: initialize the default profile from the user's home directory.
+    pub fn init_default(home: &std::path::Path) -> Result<String, String> {
+        let mgr = Self::new(home);
+        mgr.initialize().map_err(|e| format!("profile init: {e}"))?;
+        Ok(mgr.active_id().to_string())
+    }
+
+    /// Return the currently active profile ID.
+    pub fn active_id(&self) -> String {
+        self.active_profile.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("profile manager RwLock poisoned; recovering");
+            poisoned.into_inner()
+        }).clone()
     }
 }
 

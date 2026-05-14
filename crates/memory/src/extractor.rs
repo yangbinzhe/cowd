@@ -171,8 +171,9 @@ impl MemoryExtractor {
 
     /// Return `true` when the message slice is worth extracting from.
     ///
-    /// Skips trivial conversations (pure Q&A with no tool activity or fewer
-    /// than two turns) to avoid persisting noise.
+    /// Skips trivial conversations (insufficient turns or content) to avoid
+    /// persisting noise. Tool activity alone is not a positive signal — only
+    /// substantive user and assistant text content triggers extraction.
     #[must_use]
     pub fn should_extract(messages: &[Message]) -> bool {
         // Need at least two messages.
@@ -192,21 +193,23 @@ impl MemoryExtractor {
             return false;
         }
 
-        // Consider worth extracting if there is at least one tool call/result
-        // OR the total user-content length exceeds a threshold.
-        // Threshold: 200 chars → 50 chars to cover most daily conversations.
-        // Reference: hermes-agent supermemory uses 10 chars.
-        let has_tool_activity = messages
-            .iter()
-            .any(|m| m.role == MessageRole::Tool || m.tool_use_id.is_some());
-
+        // Consider worth extracting based on total substantive text content
+        // (user + assistant). Tool activity is NOT a positive signal because
+        // tool execution data is machine-optimised and can be re-derived by
+        // re-running the tool.
         let user_content_len: usize = messages
             .iter()
             .filter(|m| m.role == MessageRole::User)
             .map(|m| m.content.len())
             .sum();
+        let assistant_content_len: usize = messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .map(|m| m.content.len())
+            .sum();
 
-        has_tool_activity || user_content_len >= 50
+        // Threshold: 50 chars covers most daily conversations.
+        user_content_len + assistant_content_len >= 50
     }
 
     /// Extract meaningful [`MemoryEntry`] items from `messages`.
@@ -660,9 +663,28 @@ mod tests {
     }
 
     #[test]
-    fn should_extract_returns_true_for_tool_activity() {
+    fn should_extract_returns_true_for_substantive_content() {
         let msgs = make_messages();
         assert!(MemoryExtractor::should_extract(&msgs));
+    }
+
+    #[test]
+    fn should_extract_returns_false_when_only_tool_activity() {
+        // Tool-only messages should NOT trigger extraction — the content
+        // is machine-optimised and can be re-derived.
+        let msgs = vec![
+            Message::user(""),
+            Message::assistant(""),
+            {
+                let mut m = Message::tool_result("t1", "bash", "ok");
+                m.role = MessageRole::Tool;
+                m
+            },
+        ];
+        assert!(
+            !MemoryExtractor::should_extract(&msgs),
+            "tool-only messages should not trigger extraction"
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use futures::stream::Stream;
 use memory::cognitive::CognitiveContextManager;
 use memory::config::MemoryConfig as CcMemoryConfig;
-use memory::types::{Message as MemMessage, MessageRole as MemMessageRole, MemoryEntry as MemEntry};
+use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
+use memory::coherence;
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 use tracing;
@@ -208,6 +209,7 @@ bus: Option<crate::bus::EventBus>,
     turn_callback: Option<Arc<TurnCallback>>,
     profiler: crate::context_profiler::ContextProfiler,
     use_aaak_index: bool,
+    coherence_threshold: f32,
     auto_compaction_input_tokens_threshold: u32,
     model_context_window: u32,
     cached_prompt: crate::cached_prompt::CachedSystemPrompt,
@@ -216,10 +218,16 @@ bus: Option<crate::bus::EventBus>,
     session_tracer: Option<SessionTracer>,
     /// Optional cognitive memory manager – `None` when memory is disabled.
     memory_manager: Option<Arc<CognitiveContextManager>>,
+    /// Human-readable memory status message. `None` when healthy; `Some(msg)` when degraded.
+    memory_status: Option<String>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
     /// Optional smart approval gate for intelligent command approval (P0-1).
     approval_gate: Option<Arc<crate::approval_gate::SmartApprovalGate>>,
+    /// P2-10: Optional EffectHandler for side-effect recording / mocking.
+    effect_handler: Option<Arc<dyn crate::effect::EffectHandler>>,
+    /// P2-2: Current project phase (Discovery→Planning→Building→Reviewing→Shipping→Graduated).
+    project_phase: String,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -257,28 +265,33 @@ where
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
         // Initialise the cognitive memory manager if the memory subsystem is enabled.
-        let memory_manager = if feature_config.memory().enabled {
+        let (memory_manager, memory_status) = if feature_config.memory().enabled {
             let mem_cfg = build_cc_memory_config(feature_config);
             match tokio::runtime::Handle::try_current() {
-                Ok(handle) => match handle.block_on(CognitiveContextManager::new(mem_cfg)) {
+                Ok(handle) => {
+                    let result = tokio::task::block_in_place(|| {
+                        handle.block_on(CognitiveContextManager::new(mem_cfg))
+                    });
+                    match result {
                     Ok(mgr) => {
                         tracing::debug!("memory: CognitiveContextManager initialised");
-                        Some(Arc::new(mgr))
+                        (Some(Arc::new(mgr)), None)
                     }
                     Err(err) => {
-                        // Memory is a core subsystem — emit a clear error so the user knows
-                        // context will NOT be extracted or persisted across turns.
-                        tracing::error!(%err, "memory: failed to initialise CognitiveContextManager — memory features (extraction, compaction, persistence) are DISABLED. Check your memory configuration (store paths, vector API credentials, etc.)");
-                        None
+                        let msg = format!("Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory.");
+                        tracing::error!("{msg}");
+                        (None, Some(msg))
+                    }
                     }
                 },
                 Err(_) => {
-                    tracing::error!("memory: no tokio runtime available — CognitiveContextManager disabled. Memory features will NOT work.");
-                    None
+                    let msg = "Memory system unavailable: no async runtime available. Memory features will NOT work.".to_string();
+                    tracing::error!("{msg}");
+                    (None, Some(msg))
                 }
             }
         } else {
-            None
+            (None, None)
         };
         Self {
             session,
@@ -292,19 +305,29 @@ where
             bus: None,
             turn_callback: None,
             profiler: crate::context_profiler::ContextProfiler::new(),
-            use_aaak_index: false,
-            auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            use_aaak_index: feature_config.memory().aaak_index_enabled,
+            coherence_threshold: feature_config.memory().coherence_threshold_bp as f32 / 10000.0,
+            auto_compaction_input_tokens_threshold: {
+                let env_val = auto_compaction_threshold_from_env();
+                if env_val > 0 { env_val }
+                else { feature_config.compression().session.threshold_tokens }
+            },
             model_context_window: 0,
             cached_prompt: crate::cached_prompt::CachedSystemPrompt::new(
-                std::path::PathBuf::from(".cowd/config.yaml"),
-                std::path::PathBuf::from(".cowd/identity.md"),
+                crate::cowd_dirs::project_dot_dir(&std::env::current_dir().unwrap_or_default())
+                    .join(crate::cowd_dirs::CONFIG_FILE_YAML),
+                crate::cowd_dirs::project_dot_dir(&std::env::current_dir().unwrap_or_default())
+                    .join("identity.md"),
             ),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
             memory_manager,
+            memory_status,
             tool_callback: None,
             approval_gate: None,
+            effect_handler: None,
+            project_phase: "Discovery".to_string(),
         }
     }
 
@@ -312,6 +335,17 @@ where
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
         self
+    }
+
+    /// Return a human-readable description of memory subsystem health.
+    /// `None` when healthy; `Some(msg)` when degraded or unavailable.
+    pub fn memory_status(&self) -> Option<&str> {
+        self.memory_status.as_deref()
+    }
+
+    /// Return the current project lifecycle phase.
+    pub fn phase(&self) -> &str {
+        &self.project_phase
     }
 
     #[must_use]
@@ -347,10 +381,24 @@ where
         self
     }
 
+    /// P2-10: Register an EffectHandler for side-effect tracking.
+    #[must_use]
+    pub fn with_effect_handler(mut self, handler: Arc<dyn crate::effect::EffectHandler>) -> Self {
+        self.effect_handler = Some(handler);
+        self
+    }
+
     /// P0: Enable AAAK symbolic index mode for memory context injection.
     #[must_use]
     pub fn with_aaak_index(mut self) -> Self {
         self.use_aaak_index = true;
+        self
+    }
+
+    /// P1-05: Register a TurnCallback for generator-style injection after tool results.
+    #[must_use]
+    pub fn with_turn_callback(mut self, cb: TurnCallback) -> Self {
+        self.turn_callback = Some(Arc::new(cb));
         self
     }
 
@@ -422,6 +470,26 @@ where
                 tracing::warn!("memory: no tokio runtime, cannot restore handoff");
             }
         }
+    }
+
+    fn record_context_event(&mut self, event_type: &str, category: &str, summary: &str, priority: u8) {
+        let project_dir = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.profiler.record_dedup(crate::context_profiler::SessionEvent {
+            event_type: event_type.into(),
+            category: category.into(),
+            data_summary: summary.into(),
+            priority,
+            data_hash: 0,     // computed by record_dedup
+            timestamp,
+            project_dir,
+            attribution_confidence: 0.9,
+        });
     }
 
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
@@ -528,15 +596,17 @@ pub async fn run_turn_async(
         }
 
         self.record_turn_started(&user_input);
+        self.record_context_event("user_input", "user",
+            &user_input[..user_input.len().min(200)], 8);
         self.session
             .push_user_text(user_input.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
 
-        let mut effective_system_prompt = self.prepare_memory_context(&user_input);
+        let mut effective_system_prompt = self.prepare_memory_context(&user_input).await;
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
-        let mut prompt_cache_events = Vec::new();
+        let prompt_cache_events = Vec::new();
         let mut iterations = 0;
 
         loop {
@@ -553,7 +623,7 @@ pub async fn run_turn_async(
                 let result = compact_session(&self.session, CompactionConfig::default());
                 if result.removed_message_count > 0 {
                     self.session = result.compacted_session;
-                    effective_system_prompt = self.prepare_memory_context(&user_input);
+                    effective_system_prompt = self.prepare_memory_context(&user_input).await;
                 }
             }
             if self.model_context_window > 0 {
@@ -573,13 +643,20 @@ pub async fn run_turn_async(
             let mut current_text = String::new();
             let mut pending_tool_uses: Vec<(String, String, String)> = Vec::new();
             let mut turn_usage: Option<TokenUsage> = None;
+            let mut stream_events: Vec<(String, String, String, u8)> = Vec::new();
 
             {
                 let mut stream = self.api_client.stream(request);
                 while let Some(event) = stream.next().await {
                     match event? {
-                        AssistantEvent::TextDelta(text) => { current_text.push_str(&text); }
-                        AssistantEvent::ThinkingDelta(thinking) => { current_text.push_str(&format!("\n[think]{}[/think]\n", thinking)); }
+                        AssistantEvent::TextDelta(text) => {
+                            current_text.push_str(&text);
+                            stream_events.push(("text_delta".into(), "assistant".into(), text[..text.len().min(80)].to_string(), 3));
+                        }
+                        AssistantEvent::ThinkingDelta(thinking) => {
+                            current_text.push_str(&format!("\n[think]{}[/think]\n", thinking));
+                            stream_events.push(("thinking".into(), "reasoning".into(), thinking[..thinking.len().min(80)].to_string(), 2));
+                        }
                         AssistantEvent::ToolUse { id, name, input } => { pending_tool_uses.push((id, name, input)); }
                         AssistantEvent::Usage(usage) => { turn_usage = Some(usage); }
                         AssistantEvent::MessageStop => break,
@@ -597,6 +674,11 @@ pub async fn run_turn_async(
                     }
                 }
             } // stream dropped here, releasing &mut self.api_client
+
+            // Flush buffered stream events into context profiler
+            for (event_type, category, summary, priority) in stream_events {
+                self.record_context_event(&event_type, &category, &summary, priority);
+            }
 
             if let Some(usage) = turn_usage {
                 self.usage_tracker.record(usage);
@@ -629,14 +711,8 @@ pub async fn run_turn_async(
                     &mut prompter, iterations,
                 )?;
                 // 01: context profiler — record tool execution event
-                self.profiler.record(crate::context_profiler::SessionEvent {
-                    event_type: "tool_use".into(),
-                    category: "tool".into(),
-                    data_summary: format!("{}: {}", tool_name, &input[..input.len().min(60)]),
-                    priority: 5, data_hash: 0, timestamp: 0,
-                    project_dir: std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()),
-                    attribution_confidence: 0.8,
-                });
+                self.record_context_event("tool_use", "tool",
+                    &format!("{}: {}", tool_name, &input[..input.len().min(60)]), 5);
                 // P1-05: TurnCallback — allow caller to inject new input after tool result
                 if let Some(ref cb) = self.turn_callback {
                     if let Some(new_input) = (cb.on_tool_result)(&tool_name, &result_msg.blocks.first().map(|b| match b {
@@ -808,7 +884,13 @@ self.record_turn_completed(&summary);
         // ── Memory: prepare context before the first model call ──────────────
         // Build an effective system prompt that includes memory context.
         // Falls back to the configured system_prompt when memory is disabled.
-        let effective_system_prompt = self.prepare_memory_context(&user_input);
+        let effective_system_prompt = {
+            let handle = tokio::runtime::Handle::try_current()
+                .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
+            tokio::task::block_in_place(|| {
+                handle.block_on(self.prepare_memory_context(&user_input))
+            })
+        };
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -1244,8 +1326,9 @@ self.record_turn_completed(&summary);
     ///
     /// Returns a clone of `self.system_prompt` when memory is disabled so the
     /// hot path has zero cost.
-    fn prepare_memory_context(&self, user_input: &str) -> Vec<String> {
-        let memory_high = 0usize;
+    async fn prepare_memory_context(&self, user_input: &str) -> Vec<String> {
+        let _perf_start = std::time::Instant::now();
+        let memory_high = self.cached_prompt.memory_high_count();
         if !self.cached_prompt.needs_rebuild(memory_high) {
             return self.cached_prompt.get();
         }
@@ -1256,6 +1339,10 @@ self.record_turn_completed(&summary);
         };
 
         // Convert session messages to memory's Message type for context scoring.
+        // DESIGN: Tool blocks (ToolUse, ToolResult, Thinking) are explicitly excluded
+        // from memory extraction. Only user/assistant text content is persisted.
+        // Tool execution results are machine-optimised data, not knowledge worth retaining
+        // in long-term memory (they can be re-derived by re-running the tool).
         let mem_messages: Vec<MemMessage> = self
             .session
             .messages
@@ -1268,7 +1355,8 @@ self.record_turn_completed(&summary);
                     crate::session::MessageRole::Tool => MemMessageRole::Tool,
                     crate::session::MessageRole::System => MemMessageRole::User,
                 };
-                // Flatten all text content blocks into a single string.
+                // Extract only Text content blocks; ToolUse, ToolResult, Thinking blocks
+                // are deliberately omitted from the memory extraction stream.
                 let content: String = msg
                     .blocks
                     .iter()
@@ -1278,23 +1366,34 @@ self.record_turn_completed(&summary);
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                // Extract tool identity for tool result messages so the memory extractor
+                // can properly attribute error-fix sequences.
+                let (tool_use_id, tool_name) = match msg.role {
+                    crate::session::MessageRole::Tool => {
+                        let tid = msg.blocks.iter().find_map(|b| match b {
+                            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                            _ => None,
+                        });
+                        let tname = msg.blocks.iter().find_map(|b| match b {
+                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => Some(tool_name.clone()),
+                            _ => None,
+                        });
+                        (tid, tname)
+                    }
+                    _ => (None, None),
+                };
                 MemMessage {
                     turn_index: idx,
                     role,
                     content,
-                    tool_use_id: None,
-                    tool_name: None,
+                    tool_use_id,
+                    tool_name,
                     pinned: false,
                 }
             })
             .collect();
 
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return self.system_prompt.clone(),
-        };
-
-        match handle.block_on(mgr.prepare_context(user_input, &mem_messages)) {
+        match mgr.prepare_context(user_input, &mem_messages).await {
             Ok(mut prepared) => {
                 if prepared.entries.is_empty() {
                     return self.system_prompt.clone();
@@ -1302,14 +1401,12 @@ self.record_turn_completed(&summary);
 
                 // M2: Budget enforcement — sort by layer priority then confidence, truncate to budget
                 use memory::types::MemoryLayer;
-                // P1-1: Coherence filtering — skip entries unrelated to current query
-                let query_lower = user_input.to_lowercase();
-                let cohere = |e: &&MemEntry| {
-                    let ct = e.content.to_lowercase();
-                    query_lower.split_whitespace().any(|w| ct.contains(w))
-                        || e.confidence > 0.8
-                };
-                let relevant: Vec<_> = prepared.entries.iter().filter(|e| cohere(e) || matches!(e.layer, MemoryLayer::L0|MemoryLayer::L1)).cloned().collect();
+                // P1-1: Coherence filtering — Jaccard similarity against current query
+                let threshold = self.coherence_threshold;
+                let relevant: Vec<_> = prepared.entries.iter()
+                    .filter(|e| coherence::is_relevant(&e.content, user_input, threshold, matches!(e.layer, MemoryLayer::L0)))
+                    .cloned()
+                    .collect();
                 if !relevant.is_empty() { prepared.entries = relevant; }
                 prepared.entries.sort_by(|a, b| {
                     let layer_rank = |l: MemoryLayer| match l {
@@ -1372,14 +1469,20 @@ self.record_turn_completed(&summary);
                         if rel_count == 0 { context.push_str("\n<knowledge_graph>\n"); }
                         rel_count += 1;
                         if rel_count > 15 { break; }
-                        // 09: skip expired temporal relations
+                        // 09: skip expired or not-yet-valid temporal relations
                         if let Some(ref tm) = rel.temporal {
+                            if let Some(from) = tm.valid_from {
+                                if from > chrono::Utc::now() { continue; }
+                            }
                             if let Some(until) = tm.valid_until {
                                 if until < chrono::Utc::now() { continue; }
                             }
                         }
                         let mut attrs = format!("subject=\"{}\" kind=\"{:?}\" strength=\"{:.2}\"",
                             entry.title, rel.kind, rel.strength);
+                        if let Some(ref entity_name) = rel.entity {
+                            attrs.push_str(&format!(" entity=\"{}\"", entity_name));
+                        }
                         if let Some(ref tm) = rel.temporal {
                             if let Some(from) = tm.valid_from {
                                 attrs.push_str(&format!(" valid_from=\"{}\"", from.format("%Y-%m-%d")));
@@ -1394,9 +1497,13 @@ self.record_turn_completed(&summary);
                 }
                 if rel_count > 0 { context.push_str("</knowledge_graph>\n"); }
 
+                let actual_memory_high = prepared.entries.iter()
+                    .filter(|e| matches!(e.layer, MemoryLayer::L0 | MemoryLayer::L1))
+                    .count();
+
                 let mut prompt = self.system_prompt.clone();
                 prompt.insert(0, context);
-                self.cached_prompt.rebuild(prompt.clone(), 0);
+                self.cached_prompt.rebuild(prompt.clone(), actual_memory_high);
                 prompt
             }
             Err(err) => {
@@ -1415,6 +1522,8 @@ self.record_turn_completed(&summary);
         };
         let mgr = Arc::clone(mgr);
 
+        // Convert session messages to memory's Message type for post-turn extraction.
+        // DESIGN: Tool blocks are excluded (same rationale as prepare_memory_context).
         let mut mem_messages: Vec<MemMessage> = self
             .session
             .messages
@@ -1427,17 +1536,35 @@ self.record_turn_completed(&summary);
                     crate::session::MessageRole::Tool => MemMessageRole::Tool,
                     crate::session::MessageRole::System => MemMessageRole::User,
                 };
+                // Extract only Text blocks; tool blocks are deliberately omitted.
                 let content: String = msg.blocks.iter()
                     .filter_map(|b| match b { ContentBlock::Text { text } => Some(text.as_str()), _ => None })
                     .collect::<Vec<_>>().join(" ");
-                MemMessage { turn_index: idx, role, content, tool_use_id: None, tool_name: None, pinned: false }
+                // Pass tool identity for tool result messages.
+                let (tool_use_id, tool_name) = match msg.role {
+                    crate::session::MessageRole::Tool => {
+                        let tid = msg.blocks.iter().find_map(|b| match b {
+                            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                            _ => None,
+                        });
+                        let tname = msg.blocks.iter().find_map(|b| match b {
+                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => Some(tool_name.clone()),
+                            _ => None,
+                        });
+                        (tid, tname)
+                    }
+                    _ => (None, None),
+                };
+                MemMessage { turn_index: idx, role, content, tool_use_id, tool_name, pinned: false }
             }).collect();
 
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => return Ok(()),
         };
-        handle.block_on(mgr.on_turn_end(&mut mem_messages))
+        tokio::task::block_in_place(|| {
+            handle.block_on(mgr.on_turn_end(&mut mem_messages))
+        })
             .map_err(|err| RuntimeError::new(format!("memory on_turn_end: {err}")))
     }
 }
@@ -2315,8 +2442,8 @@ mod tests {
         assert!(rank(MemoryLayer::L1) > rank(MemoryLayer::L2));
     }
 
-    #[test]
-    fn m2_empty_session_no_memory_crash() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2_empty_session_no_memory_crash() {
         let session = Session::new();
         let mut rt = ConversationRuntime::new(
             session, MockApi,
@@ -2324,12 +2451,12 @@ mod tests {
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         );
-        let _ = rt.prepare_memory_context("query");
+        let _ = rt.prepare_memory_context("query").await;
         let _ = rt.run_memory_post_turn();
     }
 
-    #[test]
-    fn m2_budget_cap_without_memory_returns_system_prompt() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2_budget_cap_without_memory_returns_system_prompt() {
         let session = Session::new();
         let mut rt = ConversationRuntime::new(
             session, MockApi,
@@ -2337,12 +2464,12 @@ mod tests {
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["test prompt".to_string()],
         );
-        let result = rt.prepare_memory_context("test");
+        let result = rt.prepare_memory_context("test").await;
         assert_eq!(result.len(), 1, "without memory manager, returns base system prompt only");
     }
 
-    #[test]
-    fn m2_structured_xml_format_present() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2_structured_xml_format_present() {
         let session = Session::new();
         let mut rt = ConversationRuntime::new(
             session, MockApi,
@@ -2350,7 +2477,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["base prompt".to_string()],
         );
-        let prompt = rt.prepare_memory_context("hello");
+        let prompt = rt.prepare_memory_context("hello").await;
         assert!(prompt.len() >= 1, "should have at least system prompt");
     }
 
@@ -2363,12 +2490,12 @@ mod tests {
         assert!(r.is_ok(), "run_memory_post_turn should return Ok when no memory manager");
     }
 
-    #[test]
-    fn m2_structured_injection_has_memory_context_tag() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2_structured_injection_has_memory_context_tag() {
         let session = Session::new();
         let mut rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["system".to_string()]);
-        let prompt = rt.prepare_memory_context("test");
+        let prompt = rt.prepare_memory_context("test").await;
         assert!(prompt.len() >= 1);
         // Without memory manager, should still return system prompt
         assert!(prompt[0] == "system" || prompt[0].starts_with("system"));
@@ -2383,27 +2510,27 @@ mod tests {
         assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L3));
     }
 
-    #[test]
-    fn m2_budget_cap_applied_on_prepare() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2_budget_cap_applied_on_prepare() {
         let session = Session::new();
         let mut rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["base".to_string()]);
         // Verify that prepare_memory_context doesn't panic with empty session
-        let result = rt.prepare_memory_context("any query");
+        let result = rt.prepare_memory_context("any query").await;
         assert!(!result.is_empty(), "should return at least the system prompt");
     }
 
     // ── M2-L2: integration-level memory tests ──────────────────────
 
-    #[test]
-    fn m2_l2_budget_enforcement_limits_system_prompt() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2_l2_budget_enforcement_limits_system_prompt() {
         // M2-L2-2: verify memory context doesn't exceed budget proportions
         let session = Session::new();
         let mut rt = ConversationRuntime::new(session, MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system prompt".to_string()]);
-        let prompt = rt.prepare_memory_context("test query");
+        let prompt = rt.prepare_memory_context("test query").await;
         // Without memory manager, only system prompt is returned
         assert_eq!(prompt.len(), 1);
         // System prompt should be reasonably sized

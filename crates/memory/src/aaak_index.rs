@@ -2,7 +2,9 @@
 // Derived from mempalace's AAAK compression dialect.
 // Injects compact symbolic slots instead of full entry contents.
 
-use crate::types::{MemoryEntry, MemoryLayer, MemoryId};
+use crate::types::{MemoryEntry, MemoryId};
+#[cfg(test)]
+use crate::types::MemoryLayer;
 use std::collections::HashMap;
 
 /// A compact symbolic slot pointing to a full memory entry.

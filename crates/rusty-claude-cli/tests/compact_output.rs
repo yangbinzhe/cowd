@@ -24,6 +24,7 @@ fn compact_flag_prints_only_final_assistant_text_without_tool_call_details() {
     fs::create_dir_all(&workspace).expect("workspace should exist");
     fs::create_dir_all(&config_home).expect("config home should exist");
     fs::create_dir_all(&home).expect("home should exist");
+    write_minimal_config(&config_home);
     fs::write(workspace.join("fixture.txt"), "alpha parity line\n").expect("fixture should write");
 
     // when we run claw in compact text mode against a tool-using scenario
@@ -91,6 +92,7 @@ fn compact_flag_streaming_text_only_emits_final_message_text() {
     fs::create_dir_all(&workspace).expect("workspace should exist");
     fs::create_dir_all(&config_home).expect("config home should exist");
     fs::create_dir_all(&home).expect("home should exist");
+    write_minimal_config(&config_home);
 
     // when we invoke claw with --compact for the streaming text scenario
     let prompt = format!("{SCENARIO_PREFIX}streaming_text");
@@ -123,6 +125,19 @@ fn compact_flag_streaming_text_only_emits_final_message_text() {
     );
 
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+}
+
+fn write_minimal_config(config_home: &std::path::Path) {
+    let config_dir = config_home;
+    fs::create_dir_all(config_dir).expect("config dir should exist");
+    let config_content = "model: \"sonnet\"\n\
+        providers:\n  anthropic:\n    base_url: \"https://api.anthropic.com/v1\"\n    \
+        api_key: \"test-key\"\n    models: [\"sonnet\"]\n\
+        permissions:\n  defaultMode: \"acceptEdits\"\n  allow: []\n  deny: []\n  ask: []\n\
+        memory:\n  enabled: false\n\
+        gateway:\n  enabled: false\n";
+    fs::write(config_dir.join("config.yaml"), config_content)
+        .expect("minimal config should write");
 }
 
 fn run_cowd(
