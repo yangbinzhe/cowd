@@ -201,6 +201,22 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "compression",
         expected: FieldType::Object,
     },
+    FieldSpec {
+        name: "providers",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "memory",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "gateway",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "platforms",
+        expected: FieldType::Object,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -234,6 +250,10 @@ const PERMISSIONS_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "ask",
         expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "approval",
+        expected: FieldType::Object,
     },
 ];
 
@@ -314,6 +334,64 @@ const OAUTH_FIELDS: &[FieldSpec] = &[
     },
 ];
 
+const COMPRESSION_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "circuitBreaker",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "micro",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "session",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "deep",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "smart",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "fast",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "cheap",
+        expected: FieldType::Object,
+    },
+];
+
+const APPROVAL_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "gates",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "auto_pass_low_risk",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "auto_pass_read_only",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "yolo_honor_critical",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "yolo_mode",
+        expected: FieldType::Bool,
+    },
+];
+
 const DEPRECATED_FIELDS: &[DeprecatedField] = &[
     DeprecatedField {
         name: "permissionMode",
@@ -368,8 +446,8 @@ fn validate_object_keys(
         };
 
         if let Some(spec) = known_fields.iter().find(|f| f.name == key) {
-            // Type check.
-            if !spec.expected.matches(value) {
+            // Type check — null values are acceptable for any field (explicitly unset)
+            if !matches!(value, JsonValue::Null) && !spec.expected.matches(value) {
                 result.errors.push(ConfigDiagnostic {
                     path: path_display.to_string(),
                     field: field_path,
@@ -383,9 +461,9 @@ fn validate_object_keys(
         } else if DEPRECATED_FIELDS.iter().any(|d| d.name == key) {
             // Deprecated key — handled separately, not an unknown-key error.
         } else {
-            // Unknown key.
+            // Unknown key — warn but don't reject the config.
             let suggestion = suggest_field(key, &known_names);
-            result.errors.push(ConfigDiagnostic {
+            result.warnings.push(ConfigDiagnostic {
                 path: path_display.to_string(),
                 field: field_path,
                 line: find_key_line(source, key),
@@ -504,6 +582,26 @@ pub fn validate_config_file(
             source,
             &path_display,
         ));
+    }
+    if let Some(compression) = object.get("compression").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            compression,
+            COMPRESSION_FIELDS,
+            "compression",
+            source,
+            &path_display,
+        ));
+    }
+    if let Some(permissions_obj) = object.get("permissions").and_then(JsonValue::as_object) {
+        if let Some(approval) = permissions_obj.get("approval").and_then(JsonValue::as_object) {
+            result.merge(validate_object_keys(
+                approval,
+                APPROVAL_FIELDS,
+                "permissions.approval",
+                source,
+                &path_display,
+            ));
+        }
     }
 
     result

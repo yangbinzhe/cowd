@@ -537,8 +537,7 @@ impl ConfigLoader {
                     &entry.path,
                 );
                 if !validation.is_ok() {
-                    let first_error = &validation.errors[0];
-                    return Err(ConfigError::Parse(first_error.to_string()));
+                    all_warnings.extend(validation.errors);
                 }
                 all_warnings.extend(validation.warnings);
                 validate_optional_hooks_config(&parsed.object, &entry.path)?;
