@@ -1,7 +1,5 @@
 use std::env;
-use std::path::PathBuf;
 
-use serde_json::Value;
 
 use runtime::{McpServer, McpServerSpec, McpTool};
 use tools::{execute_tool, mvp_tool_specs};

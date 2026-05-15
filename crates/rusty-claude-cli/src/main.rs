@@ -45,18 +45,17 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
+    check_base_commit, format_stale_base_warning, format_usd,
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, PermissionMode, PermissionPolicy,
+    ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy,
     ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
     ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::json;
 use tools::{
-    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition,
+    GlobalToolRegistry, RuntimeToolDefinition,
 };
 
 pub(crate) const DEFAULT_MODEL: &str = "claude-opus-4-6";

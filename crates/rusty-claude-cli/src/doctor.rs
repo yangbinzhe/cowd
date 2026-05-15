@@ -1,7 +1,6 @@
 use std::env;
-use std::path::PathBuf;
 use serde_json::{json, Map, Value};
-use runtime::{ConfigLoader, RuntimeConfig, SandboxStatus, ProjectContext};
+use runtime::{ConfigLoader, ProjectContext};
 use crate::{CliOutputFormat, StatusContext, DEFAULT_DATE,
     parse_git_status_metadata, parse_git_workspace_summary, resolve_sandbox_status,
     checks,

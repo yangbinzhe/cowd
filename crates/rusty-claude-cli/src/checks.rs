@@ -3,13 +3,11 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
-use runtime::{ConfigLoader, RuntimeConfig, SandboxStatus, ProjectContext, load_oauth_credentials};
-use tools::mvp_tool_specs;
-use crate::{CliOutputFormat, StatusContext,
-    VERSION, BUILD_TARGET, GIT_SHA, DEFAULT_DATE, DEFAULT_MODEL,
+use runtime::{ConfigLoader, load_oauth_credentials};
+use crate::{StatusContext,
+    VERSION, BUILD_TARGET, GIT_SHA,
     OFFICIAL_REPO_URL, OFFICIAL_REPO_SLUG, DEPRECATED_INSTALL_COMMAND,
-    parse_git_status_metadata, parse_git_workspace_summary, resolve_sandbox_status,
-    doctor::{DiagnosticCheck, DiagnosticLevel, DoctorReport},
+    doctor::{DiagnosticCheck, DiagnosticLevel},
 };
 #[allow(clippy::too_many_lines)]
 pub(crate) fn check_auth_health() -> DiagnosticCheck {
