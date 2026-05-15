@@ -9,8 +9,9 @@ window.Messages = (()=>{
   function connectWs(){
     if(!Api.sid)return;
     const proto=location.protocol==='https:'?'wss':'ws';
+    const tokenParam = Api.token ? '?token=' + encodeURIComponent(Api.token) : '';
     try{
-      ws=new WebSocket(proto+'://'+location.host+'/ws');
+      ws=new WebSocket(proto+'://'+location.host+'/ws'+tokenParam);
       ws.onmessage=(evt)=>{ try{ const d=JSON.parse(evt.data); dispatch(d); }catch(e){} };
       ws.onclose=()=>{ ws=null; };
     }catch(e){}
@@ -33,9 +34,10 @@ window.Messages = (()=>{
     connectWs();
     abortController=new AbortController();
     try{
+      const headers = Api.token ? {'Content-Type':'application/json', 'Authorization':'Bearer '+Api.token} : {'Content-Type':'application/json'};
       fetch(Api.getStreamUrl(),{
         method:'POST',
-        headers:{'Content-Type':'application/json'},
+        headers: headers,
         body:JSON.stringify({listen:true}),
         signal:abortController.signal,
       }).then(resp=>{

@@ -8,6 +8,7 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 // ── Re-export from unified config crate ──────────────────────────────
 pub use config::{ApprovalConfig, ResolvedPermissionMode, McpTransport, McpOAuthConfig, OAuthConfig};
 pub use config::{ConfigSource, ConfigEntry, ConfigError};
+pub use config::ConfigLoader as UnifiedConfigLoader;
 
 /// Prefix used for environment variable config overrides.
 const ENV_OVERRIDE_PREFIX: &str = "COWD_";

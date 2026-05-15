@@ -835,52 +835,52 @@ fn check_auth_simple() -> Option<Response> {
 }
 
 /// Extract and validate bearer token from Authorization header.
+/// For WebSocket upgrade requests (where browsers cannot set custom headers),
+/// also checks the `token` query parameter as a fallback.
 fn check_auth<B>(state: &HttpAppState, req: &axum::http::Request<B>) -> Option<Response> {
     // Skip auth if disabled or no token configured (auto-disable when auth_token is empty)
     if !state.auth_enabled || state.auth_token.is_empty() {
         return None;
     }
 
-    // Extract Authorization header
-    let auth_header = match req.headers()
+    // Try Authorization header first
+    if let Some(token) = req.headers()
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
     {
-        Some(h) => h,
-        None => {
-            return Some((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": "Missing Authorization header. Include 'Authorization: Bearer <token>' header."
-                })),
-            ).into_response());
+        if token == state.auth_token {
+            return None;
         }
-    };
-
-    // Check Bearer token format
-    let token = match auth_header.strip_prefix("Bearer ") {
-        Some(t) => t,
-        None => {
-            return Some((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": "Invalid Authorization header format. Use 'Bearer <token>'."
-                })),
-            ).into_response());
-        }
-    };
-
-    // Validate token (constant-time comparison)
-    if token != state.auth_token {
-        return Some((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "Invalid or missing token. Include 'Authorization: Bearer <token>' header."
-            })),
-        ).into_response());
     }
 
-    None // Auth passed
+    // Fallback: check ?token= query param (needed for WebSocket connections)
+    let is_ws_upgrade = req.headers()
+        .get("Upgrade")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    if is_ws_upgrade {
+        if let Some(token) = req.uri().query()
+            .and_then(|q| {
+                q.split('&')
+                    .find(|p| p.starts_with("token="))
+                    .map(|p| &p[6..])
+            })
+        {
+            if token == state.auth_token {
+                return None;
+            }
+        }
+    }
+
+    Some((
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "Authentication required. Include 'Authorization: Bearer <token>' header, or for WebSocket: ws://host/ws?token=<token>."
+        })),
+    ).into_response())
 }
 
 /// Require auth middleware helper
