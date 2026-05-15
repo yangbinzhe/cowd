@@ -886,7 +886,7 @@ self.record_turn_completed(&summary);
         // Falls back to the configured system_prompt when memory is disabled.
         let effective_system_prompt = {
             let handle = tokio::runtime::Handle::try_current()
-                .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
+                .unwrap_or_else(|_| tokio::runtime::Runtime::new().expect("tokio runtime fallback").handle().clone());
             tokio::task::block_in_place(|| {
                 handle.block_on(self.prepare_memory_context(&user_input))
             })

@@ -115,7 +115,7 @@ fn not_found() -> Response {
             Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty())
-                .unwrap()
+                .expect("NOT_FOUND response should build")
         })
 }
 
@@ -2913,7 +2913,10 @@ async fn handle_ws(mut socket: WebSocket, addr: std::net::SocketAddr, state: Htt
         session_id: Some(session_id.clone()),
         error: None,
     };
-    if socket.send(WsMessage::Text(serde_json::to_string(&welcome).unwrap().into())).await.is_err() {
+    if socket.send(WsMessage::Text(serde_json::to_string(&welcome).unwrap_or_else(|e| {
+        tracing::warn!("failed to serialize welcome message: {e}");
+        "{}".to_string()
+    }).into())).await.is_err() {
         return;
     }
 
