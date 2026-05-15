@@ -794,7 +794,7 @@ mod tests {
         fs::create_dir_all(root.join(".cowd")).expect("cc dir");
         fs::write(root.join("COWD.md"), "Project rules").expect("write instructions");
         fs::write(
-            root.join(".cowd").join("settings.json"),
+            root.join(".cowd").join("config.yaml"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("write settings");
@@ -837,7 +837,7 @@ mod tests {
         fs::create_dir_all(root.join(".cowd")).expect("cc dir");
         fs::write(root.join("COWD.md"), "Project rules").expect("write COWD.md");
         fs::write(
-            root.join(".cowd").join("settings.json"),
+            root.join(".cowd").join("config.yaml"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("write settings");

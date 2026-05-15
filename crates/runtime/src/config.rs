@@ -478,29 +478,10 @@ impl ConfigLoader {
 
     #[must_use]
     pub fn discover(&self) -> Vec<ConfigEntry> {
-        // Derive the user config base directory (~/.cc or overridden via env).
-        // The config_home field already holds this resolved directory.
         let cc_user_dir = &self.config_home;
 
-        // Legacy .cowd.json path (sibling of config_home, e.g. ~/.cowd.json).
-        let user_legacy_path = cc_user_dir.parent().map_or_else(
-            || PathBuf::from(".cowd.json"),
-            |parent| parent.join(".cowd.json"),
-        );
-
         vec![
-            // ── Legacy: .cowd.json (lowest priority, deprecated) ─────────────────────
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::User,
-                path: user_legacy_path,
-            },
-            // ── User-level: ~/.cc paths (preferred config.*) ──────────────────────────
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::User,
-                path: cc_user_dir.join("settings.json"),
-            },
+            // ── User-level: ~/.cc paths ──────────────────────────────────────
             ConfigEntry {
                 exists: true,
                 source: ConfigSource::User,
@@ -511,22 +492,7 @@ impl ConfigLoader {
                 source: ConfigSource::User,
                 path: cc_user_dir.join("config.yml"),
             },
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::User,
-                path: cc_user_dir.join("config.json"),
-            },
-            // ── Project-level: .cowd/.claw paths ───────────────────────────────────────
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::Project,
-                path: self.cwd.join(".cowd.json"),
-            },
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::Project,
-                path: self.cwd.join(".cowd").join("settings.json"),
-            },
+            // ── Project-level: .cowd/ paths ──────────────────────────────────
             ConfigEntry {
                 exists: true,
                 source: ConfigSource::Project,
@@ -537,17 +503,7 @@ impl ConfigLoader {
                 source: ConfigSource::Project,
                 path: self.cwd.join(".cowd").join("config.yml"),
             },
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::Project,
-                path: self.cwd.join(".cowd").join("config.json"),
-            },
-            // ── Local overrides: .cc paths (highest priority) ─────────────────────────
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::Local,
-                path: self.cwd.join(".cowd").join("settings.local.json"),
-            },
+            // ── Local overrides: highest priority ────────────────────────────
             ConfigEntry {
                 exists: true,
                 source: ConfigSource::Local,
@@ -557,11 +513,6 @@ impl ConfigLoader {
                 exists: true,
                 source: ConfigSource::Local,
                 path: self.cwd.join(".cowd").join("config.local.yml"),
-            },
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::Local,
-                path: self.cwd.join(".cowd").join("config.local.json"),
             },
         ]
     }
@@ -574,17 +525,12 @@ impl ConfigLoader {
 
         for entry in self.discover() {
             crate::config_validate::check_unsupported_format(&entry.path)?;
-            let is_yaml = is_yaml_path(&entry.path);
-            let parsed_opt = if is_yaml {
-                read_optional_yaml_object(&entry.path)?
-            } else {
-                read_optional_json_object(&entry.path)?
-            };
+            let parsed_opt = read_optional_yaml_object(&entry.path)?;
             let Some(parsed) = parsed_opt else {
                 continue;
             };
-            // Skip schema validation for YAML files (no line-number source available)
-            if !is_yaml {
+            // Validate schema
+            {
                 let validation = crate::config_validate::validate_config_file(
                     &parsed.object,
                     &parsed.source,
@@ -1058,7 +1004,7 @@ impl McpServerConfig {
     }
 }
 
-/// Parsed JSON object paired with its raw source text for validation.
+/// Parsed config object paired with its raw source text for validation.
 struct ParsedConfigFile {
     object: BTreeMap<String, JsonValue>,
     source: String,
@@ -1073,7 +1019,7 @@ fn is_yaml_path(path: &Path) -> bool {
 }
 
 /// Convert a `serde_yaml::Value` into the project-internal `JsonValue`.
-/// Returns `None` for YAML types that have no JSON equivalent (e.g. tagged values).
+/// Returns `None` for YAML types that have no YAML equivalent (e.g. tagged values).
 fn yaml_to_json(value: serde_yaml::Value) -> Option<JsonValue> {
     match value {
         serde_yaml::Value::Null => Some(JsonValue::Null),
@@ -1140,7 +1086,7 @@ fn read_optional_yaml_object(path: &Path) -> Result<Option<ParsedConfigFile>, Co
 
     let Some(object) = json_value.as_object() else {
         return Err(ConfigError::Parse(format!(
-            "{}: top-level settings value must be a YAML mapping",
+            "{}: top-level config value must be an object",
             path.display()
         )));
     };
@@ -1262,7 +1208,7 @@ fn insert_nested(map: &mut BTreeMap<String, JsonValue>, path: &[String], value: 
     }
 }
 
-fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
+fn read_optional_config_file(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1282,7 +1228,7 @@ fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, Co
     };
     let Some(object) = parsed.as_object() else {
         return Err(ConfigError::Parse(format!(
-            "{}: top-level settings value must be a JSON object",
+            "{}: top-level config value must be an object",
             path.display()
         )));
     };
@@ -1965,7 +1911,7 @@ fn expect_object<'a>(
 ) -> Result<&'a BTreeMap<String, JsonValue>, ConfigError> {
     value
         .as_object()
-        .ok_or_else(|| ConfigError::Parse(format!("{context}: expected JSON object")))
+        .ok_or_else(|| ConfigError::Parse(format!("{context}: expected config object")))
 }
 
 fn expect_string<'a>(
@@ -2094,7 +2040,7 @@ fn optional_usize(
 fn parse_bool_map(value: &JsonValue, context: &str) -> Result<BTreeMap<String, bool>, ConfigError> {
     let Some(map) = value.as_object() else {
         return Err(ConfigError::Parse(format!(
-            "{context}: expected JSON object"
+            "{context}: expected config object"
         )));
     };
     map.iter()
@@ -2290,14 +2236,14 @@ mod tests {
         let home = root.join("home").join(".cowd");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
-        fs::write(home.join("settings.json"), "[]").expect("write bad settings");
+        fs::write(home.join("config.yaml"), "[]").expect("write bad settings");
 
         let error = ConfigLoader::new(&cwd, &home)
             .load()
             .expect_err("config should fail");
         assert!(error
             .to_string()
-            .contains("top-level settings value must be a JSON object"));
+            .contains("top-level config value must be an object"));
 
         if root.exists() {
             fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -2313,27 +2259,27 @@ mod tests {
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            home.parent().expect("home parent").join(".cowd/config.json"),
+            home.parent().expect("home parent").join(".cowd/config.yaml"),
             r#"{"model":"haiku","env":{"A":"1"},"mcpServers":{"home":{"command":"uvx","args":["home"]}}}"#,
         )
         .expect("write user compat config");
         fs::write(
-            home.join("settings.json"),
+            home.join("config.yaml"),
             r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]}}"#,
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".cowd/config.json"),
+            cwd.join(".cowd/config.yaml"),
             r#"{"model":"project-compat","env":{"B":"2"}}"#,
         )
         .expect("write project compat config");
         fs::write(
-            cwd.join(".cowd").join("settings.json"),
+            cwd.join(".cowd").join("config.yaml"),
             r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
         )
         .expect("write project settings");
         fs::write(
-            cwd.join(".cowd").join("settings.local.json"),
+            cwd.join(".cowd").join("config.local.yaml"),
             r#"{"model":"opus","permissionMode":"acceptEdits"}"#,
         )
         .expect("write local settings");
@@ -2343,8 +2289,10 @@ mod tests {
             .expect("config should load");
 
         assert_eq!(COWD_SETTINGS_SCHEMA_NAME, "SettingsSchema");
-        assert_eq!(loaded.loaded_entries().len(), 5);
+        assert_eq!(loaded.loaded_entries().len(), 3);
         assert_eq!(loaded.loaded_entries()[0].source, ConfigSource::User);
+        assert!(loaded.loaded_entries()[1].source == ConfigSource::Project);
+        assert!(loaded.loaded_entries()[2].source == ConfigSource::Local);
         assert_eq!(
             loaded.get("model"),
             Some(&JsonValue::String("opus".to_string()))
@@ -2360,7 +2308,7 @@ mod tests {
                 .and_then(JsonValue::as_object)
                 .expect("env object")
                 .len(),
-            4
+            2
         );
         assert!(loaded
             .get("hooks")
@@ -2399,7 +2347,7 @@ mod tests {
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            cwd.join(".cowd").join("settings.local.json"),
+            cwd.join(".cowd").join("config.local.yaml"),
             r#"{
               "sandbox": {
                 "enabled": true,
@@ -2437,7 +2385,7 @@ mod tests {
         fs::create_dir_all(cwd.join(".cowd")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
         fs::write(
-            home.join("settings.json"),
+            home.join("config.yaml"),
             r#"{
               "providerFallbacks": {
                 "primary": "claude-opus-4-6",
@@ -2472,7 +2420,7 @@ mod tests {
         let home = root.join("home").join(".cowd");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
-        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+        fs::write(home.join("config.yaml"), "{}").expect("write empty settings");
 
         // when
         let loaded = ConfigLoader::new(&cwd, &home)
@@ -2497,7 +2445,7 @@ mod tests {
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
-            home.join("settings.json"),
+            home.join("config.yaml"),
             r#"{"trustedRoots": ["/tmp/worktrees", "/home/user/projects"]}"#,
         )
         .expect("write settings");
@@ -2522,7 +2470,7 @@ mod tests {
         let home = root.join("home").join(".cowd");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
-        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+        fs::write(home.join("config.yaml"), "{}").expect("write empty settings");
 
         // when
         let loaded = ConfigLoader::new(&cwd, &home)
@@ -2544,7 +2492,7 @@ mod tests {
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            home.join("settings.json"),
+            home.join("config.yaml"),
             r#"{
               "mcpServers": {
                 "stdio-server": {
@@ -2577,7 +2525,7 @@ mod tests {
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".cowd").join("settings.local.json"),
+            cwd.join(".cowd").join("config.local.yaml"),
             r#"{
               "mcpServers": {
                 "remote-server": {
@@ -2634,7 +2582,7 @@ mod tests {
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
-            home.join("settings.json"),
+            home.join("config.yaml"),
             r#"{
               "mcpServers": {
                 "remote": {
@@ -2673,7 +2621,7 @@ mod tests {
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            home.join("settings.json"),
+            home.join("config.yaml"),
             r#"{
               "enabledPlugins": {
                 "tool-guard@builtin": true,
@@ -2711,7 +2659,7 @@ mod tests {
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            home.join("settings.json"),
+            home.join("config.yaml"),
             r#"{
               "enabledPlugins": {
                 "core-helpers@builtin": true
@@ -2763,7 +2711,7 @@ mod tests {
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
-            home.join("settings.json"),
+            home.join("config.yaml"),
             r#"{"mcpServers":{"broken":{"type":"http","url":123}}}"#,
         )
         .expect("write broken settings");
@@ -2791,12 +2739,12 @@ mod tests {
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            home.join("settings.json"),
+            home.join("config.yaml"),
             r#"{"aliases":{"fast":"claude-haiku-4-5-20251213","smart":"claude-opus-4-6"}}"#,
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".cowd").join("settings.local.json"),
+            cwd.join(".cowd").join("config.local.yaml"),
             r#"{"aliases":{"smart":"claude-sonnet-4-6","cheap":"grok-3-mini"}}"#,
         )
         .expect("write local settings");
@@ -2832,7 +2780,7 @@ mod tests {
         let home = root.join("home").join(".cowd");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
-        fs::write(home.join("settings.json"), "").expect("write empty settings");
+        fs::write(home.join("config.yaml"), "").expect("write empty settings");
 
         // when
         let loaded = ConfigLoader::new(&cwd, &home)
@@ -2885,12 +2833,12 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".cowd");
-        let project_settings = cwd.join(".cowd").join("settings.json");
+        let project_settings = cwd.join(".cowd").join("config.yaml");
         fs::create_dir_all(cwd.join(".cowd")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            home.join("settings.json"),
+            home.join("config.yaml"),
             r#"{"hooks":{"PreToolUse":["base"]}}"#,
         )
         .expect("write user settings");
@@ -2984,7 +2932,7 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".cowd");
-        let user_settings = home.join("settings.json");
+        let user_settings = home.join("config.yaml");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3022,7 +2970,7 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".cowd");
-        let user_settings = home.join("settings.json");
+        let user_settings = home.join("config.yaml");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3065,7 +3013,7 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".cowd");
-        let user_settings = home.join("settings.json");
+        let user_settings = home.join("config.yaml");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3107,7 +3055,7 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".cowd");
-        let user_settings = home.join("settings.json");
+        let user_settings = home.join("config.yaml");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(&user_settings, "{\n  \"modle\": \"opus\"\n}\n").expect("write user settings");

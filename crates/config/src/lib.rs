@@ -46,8 +46,6 @@ use serde_json::Map;
 pub enum ConfigError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("JSON parse error: {0}")]
-    Json(#[from] serde_json::Error),
     #[error("YAML parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
     #[error("Parse error: {0}")]
@@ -1145,15 +1143,7 @@ impl ConfigLoader {
         // 1. Load files in precedence order, deep-merging each
         for entry in self.discovery.discover() {
             let content = fs::read_to_string(&entry.path)?;
-            let parsed: serde_json::Value = if entry.path
-                .extension()
-                .map(|e| e == "yaml" || e == "yml")
-                .unwrap_or(false)
-            {
-                serde_yaml::from_str(&content)?
-            } else {
-                serde_json::from_str(&content)?
-            };
+            let parsed: serde_json::Value = serde_yaml::from_str(&content)?;
 
             if let serde_json::Value::Object(ref map) = parsed {
                 for (key, value) in map {
