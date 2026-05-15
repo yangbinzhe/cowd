@@ -3251,7 +3251,7 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
         "MCP".to_string(),
         "  Usage            /mcp [list|show <server>|help]".to_string(),
         "  Direct CLI       claw mcp [list|show <server>|help]".to_string(),
-        "  Sources          .cowd/settings.json, .cowd/config.yaml, .cowd/config.local.yaml".to_string(),
+        "  Sources          .cowd/config.yaml, .cowd/config.local.yaml".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3266,7 +3266,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/mcp [list|show <server>|help]",
             "direct_cli": "cowd mcp [list|show <server>|help]",
-            "sources": [".cowd/settings.json", ".cowd/config.yaml", ".cowd/config.local.yaml"],
+            "sources": [".cowd/config.yaml", ".cowd/config.local.yaml"],
         },
         "unexpected": unexpected,
     })

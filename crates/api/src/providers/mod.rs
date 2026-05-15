@@ -629,7 +629,7 @@ mod tests {
         std::fs::create_dir_all(cwd.join(".cowd")).expect("project config dir");
         std::fs::create_dir_all(&home).expect("home config dir");
         std::fs::write(
-            home.join("settings.json"),
+            home.join("config.yaml"),
             r#"{
               "plugins": {
                 "maxOutputTokens": 12345

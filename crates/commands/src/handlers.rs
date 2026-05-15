@@ -1328,7 +1328,7 @@ mod tests {
         fs::create_dir_all(workspace.join(".cowd")).expect("workspace config dir");
         fs::create_dir_all(&config_home).expect("config home");
         fs::write(
-            workspace.join(".cowd").join("settings.json"),
+            workspace.join(".cowd").join("config.yaml"),
             r#"{
               "mcpServers": {
                 "alpha": {
@@ -1352,7 +1352,7 @@ mod tests {
         )
         .expect("write settings");
         fs::write(
-            workspace.join(".cowd").join("settings.local.json"),
+            workspace.join(".cowd").join("config.local.yaml"),
             r#"{
               "mcpServers": {
                 "remote": {
@@ -1405,7 +1405,7 @@ mod tests {
         fs::create_dir_all(workspace.join(".cowd")).expect("workspace config dir");
         fs::create_dir_all(&config_home).expect("config home");
         fs::write(
-            workspace.join(".cowd").join("settings.json"),
+            workspace.join(".cowd").join("config.yaml"),
             r#"{
               "mcpServers": {
                 "alpha": {
@@ -1429,7 +1429,7 @@ mod tests {
         )
         .expect("write settings");
         fs::write(
-            workspace.join(".cowd").join("settings.local.json"),
+            workspace.join(".cowd").join("config.local.yaml"),
             r#"{
               "mcpServers": {
                 "remote": {
@@ -1474,7 +1474,7 @@ mod tests {
         let help =
             render_mcp_report_json_for(&loader, &workspace, Some("help")).expect("mcp help json");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["sources"][0], ".cowd/settings.json");
+        assert_eq!(help["usage"]["sources"][0], ".cowd/config.yaml");
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
