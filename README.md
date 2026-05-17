@@ -1,7 +1,7 @@
 # Cowd — AI 编程智能体框架
 
-> **Rust 实现的高性能 AI 编程助手**，支持 CLI / TUI / WebUI 三种交互模式。
-> 提供模型适配、工具执行、记忆系统、MCP 协议、插件系统和多平台网关等完整能力。
+> **Rust 实现的高性能 AI 编程智能体框架**，支持 CLI / TUI / WebUI 三种交互模式。
+> 提供模型适配、工具执行、五层记忆系统、MCP 协议、工作流引擎、插件系统和多平台网关等完整能力。
 
 ---
 
@@ -60,11 +60,12 @@ Cowd 内置多 Provider 路由层，支持自动根据模型名匹配对应的 A
 
 ### Agent 编排
 
-- 20+ 内置工具（文件、Bash、搜索、LSP、TODO、Web 等）
-- 子 Agent 委派（`task` / `team` / `cron`）支持并行执行
-- 智能审批流（`SmartApprovalGate`）—— 危险操作拦截 + Y/N 模态确认
+- 20+ 内置工具（文件、Bash、搜索、LSP、TODO、Web 等），按安全等级分类并发执行
+- 子 Agent 委派（`task` / `team` / `cron`）支持并行执行，含 token 预算控制
+- 智能审批流（`SmartApprovalGate` / `ToolSafetyCategory`）—— 危险操作分类拦截 + 模态确认
 - YOLO 模式 —— 跳过所有审批，用于全自动场景
 - Worker 生命周期管理 —— 远端 worker boot、trust gate、prompt 交付保障
+- 工作流引擎 —— 意图路由 + 里程碑状态机 + 进度追踪，支撑结构化开发流程
 
 ---
 
@@ -79,13 +80,13 @@ cowd/
 │   ├── tools/                 # 内置工具系统（20+ 工具）
 │   ├── commands/              # 斜杠命令 + 技能系统
 │   ├── memory/                # 5 层记忆系统（36 模块）
-│   ├── memory-light/          # 轻量记忆提取器
 │   ├── config/                # 统一配置管理
 │   ├── plugins/               # 插件注册与生命周期
 │   ├── session-store/         # SQLite 会话持久化
 │   ├── telemetry/             # 遥测事件追踪
 │   ├── compat-harness/        # 兼容性测试套件
-│   ├── workflow/              # 工作流引擎
+│   ├── workflow/              # 工作流引擎（意图路由、里程碑、进度追踪）
+│   ├── memory-light/          # 轻量记忆提取器（BM25 检索、知识图谱）
 │   └── mock-anthropic-service/ # 模拟 Anthropic 服务（测试用）
 ├── webui/                     # 浏览器前端（Vanilla JS）
 ├── scripts/                   # 测试与基准脚本
@@ -161,7 +162,8 @@ cowd/
 | **平台网关** | `platform/` | 飞书/企微/邮件/API Server 适配器 |
 | **钩子系统** | `hooks`, `lifecycle_hooks`, `plugin_lifecycle` | Pre/Post 工具钩子 |
 | **任务系统** | `task_registry`, `team_cron_registry`, `task_packet` | 后台任务、团队、定时任务 |
-| **其他** | `oauth`, `sandbox`, `bus`, `effect`, `pairing`, `mirror` | OAuth、沙箱、事件总线等 |
+| **上下文分析** | `context_profiler`, `lane_events`, `wave` | 会话事件追踪、上下文水位监控 |
+| **其他** | `oauth`, `sandbox`, `bus`, `effect`, `pairing`, `mirror`, `profile` | OAuth、沙箱、事件总线、运行时 profile 等 |
 
 #### Gateway 配置 (`config.rs`)
 
@@ -254,18 +256,43 @@ cowd/
 
 Cowd 最复杂最精密的子系统。详见下方 [记忆系统](#记忆系统) 章节。
 
-### `config` — 统一配置管理
+### `config` — 统一配置管理（独立 crate）
 
-独立于 `runtime` 的配置 crate，提供类型安全的配置加载。支持：
-- YAML / JSON 配置文件自动发现
-- 深度合并（deep merge）
-- 环境变量覆盖（`COWD_*`）
+与 `runtime` 中的配置层分离的独立配置 crate，提供 `UnifiedConfig` 类型安全的配置加载。支持：
+- YAML 配置文件自动发现（已移除 JSON 支持，仅 YAML）
+- 深度合并（deep merge），User → Project → Local → 环境变量 → CLI 参数严格优先级
+- 环境变量覆盖（`COWD_*` / `CC_*` 前缀）
 - Provider 解析（按模型名匹配）
-- 完整的错误类型
+- 规划目录管理（`.cowd/planning/`）：PlanState 的 YAML 序列化
+- 完整的错误类型体系（`ConfigError`）
+- 与 `runtime::ConfigLoader` 通过 `UnifiedConfigLoader` 兼容桥接
 
 ### `session-store` — SQLite 会话持久化
 
 基于 `rusqlite` 的会话存储，使用 FTS5 全文索引支持会话搜索。
+
+### `workflow` — 工作流引擎
+
+灵感来源于 get-shit-done 工作流方法论的轻量工作流引擎，包含四个模块：
+
+| 模块 | 职责 |
+|---|---|
+| `router` | `IntentRouter` — 关键词驱动的意图路由，根据用户输入匹配工作流模板 |
+| `template` | `WorkflowTemplate` — 多步骤管道定义（analyze → implement → review → ship） |
+| `milestone` | `Milestone` + `ProjectLifecycle` — 里程碑状态机 + 项目阶段管理（Discovery → Planning → Building → Reviewing → Shipping → Graduated） |
+| `progress` | `ProgressTracker` — 阶段进度追踪，带 ASCII 进度条和百分比计算 |
+
+工作流引擎与聊天循环解耦，通过 `planning/` 目录（`.cowd/planning/`）持久化项目状态，支持 `/plan`、`/milestone` 等斜杠命令触发。
+
+### `memory-light` — 轻量记忆提取器
+
+独立于 `memory` 的轻量级记忆子系统，用于资源受限场景。包含：
+- `extract` — 从对话中提取结构化记忆
+- `layers` — 记忆层次管理
+- `bm25` — BM25 检索算法实现
+- `store` — SQLite 持久化
+- `knowledge_graph` — 知识图谱存储
+- `sandbox` / `closet` — 工具输出沙箱与闭合段管理
 
 ### `telemetry` — 遥测
 
@@ -329,6 +356,15 @@ L4 ─ Task（任务层）
 - **Coherence** — 记忆一致性检查器
 - **Drift** — 记忆偏移检测
 
+### 记忆增强模块
+
+- **EntityRegistry（实体消歧）** — `entity_registry.rs` 对提取出的命名实体进行消歧与合并，避免同义实体（如 "GPT" 和 "ChatGPT"）重复存储
+- **TemporalGraph（时序知识图谱）** — `temporal_graph.rs` 为关系三元组添加时间戳维度，支持时序推理和知识演化追踪
+- **ContextSync（跨会话同步）** — `context_sync.rs` 在多个并发会话之间同步共享上下文，确保 Project 层（L2）记忆的一致性
+- **ContextProfiler（上下文分析器）** — `runtime::context_profiler` 追踪会话事件（`SessionEvent`），监控上下文窗口水位和压缩触发时机
+- **FactChecker（事实核查）** — `fact_checker.rs` 对提取的事实进行一致性验证，防止矛盾信息进入记忆存储
+- **HandoffManager（交接管理）** — `handoff.rs` 管理跨会话的认知上下文传递，支持任务中断恢复
+
 ### 向量索引
 
 支持通过远程 Embedding API 构建向量索引，提供语义搜索能力。
@@ -363,6 +399,17 @@ mvp_tool_specs() -> Vec<ToolSpec>
 
 `ToolSearch` 工具支持对延迟工具（deferred tools）进行关键词搜索，包含模糊匹配和排名。当有 MCP 服务器待连接时，搜索结果中会包含待发现工具的状态提示。
 
+### 安全分类与并发控制
+
+`ToolSafetyCategory` 将每个内置工具分为四类，同时控制并发执行：
+
+| 分类 | 示例工具 | 并发策略 |
+|---|---|---|
+| `ReadOnly` | read, grep, glob, git_status | 无限制并发 |
+| `WriteLocal` | write, edit, bash, memory_create | 按文件路径序列化 |
+| `Network` | web_search, web_fetch, mcp_call | 限制最大并发数（默认 3） |
+| `Destructive` | rm, kill, sudo | 需要显式确认 |
+
 ### 权限控制
 
 每个工具有对应的 `PermissionMode`：
@@ -370,7 +417,9 @@ mvp_tool_specs() -> Vec<ToolSpec>
 - `WorkspaceWrite` — 工作区写入操作
 - `DangerFullAccess` — 危险操作（Bash 执行、网络访问等）
 
-`PermissionEnforcer` + `ApprovalGate` 构成双层防护。YOLO 模式可完全跳过审批。
+`PermissionEnforcer` + `ApprovalGate`（双层审批门）+ `ToolSafetyCategory` 构成三层防护。YOLO 模式可完全跳过审批。
+
+工具调用结果会自动裁剪（`ToolResultBudget`），支持 HeadOnly / TailOnly / HeadAndTail 三种截断策略。
 
 ---
 
@@ -463,10 +512,12 @@ WebUI 通过 REST API 与后端通信，主要端点：
 
 ## 配置体系
 
+> 配置格式仅支持 **YAML**（已移除 JSON 支持）。
+
 ### 配置文件优先级
 
-1. **CLI 参数** — `--model` `--permission-mode` `--yolo` 等
-2. **环境变量** — `COWD_MODEL` `ANTHROPIC_API_KEY` `COWD_PERMISSION_MODE` 等
+1. **CLI 参数** — `--model` `--permission-mode` `--yolo` `--reasoning-effort` 等
+2. **环境变量** — `COWD_MODEL` `ANTHROPIC_API_KEY` `COWD_PERMISSION_MODE` `COWD_AUTO_COMPACT_INPUT_TOKENS` 等
 3. **Local 配置** — `.cowd/config.local.yaml`（git-ignored）
 4. **Project 配置** — `.cowd/config.yaml`
 5. **User 配置** — `~/.cowd/config.yaml`
@@ -558,11 +609,17 @@ cowd --model deepseek-v4-pro "写一个排序函数"
 # YOLO 模式（跳过所有审批）
 cowd --yolo prompt "自动修复所有 lint 错误"
 
-# 继续已保存会话
-cowd --resume latest
+# 继续已保存会话并执行斜杠命令
+cowd --resume latest /status
+
+# 指定 reasoning effort（仅支持模型）
+cowd --reasoning-effort high prompt "分析这个架构"
 
 # JSON 输出格式
 cowd prompt "当前 Git 状态" --output-format json
+
+# 导出会话
+cowd export --session latest --output session.md
 ```
 
 ### 安装
@@ -618,6 +675,15 @@ cargo doc --no-deps --open
 
 编译并行度限制为 4 任务（`.cargo/config.toml`），防止内存溢出。
 
+### 规划目录
+
+工作流引擎使用 `.cowd/planning/` 目录持久化项目状态和里程碑：
+
+```bash
+.cowd/planning/
+└── state.yaml       # PlanState — current_phase, milestones, notes
+```
+
 ### CI/CD
 
 兼容性测试套件（`compat-harness`）提供与上游（Claude Code）的 manifest 提取和路径兼容性验证。
@@ -628,16 +694,21 @@ cargo doc --no-deps --open
 
 | Crate | 测试数 | 覆盖内容 |
 |---|---|---|
-| runtime | ~550 | 核心运行时（会话、压缩、权限、MCP、配置） |
-| memory | ~190 | 记忆系统各层、AAAK 压缩、实体提取 |
-| api | 129 | Provider 适配、SSE 解析、类型序列化 |
-| tools | 101 | 工具执行、权限校验、搜索排名 |
+| runtime | 569 | 核心运行时（会话、压缩、权限、MCP、配置、子 Agent 编排） |
+| memory | 252 | 记忆系统各层、AAAK 压缩、实体提取、时序图谱、上下文同步 |
+| rusty-claude-cli | 193 | CLI 参数解析、输出格式、会话恢复、Mock 一致性 |
+| api | 140 | Provider 适配、SSE 解析、类型序列化、Provider Chain |
+| tools | 109 | 工具执行、安全分类、权限校验、MCP 桥接 |
 | commands | 51 | 斜杠命令解析、技能管理、安全扫描 |
-| plugins | 39 | 插件安装/卸载/启用/禁用/更新 |
-| config | 9 | 配置加载、合并、环境变量覆盖 |
-| session-store | 10 | ⚠️ ignored（需要 FTS5 支持） |
+| plugins | 39 | 插件安装/卸载/启用/禁用/更新/市场 |
+| config（独立 crate） | 34 | 配置加载、合并、环境变量覆盖、规划目录 |
+| session-store | 15 | ⚠️ 部分 ignored（需 FTS5 支持） |
+| memory-light | 13 | BM25 检索、轻量提取、知识图谱 |
+| workflow | 9 | 意图路由、模板、里程碑、进度追踪 |
+| compat-harness | 3 | Manifest 提取与路径兼容性 |
+| telemetry | 3 | 事件追踪 serialization |
 | WebUI | 11 | 状态管理、API 客户端（Vitest） |
-| **总计** | **~1100+** | |
+| **总计** | **~1441+** | |
 
 ---
 
@@ -652,9 +723,11 @@ MIT License — 详见项目根目录 LICENSE 文件。
 Cowd 的设计借鉴了 AI 编程助手领域的最佳实践，结合 Rust 的性能优势进行重新实现。核心设计理念包括：
 
 - **零模板化**：代码生成优先于配置
-- **上下文效率**：AAAK 压缩、预检压缩、Prompt Caching 三重优化
-- **可扩展性**：插件系统 + MCP 协议 + Provider Chain
-- **安全优先**：三级权限模型 + 审批流 + 沙箱执行 + 安全扫描
+- **上下文效率**：AAAK 符号化压缩、预检自动压缩、Prompt Caching 三重优化
+- **结构化开发**：工作流引擎（意图路由 + 里程碑 + 进度追踪）支撑从探索到发布的完整开发流程
+- **实体感知记忆**：命名实体消歧、时序知识图谱、跨会话上下文同步
+- **可扩展性**：插件系统 + MCP 协议 + Provider Chain + 技能市场
+- **安全优先**：四级安全分类（ToolSafetyCategory）+ 三级权限模型 + 审批流 + 沙箱执行 + 安全扫描
 
 ---
 
