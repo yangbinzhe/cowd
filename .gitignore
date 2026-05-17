@@ -15,6 +15,9 @@ Thumbs.db
 # Cowd local artifacts
 .cowd/
 
+# Node.js dependencies (should be installed via npm, never committed)
+node_modules/
+
 # Legacy directories (no longer used)
 .omx/
 .clawd-agents/
