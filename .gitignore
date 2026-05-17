@@ -21,6 +21,15 @@ node_modules/
 # Build artifact — auto-populated by build.rs (copied from webui/)
 crates/rusty-claude-cli/static/
 
+# Runtime databases (auto-generated, should never be committed)
+*.db
+memory_blobs/
+.cargo/.global-cache
+.clawd-todos.json
+
+# Stale plan artifacts
+plan/
+
 # Legacy directories (no longer used)
 .omx/
 .clawd-agents/
