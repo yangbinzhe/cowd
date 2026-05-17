@@ -18,6 +18,9 @@ Thumbs.db
 # Node.js dependencies (should be installed via npm, never committed)
 node_modules/
 
+# Build artifact — auto-populated by build.rs (copied from webui/)
+crates/rusty-claude-cli/static/
+
 # Legacy directories (no longer used)
 .omx/
 .clawd-agents/
