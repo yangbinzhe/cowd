@@ -862,13 +862,14 @@ fn check_auth<B>(state: &HttpAppState, req: &axum::http::Request<B>) -> Option<R
         .unwrap_or(false);
 
     if is_ws_upgrade {
-        if let Some(token) = req.uri().query()
+        if let Some(encoded) = req.uri().query()
             .and_then(|q| {
                 q.split('&')
                     .find(|p| p.starts_with("token="))
                     .map(|p| &p[6..])
             })
         {
+            let token = url_decode(encoded);
             if token == state.auth_token {
                 return None;
             }
@@ -886,6 +887,38 @@ fn check_auth<B>(state: &HttpAppState, req: &axum::http::Request<B>) -> Option<R
 /// Require auth middleware helper
 fn require_auth<B>(state: &HttpAppState, req: &axum::http::Request<B>) -> Option<Response> {
     check_auth(state, req)
+}
+
+/// Decode percent-encoded query parameter values (e.g., %20 → space, %2F → /).
+fn url_decode(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                output.push((hi << 4 | lo) as char);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            output.push(' ');
+            i += 1;
+            continue;
+        }
+        output.push(bytes[i] as char);
+        i += 1;
+    }
+    output
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Axum middleware function for bearer token auth.

@@ -108,7 +108,7 @@ window.Api = (()=>{
     async listFiles(dir){const p=dir?'?dir='+encodeURIComponent(dir):'';return req('GET','/api/workspace/files'+p)},
     async createFile(path,content){return req('POST','/api/workspace/files',{path,content})},
     async getRawFile(path){return reqRaw('GET','/api/file/raw?path='+encodeURIComponent(path))},
-    async uploadFile(formData){const r=await fetch(BASE+'/api/upload',{method:'POST',body:formData});if(!r.ok)throw new Error(await r.text());return r.json()},
+    async uploadFile(formData){const r=await fetch(BASE+'/api/upload',{method:'POST',headers:authToken?{'Authorization':'Bearer '+authToken}:{},body:formData});if(!r.ok)throw new Error(await r.text());return r.json()},
 
     // ── Approval ──
     async pendingApprovals(){return req('GET','/api/approval/pending')},
