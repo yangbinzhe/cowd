@@ -2397,20 +2397,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "session-store"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3624,13 +3610,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "workflow"
-version = "0.1.0"
-dependencies = [
- "serde",
 ]
 
 [[package]]

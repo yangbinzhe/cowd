@@ -1,7 +1,7 @@
 # Cowd — AI 编程智能体框架
 
 > **Rust 实现的高性能 AI 编程智能体框架**，支持 CLI / TUI / WebUI 三种交互模式。
-> 提供模型适配、工具执行、五层记忆系统、MCP 协议、工作流引擎、插件系统和多平台网关等完整能力。
+> 提供模型适配、工具执行、五层记忆系统、MCP 协议、插件系统和多平台网关等完整能力。
 
 ---
 
@@ -65,7 +65,6 @@ Cowd 内置多 Provider 路由层，支持自动根据模型名匹配对应的 A
 - 智能审批流（`SmartApprovalGate` / `ToolSafetyCategory`）—— 危险操作分类拦截 + 模态确认
 - YOLO 模式 —— 跳过所有审批，用于全自动场景
 - Worker 生命周期管理 —— 远端 worker boot、trust gate、prompt 交付保障
-- 工作流引擎 —— 意图路由 + 里程碑状态机 + 进度追踪，支撑结构化开发流程
 
 ---
 
@@ -82,11 +81,8 @@ cowd/
 │   ├── memory/                # 5 层记忆系统（36 模块）
 │   ├── config/                # 统一配置管理
 │   ├── plugins/               # 插件注册与生命周期
-│   ├── session-store/         # SQLite 会话持久化
 │   ├── telemetry/             # 遥测事件追踪
 │   ├── compat-harness/        # 兼容性测试套件
-│   ├── workflow/              # 工作流引擎（意图路由、里程碑、进度追踪）
-│   ├── memory-light/          # 轻量记忆提取器（BM25 检索、知识图谱）
 │   └── mock-anthropic-service/ # 模拟 Anthropic 服务（测试用）
 ├── webui/                     # 浏览器前端（Vanilla JS）
 ├── scripts/                   # 测试与基准脚本
@@ -270,29 +266,6 @@ Cowd 最复杂最精密的子系统。详见下方 [记忆系统](#记忆系统)
 ### `session-store` — SQLite 会话持久化
 
 基于 `rusqlite` 的会话存储，使用 FTS5 全文索引支持会话搜索。
-
-### `workflow` — 工作流引擎
-
-灵感来源于 get-shit-done 工作流方法论的轻量工作流引擎，包含四个模块：
-
-| 模块 | 职责 |
-|---|---|
-| `router` | `IntentRouter` — 关键词驱动的意图路由，根据用户输入匹配工作流模板 |
-| `template` | `WorkflowTemplate` — 多步骤管道定义（analyze → implement → review → ship） |
-| `milestone` | `Milestone` + `ProjectLifecycle` — 里程碑状态机 + 项目阶段管理（Discovery → Planning → Building → Reviewing → Shipping → Graduated） |
-| `progress` | `ProgressTracker` — 阶段进度追踪，带 ASCII 进度条和百分比计算 |
-
-工作流引擎与聊天循环解耦，通过 `planning/` 目录（`.cowd/planning/`）持久化项目状态，支持 `/plan`、`/milestone` 等斜杠命令触发。
-
-### `memory-light` — 轻量记忆提取器
-
-独立于 `memory` 的轻量级记忆子系统，用于资源受限场景。包含：
-- `extract` — 从对话中提取结构化记忆
-- `layers` — 记忆层次管理
-- `bm25` — BM25 检索算法实现
-- `store` — SQLite 持久化
-- `knowledge_graph` — 知识图谱存储
-- `sandbox` / `closet` — 工具输出沙箱与闭合段管理
 
 ### `telemetry` — 遥测
 
@@ -675,15 +648,6 @@ cargo doc --no-deps --open
 
 编译并行度限制为 4 任务（`.cargo/config.toml`），防止内存溢出。
 
-### 规划目录
-
-工作流引擎使用 `.cowd/planning/` 目录持久化项目状态和里程碑：
-
-```bash
-.cowd/planning/
-└── state.yaml       # PlanState — current_phase, milestones, notes
-```
-
 ### CI/CD
 
 兼容性测试套件（`compat-harness`）提供与上游（Claude Code）的 manifest 提取和路径兼容性验证。
@@ -703,12 +667,10 @@ cargo doc --no-deps --open
 | plugins | 39 | 插件安装/卸载/启用/禁用/更新/市场 |
 | config（独立 crate） | 34 | 配置加载、合并、环境变量覆盖、规划目录 |
 | session-store | 15 | ⚠️ 部分 ignored（需 FTS5 支持） |
-| memory-light | 13 | BM25 检索、轻量提取、知识图谱 |
-| workflow | 9 | 意图路由、模板、里程碑、进度追踪 |
 | compat-harness | 3 | Manifest 提取与路径兼容性 |
 | telemetry | 3 | 事件追踪 serialization |
 | WebUI | 11 | 状态管理、API 客户端（Vitest） |
-| **总计** | **~1441+** | |
+| **总计** | **~1419+** | |
 
 ---
 
@@ -724,7 +686,6 @@ Cowd 的设计借鉴了 AI 编程助手领域的最佳实践，结合 Rust 的�
 
 - **零模板化**：代码生成优先于配置
 - **上下文效率**：AAAK 符号化压缩、预检自动压缩、Prompt Caching 三重优化
-- **结构化开发**：工作流引擎（意图路由 + 里程碑 + 进度追踪）支撑从探索到发布的完整开发流程
 - **实体感知记忆**：命名实体消歧、时序知识图谱、跨会话上下文同步
 - **可扩展性**：插件系统 + MCP 协议 + Provider Chain + 技能市场
 - **安全优先**：四级安全分类（ToolSafetyCategory）+ 三级权限模型 + 审批流 + 沙箱执行 + 安全扫描
