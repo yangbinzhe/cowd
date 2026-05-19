@@ -8,7 +8,9 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 // ── Re-export from unified config crate ──────────────────────────────
 pub use config::{ApprovalConfig, ResolvedPermissionMode, McpTransport, McpOAuthConfig, OAuthConfig};
 pub use config::{ConfigSource, ConfigEntry, ConfigError};
-pub use config::ConfigLoader as UnifiedConfigLoader;
+pub use config::{ProviderFallbackConfig, RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig};
+pub use config::{CompressionConfig, VectorConfig, LayerConfig};
+pub use config::{MicroCompactConfig, SessionCompactConfig, DeepCompactConfig, CircuitBreakerConfig, SessionResetPolicy};
 
 /// Prefix used for environment variable config overrides.
 const ENV_OVERRIDE_PREFIX: &str = "COWD_";
@@ -22,17 +24,6 @@ pub struct RuntimeConfig {
     merged: BTreeMap<String, JsonValue>,
     loaded_entries: Vec<ConfigEntry>,
     feature_config: RuntimeFeatureConfig,
-}
-
-/// Parsed plugin-related settings extracted from runtime config.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimePluginConfig {
-    enabled_plugins: BTreeMap<String, bool>,
-    external_directories: Vec<String>,
-    install_root: Option<String>,
-    registry_path: Option<String>,
-    bundled_root: Option<String>,
-    max_output_tokens: Option<u32>,
 }
 
 /// Structured feature configuration consumed by runtime subsystems.
@@ -54,15 +45,6 @@ pub struct RuntimeFeatureConfig {
     memory: MemoryConfig,
     compression: CompressionConfig,
     gateway: GatewayConfig,
-}
-
-/// Ordered chain of fallback model identifiers used when the primary
-/// provider returns a retryable failure (429/500/503/etc.). The chain is
-/// strict: each entry is tried in order until one succeeds.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ProviderFallbackConfig {
-    primary: Option<String>,
-    fallbacks: Vec<String>,
 }
 
 /// Configuration for a single named provider (OpenAI-compatible endpoint).
@@ -120,23 +102,6 @@ impl ProvidersConfig {
         self.providers.get(name)
     }
 }
-
-/// Hook command lists grouped by lifecycle stage.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct RuntimeHookConfig {
-    pre_tool_use: Vec<String>,
-    post_tool_use: Vec<String>,
-    post_tool_use_failure: Vec<String>,
-}
-
-/// Raw permission rule lists grouped by allow, deny, and ask behavior.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct RuntimePermissionRuleConfig {
-    allow: Vec<String>,
-    deny: Vec<String>,
-    ask: Vec<String>,
-}
-
 
 /// Collection of configured MCP servers after scope-aware merging.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -223,49 +188,10 @@ pub struct MemoryConfig {
     pub coherence_threshold_bp: u32,
 }
 
-/// Per-layer token and search limits for the memory subsystem.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LayerConfig {
-    pub l0_enabled: bool,
-    pub l1_max_tokens: u32,
-    pub l2_max_tokens: u32,
-    pub l3_search_limit: u32,
-    pub l4_enabled: bool,
-}
-
 /// Controls automatic memory extraction behaviour.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractionConfig {
     pub auto_extract: bool,
-}
-
-/// Optional vector-search backend configuration.
-///
-/// Supports OpenAI-compatible embedding API format (also works with
-/// Ollama, vLLM, LocalAI, etc.).
-///
-/// # Environment variable overrides
-/// - `CC_MEMORY_VECTOR_MODEL`   – embedding model name
-/// - `CC_MEMORY_VECTOR_API_URL` – embedding API endpoint URL
-/// - `CC_VECTOR_API_KEY`        – API key / Bearer token
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VectorConfig {
-    pub enabled: bool,
-    /// Embedding model name, e.g. `"text-embedding-3-small"`.
-    /// Overridden by `CC_MEMORY_VECTOR_MODEL`.
-    pub embedding_model: String,
-    /// Expected vector dimension (`0` = auto-detect from first API call).
-    pub dimension: u32,
-    /// Embedding API endpoint URL, e.g. `"https://api.openai.com/v1/embeddings"`.
-    /// Overridden by `CC_MEMORY_VECTOR_API_URL`.
-    pub api_url: String,
-    /// API key for the embedding service.
-    /// Overridden by `CC_VECTOR_API_KEY`.
-    pub api_key: String,
-    /// Timeout for embedding API calls in seconds (default: 30).
-    pub timeout_secs: u64,
-    /// Maximum batch size for embedding requests (default: 32).
-    pub batch_size: usize,
 }
 
 impl Default for MemoryConfig {
@@ -277,19 +203,7 @@ impl Default for MemoryConfig {
             extraction: ExtractionConfig::default(),
             vector: VectorConfig::default(),
             aaak_index_enabled: true,
-            coherence_threshold_bp: 1000,  // 0.10
-        }
-    }
-}
-
-impl Default for LayerConfig {
-    fn default() -> Self {
-        Self {
-            l0_enabled: true,
-            l1_max_tokens: 2000,
-            l2_max_tokens: 3000,
-            l3_search_limit: 5,
-            l4_enabled: false,
+            coherence_threshold_bp: 1000,
         }
     }
 }
@@ -300,113 +214,8 @@ impl Default for ExtractionConfig {
     }
 }
 
-impl Default for VectorConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            embedding_model: String::new(),
-            dimension: 0,
-            api_url: String::new(),
-            api_key: String::new(),
-            timeout_secs: 30,
-            batch_size: 32,
-        }
-    }
-}
-
 // ---- Compression configuration ----
-
-/// Context-compression pipeline configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompressionConfig {
-    pub micro: MicroCompactConfig,
-    pub session: SessionCompactConfig,
-    pub deep: DeepCompactConfig,
-    pub circuit_breaker: CircuitBreakerConfig,
-}
-
-/// Micro-compaction settings (per tool-result trimming).
-#[derive(Debug, Clone, PartialEq)]
-pub struct MicroCompactConfig {
-    pub enabled: bool,
-    pub tool_result_max_chars: u32,
-    pub time_decay_factor: f32,
-}
-
-impl Eq for MicroCompactConfig {}
-
-/// Session-level compaction trigger and output constraints.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionCompactConfig {
-    pub threshold_tokens: u32,
-    pub preserve_recent: u32,
-    pub summary_max_tokens: u32,
-    pub buffer_tokens: u32,
-}
-
-/// Deep iterative compaction settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeepCompactConfig {
-    pub enabled: bool,
-    pub iterative_update: bool,
-}
-
-/// Circuit-breaker limits for the compression pipeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CircuitBreakerConfig {
-    pub max_retries: u32,
-    pub cooldown_secs: u32,
-}
-
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        Self {
-            micro: MicroCompactConfig::default(),
-            session: SessionCompactConfig::default(),
-            deep: DeepCompactConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-        }
-    }
-}
-
-impl Default for MicroCompactConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            tool_result_max_chars: 4000,
-            time_decay_factor: 0.9,
-        }
-    }
-}
-
-impl Default for SessionCompactConfig {
-    fn default() -> Self {
-        Self {
-            threshold_tokens: 80000,
-            preserve_recent: 6,
-            summary_max_tokens: 2000,
-            buffer_tokens: 13000,
-        }
-    }
-}
-
-impl Default for DeepCompactConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            iterative_update: true,
-        }
-    }
-}
-
-impl Default for CircuitBreakerConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            cooldown_secs: 30,
-        }
-    }
-}
+// (CompressionConfig and sub-types re-exported from config crate)
 
 // ---- Gateway configuration ----
 
@@ -428,16 +237,6 @@ pub struct PlatformConfig {
     pub extra: BTreeMap<String, JsonValue>,
 }
 
-/// Policy that determines when a gateway session is reset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SessionResetPolicy {
-    Daily,
-    Idle,
-    Both,
-    #[default]
-    None,
-}
-
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -446,6 +245,17 @@ impl Default for GatewayConfig {
             session_reset: SessionResetPolicy::default(),
         }
     }
+}
+
+/// Resolve the default cowd config home directory.
+#[must_use]
+pub fn default_config_home() -> PathBuf {
+    if let Some(path) = std::env::var_os("COWD_CONFIG_HOME") {
+        return PathBuf::from(path);
+    }
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".cowd"))
+        .unwrap_or_else(|| PathBuf::from(".cowd"))
 }
 
 /// Discovers config files and merges them into a [`RuntimeConfig`].
@@ -804,172 +614,6 @@ impl RuntimeFeatureConfig {
         &self.gateway
     }
 }
-
-impl ProviderFallbackConfig {
-    #[must_use]
-    pub fn new(primary: Option<String>, fallbacks: Vec<String>) -> Self {
-        Self { primary, fallbacks }
-    }
-
-    #[must_use]
-    pub fn primary(&self) -> Option<&str> {
-        self.primary.as_deref()
-    }
-
-    #[must_use]
-    pub fn fallbacks(&self) -> &[String] {
-        &self.fallbacks
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.fallbacks.is_empty()
-    }
-}
-
-impl Default for RuntimePluginConfig {
-    fn default() -> Self {
-        Self {
-            enabled_plugins: BTreeMap::default(),
-            external_directories: Vec::default(),
-            install_root: None,
-            registry_path: None,
-            bundled_root: None,
-            max_output_tokens: std::env::var("COWD_MAX_OUTPUT_TOKENS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-        }
-    }
-}
-
-impl RuntimePluginConfig {
-    #[must_use]
-    pub fn enabled_plugins(&self) -> &BTreeMap<String, bool> {
-        &self.enabled_plugins
-    }
-
-    #[must_use]
-    pub fn external_directories(&self) -> &[String] {
-        &self.external_directories
-    }
-
-    #[must_use]
-    pub fn install_root(&self) -> Option<&str> {
-        self.install_root.as_deref()
-    }
-
-    #[must_use]
-    pub fn registry_path(&self) -> Option<&str> {
-        self.registry_path.as_deref()
-    }
-
-    #[must_use]
-    pub fn bundled_root(&self) -> Option<&str> {
-        self.bundled_root.as_deref()
-    }
-
-    #[must_use]
-    pub fn max_output_tokens(&self) -> Option<u32> {
-        self.max_output_tokens
-    }
-
-    pub fn set_max_output_tokens(&mut self, max_output_tokens: Option<u32>) {
-        self.max_output_tokens = max_output_tokens;
-    }
-
-    pub fn set_plugin_state(&mut self, plugin_id: String, enabled: bool) {
-        self.enabled_plugins.insert(plugin_id, enabled);
-    }
-
-    #[must_use]
-    pub fn state_for(&self, plugin_id: &str, default_enabled: bool) -> bool {
-        self.enabled_plugins
-            .get(plugin_id)
-            .copied()
-            .unwrap_or(default_enabled)
-    }
-}
-
-#[must_use]
-/// Returns the default per-user config directory used by the runtime.
-pub fn default_config_home() -> PathBuf {
-    // CC_CONFIG_HOME takes highest priority.
-    if let Some(path) = std::env::var_os("COWD_CONFIG_HOME") {
-        return PathBuf::from(path);
-    }
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".cowd"))
-        .unwrap_or_else(|| PathBuf::from(".cowd"))
-}
-
-impl RuntimeHookConfig {
-    #[must_use]
-    pub fn new(
-        pre_tool_use: Vec<String>,
-        post_tool_use: Vec<String>,
-        post_tool_use_failure: Vec<String>,
-    ) -> Self {
-        Self {
-            pre_tool_use,
-            post_tool_use,
-            post_tool_use_failure,
-        }
-    }
-
-    #[must_use]
-    pub fn pre_tool_use(&self) -> &[String] {
-        &self.pre_tool_use
-    }
-
-    #[must_use]
-    pub fn post_tool_use(&self) -> &[String] {
-        &self.post_tool_use
-    }
-
-    #[must_use]
-    pub fn merged(&self, other: &Self) -> Self {
-        let mut merged = self.clone();
-        merged.extend(other);
-        merged
-    }
-
-    pub fn extend(&mut self, other: &Self) {
-        extend_unique(&mut self.pre_tool_use, other.pre_tool_use());
-        extend_unique(&mut self.post_tool_use, other.post_tool_use());
-        extend_unique(
-            &mut self.post_tool_use_failure,
-            other.post_tool_use_failure(),
-        );
-    }
-
-    #[must_use]
-    pub fn post_tool_use_failure(&self) -> &[String] {
-        &self.post_tool_use_failure
-    }
-}
-
-impl RuntimePermissionRuleConfig {
-    #[must_use]
-    pub fn new(allow: Vec<String>, deny: Vec<String>, ask: Vec<String>) -> Self {
-        Self { allow, deny, ask }
-    }
-
-    #[must_use]
-    pub fn allow(&self) -> &[String] {
-        &self.allow
-    }
-
-    #[must_use]
-    pub fn deny(&self) -> &[String] {
-        &self.deny
-    }
-
-    #[must_use]
-    pub fn ask(&self) -> &[String] {
-        &self.ask
-    }
-}
-
 impl McpConfigCollection {
     #[must_use]
     pub fn servers(&self) -> &BTreeMap<String, ScopedMcpServerConfig> {
@@ -1007,14 +651,6 @@ impl McpServerConfig {
 struct ParsedConfigFile {
     object: BTreeMap<String, JsonValue>,
     source: String,
-}
-
-/// Returns true if the given path has a `.yaml` or `.yml` extension.
-fn is_yaml_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
-        .unwrap_or(false)
 }
 
 /// Convert a `serde_yaml::Value` into the project-internal `JsonValue`.
@@ -1206,37 +842,6 @@ fn insert_nested(map: &mut BTreeMap<String, JsonValue>, path: &[String], value: 
         }
     }
 }
-
-fn read_optional_config_file(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(ConfigError::Io(error)),
-    };
-
-    if contents.trim().is_empty() {
-        return Ok(Some(ParsedConfigFile {
-            object: BTreeMap::new(),
-            source: contents,
-        }));
-    }
-
-    let parsed = match JsonValue::parse(&contents) {
-        Ok(parsed) => parsed,
-        Err(error) => return Err(ConfigError::Parse(format!("{}: {error}", path.display()))),
-    };
-    let Some(object) = parsed.as_object() else {
-        return Err(ConfigError::Parse(format!(
-            "{}: top-level config value must be an object",
-            path.display()
-        )));
-    };
-    Ok(Some(ParsedConfigFile {
-        object: object.clone(),
-        source: contents,
-    }))
-}
-
 fn merge_mcp_servers(
     target: &mut BTreeMap<String, ScopedMcpServerConfig>,
     source: ConfigSource,
@@ -1559,10 +1164,10 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         let defaults = VectorConfig::default();
         // Static config values.
         let enabled = optional_bool(v, "enabled", "merged settings.memory.vector")?;
-        let embedding_model = optional_string_dual(v, "embedding_model", "merged settings.memory.vector")?;
-        let dimension = optional_u32(v, "dimension", "merged settings.memory.vector")?;
-        let api_url = optional_string_dual(v, "api_url", "merged settings.memory.vector")?;
-        let api_key = optional_string_dual(v, "api_key", "merged settings.memory.vector")?;
+        let model_name = optional_string_dual(v, "model", "merged settings.memory.vector")?;
+        let dimension = optional_usize(v, "dimension", "merged settings.memory.vector")?;
+        let api_url = optional_string_dual(v, "apiUrl", "merged settings.memory.vector")?;
+        let api_key = optional_string_dual(v, "apiKey", "merged settings.memory.vector")?;
         let timeout_secs = optional_u64(v, "timeoutSecs", "merged settings.memory.vector")?;
         let batch_size = optional_usize(v, "batchSize", "merged settings.memory.vector")?;
 
@@ -1570,22 +1175,22 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         let resolved_model = std::env::var("COWD_MEMORY_VECTOR_MODEL")
             .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|| embedding_model.map(str::to_string))
-            .unwrap_or(defaults.embedding_model);
+            .or_else(|| model_name.map(str::to_string))
+            .unwrap_or(defaults.model.clone());
         let resolved_api_url = std::env::var("COWD_MEMORY_VECTOR_API_URL")
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| api_url.map(str::to_string))
-            .unwrap_or(defaults.api_url);
+            .unwrap_or(defaults.api_url.clone());
         let resolved_api_key = std::env::var("COWD_VECTOR_API_KEY")
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| api_key.map(str::to_string))
-            .unwrap_or(defaults.api_key);
+            .unwrap_or(defaults.api_key.clone());
 
         VectorConfig {
             enabled: enabled.unwrap_or(defaults.enabled),
-            embedding_model: resolved_model,
+            model: resolved_model,
             dimension: dimension.unwrap_or(defaults.dimension),
             api_url: resolved_api_url,
             api_key: resolved_api_key,
@@ -1595,20 +1200,20 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     } else {
         // No vector section; still apply env var overrides.
         let defaults = VectorConfig::default();
-        let embedding_model = std::env::var("COWD_MEMORY_VECTOR_MODEL")
+        let model = std::env::var("COWD_MEMORY_VECTOR_MODEL")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or(defaults.embedding_model);
+            .unwrap_or(defaults.model.clone());
         let api_url = std::env::var("COWD_MEMORY_VECTOR_API_URL")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or(defaults.api_url);
+            .unwrap_or(defaults.api_url.clone());
         let api_key = std::env::var("COWD_VECTOR_API_KEY")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or(defaults.api_key);
         VectorConfig {
-            embedding_model,
+            model,
             api_url,
             api_key,
             ..defaults
@@ -1690,6 +1295,7 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
         session,
         deep,
         circuit_breaker,
+        ..CompressionConfig::default()
     })
 }
 
@@ -1715,7 +1321,9 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
                 let ctx = format!("merged settings.gateway.platforms[{i}]");
                 let p = expect_object(v, &ctx)?;
                 Ok(PlatformConfig {
-                    platform_type: expect_string(p, "platformType", &ctx)?.to_string(),
+                    platform_type: expect_string(p, "platformType", &ctx)
+                        .or_else(|_| expect_string(p, "type", &ctx))  // fallback: "type" key
+                        .map(|s| s.to_string())?,
                     enabled: optional_bool(p, "enabled", &ctx)?.unwrap_or(true),
                     extra: p
                         .iter()
@@ -2164,18 +1772,6 @@ fn deep_merge_objects(
                 target.insert(key.clone(), value.clone());
             }
         }
-    }
-}
-
-fn extend_unique(target: &mut Vec<String>, values: &[String]) {
-    for value in values {
-        push_unique(target, value.clone());
-    }
-}
-
-fn push_unique(target: &mut Vec<String>, value: String) {
-    if !target.iter().any(|existing| existing == &value) {
-        target.push(value);
     }
 }
 
@@ -2917,7 +2513,7 @@ mod tests {
     fn plugin_state_falls_back_to_default_for_unknown_plugin() {
         // given
         let mut config = RuntimePluginConfig::default();
-        config.set_plugin_state("known".to_string(), true);
+        config.enabled_plugins.insert("known".to_string(), true);
 
         // when / then
         assert!(config.state_for("known", false));

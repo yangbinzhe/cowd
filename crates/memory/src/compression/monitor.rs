@@ -382,6 +382,15 @@ impl AdaptiveThreshold {
             return 32_000;
         }
         if lower.contains("qwen") || lower.contains("deepseek") {
+            if lower.contains("turbo") || lower.contains("flash") {
+                return 8_000;
+            }
+            if lower.contains("plus") {
+                return 128_000;
+            }
+            if lower.contains("max") || lower.contains("pro") || lower.contains("v4") {
+                return 128_000;
+            }
             return 32_000;
         }
 
@@ -466,6 +475,18 @@ mod adaptive_tests {
         let t = AdaptiveThreshold::default();
         assert!(t.should_compact(85_000, 100_000)); // 85%
         assert!(!t.should_compact(84_000, 100_000)); // 84%
+    }
+
+    #[test]
+    fn qwen_turbo_8k_small_thresholds() {
+        let t = AdaptiveThreshold::for_model("qwen-turbo");
+        assert!(t.warn_ratio < 0.70);
+    }
+
+    #[test]
+    fn deepseek_v4_128k_large_thresholds() {
+        let t = AdaptiveThreshold::for_model("deepseek-v4-pro");
+        assert!(t.warn_ratio > 0.70);
     }
 
     #[test]
