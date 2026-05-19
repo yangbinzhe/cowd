@@ -5,6 +5,9 @@
 //! that drives interactive and one-shot turns.
 
 pub mod cowd_dirs;
+pub mod error;
+pub mod event_bus;
+pub mod storage;
 mod bash;
 pub mod bash_validation;
 mod bootstrap;
@@ -84,7 +87,7 @@ pub use config::{
     McpTransport, McpWebSocketServerConfig, MemoryConfig, OAuthConfig, PlatformConfig as GatewayPlatformConfig,
     ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    COWD_SETTINGS_SCHEMA_NAME,
+    SessionResetPolicy, COWD_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
