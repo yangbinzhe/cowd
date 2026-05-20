@@ -4,9 +4,18 @@
 //! a write guard that prevents writing to protected memory layers (L0/L1),
 //! and a token budget that caps its execution.
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 
 use crate::tool_orchestrator::ToolResultBudget;
+
+pub trait SubAgentProgressCallback: Send + Sync {
+    fn on_turn_complete(&self, turn: u32, max_turns: usize, tokens_used: usize);
+    fn on_tool_call(&self, tool_name: &str, input_preview: &str);
+    fn on_budget_warning(&self, remaining_tokens: usize);
+}
 
 // ---------------------------------------------------------------------------
 // SubAgentConfig
@@ -28,6 +37,9 @@ pub struct SubAgentConfig {
     /// Token budget for the sub-agent's context.
     #[serde(default = "default_budget_tokens")]
     pub budget_tokens: usize,
+    /// Optional timeout in seconds. None means no timeout.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 fn default_write_source() -> String {
@@ -50,6 +62,7 @@ impl Default for SubAgentConfig {
             write_source: default_write_source(),
             max_turns: default_max_turns(),
             budget_tokens: default_budget_tokens(),
+            timeout_secs: None,
         }
     }
 }
@@ -106,6 +119,8 @@ pub enum SubAgentError {
 
     #[error("sub-agent execution error: {0}")]
     ExecutionError(String),
+    #[error("sub-agent timed out after {0}s")]
+    Timeout(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -165,10 +180,10 @@ pub struct ToolCallRecord {
 pub struct SubAgentRuntime {
     config: SubAgentConfig,
     result_budget: ToolResultBudget,
-    /// Track turns executed so far.
     turns_executed: usize,
-    /// Track tokens consumed so far.
     tokens_consumed: usize,
+    started_at: Instant,
+    progress_callback: Option<Arc<dyn SubAgentProgressCallback>>,
 }
 
 impl SubAgentRuntime {
@@ -179,6 +194,8 @@ impl SubAgentRuntime {
             result_budget: ToolResultBudget::default(),
             turns_executed: 0,
             tokens_consumed: 0,
+            started_at: Instant::now(),
+            progress_callback: None,
             config,
         }
     }
@@ -188,6 +205,10 @@ impl SubAgentRuntime {
     pub fn with_result_budget(mut self, budget: ToolResultBudget) -> Self {
         self.result_budget = budget;
         self
+    }
+
+    pub fn set_progress_callback(&mut self, cb: Arc<dyn SubAgentProgressCallback>) {
+        self.progress_callback = Some(cb);
     }
 
     /// Check if a tool is allowed for this sub-agent.
@@ -208,6 +229,15 @@ impl SubAgentRuntime {
         }
         if self.tokens_consumed >= self.config.budget_tokens {
             return Err(SubAgentError::BudgetExceeded(self.config.budget_tokens));
+        }
+        Ok(())
+    }
+
+    pub fn check_timeout(&self) -> Result<(), SubAgentError> {
+        if let Some(timeout) = self.config.timeout_secs {
+            if self.started_at.elapsed() >= Duration::from_secs(timeout) {
+                return Err(SubAgentError::Timeout(timeout));
+            }
         }
         Ok(())
     }
@@ -280,6 +310,10 @@ impl SubAgentRuntime {
                 tracing::warn!("SubAgent budget exhausted: {}", e);
                 break;
             }
+            if let Err(e) = self.check_timeout() {
+                tracing::warn!("SubAgent timed out: {}", e);
+                break;
+            }
 
             let turn = match executor.execute_turn(
                 &current_prompt,
@@ -299,6 +333,17 @@ impl SubAgentRuntime {
 
             self.record_turn(turn.input_tokens + turn.output_tokens);
             tool_call_count += turn.tool_calls.len();
+
+            if let Some(ref cb) = self.progress_callback {
+                cb.on_turn_complete(
+                    self.turns_executed as u32,
+                    self.config.max_turns,
+                    self.tokens_consumed,
+                );
+                for tc in &turn.tool_calls {
+                    cb.on_tool_call(&tc.tool_name, &truncate_str(&tc.tool_input, 80));
+                }
+            }
 
             // Collect output
             output_parts.push(turn.text.clone());
@@ -590,6 +635,17 @@ mod tests {
         let mut runtime = SubAgentRuntime::new(config);
         let result = runtime.run_loop("expensive task", &executor);
         // After turn 2: tokens_consumed = 26000 > budget_tokens = 20000
+        assert!(!result.completed_normally);
+    }
+
+    #[test]
+    fn subagent_timeout_stops_execution() {
+        let mut config = SubAgentConfig::default();
+        config.timeout_secs = Some(0); // immediate timeout
+        config.budget_tokens = 100_000;
+        let mut runtime = SubAgentRuntime::new(config);
+        let executor = CountingExecutor::new(0);
+        let result = runtime.run_loop("test", &executor);
         assert!(!result.completed_normally);
     }
 }
