@@ -51,6 +51,7 @@ mod tests {
             write_source: "SubAgent".into(),
             max_turns: 3,
             budget_tokens: 500,
+            timeout_secs: None,
         };
         let mut executor = SubAgentExecutor::new(config, rt);
         let result = executor.execute_sync("hello", None).unwrap();
