@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1845,18 +1845,6 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
     roots
 }
 
-// Helper function to convert SkillRoot paths for SkillManager
-fn skill_roots_to_paths(roots: &[SkillRoot]) -> Vec<PathBuf> {
-    roots.iter().map(|r| r.path.clone()).collect()
-}
-
-// Discover skill roots from cwd (returns both roots and paths for different uses)
-fn discover_skill_roots_and_paths(cwd: &Path) -> (Vec<SkillRoot>, Vec<PathBuf>) {
-    let roots = discover_skill_roots_internal(cwd);
-    let paths = skill_roots_to_paths(&roots);
-    (roots, paths)
-}
-
 #[allow(clippy::too_many_lines)]
 fn discover_skill_roots_internal(cwd: &Path) -> Vec<SkillRoot> {
     let mut roots = Vec::new();
@@ -2752,27 +2740,6 @@ fn parse_skill_edit_args(input: &str) -> SkillEditInput {
     }
 }
 
-// Discover available commands on the system
-fn discover_available_commands() -> HashSet<String> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    let mut commands = HashSet::new();
-
-    for dir in path.split(':') {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if let Ok(metadata) = entry.metadata() {
-                    if metadata.is_file() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            commands.insert(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    commands
-}
-
 // Render skill create report
 fn render_skill_create_report(result: &SkillCreateOutput) -> String {
     let mut lines = vec!["Skills".to_string()];
@@ -3224,7 +3191,7 @@ fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
         "  Usage            /agents [list|help]".to_string(),
-        "  Direct CLI       claw agents".to_string(),
+        "  Direct CLI       cowd agents".to_string(),
         "  Sources          .cowd/agents, ~/.cowd/agents, $CC_CONFIG_HOME/agents".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -3250,7 +3217,7 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
         "  Usage            /mcp [list|show <server>|help]".to_string(),
-        "  Direct CLI       claw mcp [list|show <server>|help]".to_string(),
+        "  Direct CLI       cowd mcp [list|show <server>|help]".to_string(),
         "  Sources          .cowd/config.yaml, .cowd/config.local.yaml".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -3354,12 +3321,12 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
     match source {
         DefinitionSource::ProjectClaw
         | DefinitionSource::ProjectCodex
-        | DefinitionSource::ProjectClaude => "project_claw",
+        | DefinitionSource::ProjectClaude => "project_cowd",
         DefinitionSource::UserClawConfigHome | DefinitionSource::UserCodexHome => {
-            "user_claw_config_home"
+            "user_cowd_config_home"
         }
         DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
-            "user_claw"
+            "user_cowd"
         }
     }
 }

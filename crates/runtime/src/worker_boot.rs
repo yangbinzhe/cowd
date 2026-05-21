@@ -121,7 +121,7 @@ impl StartupEvidenceBundle {
 
     /// Classify the root cause of a startup timeout based on the collected
     /// evidence. Maps observable symptoms to a structured taxonomy so
-    /// downstream systems (clawhip, recovery recipes) can take targeted action.
+    /// downstream systems (cowd-orchestrator, recovery recipes) can take targeted action.
     #[must_use]
     pub fn classify(&self) -> StartupFailureClassification {
         if self.trust_prompt_detected {
@@ -674,7 +674,7 @@ impl WorkerRegistry {
     /// Observe a startup timeout: collect diagnostic evidence, classify the
     /// root cause, and transition the worker to Failed with a structured
     /// StartupNoEvidence event. Returns the classification for downstream
-    /// systems (recovery recipes, clawhip) to act on.
+    /// systems (recovery recipes, cowd-orchestrator) to act on.
     pub fn observe_startup_timeout(
         &self,
         worker_id: &str,
@@ -761,7 +761,7 @@ fn push_event(
 }
 
 /// Write current worker state to `.cowd/worker-state.json` under the worker's cwd.
-/// This is the file-based observability surface: external observers (clawhip, orchestrators)
+/// This is the file-based observability surface: external observers (cowd-orchestrator, orchestrators)
 /// poll this file instead of requiring an HTTP route on the opencode binary.
 #[derive(serde::Serialize)]
 struct StateSnapshot<'a> {

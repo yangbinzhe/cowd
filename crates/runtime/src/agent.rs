@@ -641,10 +641,10 @@ mod tests {
     #[test]
     fn subagent_timeout_stops_execution() {
         let mut config = SubAgentConfig::default();
-        config.timeout_secs = Some(0); // immediate timeout
+        config.timeout_secs = Some(0);
         config.budget_tokens = 100_000;
         let mut runtime = SubAgentRuntime::new(config);
-        let executor = CountingExecutor::new(0);
+        let executor = StubExecutor::new(vec![]);
         let result = runtime.run_loop("test", &executor);
         assert!(!result.completed_normally);
     }

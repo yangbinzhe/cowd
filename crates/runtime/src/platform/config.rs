@@ -42,25 +42,9 @@ impl PlatformConfig {
     }
 }
 
-/// Session reset policy for platform sessions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionResetPolicy {
-    /// Reset sessions daily.
-    Daily,
-    /// Reset sessions after idle timeout.
-    Idle,
-    /// Reset sessions on either condition.
-    Both,
-    /// Never reset sessions automatically.
-    None,
-}
+// ── Re-export from unified config crate ─────────────────────────────
 
-impl Default for SessionResetPolicy {
-    fn default() -> Self {
-        Self::Daily
-    }
-}
+pub use config::SessionResetPolicy;
 
 /// Runtime-wide platform configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +53,10 @@ pub struct PlatformRuntimeConfig {
     pub channel_capacity: usize,
     /// Session reset policy.
     pub session_reset: SessionResetPolicy,
+    /// Cleanup interval in seconds (default: 86400 = 1 day).
+    pub cleanup_interval_secs: u64,
+    /// Idle session timeout in minutes for Idle/Both policies (default: 30).
+    pub idle_timeout_minutes: i64,
     /// Retry configuration.
     pub retry: RetryConfig,
     /// Individual platform configurations.
@@ -79,7 +67,9 @@ impl Default for PlatformRuntimeConfig {
     fn default() -> Self {
         Self {
             channel_capacity: 256,
-            session_reset: SessionResetPolicy::default(),
+            session_reset: SessionResetPolicy::None,
+            cleanup_interval_secs: 86400,
+            idle_timeout_minutes: 30,
             retry: RetryConfig::default(),
             platforms: Vec::new(),
         }

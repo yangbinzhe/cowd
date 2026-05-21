@@ -188,10 +188,11 @@ impl PlatformRuntime {
 
         let mut sessions = self.sessions.write().await;
         let now = chrono::Utc::now();
-        let idle_duration = chrono::Duration::minutes(30);
+        let idle_duration = chrono::Duration::minutes(self.config.idle_timeout_minutes);
 
         sessions.retain(|_key, session| {
             match policy {
+                SessionResetPolicy::Always => false,
                 SessionResetPolicy::Daily => {
                     session.created_at.date_naive() == now.date_naive()
                 }

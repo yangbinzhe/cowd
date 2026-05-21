@@ -48,7 +48,7 @@ Cowd 内置多 Provider 路由层，支持自动根据模型名匹配对应的 A
 | **CLI** (交互式 REPL) | `cowd` | 类 Claw Code 命令行对话，支持管道输入、历史记录、斜杠命令 |
 | **CLI** (单次 Prompt) | `cowd prompt "..."` | 非交互式单次问答，支持 `--output-format json` |
 | **TUI** (全屏终端) | `cowd --tui` | 基于 ratatui 的终端 UI，多面板布局，支持 Markdown 渲染 |
-| **WebUI** (Web 服务) | `cowd serve --port 8080` | 基于 Axum 的 HTTP 服务 + 浏览器前端，支持 SSE 流式响应 |
+| **WebUI** (Web 服务) | `cowd serve` | 启动时读取 gateway 配置中的 host/port，CLI `--host`/`--port` 可覆盖 |
 | **管道模式** | `echo "..." \| cowd` | 自动检测 stdin 非 TTY 时以一问一答模式运行 |
 
 ### 上下文管理
@@ -60,11 +60,31 @@ Cowd 内置多 Provider 路由层，支持自动根据模型名匹配对应的 A
 
 ### Agent 编排
 
-- 20+ 内置工具（文件、Bash、搜索、LSP、TODO、Web 等），按安全等级分类并发执行
+- 50+ 内置工具（文件、Bash、搜索、LSP、TODO、Web 等），按安全等级分类并发执行
 - 子 Agent 委派（`task` / `team` / `cron`）支持并行执行，含 token 预算控制
 - 智能审批流（`SmartApprovalGate` / `ToolSafetyCategory`）—— 危险操作分类拦截 + 模态确认
 - YOLO 模式 —— 跳过所有审批，用于全自动场景
 - Worker 生命周期管理 —— 远端 worker boot、trust gate、prompt 交付保障
+
+### Wave 并行编排
+
+基于依赖关系的 Wave 并行执行引擎（`runtime::wave`），将任务按依赖关系自动分组为 Wave：
+- **DependencyGraph** — 任务依赖图构建与循环检测
+- **WaveOrchestrator** — Wave 构建、调度、执行，同 Wave 内任务并行
+- **ErrorPolicy** — 可配置的错误处理策略（停止/跳过/忽略）
+- **WaveExecutor** — 可扩展的任务执行器 trait，支持自定义任务实现
+
+适用于：多文件重构、并行代码审查、批量测试执行等场景。
+
+### Gates 质量控制
+
+四层 Gate 机制（`runtime::gates`），在代码变更的关键环节进行质量把关：
+- **PreFlightGate** — 执行前检查（lint、类型检查、测试）
+- **RevisionGate** — 变更后审查（diff 质量、breaking changes 检测）
+- **EscalationGate** — 升级门（超出范围、高风险变更时阻止）
+- **AbortGate** — 中止门（检测到严重问题时强制中止）
+
+每个 Gate 生成 `GateResult`（passed / warnings / suggestions / duration_ms），支持自定义 Gate 实现。
 
 ---
 
@@ -73,10 +93,10 @@ Cowd 内置多 Provider 路由层，支持自动根据模型名匹配对应的 A
 ```
 cowd/
 ├── crates/
-│   ├── rusty-claude-cli/     # 主程序入口：CLI / TUI / Server
-│   ├── runtime/               # 运行时核心（69 模块）
+│   ├── cowd-cli/               # 主程序入口：CLI / TUI / Server
+│   ├── runtime/               # 运行时核心（64 模块）
 │   ├── api/                   # 模型 Provider 适配层
-│   ├── tools/                 # 内置工具系统（20+ 工具）
+│   ├── tools/                 # 内置工具系统（50+ 工具）
 │   ├── commands/              # 斜杠命令 + 技能系统
 │   ├── memory/                # 5 层记忆系统（36 模块）
 │   ├── config/                # 统一配置管理
@@ -124,7 +144,7 @@ cowd/
 
 ## Crate 架构详解
 
-### `rusty-claude-cli` — 主程序入口
+### `cowd-cli` — 主程序入口
 
 唯一的二进制目标 `cowd`。职责：
 - 解析 CLI 参数（支持 `--model` / `--permission-mode` / `--yolo` 等 30+ 标志）
@@ -142,24 +162,30 @@ cowd/
 | `tui` | ratatui 终端 UI |
 | `init` | 仓库初始化 |
 
-### `runtime` — 运行时核心（69 模块）
+### `runtime` — 运行时核心（62+ 模块）
 
 最大的 crate，涵盖所有运行时基础设施：
 
 | 模块类别 | 模块 | 职责 |
 |---|---|---|
-| **会话管理** | `session`, `session_control`, `conversation` | 对话循环、消息管理、会话持久化 |
-| **配置** | `config`, `config_validate` | 5 级优先级配置加载与合并 |
+| **会话管理** | `session`, `session_control`, `conversation`, `cached_prompt` | 对话循环、消息管理、会话持久化、System Prompt 缓存 |
+| **配置** | `config`, `config_validate`, `cowd_dirs` | 5 级优先级配置加载与合并、目录管理 |
 | **权限** | `permissions`, `approval_gate`, `policy_engine`, `permission_enforcer` | 三级权限模型 + 审批流 |
-| **MCP** | `mcp_server`, `mcp_client`, `mcp_stdio`, `mcp_tool_bridge` | MCP 协议实现 |
-| **文件操作** | `file_ops`, `doc_ingestion` | 读写/编辑/搜索文件，文档注入 |
-| **Git 集成** | `git_context`, `stale_base`, `stale_branch` | Git 上下文、base commit 检查 |
-| **工具编排** | `tool_orchestrator`, `subagent_executor`, `task_graph` | 工具调用调度、子 Agent 委派 |
+| **MCP** | `mcp_server`, `mcp_client`, `mcp_stdio`, `mcp_tool_bridge`, `mcp_lifecycle_hardened`, `mcp` | MCP 协议全栈实现（含生命周期管理、故障降级） |
+| **文件操作** | `file_ops`, `doc_ingestion` | 读写/编辑/搜索文件，文档注入与分类 |
+| **Git 集成** | `git_context`, `stale_base`, `stale_branch`, `branch_lock` | Git 上下文、base commit 检查、分支锁检测 |
+| **工具编排** | `tool_orchestrator`, `subagent_executor`, `subagent`, `task_graph` | 工具调用调度、子 Agent 委派、依赖图 |
 | **平台网关** | `platform/` | 飞书/企微/邮件/API Server 适配器 |
 | **钩子系统** | `hooks`, `lifecycle_hooks`, `plugin_lifecycle` | Pre/Post 工具钩子 |
 | **任务系统** | `task_registry`, `team_cron_registry`, `task_packet` | 后台任务、团队、定时任务 |
-| **上下文分析** | `context_profiler`, `lane_events`, `wave` | 会话事件追踪、上下文水位监控 |
-| **其他** | `oauth`, `sandbox`, `bus`, `effect`, `pairing`, `mirror`, `profile` | OAuth、沙箱、事件总线、运行时 profile 等 |
+| **Wave 编排** | `wave` | 基于依赖关系的 Wave 并行任务执行引擎 |
+| **Gates 机制** | `gates` | 提交质量控制门（PreFlight / Revision / Escalation / Abort） |
+| **上下文分析** | `context_profiler`, `lane_events` | 会话事件追踪、上下文水位监控 |
+| **Agent 系统** | `agent`, `worker_boot`, `subagent_executor` | Agent 生命周期管理、Worker 启动与信任门 |
+| **恢复与韧性** | `recovery_recipes`, `green_contract`, `summary_compression` | 故障恢复策略、绿色契约验证、会话摘要压缩 |
+| **SSE 与框架** | `sse`, `json`, `bus`, `effect`, `mirror`, `pairing`, `profile` | SSE 解析、JSON 工具、事件总线、Effect 系统、运行时 Profile 等 |
+| **安全与沙箱** | `sandbox`, `bash_validation`, `oauth`, `remote`, `trust_resolver` | 沙箱执行、Bash 命令校验、OAuth、远程代理、信任解析 |
+| **其他** | `bootstrap`, `compact`, `provider_pool`, `memory_provider`, `prompt`, `usage` | 引导配置、会话压缩、Provider 池、记忆桥接、System Prompt 构建 |
 
 #### Gateway 配置 (`config.rs`)
 
@@ -188,7 +214,7 @@ cowd/
 
 ### `tools` — 内置工具系统
 
-定义 20+ 工具规范（`mvp_tool_specs()`），每个工具包含：
+定义 50+ 工具规范（`mvp_tool_specs()`），每个工具包含：
 - `name` / `description` / `input_schema`
 - `required_permission`（ReadOnly / WorkspaceWrite / DangerFullAccess）
 
@@ -263,10 +289,6 @@ Cowd 最复杂最精密的子系统。详见下方 [记忆系统](#记忆系统)
 - 完整的错误类型体系（`ConfigError`）
 - 与 `runtime::ConfigLoader` 通过 `UnifiedConfigLoader` 兼容桥接
 
-### `session-store` — SQLite 会话持久化
-
-基于 `rusqlite` 的会话存储，使用 FTS5 全文索引支持会话搜索。
-
 ### `telemetry` — 遥测
 
 事件追踪基础设施，支持 `JsonlTelemetrySink` 和 `MemoryTelemetrySink` 两种 sink。
@@ -299,10 +321,10 @@ L3 ─ Deep Recall（深度召回层）
   ├── FTS5 全文索引
   └── BM25 + 混合搜索
 
-L4 ─ Task（任务层）
-  ├── 当前任务的工作内存
-  ├── 会话内临时
-  └── 任务完成即清理
+L4 ─ Shared（共享层）
+  ├── 团队/组织共享知识
+  ├── 跨 Agent 可见
+  └── 可选的，通过 shared_scope 隔离
 ```
 
 ### 自动提取引擎（Background Extractor）
@@ -331,16 +353,28 @@ L4 ─ Task（任务层）
 
 ### 记忆增强模块
 
+- **WriteGuard（写保护）** — `write_guard.rs` 记忆写保护机制，防止腐败注入。审计日志追踪所有写操作来源（`WriteSource`），完整性检查器检测异常（`Anomaly`）并生成报告
+- **Closet（指针索引层）** — `closet.rs` 精简指针行索引，实现快速主题路由。为常见查询维护指向相关"抽屉"（记忆条目）的短指针，并应用排名提升（`RANK_BOOSTS`）
+- **Miner（多模式挖掘）** — `miner.rs` 三种挖掘模式：Project（项目代码/文档）、Conversations（会话文件）、General（自由文本），支持 .gitignore 感知和自动分类
+- **StateRebuilder（状态重建）** — `state_rebuilder.rs` 从持久化的记忆状态重建会话上下文，支持 GSD（GsdState）增量重建
+- **HotReload（配置热重载）** — `hot_reload.rs` 监听配置文件变更事件（`ConfigChangeEvent`），自动刷新记忆系统配置
 - **EntityRegistry（实体消歧）** — `entity_registry.rs` 对提取出的命名实体进行消歧与合并，避免同义实体（如 "GPT" 和 "ChatGPT"）重复存储
-- **TemporalGraph（时序知识图谱）** — `temporal_graph.rs` 为关系三元组添加时间戳维度，支持时序推理和知识演化追踪
+- **TemporalGraph（时序知识图谱）** — `temporal_graph.rs` 为关系三元组添加时间戳维度（`TemporalMarker`），支持时序推理和知识演化追踪，提供时间范围查询（`TemporalQuery`）
 - **ContextSync（跨会话同步）** — `context_sync.rs` 在多个并发会话之间同步共享上下文，确保 Project 层（L2）记忆的一致性
-- **ContextProfiler（上下文分析器）** — `runtime::context_profiler` 追踪会话事件（`SessionEvent`），监控上下文窗口水位和压缩触发时机
+- **ContextFence（记忆围栏）** — `context_fence.rs` 基于规则的记忆过滤，防止注入无关记忆。支持 `FenceConfig` 和 `FenceRegistry`，提供 `build_memory_context_block()` 构建注入块
 - **FactChecker（事实核查）** — `fact_checker.rs` 对提取的事实进行一致性验证，防止矛盾信息进入记忆存储
 - **HandoffManager（交接管理）** — `handoff.rs` 管理跨会话的认知上下文传递，支持任务中断恢复
+- **FreshContextManager（新鲜度管理）** — `fresh_context.rs` 新鲜度感知的上下文预算分配，每个会话独立 `SessionTokenBudget`
+- **Drift（偏移检测）** — `drift.rs` 检测记忆条目的陈旧度和矛盾，支持自动剪枝
+- **SummaryCompression（摘要压缩）** — `runtime::summary_compression` 使用 LLM 对长会话进行语义摘要压缩，降低上下文占用
+
+### Closet 快速路由
+
+Closet（源自 MemPalace 的 closet 概念）是一个精简的指针行索引层，用于快速主题路由。对于常见查询，Closet 维护指向相关"抽屉"的短指针，应用排名提升（`RANK_BOOSTS: [0.40, 0.25, 0.15, 0.08, 0.04]`），无需读取完整数据即可实现高效检索。
 
 ### 向量索引
 
-支持通过远程 Embedding API 构建向量索引，提供语义搜索能力。
+支持通过远程 Embedding API 构建向量索引，提供语义搜索能力。向量维度、模型、API 端点均可配置（`VectorConfig`）。
 
 ### 工具沙箱
 
@@ -393,6 +427,14 @@ mvp_tool_specs() -> Vec<ToolSpec>
 `PermissionEnforcer` + `ApprovalGate`（双层审批门）+ `ToolSafetyCategory` 构成三层防护。YOLO 模式可完全跳过审批。
 
 工具调用结果会自动裁剪（`ToolResultBudget`），支持 HeadOnly / TailOnly / HeadAndTail 三种截断策略。
+
+### 工具执行器（Tool Executor）
+
+工具执行由 `tools` crate 的 `executor.rs` 统一调度，包含：
+- **Web 工具**（`web_tools.rs`）：`WebFetch` 和 `WebSearch` 的实现，支持自定义 User-Agent、超时控制
+- **PDF 提取**（`pdf_extract.rs`）：PDF 文档文本提取与结构化解析
+- **沙箱执行**（`sandbox_exec.rs`）：代码沙箱执行隔离环境
+- **Lane 完成管理**（`lane_completion.rs`）：工具调用 lane 的生命周期追踪
 
 ---
 
@@ -660,17 +702,16 @@ cargo doc --no-deps --open
 |---|---|---|
 | runtime | 569 | 核心运行时（会话、压缩、权限、MCP、配置、子 Agent 编排） |
 | memory | 252 | 记忆系统各层、AAAK 压缩、实体提取、时序图谱、上下文同步 |
-| rusty-claude-cli | 193 | CLI 参数解析、输出格式、会话恢复、Mock 一致性 |
+| cowd-cli | 193 | CLI 参数解析、输出格式、会话恢复、Mock 一致性 |
 | api | 140 | Provider 适配、SSE 解析、类型序列化、Provider Chain |
 | tools | 109 | 工具执行、安全分类、权限校验、MCP 桥接 |
 | commands | 51 | 斜杠命令解析、技能管理、安全扫描 |
 | plugins | 39 | 插件安装/卸载/启用/禁用/更新/市场 |
 | config（独立 crate） | 34 | 配置加载、合并、环境变量覆盖、规划目录 |
-| session-store | 15 | ⚠️ 部分 ignored（需 FTS5 支持） |
 | compat-harness | 3 | Manifest 提取与路径兼容性 |
 | telemetry | 3 | 事件追踪 serialization |
 | WebUI | 11 | 状态管理、API 客户端（Vitest） |
-| **总计** | **~1419+** | |
+| **总计** | **~1400+** | |
 
 ---
 

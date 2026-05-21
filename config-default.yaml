@@ -1,128 +1,358 @@
 # Cowd 默认配置文件
 # 安装后自动复制到 ~/.cowd/config.yaml
-# 本文件包含所有可配置项及说明
+# 本文件包含所有可配置项、默认值及说明
+#
+# 配置优先级 (高→低):
+# 1. CLI 参数 (--model, --yolo, --permission-mode 等)
+# 2. 环境变量 (COWD_* 前缀)
+# 3. 本地覆盖 (.cowd/config.local.yaml, git-ignored)
+# 4. 项目配置 (.cowd/config.yaml)
+# 5. 用户配置 (~/.cowd/config.yaml, 即本文件)
 
 # =============================================================================
 # 基础配置
 # =============================================================================
 
-# 默认模型（可通过 --model 覆盖）
+# 默认模型 (可通过 --model 或 COWD_MODEL 覆盖)
 model: "claude-sonnet-4-6"
 
-# 模型别名（快捷切换: cowd --model fast）
+# 模型别名 (快捷切换: cowd --model fast)
 aliases:
   main: "claude-sonnet-4-6"
   fast: "claude-haiku-4-5-20251213"
 
-# Provider 配置（多Provider自动路由）
+# =============================================================================
+# Provider 配置 (多Provider自动路由)
+# =============================================================================
 # cowd 根据 model 名自动匹配 Provider 的 base_url 和 api_key
-providers:
-  # deepseek:
-  #   base_url: "https://api.deepseek.com"
-  #   api_key: "sk-..."
-  #   models: ["deepseek-v4-pro", "deepseek-v4-flash"]
+# 支持任意 OpenAI 兼容接口
+
+providers: {}
+# 示例:
+# providers:
+#   deepseek:
+#     base_url: "https://api.deepseek.com"
+#     api_key: "sk-..."
+#     models: ["deepseek-v4-pro", "deepseek-v4-flash"]
   # bailian:
   #   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   #   api_key: "sk-..."
   #   models: ["qwen3-max", "qwen3-coder-next"]
 
+# Provider 故障转移链
+# 当主 Provider 返回 429/500/503 等可重试错误时自动切换
+# provider_fallbacks:
+#   primary: "deepseek"
+#   fallbacks: ["bailian"]
+
+# =============================================================================
+# 权限与审批
+# =============================================================================
+
+permissions:
+  # 默认权限模式: plan(只读) | acceptEdits(可写工作区) | dontAsk(危险全访问)
+  defaultMode: "acceptEdits"
+  # 允许列表 (即使权限模式更低也允许)
+  allow: []
+  # 拒绝列表 (即使权限模式更高也禁止)
+  deny: []
+  # 每次询问
+  ask: []
+
+# 智能审批门 (SmartApprovalGate)
+# approval:
+#   yolo_mode: false              # 跳过所有审批 (全自动模式)
+#   yolo_honor_critical: true     # YOLO 模式下仍拦截危险操作
+#   auto_pass_read_only: true     # 只读命令自动通过
+#   auto_pass_low_risk: true      # 低风险命令自动通过
+
+# 受信根路径 (超出此范围的文件操作需要额外确认)
+# trusted_roots:
+#   - "/home/user/projects"
+
 # =============================================================================
 # 上下文压缩
 # =============================================================================
+# 预检自动压缩: 每次模型调用前检测上下文窗口使用率，超限时自动压缩
 
-# 自动压缩配置
-# COWD_AUTO_COMPACT_INPUT_TOKENS: 绝对token阈值（设置此项后百分比失效）
-# COWD_COMPACT_THRESHOLD_PERCENT: 百分比阈值（默认80%，即context window的80%时触发）
-# 压缩发生在每次模型调用前（预检），防止工具输出撑爆上下文
-# compression:
-#   threshold_percent: 80
-#   buffer_tokens: 8000
+# 压缩阈值与环境变量:
+#   COWD_AUTO_COMPACT_INPUT_TOKENS: 绝对 token 阈值 (设置后百分比方式失效)
+#   COWD_COMPACT_THRESHOLD_PERCENT: 百分比阈值 (默认 80%)
+compression:
+  # 微压缩 (per-tool-result 截断)
+  micro:
+    enabled: true
+    tool_result_max_chars: 4000     # 工具结果最大字符数
+    time_decay_factor: 0.9          # 时间衰减系数
+
+  # 会话级自动压缩
+  session:
+    threshold_tokens: 80000         # 触发压缩的 token 阈值
+    preserve_recent: 6              # 保留最近 N 条消息
+    summary_max_tokens: 2000        # 摘要最大 token 数
+    buffer_tokens: 13000            # 预留缓冲 token
+
+  # 深度迭代压缩 (多次压缩)
+  deep:
+    enabled: true
+    iterative_update: true          # 增量更新模式
+
+  # 熔断器 (防止无限压缩)
+  circuit_breaker:
+    max_retries: 3                  # 最大压缩重试次数
+    cooldown_secs: 30               # 冷却时间(秒)
+
+  # LLM 语义摘要 (可选, 需配置 API)
+  # llm:
+  #   enabled: false
+  #   api_url: ""                   # 环境变量: COWD_LLM_API_URL
+  #   api_key: ""                   # 环境变量: COWD_LLM_API_KEY
+  #   model: "gpt-4o-mini"          # 环境变量: COWD_LLM_MODEL
 
 # =============================================================================
 # System Prompt 缓存
 # =============================================================================
-
 # 感知配置文件和身份文件变更，自动重建缓存
-# 大幅降低 API 输入成本（Anthropic prompt caching 兼容）
-# prompt_cache:
-#   check_interval: 5       # 每N轮检查文件变更（默认5）
-#   max_age: 50             # 最大缓存轮数（默认50）
-#   memory_delta: 3         # 记忆增量阈值（新增N条High记忆后重建）
+# 大幅降低 API 输入成本 (Anthropic prompt caching 兼容)
 
-# =============================================================================
-# 记忆系统
-# =============================================================================
-
-# 3层记忆架构（L0 Identity + L1 Essential + L3 Deep Recall）
-# 记忆自动提取，后台异步，零token消耗
-memory:
-  enabled: true
-  # AAAK 符号化记忆索引 (默认开启, 节省 70-85% tokens)
-  # 关闭后将使用全量注入模式
-  # aaakIndexEnabled: true
-  # 提取批处理大小（积累N轮后批量写入，默认3）
-  # extract_batch_size: 3
-  # L1最大token数（默认800）
-  # l1_max_tokens: 800
-  # L1最大条目数（默认15）
-  # l1_max_entries: 15
+prompt_cache:
+  check_interval: 5                # 每 N 轮检查文件变更
+  max_age: 50                      # 最大缓存轮数
+  memory_delta: 3                  # 记忆增量阈值 (新增 N 条 High 记忆后重建)
 
 # =============================================================================
 # 输出风格
 # =============================================================================
 
-# output_style: "terse"  # terse(极简) | standard(标准) | 不设置(默认)
+# output_style: "terse"  # terse(极简) | standard(标准) | 不设置(使用模型默认)
 
 # =============================================================================
 # 沙箱执行
 # =============================================================================
 
-# execute_code 工具配置
-# sandbox:
-#   timeout_secs: 30       # 执行超时（默认30秒）
-#   max_output_kib: 100    # 输出上限（默认100KB）
-#   max_entries: 50        # FTS5沙箱条目上限
+sandbox:
+  enabled: false                   # 默认不启用沙箱
+  timeout_secs: 30                 # 执行超时 (秒)
+  max_output_kib: 100              # 输出上限 (KB)
+  max_entries: 50                  # FTS5 沙箱条目上限
+  # 文件系统隔离模式 (可选)
+  # filesystem_mode: "workspace-only"  # off | workspace-only | allow-list
+  # allowed_dirs:                      # allow-list 模式下的允许目录
+  #   - "/tmp"
+  #   - "/var/cache"
 
 # =============================================================================
-# 权限
+# 记忆系统 (5层架构: L0-L4)
 # =============================================================================
 
-permissions:
-  defaultMode: "acceptEdits"   # plan(只读) | acceptEdits(可写工作区) | dontAsk(危险全访问)
-  allow: []
-  deny: []
-  ask: []
+memory:
+  # 全局开关
+  enabled: true
+
+  # AAAK 符号化索引 (节省 70-85% tokens)
+  aaak_index_enabled: true
+
+  # 一致性过滤阈值 (基点, 100=0.01, 1000=0.10, 5000=0.50)
+  # 低于此阈值的记忆条目将被排除
+  coherence_threshold_bp: 1000
+
+  # 自适应压缩模型 (根据模型名自动调整压缩参数)
+  # model: "claude-sonnet-4-6"
+
+  # ── 存储配置 ──
+  store:
+    sqlite_path: "memory.db"      # SQLite 数据库路径
+    blob_dir: "memory_blobs"      # Blob 存储目录
+    enable_vector_index: false    # 启用向量索引
+
+  # ── 向量索引 (可选, 需配置远程 API) ──
+  vector:
+    enabled: false
+    model: ""                     # 环境变量: COWD_MEMORY_VECTOR_MODEL
+    api_url: ""                   # 环境变量: COWD_MEMORY_VECTOR_API_URL
+    api_key: ""                   # 环境变量: COWD_VECTOR_API_KEY
+    dimension: 0                  # 向量维度 (0=自动检测)
+    timeout_secs: 30
+    batch_size: 32
+
+  # ── Token 预算 ──
+  budget:
+    context_window: 200000        # 上下文窗口总大小 (按模型自适应)
+    reserved_system: 10000        # 系统提示预留
+    reserved_response: 8000       # 响应预留
+    warning_threshold: 0.70       # 警告阈值 (70%)
+    critical_threshold: 0.90      # 临界阈值 (90%)
+
+  # ── 压缩管线 ──
+  compression:
+    micro:
+      enabled: true
+      tool_result_max_chars: 4000
+      time_decay_factor: 0.9
+    session:
+      threshold_tokens: 80000
+      preserve_recent: 6
+      summary_max_tokens: 2000
+      buffer_tokens: 13000
+    deep:
+      enabled: true
+      iterative_update: true
+    circuit_breaker:
+      max_retries: 3
+      cooldown_secs: 30
+    # llm: ...
+
+  # ── 记忆提取器 ──
+  extractor:
+    auto_extract: true            # 自动后台提取
+    poll_interval_secs: 30        # 轮询间隔 (秒)
+    batch_size: 20                # 每次提取的条目数上限
+    min_confidence: 0.6           # 最低置信度阈值
+
+  # ── 偏移检测 (自动清理过期记忆) ──
+  drift:
+    staleness_decay_per_day: 0.02 # 每日陈旧衰减系数
+    review_threshold: 0.7         # 审查阈值
+    prune_threshold: 0.95         # 自动剪枝阈值
+    contradiction_jaccard_threshold: 0.6  # 矛盾检测 Jaccard 相似度
+
+  # ── 性能预算 ──
+  perf:
+    hook_max_ms: 500              # 钩子最大耗时 (毫秒)
+    inject_max_ms: 100            # 注入最大耗时 (毫秒)
+    warn_threshold_pct: 0.8       # 警告阈值 (百分比)
+
+  # ── 分层配置 ──
+  layers:
+    l0_enabled: true              # L0: 身份层
+    l1_max_tokens: 2000           # L1: 核心层最大 tokens
+    l2_max_tokens: 3000           # L2: 项目层最大 tokens
+    l3_search_limit: 5            # L3: 深度召回结果数
+    l4_enabled: false             # L4: 共享层 (团队模式启用)
 
 # =============================================================================
-# 网关
+# 钩子系统 (Pre/Post 工具钩子)
 # =============================================================================
+
+hooks:
+  # 工具调用前执行的命令列表
+  pre_tool_use: []
+  # 工具调用成功后执行的命令列表
+  post_tool_use: []
+  # 工具调用失败后执行的命令列表
+  post_tool_use_failure: []
+
+# =============================================================================
+# 插件系统
+# =============================================================================
+
+plugins:
+  # 插件启用状态 (plugin_id → enabled)
+  enabled: {}
+  # 外部插件目录
+  external_dirs: []
+
+# =============================================================================
+# MCP 服务器 (Model Context Protocol)
+# =============================================================================
+
+mcp:
+  servers: {}
+  # 示例:
+  # servers:
+  #   filesystem:
+  #     type: stdio
+  #     command: "npx"
+  #     args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/files"]
+  #   remote-api:
+  #     type: sse
+  #     url: "https://mcp.example.com/sse"
+  #     headers:
+  #       Authorization: "Bearer ..."
+
+# =============================================================================
+# 网关 (多平台接入)
+# =============================================================================
+# cowd serve 启动时自动读取本配置：
+#   - host/port 从 api_server 配置读取（CLI --host/--port 可覆盖）
+#   - auth.enabled/token 控制 API 认证（CLI --no-auth 可关闭）
+#   - 直接启动: cowd serve （使用以下配置）
+#   - 指定端口: cowd serve --port 9090 （覆盖以下 port）
 
 gateway:
   enabled: true
+  # 会话重置策略: daily | idle | both | always | none
+  # 控制平台会话（飞书/邮件）何时自动结束并开启新对话
+  session_reset: "none"
+  # 清理检查间隔（秒），默认 86400 = 1天
+  # cleanup_interval_secs: 86400
+  # 空闲会话超时（分钟），用于 idle/both 策略，默认 30
+  # idle_timeout_minutes: 30
   platforms:
-    # Web API Server
-    - type: api_server
+    # Web API Server — cowd serve 命令使用此配置
+    - platformType: api_server
       enabled: true
       host: "127.0.0.1"
       port: 8642
       auth:
         enabled: false
         token: ""
+
     # 飞书机器人
-    # - type: feishu
+    # - platformType: feishu
     #   enabled: false
     #   app_id: ""
     #   app_secret: ""
-    # 企业微信
-    # - type: wechat
-    #   enabled: false
-    #   corpid: ""
-    #   corpsecret: ""
-    #   agentid: ""
+    #   verification_token: ""
+    #   encrypt_key: ""
+    #   webhook_port: 8080
+    #   bot_name: "Cowd"
+
     # 邮箱
-    # - type: email
+    # - platformType: email
     #   enabled: false
     #   smtp_host: "smtp.gmail.com"
     #   smtp_port: 587
-    #   username: ""
-    #   password: ""
+    #   smtp_user: ""
+    #   smtp_password: ""
+    #   imap_host: "imap.gmail.com"
+    #   imap_port: 993
+    #   imap_user: ""
+    #   imap_password: ""
+    #   check_interval_secs: 60
+
+# =============================================================================
+# 环境变量参考 (COWD_* 前缀, 优先级高于本文件)
+# =============================================================================
+#
+# 模型与 API:
+#   COWD_MODEL                     - 覆盖 model
+#   ANTHROPIC_API_KEY              - Anthropic API 密钥
+#   ANTHROPIC_AUTH_TOKEN           - Anthropic OAuth Token
+#   OPENAI_API_KEY                 - OpenAI API 密钥
+#   OPENAI_BASE_URL                - OpenAI Base URL
+#
+# 压缩:
+#   COWD_AUTO_COMPACT_INPUT_TOKENS - 绝对 token 阈值触发压缩
+#   COWD_COMPACT_THRESHOLD_PERCENT - 百分比阈值 (覆盖 compression.session.threshold_tokens)
+#
+# 记忆:
+#   COWD_MEMORY_VECTOR_MODEL       - 向量嵌入模型名
+#   COWD_MEMORY_VECTOR_API_URL     - 向量嵌入 API URL
+#   COWD_VECTOR_API_KEY            - 向量 API 密钥
+#
+# LLM 压缩:
+#   COWD_LLM_API_URL               - LLM 摘要 API URL
+#   COWD_LLM_API_KEY               - LLM 摘要 API 密钥
+#   COWD_LLM_MODEL                 - LLM 摘要模型名
+#
+# 权限:
+#   COWD_PERMISSION_MODE           - 覆盖 permissions.defaultMode
+#
+# 运行时:
+#   COWD_MAX_OUTPUT_TOKENS         - 覆盖 plugins 的 max_output_tokens
+#   COWD_CONFIG_HOME               - 配置主目录 (默认 ~/.cowd)
+#
+# 平台:
+#   各平台 API 密钥通过配置文件中的 app_secret/corp_secret 等字段设置
+#   不提供环境变量覆盖以确保安全性

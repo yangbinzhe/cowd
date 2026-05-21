@@ -15,7 +15,6 @@ use crate::session::{Session, SessionError};
 /// explicit `--data-dir` flag).  Both constructors produce a directory layout
 /// of `<data_dir>/sessions/<workspace_hash>/` where `<workspace_hash>` is a
 /// stable hex digest of the canonical workspace root.
-#[deprecated(since = "0.2.0", note = "use crate::session_store::UnifiedSessionStore")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStore {
     /// Resolved root of the session namespace, e.g.
@@ -521,7 +520,7 @@ fn format_missing_session_reference(reference: &str) -> String {
 
 fn format_no_managed_sessions() -> String {
     format!(
-        "no managed sessions found in .cowd/sessions/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
+        "no managed sessions found in .cowd/sessions/\nStart `cowd` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
     )
 }
 

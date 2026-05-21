@@ -19,12 +19,13 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+use std::os::unix::io::FromRawFd;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -64,6 +65,9 @@ pub(crate) const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
     cli::max_tokens_for_model(model)
 }
+static TOKIO_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Runtime::new().expect("tokio runtime")
+});
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
 const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
@@ -2693,7 +2697,24 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                         let parsed = SlashCommand::parse(&text).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                         match parsed {
                             Some(cmd) => {
-                                if cli.handle_repl_command(cmd)? { cli.persist_session()?; }
+                                let output = capture_stdout(|| cli.handle_repl_command(cmd));
+                                match output {
+                                    Ok((true, captured)) => {
+                                        cli.persist_session()?;
+                                        app.add_message("system", &format!("Cmd: {text}"));
+                                        for line in captured.trim().lines() {
+                                            app.add_message("system", line);
+                                        }
+                                    }
+                                    Ok((false, captured)) => {
+                                        for line in captured.trim().lines() {
+                                            app.add_message("system", line);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app.add_message("system", &format!("Error: {e}"));
+                                    }
+                                }
                                 continue;
                             }
                             None => {}
@@ -2750,10 +2771,10 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                 }
                 tui::input::InputResult::Nothing => {}
             }
-            // Enforce frame budget (~120fps max) to prevent CPU spin
+            let budget = if app.turn_active { Duration::from_millis(0) } else { frame_budget };
             let elapsed = frame_start.elapsed();
-            if elapsed < frame_budget {
-                std::thread::sleep(frame_budget - elapsed);
+            if elapsed < budget {
+                std::thread::sleep(budget - elapsed);
             }
         }
         Ok(())
@@ -2769,12 +2790,34 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 /// Process all pending TuiEvents from the channel without blocking.
 /// This is called at the top of the TUI render loop to keep the display
 /// in sync with the background turn runner.
+fn capture_stdout<F, R>(f: F) -> Result<(R, String), Box<dyn std::error::Error>>
+where F: FnOnce() -> Result<R, Box<dyn std::error::Error>>
+{
+    let mut pipe_fds = [-1i32; 2];
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        return Err("pipe failed".into());
+    }
+    let read_fd = pipe_fds[0];
+    let write_fd = pipe_fds[1];
+    let saved = unsafe { libc::dup(1) };
+    if unsafe { libc::dup2(write_fd, 1) } < 0 {
+        unsafe { libc::close(read_fd); libc::close(write_fd); }
+        return Err("dup2 failed".into());
+    }
+    let result = f();
+    unsafe { libc::dup2(saved, 1); libc::close(saved); libc::close(write_fd); }
+    let mut buf = String::new();
+    std::io::Read::read_to_string(&mut unsafe { std::fs::File::from_raw_fd(read_fd) }, &mut buf)?;
+    Ok((result?, buf))
+}
+
 fn drain_tui_events(rx: &tui::TuiEventReceiver, app: &mut tui::App) {
     let mut count = 0;
+    let limit = if app.turn_active { usize::MAX } else { 256 };
     while let Ok(event) = rx.try_recv() {
         app.apply_event(event);
         count += 1;
-        if count >= 64 {
+        if count >= limit {
             break;
         }
     }
@@ -3390,7 +3433,7 @@ impl LiveCli {
         let hook_abort_signal = runtime::HookAbortSignal::new();
         let abort_for_caller = hook_abort_signal.clone();
         let runtime = build_runtime(
-            self.runtime.session().clone(),
+            self.runtime.session().without_persistence(),
             &self.session.id,
             self.model.clone(),
             self.system_prompt.clone(),
@@ -3867,7 +3910,7 @@ impl LiveCli {
         }
 
         let previous = self.model.clone();
-        let session = self.runtime.session().clone();
+        let session = self.runtime.session().without_persistence();
         let message_count = session.messages.len();
         let runtime = build_runtime(
             session,
@@ -3915,7 +3958,7 @@ impl LiveCli {
         }
 
         let previous = self.permission_mode.as_str().to_string();
-        let session = self.runtime.session().clone();
+        let session = self.runtime.session().without_persistence();
         self.permission_mode = permission_mode_from_label(normalized);
         let runtime = build_runtime(
             session,
@@ -4286,7 +4329,7 @@ impl LiveCli {
 
     fn reload_runtime_features(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let runtime = build_runtime(
-            self.runtime.session().clone(),
+            self.runtime.session().without_persistence(),
             &self.session.id,
             self.model.clone(),
             self.system_prompt.clone(),
@@ -4332,7 +4375,7 @@ impl LiveCli {
         enable_tools: bool,
         progress: Option<InternalPromptProgressReporter>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let session = self.runtime.session().clone();
+        let session = self.runtime.session().without_persistence();
         let mut runtime = build_runtime(
             session,
             &self.session.id,
@@ -6472,7 +6515,6 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 // churning `BuiltRuntime` and every Deref/DerefMut site that references
 // it. See ROADMAP #29 for the provider-dispatch routing fix.
 struct AnthropicRuntimeClient {
-    runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
     session_id: String,
     model: String,
@@ -6540,7 +6582,6 @@ impl AnthropicRuntimeClient {
             }
         };
         Ok(Self {
-            runtime: tokio::runtime::Runtime::new()?,
             client,
             session_id: session_id.to_string(),
             model,
@@ -6611,7 +6652,7 @@ impl AnthropicRuntimeClient {
             ..Default::default()
         };
 
-        self.runtime.block_on(async {
+        TOKIO_RT.block_on(async {
             // When resuming after tool execution, apply a stall timeout on the
             // first stream event.  If the model does not respond within the
             // deadline we drop the stalled connection and re-send the request as

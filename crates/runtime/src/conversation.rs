@@ -1618,7 +1618,7 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
             cache_capacity: 512,
             vector: memory::config::VectorConfig {
                 enabled: mem.vector.enabled,
-                model: mem.vector.embedding_model.clone(),
+                model: mem.vector.model.clone(),
                 api_url: mem.vector.api_url.clone(),
                 api_key: mem.vector.api_key.clone(),
                 dimension: mem.vector.dimension as usize,

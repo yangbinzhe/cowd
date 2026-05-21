@@ -1034,7 +1034,7 @@ mod tests {
         assert_eq!(report["agents"][1]["name"], "verifier");
         assert_eq!(report["agents"][2]["name"], "planner");
         assert_eq!(report["agents"][2]["active"], false);
-        assert_eq!(report["agents"][2]["shadowed_by"]["id"], "project_claw");
+        assert_eq!(report["agents"][2]["shadowed_by"]["id"], "project_cowd");
 
         let help = handle_agents_slash_command_json(Some("help"), &workspace).expect("agents help");
         assert_eq!(help["kind"], "agents");
@@ -1154,10 +1154,10 @@ mod tests {
         assert_eq!(report["summary"]["active"], 3);
         assert_eq!(report["summary"]["shadowed"], 1);
         assert_eq!(report["skills"][0]["name"], "plan");
-        assert_eq!(report["skills"][0]["source"]["id"], "project_claw");
+        assert_eq!(report["skills"][0]["source"]["id"], "project_cowd");
         assert_eq!(report["skills"][1]["name"], "deploy");
         assert_eq!(report["skills"][1]["origin"]["id"], "legacy_commands_dir");
-        assert_eq!(report["skills"][3]["shadowed_by"]["id"], "project_claw");
+        assert_eq!(report["skills"][3]["shadowed_by"]["id"], "project_cowd");
 
         let help = handle_skills_slash_command_json(Some("help"), &workspace).expect("skills help");
         assert_eq!(help["kind"], "skills");
@@ -1179,7 +1179,7 @@ mod tests {
         let agents_help =
             handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|help]"));
-        assert!(agents_help.contains("Direct CLI       claw agents"));
+        assert!(agents_help.contains("Direct CLI       cowd agents"));
         assert!(agents_help
             .contains("Sources          .cowd/agents, ~/.cowd/agents, $CC_CONFIG_HOME/agents"));
 
@@ -1302,7 +1302,7 @@ mod tests {
 
         let help = handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
         assert!(help.contains("Usage            /mcp [list|show <server>|help]"));
-        assert!(help.contains("Direct CLI       claw mcp [list|show <server>|help]"));
+        assert!(help.contains("Direct CLI       cowd mcp [list|show <server>|help]"));
 
         let unexpected =
             handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");

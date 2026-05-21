@@ -19,20 +19,20 @@ Thumbs.db
 node_modules/
 
 # Build artifact — auto-populated by build.rs (copied from webui/)
-crates/rusty-claude-cli/static/
+crates/cowd-cli/static/
 
 # Runtime databases (auto-generated, should never be committed)
 *.db
 memory_blobs/
 .cargo/.global-cache
-.clawd-todos.json
+.cowd-todos.json
 
 # Stale plan artifacts
 plan/
 
-# Legacy directories (no longer used)
+# Legacy directories (no longer used, pre-cowd rename)
 .omx/
-.clawd-agents/
+.cowd-agents/
 .claw/
 .cc/
 .sandbox-home/

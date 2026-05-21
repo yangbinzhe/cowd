@@ -1,4 +1,4 @@
-//! `memory` – unified memory framework for the claw AI assistant.
+//! `memory` – unified memory framework for the cowd AI assistant.
 //!
 //! # Architecture
 //!

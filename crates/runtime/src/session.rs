@@ -3,7 +3,8 @@ use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::{JsonError, JsonValue};
@@ -106,6 +107,8 @@ pub struct Session {
     pub last_health_check_ms: Option<u64>,
     pub model: Option<String>,
     persistence: Option<SessionPersistence>,
+    #[doc(hidden)]
+    pub appended_since_snapshot: Arc<AtomicUsize>,
 }
 
 impl PartialEq for Session {
@@ -174,6 +177,7 @@ impl Session {
             last_health_check_ms: None,
             model: None,
             persistence: None,
+            appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -194,6 +198,19 @@ impl Session {
         self
     }
 
+    /// Create a clone suitable for a single turn execution.
+    ///
+    /// The clone has `persistence` cleared so that `push_message` calls
+    /// during the turn will not append partial data to the real session
+    /// file. The caller is responsible for persisting the final state
+    /// via `save_to_path` after a successful turn.
+    #[must_use]
+    pub fn without_persistence(&self) -> Self {
+        let mut clone = self.clone();
+        clone.persistence = None;
+        clone
+    }
+
     #[must_use]
     pub fn workspace_root(&self) -> Option<&Path> {
         self.workspace_root.as_deref()
@@ -206,9 +223,16 @@ impl Session {
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
         let path = path.as_ref();
+        const SNAPSHOT_INTERVAL: usize = 50;
+        if self.appended_since_snapshot.load(std::sync::atomic::Ordering::Relaxed) < SNAPSHOT_INTERVAL
+            && path.exists()
+        {
+            return Ok(());
+        }
         let snapshot = self.render_jsonl_snapshot()?;
         rotate_session_file_if_needed(path)?;
         write_atomic(path, &snapshot)?;
+        self.appended_since_snapshot.store(0, std::sync::atomic::Ordering::Relaxed);
         cleanup_rotated_logs(path)?;
         Ok(())
     }
@@ -242,6 +266,7 @@ impl Session {
             self.messages.pop();
             return Err(error);
         }
+        self.appended_since_snapshot.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -278,6 +303,7 @@ impl Session {
             last_health_check_ms: self.last_health_check_ms,
             model: self.model.clone(),
             persistence: None,
+            appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -402,6 +428,7 @@ impl Session {
             last_health_check_ms: None,
             model,
             persistence: None,
+            appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -503,6 +530,7 @@ impl Session {
             last_health_check_ms: None,
             model,
             persistence: None,
+            appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1475,7 +1503,7 @@ mod tests {
 /// Per-worktree session isolation: returns a session directory namespaced
 /// by the workspace fingerprint of the given working directory.
 /// This prevents parallel `opencode serve` instances from colliding.
-/// Called by external consumers (e.g. clawhip) to enumerate sessions for a CWD.
+/// Called by external consumers (e.g. cowd-orchestrator) to enumerate sessions for a CWD.
 #[allow(dead_code)]
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
     let store = crate::session_control::SessionStore::from_cwd(cwd)

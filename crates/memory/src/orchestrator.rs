@@ -15,6 +15,7 @@ use chrono::Utc;
 use crate::{
     config::MemoryConfig,
     context_fence::FenceRegistry,
+    closet::{ClosetManager, Closet},
     error::MemoryError,
     layers::{
         deep::DeepLayer,
@@ -53,6 +54,8 @@ pub struct MemoryOrchestrator {
     l3: DeepLayer,
     /// L4 – shared team layer.
     l4: SharedLayer,
+    /// Closet – compact pointer-row index for fast topic routing.
+    closet: ClosetManager,
     /// Fence registry for context isolation.
     fence_registry: FenceRegistry,
 }
@@ -111,6 +114,9 @@ impl MemoryOrchestrator {
             SharedLayer::new(Arc::clone(&store))
         };
 
+        // Build Closet index from L2 (project) + L3 (deep) memory metadata.
+        let closet = ClosetManager::from_closet(Closet::default());
+
         Ok(Self {
             store,
             config,
@@ -119,6 +125,7 @@ impl MemoryOrchestrator {
             l2,
             l3,
             l4,
+            closet,
             fence_registry: FenceRegistry::new(),
         })
     }
@@ -142,8 +149,11 @@ impl MemoryOrchestrator {
         self.l2.load().await
     }
 
-    /// Recall relevant memories on-demand (L3 + L4), filtered by token budget.
+    /// Recall relevant memories on-demand (L3 + L4), pre-routed through
+    /// the Closet index for topic-aware drawer selection.
     ///
+    /// Closet routing narrows the search space: matched topics identify
+    /// relevant drawer IDs which are prioritised in the recall phase.
     /// Entries whose IDs appear in `already_surfaced` are excluded to avoid
     /// duplicating content already shown to the model.
     pub async fn recall_relevant(
@@ -153,6 +163,13 @@ impl MemoryOrchestrator {
         already_surfaced: &HashSet<MemoryId>,
         token_budget: u32,
     ) -> Result<Vec<MemoryEntry>> {
+        // Phase 1: Closet topic routing – find relevant drawer IDs.
+        let closet_topics = self.closet.search_topics(query);
+        let drawer_ids: HashSet<String> = closet_topics
+            .iter()
+            .flat_map(|ptr| ptr.drawer_ids.iter().cloned())
+            .collect();
+
         // Gather L3 results.
         let mut l3 = self.l3.recall(query, embedding, already_surfaced).await?;
 
@@ -171,6 +188,17 @@ impl MemoryOrchestrator {
             }
         }
 
+        // Phase 2: Apply Closet boost – entries matching drawer IDs get priority.
+        if !drawer_ids.is_empty() {
+            l3.sort_by(|a, b| {
+                let a_in_closet = drawer_ids.contains(&a.id.to_string());
+                let b_in_closet = drawer_ids.contains(&b.id.to_string());
+                b_in_closet.cmp(&a_in_closet)
+                    .then(b.priority.cmp(&a.priority))
+                    .then(b.updated_at.cmp(&a.updated_at))
+            });
+        }
+
         // Truncate to token budget.
         let budget = u64::from(token_budget);
         let mut used: u64 = 0;
@@ -184,6 +212,15 @@ impl MemoryOrchestrator {
             kept.push(e);
         }
         Ok(kept)
+    }
+
+    /// Rebuild the Closet index from current memory store state (L2 + L3).
+    ///
+    /// Call periodically after significant memory insertions to keep
+    /// the routing index fresh.
+    pub async fn rebuild_closet(&mut self) -> Result<()> {
+        self.closet = ClosetManager::build_from_orchestrator(self).await?;
+        Ok(())
     }
 
     /// Prepare a full context snapshot for the next model turn.
@@ -342,6 +379,56 @@ impl MemoryOrchestrator {
     /// List metadata for all entries in a given layer.
     pub async fn list_layer(&self, layer: MemoryLayer) -> Result<Vec<MemoryMeta>> {
         self.store.list_metas(Some(layer)).await
+    }
+
+    // -----------------------------------------------------------------------
+    // L4 Shared Layer – Team Knowledge Operations
+    // -----------------------------------------------------------------------
+
+    /// Write a shared entry visible to all agents in the same team scope.
+    ///
+    /// This is the recommended API for agent-to-agent knowledge sharing:
+    /// task handoff, team decisions, coding conventions, operational runbooks.
+    /// Entries are automatically scoped by `shared_scope` and pruned based
+    /// on staleness thresholds during maintenance ticks.
+    pub async fn team_remember(
+        &self,
+        title: &str,
+        content: &str,
+        priority: Priority,
+        tags: Vec<String>,
+        scope: Option<String>,
+    ) -> Result<MemoryId> {
+        self.write(
+            MemoryLayer::L4,
+            MemoryCategory::Shared,
+            title,
+            content,
+            priority,
+            MemorySource::Import,
+            tags,
+            scope,
+        )
+        .await
+    }
+
+    /// Query team-shared knowledge relevant to a search term.
+    ///
+    /// Returns entries from L4 filtered by the given scope. This is the
+    /// entry point for agents to discover team conventions, prior decisions,
+    /// and peer agent handoff data before starting a new task.
+    pub async fn team_query(
+        &self,
+        query: &str,
+        scope: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let mut entries = self.l4.recall(query, limit * 2).await?;
+        if let Some(s) = scope {
+            entries.retain(|e| e.scope.as_deref() == Some(s));
+        }
+        entries.truncate(limit);
+        Ok(entries)
     }
 
     // -----------------------------------------------------------------------

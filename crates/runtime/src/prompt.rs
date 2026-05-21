@@ -803,7 +803,7 @@ mod tests {
         ensure_valid_cwd();
         let previous = std::env::current_dir().expect("cwd");
         let original_home = std::env::var("HOME").ok();
-        let original_claw_home = std::env::var("COWD_CONFIG_HOME").ok();
+        let original_cowd_home = std::env::var("COWD_CONFIG_HOME").ok();
         std::env::set_var("HOME", &root);
         std::env::set_var("COWD_CONFIG_HOME", root.join("missing-home"));
         std::env::set_current_dir(&root).expect("change cwd");
@@ -820,7 +820,7 @@ mod tests {
         } else {
             std::env::remove_var("HOME");
         }
-        if let Some(value) = original_claw_home {
+        if let Some(value) = original_cowd_home {
             std::env::set_var("COWD_CONFIG_HOME", value);
         } else {
             std::env::remove_var("COWD_CONFIG_HOME");

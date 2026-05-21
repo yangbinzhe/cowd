@@ -1,1 +1,0 @@
-# Cowd Documentation\n\n## Quick Start\n\nSee README.md for installation and basic usage.\n\n## Architecture\n\nCowd is a Rust-based AI coding agent with:\n- TUI (ratatui)\n- Memory system (3-layer + EventLog)\n- Context management (preflight compression)\n- Multi-platform gateway\n- 20+ built-in tools\n\n## Configuration\n\nSee config-default.yaml for all options.\n

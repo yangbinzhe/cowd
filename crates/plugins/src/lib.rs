@@ -312,14 +312,14 @@ impl PluginTool {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("CLAWD_PLUGIN_ID", &self.plugin_id)
-            .env("CLAWD_PLUGIN_NAME", &self.plugin_name)
-            .env("CLAWD_TOOL_NAME", &self.definition.name)
-            .env("CLAWD_TOOL_INPUT", &input_json);
+            .env("COWD_PLUGIN_ID", &self.plugin_id)
+            .env("COWD_PLUGIN_NAME", &self.plugin_name)
+            .env("COWD_TOOL_NAME", &self.definition.name)
+            .env("COWD_TOOL_INPUT", &input_json);
         if let Some(root) = &self.root {
             process
                 .current_dir(root)
-                .env("CLAWD_PLUGIN_ROOT", root.display().to_string());
+                .env("COWD_PLUGIN_ROOT", root.display().to_string());
         }
 
         let mut child = process.spawn()?;
@@ -1626,11 +1626,11 @@ fn detect_claude_code_manifest_contract_gaps(
         ),
         (
             "mcpServers",
-            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; `claw` does not import MCP servers from plugin manifests.",
+            "plugin manifest field `mcpServers` uses the Claude Code plugin contract; Cowd does not import MCP servers from plugin manifests.",
         ),
         (
             "agents",
-            "plugin manifest field `agents` uses the Claude Code plugin contract; `claw` does not load plugin-managed agent markdown catalogs from plugin manifests.",
+            "plugin manifest field `agents` uses the Claude Code plugin contract; Cowd does not load plugin-managed agent markdown catalogs from plugin manifests.",
         ),
     ] {
         if root.contains_key(field) {
@@ -1646,7 +1646,7 @@ fn detect_claude_code_manifest_contract_gaps(
         .is_some_and(|commands| commands.iter().any(Value::is_string))
     {
         errors.push(PluginManifestValidationError::UnsupportedManifestContract {
-            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; `claw` slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
+            detail: "plugin manifest field `commands` uses Claude Code-style directory globs; Cowd slash dispatch is still built-in and does not load plugin slash command markdown files.".to_string(),
         });
     }
 
@@ -1658,7 +1658,7 @@ fn detect_claude_code_manifest_contract_gaps(
             ) {
                 errors.push(PluginManifestValidationError::UnsupportedManifestContract {
                     detail: format!(
-                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; `claw` plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
+                        "plugin hook `{hook_name}` uses the Claude Code lifecycle contract; Cowd plugins currently support only PreToolUse, PostToolUse, and PostToolUseFailure."
                     ),
                 });
             }
@@ -2444,7 +2444,7 @@ mod tests {
         let script_path = root.join("tools").join("echo-json.sh");
         write_file(
             &script_path,
-            "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_PLUGIN_ID\" \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
+            "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$COWD_PLUGIN_ID\" \"$COWD_TOOL_NAME\" \"$INPUT\"\n",
         );
         #[cfg(unix)]
         {
@@ -3511,7 +3511,7 @@ mod tests {
     /// Regression test for ROADMAP #41: verify that `COWD_CONFIG_HOME` isolation prevents
     /// host `~/.cowd/plugins/` from bleeding into test runs.
     #[test]
-    fn claw_config_home_isolation_prevents_host_plugin_leakage() {
+    fn cowd_config_home_isolation_prevents_host_plugin_leakage() {
         let _guard = env_lock().lock().expect("env lock");
 
         // Create a temp directory to act as our isolated COWD_CONFIG_HOME

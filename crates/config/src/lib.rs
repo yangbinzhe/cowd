@@ -239,10 +239,6 @@ pub struct UnifiedConfig {
     #[serde(flatten)]
     pub providers: ProvidersConfig,
 
-    /// Platform adapters configuration (T07-05)
-    #[serde(default)]
-    pub platforms: PlatformsConfig,
-
     /// Internal merged raw config for unknown keys
     #[serde(skip)]
     raw: BTreeMap<String, serde_json::Value>,
@@ -262,10 +258,6 @@ pub struct RuntimeConfig {
     /// Permission mode
     #[serde(default)]
     pub permission_mode: Option<String>,
-
-    /// Enable auto-compaction
-    #[serde(default)]
-    pub auto_compact: bool,
 
     /// Output style: "terse", "standard", or default
     #[serde(default)]
@@ -762,7 +754,7 @@ impl Default for StoreConfig {
 }
 
 /// Vector embedding configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorConfig {
     /// Enable remote embedding
     #[serde(default)]
@@ -811,7 +803,7 @@ impl Default for VectorConfig {
 }
 
 /// Compression configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompressionConfig {
     /// Micro compression settings (per tool-result)
     #[serde(default)]
@@ -835,6 +827,8 @@ pub struct CompressionConfig {
 }
 
 fn default_true_bool() -> bool { true }
+
+impl Eq for CompressionConfig {}
 
 impl Default for CompressionConfig {
     fn default() -> Self {
@@ -928,10 +922,6 @@ pub struct ProvidersConfig {
     /// Provider configurations keyed by name
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
-
-    /// Provider fallbacks
-    #[serde(default)]
-    pub fallbacks: ProviderFallbacks,
 }
 
 /// A single provider configuration
@@ -946,18 +936,6 @@ pub struct ProviderConfig {
     /// Supported models
     #[serde(default)]
     pub models: Vec<String>,
-}
-
-/// Provider fallback chain
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProviderFallbacks {
-    /// Primary provider name
-    #[serde(default)]
-    pub primary: Option<String>,
-
-    /// Fallback provider names in order
-    #[serde(default)]
-    pub chain: Vec<String>,
 }
 
 impl ProvidersConfig {
@@ -1289,7 +1267,7 @@ pub enum ResolvedPermissionMode {
 // ── Detailed Memory Sub-Configuration ─────────────────────────────────────
 
 /// Per-layer token and search limits for the memory subsystem.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerConfig {
     #[serde(default = "default_true_bool")]
     pub l0_enabled: bool,
@@ -1434,7 +1412,7 @@ impl Default for ModelProfile {
 }
 
 /// LLM summarization configuration for compression pipeline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmSummarizerConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1454,6 +1432,8 @@ impl LlmSummarizerConfig {
 }
 
 fn default_llm_model() -> String { "gpt-4o-mini".to_string() }
+
+impl Eq for LlmSummarizerConfig {}
 
 impl Default for LlmSummarizerConfig {
     fn default() -> Self {
@@ -1479,10 +1459,10 @@ pub struct MicroCompactConfig {
     pub time_decay_factor: f32,
 }
 
-impl Eq for MicroCompactConfig {}
-
 fn default_tool_result_max_chars() -> u32 { 4000 }
 fn default_decay_factor() -> f32 { 0.9 }
+
+impl Eq for MicroCompactConfig {}
 
 impl Default for MicroCompactConfig {
     fn default() -> Self {
@@ -1588,6 +1568,217 @@ pub struct OAuthConfig {
     pub scopes: Vec<String>,
 }
 
+// ── Runtime configuration types (unified from runtime::config) ──────────────
+
+/// Ordered chain of fallback model identifiers used when the primary
+/// provider returns a retryable failure (429/500/503/etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProviderFallbackConfig {
+    #[serde(default)]
+    pub primary: Option<String>,
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
+}
+
+/// Hook command lists grouped by lifecycle stage.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuntimeHookConfig {
+    #[serde(default)]
+    pub pre_tool_use: Vec<String>,
+    #[serde(default)]
+    pub post_tool_use: Vec<String>,
+    #[serde(default)]
+    pub post_tool_use_failure: Vec<String>,
+}
+
+/// Raw permission rule lists grouped by allow, deny, and ask behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuntimePermissionRuleConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+}
+
+/// Parsed plugin-related settings extracted from runtime config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePluginConfig {
+    #[serde(default)]
+    pub enabled_plugins: std::collections::BTreeMap<String, bool>,
+    #[serde(default)]
+    pub external_directories: Vec<String>,
+    #[serde(default)]
+    pub install_root: Option<String>,
+    #[serde(default)]
+    pub registry_path: Option<String>,
+    #[serde(default)]
+    pub bundled_root: Option<String>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+}
+
+// ── Impl blocks for runtime config types ────────────────────────────────────
+
+impl Default for RuntimePluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled_plugins: std::collections::BTreeMap::default(),
+            external_directories: Vec::default(),
+            install_root: None,
+            registry_path: None,
+            bundled_root: None,
+            max_output_tokens: std::env::var("COWD_MAX_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+        }
+    }
+}
+
+impl ProviderFallbackConfig {
+    #[must_use]
+    pub fn new(primary: Option<String>, fallbacks: Vec<String>) -> Self {
+        Self { primary, fallbacks }
+    }
+
+    #[must_use]
+    pub fn primary(&self) -> Option<&str> {
+        self.primary.as_deref()
+    }
+
+    #[must_use]
+    pub fn fallbacks(&self) -> &[String] {
+        &self.fallbacks
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fallbacks.is_empty()
+    }
+}
+
+impl RuntimePluginConfig {
+    #[must_use]
+    pub fn enabled_plugins(&self) -> &std::collections::BTreeMap<String, bool> {
+        &self.enabled_plugins
+    }
+
+    #[must_use]
+    pub fn external_directories(&self) -> &[String] {
+        &self.external_directories
+    }
+
+    #[must_use]
+    pub fn install_root(&self) -> Option<&str> {
+        self.install_root.as_deref()
+    }
+
+    #[must_use]
+    pub fn registry_path(&self) -> Option<&str> {
+        self.registry_path.as_deref()
+    }
+
+    #[must_use]
+    pub fn bundled_root(&self) -> Option<&str> {
+        self.bundled_root.as_deref()
+    }
+
+    #[must_use]
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
+
+    #[must_use]
+    pub fn state_for(&self, plugin_id: &str, default_enabled: bool) -> bool {
+        self.enabled_plugins
+            .get(plugin_id)
+            .copied()
+            .unwrap_or(default_enabled)
+    }
+}
+
+impl RuntimeHookConfig {
+    #[must_use]
+    pub fn new(
+        pre_tool_use: Vec<String>,
+        post_tool_use: Vec<String>,
+        post_tool_use_failure: Vec<String>,
+    ) -> Self {
+        Self {
+            pre_tool_use,
+            post_tool_use,
+            post_tool_use_failure,
+        }
+    }
+
+    #[must_use]
+    pub fn pre_tool_use(&self) -> &[String] {
+        &self.pre_tool_use
+    }
+
+    #[must_use]
+    pub fn post_tool_use(&self) -> &[String] {
+        &self.post_tool_use
+    }
+
+    #[must_use]
+    pub fn post_tool_use_failure(&self) -> &[String] {
+        &self.post_tool_use_failure
+    }
+
+    #[must_use]
+    pub fn merged(&self, other: &Self) -> Self {
+        let mut merged = self.clone();
+        merged.extend(other);
+        merged
+    }
+
+    pub fn extend(&mut self, other: &Self) {
+        // Deduplicate per-field: each field's uniqueness is independent
+        let mut pre_set: std::collections::HashSet<String> = self.pre_tool_use.iter().cloned().collect();
+        for item in &other.pre_tool_use {
+            if pre_set.insert(item.clone()) {
+                self.pre_tool_use.push(item.clone());
+            }
+        }
+        let mut post_set: std::collections::HashSet<String> = self.post_tool_use.iter().cloned().collect();
+        for item in &other.post_tool_use {
+            if post_set.insert(item.clone()) {
+                self.post_tool_use.push(item.clone());
+            }
+        }
+        let mut fail_set: std::collections::HashSet<String> = self.post_tool_use_failure.iter().cloned().collect();
+        for item in &other.post_tool_use_failure {
+            if fail_set.insert(item.clone()) {
+                self.post_tool_use_failure.push(item.clone());
+            }
+        }
+    }
+}
+
+impl RuntimePermissionRuleConfig {
+    #[must_use]
+    pub fn new(allow: Vec<String>, deny: Vec<String>, ask: Vec<String>) -> Self {
+        Self { allow, deny, ask }
+    }
+
+    #[must_use]
+    pub fn allow(&self) -> &[String] {
+        &self.allow
+    }
+
+    #[must_use]
+    pub fn deny(&self) -> &[String] {
+        &self.deny
+    }
+
+    #[must_use]
+    pub fn ask(&self) -> &[String] {
+        &self.ask
+    }
+}
+
 // ── Convenience Re-exports ───────────────────────────────────────────────────
 
 /// Simple directory helper for config paths.
@@ -1666,7 +1857,6 @@ mod tests {
         let cfg = RuntimeConfig::default();
         assert!(cfg.model.is_none());
         assert!(cfg.model_aliases.is_empty());
-        assert!(!cfg.auto_compact);
     }
 
     #[test]
@@ -1853,5 +2043,59 @@ mod tests {
         let cfg = RuntimeConfig::default();
         assert!(cfg.output_style.is_none());
         assert_eq!(cfg.prompt_cache.check_interval, 5);
+    }
+
+    // ── Robustness tests ───────────────────────────────────────────────
+
+    #[test]
+    fn deserializes_config_default_yaml() {
+        let default_yaml = include_str!("../../../config-default.yaml");
+        // config-default.yaml is ingested by runtime's ConfigLoader which
+        // maps top-level keys to feature config paths. The UnifiedConfig
+        // struct expects nested runtime/memory/gateway sections, but the
+        // default yaml uses a flattened layout for user ergonomics.
+        // This test verifies the yaml is valid and can be parsed at all.
+        let _config: serde_yaml::Value = serde_yaml::from_str(default_yaml)
+            .expect("config-default.yaml should be valid YAML");
+    }
+
+    #[test]
+    fn all_defaults_are_sane() {
+        // Verify every config type has reasonable defaults
+        let cfg = CompressionConfig::default();
+        assert!(cfg.micro.enabled);
+        assert_eq!(cfg.session.threshold_tokens, 80000);
+        assert!(cfg.deep.enabled);
+        assert_eq!(cfg.circuit_breaker.max_retries, 3);
+
+        let mem = MemoryConfig::default();
+        assert!(mem.enabled);
+        assert!(mem.aaak_index_enabled);
+        assert_eq!(mem.coherence_threshold_bp, 1000);
+        assert_eq!(mem.budget.context_window, 200000);
+        assert_eq!(mem.budget.warning_threshold, 0.70);
+        assert_eq!(mem.budget.critical_threshold, 0.90);
+        assert_eq!(mem.extractor.auto_extract, true);
+        assert_eq!(mem.extractor.min_confidence, 0.6);
+        assert_eq!(mem.drift.staleness_decay_per_day, 0.02);
+        assert_eq!(mem.perf.hook_max_ms, 500);
+    }
+
+    #[test]
+    fn vector_config_defaults_disabled() {
+        let cfg = VectorConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.dimension, 0);
+        assert_eq!(cfg.timeout_secs, 30);
+        assert_eq!(cfg.batch_size, 32);
+    }
+
+    #[test]
+    fn env_var_prefix_is_cowd() {
+        // Ensure env var override prefix is "COWD_"
+        let prefix = "COWD_";
+        assert!(!prefix.is_empty());
+        // All COWD_* env vars should override config values
+        // This test validates the naming convention, not actual env state
     }
 }

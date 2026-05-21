@@ -1,12 +1,36 @@
-//! L4 – Shared / team-scoped layer.
+//! L4 – Shared / team knowledge backbone for multi-agent collaboration.
 //!
-//! Entries here are visible to all agents within a team or organisation.
-//! Typical content: shared conventions, team decisions, on-call runbooks.
+//! # Role in Multi-Agent Architecture
 //!
-//! Characteristics:
-//! - Optional: if `enabled` is false all operations are no-ops / empty
-//! - Entries are scoped with a shared scope key (e.g. team name)
-//! - Sync mechanism: re-reads entries from a shared store path on demand
+//! L4 serves as the **cross-agent knowledge bus** in Cowd's multi-agent
+//! architecture. Unlike L0-L3 which are session/agent-scoped, L4 entries are
+//! visible to all agents within a team or organisation.
+//!
+//! ## Key Use Cases
+//!
+//! - **Team conventions**: coding standards, review checklists, naming conventions
+//! - **Shared decisions**: architectural decisions, API contracts, design tradeoffs
+//! - **Task handoff**: agent-to-agent context transfer via persistent shared entries
+//! - **Runbooks**: operational knowledge, on-call procedures, troubleshooting guides
+//! - **Agent orchestration**: Worker assignments, task progress tracking, completion
+//!   signals visible to the orchestrator and peer agents
+//!
+//! ## Scope Isolation
+//!
+//! Each entry is tagged with an optional `shared_scope` key (e.g. team name,
+//! organisation ID). Agents in different scopes are isolated from each other's
+//! shared memory. This enables multi-tenant deployments where Team A and Team B
+//! share the same Cowd instance but have separate knowledge spaces.
+//!
+//! ## Characteristics
+//!
+//! - **Optional by default**: disabled in single-user mode; auto-enabled when
+//!   team mode is activated via configuration.
+//! - **Scope-keyed isolation**: entries are tagged with a team/organisation scope.
+//! - **Sync mechanism**: periodic re-read from shared store ensures freshness
+//!   across concurrent agent sessions.
+//! - **Automatic pruning**: stale entries (exceeding drift threshold) are
+//!   removed during `tick()` to prevent accumulation.
 
 use async_trait::async_trait;
 use chrono::Utc;

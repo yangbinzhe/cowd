@@ -373,6 +373,7 @@ fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
 }
 
 /// Estimate the serialized byte size of a message request body.
+#[allow(dead_code)]
 #[must_use]
 pub fn estimate_request_body_size(request: &MessageRequest) -> usize {
     serde_json::to_vec(request).map_or(0, |bytes| bytes.len())
@@ -380,6 +381,7 @@ pub fn estimate_request_body_size(request: &MessageRequest) -> usize {
 
 /// Check whether a request body exceeds the given per-provider byte limit.
 /// Returns `Ok(())` when no limit is configured or the body fits.
+#[allow(dead_code)]
 pub fn check_request_body_size(
     request: &MessageRequest,
     max_bytes: Option<usize>,
@@ -582,7 +584,7 @@ mod tests {
 
     #[test]
     fn qwen_prefix_routes_to_dashscope_not_anthropic() {
-        // User request from Discord #clawcode-get-help: web3g wants to use
+        // User request from community support: web3g wants to use
         // Qwen 3.6 Plus via native Alibaba DashScope API (not OpenRouter,
         // which has lower rate limits). metadata_for_model must route
         // qwen/* and bare qwen-* to the OpenAi provider kind pointed at
