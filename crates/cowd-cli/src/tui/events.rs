@@ -27,8 +27,6 @@ pub enum TuiEvent {
     // ── Statistics ──
     /// Cumulative token usage
     TokenUsage { input: u64, output: u64, cache_create: u64, cache_read: u64 },
-    /// Estimated cost in USD
-    CostEstimate { cost_usd: f64 },
 
     // ── Turn lifecycle ──
     /// A new turn has started (user input being processed)
@@ -48,11 +46,11 @@ pub type TuiEventSender = mpsc::SyncSender<TuiEvent>;
 pub type TuiEventReceiver = mpsc::Receiver<TuiEvent>;
 
 /// Create a bounded TUI event channel.
-/// Buffer size 256 prevents backpressure from blocking the background thread
-/// while providing enough headroom for bursty streaming events.
+/// Buffer size 2048 provides headroom for bursty streaming events
+/// without dropping, while bounded to prevent runaway memory.
 #[must_use]
 pub fn tui_event_channel() -> (TuiEventSender, TuiEventReceiver) {
-    mpsc::sync_channel::<TuiEvent>(256)
+    mpsc::sync_channel::<TuiEvent>(2048)
 }
 
 #[cfg(test)]
@@ -82,7 +80,7 @@ mod tests {
     #[test]
     fn channel_backpressure_no_panic() {
         let (tx, _rx) = tui_event_channel();
-        for i in 0..256 {
+        for i in 0..2048 {
             let _ = tx.try_send(TuiEvent::TextDelta { text: format!("msg{i}") });
         }
         // After channel fills, try_send returns Err — should not panic
@@ -101,7 +99,6 @@ mod tests {
             TuiEvent::ToolProgress { id: "i".into(), name: "n".into(), progress: "p".into() },
             TuiEvent::ToolComplete { id: "i".into(), name: "n".into(), summary: "s".into(), exit_code: Some(0) },
             TuiEvent::TokenUsage { input: 1, output: 2, cache_create: 3, cache_read: 4 },
-            TuiEvent::CostEstimate { cost_usd: 0.01 },
             TuiEvent::TurnStarted,
             TuiEvent::TurnComplete { assistant_text: "ok".into(), iterations: 1 },
             TuiEvent::TurnError { error: "e".into() },

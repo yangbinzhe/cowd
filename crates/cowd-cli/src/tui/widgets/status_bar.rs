@@ -36,8 +36,11 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray),
         ));
     }
-    if let Some(cost) = app.cost_estimate {
-        spans.push(Span::styled(format!(" │ ${:.4}", cost), Style::default().fg(Color::DarkGray)));
+    if app.turn_active && (app.turn_input_tokens > 0 || app.turn_output_tokens > 0) {
+        spans.push(Span::styled(
+            format!(" │ turn:in:{} out:{}", fmt_tokens(app.turn_input_tokens), fmt_tokens(app.turn_output_tokens)),
+            Style::default().fg(Color::Yellow),
+        ));
     }
     if app.compaction_count > 0 {
         spans.push(Span::styled(format!(" │ cmp:{}", app.compaction_count), Style::default().fg(Color::DarkGray)));

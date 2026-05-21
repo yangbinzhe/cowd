@@ -25,9 +25,7 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
             if app.approval.is_some() { return handle_approval(app, key.code); }
             match key.code {
                 KeyCode::Esc => {
-                    if app.turn_active {
-                        return Ok(InputResult::Cancel);
-                    }
+                    if app.turn_active { return Ok(InputResult::Cancel); }
                     Ok(InputResult::Exit)
                 }
                 KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
@@ -35,10 +33,22 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                     Ok(InputResult::Exit)
                 }
                 KeyCode::Enter => {
+                    // Shift+Enter: insert newline
                     if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
                         app.input.insert_newline();
                         return Ok(InputResult::Nothing);
                     }
+                    // If input is empty and there's a focused collapsible entry, toggle it
+                    if app.input.is_empty() {
+                        let focused = app.timeline.get(app.timeline_cursor);
+                        if let Some(entry) = focused {
+                            if entry.is_collapsible() {
+                                app.toggle_expand_current();
+                                return Ok(InputResult::Nothing);
+                            }
+                        }
+                    }
+                    // Otherwise: submit
                     let text = app.input.lines().join("\n").trim().to_string();
                     app.input = TextArea::default();
                     app.input.set_block(Block::default().borders(Borders::ALL).title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
@@ -46,14 +56,10 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                 }
                 KeyCode::Tab => { app.next_panel(); Ok(InputResult::Nothing) }
                 KeyCode::Up => {
-                    // If thinking panel is expanded and input is empty, scroll thinking
-                    if app.input.is_empty() && app.thinking_expanded && !app.streaming_thinking.is_empty() {
-                        app.thinking_auto_scroll = false;
-                        app.thinking_scroll_offset = app.thinking_scroll_offset.saturating_sub(1);
-                        return Ok(InputResult::Nothing);
-                    }
                     if app.input.is_empty() {
-                        app.auto_scroll = false;
+                        // Navigate timeline cursor up
+                        app.cursor_up();
+                        // Also scroll the view a bit
                         app.scroll_offset = app.scroll_offset.saturating_sub(1);
                         return Ok(InputResult::Nothing);
                     }
@@ -61,11 +67,8 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                     Ok(InputResult::Nothing)
                 }
                 KeyCode::Down => {
-                    if app.input.is_empty() && app.thinking_expanded && !app.streaming_thinking.is_empty() {
-                        app.thinking_scroll_offset = app.thinking_scroll_offset.saturating_add(1);
-                        return Ok(InputResult::Nothing);
-                    }
                     if app.input.is_empty() {
+                        app.cursor_down();
                         app.scroll_offset = app.scroll_offset.saturating_add(1);
                         return Ok(InputResult::Nothing);
                     }
@@ -73,11 +76,6 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                     Ok(InputResult::Nothing)
                 }
                 KeyCode::PageUp => {
-                    if app.input.is_empty() && app.thinking_expanded && !app.streaming_thinking.is_empty() {
-                        app.thinking_auto_scroll = false;
-                        app.thinking_scroll_offset = app.thinking_scroll_offset.saturating_sub(10);
-                        return Ok(InputResult::Nothing);
-                    }
                     if app.input.is_empty() {
                         app.auto_scroll = false;
                         app.scroll_offset = app.scroll_offset.saturating_sub(10);
@@ -87,10 +85,6 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                     Ok(InputResult::Nothing)
                 }
                 KeyCode::PageDown => {
-                    if app.input.is_empty() && app.thinking_expanded && !app.streaming_thinking.is_empty() {
-                        app.thinking_scroll_offset = app.thinking_scroll_offset.saturating_add(10);
-                        return Ok(InputResult::Nothing);
-                    }
                     if app.input.is_empty() {
                         app.scroll_offset = app.scroll_offset.saturating_add(10);
                         return Ok(InputResult::Nothing);

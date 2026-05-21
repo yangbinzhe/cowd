@@ -2505,6 +2505,7 @@ fn list_workspace_files(workspace: &PathBuf) -> Vec<tui::FileEntry> {
 
 fn load_session_history(app: &mut tui::App, session: &runtime::Session) {
     use runtime::{ContentBlock, MessageRole};
+    use crate::tui::TuiEvent;
 
     for msg in &session.messages {
         match msg.role {
@@ -2525,14 +2526,28 @@ fn load_session_history(app: &mut tui::App, session: &runtime::Session) {
                                 app.add_message("assistant", &text_parts.join(""));
                                 text_parts.clear();
                             }
-                            app.add_tool_card(id, name);
-                            app.update_tool_card(id, input, Some(0));
+                            // Create a collapsed tool card via ToolStart event
+                            let preview = if input.len() > 100 {
+                                format!("{}...", &input[..100])
+                            } else {
+                                input.clone()
+                            };
+                            app.apply_event(TuiEvent::ToolStart {
+                                id: id.clone(),
+                                name: name.clone(),
+                                preview,
+                            });
                         }
                         ContentBlock::ToolResult {
                             tool_use_id, output, is_error, ..
                         } => {
                             let exit = if *is_error { Some(1) } else { Some(0) };
-                            app.update_tool_card(tool_use_id, output, exit);
+                            app.apply_event(TuiEvent::ToolComplete {
+                                id: tool_use_id.clone(),
+                                name: String::new(),
+                                summary: output.clone(),
+                                exit_code: exit,
+                            });
                         }
                         _ => {}
                     }
@@ -2649,6 +2664,8 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
     let res = (|| -> Result<(), Box<dyn std::error::Error>> {
         let frame_budget = std::time::Duration::from_millis(8);
+        let render_throttle = std::time::Duration::from_millis(16);
+        let mut last_render_time = std::time::Instant::now();
         loop {
             let frame_start = std::time::Instant::now();
 
@@ -2664,7 +2681,6 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                     cli.replace_runtime(runtime)?;
                                     app.is_loading = false;
                                     app.token_count = cli.runtime.usage().cumulative_usage().total_tokens() as u64;
-                                    app.cost_estimate = Some(cli.runtime.usage().cumulative_usage().estimate_cost_usd().total_cost_usd());
                                 }
                                 tui::TurnOutcome::Cancelled => {
                                     app.is_loading = false;
@@ -2687,7 +2703,13 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                     abort_signal_for_turn = None;
                 }
 
-            terminal.draw(|f| tui::render::draw(f, &mut app))?;
+            // Throttle rendering during active turns to avoid burning CPU
+            // on redundant terminal redraws. Events are still drained in real-time.
+            let since_last_render = last_render_time.elapsed();
+            if since_last_render >= render_throttle || !app.turn_active {
+                terminal.draw(|f| tui::render::draw(f, &mut app))?;
+                last_render_time = std::time::Instant::now();
+            }
 
             match tui::input::handle_input(&mut app)? {
                 tui::input::InputResult::Submit(text) => {
@@ -2771,7 +2793,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                 }
                 tui::input::InputResult::Nothing => {}
             }
-            let budget = if app.turn_active { Duration::from_millis(0) } else { frame_budget };
+            let budget = if app.turn_active { Duration::from_millis(2) } else { frame_budget };
             let elapsed = frame_start.elapsed();
             if elapsed < budget {
                 std::thread::sleep(budget - elapsed);

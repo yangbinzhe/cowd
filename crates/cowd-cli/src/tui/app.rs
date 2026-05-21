@@ -3,6 +3,74 @@ use tui_textarea::TextArea;
 use ratatui::widgets::{Block, Borders};
 use crate::tui::TuiEvent;
 
+/// A single entry in the time-ordered conversation timeline.
+/// Replaces the old split model of Vec<ChatMessage> + Vec<ToolCard> + streaming_thinking.
+#[derive(Debug, Clone)]
+pub enum TimelineEntry {
+    /// A text message (user or assistant or system).
+    Message {
+        role: String,
+        content: String,
+    },
+    /// A thinking/reasoning block that can be collapsed.
+    Thinking {
+        id: u64,
+        content: String,
+        complete: bool,
+        expanded: bool,
+    },
+    /// A tool call that can be collapsed.
+    ToolCall {
+        id: String,
+        name: String,
+        preview: String,
+        output: String,
+        done: bool,
+        expanded: bool,
+        exit_code: Option<i32>,
+    },
+}
+
+impl TimelineEntry {
+    /// Number of display lines when fully expanded (approx).
+    pub fn expanded_lines(&self) -> usize {
+        match self {
+            Self::Message { content, .. } => content.lines().count().max(1),
+            Self::Thinking { content, expanded, .. } => {
+                if *expanded { content.lines().count().max(1) + 2 } else { 1 }
+            }
+            Self::ToolCall { output, expanded, .. } => {
+                if *expanded && !output.is_empty() { output.lines().count().max(1) + 2 } else { 1 }
+            }
+        }
+    }
+
+    /// Whether this entry can be toggled (expanded/collapsed).
+    pub fn is_collapsible(&self) -> bool {
+        matches!(self, Self::Thinking { .. } | Self::ToolCall { .. })
+    }
+
+    /// Whether this entry is currently expanded.
+    pub fn is_expanded(&self) -> bool {
+        match self {
+            Self::Thinking { expanded, .. } => *expanded,
+            Self::ToolCall { expanded, .. } => *expanded,
+            _ => false,
+        }
+    }
+
+    /// Toggle expanded state.
+    pub fn toggle(&mut self) {
+        match self {
+            Self::Thinking { expanded, .. } => *expanded = !*expanded,
+            Self::ToolCall { expanded, .. } => *expanded = !*expanded,
+            _ => {}
+        }
+    }
+}
+
+// ── Legacy types kept for App API compatibility ──
+
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub role: String,
@@ -33,14 +101,19 @@ pub enum Panel { Chat, Gateway, Files, Delegate, Memory, Skills }
 pub struct App {
     pub model: String,
     pub session_id: String,
-    pub messages: Vec<ChatMessage>,
     pub input: TextArea<'static>,
     pub is_loading: bool,
     pub spinner_idx: usize,
     pub should_quit: bool,
-    pub tool_cards: Vec<ToolCard>,
+
+    // ── Timeline (replaces messages + tool_cards + streaming_thinking) ──
+    pub timeline: Vec<TimelineEntry>,
+    /// Index of the currently focused timeline entry (for expand/collapse).
+    pub timeline_cursor: usize,
+    /// Counter for generating unique thinking IDs.
+    thinking_id_counter: u64,
+
     pub token_count: u64,
-    pub cost_estimate: Option<f64>,
     pub compaction_count: u32,
     pub cache_hits: u64,
     pub picker_active: bool,
@@ -57,20 +130,31 @@ pub struct App {
     pub skill_list: Vec<SkillSummary>,
     pub skin: crate::tui::skin::SkinConfig,
     pub memory_status: Option<String>,
+
+    // ── Scrolling ──
     pub scroll_offset: u16,
     pub auto_scroll: bool,
+
+    // ── Turn state ──
     pub turn_active: bool,
-    pub streaming_thinking: String,
-    pub thinking_expanded: bool,
-    pub thinking_complete: bool,
-    pub thinking_scroll_offset: u16,
-    pub thinking_auto_scroll: bool,
+    /// Whether we've received any TextDelta this turn (for TurnComplete fallback).
     streaming_received: bool,
+
     pub msg_version: u64,
     pub last_drawn_version: u64,
     pub context_window: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+
+    // ── Per-turn token tracking ──
+    pub turn_input_tokens: u64,
+    pub turn_output_tokens: u64,
+    /// Snapshot of cumulative totals at turn start (for computing deltas).
+    pre_turn_input: u64,
+    pre_turn_output: u64,
+
+    // ── Render cache ──
+    pub cached_chat_lines: Vec<ratatui::text::Line<'static>>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,14 +228,16 @@ impl App {
         Self {
             model: model.to_string(),
             session_id: session_id.to_string(),
-            messages: Vec::new(),
             input,
             is_loading: false,
             spinner_idx: 0,
             should_quit: false,
-            tool_cards: Vec::new(),
+
+            timeline: Vec::new(),
+            timeline_cursor: 0,
+            thinking_id_counter: 0,
+
             token_count: 0,
-            cost_estimate: None,
             compaction_count: 0,
             cache_hits: 0,
             picker_active: false,
@@ -168,20 +254,25 @@ impl App {
             skill_list: Vec::new(),
             skin: crate::tui::skin::SkinConfig::default(),
             memory_status: None,
+
             scroll_offset: 0,
             auto_scroll: true,
+
             turn_active: false,
-            streaming_thinking: String::new(),
-            thinking_expanded: false,
-            thinking_complete: false,
-            thinking_scroll_offset: 0,
-            thinking_auto_scroll: true,
             streaming_received: false,
+
             msg_version: 0,
             last_drawn_version: u64::MAX,
             context_window: 0,
             input_tokens: 0,
             output_tokens: 0,
+
+            turn_input_tokens: 0,
+            turn_output_tokens: 0,
+            pre_turn_input: 0,
+            pre_turn_output: 0,
+
+            cached_chat_lines: Vec::new(),
         }
     }
 
@@ -203,35 +294,7 @@ impl App {
 
     pub fn tick(&mut self) { self.spinner_idx = self.spinner_idx.wrapping_add(1); }
 
-    pub fn add_message(&mut self, role: &str, content: &str) {
-        self.messages.push(ChatMessage { role: role.to_string(), content: content.to_string() });
-        self.msg_version = self.msg_version.wrapping_add(1);
-        const MAX: usize = 2000;
-        if self.messages.len() > MAX {
-            let excess = self.messages.len() - MAX;
-            self.messages.drain(0..excess);
-            self.scroll_offset = self.scroll_offset.saturating_sub(excess as u16);
-        }
-    }
-
-    pub fn add_tool_card(&mut self, id: &str, name: &str) {
-        const MAX_CARDS: usize = 200;
-        if self.tool_cards.len() >= MAX_CARDS {
-            self.tool_cards.remove(0);
-        }
-        self.tool_cards.push(ToolCard {
-            id: id.to_string(), name: name.to_string(), output: String::new(),
-            done: false, expanded: true, exit_code: None,
-        });
-    }
-
-    pub fn update_tool_card(&mut self, id: &str, output: &str, exit_code: Option<i32>) {
-        if let Some(card) = self.tool_cards.iter_mut().find(|c| c.id == id) {
-            card.output = output.to_string();
-            card.done = true;
-            card.exit_code = exit_code;
-        }
-    }
+    // ── Session picker ──
 
     pub fn open_session_picker(&mut self, sessions: Vec<SessionSummary>) {
         self.picker_sessions = sessions;
@@ -257,78 +320,245 @@ impl App {
         self.picker_sessions.get(self.picker_idx).map(|s| s.id.as_str())
     }
 
+    // ── Navigation ──
+
+    /// Move timeline cursor up by one collapsible entry.
+    pub fn cursor_up(&mut self) {
+        if self.timeline.is_empty() { return; }
+        let mut idx = self.timeline_cursor;
+        loop {
+            if idx == 0 { break; }
+            idx -= 1;
+            if self.timeline[idx].is_collapsible() {
+                self.timeline_cursor = idx;
+                self.auto_scroll = false;
+                return;
+            }
+        }
+        // If no collapsible entry found above, stay at current
+    }
+
+    /// Move timeline cursor down by one collapsible entry.
+    pub fn cursor_down(&mut self) {
+        if self.timeline.is_empty() { return; }
+        let mut idx = self.timeline_cursor;
+        while idx + 1 < self.timeline.len() {
+            idx += 1;
+            if self.timeline[idx].is_collapsible() {
+                self.timeline_cursor = idx;
+                self.auto_scroll = true; // re-enable auto-scroll when moving to bottom
+                return;
+            }
+        }
+    }
+
+    /// Toggle expand/collapse on the currently focused timeline entry.
+    pub fn toggle_expand_current(&mut self) {
+        if let Some(entry) = self.timeline.get_mut(self.timeline_cursor) {
+            entry.toggle();
+            self.msg_version = self.msg_version.wrapping_add(1);
+        }
+    }
+
+    // ── Trim ──
+
+    fn trim_timeline(&mut self) {
+        const MAX: usize = 3000;
+        if self.timeline.len() > MAX {
+            let excess = self.timeline.len() - MAX;
+            self.timeline.drain(0..excess);
+            self.timeline_cursor = self.timeline_cursor.saturating_sub(excess);
+            self.scroll_offset = self.scroll_offset.saturating_sub(excess as u16);
+        }
+    }
+
+    // ── Public API (used by runner to push user/system messages) ──
+
+    /// Add a user or system message to the timeline.
+    pub fn add_message(&mut self, role: &str, content: &str) {
+        self.timeline.push(TimelineEntry::Message {
+            role: role.to_string(),
+            content: content.to_string(),
+        });
+        self.timeline_cursor = self.timeline.len().saturating_sub(1);
+        self.msg_version = self.msg_version.wrapping_add(1);
+        self.trim_timeline();
+    }
+
+    // ── Event handling ──
+
     /// Apply a TuiEvent from the background turn runner to the display state.
     pub fn apply_event(&mut self, event: TuiEvent) {
         match event {
             TuiEvent::TextDelta { text } => {
                 self.streaming_received = true;
                 self.auto_scroll = true;
-                if let Some(last) = self.messages.last_mut() {
-                    if last.role == "assistant" && last.content != "✓ Done" {
-                        last.content.push_str(&text);
-                        return;
+                // Find last incomplete assistant Message, or create new one
+                let mut found = false;
+                if let Some(TimelineEntry::Message { role, content }) = self.timeline.last_mut() {
+                    if role == "assistant" && content != "✓ Done" {
+                        content.push_str(&text);
+                        found = true;
                     }
                 }
-                self.add_message("assistant", &text);
+                if !found {
+                    self.timeline.push(TimelineEntry::Message {
+                        role: "assistant".into(),
+                        content: text,
+                    });
+                }
+                self.timeline_cursor = self.timeline.len().saturating_sub(1);
+                self.msg_version = self.msg_version.wrapping_add(1);
+                self.trim_timeline();
             }
+
             TuiEvent::ThinkingDelta { thinking } => {
-                self.streaming_thinking.push_str(&thinking);
+                // Find last incomplete Thinking entry, or create new one
+                let mut found = false;
+                if let Some(TimelineEntry::Thinking { content, complete, .. }) = self.timeline.last_mut() {
+                    if !*complete {
+                        content.push_str(&thinking);
+                        found = true;
+                    }
+                }
+                if !found {
+                    let id = self.thinking_id_counter;
+                    self.thinking_id_counter += 1;
+                    self.timeline.push(TimelineEntry::Thinking {
+                        id,
+                        content: thinking,
+                        complete: false,
+                        expanded: false,
+                    });
+                }
+                self.timeline_cursor = self.timeline.len().saturating_sub(1);
+                self.msg_version = self.msg_version.wrapping_add(1);
+                self.trim_timeline();
             }
+
             TuiEvent::ThinkingComplete => {
-                self.thinking_complete = true;
+                // Mark the last incomplete Thinking as complete and collapse it
+                if let Some(TimelineEntry::Thinking { complete, expanded, .. }) = self.timeline.last_mut() {
+                    *complete = true;
+                    *expanded = false; // auto-collapse when done
+                }
+                self.msg_version = self.msg_version.wrapping_add(1);
             }
-            TuiEvent::ToolStart { id, name, preview: _ } => {
+
+            TuiEvent::ToolStart { id, name, preview } => {
                 self.auto_scroll = true;
-                self.add_tool_card(&id, &name);
+                self.timeline.push(TimelineEntry::ToolCall {
+                    id,
+                    name,
+                    preview,
+                    output: String::new(),
+                    done: false,
+                    expanded: true, // expanded while running so user can see progress
+                    exit_code: None,
+                });
+                self.timeline_cursor = self.timeline.len().saturating_sub(1);
+                self.msg_version = self.msg_version.wrapping_add(1);
+                self.trim_timeline();
             }
+
             TuiEvent::ToolProgress { id, name: _, progress } => {
-                if let Some(card) = self.tool_cards.iter_mut().find(|c| c.id == id) {
-                    card.done = false;
-                    card.output.push_str(&progress);
-                    if card.output.len() > 4096 {
-                        card.output = card.output[card.output.len() - 4096..].to_string();
+                if let Some(TimelineEntry::ToolCall { output, .. }) = self.timeline.iter_mut()
+                    .rev()
+                    .find(|e| matches!(e, TimelineEntry::ToolCall { id: tid, .. } if tid == &id))
+                {
+                    output.push_str(&progress);
+                    if output.len() > 4096 {
+                        *output = output[output.len() - 4096..].to_string();
                     }
                 }
             }
+
             TuiEvent::ToolComplete { id, name: _, summary, exit_code } => {
-                self.update_tool_card(&id, &summary, exit_code);
+                if let Some(entry) = self.timeline.iter_mut()
+                    .rev()
+                    .find(|e| matches!(e, TimelineEntry::ToolCall { id: tid, .. } if tid == &id))
+                {
+                    if let TimelineEntry::ToolCall { output, done, expanded, exit_code: ec, .. } = entry {
+                        *output = summary;
+                        *done = true;
+                        *expanded = false; // auto-collapse when done
+                        *ec = exit_code;
+                    }
+                }
+                self.msg_version = self.msg_version.wrapping_add(1);
             }
+
             TuiEvent::TokenUsage { input, output, cache_create, cache_read } => {
                 self.input_tokens = input;
                 self.output_tokens = output;
                 self.token_count = input + output + cache_create + cache_read;
+                // Compute per-turn deltas from pre-turn snapshots
+                self.turn_input_tokens = input.saturating_sub(self.pre_turn_input);
+                self.turn_output_tokens = output.saturating_sub(self.pre_turn_output);
             }
-            TuiEvent::CostEstimate { cost_usd } => {
-                self.cost_estimate = Some(cost_usd);
-            }
+
             TuiEvent::TurnStarted => {
                 self.is_loading = true;
                 self.turn_active = true;
-                self.streaming_thinking.clear();
-                self.thinking_complete = false;
-                self.thinking_expanded = false;
-                self.thinking_scroll_offset = 0;
-                self.thinking_auto_scroll = true;
                 self.streaming_received = false;
-                self.tool_cards.clear();
+                self.thinking_id_counter = 0;
+                // Capture pre-turn snapshots for delta computation
+                self.pre_turn_input = self.input_tokens;
+                self.pre_turn_output = self.output_tokens;
+                self.turn_input_tokens = 0;
+                self.turn_output_tokens = 0;
+                self.msg_version = self.msg_version.wrapping_add(1);
             }
+
             TuiEvent::TurnComplete { assistant_text, iterations: _ } => {
                 self.is_loading = false;
                 self.turn_active = false;
-                self.thinking_complete = true;
-                if !assistant_text.is_empty() && !self.streaming_received {
-                    self.add_message("assistant", &assistant_text);
+                // Collapse all thinking and tool entries from this turn
+                for entry in &mut self.timeline {
+                    match entry {
+                        TimelineEntry::Thinking { expanded, .. } => *expanded = false,
+                        TimelineEntry::ToolCall { expanded, .. } => *expanded = false,
+                        _ => {}
+                    }
                 }
-                self.add_message("assistant", "✓ Done");
+                // If we didn't receive any streaming text, use the fallback
+                if !assistant_text.is_empty() && !self.streaming_received {
+                    self.timeline.push(TimelineEntry::Message {
+                        role: "assistant".into(),
+                        content: assistant_text,
+                    });
+                }
+                // Add the "✓ Done" marker
+                self.timeline.push(TimelineEntry::Message {
+                    role: "assistant".into(),
+                    content: "✓ Done".into(),
+                });
+                self.timeline_cursor = self.timeline.len().saturating_sub(1);
+                self.msg_version = self.msg_version.wrapping_add(1);
+                self.trim_timeline();
             }
+
             TuiEvent::TurnError { error } => {
                 self.is_loading = false;
                 self.turn_active = false;
-                self.add_message("system", &format!("Error: {error}"));
+                self.timeline.push(TimelineEntry::Message {
+                    role: "system".into(),
+                    content: format!("Error: {error}"),
+                });
+                self.timeline_cursor = self.timeline.len().saturating_sub(1);
+                self.msg_version = self.msg_version.wrapping_add(1);
+                self.trim_timeline();
             }
+
             TuiEvent::CompactionNotice { removed_count } => {
                 self.compaction_count += 1;
-                self.add_message("system", &format!("Compacted {removed_count} earlier messages to save context."));
+                self.timeline.push(TimelineEntry::Message {
+                    role: "system".into(),
+                    content: format!("Compacted {removed_count} earlier messages to save context."),
+                });
+                self.timeline_cursor = self.timeline.len().saturating_sub(1);
+                self.msg_version = self.msg_version.wrapping_add(1);
+                self.trim_timeline();
             }
         }
     }

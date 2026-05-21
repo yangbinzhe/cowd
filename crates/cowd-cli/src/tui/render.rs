@@ -3,7 +3,7 @@ use ratatui::{
     Frame,
 };
 use super::app::{App, Panel};
-use super::widgets::{self, chat, status_bar};
+use super::widgets::{chat, status_bar};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
