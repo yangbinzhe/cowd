@@ -602,7 +602,7 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/api/approval/respond", post(respond_to_approval_handler))
         .route("/api/approval/config", get(get_approval_config_handler))
         .route("/api/approval/config", put(update_approval_config_handler))
-        .route("/api/approval/yolo", post(toggle_yolo_handler))
+        .route("/api/approval/solo", post(toggle_solo_handler))
         .route("/api/approval/history", get(list_approval_history_handler));
 
     let cron_routes = Router::new()
@@ -4478,8 +4478,8 @@ async fn get_approval_config_handler(
 ) -> axum::response::Response {
     let config = state.approval_gate.config().read().await;
     Json(serde_json::json!({
-        "yolo_mode": config.yolo_mode,
-        "yolo_honor_critical": config.yolo_honor_critical,
+        "solo_mode": config.solo_mode,
+        "solo_honor_critical": config.solo_honor_critical,
         "auto_pass_read_only": config.auto_pass_read_only,
         "auto_pass_low_risk": config.auto_pass_low_risk,
     })).into_response()
@@ -4487,8 +4487,8 @@ async fn get_approval_config_handler(
 
 #[derive(Debug, Deserialize)]
 struct UpdateApprovalConfigPayload {
-    yolo_mode: Option<bool>,
-    yolo_honor_critical: Option<bool>,
+    solo_mode: Option<bool>,
+    solo_honor_critical: Option<bool>,
     auto_pass_read_only: Option<bool>,
     auto_pass_low_risk: Option<bool>,
 }
@@ -4499,43 +4499,43 @@ async fn update_approval_config_handler(
     Json(payload): Json<UpdateApprovalConfigPayload>,
 ) -> axum::response::Response {
     let mut config = state.approval_gate.config().read().await.clone();
-    if let Some(v) = payload.yolo_mode { config.yolo_mode = v; }
-    if let Some(v) = payload.yolo_honor_critical { config.yolo_honor_critical = v; }
+    if let Some(v) = payload.solo_mode { config.solo_mode = v; }
+    if let Some(v) = payload.solo_honor_critical { config.solo_honor_critical = v; }
     if let Some(v) = payload.auto_pass_read_only { config.auto_pass_read_only = v; }
     if let Some(v) = payload.auto_pass_low_risk { config.auto_pass_low_risk = v; }
     state.approval_gate.update_config(config).await;
 
     let config = state.approval_gate.config().read().await;
     Json(serde_json::json!({
-        "yolo_mode": config.yolo_mode,
-        "yolo_honor_critical": config.yolo_honor_critical,
+        "solo_mode": config.solo_mode,
+        "solo_honor_critical": config.solo_honor_critical,
         "auto_pass_read_only": config.auto_pass_read_only,
         "auto_pass_low_risk": config.auto_pass_low_risk,
     })).into_response()
 }
 
 #[derive(Debug, Deserialize)]
-struct ToggleYoloPayload {
+struct ToggleSoloPayload {
     enabled: bool,
     honor_critical: Option<bool>,
 }
 
-/// POST /api/approval/yolo - Toggle YOLO mode
-async fn toggle_yolo_handler(
+/// POST /api/approval/solo - Toggle SOLO mode
+async fn toggle_solo_handler(
     AxumState(state): AxumState<HttpAppState>,
-    Json(payload): Json<ToggleYoloPayload>,
+    Json(payload): Json<ToggleSoloPayload>,
 ) -> axum::response::Response {
     let mut config = state.approval_gate.config().read().await.clone();
-    config.yolo_mode = payload.enabled;
+    config.solo_mode = payload.enabled;
     if let Some(honor) = payload.honor_critical {
-        config.yolo_honor_critical = honor;
+        config.solo_honor_critical = honor;
     }
     state.approval_gate.update_config(config).await;
 
     let config = state.approval_gate.config().read().await;
     Json(serde_json::json!({
-        "yolo_mode": config.yolo_mode,
-        "yolo_honor_critical": config.yolo_honor_critical,
+        "solo_mode": config.solo_mode,
+        "solo_honor_critical": config.solo_honor_critical,
     })).into_response()
 }
 

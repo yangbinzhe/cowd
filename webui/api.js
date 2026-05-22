@@ -115,7 +115,7 @@ window.Api = (()=>{
     async respondApproval(id,approved){return req('POST','/api/approval/respond',{id,approved})},
     async getApprovalConfig(){return req('GET','/api/approval/config')},
     async updateApprovalConfig(cfg){return req('PUT','/api/approval/config',cfg)},
-    async toggleYolo(){return req('POST','/api/approval/yolo')},
+    async toggleSolo(){return req('POST','/api/approval/solo')},
     async approvalHistory(){return req('GET','/api/approval/history')},
 
     // ── Commands ──

@@ -991,8 +991,8 @@ pub enum AutoPassReason {
     ReadOnlyCommand,
     /// Command matched a Low-risk pattern but auto-pass is enabled.
     LowRiskAutoPass,
-    /// YOLO mode is active; non-critical commands bypass approval.
-    YoloBypass,
+    /// SOLO mode is active; non-critical commands bypass approval.
+    SoloBypass,
     /// Command was previously approved with Session/Always persistence.
     CachedApproval { persistence: ApprovalPersistence },
 }
@@ -1011,7 +1011,7 @@ impl DestructivePatternDetector {
     ///
     /// This method applies the smart approval policy:
     /// - Read-only commands auto-pass
-    /// - YOLO mode bypasses non-critical approvals
+    /// - SOLO mode bypasses non-critical approvals
     /// - Low-risk patterns auto-pass when configured
     /// - Everything else requires explicit approval
     pub fn detect_with_config(
@@ -1061,19 +1061,19 @@ impl DestructivePatternDetector {
             };
         };
 
-        // Step 5: YOLO mode logic
-        if config.yolo_mode {
-            // In YOLO mode, Critical-risk commands may still require approval
-            if approval_req.risk_level == RiskLevel::Critical && config.yolo_honor_critical {
+        // Step 5: SOLO mode logic
+        if config.solo_mode {
+            // In SOLO mode, Critical-risk commands may still require approval
+            if approval_req.risk_level == RiskLevel::Critical && config.solo_honor_critical {
                 // Fall through to NeedsApproval
             } else {
                 tracing::info!(
                     command = %raw_cmd,
                     risk_level = ?approval_req.risk_level,
-                    "YOLO mode: auto-passing command"
+                    "SOLO mode: auto-passing command"
                 );
                 return SmartApprovalVerdict::AutoPass {
-                    reason: AutoPassReason::YoloBypass,
+                    reason: AutoPassReason::SoloBypass,
                 };
             }
         }

@@ -334,7 +334,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Doctor { output_format } => doctor::run_doctor(output_format)?,
         CliAction::State { output_format } => mcp_serve::run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
-        CliAction::Serve { host, port, auth_enabled, cors_origins, output_format: _, yolo_mode } => {
+        CliAction::Serve { host, port, auth_enabled, cors_origins, output_format: _, solo_mode } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
             // ── 加载统一配置 ──
@@ -408,12 +408,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // platform configs: runtime::config::PlatformConfig → runtime::platform::PlatformConfig
             let platform_configs = build_platform_configs(runtime_config.gateway());
 
-            // approval config: 如果 --yolo 启用，强制设置 yolo_mode=true
+            // approval config: 如果 --solo 启用，强制设置 solo_mode=true
             let mut approval_config = runtime_config.approval().clone();
-            if yolo_mode {
-                approval_config.yolo_mode = true;
-                approval_config.yolo_honor_critical = false;
-                eprintln!("🚀 YOLO mode enabled: all command approvals bypassed");
+            if solo_mode {
+                approval_config.solo_mode = true;
+                approval_config.solo_honor_critical = false;
+                eprintln!("🚀 SOLO mode enabled: all command approvals bypassed");
             }
 
             let config = server::HttpConfig {
@@ -533,7 +533,7 @@ pub(crate) enum CliAction {
         auth_enabled: bool,
         cors_origins: Vec<String>,
         output_format: CliOutputFormat,
-        yolo_mode: bool,
+        solo_mode: bool,
     },
     Export {
         session_reference: String,
@@ -592,7 +592,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
-    let mut global_yolo_mode = false;
+    let mut global_solo_mode = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -662,9 +662,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode_override = Some(parse_permission_mode_arg(&flag[18..])?);
                 index += 1;
             }
-            "--dangerously-skip-permissions" | "--yolo" => {
+            "--dangerously-skip-permissions" | "--solo" => {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
-                global_yolo_mode = true;
+                global_solo_mode = true;
                 index += 1;
             }
             "--compact" => {
@@ -862,14 +862,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let mut port: Option<u16> = None;
             let mut auth_enabled = true;
             let mut cors_origins: Vec<String> = Vec::new();
-            let mut yolo_mode = false;
+            let mut solo_mode = false;
             let mut i = 1;
             while i < rest.len() {
                 match rest[i].as_str() {
                     "--host" if i + 1 < rest.len() => { host = Some(rest[i + 1].clone()); i += 2; }
                     "--port" if i + 1 < rest.len() => { port = Some(rest[i + 1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?); i += 2; }
                     "--no-auth" => { auth_enabled = false; i += 1; }
-                    "--yolo" => { yolo_mode = true; i += 1; }
+                    "--solo" => { solo_mode = true; i += 1; }
                     "--cors-origins" if i + 1 < rest.len() => {
                         cors_origins = rest[i + 1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
                         i += 2;
@@ -877,7 +877,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     other => return Err(format!("unknown serve flag: {other}")),
                 }
             }
-            Ok(CliAction::Serve { host, port, auth_enabled, cors_origins, output_format, yolo_mode: yolo_mode || global_yolo_mode })
+            Ok(CliAction::Serve { host, port, auth_enabled, cors_origins, output_format, solo_mode: solo_mode || global_solo_mode })
         }
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
@@ -8077,7 +8077,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --yolo                       Alias for --dangerously-skip-permissions"
+        "  --solo                       Alias for --dangerously-skip-permissions"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(

@@ -63,7 +63,7 @@ Cowd 内置多 Provider 路由层，支持自动根据模型名匹配对应的 A
 - 50+ 内置工具（文件、Bash、搜索、LSP、TODO、Web 等），按安全等级分类并发执行
 - 子 Agent 委派（`task` / `team` / `cron`）支持并行执行，含 token 预算控制
 - 智能审批流（`SmartApprovalGate` / `ToolSafetyCategory`）—— 危险操作分类拦截 + 模态确认
-- YOLO 模式 —— 跳过所有审批，用于全自动场景
+- SOLO 模式 —— 跳过所有审批，用于全自动场景
 - Worker 生命周期管理 —— 远端 worker boot、trust gate、prompt 交付保障
 
 ### Wave 并行编排
@@ -147,7 +147,7 @@ cowd/
 ### `cowd-cli` — 主程序入口
 
 唯一的二进制目标 `cowd`。职责：
-- 解析 CLI 参数（支持 `--model` / `--permission-mode` / `--yolo` 等 30+ 标志）
+- 解析 CLI 参数（支持 `--model` / `--permission-mode` / `--solo` 等 30+ 标志）
 - 管理三种交互模式：REPL、TUI、Server
 - 组装运行时组件：ConfigLoader → ConversationRuntime → ToolExecutor → ProviderClient
 - 处理会话生命周期：创建、继续、fork、compact、export
@@ -190,7 +190,7 @@ cowd/
 #### Gateway 配置 (`config.rs`)
 
 配置加载遵循严格优先级：
-1. **CLI 参数**（最高优先级，如 `--model` `--yolo`）
+1. **CLI 参数**（最高优先级，如 `--model` `--solo`）
 2. **环境变量**（`COWD_*` 前缀，如 `COWD_MODEL`）
 3. **Local 配置**（`.cowd/config.local.yaml`，git-ignored）
 4. **Project 配置**（`.cowd/config.yaml`）
@@ -424,7 +424,7 @@ mvp_tool_specs() -> Vec<ToolSpec>
 - `WorkspaceWrite` — 工作区写入操作
 - `DangerFullAccess` — 危险操作（Bash 执行、网络访问等）
 
-`PermissionEnforcer` + `ApprovalGate`（双层审批门）+ `ToolSafetyCategory` 构成三层防护。YOLO 模式可完全跳过审批。
+`PermissionEnforcer` + `ApprovalGate`（双层审批门）+ `ToolSafetyCategory` 构成三层防护。SOLO 模式可完全跳过审批。
 
 工具调用结果会自动裁剪（`ToolResultBudget`），支持 HeadOnly / TailOnly / HeadAndTail 三种截断策略。
 
@@ -531,7 +531,7 @@ WebUI 通过 REST API 与后端通信，主要端点：
 
 ### 配置文件优先级
 
-1. **CLI 参数** — `--model` `--permission-mode` `--yolo` `--reasoning-effort` 等
+1. **CLI 参数** — `--model` `--permission-mode` `--solo` `--reasoning-effort` 等
 2. **环境变量** — `COWD_MODEL` `ANTHROPIC_API_KEY` `COWD_PERMISSION_MODE` `COWD_AUTO_COMPACT_INPUT_TOKENS` 等
 3. **Local 配置** — `.cowd/config.local.yaml`（git-ignored）
 4. **Project 配置** — `.cowd/config.yaml`
@@ -621,8 +621,8 @@ echo "列出当前目录文件" | cowd
 # 指定模型
 cowd --model deepseek-v4-pro "写一个排序函数"
 
-# YOLO 模式（跳过所有审批）
-cowd --yolo prompt "自动修复所有 lint 错误"
+# SOLO 模式（跳过所有审批）
+cowd --solo prompt "自动修复所有 lint 错误"
 
 # 继续已保存会话并执行斜杠命令
 cowd --resume latest /status

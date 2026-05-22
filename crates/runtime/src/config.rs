@@ -945,8 +945,8 @@ fn parse_optional_approval_config(root: &JsonValue) -> Result<ApprovalConfig, Co
     };
 
     Ok(ApprovalConfig {
-        yolo_mode: optional_bool(approval, "yolo_mode", "merged settings.permissions.approval")?.unwrap_or(false),
-        yolo_honor_critical: optional_bool(approval, "yolo_honor_critical", "merged settings.permissions.approval")?.unwrap_or(true),
+        solo_mode: optional_bool(approval, "solo_mode", "merged settings.permissions.approval")?.unwrap_or(false),
+        solo_honor_critical: optional_bool(approval, "solo_honor_critical", "merged settings.permissions.approval")?.unwrap_or(true),
         auto_pass_read_only: optional_bool(approval, "auto_pass_read_only", "merged settings.permissions.approval")?.unwrap_or(true),
         auto_pass_low_risk: optional_bool(approval, "auto_pass_low_risk", "merged settings.permissions.approval")?.unwrap_or(true),
     })

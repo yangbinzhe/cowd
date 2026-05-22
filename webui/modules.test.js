@@ -62,7 +62,7 @@ describe('API module', () => {
     expect(typeof window.Api.respondApproval).toBe('function');
     expect(typeof window.Api.getApprovalConfig).toBe('function');
     expect(typeof window.Api.updateApprovalConfig).toBe('function');
-    expect(typeof window.Api.toggleYolo).toBe('function');
+    expect(typeof window.Api.toggleSolo).toBe('function');
     expect(typeof window.Api.approvalHistory).toBe('function');
   });
 
@@ -120,7 +120,7 @@ describe('API module', () => {
 
   it('gateway and skills endpoints are defined', () => {
     expect(typeof window.Api.getUsage).toBe('function');
-    expect(typeof window.Api.toggleYolo).toBe('function');
+    expect(typeof window.Api.toggleSolo).toBe('function');
     expect(typeof window.Api.compactSession).toBe('function');
   });
 

@@ -1,8 +1,8 @@
-//! Smart Approval Gate — intelligent command approval with YOLO mode support.
+//! Smart Approval Gate — intelligent command approval with SOLO mode support.
 //!
 //! This module provides the `SmartApprovalGate` which sits between the
 //! destructive pattern detector and the conversation runtime, applying
-//! approval configuration (YOLO mode, auto-pass settings) and managing
+//! approval configuration (SOLO mode, auto-pass settings) and managing
 //! the blocking approval flow with the frontend via SSE + oneshot channels.
 
 use std::collections::{HashMap, HashSet};
@@ -138,8 +138,8 @@ pub trait ApprovalSseSender: Send + Sync {
     fn send_approval_request(&self, request: &ApprovalRequest);
     /// Push an approval resolved event to the frontend.
     fn send_approval_resolved(&self, request_id: &str, verdict: &ApprovalVerdict);
-    /// Push a YOLO mode changed event to the frontend.
-    fn send_yolo_mode_changed(&self, enabled: bool, honor_critical: bool);
+    /// Push a SOLO mode changed event to the frontend.
+    fn send_solo_mode_changed(&self, enabled: bool, honor_critical: bool);
 }
 
 /// The smart approval gate combines destructive pattern detection with
@@ -155,7 +155,7 @@ pub trait ApprovalSseSender: Send + Sync {
 pub struct SmartApprovalGate {
     /// The destructive pattern detector.
     detector: Arc<DestructivePatternDetector>,
-    /// Runtime-toggleable approval configuration (for YOLO mode, etc.).
+    /// Runtime-toggleable approval configuration (for SOLO mode, etc.).
     config: Arc<RwLock<ApprovalConfig>>,
     /// Pending approval requests: approval_id → (request, oneshot sender).
     pending: Arc<RwLock<HashMap<String, (ApprovalRequest, oneshot::Sender<ApprovalVerdict>)>>>,
@@ -220,20 +220,20 @@ impl SmartApprovalGate {
         &self.history
     }
 
-    /// Update the approval configuration at runtime (for YOLO toggle, etc.).
+    /// Update the approval configuration at runtime (for SOLO toggle, etc.).
     pub async fn update_config(&self, new_config: ApprovalConfig) {
-        let yolo_changed = {
+        let solo_changed = {
             let old = self.config.read().await;
-            old.yolo_mode != new_config.yolo_mode
+            old.solo_mode != new_config.solo_mode
         };
 
         *self.config.write().await = new_config;
 
-        // Notify frontend if YOLO mode changed
-        if yolo_changed {
+        // Notify frontend if SOLO mode changed
+        if solo_changed {
             let config = self.config.read().await;
             if let Some(sender) = &self.sse_sender {
-                sender.send_yolo_mode_changed(config.yolo_mode, config.yolo_honor_critical);
+                sender.send_solo_mode_changed(config.solo_mode, config.solo_honor_critical);
             }
         }
     }
@@ -539,33 +539,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn yolo_mode_bypasses_high_risk() {
-        let config = ApprovalConfig::default().with_yolo_mode(true);
+    async fn solo_mode_bypasses_high_risk() {
+        let config = ApprovalConfig::default().with_solo_mode(true);
         let detector = DestructivePatternDetector::new(PathBuf::from("/tmp"));
         // Use git push --force which is High risk, not caught by is_read_only_command
         let verdict = detector.detect_with_config("git push --force origin main", &config);
         assert!(matches!(
             verdict,
             SmartApprovalVerdict::AutoPass {
-                reason: AutoPassReason::YoloBypass
+                reason: AutoPassReason::SoloBypass
             }
         ));
     }
 
     #[tokio::test]
-    async fn yolo_mode_honors_critical() {
-        let config = ApprovalConfig::default().with_yolo_mode(true);
+    async fn solo_mode_honors_critical() {
+        let config = ApprovalConfig::default().with_solo_mode(true);
         let detector = DestructivePatternDetector::new(PathBuf::from("/tmp"));
         let verdict = detector.detect_with_config("rm -rf /", &config);
-        // rm -rf / is Critical, and yolo_honor_critical defaults to true
+        // rm -rf / is Critical, and solo_honor_critical defaults to true
         assert!(matches!(verdict, SmartApprovalVerdict::NeedsApproval(_)));
     }
 
     #[tokio::test]
-    async fn yolo_mode_critical_bypass_when_not_honored() {
+    async fn solo_mode_critical_bypass_when_not_honored() {
         let config = ApprovalConfig {
-            yolo_mode: true,
-            yolo_honor_critical: false,
+            solo_mode: true,
+            solo_honor_critical: false,
             auto_pass_read_only: true,
             auto_pass_low_risk: true,
         };
@@ -574,7 +574,7 @@ mod tests {
         assert!(matches!(
             verdict,
             SmartApprovalVerdict::AutoPass {
-                reason: AutoPassReason::YoloBypass
+                reason: AutoPassReason::SoloBypass
             }
         ));
     }

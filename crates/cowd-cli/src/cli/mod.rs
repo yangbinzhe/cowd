@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn normalize_permission_unknown() {
-        assert_eq!(normalize_permission_mode("yolo"), None);
+        assert_eq!(normalize_permission_mode("solo"), None);
     }
 
     #[test]

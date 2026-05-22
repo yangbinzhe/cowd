@@ -130,7 +130,7 @@ pub struct GlobSearchOutput {
 /// Parameters accepted by the grep-style search tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GrepSearchInput {
-    pub pattern: String,
+    pub pattern: Option<String>,
     pub path: Option<String>,
     pub glob: Option<String>,
     #[serde(rename = "output_mode")]
@@ -349,6 +349,16 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 
 /// Runs a regex search over workspace files with optional context lines.
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+    let pattern = match &input.pattern {
+        Some(p) if !p.is_empty() => p.as_str(),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pattern is required — please provide a regex pattern to search for",
+            ));
+        }
+    };
+
     let base_path = input
         .path
         .as_deref()
@@ -356,7 +366,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
 
-    let regex = RegexBuilder::new(&input.pattern)
+    let regex = RegexBuilder::new(pattern)
         .case_insensitive(input.case_insensitive.unwrap_or(false))
         .dot_matches_new_line(input.multiline.unwrap_or(false))
         .build()
@@ -771,7 +781,7 @@ mod tests {
         assert_eq!(globbed.num_files, 1);
 
         let grep_output = grep_search(&GrepSearchInput {
-            pattern: String::from("hello"),
+            pattern: Some(String::from("hello")),
             path: Some(dir.to_string_lossy().into_owned()),
             glob: Some(String::from("**/*.rs")),
             output_mode: Some(String::from("content")),

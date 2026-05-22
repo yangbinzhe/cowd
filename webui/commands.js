@@ -11,7 +11,7 @@ window.Commands = (()=>{
     {cmd:'/crons',desc:'Open crons panel'},
     {cmd:'/settings',desc:'Open settings'},
     {cmd:'/export',desc:'Export session as JSON'},
-    {cmd:'/yolo',desc:'Toggle YOLO approval mode'},
+    {cmd:'/solo',desc:'Toggle SOLO approval mode'},
   ];
 
   function getMatches(input){
@@ -49,7 +49,7 @@ window.Commands = (()=>{
       case'/skills':Panels.renderSkills();break;
       case'/crons':Panels.renderCrons();break;
       case'/settings':Panels.renderSettings();break;
-      case'/yolo':try{await Api.toggleYolo();UI.showToast('YOLO toggled','success')}catch(e){UI.showToast(e.message,'error')};break;
+      case'/solo':try{await Api.toggleSolo();UI.showToast('SOLO toggled','success')}catch(e){UI.showToast(e.message,'error')};break;
       case'/export':exportSession();break;
       default:Messages.send(cmd+' '+(args||''));break;
     }

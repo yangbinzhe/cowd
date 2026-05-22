@@ -1220,16 +1220,16 @@ impl UnifiedConfig {
 
 /// Smart approval configuration for the intelligent command approval gate.
 ///
-/// Controls which commands auto-pass vs. require approval, and YOLO mode
+/// Controls which commands auto-pass vs. require approval, and SOLO mode
 /// for bypassing approvals during long-running autonomous tasks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalConfig {
     /// When true, all non-critical commands bypass the approval flow.
-    #[serde(default)]
-    pub yolo_mode: bool,
-    /// When true, even in YOLO mode, Critical-risk commands still require approval.
-    #[serde(default = "default_true_bool")]
-    pub yolo_honor_critical: bool,
+    #[serde(default, alias = "yolo_mode")]
+    pub solo_mode: bool,
+    /// When true, even in SOLO mode, Critical-risk commands still require approval.
+    #[serde(default = "default_true_bool", alias = "yolo_honor_critical")]
+    pub solo_honor_critical: bool,
     /// Auto-pass commands detected as read-only (ls, cat, grep, git status, etc.).
     #[serde(default = "default_true_bool")]
     pub auto_pass_read_only: bool,
@@ -1241,8 +1241,8 @@ pub struct ApprovalConfig {
 impl Default for ApprovalConfig {
     fn default() -> Self {
         Self {
-            yolo_mode: false,
-            yolo_honor_critical: true,
+            solo_mode: false,
+            solo_honor_critical: true,
             auto_pass_read_only: true,
             auto_pass_low_risk: true,
         }
@@ -1251,8 +1251,8 @@ impl Default for ApprovalConfig {
 
 impl ApprovalConfig {
     pub fn new() -> Self { Self::default() }
-    pub fn with_yolo_mode(mut self, enabled: bool) -> Self { self.yolo_mode = enabled; self }
-    pub fn with_yolo_honor_critical(mut self, honor: bool) -> Self { self.yolo_honor_critical = honor; self }
+    pub fn with_solo_mode(mut self, enabled: bool) -> Self { self.solo_mode = enabled; self }
+    pub fn with_solo_honor_critical(mut self, honor: bool) -> Self { self.solo_honor_critical = honor; self }
 }
 
 /// Effective permission mode after decoding config values.
@@ -1884,8 +1884,8 @@ mod tests {
     #[test]
     fn approval_config_defaults() {
         let cfg = ApprovalConfig::default();
-        assert!(!cfg.yolo_mode);
-        assert!(cfg.yolo_honor_critical);
+        assert!(!cfg.solo_mode);
+        assert!(cfg.solo_honor_critical);
         assert!(cfg.auto_pass_read_only);
         assert!(cfg.auto_pass_low_risk);
     }

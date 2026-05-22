@@ -3,7 +3,7 @@
 # 本文件包含所有可配置项、默认值及说明
 #
 # 配置优先级 (高→低):
-# 1. CLI 参数 (--model, --yolo, --permission-mode 等)
+# 1. CLI 参数 (--model, --solo, --permission-mode 等)
 # 2. 环境变量 (COWD_* 前缀)
 # 3. 本地覆盖 (.cowd/config.local.yaml, git-ignored)
 # 4. 项目配置 (.cowd/config.yaml)
@@ -61,8 +61,8 @@ permissions:
 
 # 智能审批门 (SmartApprovalGate)
 # approval:
-#   yolo_mode: false              # 跳过所有审批 (全自动模式)
-#   yolo_honor_critical: true     # YOLO 模式下仍拦截危险操作
+#   solo_mode: false              # 跳过所有审批 (全自动模式)
+#   solo_honor_critical: true     # SOLO 模式下仍拦截危险操作
 #   auto_pass_read_only: true     # 只读命令自动通过
 #   auto_pass_low_risk: true      # 低风险命令自动通过
 

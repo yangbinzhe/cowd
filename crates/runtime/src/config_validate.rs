@@ -383,11 +383,11 @@ const APPROVAL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Bool,
     },
     FieldSpec {
-        name: "yolo_honor_critical",
+        name: "solo_honor_critical",
         expected: FieldType::Bool,
     },
     FieldSpec {
-        name: "yolo_mode",
+        name: "solo_mode",
         expected: FieldType::Bool,
     },
 ];
