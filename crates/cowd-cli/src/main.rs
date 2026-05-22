@@ -2839,7 +2839,7 @@ where F: FnOnce() -> Result<R, Box<dyn std::error::Error>>
 
 fn drain_tui_events(rx: &tui::TuiEventReceiver, app: &mut tui::App) {
     let mut count = 0;
-    let limit = if app.turn_active { usize::MAX } else { 256 };
+    let limit = if app.turn_active { 64 } else { 256 };
     while let Ok(event) = rx.try_recv() {
         app.apply_event(event);
         count += 1;

@@ -37,6 +37,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let full = frame.area();
     if app.picker_active { draw_session_picker(frame, full, app); }
     if app.approval.is_some() { draw_approval_modal(frame, full, app); }
+    if app.help_visible { draw_help_modal(frame, full); }
     if app.current_panel == Panel::Gateway { draw_gateway_panel(frame, full, app); }
     if app.current_panel == Panel::Delegate { draw_delegate_panel(frame, full, app); }
 }
@@ -132,6 +133,69 @@ fn draw_file_browser(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
         }
     }
     frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+}
+
+fn draw_help_modal(frame: &mut Frame, area: ratatui::layout::Rect) {
+    let w = 52u16.min(area.width - 4);
+    let h = 17u16.min(area.height - 2);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let pa = ratatui::layout::Rect::new(x, y, w, h);
+    frame.render_widget(Clear, pa);
+    let help_text = vec![
+        Line::from(Span::styled("Keyboard Shortcuts", Style::default().fg(Color::Cyan).bold())),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  Enter      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Submit input / Toggle expand"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Shift+Enter", Style::default().fg(Color::Yellow)),
+            Span::raw("Insert newline"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Cancel turn / Exit app"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ctrl+C     ", Style::default().fg(Color::Yellow)),
+            Span::raw("Exit immediately"),
+        ]),
+        Line::from(vec![
+            Span::styled("  /          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Search in timeline"),
+        ]),
+        Line::from(vec![
+            Span::styled("  n / N      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Next/Prev search match"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tab        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Switch panel"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Alt+↑/↓    ", Style::default().fg(Color::Yellow)),
+            Span::raw("Browse input history"),
+        ]),
+        Line::from(vec![
+            Span::styled("  PgUp/PgDn  ", Style::default().fg(Color::Yellow)),
+            Span::raw("Scroll viewport"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ctrl+T     ", Style::default().fg(Color::Yellow)),
+            Span::raw("Toggle theme"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ctrl+Y     ", Style::default().fg(Color::Yellow)),
+            Span::raw("Copy focused entry"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ?          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Toggle this help"),
+        ]),
+    ];
+    let block = Block::default().borders(Borders::ALL).title(" Help (? to close) ").fg(Color::Cyan);
+    frame.render_widget(Paragraph::new(Text::from(help_text)).block(block), pa);
 }
 
 fn draw_delegate_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {

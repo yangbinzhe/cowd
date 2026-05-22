@@ -8,27 +8,54 @@ use ratatui::{
 use super::super::app::{App, Theme, TimelineEntry};
 
 pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    // ── Render cache: rebuild only when data has changed ──
-    if app.msg_version != app.last_drawn_version {
-        // Full rebuild due to structural change
-        app.cached_chat_lines = build_new_lines(app);
-        app.entry_line_counts = compute_entry_line_counts(app);
-        app.last_drawn_version = app.msg_version;
-        app.lines_dirty = false;
-    } else if app.lines_dirty {
-        // Incremental rebuild for streaming updates (no structural change)
-        rebuild_streaming_tail(app);
-        app.lines_dirty = false;
+    let viewport_h = area.height as usize;
+
+    // ── Compute total content lines (even for virtual-mode, used by scrollbar) ──
+    let mut total_lines: usize = app.entry_line_counts.iter()
+        .map(|&c| c as usize + 1) // +1 for blank separator between entries
+        .sum::<usize>();
+    if total_lines == 0 && app.timeline.is_empty() {
+        total_lines = 1; // placeholder line
+    }
+    if app.turn_active {
+        total_lines += 1; // spinner line
     }
 
-    let content_height = app.cached_chat_lines.len() as u16;
-    let viewport_height = area.height;
-
-    if app.auto_scroll && content_height > viewport_height {
-        app.scroll_offset = content_height.saturating_sub(viewport_height);
+    // ── Auto-scroll logic ──
+    if app.auto_scroll && total_lines > viewport_h {
+        app.scroll_offset = (total_lines - viewport_h) as u16;
     }
-    let scroll_offset = app.scroll_offset.min(content_height.saturating_sub(1));
+    let scroll_off = app.scroll_offset.min(total_lines.saturating_sub(1) as u16) as usize;
 
+    // ── Build visible lines ──
+    let visible_lines: Vec<Line<'static>>;
+    let paragraph_scroll: u16;
+
+    // Store viewport height for PageUp/PageDown calculations
+    app.viewport_height = viewport_h as u16;
+
+    // Threshold: if content is more than 3× viewport, use virtual scrolling
+    if total_lines > viewport_h.saturating_mul(3) {
+        // Virtual scrolling: only build entries visible in the viewport
+        visible_lines = build_visible(app, scroll_off, viewport_h);
+        paragraph_scroll = 0; // visible_lines already starts at the right offset
+    } else {
+        // Small timeline: use render cache with full-line rebuild
+        if app.msg_version != app.last_drawn_version {
+            app.cached_chat_lines = build_new_lines(app);
+            app.entry_line_counts = compute_entry_line_counts(app);
+            app.last_drawn_version = app.msg_version;
+            app.lines_dirty = false;
+        } else if app.lines_dirty {
+            rebuild_streaming_tail(app);
+            app.entry_line_counts = compute_entry_line_counts(app);
+            app.lines_dirty = false;
+        }
+        visible_lines = app.cached_chat_lines.clone();
+        paragraph_scroll = scroll_off as u16;
+    }
+
+    // ── Layout & render ──
     let inner_area = Rect {
         x: area.x,
         y: area.y,
@@ -43,20 +70,21 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     };
 
     f.render_widget(Clear, area);
-    let paragraph = Paragraph::new(Text::from(app.cached_chat_lines.clone()))
+    let paragraph = Paragraph::new(Text::from(visible_lines))
         .wrap(Wrap { trim: false })
-        .scroll((scroll_offset, 0));
+        .scroll((paragraph_scroll, 0));
     f.render_widget(paragraph, inner_area);
 
-    if content_height > viewport_height {
+    // ── Scrollbar ──
+    if total_lines > viewport_h {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))
             .end_symbol(Some("↓"))
             .track_symbol(Some("│"))
             .thumb_symbol("█");
-        let mut scroll_state = ScrollbarState::new(content_height as usize)
-            .position(scroll_offset as usize)
-            .viewport_content_length(viewport_height as usize);
+        let mut scroll_state = ScrollbarState::new(total_lines)
+            .position(scroll_off)
+            .viewport_content_length(viewport_h);
         f.render_stateful_widget(scrollbar, scrollbar_area, &mut scroll_state);
     }
 }
@@ -142,32 +170,195 @@ fn build_new_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+/// Build only the entries visible within [scroll_offset, scroll_offset + viewport_height].
+/// Uses entry_line_counts for O(entries) offset computation without rendering off-screen entries.
+fn build_visible(app: &App, scroll_offset: usize, viewport_h: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut cumulative: usize = 0;
+    let viewport_end = scroll_offset + viewport_h;
+
+    if app.timeline.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Type to start. /help /resume /exit",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return lines;
+    }
+
+    for (idx, entry) in app.timeline.iter().enumerate() {
+        let entry_lines = app.entry_line_counts.get(idx).copied().unwrap_or(1) as usize + 1; // +1 for separator blank
+        let entry_end = cumulative + entry_lines;
+
+        // Include entry if it overlaps the visible viewport
+        if entry_end > scroll_offset && cumulative < viewport_end {
+            let is_focused = idx == app.timeline_cursor;
+            build_entry(entry, is_focused, &mut lines, app.theme);
+            lines.push(Line::raw(""));
+        }
+
+        cumulative = entry_end;
+        if cumulative >= viewport_end {
+            break;
+        }
+    }
+
+    // Loading spinner at the bottom when turn is active and viewport reaches the end
+    if app.turn_active {
+        let spinner = app.spinner_char();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{spinner} Processing..."),
+                Style::default().fg(Color::Blue),
+            ),
+        ]));
+    }
+
+    lines
+}
+
+/// Highlight inline markdown spans in a message line.
+/// Handles: `code` (yellow), **bold** (bold), *italic* (italic/dim).
+fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color) {
+    let mut remaining = line;
+    while !remaining.is_empty() {
+        // Find the next markdown token: backtick, double-star, or single-star
+        let bt = remaining.find('`');
+        let bs = remaining.find("**");
+        let is = remaining.find('*');
+
+        // Determine which token comes first (if any)
+        let earliest = [bt, bs, is].iter().filter_map(|&o| o).min();
+
+        match earliest {
+            None => {
+                // No more markdown — push remaining text as-is
+                spans.push(Span::styled(
+                    remaining.to_string(),
+                    Style::default().fg(base_color),
+                ));
+                break;
+            }
+            Some(pos) => {
+                // Push text before the token
+                if pos > 0 {
+                    spans.push(Span::styled(
+                        remaining[..pos].to_string(),
+                        Style::default().fg(base_color),
+                    ));
+                }
+
+                // Determine token type
+                if bt == Some(pos) {
+                    // Inline code: `...`
+                    remaining = &remaining[pos + 1..];
+                    if let Some(end) = remaining.find('`') {
+                        spans.push(Span::styled(
+                            remaining[..end].to_string(),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                        remaining = &remaining[end + 1..];
+                    } else {
+                        // Unclosed backtick — treat rest as code
+                        spans.push(Span::styled(
+                            remaining.to_string(),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                        remaining = "";
+                    }
+                } else if bs == Some(pos) {
+                    // Bold: **...**
+                    remaining = &remaining[pos + 2..];
+                    if let Some(end) = remaining.find("**") {
+                        spans.push(Span::styled(
+                            remaining[..end].to_string(),
+                            Style::default().fg(base_color).bold(),
+                        ));
+                        remaining = &remaining[end + 2..];
+                    } else {
+                        // Unclosed ** — treat rest as bold
+                        spans.push(Span::styled(
+                            remaining.to_string(),
+                            Style::default().fg(base_color).bold(),
+                        ));
+                        remaining = "";
+                    }
+                } else if is == Some(pos) {
+                    // Italic: *...*
+                    remaining = &remaining[pos + 1..];
+                    if let Some(end) = remaining.find('*') {
+                        // Make sure it's not a **
+                        if remaining.get(end + 1..end + 2) == Some("*") {
+                            // False positive: single * followed by *, treat as text
+                            spans.push(Span::styled(
+                                format!("*{}", &remaining[..end]),
+                                Style::default().fg(base_color),
+                            ));
+                            remaining = &remaining[end..];
+                        } else {
+                            spans.push(Span::styled(
+                                remaining[..end].to_string(),
+                                Style::default().fg(base_color).italic(),
+                            ));
+                            remaining = &remaining[end + 1..];
+                        }
+                    } else {
+                        // Unclosed * — treat rest as italic
+                        spans.push(Span::styled(
+                            remaining.to_string(),
+                            Style::default().fg(base_color).italic(),
+                        ));
+                        remaining = "";
+                    }
+                } else {
+                    // Shouldn't happen — push the char and continue
+                    spans.push(Span::styled(
+                        remaining[..1].to_string(),
+                        Style::default().fg(base_color),
+                    ));
+                    remaining = &remaining[1..];
+                }
+            }
+        }
+    }
+}
+
 /// Build ratatui Lines for a single timeline entry, using owned strings for caching.
 pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line<'static>>, theme: Theme) {
     match entry {
-        TimelineEntry::Message { role, content } => {
+        TimelineEntry::Message { role, content, .. } => {
             let (color, prefix) = match role.as_str() {
                 "user" => (theme.user_color(), "> "),
                 "system" => (Color::DarkGray, "  "),
                 _ => (theme.fg(), ""),
             };
-            for line in content.lines() {
-                lines.push(Line::from(vec![
+            let total_lines = content.lines().count();
+            const MAX_LINES: usize = 500;
+            for (i, line) in content.lines().enumerate() {
+                if i >= MAX_LINES {
+                    lines.push(Line::from(Span::styled(
+                        format!("  ... ({} more lines truncated)", total_lines.saturating_sub(MAX_LINES)),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    break;
+                }
+                let mut spans = vec![
                     Span::styled(prefix.to_string(), Style::default().fg(color).bold()),
-                    Span::styled(line.to_string(), Style::default().fg(color)),
-                ]));
+                ];
+                highlight_line(line, &mut spans, color);
+                lines.push(Line::from(spans));
             }
         }
 
         TimelineEntry::Thinking { id: _, content, complete, expanded } => {
-            let line_count = content.lines().count();
+            // Pre-compute once to avoid O(n²) repeated traversal
+            let total_lines = content.lines().count();
             let status = if *complete { "complete" } else { "thinking" };
             let focus_marker = if is_focused { "● " } else { "  " };
 
             if *expanded {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{focus_marker}┌─ 💭 Thinking [{status}] ({line_count} lines)"),
+                        format!("{focus_marker}┌─ 💭 Thinking [{status}] ({total_lines} lines)"),
                         Style::default().fg(Color::Cyan),
                     ),
                     Span::styled(
@@ -182,11 +373,11 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
                         Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
                     ]));
                 }
-                if content.lines().count() > 200 {
+                if total_lines > 200 {
                     lines.push(Line::from(vec![
                         Span::styled("│  ".to_string(), Style::default().fg(Color::Cyan)),
                         Span::styled(
-                            format!("... ({} more lines)", content.lines().count() - 200),
+                            format!("... ({} more lines)", total_lines - 200),
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]));
@@ -200,7 +391,7 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
                 let more = if content.len() > 80 { "..." } else { "" };
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{focus_marker}💭 Thinking [{status}] ({line_count}L): {preview}{more}"),
+                        format!("{focus_marker}💭 Thinking [{status}] ({total_lines}L): {preview}{more}"),
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(
@@ -229,6 +420,8 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
             let focus_marker = if is_focused { "● " } else { "  " };
 
             if *expanded && !output.is_empty() {
+                // Pre-compute total lines to avoid repeated O(n) traversal
+                let total_lines = output.lines().count();
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{focus_marker}┌─ 🔧 {name}"),
@@ -250,9 +443,9 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
-                if output.lines().count() > 100 {
+                if total_lines > 100 {
                     lines.push(Line::from(Span::styled(
-                        format!("│ ... ({} more lines)", output.lines().count() - 100),
+                        format!("│ ... ({} more lines)", total_lines - 100),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
@@ -283,13 +476,14 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
         }
 
         TimelineEntry::SlashOutput { command, output, expanded } => {
-            let line_count = output.lines().count();
+            // Pre-compute total lines to avoid repeated O(n) traversal
+            let total_lines = output.lines().count();
             let focus_marker = if is_focused { "● " } else { "  " };
 
             if *expanded {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{focus_marker}┌─ /{command} ({line_count} lines)"),
+                        format!("{focus_marker}┌─ /{command} ({total_lines} lines)"),
                         Style::default().fg(Color::Magenta).bold(),
                     ),
                     Span::styled(
@@ -303,9 +497,9 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
                         Span::styled(line.to_string(), Style::default().fg(Color::White)),
                     ]));
                 }
-                if output.lines().count() > 100 {
+                if total_lines > 100 {
                     lines.push(Line::from(Span::styled(
-                        format!("│ ... ({} more lines)", output.lines().count() - 100),
+                        format!("│ ... ({} more lines)", total_lines - 100),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
@@ -318,7 +512,7 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
                 let more = if output.len() > 80 { "..." } else { "" };
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{focus_marker}/ {command} ({line_count}L): {preview}{more}"),
+                        format!("{focus_marker}/ {command} ({total_lines}L): {preview}{more}"),
                         Style::default().fg(Color::Magenta).bold(),
                     ),
                     Span::styled(

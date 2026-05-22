@@ -11,6 +11,7 @@ pub enum TimelineEntry {
     Message {
         role: String,
         content: String,
+        timestamp: String,
     },
     /// A thinking/reasoning block that can be collapsed.
     Thinking {
@@ -193,6 +194,26 @@ pub struct App {
     // ── Input history ──
     pub input_history: Vec<String>,
     pub history_idx: Option<usize>,
+
+    // ── Search ──
+    pub search_query: String,
+    pub search_matches: Vec<usize>,
+    pub search_current: usize,
+    pub search_active: bool,
+
+    // ── Viewport (updated by chat widget) ──
+    pub viewport_height: u16,
+
+    // ── Help panel ──
+    pub help_visible: bool,
+
+    // ── Model switching ──
+    pub available_models: Vec<String>,
+    pub model_dirty: bool,
+
+    // ── Notification ──
+    pub notification: Option<String>,
+    notification_ttl: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +339,21 @@ impl App {
 
             input_history: Vec::new(),
             history_idx: None,
+
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_current: 0,
+            search_active: false,
+
+            viewport_height: 24,
+
+            help_visible: false,
+
+            available_models: Vec::new(),
+            model_dirty: false,
+
+            notification: None,
+            notification_ttl: 0,
         }
     }
 
@@ -343,7 +379,52 @@ impl App {
         F[self.spinner_idx % F.len()]
     }
 
-    pub fn tick(&mut self) { self.spinner_idx = self.spinner_idx.wrapping_add(1); }
+    pub fn tick(&mut self) {
+        self.spinner_idx = self.spinner_idx.wrapping_add(1);
+        if self.notification_ttl > 0 {
+            self.notification_ttl -= 1;
+            if self.notification_ttl == 0 {
+                self.notification = None;
+            }
+        }
+    }
+
+    /// Cycle to the next available model name.
+    /// Returns the new model name, or None if only one model is available.
+    pub fn next_model(&mut self) -> Option<String> {
+        if self.available_models.len() <= 1 {
+            return None;
+        }
+        if let Some(pos) = self.available_models.iter().position(|m| m == &self.model) {
+            let idx = (pos + 1) % self.available_models.len();
+            self.model = self.available_models[idx].clone();
+            self.model_dirty = true;
+            Some(self.model.clone())
+        } else {
+            // Current model not in list — pick first
+            self.model = self.available_models[0].clone();
+            self.model_dirty = true;
+            Some(self.model.clone())
+        }
+    }
+
+    /// Show a temporary notification that auto-dismisses after ~3 seconds.
+    pub fn show_notification(&mut self, msg: &str) {
+        self.notification = Some(msg.to_string());
+        self.notification_ttl = 30; // ~3s at 10fps tick
+    }
+
+    /// Format a timestamp for display in the chat.
+    pub fn format_timestamp() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let dur = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = dur.as_secs();
+        let h = (secs / 3600) % 24;
+        let m = (secs / 60) % 60;
+        format!("{h:02}:{m:02}")
+    }
 
     // ── Session picker ──
 
@@ -433,6 +514,7 @@ impl App {
         self.timeline.push(TimelineEntry::Message {
             role: role.to_string(),
             content: content.to_string(),
+            timestamp: App::format_timestamp(),
         });
         self.timeline_cursor = self.timeline.len().saturating_sub(1);
         self.msg_version = self.msg_version.wrapping_add(1);
@@ -474,6 +556,132 @@ impl App {
         crate::tui::osc52::write_osc52_clipboard(&text)
     }
 
+    // ── Search ──
+
+    /// Execute a search: find all timeline entries whose full_text contains the query.
+    /// Jumps to the first match if any found.
+    pub fn execute_search(&mut self, query: &str) {
+        self.search_query = query.to_string();
+        self.search_matches.clear();
+        self.search_current = 0;
+
+        let lower = query.to_lowercase();
+        for (idx, entry) in self.timeline.iter().enumerate() {
+            if entry.full_text().to_lowercase().contains(&lower) {
+                self.search_matches.push(idx);
+            }
+        }
+
+        // Jump to first match
+        self.go_search_match(0);
+    }
+
+    /// Navigate to the next search match.
+    pub fn search_next(&mut self) {
+        if self.search_matches.is_empty() { return; }
+        let idx = if self.search_current + 1 < self.search_matches.len() {
+            self.search_current + 1
+        } else {
+            0
+        };
+        self.go_search_match(idx);
+    }
+
+    /// Navigate to the previous search match.
+    pub fn search_prev(&mut self) {
+        if self.search_matches.is_empty() { return; }
+        let idx = if self.search_current > 0 {
+            self.search_current - 1
+        } else {
+            self.search_matches.len() - 1
+        };
+        self.go_search_match(idx);
+    }
+
+    fn go_search_match(&mut self, match_idx: usize) {
+        if let Some(&entry_idx) = self.search_matches.get(match_idx) {
+            self.search_current = match_idx;
+            self.timeline_cursor = entry_idx;
+            self.auto_scroll = false;
+            self.scroll_to_entry(entry_idx);
+        }
+    }
+
+    /// Clear search state.
+    pub fn cancel_search(&mut self) {
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_current = 0;
+        self.search_active = false;
+    }
+
+    // ── Scrolling helpers ──
+
+    /// Scroll so the entry at the given index is visible in the viewport.
+    pub fn scroll_to_entry(&mut self, entry_idx: usize) {
+        let vh = self.viewport_height.max(1) as usize;
+        // Compute the line offset where this entry starts
+        let mut offset: usize = 0;
+        for i in 0..entry_idx.min(self.entry_line_counts.len()) {
+            offset += self.entry_line_counts[i] as usize + 1; // +1 for separator
+        }
+        let entry_h = self.entry_line_counts
+            .get(entry_idx)
+            .copied()
+            .unwrap_or(1) as usize;
+
+        // If the entry is above the viewport, scroll to it
+        let scroll = self.scroll_offset as usize;
+        if offset < scroll {
+            self.scroll_offset = offset as u16;
+        }
+        // If the entry is below the viewport, scroll so it's visible at the bottom
+        else if offset + entry_h > scroll + vh {
+            self.scroll_offset = offset.saturating_sub(vh.saturating_sub(entry_h)) as u16;
+        }
+    }
+
+    /// Scroll up by one viewport worth of lines.
+    pub fn scroll_page_up(&mut self) {
+        let amount = self.viewport_height.max(1).saturating_sub(1);
+        self.scroll_offset = self.scroll_offset.saturating_sub(amount);
+    }
+
+    /// Scroll down by one viewport worth of lines.
+    pub fn scroll_page_down(&mut self) {
+        let amount = self.viewport_height.max(1).saturating_sub(1);
+        self.scroll_offset = self.scroll_offset.saturating_add(amount);
+    }
+
+    // ── Input history ──
+
+    /// Navigate to an older (previous) input history entry.
+    /// Returns the history text to set in the input box, if any.
+    pub fn history_prev(&mut self) -> Option<String> {
+        if self.input_history.is_empty() { return None; }
+        let idx = match self.history_idx {
+            Some(0) => return None,
+            Some(i) => i - 1,
+            None => self.input_history.len().saturating_sub(1),
+        };
+        self.history_idx = Some(idx);
+        self.input_history.get(idx).cloned()
+    }
+
+    /// Navigate to a newer (next) input history entry.
+    /// Returns the history text to set in the input box, or empty string to clear.
+    pub fn history_next(&mut self) -> Option<String> {
+        let idx = match self.history_idx {
+            Some(i) if i + 1 < self.input_history.len() => i + 1,
+            _ => {
+                self.history_idx = None;
+                return Some(String::new());
+            }
+        };
+        self.history_idx = Some(idx);
+        self.input_history.get(idx).cloned()
+    }
+
     // ── Event handling ──
 
     /// Apply a TuiEvent from the background turn runner to the display state.
@@ -484,7 +692,7 @@ impl App {
                 self.auto_scroll = true;
                 // Find last incomplete assistant Message, or create new one
                 let mut found = false;
-                if let Some(TimelineEntry::Message { role, content }) = self.timeline.last_mut() {
+                if let Some(TimelineEntry::Message { role, content, .. }) = self.timeline.last_mut() {
                     if role == "assistant" && content != "✓ Done" {
                         content.push_str(&text);
                         found = true;
@@ -494,6 +702,7 @@ impl App {
                     self.timeline.push(TimelineEntry::Message {
                         role: "assistant".into(),
                         content: text,
+                        timestamp: App::format_timestamp(),
                     });
                     self.msg_version = self.msg_version.wrapping_add(1); // structural change
                 } else {
@@ -623,12 +832,14 @@ impl App {
                     self.timeline.push(TimelineEntry::Message {
                         role: "assistant".into(),
                         content: assistant_text,
+                        timestamp: App::format_timestamp(),
                     });
                 }
                 // Add the "✓ Done" marker
                 self.timeline.push(TimelineEntry::Message {
                     role: "assistant".into(),
                     content: "✓ Done".into(),
+                    timestamp: App::format_timestamp(),
                 });
                 self.timeline_cursor = self.timeline.len().saturating_sub(1);
                 self.msg_version = self.msg_version.wrapping_add(1);
@@ -641,6 +852,7 @@ impl App {
                 self.timeline.push(TimelineEntry::Message {
                     role: "system".into(),
                     content: format!("Error: {error}"),
+                    timestamp: App::format_timestamp(),
                 });
                 self.timeline_cursor = self.timeline.len().saturating_sub(1);
                 self.msg_version = self.msg_version.wrapping_add(1);
@@ -652,6 +864,7 @@ impl App {
                 self.timeline.push(TimelineEntry::Message {
                     role: "system".into(),
                     content: format!("Compacted {removed_count} earlier messages to save context."),
+                    timestamp: App::format_timestamp(),
                 });
                 self.timeline_cursor = self.timeline.len().saturating_sub(1);
                 self.msg_version = self.msg_version.wrapping_add(1);
