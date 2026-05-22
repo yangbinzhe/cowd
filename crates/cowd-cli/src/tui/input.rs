@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use std::io;
-use crossterm::event::{Event, KeyCode, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use tui_textarea::TextArea;
 use ratatui::widgets::{Block, Borders};
 use super::app::App;
@@ -23,22 +23,35 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             if app.picker_active { return handle_picker(app, key.code); }
             if app.approval.is_some() { return handle_approval(app, key.code); }
+
+            // ── Search mode: typing the search query ──
+            if app.search_active {
+                return handle_search_input(app, key);
+            }
+
+            // ── Normal mode ──
             match key.code {
                 KeyCode::Esc => {
+                    if app.help_visible {
+                        app.help_visible = false;
+                        return Ok(InputResult::Nothing);
+                    }
+                    if !app.search_matches.is_empty() {
+                        app.cancel_search();
+                        return Ok(InputResult::Nothing);
+                    }
                     if app.turn_active { return Ok(InputResult::Cancel); }
                     Ok(InputResult::Exit)
                 }
-                KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if app.turn_active { return Ok(InputResult::Cancel); }
                     Ok(InputResult::Exit)
                 }
                 KeyCode::Enter => {
-                    // Shift+Enter: insert newline
-                    if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
                         app.input.insert_newline();
                         return Ok(InputResult::Nothing);
                     }
-                    // If input is empty and there's a focused collapsible entry, toggle it
                     if app.input.is_empty() {
                         let focused = app.timeline.get(app.timeline_cursor);
                         if let Some(entry) = focused {
@@ -48,7 +61,6 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                             }
                         }
                     }
-                    // Otherwise: submit
                     let text = app.input.lines().join("\n").trim().to_string();
                     app.input = TextArea::default();
                     app.input.set_block(Block::default().borders(Borders::ALL).title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
@@ -56,10 +68,13 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                 }
                 KeyCode::Tab => { app.next_panel(); Ok(InputResult::Nothing) }
                 KeyCode::Up => {
+                    // Alt+Up: browse input history (older)
+                    if key.modifiers.contains(KeyModifiers::ALT) {
+                        return handle_history(app, true);
+                    }
                     if app.input.is_empty() {
-                        // Navigate timeline cursor up
                         if app.cursor_up() {
-                            app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                            app.scroll_to_entry(app.timeline_cursor);
                         }
                         return Ok(InputResult::Nothing);
                     }
@@ -67,9 +82,13 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                     Ok(InputResult::Nothing)
                 }
                 KeyCode::Down => {
+                    // Alt+Down: browse input history (newer)
+                    if key.modifiers.contains(KeyModifiers::ALT) {
+                        return handle_history(app, false);
+                    }
                     if app.input.is_empty() {
                         if app.cursor_down() {
-                            app.scroll_offset = app.scroll_offset.saturating_add(1);
+                            app.scroll_to_entry(app.timeline_cursor);
                         }
                         return Ok(InputResult::Nothing);
                     }
@@ -79,7 +98,7 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                 KeyCode::PageUp => {
                     if app.input.is_empty() {
                         app.auto_scroll = false;
-                        app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                        app.scroll_page_up();
                         return Ok(InputResult::Nothing);
                     }
                     app.input.input(key);
@@ -87,7 +106,7 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                 }
                 KeyCode::PageDown => {
                     if app.input.is_empty() {
-                        app.scroll_offset = app.scroll_offset.saturating_add(10);
+                        app.scroll_page_down();
                         return Ok(InputResult::Nothing);
                     }
                     app.input.input(key);
@@ -110,17 +129,101 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                     app.input.input(key);
                     Ok(InputResult::Nothing)
                 }
-                KeyCode::Char('t') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.theme.toggle(); Ok(InputResult::Nothing)
                 }
-                KeyCode::Char('y') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if app.input.is_empty() {
                         app.copy_focused_content();
                     }
                     Ok(InputResult::Nothing)
                 }
+                // ── Model switching: Ctrl+M ──
+                KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(model) = app.next_model() {
+                        app.show_notification(&format!("Switched to model: {model}"));
+                    }
+                    Ok(InputResult::Nothing)
+                }
+                // ── Search trigger: '/' ──
+                KeyCode::Char('/') => {
+                    if app.input.is_empty() {
+                        app.search_active = true;
+                        app.search_query.clear();
+                        return Ok(InputResult::Nothing);
+                    }
+                    app.input.input(key);
+                    Ok(InputResult::Nothing)
+                }
+                // ── Search navigation: n/N ──
+                KeyCode::Char('n') => {
+                    if app.input.is_empty() && !app.search_matches.is_empty() {
+                        app.search_next();
+                        return Ok(InputResult::Nothing);
+                    }
+                    app.input.input(key);
+                    Ok(InputResult::Nothing)
+                }
+                KeyCode::Char('N') => {
+                    if app.input.is_empty() && !app.search_matches.is_empty() {
+                        app.search_prev();
+                        return Ok(InputResult::Nothing);
+                    }
+                    app.input.input(key);
+                    Ok(InputResult::Nothing)
+                }
+                // ── Help panel ──
+                KeyCode::Char('?') => {
+                    app.help_visible = !app.help_visible;
+                    Ok(InputResult::Nothing)
+                }
                 _ => { app.input.input(key); Ok(InputResult::Nothing) }
             }
+        }
+        _ => Ok(InputResult::Nothing),
+    }
+}
+
+fn handle_history(app: &mut App, prev: bool) -> io::Result<InputResult> {
+    let text = if prev {
+        app.history_prev()
+    } else {
+        app.history_next()
+    };
+    if let Some(text) = text {
+        // Clear and refill the textarea
+        let mut ta = TextArea::default();
+        ta.set_block(Block::default().borders(Borders::ALL).title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
+        ta.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
+        if !text.is_empty() {
+            ta.insert_str(&text);
+        }
+        app.input = ta;
+    }
+    Ok(InputResult::Nothing)
+}
+
+fn handle_search_input(app: &mut App, key: crossterm::event::KeyEvent) -> io::Result<InputResult> {
+    match key.code {
+        KeyCode::Esc => {
+            app.cancel_search();
+            Ok(InputResult::Nothing)
+        }
+        KeyCode::Enter => {
+            let query = app.search_query.clone();
+            app.search_active = false;
+            if !query.is_empty() {
+                app.execute_search(&query);
+            }
+            Ok(InputResult::Nothing)
+        }
+        KeyCode::Backspace => {
+            app.search_query.pop();
+            Ok(InputResult::Nothing)
+        }
+        KeyCode::Char(c) => {
+            app.search_query.push(c);
+            Ok(InputResult::Nothing)
         }
         _ => Ok(InputResult::Nothing),
     }
