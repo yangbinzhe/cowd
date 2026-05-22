@@ -2723,15 +2723,19 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                 match output {
                                     Ok((true, captured)) => {
                                         cli.persist_session()?;
-                                        app.add_message("system", &format!("Cmd: {text}"));
-                                        for line in captured.trim().lines() {
-                                            app.add_message("system", line);
-                                        }
+                                        // Extract command name from "/session list" -> "session"
+                                        let cmd_name = text
+                                            .strip_prefix('/')
+                                            .and_then(|s| s.split_whitespace().next())
+                                            .unwrap_or(&text);
+                                        app.add_slash_output(cmd_name, &captured);
                                     }
                                     Ok((false, captured)) => {
-                                        for line in captured.trim().lines() {
-                                            app.add_message("system", line);
-                                        }
+                                        let cmd_name = text
+                                            .strip_prefix('/')
+                                            .and_then(|s| s.split_whitespace().next())
+                                            .unwrap_or(&text);
+                                        app.add_slash_output(cmd_name, &captured);
                                     }
                                     Err(e) => {
                                         app.add_message("system", &format!("Error: {e}"));

@@ -58,9 +58,9 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                 KeyCode::Up => {
                     if app.input.is_empty() {
                         // Navigate timeline cursor up
-                        app.cursor_up();
-                        // Also scroll the view a bit
-                        app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                        if app.cursor_up() {
+                            app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                        }
                         return Ok(InputResult::Nothing);
                     }
                     app.input.input(key);
@@ -68,8 +68,9 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                 }
                 KeyCode::Down => {
                     if app.input.is_empty() {
-                        app.cursor_down();
-                        app.scroll_offset = app.scroll_offset.saturating_add(1);
+                        if app.cursor_down() {
+                            app.scroll_offset = app.scroll_offset.saturating_add(1);
+                        }
                         return Ok(InputResult::Nothing);
                     }
                     app.input.input(key);
@@ -111,6 +112,12 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                 }
                 KeyCode::Char('t') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
                     app.theme.toggle(); Ok(InputResult::Nothing)
+                }
+                KeyCode::Char('y') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                    if app.input.is_empty() {
+                        app.copy_focused_content();
+                    }
+                    Ok(InputResult::Nothing)
                 }
                 _ => { app.input.input(key); Ok(InputResult::Nothing) }
             }

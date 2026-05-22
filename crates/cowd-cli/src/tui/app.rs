@@ -29,6 +29,16 @@ pub enum TimelineEntry {
         expanded: bool,
         exit_code: Option<i32>,
     },
+    /// Slash command output (grouped into a single collapsible entry).
+    /// Prevents flooding the timeline with per-line system messages.
+    SlashOutput {
+        /// Command name (e.g. "session", "status", "cost")
+        command: String,
+        /// Full captured output text
+        output: String,
+        /// Whether the output is currently expanded
+        expanded: bool,
+    },
 }
 
 impl TimelineEntry {
@@ -42,12 +52,15 @@ impl TimelineEntry {
             Self::ToolCall { output, expanded, .. } => {
                 if *expanded && !output.is_empty() { output.lines().count().max(1) + 2 } else { 1 }
             }
+            Self::SlashOutput { output, expanded, .. } => {
+                if *expanded && !output.is_empty() { output.lines().count().max(1) + 2 } else { 1 }
+            }
         }
     }
 
     /// Whether this entry can be toggled (expanded/collapsed).
     pub fn is_collapsible(&self) -> bool {
-        matches!(self, Self::Thinking { .. } | Self::ToolCall { .. })
+        matches!(self, Self::Thinking { .. } | Self::ToolCall { .. } | Self::SlashOutput { .. })
     }
 
     /// Whether this entry is currently expanded.
@@ -55,6 +68,7 @@ impl TimelineEntry {
         match self {
             Self::Thinking { expanded, .. } => *expanded,
             Self::ToolCall { expanded, .. } => *expanded,
+            Self::SlashOutput { expanded, .. } => *expanded,
             _ => false,
         }
     }
@@ -64,7 +78,18 @@ impl TimelineEntry {
         match self {
             Self::Thinking { expanded, .. } => *expanded = !*expanded,
             Self::ToolCall { expanded, .. } => *expanded = !*expanded,
+            Self::SlashOutput { expanded, .. } => *expanded = !*expanded,
             _ => {}
+        }
+    }
+
+    /// Get the full text content of this entry (for copy to clipboard).
+    pub fn full_text(&self) -> String {
+        match self {
+            Self::Message { content, .. } => content.clone(),
+            Self::Thinking { content, .. } => content.clone(),
+            Self::ToolCall { output, .. } => output.clone(),
+            Self::SlashOutput { output, .. } => output.clone(),
         }
     }
 }
@@ -323,8 +348,9 @@ impl App {
     // ── Navigation ──
 
     /// Move timeline cursor up by one collapsible entry.
-    pub fn cursor_up(&mut self) {
-        if self.timeline.is_empty() { return; }
+    /// Returns true if the cursor actually moved.
+    pub fn cursor_up(&mut self) -> bool {
+        if self.timeline.is_empty() { return false; }
         let mut idx = self.timeline_cursor;
         loop {
             if idx == 0 { break; }
@@ -332,24 +358,26 @@ impl App {
             if self.timeline[idx].is_collapsible() {
                 self.timeline_cursor = idx;
                 self.auto_scroll = false;
-                return;
+                return true;
             }
         }
-        // If no collapsible entry found above, stay at current
+        false
     }
 
     /// Move timeline cursor down by one collapsible entry.
-    pub fn cursor_down(&mut self) {
-        if self.timeline.is_empty() { return; }
+    /// Returns true if the cursor actually moved.
+    pub fn cursor_down(&mut self) -> bool {
+        if self.timeline.is_empty() { return false; }
         let mut idx = self.timeline_cursor;
         while idx + 1 < self.timeline.len() {
             idx += 1;
             if self.timeline[idx].is_collapsible() {
                 self.timeline_cursor = idx;
                 self.auto_scroll = true; // re-enable auto-scroll when moving to bottom
-                return;
+                return true;
             }
         }
+        false
     }
 
     /// Toggle expand/collapse on the currently focused timeline entry.
@@ -383,6 +411,41 @@ impl App {
         self.timeline_cursor = self.timeline.len().saturating_sub(1);
         self.msg_version = self.msg_version.wrapping_add(1);
         self.trim_timeline();
+    }
+
+    /// Add slash command output as a single collapsible entry.
+    /// Short output (<=3 lines) is added as a simple system message.
+    /// Longer output gets grouped into a SlashOutput entry.
+    pub fn add_slash_output(&mut self, command: &str, output: &str) {
+        let trimmed = output.trim();
+        if trimmed.is_empty() { return; }
+        let line_count = trimmed.lines().count();
+        if line_count <= 3 {
+            self.add_message("system", &format!("/{command}:"));
+            self.add_message("system", trimmed);
+        } else {
+            self.timeline.push(TimelineEntry::SlashOutput {
+                command: command.to_string(),
+                output: trimmed.to_string(),
+                expanded: false, // collapsed by default to avoid dominating the view
+            });
+            self.timeline_cursor = self.timeline.len().saturating_sub(1);
+            self.msg_version = self.msg_version.wrapping_add(1);
+            self.trim_timeline();
+        }
+    }
+
+    /// Copy the content of the currently focused timeline entry to system clipboard.
+    /// Returns true if copy succeeded, false otherwise.
+    pub fn copy_focused_content(&self) -> bool {
+        let Some(entry) = self.timeline.get(self.timeline_cursor) else {
+            return false;
+        };
+        let text = entry.full_text();
+        if text.is_empty() {
+            return false;
+        }
+        crate::tui::osc52::write_osc52_clipboard(&text)
     }
 
     // ── Event handling ──

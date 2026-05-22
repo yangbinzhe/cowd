@@ -226,5 +226,52 @@ fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line<'st
                 ]));
             }
         }
+
+        TimelineEntry::SlashOutput { command, output, expanded } => {
+            let line_count = output.lines().count();
+            let focus_marker = if is_focused { "● " } else { "  " };
+
+            if *expanded {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{focus_marker}┌─ /{command} ({line_count} lines)"),
+                        Style::default().fg(Color::Magenta).bold(),
+                    ),
+                    Span::styled(
+                        if is_focused { "[Enter=collapse] [Ctrl+Y=copy]".to_string() } else { String::new() },
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                for line in output.lines().take(100) {
+                    lines.push(Line::from(vec![
+                        Span::styled("│  ".to_string(), Style::default().fg(Color::Magenta)),
+                        Span::styled(line.to_string(), Style::default().fg(Color::White)),
+                    ]));
+                }
+                if output.lines().count() > 100 {
+                    lines.push(Line::from(Span::styled(
+                        format!("│ ... ({} more lines)", output.lines().count() - 100),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    "└─".to_string(),
+                    Style::default().fg(Color::Magenta),
+                )));
+            } else {
+                let preview: String = output.chars().take(80).collect();
+                let more = if output.len() > 80 { "..." } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{focus_marker}/ {command} ({line_count}L): {preview}{more}"),
+                        Style::default().fg(Color::Magenta).bold(),
+                    ),
+                    Span::styled(
+                        if is_focused { "[Enter=expand] [Ctrl+Y=copy]".to_string() } else { String::new() },
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
     }
 }

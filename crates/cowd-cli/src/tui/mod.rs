@@ -6,6 +6,7 @@ pub mod events;
 pub mod runner;
 pub mod callbacks;
 pub mod widgets;
+pub mod osc52;
 
 pub use app::{App, FileEntry, DelegateTask, MemoryEntry, SkillSummary};
 pub use events::{TuiEvent, TuiEventReceiver, tui_event_channel};
