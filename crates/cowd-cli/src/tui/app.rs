@@ -180,6 +180,19 @@ pub struct App {
 
     // ── Render cache ──
     pub cached_chat_lines: Vec<ratatui::text::Line<'static>>,
+
+    // ── Virtual scrolling ──
+    /// Per-entry line count in cached_chat_lines (excluding separator blank lines).
+    /// Used to compute viewport-visible entries without building all lines.
+    pub entry_line_counts: Vec<u16>,
+    /// True when cached_chat_lines is stale and needs rebuilding.
+    pub lines_dirty: bool,
+    /// For incremental line building: last index into cached_chat_lines that was built.
+    last_built_line_count: usize,
+
+    // ── Input history ──
+    pub input_history: Vec<String>,
+    pub history_idx: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -298,7 +311,20 @@ impl App {
             pre_turn_output: 0,
 
             cached_chat_lines: Vec::new(),
+
+            entry_line_counts: Vec::new(),
+            lines_dirty: true,
+            last_built_line_count: 0,
+
+            input_history: Vec::new(),
+            history_idx: None,
         }
+    }
+
+    /// Mark render cache as dirty (force rebuild next draw).
+    pub fn mark_dirty(&mut self) {
+        self.lines_dirty = true;
+        self.msg_version = self.msg_version.wrapping_add(1);
     }
 
     pub fn next_panel(&mut self) {
@@ -469,9 +495,12 @@ impl App {
                         role: "assistant".into(),
                         content: text,
                     });
+                    self.msg_version = self.msg_version.wrapping_add(1); // structural change
+                } else {
+                    // Streaming update: mark dirty without full version bump
+                    self.lines_dirty = true;
                 }
                 self.timeline_cursor = self.timeline.len().saturating_sub(1);
-                self.msg_version = self.msg_version.wrapping_add(1);
                 self.trim_timeline();
             }
 
@@ -493,9 +522,12 @@ impl App {
                         complete: false,
                         expanded: false,
                     });
+                    self.msg_version = self.msg_version.wrapping_add(1); // structural change
+                } else {
+                    // Streaming update: mark dirty without full version bump
+                    self.lines_dirty = true;
                 }
                 self.timeline_cursor = self.timeline.len().saturating_sub(1);
-                self.msg_version = self.msg_version.wrapping_add(1);
                 self.trim_timeline();
             }
 
@@ -533,6 +565,8 @@ impl App {
                     if output.len() > 4096 {
                         *output = output[output.len() - 4096..].to_string();
                     }
+                    // Mark dirty for incremental rebuild (streaming tool output)
+                    self.lines_dirty = true;
                 }
             }
 

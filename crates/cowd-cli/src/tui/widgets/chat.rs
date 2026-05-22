@@ -5,13 +5,20 @@ use ratatui::{
     widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
 };
-use super::super::app::{App, TimelineEntry};
+use super::super::app::{App, Theme, TimelineEntry};
 
 pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    // ── Render cache: only rebuild lines when data has changed ──
+    // ── Render cache: rebuild only when data has changed ──
     if app.msg_version != app.last_drawn_version {
+        // Full rebuild due to structural change
         app.cached_chat_lines = build_new_lines(app);
+        app.entry_line_counts = compute_entry_line_counts(app);
         app.last_drawn_version = app.msg_version;
+        app.lines_dirty = false;
+    } else if app.lines_dirty {
+        // Incremental rebuild for streaming updates (no structural change)
+        rebuild_streaming_tail(app);
+        app.lines_dirty = false;
     }
 
     let content_height = app.cached_chat_lines.len() as u16;
@@ -54,8 +61,56 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// Rebuild chat lines from app state. Called only when msg_version changes.
-/// Returns a freshly built Vec<Line<'static>> to avoid borrow conflicts.
+/// Rebuild only the last entry (being streamed) in-place.
+/// Avoids iterating the entire timeline on every TextDelta.
+fn rebuild_streaming_tail(app: &mut App) {
+    let n = app.timeline.len();
+    if n == 0 { return; }
+
+    // Compute prefix line count (all entries except the last one, plus their separator blanks)
+    let prefix_count: usize = app.entry_line_counts.iter()
+        .take(n.saturating_sub(1))
+        .sum::<u16>()
+        .saturating_add((n.saturating_sub(1)) as u16) // separator blanks for previous entries
+        as usize;
+
+    // Clone data we need before mutable borrow of cached_chat_lines
+    let last_entry = app.timeline[n - 1].clone();
+    let is_focused = (n - 1) == app.timeline_cursor;
+    let theme = app.theme;
+    let turn_active = app.turn_active;
+    let spinner_str = if turn_active { Some(app.spinner_char().to_string()) } else { None };
+
+    // Now do the mutable operations
+    app.cached_chat_lines.truncate(prefix_count.min(app.cached_chat_lines.len()));
+    let before_len = app.cached_chat_lines.len();
+    build_entry(&last_entry, is_focused, &mut app.cached_chat_lines, theme);
+    app.cached_chat_lines.push(Line::raw(""));
+
+    // Update the line count for the last entry
+    if let Some(count) = app.entry_line_counts.get_mut(n - 1) {
+        *count = (app.cached_chat_lines.len() - before_len) as u16;
+    }
+
+    // Re-add loading spinner if turn is active
+    if let Some(spinner) = spinner_str {
+        app.cached_chat_lines.push(Line::from(vec![
+            Span::styled(
+                format!("{spinner} Processing..."),
+                Style::default().fg(Color::Blue),
+            ),
+        ]));
+    }
+}
+
+/// Pre-compute per-entry line counts for virtual scrolling / incremental rebuild.
+fn compute_entry_line_counts(app: &App) -> Vec<u16> {
+    app.timeline.iter()
+        .map(|e| e.expanded_lines() as u16)
+        .collect()
+}
+
+/// Full rebuild of chat lines from app state.
 fn build_new_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -68,7 +123,7 @@ fn build_new_lines(app: &App) -> Vec<Line<'static>> {
 
     for (idx, entry) in app.timeline.iter().enumerate() {
         let is_focused = idx == app.timeline_cursor;
-        build_entry(entry, is_focused, &mut lines, app);
+        build_entry(entry, is_focused, &mut lines, app.theme);
         // Add a blank separator line between entries
         lines.push(Line::raw(""));
     }
@@ -88,13 +143,13 @@ fn build_new_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 /// Build ratatui Lines for a single timeline entry, using owned strings for caching.
-fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line<'static>>, app: &App) {
+pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line<'static>>, theme: Theme) {
     match entry {
         TimelineEntry::Message { role, content } => {
             let (color, prefix) = match role.as_str() {
-                "user" => (app.theme.user_color(), "> "),
+                "user" => (theme.user_color(), "> "),
                 "system" => (Color::DarkGray, "  "),
-                _ => (app.theme.fg(), ""),
+                _ => (theme.fg(), ""),
             };
             for line in content.lines() {
                 lines.push(Line::from(vec![
