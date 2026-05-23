@@ -8,6 +8,7 @@ pub mod chat_view;
 pub mod context_panel;
 pub mod dialog;
 pub mod diff_viewer;
+pub mod revert_dialog;
 pub mod export_dialog;
 pub mod file_changes_panel;
 pub mod file_tree;

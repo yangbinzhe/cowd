@@ -64,22 +64,20 @@ impl ThinkingPanel {
 
         // Extract reasoning from the last Thinking entry
         self.reasoning.clear();
-        for entry in app.timeline.iter().rev() {
-            if let TimelineEntry::Thinking {
-                content,
-                complete,
-                ..
-            } = entry
-            {
-                self.reasoning = content.clone();
-                self.reasoning_complete = *complete;
-                break;
+        let mut last_reasoning: Option<(String, bool)> = None;
+        for (_, entry) in app.timeline_iter() {
+            if let TimelineEntry::Thinking { content, complete, .. } = entry {
+                last_reasoning = Some((content.clone(), *complete));
             }
+        }
+        if let Some((reasoning, complete)) = last_reasoning {
+            self.reasoning = reasoning;
+            self.reasoning_complete = complete;
         }
 
         // Extract tool progress
         self.tools.clear();
-        for entry in &app.timeline {
+        for (_, entry) in app.timeline_iter() {
             if let TimelineEntry::ToolCall {
                 id,
                 name,

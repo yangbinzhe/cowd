@@ -45,6 +45,12 @@ pub enum DialogKind {
         /// Current input buffer.
         input: String,
     },
+    /// Revert confirmation with diff preview.
+    /// Shows file changes (+N -M) before confirming the revert.
+    RevertConfirm {
+        title: String,
+        files: Vec<(String, usize, usize)>,
+    },
     /// Multi-stage permission dialog: Allow Once / Always / Reject with reason.
     /// Backward-compatible with __approval_approved__ / __approval_denied__ protocol.
     Permission {
@@ -255,6 +261,18 @@ impl DialogManager {
                 _ => consumed = false,
             },
 
+            DialogKind::RevertConfirm { .. } => match event.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                    self.stack[idx].result = Some(DialogResult::Yes);
+                    dismiss = true;
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    self.stack[idx].result = Some(DialogResult::No);
+                    dismiss = true;
+                }
+                _ => consumed = false,
+            },
+
             DialogKind::Permission {
                 action,
                 showing_reject_input,
@@ -382,7 +400,8 @@ impl DialogManager {
             DialogKind::Alert { title, .. }
             | DialogKind::Confirm { title, .. }
             | DialogKind::Select { title, .. }
-            | DialogKind::Prompt { title, .. } => title.len() as u16,
+            | DialogKind::Prompt { title, .. }
+            | DialogKind::RevertConfirm { title, .. } => title.len() as u16,
             DialogKind::Permission { tool_name, .. } => {
                 format!(" Permission: {tool_name} ").len() as u16
             }
@@ -408,10 +427,21 @@ impl DialogManager {
             DialogKind::Permission { input_preview, .. } => {
                 input_preview.len().max(50) as u16
             }
+            DialogKind::RevertConfirm { files, .. } => {
+                let max_file_len = files
+                    .iter()
+                    .map(|(fname, adds, dels)| fname.len() + 3 + format!("{adds}").len() + format!("{dels}").len())
+                    .max()
+                    .unwrap_or(0);
+                max_file_len.max(20) as u16
+            }
         };
 
-        let buttons_w: u16 = if matches!(dialog.kind, DialogKind::Confirm { .. }) {
-            20 // "[Y] Yes  [N] No"
+        let buttons_w: u16 = if matches!(
+            dialog.kind,
+            DialogKind::Confirm { .. } | DialogKind::RevertConfirm { .. }
+        ) {
+            20 // "[Y] Yes  [N] No" or "[Y] Confirm  [N] Cancel"
         } else {
             0
         };
@@ -436,6 +466,10 @@ impl DialogManager {
             DialogKind::Prompt { .. } => 7,
             // Permission: border(2) + title + preview + blank + 3 buttons + hint + spare
             DialogKind::Permission { .. } => 10,
+            // RevertConfirm: border(2) + title + blank + "Files changed:" + blank + file lines + blank + buttons
+            DialogKind::RevertConfirm { files, .. } => {
+                (files.len() as u16 + 8).max(7)
+            }
         }
     }
 
@@ -591,6 +625,59 @@ impl DialogManager {
 
                 let p = Paragraph::new(text).block(block);
 
+                frame.render_widget(p, rect);
+            }
+
+            DialogKind::RevertConfirm { title, files } => {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.as_str())
+                    .fg(accent);
+
+                let mut text_lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        " Files changed:",
+                        Style::default().fg(Color::DarkGray).bold(),
+                    )),
+                    Line::from(""),
+                ];
+
+                for (filename, adds, dels) in files {
+                    let line = Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(filename.to_string(), Style::default()),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("+{adds}"),
+                            Style::default().fg(Color::Green),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("-{dels}"),
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]);
+                    text_lines.push(line);
+                }
+
+                text_lines.push(Line::from(""));
+
+                let buttons = Line::from(vec![
+                    Span::styled(
+                        " [Y] Confirm ",
+                        Style::default().fg(Color::Black).bg(Color::Green),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        " [N] Cancel ",
+                        Style::default().fg(Color::Black).bg(Color::Red),
+                    ),
+                ]);
+                text_lines.push(buttons);
+
+                let text = Text::from(text_lines);
+                let p = Paragraph::new(text).block(block).centered();
                 frame.render_widget(p, rect);
             }
 

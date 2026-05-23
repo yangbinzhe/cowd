@@ -116,7 +116,7 @@ impl ChatView {
     /// Sync view-model from the shared App state.
     /// Called once per frame before rendering.
     pub fn sync_from_app(&mut self, app: &crate::tui::App) {
-        self.timeline = app.timeline.clone();
+        self.timeline = app.timeline_clone_vec();
         self.timeline_cursor = app.timeline_cursor;
         self.scroll_offset = app.scroll_offset;
         self.auto_scroll = app.auto_scroll;

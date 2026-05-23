@@ -51,7 +51,7 @@ impl AgentsOverlay {
 
     pub fn sync_from_app(&mut self, app: &App) {
         self.agents.clear();
-        for entry in &app.timeline {
+        for (_, entry) in app.timeline_iter() {
             if let TimelineEntry::ToolCall {
                 id,
                 name,

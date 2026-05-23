@@ -1,27 +1,33 @@
 #![allow(dead_code)]
+use std::collections::VecDeque;
 use tui_textarea::TextArea;
 use ratatui::widgets::{Block, Borders};
 use crate::tui::TuiEvent;
 use crate::tui::layout::{LayoutState, LayoutTree, build_default_layout};
 
-/// A single entry in the time-ordered conversation timeline.
-/// Replaces the old split model of Vec<ChatMessage> + Vec<ToolCard> + streaming_thinking.
+const PAGE_SIZE: usize = 500;
+const SOFT_CAP: usize = 10000;
+const HARD_CAP: usize = 50000;
+
+#[derive(Debug, Clone)]
+pub struct TimelinePage {
+    pub entries: Vec<TimelineEntry>,
+    pub start_index: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum TimelineEntry {
-    /// A text message (user or assistant or system).
     Message {
         role: String,
         content: String,
         timestamp: String,
     },
-    /// A thinking/reasoning block that can be collapsed.
     Thinking {
         id: u64,
         content: String,
         complete: bool,
         expanded: bool,
     },
-    /// A tool call that can be collapsed.
     ToolCall {
         id: String,
         name: String,
@@ -31,20 +37,14 @@ pub enum TimelineEntry {
         expanded: bool,
         exit_code: Option<i32>,
     },
-    /// Slash command output (grouped into a single collapsible entry).
-    /// Prevents flooding the timeline with per-line system messages.
     SlashOutput {
-        /// Command name (e.g. "session", "status", "cost")
         command: String,
-        /// Full captured output text
         output: String,
-        /// Whether the output is currently expanded
         expanded: bool,
     },
 }
 
 impl TimelineEntry {
-    /// Number of display lines when fully expanded (approx).
     pub fn expanded_lines(&self) -> usize {
         match self {
             Self::Message { content, .. } => content.lines().count().max(1),
@@ -60,12 +60,10 @@ impl TimelineEntry {
         }
     }
 
-    /// Whether this entry can be toggled (expanded/collapsed).
     pub fn is_collapsible(&self) -> bool {
         matches!(self, Self::Thinking { .. } | Self::ToolCall { .. } | Self::SlashOutput { .. })
     }
 
-    /// Whether this entry is currently expanded.
     pub fn is_expanded(&self) -> bool {
         match self {
             Self::Thinking { expanded, .. } => *expanded,
@@ -75,7 +73,6 @@ impl TimelineEntry {
         }
     }
 
-    /// Toggle expanded state.
     pub fn toggle(&mut self) {
         match self {
             Self::Thinking { expanded, .. } => *expanded = !*expanded,
@@ -85,7 +82,6 @@ impl TimelineEntry {
         }
     }
 
-    /// Get the full text content of this entry (for copy to clipboard).
     pub fn full_text(&self) -> String {
         match self {
             Self::Message { content, .. } => content.clone(),
@@ -95,8 +91,6 @@ impl TimelineEntry {
         }
     }
 }
-
-// ── Legacy types kept for App API compatibility ──
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -133,11 +127,9 @@ pub struct App {
     pub spinner_idx: usize,
     pub should_quit: bool,
 
-    // ── Timeline (replaces messages + tool_cards + streaming_thinking) ──
-    pub timeline: Vec<TimelineEntry>,
-    /// Index of the currently focused timeline entry (for expand/collapse).
+    pub timeline_pages: VecDeque<TimelinePage>,
+    pub total_entries: usize,
     pub timeline_cursor: usize,
-    /// Counter for generating unique thinking IDs.
     thinking_id_counter: u64,
 
     pub token_count: u64,
@@ -158,13 +150,10 @@ pub struct App {
     pub skin: crate::tui::skin::SkinConfig,
     pub memory_status: Option<String>,
 
-    // ── Scrolling ──
     pub scroll_offset: u16,
     pub auto_scroll: bool,
 
-    // ── Turn state ──
     pub turn_active: bool,
-    /// Whether we've received any TextDelta this turn (for TurnComplete fallback).
     streaming_received: bool,
 
     pub msg_version: u64,
@@ -173,53 +162,36 @@ pub struct App {
     pub input_tokens: u64,
     pub output_tokens: u64,
 
-    // ── Per-turn token tracking ──
     pub turn_input_tokens: u64,
     pub turn_output_tokens: u64,
-    /// Snapshot of cumulative totals at turn start (for computing deltas).
     pre_turn_input: u64,
     pre_turn_output: u64,
 
-    // ── Render cache ──
     pub cached_chat_lines: Vec<ratatui::text::Line<'static>>,
 
-    // ── Virtual scrolling ──
-    /// Per-entry line count in cached_chat_lines (excluding separator blank lines).
-    /// Used to compute viewport-visible entries without building all lines.
     pub entry_line_counts: Vec<u16>,
-    /// True when cached_chat_lines is stale and needs rebuilding.
     pub lines_dirty: bool,
-    /// For incremental line building: last index into cached_chat_lines that was built.
     last_built_line_count: usize,
 
-    // ── Input history ──
     pub input_history: Vec<String>,
     pub history_idx: Option<usize>,
 
-    // ── Search ──
     pub search_query: String,
     pub search_matches: Vec<usize>,
     pub search_current: usize,
     pub search_active: bool,
 
-    // ── Viewport (updated by chat widget) ──
     pub viewport_height: u16,
 
-    // ── Help panel ──
     pub help_visible: bool,
 
-    // ── Model switching ──
     pub available_models: Vec<String>,
     pub model_dirty: bool,
 
-    // ── Notification ──
     pub notification: Option<String>,
     notification_ttl: u32,
 
-    // ── Layout ──
-    /// The current layout tree defining the TUI split structure.
     pub layout_tree: LayoutTree,
-    /// Runtime layout state (sidebar visibility, split ratio).
     pub layout_state: LayoutState,
 }
 
@@ -299,7 +271,8 @@ impl App {
             spinner_idx: 0,
             should_quit: false,
 
-            timeline: Vec::new(),
+            timeline_pages: VecDeque::new(),
+            total_entries: 0,
             timeline_cursor: 0,
             thinking_id_counter: 0,
 
@@ -367,10 +340,145 @@ impl App {
         }
     }
 
-    /// Mark render cache as dirty (force rebuild next draw).
     pub fn mark_dirty(&mut self) {
         self.lines_dirty = true;
         self.msg_version = self.msg_version.wrapping_add(1);
+    }
+
+    pub fn timeline_len(&self) -> usize {
+        self.total_entries
+    }
+
+    pub fn timeline_is_empty(&self) -> bool {
+        self.total_entries == 0
+    }
+
+    pub fn timeline_get(&self, idx: usize) -> Option<&TimelineEntry> {
+        if idx >= self.total_entries {
+            return None;
+        }
+        for page in &self.timeline_pages {
+            if idx >= page.start_index && idx < page.start_index + page.entries.len() {
+                return page.entries.get(idx - page.start_index);
+            }
+        }
+        None
+    }
+
+    pub fn timeline_get_mut(&mut self, idx: usize) -> Option<&mut TimelineEntry> {
+        if idx >= self.total_entries {
+            return None;
+        }
+        for page in &mut self.timeline_pages {
+            if idx >= page.start_index && idx < page.start_index + page.entries.len() {
+                return page.entries.get_mut(idx - page.start_index);
+            }
+        }
+        None
+    }
+
+    pub fn timeline_last_mut(&mut self) -> Option<&mut TimelineEntry> {
+        self.timeline_pages.back_mut()
+            .and_then(|page| page.entries.last_mut())
+    }
+
+    pub fn timeline_push(&mut self, entry: TimelineEntry) {
+        if self.timeline_pages.is_empty()
+            || self.timeline_pages.back().map_or(true, |p| p.entries.len() >= PAGE_SIZE)
+        {
+            let start = self.timeline_pages.back()
+                .map_or(0, |p| p.start_index + p.entries.len());
+            self.timeline_pages.push_back(TimelinePage {
+                entries: Vec::with_capacity(PAGE_SIZE),
+                start_index: start,
+            });
+        }
+        self.timeline_pages.back_mut().unwrap().entries.push(entry);
+        self.total_entries += 1;
+        self.soft_evict();
+        self.hard_evict();
+    }
+
+    pub fn timeline_iter(&self) -> impl Iterator<Item = (usize, &TimelineEntry)> + '_ {
+        self.timeline_pages.iter()
+            .flat_map(|page| {
+                let start = page.start_index;
+                page.entries.iter().enumerate()
+                    .map(move |(i, e)| (start + i, e))
+            })
+    }
+
+    pub fn timeline_iter_mut(&mut self) -> impl Iterator<Item = &mut TimelineEntry> + '_ {
+        self.timeline_pages.iter_mut()
+            .flat_map(|page| page.entries.iter_mut())
+    }
+
+    pub fn timeline_clone_vec(&self) -> Vec<TimelineEntry> {
+        let mut v = Vec::with_capacity(self.total_entries);
+        for page in &self.timeline_pages {
+            v.extend(page.entries.iter().cloned());
+        }
+        v
+    }
+
+    fn soft_evict(&mut self) {
+        while self.total_entries > SOFT_CAP {
+            let Some(front) = self.timeline_pages.front() else { break };
+            let evict_count = front.entries.len();
+
+            let evicted_lines: u16 = if !self.entry_line_counts.is_empty() {
+                let count = evict_count.min(self.entry_line_counts.len());
+                self.entry_line_counts.iter().take(count).map(|&c| c + 1).sum()
+            } else {
+                0
+            };
+
+            let drain_count = evict_count.min(self.entry_line_counts.len());
+            self.entry_line_counts.drain(0..drain_count);
+            self.scroll_offset = self.scroll_offset.saturating_sub(evicted_lines);
+            self.timeline_cursor = self.timeline_cursor.saturating_sub(evict_count);
+            self.search_matches.retain(|&m| m >= evict_count);
+            self.search_matches.iter_mut().for_each(|m| *m -= evict_count);
+
+            self.timeline_pages.pop_front();
+            self.total_entries -= evict_count;
+
+            let mut next_start = 0usize;
+            for page in &mut self.timeline_pages {
+                page.start_index = next_start;
+                next_start += page.entries.len();
+            }
+        }
+    }
+
+    fn hard_evict(&mut self) {
+        while self.total_entries > HARD_CAP {
+            let Some(front) = self.timeline_pages.front() else { break };
+            let evict_count = front.entries.len();
+
+            let evicted_lines: u16 = if !self.entry_line_counts.is_empty() {
+                let count = evict_count.min(self.entry_line_counts.len());
+                self.entry_line_counts.iter().take(count).map(|&c| c + 1).sum()
+            } else {
+                0
+            };
+
+            let drain_count = evict_count.min(self.entry_line_counts.len());
+            self.entry_line_counts.drain(0..drain_count);
+            self.scroll_offset = self.scroll_offset.saturating_sub(evicted_lines);
+            self.timeline_cursor = self.timeline_cursor.saturating_sub(evict_count);
+            self.search_matches.retain(|&m| m >= evict_count);
+            self.search_matches.iter_mut().for_each(|m| *m -= evict_count);
+
+            self.timeline_pages.pop_front();
+            self.total_entries -= evict_count;
+
+            let mut next_start = 0usize;
+            for page in &mut self.timeline_pages {
+                page.start_index = next_start;
+                next_start += page.entries.len();
+            }
+        }
     }
 
     pub fn next_panel(&mut self) {
@@ -399,8 +507,6 @@ impl App {
         }
     }
 
-    /// Cycle to the next available model name.
-    /// Returns the new model name, or None if only one model is available.
     pub fn next_model(&mut self) -> Option<String> {
         if self.available_models.len() <= 1 {
             return None;
@@ -411,20 +517,17 @@ impl App {
             self.model_dirty = true;
             Some(self.model.clone())
         } else {
-            // Current model not in list — pick first
             self.model = self.available_models[0].clone();
             self.model_dirty = true;
             Some(self.model.clone())
         }
     }
 
-    /// Show a temporary notification that auto-dismisses after ~3 seconds.
     pub fn show_notification(&mut self, msg: &str) {
         self.notification = Some(msg.to_string());
-        self.notification_ttl = 30; // ~3s at 10fps tick
+        self.notification_ttl = 30;
     }
 
-    /// Format a timestamp for display in the chat.
     pub fn format_timestamp() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         let dur = SystemTime::now()
@@ -435,8 +538,6 @@ impl App {
         let m = (secs / 60) % 60;
         format!("{h:02}:{m:02}")
     }
-
-    // ── Session picker ──
 
     pub fn open_session_picker(&mut self, sessions: Vec<SessionSummary>) {
         self.picker_sessions = sessions;
@@ -462,17 +563,13 @@ impl App {
         self.picker_sessions.get(self.picker_idx).map(|s| s.id.as_str())
     }
 
-    // ── Navigation ──
-
-    /// Move timeline cursor up by one collapsible entry.
-    /// Returns true if the cursor actually moved.
     pub fn cursor_up(&mut self) -> bool {
-        if self.timeline.is_empty() { return false; }
+        if self.timeline_is_empty() { return false; }
         let mut idx = self.timeline_cursor;
         loop {
             if idx == 0 { break; }
             idx -= 1;
-            if self.timeline[idx].is_collapsible() {
+            if self.timeline_get(idx).map_or(false, |e| e.is_collapsible()) {
                 self.timeline_cursor = idx;
                 self.auto_scroll = false;
                 return true;
@@ -481,59 +578,37 @@ impl App {
         false
     }
 
-    /// Move timeline cursor down by one collapsible entry.
-    /// Returns true if the cursor actually moved.
     pub fn cursor_down(&mut self) -> bool {
-        if self.timeline.is_empty() { return false; }
+        if self.timeline_is_empty() { return false; }
         let mut idx = self.timeline_cursor;
-        while idx + 1 < self.timeline.len() {
+        while idx + 1 < self.timeline_len() {
             idx += 1;
-            if self.timeline[idx].is_collapsible() {
+            if self.timeline_get(idx).map_or(false, |e| e.is_collapsible()) {
                 self.timeline_cursor = idx;
-                self.auto_scroll = true; // re-enable auto-scroll when moving to bottom
+                self.auto_scroll = true;
                 return true;
             }
         }
         false
     }
 
-    /// Toggle expand/collapse on the currently focused timeline entry.
     pub fn toggle_expand_current(&mut self) {
-        if let Some(entry) = self.timeline.get_mut(self.timeline_cursor) {
+        if let Some(entry) = self.timeline_get_mut(self.timeline_cursor) {
             entry.toggle();
             self.msg_version = self.msg_version.wrapping_add(1);
         }
     }
 
-    // ── Trim ──
-
-    fn trim_timeline(&mut self) {
-        const MAX: usize = 3000;
-        if self.timeline.len() > MAX {
-            let excess = self.timeline.len() - MAX;
-            self.timeline.drain(0..excess);
-            self.timeline_cursor = self.timeline_cursor.saturating_sub(excess);
-            self.scroll_offset = self.scroll_offset.saturating_sub(excess as u16);
-        }
-    }
-
-    // ── Public API (used by runner to push user/system messages) ──
-
-    /// Add a user or system message to the timeline.
     pub fn add_message(&mut self, role: &str, content: &str) {
-        self.timeline.push(TimelineEntry::Message {
+        self.timeline_push(TimelineEntry::Message {
             role: role.to_string(),
             content: content.to_string(),
             timestamp: App::format_timestamp(),
         });
-        self.timeline_cursor = self.timeline.len().saturating_sub(1);
+        self.timeline_cursor = self.timeline_len().saturating_sub(1);
         self.msg_version = self.msg_version.wrapping_add(1);
-        self.trim_timeline();
     }
 
-    /// Add slash command output as a single collapsible entry.
-    /// Short output (<=3 lines) is added as a simple system message.
-    /// Longer output gets grouped into a SlashOutput entry.
     pub fn add_slash_output(&mut self, command: &str, output: &str) {
         let trimmed = output.trim();
         if trimmed.is_empty() { return; }
@@ -542,21 +617,18 @@ impl App {
             self.add_message("system", &format!("/{command}:"));
             self.add_message("system", trimmed);
         } else {
-            self.timeline.push(TimelineEntry::SlashOutput {
+            self.timeline_push(TimelineEntry::SlashOutput {
                 command: command.to_string(),
                 output: trimmed.to_string(),
-                expanded: false, // collapsed by default to avoid dominating the view
+                expanded: false,
             });
-            self.timeline_cursor = self.timeline.len().saturating_sub(1);
+            self.timeline_cursor = self.timeline_len().saturating_sub(1);
             self.msg_version = self.msg_version.wrapping_add(1);
-            self.trim_timeline();
         }
     }
 
-    /// Copy the content of the currently focused timeline entry to system clipboard.
-    /// Returns true if copy succeeded, false otherwise.
     pub fn copy_focused_content(&self) -> bool {
-        let Some(entry) = self.timeline.get(self.timeline_cursor) else {
+        let Some(entry) = self.timeline_get(self.timeline_cursor) else {
             return false;
         };
         let text = entry.full_text();
@@ -566,27 +638,23 @@ impl App {
         crate::tui::osc52::write_osc52_clipboard(&text)
     }
 
-    // ── Search ──
-
-    /// Execute a search: find all timeline entries whose full_text contains the query.
-    /// Jumps to the first match if any found.
     pub fn execute_search(&mut self, query: &str) {
         self.search_query = query.to_string();
         self.search_matches.clear();
         self.search_current = 0;
 
         let lower = query.to_lowercase();
-        for (idx, entry) in self.timeline.iter().enumerate() {
+        let mut matches = Vec::new();
+        for (idx, entry) in self.timeline_iter() {
             if entry.full_text().to_lowercase().contains(&lower) {
-                self.search_matches.push(idx);
+                matches.push(idx);
             }
         }
+        self.search_matches = matches;
 
-        // Jump to first match
         self.go_search_match(0);
     }
 
-    /// Navigate to the next search match.
     pub fn search_next(&mut self) {
         if self.search_matches.is_empty() { return; }
         let idx = if self.search_current + 1 < self.search_matches.len() {
@@ -597,7 +665,6 @@ impl App {
         self.go_search_match(idx);
     }
 
-    /// Navigate to the previous search match.
     pub fn search_prev(&mut self) {
         if self.search_matches.is_empty() { return; }
         let idx = if self.search_current > 0 {
@@ -617,7 +684,6 @@ impl App {
         }
     }
 
-    /// Clear search state.
     pub fn cancel_search(&mut self) {
         self.search_query.clear();
         self.search_matches.clear();
@@ -625,48 +691,36 @@ impl App {
         self.search_active = false;
     }
 
-    // ── Scrolling helpers ──
-
-    /// Scroll so the entry at the given index is visible in the viewport.
     pub fn scroll_to_entry(&mut self, entry_idx: usize) {
         let vh = self.viewport_height.max(1) as usize;
-        // Compute the line offset where this entry starts
         let mut offset: usize = 0;
         for i in 0..entry_idx.min(self.entry_line_counts.len()) {
-            offset += self.entry_line_counts[i] as usize + 1; // +1 for separator
+            offset += self.entry_line_counts[i] as usize + 1;
         }
         let entry_h = self.entry_line_counts
             .get(entry_idx)
             .copied()
             .unwrap_or(1) as usize;
 
-        // If the entry is above the viewport, scroll to it
         let scroll = self.scroll_offset as usize;
         if offset < scroll {
             self.scroll_offset = offset as u16;
         }
-        // If the entry is below the viewport, scroll so it's visible at the bottom
         else if offset + entry_h > scroll + vh {
             self.scroll_offset = offset.saturating_sub(vh.saturating_sub(entry_h)) as u16;
         }
     }
 
-    /// Scroll up by one viewport worth of lines.
     pub fn scroll_page_up(&mut self) {
         let amount = self.viewport_height.max(1).saturating_sub(1);
         self.scroll_offset = self.scroll_offset.saturating_sub(amount);
     }
 
-    /// Scroll down by one viewport worth of lines.
     pub fn scroll_page_down(&mut self) {
         let amount = self.viewport_height.max(1).saturating_sub(1);
         self.scroll_offset = self.scroll_offset.saturating_add(amount);
     }
 
-    // ── Input history ──
-
-    /// Navigate to an older (previous) input history entry.
-    /// Returns the history text to set in the input box, if any.
     pub fn history_prev(&mut self) -> Option<String> {
         if self.input_history.is_empty() { return None; }
         let idx = match self.history_idx {
@@ -678,8 +732,6 @@ impl App {
         self.input_history.get(idx).cloned()
     }
 
-    /// Navigate to a newer (next) input history entry.
-    /// Returns the history text to set in the input box, or empty string to clear.
     pub fn history_next(&mut self) -> Option<String> {
         let idx = match self.history_idx {
             Some(i) if i + 1 < self.input_history.len() => i + 1,
@@ -692,41 +744,34 @@ impl App {
         self.input_history.get(idx).cloned()
     }
 
-    // ── Event handling ──
-
-    /// Apply a TuiEvent from the background turn runner to the display state.
     pub fn apply_event(&mut self, event: TuiEvent) {
         match event {
             TuiEvent::TextDelta { text } => {
                 self.streaming_received = true;
                 self.auto_scroll = true;
-                // Find last incomplete assistant Message, or create new one
                 let mut found = false;
-                if let Some(TimelineEntry::Message { role, content, .. }) = self.timeline.last_mut() {
+                if let Some(TimelineEntry::Message { role, content, .. }) = self.timeline_last_mut() {
                     if role == "assistant" && content != "✓ Done" {
                         content.push_str(&text);
                         found = true;
                     }
                 }
                 if !found {
-                    self.timeline.push(TimelineEntry::Message {
+                    self.timeline_push(TimelineEntry::Message {
                         role: "assistant".into(),
                         content: text,
                         timestamp: App::format_timestamp(),
                     });
-                    self.msg_version = self.msg_version.wrapping_add(1); // structural change
+                    self.msg_version = self.msg_version.wrapping_add(1);
                 } else {
-                    // Streaming update: mark dirty without full version bump
                     self.lines_dirty = true;
                 }
-                self.timeline_cursor = self.timeline.len().saturating_sub(1);
-                self.trim_timeline();
+                self.timeline_cursor = self.timeline_len().saturating_sub(1);
             }
 
             TuiEvent::ThinkingDelta { thinking } => {
-                // Find last incomplete Thinking entry, or create new one
                 let mut found = false;
-                if let Some(TimelineEntry::Thinking { content, complete, .. }) = self.timeline.last_mut() {
+                if let Some(TimelineEntry::Thinking { content, complete, .. }) = self.timeline_last_mut() {
                     if !*complete {
                         content.push_str(&thinking);
                         found = true;
@@ -735,71 +780,74 @@ impl App {
                 if !found {
                     let id = self.thinking_id_counter;
                     self.thinking_id_counter += 1;
-                    self.timeline.push(TimelineEntry::Thinking {
+                    self.timeline_push(TimelineEntry::Thinking {
                         id,
                         content: thinking,
                         complete: false,
                         expanded: false,
                     });
-                    self.msg_version = self.msg_version.wrapping_add(1); // structural change
+                    self.msg_version = self.msg_version.wrapping_add(1);
                 } else {
-                    // Streaming update: mark dirty without full version bump
                     self.lines_dirty = true;
                 }
-                self.timeline_cursor = self.timeline.len().saturating_sub(1);
-                self.trim_timeline();
+                self.timeline_cursor = self.timeline_len().saturating_sub(1);
             }
 
             TuiEvent::ThinkingComplete => {
-                // Mark the last incomplete Thinking as complete and collapse it
-                if let Some(TimelineEntry::Thinking { complete, expanded, .. }) = self.timeline.last_mut() {
+                if let Some(TimelineEntry::Thinking { complete, expanded, .. }) = self.timeline_last_mut() {
                     *complete = true;
-                    *expanded = false; // auto-collapse when done
+                    *expanded = false;
                 }
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
             TuiEvent::ToolStart { id, name, preview } => {
                 self.auto_scroll = true;
-                self.timeline.push(TimelineEntry::ToolCall {
+                self.timeline_push(TimelineEntry::ToolCall {
                     id,
                     name,
                     preview,
                     output: String::new(),
                     done: false,
-                    expanded: true, // expanded while running so user can see progress
+                    expanded: true,
                     exit_code: None,
                 });
-                self.timeline_cursor = self.timeline.len().saturating_sub(1);
+                self.timeline_cursor = self.timeline_len().saturating_sub(1);
                 self.msg_version = self.msg_version.wrapping_add(1);
-                self.trim_timeline();
             }
 
             TuiEvent::ToolProgress { id, name: _, progress } => {
-                if let Some(TimelineEntry::ToolCall { output, .. }) = self.timeline.iter_mut()
-                    .rev()
-                    .find(|e| matches!(e, TimelineEntry::ToolCall { id: tid, .. } if tid == &id))
-                {
+                let mut found_output: Option<&mut String> = None;
+                for entry in self.timeline_iter_mut() {
+                    if let TimelineEntry::ToolCall { id: tid, output, .. } = entry {
+                        if tid == &id {
+                            found_output = Some(output);
+                        }
+                    }
+                }
+                if let Some(output) = found_output {
                     output.push_str(&progress);
                     if output.len() > 4096 {
                         *output = output[output.len() - 4096..].to_string();
                     }
-                    // Mark dirty for incremental rebuild (streaming tool output)
                     self.lines_dirty = true;
                 }
             }
 
             TuiEvent::ToolComplete { id, name: _, summary, exit_code } => {
-                if let Some(entry) = self.timeline.iter_mut()
-                    .rev()
-                    .find(|e| matches!(e, TimelineEntry::ToolCall { id: tid, .. } if tid == &id))
-                {
-                    if let TimelineEntry::ToolCall { output, done, expanded, exit_code: ec, .. } = entry {
-                        *output = summary;
-                        *done = true;
-                        *expanded = false; // auto-collapse when done
-                        *ec = exit_code;
+                let mut found: Option<(&mut String, &mut bool, &mut bool, &mut Option<i32>)> = None;
+                for entry in self.timeline_iter_mut() {
+                    if let TimelineEntry::ToolCall { id: tid, output, done, expanded, exit_code: ec, .. } = entry {
+                        if tid == &id {
+                            found = Some((output, done, expanded, ec));
+                        }
                     }
+                }
+                if let Some((output, done, expanded, ec)) = found {
+                    *output = summary;
+                    *done = true;
+                    *expanded = false;
+                    *ec = exit_code;
                 }
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
@@ -808,7 +856,6 @@ impl App {
                 self.input_tokens = input;
                 self.output_tokens = output;
                 self.token_count = input + output + cache_create + cache_read;
-                // Compute per-turn deltas from pre-turn snapshots
                 self.turn_input_tokens = input.saturating_sub(self.pre_turn_input);
                 self.turn_output_tokens = output.saturating_sub(self.pre_turn_output);
             }
@@ -818,7 +865,6 @@ impl App {
                 self.turn_active = true;
                 self.streaming_received = false;
                 self.thinking_id_counter = 0;
-                // Capture pre-turn snapshots for delta computation
                 self.pre_turn_input = self.input_tokens;
                 self.pre_turn_output = self.output_tokens;
                 self.turn_input_tokens = 0;
@@ -829,57 +875,173 @@ impl App {
             TuiEvent::TurnComplete { assistant_text, iterations: _ } => {
                 self.is_loading = false;
                 self.turn_active = false;
-                // Collapse all thinking and tool entries from this turn
-                for entry in &mut self.timeline {
+                for entry in self.timeline_iter_mut() {
                     match entry {
                         TimelineEntry::Thinking { expanded, .. } => *expanded = false,
                         TimelineEntry::ToolCall { expanded, .. } => *expanded = false,
                         _ => {}
                     }
                 }
-                // If we didn't receive any streaming text, use the fallback
                 if !assistant_text.is_empty() && !self.streaming_received {
-                    self.timeline.push(TimelineEntry::Message {
+                    self.timeline_push(TimelineEntry::Message {
                         role: "assistant".into(),
                         content: assistant_text,
                         timestamp: App::format_timestamp(),
                     });
                 }
-                // Add the "✓ Done" marker
-                self.timeline.push(TimelineEntry::Message {
+                self.timeline_push(TimelineEntry::Message {
                     role: "assistant".into(),
                     content: "✓ Done".into(),
                     timestamp: App::format_timestamp(),
                 });
-                self.timeline_cursor = self.timeline.len().saturating_sub(1);
+                self.timeline_cursor = self.timeline_len().saturating_sub(1);
                 self.msg_version = self.msg_version.wrapping_add(1);
-                self.trim_timeline();
             }
 
             TuiEvent::TurnError { error } => {
                 self.is_loading = false;
                 self.turn_active = false;
-                self.timeline.push(TimelineEntry::Message {
+                self.timeline_push(TimelineEntry::Message {
                     role: "system".into(),
                     content: format!("Error: {error}"),
                     timestamp: App::format_timestamp(),
                 });
-                self.timeline_cursor = self.timeline.len().saturating_sub(1);
+                self.timeline_cursor = self.timeline_len().saturating_sub(1);
                 self.msg_version = self.msg_version.wrapping_add(1);
-                self.trim_timeline();
             }
 
             TuiEvent::CompactionNotice { removed_count } => {
                 self.compaction_count += 1;
-                self.timeline.push(TimelineEntry::Message {
+                self.timeline_push(TimelineEntry::Message {
                     role: "system".into(),
                     content: format!("Compacted {removed_count} earlier messages to save context."),
                     timestamp: App::format_timestamp(),
                 });
-                self.timeline_cursor = self.timeline.len().saturating_sub(1);
+                self.timeline_cursor = self.timeline_len().saturating_sub(1);
                 self.msg_version = self.msg_version.wrapping_add(1);
-                self.trim_timeline();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_msg(content: &str) -> TimelineEntry {
+        TimelineEntry::Message {
+            role: "user".into(),
+            content: content.into(),
+            timestamp: "12:00".into(),
+        }
+    }
+
+    #[test]
+    fn timeline_no_trim_at_3000() {
+        let mut app = App::new("test", "sess");
+        for i in 0..3500 {
+            app.add_message("user", &format!("msg {i}"));
+        }
+        assert_eq!(app.timeline_len(), 3500);
+        let first = app.timeline_get(0).unwrap();
+        assert!(first.full_text().contains("msg 0"));
+        let last = app.timeline_get(3499).unwrap();
+        assert!(last.full_text().contains("msg 3499"));
+    }
+
+    #[test]
+    fn scroll_up_loads_page() {
+        let mut app = App::new("test", "sess");
+        for i in 0..600 {
+            app.add_message("user", &format!("msg {i}"));
+        }
+        assert_eq!(app.timeline_len(), 600);
+        assert_eq!(app.timeline_pages.len(), 2);
+        let at_500 = app.timeline_get(500).unwrap();
+        assert!(at_500.full_text().contains("msg 500"));
+        let at_0 = app.timeline_get(0).unwrap();
+        assert!(at_0.full_text().contains("msg 0"));
+    }
+
+    #[test]
+    fn page_boundary_seamless() {
+        let mut app = App::new("test", "sess");
+        for i in 0..PAGE_SIZE {
+            app.add_message("user", &format!("msg {i}"));
+        }
+        assert_eq!(app.timeline_len(), PAGE_SIZE);
+        assert_eq!(app.timeline_pages.len(), 1);
+
+        app.add_message("user", "overflow");
+        assert_eq!(app.timeline_len(), PAGE_SIZE + 1);
+        assert_eq!(app.timeline_pages.len(), 2);
+
+        assert!(app.timeline_get(0).unwrap().full_text().contains("msg 0"));
+        assert!(app.timeline_get(PAGE_SIZE - 1).unwrap().full_text().contains(&format!("msg {}", PAGE_SIZE - 1)));
+        assert!(app.timeline_get(PAGE_SIZE).unwrap().full_text().contains("overflow"));
+
+        let count = app.timeline_iter().count();
+        assert_eq!(count, PAGE_SIZE + 1);
+    }
+
+    #[test]
+    fn memory_soft_cap() {
+        let mut app = App::new("test", "sess");
+        for i in 0..(SOFT_CAP + 500) {
+            app.add_message("user", &format!("msg {i}"));
+        }
+        assert!(app.timeline_len() <= SOFT_CAP);
+        let first_entry = app.timeline_get(0).unwrap();
+        assert!(!first_entry.full_text().contains("msg 0"));
+    }
+
+    #[test]
+    fn empty_timeline_handled() {
+        let app = App::new("test", "sess");
+        assert!(app.timeline_is_empty());
+        assert_eq!(app.timeline_len(), 0);
+        assert!(app.timeline_get(0).is_none());
+        assert_eq!(app.timeline_iter().count(), 0);
+    }
+
+    #[test]
+    fn add_entry_appends_to_last_page() {
+        let mut app = App::new("test", "sess");
+        for i in 0..300 {
+            app.timeline_push(make_msg(&format!("entry {i}")));
+        }
+        assert_eq!(app.timeline_len(), 300);
+        assert_eq!(app.timeline_pages.len(), 1);
+        assert_eq!(app.timeline_pages[0].entries.len(), 300);
+        assert_eq!(app.timeline_pages[0].start_index, 0);
+    }
+
+    #[test]
+    fn get_entry_cross_page() {
+        let mut app = App::new("test", "sess");
+        for i in 0..(PAGE_SIZE * 3 + 200) {
+            app.timeline_push(make_msg(&format!("entry {i}")));
+        }
+        assert_eq!(app.timeline_len(), PAGE_SIZE * 3 + 200);
+        assert!(app.timeline_get(0).unwrap().full_text().contains("entry 0"));
+        assert!(app.timeline_get(PAGE_SIZE).unwrap().full_text().contains(&format!("entry {}", PAGE_SIZE)));
+        assert!(app.timeline_get(PAGE_SIZE * 2 + 50).unwrap().full_text().contains(&format!("entry {}", PAGE_SIZE * 2 + 50)));
+    }
+
+    #[test]
+    fn cursor_up_down_works_across_pages() {
+        let mut app = App::new("test", "sess");
+        for i in 0..600 {
+            app.timeline_push(TimelineEntry::Thinking {
+                id: i,
+                content: format!("think {i}"),
+                complete: true,
+                expanded: false,
+            });
+        }
+        app.timeline_cursor = 599;
+        let moved = app.cursor_up();
+        assert!(moved);
+        assert!(app.timeline_cursor < 599);
     }
 }

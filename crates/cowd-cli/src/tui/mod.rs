@@ -11,6 +11,7 @@ pub mod runner;
 pub mod callbacks;
 pub mod widgets;
 pub mod osc52;
+pub mod clipboard;
 pub mod md_renderer;
 pub mod state;
 pub mod test_utils;

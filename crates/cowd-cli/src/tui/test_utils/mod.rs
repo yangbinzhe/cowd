@@ -371,8 +371,8 @@ mod tests {
     #[test]
     fn fixture_roundtrip() {
         let app = app_with_messages(5);
-        assert_eq!(app.timeline.len(), 5);
-        for (i, entry) in app.timeline.iter().enumerate() {
+        assert_eq!(app.timeline_len(), 5);
+        for (i, entry) in app.timeline_iter() {
             let expected_role = if i % 2 == 0 { "user" } else { "assistant" };
             match entry {
                 crate::tui::app::TimelineEntry::Message { role, content, .. } => {
@@ -391,9 +391,8 @@ mod tests {
     fn fixture_messages_alternate_roles() {
         let app = app_with_messages(4);
         let roles: Vec<&str> = app
-            .timeline
-            .iter()
-            .filter_map(|e| match e {
+            .timeline_iter()
+            .filter_map(|(_, e)| match e {
                 crate::tui::app::TimelineEntry::Message { role, .. } => Some(role.as_str()),
                 _ => None,
             })
@@ -406,12 +405,11 @@ mod tests {
         let app = app_with_tool_calls(3);
         // ToolStart pushes a ToolCall entry; ToolComplete mutates it in-place.
         // So 3 tool calls → 3 timeline entries.
-        assert_eq!(app.timeline.len(), 3);
-        // All ToolCall entries should be done
-        for entry in &app.timeline {
+        assert_eq!(app.timeline_len(), 3);
+        for (_, entry) in app.timeline_iter() {
             if let crate::tui::app::TimelineEntry::ToolCall { done, exit_code, .. } = entry {
-                assert!(done, "tool should be done");
-                assert_eq!(*exit_code, Some(0), "exit_code should be 0");
+                assert!(*done, "tool should be done");
+                assert_eq!(exit_code, &Some(0), "exit_code should be 0");
             }
         }
     }
@@ -422,9 +420,8 @@ mod tests {
         assert!(app.turn_active);
         // Should have 1 TextDelta message in timeline
         let msg = app
-            .timeline
-            .iter()
-            .find_map(|e| match e {
+            .timeline_iter()
+            .find_map(|(_, e)| match e {
                 crate::tui::app::TimelineEntry::Message { content, .. } => Some(content.clone()),
                 _ => None,
             })
@@ -435,7 +432,7 @@ mod tests {
     #[test]
     fn app_with_zero_messages_produces_empty_timeline() {
         let app = app_with_messages(0);
-        assert!(app.timeline.is_empty());
+        assert!(app.timeline_is_empty());
     }
 
     // ── tui_test! macro tests ────────────────────────────────────

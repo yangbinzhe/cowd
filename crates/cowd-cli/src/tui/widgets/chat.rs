@@ -10,37 +10,30 @@ use super::super::app::{App, Theme, TimelineEntry};
 pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let viewport_h = area.height as usize;
 
-    // ── Compute total content lines (even for virtual-mode, used by scrollbar) ──
     let mut total_lines: usize = app.entry_line_counts.iter()
-        .map(|&c| c as usize + 1) // +1 for blank separator between entries
+        .map(|&c| c as usize + 1)
         .sum::<usize>();
-    if total_lines == 0 && app.timeline.is_empty() {
-        total_lines = 1; // placeholder line
+    if total_lines == 0 && app.timeline_is_empty() {
+        total_lines = 1;
     }
     if app.turn_active {
-        total_lines += 1; // spinner line
+        total_lines += 1;
     }
 
-    // ── Auto-scroll logic ──
     if app.auto_scroll && total_lines > viewport_h {
         app.scroll_offset = (total_lines - viewport_h) as u16;
     }
     let scroll_off = app.scroll_offset.min(total_lines.saturating_sub(1) as u16) as usize;
 
-    // ── Build visible lines ──
     let visible_lines: Vec<Line<'static>>;
     let paragraph_scroll: u16;
 
-    // Store viewport height for PageUp/PageDown calculations
     app.viewport_height = viewport_h as u16;
 
-    // Threshold: if content is more than 3× viewport, use virtual scrolling
     if total_lines > viewport_h.saturating_mul(3) {
-        // Virtual scrolling: only build entries visible in the viewport
         visible_lines = build_visible(app, scroll_off, viewport_h);
-        paragraph_scroll = 0; // visible_lines already starts at the right offset
+        paragraph_scroll = 0;
     } else {
-        // Small timeline: use render cache with full-line rebuild
         if app.msg_version != app.last_drawn_version {
             app.cached_chat_lines = build_new_lines(app);
             app.entry_line_counts = compute_entry_line_counts(app);
@@ -55,7 +48,6 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         paragraph_scroll = scroll_off as u16;
     }
 
-    // ── Layout & render ──
     let inner_area = Rect {
         x: area.x,
         y: area.y,
@@ -75,7 +67,6 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         .scroll((paragraph_scroll, 0));
     f.render_widget(paragraph, inner_area);
 
-    // ── Scrollbar ──
     if total_lines > viewport_h {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("↑"))
@@ -89,38 +80,31 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// Rebuild only the last entry (being streamed) in-place.
-/// Avoids iterating the entire timeline on every TextDelta.
 fn rebuild_streaming_tail(app: &mut App) {
-    let n = app.timeline.len();
+    let n = app.timeline_len();
     if n == 0 { return; }
 
-    // Compute prefix line count (all entries except the last one, plus their separator blanks)
     let prefix_count: usize = app.entry_line_counts.iter()
         .take(n.saturating_sub(1))
         .sum::<u16>()
-        .saturating_add((n.saturating_sub(1)) as u16) // separator blanks for previous entries
+        .saturating_add((n.saturating_sub(1)) as u16)
         as usize;
 
-    // Clone data we need before mutable borrow of cached_chat_lines
-    let last_entry = app.timeline[n - 1].clone();
+    let last_entry = app.timeline_get(n - 1).cloned().unwrap();
     let is_focused = (n - 1) == app.timeline_cursor;
     let theme = app.theme;
     let turn_active = app.turn_active;
     let spinner_str = if turn_active { Some(app.spinner_char().to_string()) } else { None };
 
-    // Now do the mutable operations
     app.cached_chat_lines.truncate(prefix_count.min(app.cached_chat_lines.len()));
     let before_len = app.cached_chat_lines.len();
     build_entry(&last_entry, is_focused, &mut app.cached_chat_lines, theme);
     app.cached_chat_lines.push(Line::raw(""));
 
-    // Update the line count for the last entry
     if let Some(count) = app.entry_line_counts.get_mut(n - 1) {
         *count = (app.cached_chat_lines.len() - before_len) as u16;
     }
 
-    // Re-add loading spinner if turn is active
     if let Some(spinner) = spinner_str {
         app.cached_chat_lines.push(Line::from(vec![
             Span::styled(
@@ -131,32 +115,28 @@ fn rebuild_streaming_tail(app: &mut App) {
     }
 }
 
-/// Pre-compute per-entry line counts for virtual scrolling / incremental rebuild.
 fn compute_entry_line_counts(app: &App) -> Vec<u16> {
-    app.timeline.iter()
-        .map(|e| e.expanded_lines() as u16)
+    app.timeline_iter()
+        .map(|(_, e)| e.expanded_lines() as u16)
         .collect()
 }
 
-/// Full rebuild of chat lines from app state.
 fn build_new_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    if app.timeline.is_empty() {
+    if app.timeline_is_empty() {
         lines.push(Line::from(Span::styled(
             "Type to start. /help /resume /exit",
             Style::default().fg(Color::DarkGray),
         )));
     }
 
-    for (idx, entry) in app.timeline.iter().enumerate() {
+    for (idx, entry) in app.timeline_iter() {
         let is_focused = idx == app.timeline_cursor;
         build_entry(entry, is_focused, &mut lines, app.theme);
-        // Add a blank separator line between entries
         lines.push(Line::raw(""));
     }
 
-    // Loading spinner at the bottom when turn is active
     if app.turn_active {
         let spinner = app.spinner_char();
         lines.push(Line::from(vec![
@@ -170,14 +150,12 @@ fn build_new_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-/// Build only the entries visible within [scroll_offset, scroll_offset + viewport_height].
-/// Uses entry_line_counts for O(entries) offset computation without rendering off-screen entries.
 fn build_visible(app: &App, scroll_offset: usize, viewport_h: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut cumulative: usize = 0;
     let viewport_end = scroll_offset + viewport_h;
 
-    if app.timeline.is_empty() {
+    if app.timeline_is_empty() {
         lines.push(Line::from(Span::styled(
             "Type to start. /help /resume /exit",
             Style::default().fg(Color::DarkGray),
@@ -185,11 +163,10 @@ fn build_visible(app: &App, scroll_offset: usize, viewport_h: usize) -> Vec<Line
         return lines;
     }
 
-    for (idx, entry) in app.timeline.iter().enumerate() {
-        let entry_lines = app.entry_line_counts.get(idx).copied().unwrap_or(1) as usize + 1; // +1 for separator blank
+    for (idx, entry) in app.timeline_iter() {
+        let entry_lines = app.entry_line_counts.get(idx).copied().unwrap_or(1) as usize + 1;
         let entry_end = cumulative + entry_lines;
 
-        // Include entry if it overlaps the visible viewport
         if entry_end > scroll_offset && cumulative < viewport_end {
             let is_focused = idx == app.timeline_cursor;
             build_entry(entry, is_focused, &mut lines, app.theme);
@@ -202,7 +179,6 @@ fn build_visible(app: &App, scroll_offset: usize, viewport_h: usize) -> Vec<Line
         }
     }
 
-    // Loading spinner at the bottom when turn is active and viewport reaches the end
     if app.turn_active {
         let spinner = app.spinner_char();
         lines.push(Line::from(vec![
@@ -216,22 +192,17 @@ fn build_visible(app: &App, scroll_offset: usize, viewport_h: usize) -> Vec<Line
     lines
 }
 
-/// Highlight inline markdown spans in a message line.
-/// Handles: `code` (yellow), **bold** (bold), *italic* (italic/dim).
 fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color) {
     let mut remaining = line;
     while !remaining.is_empty() {
-        // Find the next markdown token: backtick, double-star, or single-star
         let bt = remaining.find('`');
         let bs = remaining.find("**");
         let is = remaining.find('*');
 
-        // Determine which token comes first (if any)
         let earliest = [bt, bs, is].iter().filter_map(|&o| o).min();
 
         match earliest {
             None => {
-                // No more markdown — push remaining text as-is
                 spans.push(Span::styled(
                     remaining.to_string(),
                     Style::default().fg(base_color),
@@ -239,7 +210,6 @@ fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color)
                 break;
             }
             Some(pos) => {
-                // Push text before the token
                 if pos > 0 {
                     spans.push(Span::styled(
                         remaining[..pos].to_string(),
@@ -247,9 +217,7 @@ fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color)
                     ));
                 }
 
-                // Determine token type
                 if bt == Some(pos) {
-                    // Inline code: `...`
                     remaining = &remaining[pos + 1..];
                     if let Some(end) = remaining.find('`') {
                         spans.push(Span::styled(
@@ -258,7 +226,6 @@ fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color)
                         ));
                         remaining = &remaining[end + 1..];
                     } else {
-                        // Unclosed backtick — treat rest as code
                         spans.push(Span::styled(
                             remaining.to_string(),
                             Style::default().fg(Color::Yellow),
@@ -266,7 +233,6 @@ fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color)
                         remaining = "";
                     }
                 } else if bs == Some(pos) {
-                    // Bold: **...**
                     remaining = &remaining[pos + 2..];
                     if let Some(end) = remaining.find("**") {
                         spans.push(Span::styled(
@@ -275,7 +241,6 @@ fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color)
                         ));
                         remaining = &remaining[end + 2..];
                     } else {
-                        // Unclosed ** — treat rest as bold
                         spans.push(Span::styled(
                             remaining.to_string(),
                             Style::default().fg(base_color).bold(),
@@ -283,12 +248,9 @@ fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color)
                         remaining = "";
                     }
                 } else if is == Some(pos) {
-                    // Italic: *...*
                     remaining = &remaining[pos + 1..];
                     if let Some(end) = remaining.find('*') {
-                        // Make sure it's not a **
                         if remaining.get(end + 1..end + 2) == Some("*") {
-                            // False positive: single * followed by *, treat as text
                             spans.push(Span::styled(
                                 format!("*{}", &remaining[..end]),
                                 Style::default().fg(base_color),
@@ -302,7 +264,6 @@ fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color)
                             remaining = &remaining[end + 1..];
                         }
                     } else {
-                        // Unclosed * — treat rest as italic
                         spans.push(Span::styled(
                             remaining.to_string(),
                             Style::default().fg(base_color).italic(),
@@ -310,7 +271,6 @@ fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color)
                         remaining = "";
                     }
                 } else {
-                    // Shouldn't happen — push the char and continue
                     spans.push(Span::styled(
                         remaining[..1].to_string(),
                         Style::default().fg(base_color),
@@ -322,7 +282,6 @@ fn highlight_line(line: &str, spans: &mut Vec<Span<'static>>, base_color: Color)
     }
 }
 
-/// Build ratatui Lines for a single timeline entry, using owned strings for caching.
 pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line<'static>>, theme: Theme) {
     match entry {
         TimelineEntry::Message { role, content, .. } => {
@@ -333,7 +292,6 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
             };
             let total_lines = content.lines().count();
             const MAX_LINES: usize = 500;
-            // Use full markdown rendering for assistant messages
             if role == "assistant" {
                 let md_lines = super::super::md_renderer::render_markdown_lines(content, color);
                 for line in md_lines.into_iter().take(MAX_LINES) {
@@ -364,7 +322,6 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
         }
 
         TimelineEntry::Thinking { id: _, content, complete, expanded } => {
-            // Pre-compute once to avoid O(n²) repeated traversal
             let total_lines = content.lines().count();
             let status = if *complete { "complete" } else { "thinking" };
             let focus_marker = if is_focused { "● " } else { "  " };
@@ -434,7 +391,6 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
             let focus_marker = if is_focused { "● " } else { "  " };
 
             if *expanded && !output.is_empty() {
-                // Pre-compute total lines to avoid repeated O(n) traversal
                 let total_lines = output.lines().count();
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -490,7 +446,6 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
         }
 
         TimelineEntry::SlashOutput { command, output, expanded } => {
-            // Pre-compute total lines to avoid repeated O(n) traversal
             let total_lines = output.lines().count();
             let focus_marker = if is_focused { "● " } else { "  " };
 

@@ -60,7 +60,7 @@ fn integration_launch_type_stream() {
 
     assert!(!state.turn_active);
     assert!(!state.is_loading);
-    assert!(state.timeline.len() >= 2);
+    assert!(state.timeline_len() >= 2);
 }
 
 #[test]
@@ -201,7 +201,7 @@ fn integration_diff_viewer_component_exists() {
     state.add_message("system", "+ added line");
     state.add_message("system", "- removed line");
 
-    assert!(state.timeline.len() >= 3);
+    assert!(state.timeline_len() >= 3);
 }
 
 #[test]
@@ -252,7 +252,7 @@ fn integration_scroll_offset_updates() {
         state.add_message("user", &format!("Message number {i}"));
     }
 
-    assert!(state.timeline.len() >= 50);
+    assert!(state.timeline_len() >= 50);
 
     let initial_scroll = state.scroll_offset;
     state.handle_input(key(KeyCode::Char('j')));
@@ -301,7 +301,7 @@ fn integration_timeline_entry_lifecycle() {
         preview: "ls -la".into(),
     });
 
-    let has_tool = state.timeline.iter().any(|e| {
+    let has_tool = state.timeline_iter().any(|(_, e)| {
         matches!(e, crate::tui::app::TimelineEntry::ToolCall { id, .. } if id == "tool-1")
     });
     assert!(has_tool);
@@ -313,7 +313,7 @@ fn integration_timeline_entry_lifecycle() {
         exit_code: Some(0),
     });
 
-    let tool = state.timeline.iter().find_map(|e| {
+    let tool = state.timeline_iter().find_map(|(_, e)| {
         if let crate::tui::app::TimelineEntry::ToolCall { id, done, expanded, .. } = e {
             if id == "tool-1" { Some((*done, *expanded)) } else { None }
         } else {

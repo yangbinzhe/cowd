@@ -342,7 +342,7 @@ impl TuiState {
             }
             if self.app.input.is_empty() {
                 // Empty input + Enter → toggle expand on focused entry
-                if let Some(entry) = self.app.timeline.get(self.app.timeline_cursor) {
+                if let Some(entry) = self.app.timeline_get(self.app.timeline_cursor) {
                     if entry.is_collapsible() {
                         self.app.toggle_expand_current();
                         return ProcessedKey::Nothing;
@@ -837,10 +837,10 @@ mod tests {
 
         // Access App fields via Deref
         state.add_message("user", "hello");
-        assert_eq!(state.timeline.len(), 1);
+        assert_eq!(state.timeline_len(), 1);
 
         state.add_message("assistant", "world");
-        assert_eq!(state.timeline.len(), 2);
+        assert_eq!(state.timeline_len(), 2);
 
         // DerefMut works for direct field access
         state.is_loading = true;
@@ -854,7 +854,7 @@ mod tests {
         state.add_message("system", "test");
         state.add_message("assistant", "response");
 
-        assert_eq!(state.timeline.len(), 2);
+        assert_eq!(state.timeline_len(), 2);
         assert!(state.auto_scroll);
 
         // picker methods
@@ -906,9 +906,9 @@ mod tests {
         });
 
         // Should have: assistant message + "✓ Done"
-        assert!(state.timeline.len() >= 2);
+        assert!(state.timeline_len() >= 2);
         // The last entry should be "✓ Done"
-        let last = &state.timeline[state.timeline.len() - 1];
+        let last = state.timeline_get(state.timeline_len() - 1).unwrap();
         let text = last.full_text();
         assert!(text.contains("Done"), "expected '✓ Done' marker, got: {text}");
     }
@@ -925,9 +925,8 @@ mod tests {
         });
 
         assert!(state
-            .timeline
-            .iter()
-            .any(|e| matches!(e, crate::tui::app::TimelineEntry::ToolCall { id, .. } if id == "t1")));
+            .timeline_iter()
+            .any(|(_, e)| matches!(&e, crate::tui::app::TimelineEntry::ToolCall { id, .. } if id == "t1")));
     }
 
     #[test]

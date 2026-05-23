@@ -53,7 +53,7 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                         return Ok(InputResult::Nothing);
                     }
                     if app.input.is_empty() {
-                        let focused = app.timeline.get(app.timeline_cursor);
+                        let focused = app.timeline_get(app.timeline_cursor);
                         if let Some(entry) = focused {
                             if entry.is_collapsible() {
                                 app.toggle_expand_current();
@@ -131,6 +131,18 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                 }
                 KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.theme.toggle(); Ok(InputResult::Nothing)
+                }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    match crate::tui::clipboard::read_clipboard() {
+                        Some(crate::tui::clipboard::ClipboardContent::Text(text)) => {
+                            app.input.insert_str(&text);
+                        }
+                        Some(crate::tui::clipboard::ClipboardContent::Image { .. }) => {
+                            app.input.insert_str("[Image]");
+                        }
+                        None => {}
+                    }
+                    Ok(InputResult::Nothing)
                 }
                 KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if app.input.is_empty() {
