@@ -126,6 +126,8 @@ pub struct DiffViewer {
     scroll_offset: u16,
     /// View title shown in the border.
     title: String,
+    /// Set of file paths that have been marked as reviewed (Task 10).
+    reviewed_files: std::collections::HashSet<String>,
 }
 
 impl DiffViewer {
@@ -139,6 +141,7 @@ impl DiffViewer {
             mode: DiffMode::Unified,
             scroll_offset: 0,
             title: title.to_string(),
+            reviewed_files: std::collections::HashSet::new(),
         }
     }
 
@@ -196,6 +199,40 @@ impl DiffViewer {
     #[must_use]
     pub fn scroll_offset(&self) -> u16 {
         self.scroll_offset
+    }
+
+    // ── Mark reviewed (Task 10) ──
+
+    /// Toggle the reviewed state of a file path.
+    pub fn toggle_reviewed(&mut self, file_path: &str) {
+        if self.reviewed_files.contains(file_path) {
+            self.reviewed_files.remove(file_path);
+        } else {
+            self.reviewed_files.insert(file_path.to_string());
+        }
+    }
+
+    /// Toggle reviewed state for the currently selected file.
+    pub fn toggle_reviewed_selected(&mut self) {
+        let path = self
+            .files
+            .get(self.selected_file)
+            .map(|f| f.path.clone());
+        if let Some(p) = path {
+            self.toggle_reviewed(&p);
+        }
+    }
+
+    /// Check if a file has been marked as reviewed.
+    #[must_use]
+    pub fn is_reviewed(&self, file_path: &str) -> bool {
+        self.reviewed_files.contains(file_path)
+    }
+
+    /// Return the set of reviewed file paths.
+    #[must_use]
+    pub fn reviewed_files(&self) -> &std::collections::HashSet<String> {
+        &self.reviewed_files
     }
 
     /// Cycle to the next hunk within the current file.
@@ -311,20 +348,39 @@ impl DiffViewer {
             .skip(self.scroll_offset as usize)
             .take(max_visible)
             .map(|(i, f)| {
+                let reviewed_mark = if self.reviewed_files.contains(&f.path) {
+                    "✅ "
+                } else {
+                    ""
+                };
                 let label = format!(
-                    " {} [+{} -{}] ",
-                    truncate_middle(&f.path, inner.width.saturating_sub(4) as usize),
+                    " {}{} [+{} -{}] ",
+                    reviewed_mark,
+                    truncate_middle(&f.path, inner.width.saturating_sub(8) as usize),
                     f.added,
                     f.removed
                 );
+                let is_reviewed = self.reviewed_files.contains(&f.path);
                 if i == self.selected_file {
-                    Line::styled(
-                        label,
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                    if is_reviewed {
+                        Line::styled(
+                            label,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .bg(Color::Rgb(40, 40, 40))
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Line::styled(
+                            label,
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    }
+                } else if is_reviewed {
+                    Line::styled(label, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))
                 } else {
                     Line::styled(label, Style::default().fg(Color::Gray))
                 }
@@ -652,7 +708,7 @@ impl DiffViewer {
         let help_text = if self.files.is_empty() {
             " No diff loaded "
         } else {
-            " j/k:file  n/N:hunk  t:mode  ↑/↓:scroll  PgUp/PgDn  q/help:exit "
+            " j/k:file  n/N:hunk  t:mode  m:review  ↑/↓:scroll  PgUp/PgDn  q/help:exit "
         };
         let span = Span::styled(
             help_text,
@@ -737,6 +793,12 @@ impl DiffViewer {
             // Mode toggle
             KeyCode::Char('t') => {
                 self.toggle_mode();
+                EventResult::Consumed
+            }
+
+            // Mark reviewed (Task 10)
+            KeyCode::Char('m') => {
+                self.toggle_reviewed_selected();
                 EventResult::Consumed
             }
 
@@ -1519,5 +1581,91 @@ mod tests {
 
         // Should not panic; should render something
         terminal.assert_line_contains("Files (20)");
+    }
+
+    // ── Task 10: Diff file tree counts and mark reviewed ────────────
+
+    #[test]
+    fn diff_file_tree_counts_shown() {
+        let mut viewer = DiffViewer::new("Test");
+        viewer.load(simple_diff());
+
+        let mut terminal = MockTerminal::new(100, 30);
+        let theme = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            viewer.render(&mut ctx, area);
+        });
+
+        // File tree should show [+N -M] counts
+        terminal.assert_line_contains("+2");
+        terminal.assert_line_contains("-1");
+    }
+
+    #[test]
+    fn mark_reviewed_toggles_state() {
+        let mut viewer = DiffViewer::new("Test");
+        viewer.load(simple_diff()); // loads "src/main.rs"
+
+        // Initially not reviewed
+        assert!(!viewer.is_reviewed("src/main.rs"));
+
+        // Toggle reviewed
+        viewer.toggle_reviewed("src/main.rs");
+        assert!(viewer.is_reviewed("src/main.rs"));
+
+        // Toggle again to un-review
+        viewer.toggle_reviewed("src/main.rs");
+        assert!(!viewer.is_reviewed("src/main.rs"));
+    }
+
+    #[test]
+    fn mark_reviewed_toggle_selected() {
+        let mut viewer = DiffViewer::new("Test");
+        viewer.load(multi_file_diff()); // files: src/lib.rs, src/main.rs
+
+        // First file is src/lib.rs
+        assert_eq!(viewer.selected_file_index(), 0);
+        assert!(!viewer.is_reviewed("src/lib.rs"));
+
+        // Toggle reviewed for selected file
+        viewer.toggle_reviewed_selected();
+        assert!(viewer.is_reviewed("src/lib.rs"));
+
+        // Select next file and toggle
+        viewer.select_next_file();
+        viewer.toggle_reviewed_selected();
+        assert!(viewer.is_reviewed("src/main.rs"));
+        assert!(viewer.is_reviewed("src/lib.rs")); // still reviewed
+    }
+
+    #[test]
+    fn reviewed_files_show_dimmed() {
+        let mut viewer = DiffViewer::new("Test");
+        viewer.load(simple_diff());
+
+        // Initially not reviewed
+        assert!(!viewer.is_reviewed("src/main.rs"));
+
+        // Mark as reviewed
+        viewer.toggle_reviewed("src/main.rs");
+        assert!(viewer.is_reviewed("src/main.rs"));
+
+        // Check that is_reviewed works and the file is in the set
+        assert!(viewer.reviewed_files().contains("src/main.rs"));
+        assert_eq!(viewer.reviewed_files().len(), 1);
+    }
+
+    #[test]
+    fn mark_reviewed_via_m_key() {
+        let mut viewer = DiffViewer::new("Test");
+        viewer.load(simple_diff());
+
+        // Press 'm' to mark currently selected file as reviewed
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('m'), crossterm::event::KeyModifiers::NONE));
+        let result = viewer.handle_event(&event);
+        assert!(result.is_consumed(), "'m' key should be consumed");
+        assert!(viewer.is_reviewed("src/main.rs"));
     }
 }

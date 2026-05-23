@@ -42,6 +42,16 @@ pub struct ChatView {
     pub turn_active: bool,
     spinner_idx: usize,
 
+    // ── Message menu (Task 5) ──
+    /// Set when user presses Ctrl+O on a focused message.
+    pub pending_message_menu: bool,
+    /// Index of the message to show the menu for.
+    pub pending_menu_entry_idx: usize,
+
+    // ── Subagent navigation (Task 9) ──
+    /// Set when user presses Enter on a tool call with subagent_session_id.
+    pub pending_subagent_nav: Option<String>,
+
     // ── Render cache ──
     cached_chat_lines: Vec<Line<'static>>,
     entry_line_counts: Vec<u16>,
@@ -65,6 +75,9 @@ impl ChatView {
             viewport_height: 24,
             turn_active: false,
             spinner_idx: 0,
+            pending_message_menu: false,
+            pending_menu_entry_idx: 0,
+            pending_subagent_nav: None,
             cached_chat_lines: Vec::new(),
             entry_line_counts: Vec::new(),
             msg_version: 0,
@@ -310,8 +323,36 @@ impl Component for ChatView {
 
 impl ChatView {
     fn handle_key(&mut self, key: &KeyEvent) -> EventResult {
+        // ── Ctrl+O: open per-message action menu (Task 5) ──
+        if key.modifiers == crossterm::event::KeyModifiers::CONTROL && key.code == KeyCode::Char('o') {
+            if !self.timeline.is_empty() && self.timeline_cursor < self.timeline.len() {
+                self.pending_menu_entry_idx = self.timeline_cursor;
+                self.pending_message_menu = true;
+            }
+            return EventResult::Consumed;
+        }
+
         match key.code {
             KeyCode::Enter => {
+                // Check if focused entry is a ToolCall with subagent_session_id (Task 9)
+                if let Some(entry) = self.timeline.get(self.timeline_cursor) {
+                    if let TimelineEntry::ToolCall { name, output, done, .. } = entry {
+                        if *done && name == "task" && !output.is_empty() {
+                            // Try to extract subagent_session_id from output
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(output) {
+                                let session_id = val
+                                    .get("subagent_session_id")
+                                    .or_else(|| val.get("session_id"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                if let Some(sid) = session_id {
+                                    self.pending_subagent_nav = Some(sid);
+                                    return EventResult::Consumed;
+                                }
+                            }
+                        }
+                    }
+                }
                 self.toggle_expand_current();
                 EventResult::Consumed
             }
@@ -706,23 +747,56 @@ impl ChatView {
                 };
                 let focus_marker = if is_focused { "● " } else { "  " };
 
+                // Check for subagent session (Task 9)
+                let subagent_label = if *done && name == "task" && !output.is_empty() {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(output) {
+                        let has_sid = val
+                            .get("subagent_session_id")
+                            .or_else(|| val.get("session_id"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false);
+                        if has_sid && is_focused {
+                            Some(" [Open Subagent]".to_string())
+                        } else if has_sid {
+                            Some(String::new())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 if *expanded && !output.is_empty() {
                     let total_lines = output.lines().count();
-                    lines.push(Line::from(vec![
+                    let mut tool_line = vec![
                         Span::styled(
                             format!("{focus_marker}┌─ 🔧 {name}"),
                             Style::default().fg(Color::Yellow).bold(),
                         ),
                         Span::styled(format!(" [{status_text}]"), status_style),
-                        Span::styled(
-                            if is_focused {
-                                "[Enter=collapse]".to_string()
-                            } else {
-                                String::new()
-                            },
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
+                    ];
+                    if let Some(sa) = &subagent_label {
+                        if !sa.is_empty() {
+                            tool_line.push(Span::styled(
+                                sa.clone(),
+                                Style::default().fg(Color::Cyan),
+                            ));
+                        }
+                    }
+                    tool_line.push(Span::styled(
+                        if is_focused {
+                            "[Enter=collapse]".to_string()
+                        } else {
+                            String::new()
+                        },
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    lines.push(Line::from(tool_line));
+
                     let display_lines: Vec<String> =
                         output.lines().take(100).map(|s| s.to_string()).collect();
                     for line in &display_lines {
@@ -749,7 +823,7 @@ impl ChatView {
                     };
                     let short_preview: String = preview_text.chars().take(60).collect();
                     let more = if preview_text.len() > 60 { "..." } else { "" };
-                    lines.push(Line::from(vec![
+                    let mut tool_line = vec![
                         Span::styled(
                             format!("{focus_marker}🔧 {name}"),
                             Style::default().fg(Color::Yellow).bold(),
@@ -762,15 +836,28 @@ impl ChatView {
                             format!(" [{status_icon} {status_text}]"),
                             status_style,
                         ),
-                        Span::styled(
-                            if is_focused && *done {
-                                "[Enter=expand]".to_string()
+                    ];
+                    if let Some(sa) = &subagent_label {
+                        if !sa.is_empty() {
+                            tool_line.push(Span::styled(
+                                sa.clone(),
+                                Style::default().fg(Color::Cyan),
+                            ));
+                        }
+                    }
+                    tool_line.push(Span::styled(
+                        if is_focused && *done {
+                            if name == "task" {
+                                "[Enter=expand|nav]".to_string()
                             } else {
-                                String::new()
-                            },
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]));
+                                "[Enter=expand]".to_string()
+                            }
+                        } else {
+                            String::new()
+                        },
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    lines.push(Line::from(tool_line));
                 }
             }
 
@@ -1414,5 +1501,184 @@ mod tests {
 
         assert_eq!(app.scroll_offset, 42);
         assert!(app.auto_scroll);
+    }
+
+    // ── Task 5: Per-message actions menu ────────────────────────────
+
+    #[test]
+    fn message_menu_shows_on_ctrl_o() {
+        let mut view = ChatView::new();
+        view.timeline = vec![make_message("user", "Hello")];
+        view.timeline_cursor = 0;
+        view.msg_version = 0;
+        view.lines_dirty = false;
+
+        let ev = Event::Key(KeyEvent::new(
+            KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let result = view.handle_event(&ev);
+        assert!(result.is_consumed(), "Ctrl+O should be consumed");
+        assert!(
+            view.pending_message_menu,
+            "pending_message_menu should be set"
+        );
+        assert_eq!(
+            view.pending_menu_entry_idx, 0,
+            "should target entry 0"
+        );
+    }
+
+    #[test]
+    fn message_menu_ctrl_o_empty_timeline_noop() {
+        let mut view = ChatView::new();
+        let ev = Event::Key(KeyEvent::new(
+            KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let result = view.handle_event(&ev);
+        assert!(result.is_consumed(), "Ctrl+O should always be consumed");
+        assert!(
+            !view.pending_message_menu,
+            "no pending menu on empty timeline"
+        );
+    }
+
+    #[test]
+    fn message_menu_entry_idx_tracks_cursor() {
+        let mut view = ChatView::new();
+        view.timeline = vec![
+            make_message("user", "A"),
+            make_message("user", "B"),
+            make_message("user", "C"),
+        ];
+        view.timeline_cursor = 2;
+        view.msg_version = 0;
+        view.lines_dirty = false;
+
+        let ev = Event::Key(KeyEvent::new(
+            KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let _ = view.handle_event(&ev);
+        assert_eq!(
+            view.pending_menu_entry_idx, 2,
+            "should track cursor position"
+        );
+    }
+
+    // ── Task 9: Subagent session navigation ─────────────────────────
+
+    #[test]
+    fn subagent_nav_shows_on_task_tool_call() {
+        let mut view = ChatView::new();
+        let output = r#"{"subagent_session_id": "sess_sub_123"}"#;
+        view.timeline = vec![TimelineEntry::ToolCall {
+            id: "t1".into(),
+            name: "task".into(),
+            preview: "Run subagent".into(),
+            output: output.into(),
+            done: true,
+            expanded: false,
+            exit_code: Some(0),
+        }];
+        view.timeline_cursor = 0;
+        view.entry_line_counts = vec![1];
+        view.msg_version = 0;
+        view.lines_dirty = false;
+
+        let lines = render_view(&mut view, 80, 24);
+        let joined = lines.join("\n");
+        // Should show subagent navigation label
+        assert!(
+            joined.contains("Open Subagent") || joined.contains("nav"),
+            "Expected subagent navigation indicator in output, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn open_subagent_navigates_on_enter() {
+        let mut view = ChatView::new();
+        let output = r#"{"subagent_session_id": "sess_sub_456"}"#;
+        view.timeline = vec![TimelineEntry::ToolCall {
+            id: "t1".into(),
+            name: "task".into(),
+            preview: "Run subagent".into(),
+            output: output.into(),
+            done: true,
+            expanded: false,
+            exit_code: Some(0),
+        }];
+        view.timeline_cursor = 0;
+
+        // Enter on task tool call should set pending_subagent_nav
+        let ev = Event::Key(KeyEvent::from(KeyCode::Enter));
+        let result = view.handle_event(&ev);
+        assert!(result.is_consumed(), "Enter should be consumed");
+
+        assert!(
+            view.pending_subagent_nav.is_some(),
+            "pending_subagent_nav should be set"
+        );
+        assert_eq!(
+            view.pending_subagent_nav.as_deref(),
+            Some("sess_sub_456"),
+            "should capture session ID"
+        );
+    }
+
+    #[test]
+    fn subagent_nav_no_output_does_not_navigate() {
+        let mut view = ChatView::new();
+        view.timeline = vec![TimelineEntry::ToolCall {
+            id: "t1".into(),
+            name: "task".into(),
+            preview: "Run subagent".into(),
+            output: String::new(),
+            done: true,
+            expanded: false,
+            exit_code: Some(0),
+        }];
+        view.timeline_cursor = 0;
+
+        let ev = Event::Key(KeyEvent::from(KeyCode::Enter));
+        let result = view.handle_event(&ev);
+        assert!(result.is_consumed(), "Enter should be consumed");
+
+        // Without output, should just toggle expand, not set nav
+        assert!(
+            view.pending_subagent_nav.is_none(),
+            "no nav without output"
+        );
+        // Should have expanded the entry
+        match &view.timeline[0] {
+            TimelineEntry::ToolCall { expanded, .. } => {
+                assert!(*expanded, "Should have expanded tool call");
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn subagent_nav_non_task_tool_no_nav() {
+        let mut view = ChatView::new();
+        let output = r#"{"subagent_session_id": "sess_sub_789"}"#;
+        view.timeline = vec![TimelineEntry::ToolCall {
+            id: "t1".into(),
+            name: "bash".into(), // not "task"
+            preview: "echo".into(),
+            output: output.into(),
+            done: true,
+            expanded: false,
+            exit_code: Some(0),
+        }];
+        view.timeline_cursor = 0;
+
+        let ev = Event::Key(KeyEvent::from(KeyCode::Enter));
+        let _ = view.handle_event(&ev);
+        assert!(
+            view.pending_subagent_nav.is_none(),
+            "non-task tool should not set nav flag"
+        );
     }
 }

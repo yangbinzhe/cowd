@@ -45,6 +45,22 @@ pub enum DialogKind {
         /// Current input buffer.
         input: String,
     },
+    /// Multi-stage permission dialog: Allow Once / Always / Reject with reason.
+    /// Backward-compatible with __approval_approved__ / __approval_denied__ protocol.
+    Permission {
+        /// The tool requesting permission (e.g., "edit", "bash", "web_fetch").
+        tool_name: String,
+        /// Preview of the tool input (e.g., diff preview, shell command, URL).
+        input_preview: String,
+        /// Selected action: "allow_once", "allow_always", "reject"
+        action: String,
+        /// Rejection reason (for the "reject" action, filled via nested Prompt).
+        reject_reason: String,
+        /// Whether the nested reject-reason prompt is active.
+        showing_reject_input: bool,
+        /// Buffer for the reject-reason input.
+        reject_input_buffer: String,
+    },
 }
 
 /// Result produced when a dialog is dismissed.
@@ -238,6 +254,59 @@ impl DialogManager {
                 }
                 _ => consumed = false,
             },
+
+            DialogKind::Permission {
+                action,
+                showing_reject_input,
+                reject_input_buffer,
+                ..
+            } => {
+                if *showing_reject_input {
+                    // Nested reject-reason prompt mode
+                    match event.code {
+                        KeyCode::Char(c) => {
+                            reject_input_buffer.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            reject_input_buffer.pop();
+                        }
+                        KeyCode::Enter => {
+                            let reason = reject_input_buffer.clone();
+                            self.stack[idx].result =
+                                Some(DialogResult::Ok(format!("reject:{}", reason)));
+                            dismiss = true;
+                        }
+                        KeyCode::Esc => {
+                            *showing_reject_input = false;
+                            *action = String::new();
+                            reject_input_buffer.clear();
+                        }
+                        _ => consumed = false,
+                    }
+                } else {
+                    match event.code {
+                        KeyCode::Char('a' | 'A') => {
+                            *action = "allow_once".to_string();
+                            self.stack[idx].result = Some(DialogResult::Ok("__approval_approved__".into()));
+                            dismiss = true;
+                        }
+                        KeyCode::Char('l' | 'L') => {
+                            *action = "allow_always".to_string();
+                            self.stack[idx].result = Some(DialogResult::Ok("allow_always".into()));
+                            dismiss = true;
+                        }
+                        KeyCode::Char('r' | 'R') => {
+                            *action = "reject".to_string();
+                            *showing_reject_input = true;
+                        }
+                        KeyCode::Esc => {
+                            self.stack[idx].result = Some(DialogResult::Ok("__approval_denied__".into()));
+                            dismiss = true;
+                        }
+                        _ => consumed = false,
+                    }
+                }
+            }
         }
 
         if dismiss {
@@ -314,6 +383,9 @@ impl DialogManager {
             | DialogKind::Confirm { title, .. }
             | DialogKind::Select { title, .. }
             | DialogKind::Prompt { title, .. } => title.len() as u16,
+            DialogKind::Permission { tool_name, .. } => {
+                format!(" Permission: {tool_name} ").len() as u16
+            }
         };
 
         let content_w = match &dialog.kind {
@@ -332,6 +404,9 @@ impl DialogManager {
                     input.len() + 1 // +1 for cursor block
                 };
                 (visible + 2) as u16 // +2 for "  " prefix
+            }
+            DialogKind::Permission { input_preview, .. } => {
+                input_preview.len().max(50) as u16
             }
         };
 
@@ -359,6 +434,8 @@ impl DialogManager {
             }
             // Prompt: border(2) + title + blank + input + blank + hint
             DialogKind::Prompt { .. } => 7,
+            // Permission: border(2) + title + preview + blank + 3 buttons + hint + spare
+            DialogKind::Permission { .. } => 10,
         }
     }
 
@@ -515,6 +592,111 @@ impl DialogManager {
                 let p = Paragraph::new(text).block(block);
 
                 frame.render_widget(p, rect);
+            }
+
+            DialogKind::Permission {
+                tool_name,
+                input_preview,
+                showing_reject_input,
+                reject_input_buffer,
+                ..
+            } => {
+                let title = format!(" Permission: {tool_name} ");
+
+                if *showing_reject_input {
+                    // Render reject-reason input
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .title(title.as_str())
+                        .fg(Color::Red);
+
+                    let display: Span = if reject_input_buffer.is_empty() {
+                        Span::styled(
+                            "  Tell the AI what to do instead...",
+                            Style::default().fg(Color::DarkGray),
+                        )
+                    } else {
+                        Span::styled(
+                            format!("  {}▊", reject_input_buffer),
+                            Style::default(),
+                        )
+                    };
+
+                    let hint = Span::styled(
+                        "Enter to confirm rejection  Esc to go back",
+                        Style::default().fg(Color::DarkGray),
+                    );
+
+                    let text = Text::from(vec![
+                        Line::from(""),
+                        Line::from("Provide a reason or alternative instruction:"),
+                        Line::from(display),
+                        Line::from(""),
+                        Line::from(hint),
+                    ]);
+
+                    let p = Paragraph::new(text).block(block);
+                    frame.render_widget(p, rect);
+                } else {
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .title(title.as_str())
+                        .fg(accent);
+
+                    // Type-specific preview
+                    let preview_style = if tool_name == "edit" {
+                        Style::default().fg(Color::Green)
+                    } else if tool_name == "bash" || tool_name == "shell" {
+                        Style::default().fg(Color::Yellow)
+                    } else if tool_name == "web_fetch" || tool_name == "web_search" {
+                        Style::default().fg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+
+                    let preview_line = Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(input_preview.as_str(), preview_style),
+                    ]);
+
+                    let buttons = Line::from(vec![
+                        Span::styled(
+                            " [A] Allow Once ",
+                            Style::default().fg(Color::Black).bg(Color::Green),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            " [L] Always ",
+                            Style::default().fg(Color::Black).bg(accent),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            " [R] Reject ",
+                            Style::default().fg(Color::Black).bg(Color::Red),
+                        ),
+                    ]);
+
+                    let hint = Span::styled(
+                        "Esc to deny  A/L/R to choose",
+                        Style::default().fg(Color::DarkGray),
+                    );
+
+                    let text = Text::from(vec![
+                        Line::from(""),
+                        Line::from("  This tool requires permission:"),
+                        Line::from(""),
+                        preview_line,
+                        Line::from(""),
+                        buttons,
+                        Line::from(""),
+                        Line::from(hint),
+                    ]);
+
+                    let p = Paragraph::new(text)
+                        .block(block)
+                        .centered();
+                    frame.render_widget(p, rect);
+                }
             }
         }
     }
@@ -1144,5 +1326,170 @@ mod tests {
             lines.iter().all(|l| l.is_empty()),
             "Empty stack should not render anything"
         );
+    }
+
+    // ── Permission tests (Task 6) ─────────────────────────────────────
+
+    fn make_permission(tool_name: &str, input_preview: &str) -> DialogState {
+        DialogState::new(DialogKind::Permission {
+            tool_name: tool_name.to_string(),
+            input_preview: input_preview.to_string(),
+            action: String::new(),
+            reject_reason: String::new(),
+            showing_reject_input: false,
+            reject_input_buffer: String::new(),
+        })
+    }
+
+    #[test]
+    fn permission_shows_three_buttons() {
+        let mut terminal = MockTerminal::new(80, 24);
+        let theme = SkinConfig::default();
+        let mut mgr = DialogManager::new();
+        mgr.push(make_permission("edit", "diff --git a/src/main.rs b/src/main.rs"));
+
+        terminal.draw(|f: &mut Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            mgr.render(&mut ctx, area);
+        });
+
+        terminal.assert_line_contains("Allow Once");
+        terminal.assert_line_contains("Always");
+        terminal.assert_line_contains("Reject");
+        terminal.assert_line_contains("permission");
+    }
+
+    #[test]
+    fn permission_allow_once() {
+        let mut mgr = DialogManager::new();
+        mgr.push(make_permission("bash", "echo test"));
+
+        // Press 'a' for Allow Once
+        let consumed = mgr.handle_key(&key(KeyCode::Char('a')));
+        assert!(consumed, "Allow Once should be consumed");
+        assert!(mgr.is_empty(), "Dialog should be dismissed");
+
+        let result = mgr.take_last_dismissed_result();
+        assert_eq!(result, Some(DialogResult::Ok("__approval_approved__".into())));
+    }
+
+    #[test]
+    fn permission_allow_always() {
+        let mut mgr = DialogManager::new();
+        mgr.push(make_permission("bash", "echo test"));
+
+        // Press 'l' for Always
+        let consumed = mgr.handle_key(&key(KeyCode::Char('l')));
+        assert!(consumed, "Always should be consumed");
+        assert!(mgr.is_empty());
+
+        let result = mgr.take_last_dismissed_result();
+        assert_eq!(result, Some(DialogResult::Ok("allow_always".into())));
+    }
+
+    #[test]
+    fn permission_reject_with_reason() {
+        let mut mgr = DialogManager::new();
+        mgr.push(make_permission("web_fetch", "https://example.com"));
+
+        // Press 'r' for Reject — should enter reject-reason input mode
+        let consumed = mgr.handle_key(&key(KeyCode::Char('r')));
+        assert!(consumed, "Reject should be consumed");
+        assert!(!mgr.is_empty(), "Dialog should stay open for reason input");
+
+        // Verify we're in reject-input mode
+        let current = mgr.current().unwrap();
+        match &current.kind {
+            DialogKind::Permission { showing_reject_input, .. } => {
+                assert!(*showing_reject_input, "Should be in reject-input mode");
+            }
+            _ => panic!("expected Permission"),
+        }
+
+        // Type a reason
+        mgr.handle_key(&key(KeyCode::Char('u')));
+        mgr.handle_key(&key(KeyCode::Char('s')));
+        mgr.handle_key(&key(KeyCode::Char('e')));
+        mgr.handle_key(&key(KeyCode::Char(' ')));
+        mgr.handle_key(&key(KeyCode::Char('l')));
+        mgr.handle_key(&key(KeyCode::Char('s')));
+
+        // Submit
+        let consumed2 = mgr.handle_key(&key(KeyCode::Enter));
+        assert!(consumed2, "Submit reason should be consumed");
+        assert!(mgr.is_empty(), "Dialog should be dismissed after reason submit");
+
+        let result = mgr.take_last_dismissed_result();
+        assert_eq!(
+            result,
+            Some(DialogResult::Ok("reject:use ls".into())),
+            "Should return reason prefixed with 'reject:'"
+        );
+    }
+
+    #[test]
+    fn permission_esc_denies() {
+        let mut mgr = DialogManager::new();
+        mgr.push(make_permission("edit", "some edit"));
+
+        // Esc should deny
+        let consumed = mgr.handle_key(&key(KeyCode::Esc));
+        assert!(consumed);
+        assert!(mgr.is_empty());
+
+        let result = mgr.take_last_dismissed_result();
+        assert_eq!(result, Some(DialogResult::Ok("__approval_denied__".into())));
+    }
+
+    #[test]
+    fn permission_reject_esc_goes_back() {
+        let mut mgr = DialogManager::new();
+        mgr.push(make_permission("bash", "command"));
+
+        // Enter reject mode
+        mgr.handle_key(&key(KeyCode::Char('r')));
+        let current = mgr.current().unwrap();
+        match &current.kind {
+            DialogKind::Permission { showing_reject_input, .. } => {
+                assert!(*showing_reject_input);
+            }
+            _ => panic!("expected Permission"),
+        }
+
+        // Type something
+        mgr.handle_key(&key(KeyCode::Char('x')));
+
+        // Esc to go back to main permission view
+        let consumed = mgr.handle_key(&key(KeyCode::Esc));
+        assert!(consumed);
+        assert!(!mgr.is_empty(), "Dialog should still be open");
+
+        let current = mgr.current().unwrap();
+        match &current.kind {
+            DialogKind::Permission { showing_reject_input, reject_input_buffer, .. } => {
+                assert!(!*showing_reject_input, "Should be back in main view");
+                assert!(reject_input_buffer.is_empty(), "Buffer should be cleared");
+            }
+            _ => panic!("expected Permission"),
+        }
+    }
+
+    #[test]
+    fn permission_renders_with_type_preview() {
+        let mut terminal = MockTerminal::new(80, 24);
+        let theme = SkinConfig::default();
+        let mut mgr = DialogManager::new();
+        mgr.push(make_permission("bash", "ls -la /tmp"));
+
+        terminal.draw(|f: &mut Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            mgr.render(&mut ctx, area);
+        });
+
+        terminal.assert_line_contains("ls -la");
+        terminal.assert_line_contains("permission");
+        terminal.assert_line_contains("Allow Once");
     }
 }
