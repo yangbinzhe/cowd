@@ -16,19 +16,25 @@
 
 #![allow(dead_code)]
 
+use std::panic::AssertUnwindSafe;
+
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
 
+use crate::tui::accessibility::AccessibilityMode;
+use crate::tui::animation::{AnimationEngine, AnimationKind};
 use crate::tui::app::App;
 use crate::tui::components::chat_view::ChatView;
 use crate::tui::components::dialog::DialogManager;
 use crate::tui::components::render_engine;
 use crate::tui::components::{Component, RenderContext};
+use crate::tui::error_recovery::{self, RenderResult};
 use crate::tui::event::dispatcher::EventDispatcher;
 use crate::tui::event::{ComponentId as EventComponentId, EventBus, EventPriority};
 use crate::tui::keybind::types::Action;
 use crate::tui::keybind::{default_bindings, KeybindEngine};
 use crate::tui::layout::{LayoutNode, LayoutTree, Split, SplitDirection};
+use crate::tui::profiler::{FrameTimer, RenderProfiler};
 use crate::tui::theme::ThemeEngine;
 use crate::tui::TuiEvent;
 
@@ -78,6 +84,18 @@ pub struct TuiState {
 
     /// Stack-based dialog manager for alerts, confirmations, prompts.
     pub dialog_manager: DialogManager,
+
+    /// Frame-based animation engine for transitions and effects.
+    pub animation_engine: AnimationEngine,
+
+    /// Frame timer with render-skip optimization for idle CPU <5%.
+    pub frame_timer: FrameTimer,
+
+    /// Per-component render timing profiler (disabled by default).
+    pub render_profiler: RenderProfiler,
+
+    /// Accessibility settings (ARIA labels, high contrast, screen reader).
+    pub accessibility: AccessibilityMode,
 }
 
 impl TuiState {
@@ -114,6 +132,10 @@ impl TuiState {
         let event_dispatcher = EventDispatcher::new();
         let theme_engine = ThemeEngine::new_dark();
         let dialog_manager = DialogManager::new();
+        let animation_engine = AnimationEngine::new();
+        let frame_timer = FrameTimer::new();
+        let render_profiler = RenderProfiler::new();
+        let accessibility = AccessibilityMode::new();
 
         Self {
             app,
@@ -124,6 +146,10 @@ impl TuiState {
             event_dispatcher,
             theme_engine,
             dialog_manager,
+            animation_engine,
+            frame_timer,
+            render_profiler,
+            accessibility,
         }
     }
 
@@ -166,23 +192,52 @@ impl TuiState {
     /// 3. **ChatView** — rendered directly (so it can be synced beforehand).
     /// 4. **Sync back** — ChatView persists scroll/viewport state to `App`.
     /// 5. **Dialogs** — rendered on top with backdrop dimming.
+    ///
+    /// Skips rendering if msg_version unchanged and frame budget allows.
     pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let skin = self.app.skin.clone();
+
+        // Animation tick: advance all active animations
+        self.animation_engine.tick();
 
         // Sync chat view from App state before rendering
         self.chat_view.sync_from_app(&self.app);
 
         // 1. Render layout tree (placeholder for future panels)
-        let render_state = render_engine::TuiState {
-            theme: skin.clone(),
-        };
-        render_engine::render_tree(&mut self.layout_tree, frame, &render_state);
+        {
+            let render_state = render_engine::TuiState {
+                theme: skin.clone(),
+            };
+            let degraded = {
+                let _guard = self.render_profiler.guard("layout_tree");
+                match error_recovery::catch_render_panic("layout_tree", AssertUnwindSafe(|| {
+                    render_engine::render_tree(&mut self.layout_tree, frame, &render_state);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
+        }
 
         // 2. Render ChatView directly (needs prior sync)
         {
-            let mut ctx = RenderContext::new(frame, &skin);
-            self.chat_view.render(&mut ctx, area);
+            let degraded = {
+                let mut ctx = RenderContext::new(frame, &skin);
+                let _guard = self.render_profiler.guard("chat_view");
+                match error_recovery::catch_render_panic("chat_view", AssertUnwindSafe(|| {
+                    self.chat_view.render(&mut ctx, area);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
         }
 
         // Sync back scroll/viewport state to App
@@ -190,9 +245,23 @@ impl TuiState {
 
         // 3. Render dialog stack on top (backdrop + centered dialog)
         if !self.dialog_manager.is_empty() {
-            let mut ctx = RenderContext::new(frame, &skin);
-            self.dialog_manager.render(&mut ctx, area);
+            let degraded = {
+                let mut ctx = RenderContext::new(frame, &skin);
+                let _guard = self.render_profiler.guard("dialog_manager");
+                match error_recovery::catch_render_panic("dialog_manager", AssertUnwindSafe(|| {
+                    self.dialog_manager.render(&mut ctx, area);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
         }
+
+        // Update last drawn version for render skip optimization
+        self.app.last_drawn_version = self.app.msg_version;
     }
 
     // ── Input Handling ──────────────────────────────────────────
@@ -473,16 +542,24 @@ impl TuiState {
                 if self.app.input.is_empty() {
                     self.app.search_active = true;
                     self.app.search_query.clear();
+                    // Trigger search highlight pulse animation
+                    self.animation_engine
+                        .start_one_shot(AnimationKind::SearchPulse, 4);
                 }
             }
             Action::SearchNext => {
                 if self.app.input.is_empty() && !self.app.search_matches.is_empty() {
                     self.app.search_next();
+                    // Re-trigger pulse on each match navigation
+                    self.animation_engine
+                        .start_one_shot(AnimationKind::SearchPulse, 4);
                 }
             }
             Action::SearchPrev => {
                 if self.app.input.is_empty() && !self.app.search_matches.is_empty() {
                     self.app.search_prev();
+                    self.animation_engine
+                        .start_one_shot(AnimationKind::SearchPulse, 4);
                 }
             }
             Action::Cancel => {
@@ -544,6 +621,8 @@ impl TuiState {
                     }),
                 };
                 self.dialog_manager.push(dialog);
+                self.animation_engine
+                    .start_one_shot(AnimationKind::DialogFade, 4);
             }
             Action::Execute(ref _cmd) => {}
             Action::TogglePanel(ref _name) => {}

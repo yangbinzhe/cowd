@@ -2645,6 +2645,18 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     use ratatui::backend::CrosstermBackend;
     use ratatui::Terminal;
     use tui::state::{ProcessedKey, TuiState};
+    use tui::error_recovery;
+
+    // ── Install custom panic hook for crash recovery ──
+    error_recovery::install_tui_panic_hook();
+
+    // ── Run config migration (skin.yaml → theme.yaml) ──
+    let migration_report = tui::config_migration::run_startup_migration();
+
+    // ── Check for accessibility flag ──
+    let accessibility_enabled = std::env::var("COWD_TUI_ACCESSIBILITY")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2656,8 +2668,21 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
     let session_id = cli.session.id.clone();
     let mut state = TuiState::new(&cli.model, &session_id);
+
+    // Enable accessibility mode if flag is set
+    if accessibility_enabled {
+        state.accessibility = tui::accessibility::AccessibilityMode::full();
+        // Apply high contrast theme
+        let hc_theme = tui::accessibility::high_contrast_theme(true);
+        state.theme_engine = tui::theme::ThemeEngine::new(hc_theme);
+    }
+
     state.add_message("system", &cli.startup_banner());
     state.add_message("system", &format_connected_line(&cli.model));
+    // Show migration report if anything was migrated
+    if !migration_report.contains("nothing to migrate") {
+        state.add_message("system", &migration_report);
+    }
     load_session_history(&mut state, &cli.runtime.session());
     refresh_panels(&mut state, &workspace, &cli.runtime);
 
@@ -2667,7 +2692,6 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
     let res = (|| -> Result<(), Box<dyn std::error::Error>> {
         let frame_budget = Duration::from_millis(8);
-        let mut last_render_time = std::time::Instant::now();
         loop {
             let frame_start = std::time::Instant::now();
 
@@ -2705,17 +2729,21 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                     abort_signal_for_turn = None;
                 }
 
-            // Adaptive render throttle
+            // ── Render using FrameTimer for skip optimization ──
             let render_throttle = if state.turn_active {
                 Duration::from_millis(32)
             } else {
                 Duration::from_millis(16)
             };
-            let since_last_render = last_render_time.elapsed();
-            if since_last_render >= render_throttle || !state.turn_active {
+            if state.frame_timer.should_render(
+                state.msg_version,
+                state.last_drawn_version,
+                render_throttle,
+            ) {
                 terminal.draw(|f| state.render(f))?;
-                last_render_time = std::time::Instant::now();
+                state.frame_timer.mark_rendered();
             }
+            state.frame_timer.end_frame();
 
             // ── Input handling via TuiState engine ──
             let poll_ms = if state.turn_active { 5u64 } else { 10u64 };

@@ -15,6 +15,14 @@ pub mod md_renderer;
 pub mod state;
 pub mod test_utils;
 pub mod theme;
+pub mod profiler;
+pub mod animation;
+pub mod error_recovery;
+pub mod config_migration;
+pub mod accessibility;
+
+#[cfg(test)]
+mod tui_integration_tests;
 
 pub use app::{App, FileEntry, DelegateTask, MemoryEntry, SkillSummary};
 pub use components::{Component, ComponentId, EventResult, RenderContext};
