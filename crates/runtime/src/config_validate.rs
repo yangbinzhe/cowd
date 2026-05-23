@@ -639,7 +639,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_path() -> PathBuf {
-        PathBuf::from("/test/settings.json")
+        PathBuf::from("/test/config.yaml")
     }
 
     #[test]
@@ -908,7 +908,7 @@ mod tests {
     #[test]
     fn check_unsupported_format_allows_json() {
         // given
-        let path = PathBuf::from("/home/.cowd/settings.json");
+        let path = PathBuf::from("/home/.cowd/config.yaml");
 
         // when / then
         assert!(check_unsupported_format(&path).is_ok());
@@ -940,7 +940,7 @@ mod tests {
     fn display_format_unknown_key_with_line() {
         // given
         let diag = ConfigDiagnostic {
-            path: "/test/settings.json".to_string(),
+            path: "/test/config.yaml".to_string(),
             field: "badKey".to_string(),
             line: Some(5),
             kind: DiagnosticKind::UnknownKey { suggestion: None },
@@ -952,7 +952,7 @@ mod tests {
         // then
         assert_eq!(
             output,
-            r#"/test/settings.json: unknown key "badKey" (line 5)"#
+            r#"/test/config.yaml: unknown key "badKey" (line 5)"#
         );
     }
 
@@ -960,7 +960,7 @@ mod tests {
     fn display_format_wrong_type_with_line() {
         // given
         let diag = ConfigDiagnostic {
-            path: "/test/settings.json".to_string(),
+            path: "/test/config.yaml".to_string(),
             field: "model".to_string(),
             line: Some(2),
             kind: DiagnosticKind::WrongType {
@@ -975,7 +975,7 @@ mod tests {
         // then
         assert_eq!(
             output,
-            r#"/test/settings.json: field "model" must be a string, got a number (line 2)"#
+            r#"/test/config.yaml: field "model" must be a string, got a number (line 2)"#
         );
     }
 
@@ -983,7 +983,7 @@ mod tests {
     fn display_format_deprecated_with_line() {
         // given
         let diag = ConfigDiagnostic {
-            path: "/test/settings.json".to_string(),
+            path: "/test/config.yaml".to_string(),
             field: "permissionMode".to_string(),
             line: Some(3),
             kind: DiagnosticKind::Deprecated {
@@ -997,7 +997,7 @@ mod tests {
         // then
         assert_eq!(
             output,
-            r#"/test/settings.json: field "permissionMode" is deprecated (line 3). Use "permissions.defaultMode" instead"#
+            r#"/test/config.yaml: field "permissionMode" is deprecated (line 3). Use "permissions.defaultMode" instead"#
         );
     }
 }

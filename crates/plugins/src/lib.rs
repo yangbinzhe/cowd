@@ -18,7 +18,7 @@ pub use hooks::{HookEvent, HookRunResult, HookRunner};
 const EXTERNAL_MARKETPLACE: &str = "external";
 const BUILTIN_MARKETPLACE: &str = "builtin";
 const BUNDLED_MARKETPLACE: &str = "bundled";
-const SETTINGS_FILE_NAME: &str = "settings.json";
+const SETTINGS_FILE_NAME: &str = "plugin-state.json";
 const REGISTRY_FILE_NAME: &str = "installed.json";
 const MANIFEST_FILE_NAME: &str = "plugin.json";
 const MANIFEST_RELATIVE_PATH: &str = ".cowd/plugins/plugin.json";
@@ -1060,8 +1060,10 @@ impl PluginManager {
         })
     }
 
+    /// Path to the plugin state file (`~/.cowd/plugin-state.json`).
+    /// Tracks enabled/disabled state for all installed plugins at runtime.
     #[must_use]
-    pub fn settings_path(&self) -> PathBuf {
+    pub fn plugin_state_path(&self) -> PathBuf {
         self.config.config_home.join(SETTINGS_FILE_NAME)
     }
 
@@ -1487,7 +1489,7 @@ impl PluginManager {
         plugin_id: &str,
         enabled: Option<bool>,
     ) -> Result<(), PluginError> {
-        update_settings_json(&self.settings_path(), |root| {
+        update_settings_json(&self.plugin_state_path(), |root| {
             let enabled_plugins = ensure_object(root, "enabledPlugins");
             match enabled {
                 Some(value) => {
@@ -3163,13 +3165,13 @@ mod tests {
             .enable("starter@bundled")
             .expect("enable bundled plugin should succeed");
         assert_eq!(
-            load_enabled_plugins(&manager.settings_path()).get("starter@bundled"),
+            load_enabled_plugins(&manager.plugin_state_path()).get("starter@bundled"),
             Some(&true)
         );
 
         let mut reloaded_config = PluginManagerConfig::new(&config_home);
         reloaded_config.bundled_root = Some(bundled_root.clone());
-        reloaded_config.enabled_plugins = load_enabled_plugins(&manager.settings_path());
+        reloaded_config.enabled_plugins = load_enabled_plugins(&manager.plugin_state_path());
         let reloaded_manager = PluginManager::new(reloaded_config);
         let reloaded = reloaded_manager
             .list_installed_plugins()
@@ -3197,13 +3199,13 @@ mod tests {
             .disable("starter@bundled")
             .expect("disable bundled plugin should succeed");
         assert_eq!(
-            load_enabled_plugins(&manager.settings_path()).get("starter@bundled"),
+            load_enabled_plugins(&manager.plugin_state_path()).get("starter@bundled"),
             Some(&false)
         );
 
         let mut reloaded_config = PluginManagerConfig::new(&config_home);
         reloaded_config.bundled_root = Some(bundled_root.clone());
-        reloaded_config.enabled_plugins = load_enabled_plugins(&manager.settings_path());
+        reloaded_config.enabled_plugins = load_enabled_plugins(&manager.plugin_state_path());
         let reloaded_manager = PluginManager::new(reloaded_config);
         let reloaded = reloaded_manager
             .list_installed_plugins()
