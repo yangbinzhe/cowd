@@ -59,7 +59,6 @@ pub fn config_home_dir() -> PathBuf {
 
 pub const ENV_PREFIX: &str = "COWD_";
 pub const BIN_NAME: &str = "cowd";
-pub const CONFIG_FILE_JSON: &str = "cowd.json";
 pub const CONFIG_FILE_YAML: &str = "config.yaml";
 pub const SETTINGS_SCHEMA_NAME: &str = "CowdSettingsSchema";
 

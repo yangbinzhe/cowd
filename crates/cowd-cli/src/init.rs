@@ -1,13 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const STARTER_COWD_JSON: &str = concat!(
-    "{\n",
-    "  \"permissions\": {\n",
-    "    \"defaultMode\": \"dontAsk\"\n",
-    "  }\n",
-    "}\n",
-);
 const GITIGNORE_COMMENT: &str = "# Cowd local artifacts";
 const GITIGNORE_ENTRIES: [&str; 1] = [".cowd/config.local.yaml"];
 
@@ -115,21 +108,22 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
         });
     }
 
-    // Migration: if .claude.json exists but .cowd.json does not, copy it
-    let cowd_json = cwd.join(".cowd.json");
+    // .claude.json → config.local.yaml migration
     let claude_json = cwd.join(".claude.json");
-    if claude_json.is_file() && !cowd_json.exists() {
-        let content = fs::read_to_string(&claude_json)?;
-        fs::write(&cowd_json, &content)?;
-        artifacts.push(InitArtifact {
-            name: ".cowd.json (migrated from .claude.json)",
-            status: InitStatus::Created,
-        });
-    } else {
-        artifacts.push(InitArtifact {
-            name: ".cowd.json",
-            status: write_file_if_missing(&cowd_json, STARTER_COWD_JSON)?,
-        });
+    let project_local = cwd.join(".cowd").join("config.local.yaml");
+    if claude_json.is_file() && !project_local.exists() {
+        // Copy permissions.defaultMode from legacy .claude.json to config.local.yaml
+        if let Ok(content) = fs::read_to_string(&claude_json) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(mode) = val.get("permissions").and_then(|p| p.get("defaultMode")).and_then(|m| m.as_str()) {
+                    fs::write(&project_local, format!("permissions:\n  defaultMode: {mode}\n"))?;
+                    artifacts.push(InitArtifact {
+                        name: ".cowd/config.local.yaml (migrated from .claude.json)",
+                        status: InitStatus::Created,
+                    });
+                }
+            }
+        }
     }
 
     let gitignore = cwd.join(".gitignore");
@@ -308,7 +302,7 @@ pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
 
     lines.push("## Working agreement".to_string());
     lines.push("- Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.".to_string());
-    lines.push("- Keep shared defaults in `.cowd.json`; reserve `config.local.yaml` for machine-local overrides.".to_string());
+    lines.push("- Use `config.yaml` for shared project config; reserve `config.local.yaml` for machine-local overrides.".to_string());
     lines.push("- Do not overwrite existing `CLAUDE.md` content automatically; update it intentionally when repo workflows change.".to_string());
     lines.push(String::new());
 
@@ -454,23 +448,12 @@ mod tests {
         let report = initialize_repo(&root).expect("init should succeed");
         let rendered = report.render();
         assert!(rendered.contains(".cowd/"));
-        assert!(rendered.contains(".cowd.json"));
+        assert!(rendered.contains("CLAUDE.md"));
         assert!(rendered.contains("created"));
         assert!(rendered.contains(".gitignore       created"));
         assert!(rendered.contains("CLAUDE.md"));
         assert!(root.join(".cowd").is_dir());
-        assert!(root.join(".cowd.json").is_file());
         assert!(root.join("CLAUDE.md").is_file());
-        assert_eq!(
-            fs::read_to_string(root.join(".cowd.json")).expect("read cowd json"),
-            concat!(
-                "{\n",
-                "  \"permissions\": {\n",
-                "    \"defaultMode\": \"dontAsk\"\n",
-                "  }\n",
-                "}\n",
-            )
-        );
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert!(gitignore.contains(".cowd/config.local.yaml"));
         let claude_md = fs::read_to_string(root.join("CLAUDE.md")).expect("read claude md");
@@ -494,7 +477,7 @@ mod tests {
         let second = initialize_repo(&root).expect("second init should succeed");
         let second_rendered = second.render();
         assert!(second_rendered.contains(".cowd/"));
-        assert!(second_rendered.contains(".cowd.json"));
+        assert!(second_rendered.contains("CLAUDE.md"));
         assert!(second_rendered.contains("skipped (already exists)"));
         assert!(second_rendered.contains(".gitignore       skipped (already exists)"));
         assert!(second_rendered.contains("CLAUDE.md"));

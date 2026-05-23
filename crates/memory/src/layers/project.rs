@@ -7,7 +7,7 @@
 //! Characteristics:
 //! - ~3000 token budget
 //! - Persistent across sessions within the same project scope
-//! - Can auto-discover context from CLAUDE.md, .cowd.json etc.
+//! - Can auto-discover context from CLAUDE.md, config.yaml etc.
 //! - `tick()` applies staleness decay
 
 use async_trait::async_trait;
@@ -34,7 +34,6 @@ const DEFAULT_MAX_TOKENS: u64 = 3000;
 /// Files that are recognised as project-context sources (in priority order).
 const PROJECT_CONTEXT_FILES: &[&str] = &[
     "CLAUDE.md",
-    ".cowd.json",
     "AGENTS.md",
     "CONTRIBUTING.md",
     "README.md",
