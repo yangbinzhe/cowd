@@ -1,15 +1,22 @@
 pub mod app;
+pub mod layout;
+pub mod components;
 pub mod render;
 pub mod input;
+pub mod keybind;
 pub mod skin;
 pub mod events;
+pub mod event;
 pub mod runner;
 pub mod callbacks;
 pub mod widgets;
 pub mod osc52;
 pub mod md_renderer;
+pub mod test_utils;
+pub mod theme;
 
 pub use app::{App, FileEntry, DelegateTask, MemoryEntry, SkillSummary};
+pub use components::{Component, ComponentId, EventResult, RenderContext};
 pub use events::{TuiEvent, TuiEventReceiver, tui_event_channel};
 pub use runner::TurnOutcome;
 pub use callbacks::TuiToolCallback;
