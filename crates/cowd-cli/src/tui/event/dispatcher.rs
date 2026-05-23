@@ -1,6 +1,6 @@
-// ── EventBus — TUI-internal priority event dispatcher ─────────
-// Types only: EventBus, its helper types, and the internal channel.
-// No routing logic — that lives in Task 12's Dispatcher.
+// ── EventBus + EventDispatcher — TUI-internal event system ──
+// EventBus: priority-ordered channel for component-to-dispatcher events.
+// EventDispatcher: drains the EventBus and routes events to components.
 #![allow(dead_code)]
 
 use super::{ComponentId, EventPriority, RoutedEvent};
@@ -109,5 +109,314 @@ impl EventBus {
 impl Default for EventBus {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── EventDispatcher ──────────────────────────────────────────
+
+use crate::tui::components::Component;
+
+/// Registry-backed event dispatcher.
+///
+/// Components register themselves by `ComponentId` (from this module).
+/// On each `dispatch()` call, all pending events in the `EventBus` are
+/// drained in priority order and routed to the appropriate handler(s).
+pub struct EventDispatcher {
+    /// Component registry keyed by `ComponentId` inner `String`.
+    components: std::collections::HashMap<String, Box<dyn Component>>,
+}
+
+impl EventDispatcher {
+    /// Create an empty dispatcher.
+    #[must_use]
+    pub fn new() -> Self {
+        EventDispatcher {
+            components: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Register a component with the given identifier.
+    ///
+    /// The `id` is used to match `RoutedEvent::target` when routing.
+    pub fn register(&mut self, id: ComponentId, component: Box<dyn Component>) {
+        self.components.insert(id.0, component);
+    }
+
+    /// Drain the event bus and dispatch every event in priority order.
+    ///
+    /// Events are drained via `bus.drain()` (priority-ordered), then
+    /// routed to the appropriate component(s).
+    pub fn dispatch(&mut self, bus: &EventBus) {
+        let events = bus.drain();
+        for event in events {
+            self.dispatch_event(event);
+        }
+    }
+
+    /// Route a single event to its target component.
+    ///
+    /// - If the target is the broadcast sentinel (`__broadcast__`), the
+    ///   event goes to all focusable components.
+    /// - If the target is a registered component, the event is delivered
+    ///   there. If the handler returns `NotConsumed`, the event falls
+    ///   through to broadcast (all focusable components).
+    /// - If the target is unknown, the event broadcasts to all focusable
+    ///   components as a fallback.
+    fn dispatch_event(&mut self, event: RoutedEvent) {
+        if event.target.0 == "__broadcast__" {
+            self.broadcast(event.event);
+            return;
+        }
+
+        if let Some(component) = self.components.get_mut(&event.target.0) {
+            let result = component.handle_event(&event.event);
+            if result.is_not_consumed() {
+                self.broadcast(event.event);
+            }
+        } else {
+            self.broadcast(event.event);
+        }
+    }
+
+    /// Send an event to every registered focusable component.
+    fn broadcast(&mut self, event: crossterm::event::Event) {
+        for component in self.components.values_mut() {
+            if component.focusable() {
+                component.handle_event(&event);
+            }
+        }
+    }
+}
+
+impl Default for EventDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod dispatcher_tests {
+    use super::*;
+    use crate::tui::components::{Component, EventResult};
+    use crate::tui::event::EventPriority;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct SpyLog {
+        events: Vec<(String, Event)>,
+    }
+
+    struct SpyComponent {
+        id: &'static str,
+        log: Rc<RefCell<SpyLog>>,
+        focused: bool,
+        handler: Option<Box<dyn FnMut(&Event) -> EventResult>>,
+    }
+
+    impl SpyComponent {
+        fn new(id: &'static str, log: Rc<RefCell<SpyLog>>) -> Self {
+            SpyComponent { id, log, focused: true, handler: None }
+        }
+
+        fn with_focus(mut self, focused: bool) -> Self {
+            self.focused = focused;
+            self
+        }
+
+        fn with_handler(
+            mut self,
+            handler: impl FnMut(&Event) -> EventResult + 'static,
+        ) -> Self {
+            self.handler = Some(Box::new(handler));
+            self
+        }
+    }
+
+    impl Component for SpyComponent {
+        fn render(
+            &mut self,
+            _ctx: &mut crate::tui::components::RenderContext,
+            _area: ratatui::layout::Rect,
+        ) {}
+
+        fn handle_event(&mut self, event: &Event) -> EventResult {
+            self.log.borrow_mut().events.push((self.id.to_string(), event.clone()));
+            if let Some(ref mut handler) = self.handler {
+                handler(event)
+            } else {
+                EventResult::Consumed
+            }
+        }
+
+        fn focusable(&self) -> bool { self.focused }
+        fn id(&self) -> &str { self.id }
+    }
+
+    // ── helpers ────────────────────────────────────────────────
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn make_spy(dispatcher: &mut EventDispatcher, id: &'static str, log: Rc<RefCell<SpyLog>>) -> ComponentId {
+        let cid = ComponentId(id.to_string());
+        dispatcher.register(cid.clone(), Box::new(SpyComponent::new(id, log)));
+        cid
+    }
+
+    fn received(log: &SpyLog) -> Vec<&str> {
+        log.events.iter().map(|(id, _)| id.as_str()).collect()
+    }
+
+    fn received_by<'a>(log: &'a SpyLog, component_id: &str) -> Vec<&'a Event> {
+        log.events.iter().filter(|(id, _)| id == component_id).map(|(_, e)| e).collect()
+    }
+
+    // ── priority_order_dispatch ────────────────────────────────
+
+    #[test]
+    fn priority_order_dispatch() {
+        let bus = EventBus::new();
+        let mut dispatcher = EventDispatcher::new();
+        let log = Rc::new(RefCell::new(SpyLog::default()));
+
+        make_spy(&mut dispatcher, "spy", Rc::clone(&log));
+
+        bus.send(key_event(KeyCode::Char('l')), EventPriority::Low);
+        bus.send(key_event(KeyCode::Char('n')), EventPriority::Normal);
+        bus.send(key_event(KeyCode::Char('h')), EventPriority::High);
+
+        dispatcher.dispatch(&bus);
+
+        // All three events broadcast to spy. Priority order is verified by
+        // EventBus::drain() (tested in mod.rs). Dispatcher processes them in
+        // drain order, so spy receives h → n → l.
+        assert_eq!(log.borrow().events.len(), 3, "spy should receive all 3 broadcast events");
+        assert!(bus.drain().is_empty(), "bus should be empty after dispatch");
+    }
+
+    // ── routed_to_correct_component ────────────────────────────
+
+    #[test]
+    fn routed_to_correct_component() {
+        let bus = EventBus::new();
+        let mut dispatcher = EventDispatcher::new();
+        let log = Rc::new(RefCell::new(SpyLog::default()));
+
+        let spy_a_id = make_spy(&mut dispatcher, "component_a", Rc::clone(&log));
+        let _spy_b_id = make_spy(&mut dispatcher, "component_b", Rc::clone(&log));
+
+        let ev = key_event(KeyCode::Enter);
+        bus.send_targeted(spy_a_id, ev.clone(), EventPriority::Normal);
+
+        dispatcher.dispatch(&bus);
+
+        // Only component_a consumed the targeted event; component_b was not
+        // reached because the event was Consumed (no broadcast fallback).
+        assert_eq!(received(&log.borrow()), vec!["component_a"]);
+        assert!(bus.drain().is_empty());
+    }
+
+    // ── broadcast_fallback_on_not_consumed ─────────────────────
+
+    #[test]
+    fn broadcast_fallback_on_not_consumed() {
+        let bus = EventBus::new();
+        let mut dispatcher = EventDispatcher::new();
+        let log = Rc::new(RefCell::new(SpyLog::default()));
+
+        let not_consumed = SpyComponent::new("comp_a", Rc::clone(&log))
+            .with_handler(|_e| EventResult::NotConsumed);
+        let target_id = ComponentId("comp_a".to_string());
+        dispatcher.register(target_id.clone(), Box::new(not_consumed));
+
+        make_spy(&mut dispatcher, "comp_b", Rc::clone(&log));
+
+        bus.send_targeted(target_id, key_event(KeyCode::Tab), EventPriority::Normal);
+        dispatcher.dispatch(&bus);
+
+        // comp_a receives first (targeted), then both via broadcast.
+        // HashMap iteration order is non-deterministic, so exact order varies.
+        let log = log.borrow();
+        assert_eq!(received_by(&log, "comp_a").len(), 2, "comp_a: targeted + broadcast");
+        assert_eq!(received_by(&log, "comp_b").len(), 1, "comp_b: broadcast only");
+        assert_eq!(log.events.first().map(|(id, _)| id.as_str()), Some("comp_a"), "targeted dispatch first");
+        assert_eq!(log.events.len(), 3);
+    }
+
+    // ── broadcast_fallback_unknown_target ──────────────────────
+
+    #[test]
+    fn broadcast_fallback_unknown_target() {
+        let bus = EventBus::new();
+        let mut dispatcher = EventDispatcher::new();
+        let log = Rc::new(RefCell::new(SpyLog::default()));
+
+        make_spy(&mut dispatcher, "existing", Rc::clone(&log));
+
+        let unknown = ComponentId("nonexistent".to_string());
+        bus.send_targeted(unknown, key_event(KeyCode::F(1)), EventPriority::Normal);
+
+        dispatcher.dispatch(&bus);
+
+        assert_eq!(received(&log.borrow()), vec!["existing"], "unknown target → broadcast to existing");
+        assert!(bus.drain().is_empty());
+    }
+
+    // ── empty_queue_noop ───────────────────────────────────────
+
+    #[test]
+    fn empty_queue_noop() {
+        let bus = EventBus::new();
+        let mut dispatcher = EventDispatcher::new();
+        let log = Rc::new(RefCell::new(SpyLog::default()));
+
+        make_spy(&mut dispatcher, "noop_spy", Rc::clone(&log));
+
+        dispatcher.dispatch(&bus);
+
+        assert!(log.borrow().events.is_empty(), "empty queue → no events dispatched");
+    }
+
+    // ── broadcast_skips_non_focusable ──────────────────────────
+
+    #[test]
+    fn broadcast_skips_non_focusable() {
+        let bus = EventBus::new();
+        let mut dispatcher = EventDispatcher::new();
+        let log = Rc::new(RefCell::new(SpyLog::default()));
+
+        let focused = SpyComponent::new("focused", Rc::clone(&log)).with_focus(true);
+        let unfocused = SpyComponent::new("unfocused", Rc::clone(&log)).with_focus(false);
+
+        dispatcher.register(ComponentId("focused".to_string()), Box::new(focused));
+        dispatcher.register(ComponentId("unfocused".to_string()), Box::new(unfocused));
+
+        bus.send(key_event(KeyCode::Esc), EventPriority::Normal);
+        dispatcher.dispatch(&bus);
+
+        assert_eq!(received(&log.borrow()), vec!["focused"], "unfocused skipped");
+    }
+
+    // ── drain_post_dispatch_empty ──────────────────────────────
+
+    #[test]
+    fn drain_post_dispatch_empty() {
+        let bus = EventBus::new();
+        let mut dispatcher = EventDispatcher::new();
+        let log = Rc::new(RefCell::new(SpyLog::default()));
+
+        make_spy(&mut dispatcher, "drain_spy", Rc::clone(&log));
+
+        bus.send(key_event(KeyCode::Char('x')), EventPriority::High);
+        bus.send(key_event(KeyCode::Char('y')), EventPriority::Low);
+
+        dispatcher.dispatch(&bus);
+
+        let remaining = bus.drain();
+        assert!(remaining.is_empty(), "EventBus should be empty after dispatch");
+        assert_eq!(log.borrow().events.len(), 2, "both events dispatched");
     }
 }

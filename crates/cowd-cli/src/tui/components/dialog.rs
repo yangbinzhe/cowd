@@ -5,6 +5,16 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 
+use ratatui::{
+    layout::Rect,
+    style::{Color, Style, Stylize},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    Frame,
+};
+
+use crate::tui::components::RenderContext;
+
 /// The kind of dialog being displayed.
 #[derive(Debug, Clone)]
 pub enum DialogKind {
@@ -229,12 +239,295 @@ impl Default for DialogManager {
     }
 }
 
+// ─── Rendering ────────────────────────────────────────────────────────
+
+impl DialogManager {
+    /// Render the dialog stack: backdrop dimming + topmost dialog centered.
+    ///
+    /// Call this at the end of every draw frame. When the stack is empty
+    /// this is a no-op. Otherwise it renders:
+    /// 1. A `Clear` widget over the full area (prevents visual artifacts)
+    /// 2. A dimmed backdrop (`Paragraph` with dark background)
+    /// 3. The topmost dialog centered in the screen, auto-sized
+    ///
+    /// # Arguments
+    /// * `ctx`  — mutable render context providing access to the frame and theme
+    /// * `area` — the full screen area (typically `ctx.area()`)
+    pub fn render(&self, ctx: &mut RenderContext, area: Rect) {
+        if self.stack.is_empty() {
+            return;
+        }
+
+        let dialog = match self.current() {
+            Some(d) => d,
+            None => return,
+        };
+
+        // Extract accent color before borrowing frame mutably
+        let accent = ctx.theme().accent_color();
+
+        let frame = ctx.frame_mut();
+
+        // 1. Backdrop: Clear + dimmed overlay
+        frame.render_widget(Clear, area);
+        let dim_bg = Style::default().bg(Color::Rgb(20, 20, 20));
+        frame.render_widget(Paragraph::new("").style(dim_bg), area);
+
+        // 2. Compute auto-sized dialog rect, centered
+        let max_w = ((area.width as f32) * 0.8) as u16;
+        let w = Self::auto_width(dialog, max_w);
+        let h = Self::auto_height(dialog);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let dialog_rect = Rect::new(x, y, w, h);
+
+        // Clear the dialog area before rendering content
+        frame.render_widget(Clear, dialog_rect);
+
+        // 3. Render the dialog kind
+        Self::render_kind(frame, dialog_rect, dialog, accent);
+    }
+
+    // ── auto-sizing ────────────────────────────────────────────────
+
+    /// Compute dialog width: `max(title, content, buttons) + 6 padding`,
+    /// capped at `max_w` and floored at 20.
+    fn auto_width(dialog: &DialogState, max_w: u16) -> u16 {
+        let title_w = match &dialog.kind {
+            DialogKind::Alert { title, .. }
+            | DialogKind::Confirm { title, .. }
+            | DialogKind::Select { title, .. }
+            | DialogKind::Prompt { title, .. } => title.len() as u16,
+        };
+
+        let content_w = match &dialog.kind {
+            DialogKind::Alert { message, .. }
+            | DialogKind::Confirm { message, .. } => {
+                message.lines().map(|l| l.len() as u16).max().unwrap_or(0)
+            }
+            DialogKind::Select { items, .. } => {
+                items.iter().map(|i| i.len() as u16).max().unwrap_or(0)
+            }
+            DialogKind::Prompt { placeholder, input, .. } => {
+                // Prompt displays: "  <input>▊" or "  <placeholder>"
+                let visible = if input.is_empty() {
+                    placeholder.len()
+                } else {
+                    input.len() + 1 // +1 for cursor block
+                };
+                (visible + 2) as u16 // +2 for "  " prefix
+            }
+        };
+
+        let buttons_w: u16 = if matches!(dialog.kind, DialogKind::Confirm { .. }) {
+            20 // "[Y] Yes  [N] No"
+        } else {
+            0
+        };
+
+        let text_w = title_w.max(content_w).max(buttons_w);
+        let w = text_w + 6; // 2 borders + 4 inner padding
+        w.max(20).min(max_w)
+    }
+
+    /// Compute dialog height based on content kind.
+    fn auto_height(dialog: &DialogState) -> u16 {
+        match &dialog.kind {
+            // Alert: border(2) + title line + blank + message + blank + hint
+            DialogKind::Alert { .. } => 7,
+            // Confirm: border(2) + title line + blank + message + blank + buttons
+            DialogKind::Confirm { .. } => 7,
+            // Select: border(2) + title + items + blank + hint
+            DialogKind::Select { items, .. } => {
+                (items.len() as u16 + 5).max(6)
+            }
+            // Prompt: border(2) + title + blank + input + blank + hint
+            DialogKind::Prompt { .. } => 7,
+        }
+    }
+
+    // ── per-kind render helpers ────────────────────────────────────
+
+    fn render_kind(
+        frame: &mut Frame,
+        rect: Rect,
+        dialog: &DialogState,
+        accent: Color,
+    ) {
+        match &dialog.kind {
+            DialogKind::Alert { title, message } => {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.as_str())
+                    .fg(accent);
+
+                let hint = Span::styled(
+                    "Press any key to continue",
+                    Style::default().fg(Color::DarkGray),
+                );
+
+                let text = Text::from(vec![
+                    Line::from(""),
+                    Line::from(message.as_str()),
+                    Line::from(""),
+                    Line::from(hint),
+                ]);
+
+                let p = Paragraph::new(text)
+                    .block(block)
+                    .centered();
+
+                frame.render_widget(p, rect);
+            }
+
+            DialogKind::Confirm {
+                title,
+                message,
+                default,
+            } => {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.as_str())
+                    .fg(accent);
+
+                let yes_style = if *default {
+                    Style::default().fg(Color::Black).bg(accent)
+                } else {
+                    Style::default().fg(accent)
+                };
+                let no_style = if !*default {
+                    Style::default().fg(Color::Black).bg(Color::Red)
+                } else {
+                    Style::default()
+                };
+
+                let buttons = Line::from(vec![
+                    Span::styled("[Y] Yes", yes_style),
+                    Span::raw("  "),
+                    Span::styled("[N] No", no_style),
+                ]);
+
+                let text = Text::from(vec![
+                    Line::from(""),
+                    Line::from(message.as_str()),
+                    Line::from(""),
+                    buttons,
+                ]);
+
+                let p = Paragraph::new(text)
+                    .block(block)
+                    .centered();
+
+                frame.render_widget(p, rect);
+            }
+
+            DialogKind::Select {
+                title,
+                items,
+                selected,
+            } => {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.as_str())
+                    .fg(accent);
+
+                let mut list_items: Vec<ListItem> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| {
+                        let label = if i == *selected {
+                            format!("▶ {}", item)
+                        } else {
+                            format!("  {}", item)
+                        };
+                        if i == *selected {
+                            ListItem::from(label)
+                                .style(Style::default().fg(Color::Black).bg(accent))
+                        } else {
+                            ListItem::from(label)
+                        }
+                    })
+                    .collect();
+
+                // Footer hint as a styled list item
+                list_items.push(ListItem::from(""));
+                list_items.push(
+                    ListItem::from("↑↓ navigate  Enter select  Esc cancel")
+                        .style(Style::default().fg(Color::DarkGray)),
+                );
+
+                let list = List::new(list_items).block(block);
+
+                frame.render_widget(list, rect);
+            }
+
+            DialogKind::Prompt {
+                title,
+                placeholder,
+                input,
+            } => {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.as_str())
+                    .fg(accent);
+
+                // Show input text with cursor block, or dimmed placeholder
+                let display: Span = if input.is_empty() {
+                    Span::styled(
+                        format!("  {}", placeholder),
+                        Style::default().fg(Color::DarkGray),
+                    )
+                } else {
+                    Span::styled(
+                        format!("  {}▊", input),
+                        Style::default(),
+                    )
+                };
+
+                let hint = Span::styled(
+                    "Enter to confirm  Esc to cancel",
+                    Style::default().fg(Color::DarkGray),
+                );
+
+                let text = Text::from(vec![
+                    Line::from(""),
+                    Line::from(display),
+                    Line::from(""),
+                    Line::from(hint),
+                ]);
+
+                let p = Paragraph::new(text).block(block);
+
+                frame.render_widget(p, rect);
+            }
+        }
+    }
+}
+
+// ─── Test Helpers ─────────────────────────────────────────────────────
+
+/// Create a `ratatui::Terminal<TestBackend>` for render tests.
+#[cfg(test)]
+pub(crate) fn test_terminal(width: u16, height: u16) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    ratatui::Terminal::new(backend).expect("TestBackend terminal creation never fails")
+}
+
+/// Create a test `SkinConfig` for render tests.
+#[cfg(test)]
+pub(crate) fn test_theme() -> crate::tui::skin::SkinConfig {
+    crate::tui::skin::SkinConfig::default()
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use crate::tui::components::RenderContext;
+    use crate::tui::skin::SkinConfig;
+    use crate::tui::test_utils::MockTerminal;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -606,5 +899,234 @@ mod tests {
         });
         assert_eq!(d.width, 60);
         assert_eq!(d.height, 10);
+    }
+
+    // ── Render tests ───────────────────────────────────────────────
+
+    #[test]
+    fn dialog_centers_on_screen() {
+        let mut terminal = MockTerminal::new(80, 24);
+        let theme = SkinConfig::default();
+        let mut mgr = DialogManager::new();
+        mgr.push(DialogState::new(DialogKind::Alert {
+            title: "Test".into(),
+            message: "Centered alert".into(),
+        }));
+
+        terminal.draw(|f: &mut Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            mgr.render(&mut ctx, area);
+        });
+
+        let lines = terminal.buffer_lines();
+        // Dialog centered: border should appear near line 8 of 24 rows
+        let center_line = 8usize;
+        assert!(
+            lines[center_line].contains('┌') || lines[center_line].contains('─'),
+            "Expected border near line {}, got: '{}'",
+            center_line,
+            lines[center_line]
+        );
+    }
+
+    #[test]
+    fn backdrop_covers_full_area() {
+        let mut terminal = MockTerminal::new(80, 24);
+        let theme = SkinConfig::default();
+        let mut mgr = DialogManager::new();
+        mgr.push(DialogState::new(DialogKind::Alert {
+            title: "Test".into(),
+            message: "Backdrop test".into(),
+        }));
+
+        terminal.draw(|f: &mut Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            mgr.render(&mut ctx, area);
+        });
+
+        terminal.assert_line_contains("Test");
+        let lines = terminal.buffer_lines();
+        assert!(!lines.iter().all(|l| l.is_empty()), "Backdrop should render content");
+    }
+
+    #[test]
+    fn focus_trap_blocks_keys() {
+        let mut mgr = DialogManager::new();
+        mgr.push(DialogState::new(DialogKind::Confirm {
+            title: "Confirm".into(),
+            message: "Are you sure?".into(),
+            default: false,
+        }));
+
+        assert!(mgr.handle_key(&key(KeyCode::Char('y'))));
+        assert!(mgr.is_empty());
+
+        mgr.push(DialogState::new(DialogKind::Confirm {
+            title: "Confirm".into(),
+            message: "Again?".into(),
+            default: false,
+        }));
+
+        assert!(!mgr.handle_key(&key(KeyCode::Char('x'))));
+        assert!(!mgr.is_empty());
+    }
+
+    #[test]
+    fn auto_size_80pct() {
+        let mut terminal = MockTerminal::new(200, 24);
+        let theme = SkinConfig::default();
+        let mut mgr = DialogManager::new();
+        let long_message = "X".repeat(200);
+        mgr.push(DialogState::new(DialogKind::Alert {
+            title: "Wide Dialog Test".into(),
+            message: long_message,
+        }));
+
+        terminal.draw(|f: &mut Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            mgr.render(&mut ctx, area);
+        });
+
+        let lines = terminal.buffer_lines();
+        let border_line = lines.iter().position(|l| l.contains("Wide Dialog Test")).unwrap_or(8);
+        let line = &lines[border_line];
+        let left_border = line.find('┌').expect("Should find '┌' border");
+        assert!(left_border > 0, "Dialog not centered, left_border={left_border}");
+
+        // Find '┐' within reasonable bounds: scan chars up to left + max_allowed + margin
+        let chars: Vec<char> = line.chars().collect();
+        let max_allowed = 160u16;
+        let search_end = (left_border + max_allowed as usize + 20).min(chars.len());
+        let right_border = chars[left_border..search_end]
+            .iter()
+            .rposition(|&c| c == '┐')
+            .map(|pos| pos + left_border);
+
+        if let Some(right) = right_border {
+            let dialog_width = (right - left_border + 1) as u16;
+            assert!(
+                dialog_width <= max_allowed,
+                "Dialog width {dialog_width} exceeds 80% of 200 ({max_allowed})"
+            );
+        } else {
+            let right_pos = chars.iter().rposition(|&c| c == '┐');
+            assert!(right_pos.is_some(), "'┐' not found in line");
+            let dialog_width = (right_pos.unwrap() - left_border + 1) as u16;
+            assert!(
+                dialog_width <= max_allowed,
+                "Dialog width {dialog_width} exceeds 80% of 200 ({max_allowed})"
+            );
+        }
+    }
+
+    #[test]
+    fn select_renders_items() {
+        let mut terminal = MockTerminal::new(80, 24);
+        let theme = SkinConfig::default();
+        let mut mgr = DialogManager::new();
+        mgr.push(DialogState::new(DialogKind::Select {
+            title: "Pick one".into(),
+            items: vec!["Alpha".into(), "Beta".into(), "Gamma".into()],
+            selected: 1,
+        }));
+
+        terminal.draw(|f: &mut Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            mgr.render(&mut ctx, area);
+        });
+
+        terminal.assert_line_contains("Alpha");
+        terminal.assert_line_contains("Beta");
+        terminal.assert_line_contains("Gamma");
+        terminal.assert_line_contains("Pick one");
+
+        let lines = terminal.buffer_lines();
+        let has_selected_marker = lines.iter().any(|l| l.contains("▶ Beta"));
+        assert!(has_selected_marker, "Selected item 'Beta' should have ▶ prefix");
+    }
+
+    #[test]
+    fn confirm_renders_with_buttons() {
+        let mut terminal = MockTerminal::new(80, 24);
+        let theme = SkinConfig::default();
+        let mut mgr = DialogManager::new();
+        mgr.push(DialogState::new(DialogKind::Confirm {
+            title: "Confirm".into(),
+            message: "Proceed?".into(),
+            default: true,
+        }));
+
+        terminal.draw(|f: &mut Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            mgr.render(&mut ctx, area);
+        });
+
+        terminal.assert_line_contains("Yes");
+        terminal.assert_line_contains("No");
+        terminal.assert_line_contains("Proceed?");
+    }
+
+    #[test]
+    fn prompt_renders_placeholder() {
+        let mut terminal = MockTerminal::new(80, 24);
+        let theme = SkinConfig::default();
+        let mut mgr = DialogManager::new();
+        mgr.push(DialogState::new(DialogKind::Prompt {
+            title: "Name".into(),
+            placeholder: "Enter your name".into(),
+            input: String::new(),
+        }));
+
+        terminal.draw(|f: &mut Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            mgr.render(&mut ctx, area);
+        });
+
+        terminal.assert_line_contains("Enter your name");
+    }
+
+    #[test]
+    fn prompt_renders_input_with_cursor() {
+        let mut terminal = MockTerminal::new(80, 24);
+        let theme = SkinConfig::default();
+        let mut mgr = DialogManager::new();
+        mgr.push(DialogState::new(DialogKind::Prompt {
+            title: "Name".into(),
+            placeholder: "Enter your name".into(),
+            input: "John".into(),
+        }));
+
+        terminal.draw(|f: &mut Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            mgr.render(&mut ctx, area);
+        });
+
+        terminal.assert_line_contains("John");
+    }
+
+    #[test]
+    fn empty_stack_renders_nothing() {
+        let mut terminal = MockTerminal::new(80, 24);
+        let theme = SkinConfig::default();
+        let mgr = DialogManager::new();
+
+        terminal.draw(|f: &mut Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            mgr.render(&mut ctx, area);
+        });
+
+        let lines = terminal.buffer_lines();
+        assert!(
+            lines.iter().all(|l| l.is_empty()),
+            "Empty stack should not render anything"
+        );
     }
 }

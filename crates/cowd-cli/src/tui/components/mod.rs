@@ -4,6 +4,8 @@
 
 pub mod base;
 pub mod dialog;
+pub mod render_engine;
+pub mod prompt;
 
 #[cfg(test)]
 mod base_test;

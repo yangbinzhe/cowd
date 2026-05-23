@@ -1,4 +1,8 @@
+use std::fmt;
+
 use ratatui::layout::Rect;
+
+use crate::tui::components::Component;
 
 /// Direction of a layout split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,12 +15,21 @@ pub enum SplitDirection {
 ///
 /// The first child receives `ratio` of the total area; remaining children
 /// split the leftover space equally.
-#[derive(Debug)]
 pub struct Split {
     pub direction: SplitDirection,
     /// Proportion of the area given to the first child (clamped to 0.0–1.0).
     pub ratio: f32,
     pub children: Vec<LayoutNode>,
+}
+
+impl fmt::Debug for Split {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Split")
+            .field("direction", &self.direction)
+            .field("ratio", &self.ratio)
+            .field("children", &self.children.len())
+            .finish()
+    }
 }
 
 impl Split {
@@ -106,25 +119,52 @@ impl Split {
 }
 
 /// A node in the layout tree.
-#[derive(Debug)]
 pub enum LayoutNode {
     Split(Split),
     TabGroup(TabGroup),
     Panel(PanelDef),
-    /// Placeholder until the Component trait is available from a sibling task.
-    // TODO: Replace with Box<dyn Component> after Component trait compiles
-    Leaf(Box<dyn std::any::Any>),
+    Leaf(Box<dyn Component>),
+}
+
+impl fmt::Debug for LayoutNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Split(s) => f.debug_tuple("Split").field(s).finish(),
+            Self::TabGroup(tg) => f.debug_tuple("TabGroup").field(tg).finish(),
+            Self::Panel(p) => f.debug_tuple("Panel").field(p).finish(),
+            Self::Leaf(_) => f.debug_tuple("Leaf").field(&"<component>").finish(),
+        }
+    }
 }
 
 /// A group of tabs with exactly one active tab at a time.
-#[derive(Debug)]
 pub struct TabGroup {
     pub tabs: Vec<TabDef>,
     /// Index of the currently active tab.
     pub active: usize,
 }
 
+impl fmt::Debug for TabGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TabGroup")
+            .field("active", &self.active)
+            .field("tabs", &self.tabs.len())
+            .finish()
+    }
+}
+
 impl TabGroup {
+    /// Return a reference to the currently active tab, or `None` if the group is empty.
+    #[must_use]
+    pub fn active_tab(&self) -> Option<&TabDef> {
+        self.tabs.get(self.active)
+    }
+
+    /// Return a mutable reference to the currently active tab, or `None` if empty.
+    pub fn active_tab_mut(&mut self) -> Option<&mut TabDef> {
+        self.tabs.get_mut(self.active)
+    }
+
     /// Advance to the next tab index, wrapping around to 0.
     pub fn next_tab(&mut self) {
         if !self.tabs.is_empty() {
@@ -145,21 +185,37 @@ impl TabGroup {
 }
 
 /// A single tab within a `TabGroup`.
-#[derive(Debug)]
 pub struct TabDef {
     pub id: String,
     pub label: String,
     pub icon: Option<String>,
-    // TODO: Replace with Box<dyn Component> after Component trait compiles
-    pub content: Box<dyn std::any::Any>,
+    pub content: Box<dyn Component>,
+}
+
+impl fmt::Debug for TabDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TabDef")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("icon", &self.icon)
+            .field("content", &"<component>")
+            .finish()
+    }
 }
 
 /// A standalone panel identified by a string id.
-#[derive(Debug)]
 pub struct PanelDef {
     pub id: String,
-    // TODO: Replace with Box<dyn Component> after Component trait compiles
-    pub component: Box<dyn std::any::Any>,
+    pub component: Box<dyn Component>,
+}
+
+impl fmt::Debug for PanelDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PanelDef")
+            .field("id", &self.id)
+            .field("component", &"<component>")
+            .finish()
+    }
 }
 
 /// A sizing constraint, mirroring the common ratatui patterns.
@@ -178,6 +234,31 @@ pub enum Constraint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::components::{EventResult, RenderContext};
+
+    /// Minimal component for layout unit tests.
+    #[cfg(test)]
+    struct TestComponent {
+        id: &'static str,
+    }
+
+    #[cfg(test)]
+    impl Component for TestComponent {
+        fn render(&mut self, _ctx: &mut RenderContext, _area: Rect) {}
+        fn handle_event(&mut self, _event: &crossterm::event::Event) -> EventResult {
+            EventResult::NotConsumed
+        }
+        fn focusable(&self) -> bool {
+            false
+        }
+        fn id(&self) -> &str {
+            self.id
+        }
+    }
+
+    fn tc(id: &'static str) -> Box<dyn Component> {
+        Box::new(TestComponent { id })
+    }
 
     #[test]
     fn split_horizontal_50_50() {
@@ -187,11 +268,11 @@ mod tests {
             children: vec![
                 LayoutNode::Panel(PanelDef {
                     id: "left".into(),
-                    component: Box::new(()),
+                    component: tc("left"),
                 }),
                 LayoutNode::Panel(PanelDef {
                     id: "right".into(),
-                    component: Box::new(()),
+                    component: tc("right"),
                 }),
             ],
         };
@@ -211,11 +292,11 @@ mod tests {
             children: vec![
                 LayoutNode::Panel(PanelDef {
                     id: "top".into(),
-                    component: Box::new(()),
+                    component: tc("top"),
                 }),
                 LayoutNode::Panel(PanelDef {
                     id: "bottom".into(),
-                    component: Box::new(()),
+                    component: tc("bottom"),
                 }),
             ],
         };
@@ -245,7 +326,7 @@ mod tests {
             ratio: 0.5,
             children: vec![LayoutNode::Panel(PanelDef {
                 id: "only".into(),
-                component: Box::new(()),
+                component: tc("only"),
             })],
         };
         let areas = split.compute_areas(Rect::new(0, 0, 100, 100));
@@ -262,15 +343,15 @@ mod tests {
             children: vec![
                 LayoutNode::Panel(PanelDef {
                     id: "a".into(),
-                    component: Box::new(()),
+                    component: tc("a"),
                 }),
                 LayoutNode::Panel(PanelDef {
                     id: "b".into(),
-                    component: Box::new(()),
+                    component: tc("b"),
                 }),
                 LayoutNode::Panel(PanelDef {
                     id: "c".into(),
-                    component: Box::new(()),
+                    component: tc("c"),
                 }),
             ],
         };
@@ -291,13 +372,13 @@ mod tests {
                     id: "a".into(),
                     label: "A".into(),
                     icon: None,
-                    content: Box::new(()),
+                    content: tc("ta"),
                 },
                 TabDef {
                     id: "b".into(),
                     label: "B".into(),
                     icon: None,
-                    content: Box::new(()),
+                    content: tc("tb"),
                 },
             ],
         };
@@ -314,19 +395,19 @@ mod tests {
                     id: "a".into(),
                     label: "A".into(),
                     icon: None,
-                    content: Box::new(()),
+                    content: tc("ta"),
                 },
                 TabDef {
                     id: "b".into(),
                     label: "B".into(),
                     icon: None,
-                    content: Box::new(()),
+                    content: tc("tb"),
                 },
                 TabDef {
                     id: "c".into(),
                     label: "C".into(),
                     icon: None,
-                    content: Box::new(()),
+                    content: tc("tc"),
                 },
             ],
         };
@@ -343,19 +424,19 @@ mod tests {
                     id: "a".into(),
                     label: "A".into(),
                     icon: None,
-                    content: Box::new(()),
+                    content: tc("ta"),
                 },
                 TabDef {
                     id: "b".into(),
                     label: "B".into(),
                     icon: None,
-                    content: Box::new(()),
+                    content: tc("tb"),
                 },
                 TabDef {
                     id: "c".into(),
                     label: "C".into(),
                     icon: None,
-                    content: Box::new(()),
+                    content: tc("tc"),
                 },
             ],
         };
@@ -372,13 +453,13 @@ mod tests {
                     id: "a".into(),
                     label: "A".into(),
                     icon: None,
-                    content: Box::new(()),
+                    content: tc("ta"),
                 },
                 TabDef {
                     id: "b".into(),
                     label: "B".into(),
                     icon: None,
-                    content: Box::new(()),
+                    content: tc("tb"),
                 },
             ],
         };
@@ -412,7 +493,7 @@ mod tests {
             }),
             LayoutNode::Panel(PanelDef {
                 id: "p".into(),
-                component: Box::new(()),
+                component: tc("p"),
             }),
         ];
 

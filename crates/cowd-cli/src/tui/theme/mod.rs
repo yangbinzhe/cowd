@@ -12,6 +12,9 @@
 mod palette;
 pub use palette::{parse_hex, Palette};
 
+mod engine;
+pub use engine::ThemeEngine;
+
 use std::path::{Path, PathBuf};
 use ratatui::style::{Color, Modifier, Style};
 
