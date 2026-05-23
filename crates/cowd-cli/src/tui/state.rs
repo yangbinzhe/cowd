@@ -4,7 +4,7 @@
 //
 // Delegates all App public methods via Deref/DerefMut.
 // Bridges old App::apply_event(TuiEvent) → EventBus for new components.
-// Orchestrates rendering via render_engine::render_tree + ChatView + dialogs.
+// Orchestrates rendering via direct component layout + ChatView + dialogs.
 //
 // Architecture:
 //   - TuiState OWNS App (not a reference)
@@ -33,7 +33,6 @@ use crate::tui::components::dialog::DialogManager;
 use crate::tui::components::export_dialog::ExportDialog;
 use crate::tui::components::file_changes_panel::FileChangesPanel;
 use crate::tui::components::question_form::QuestionForm;
-use crate::tui::components::render_engine;
 use crate::tui::components::status_bar::StatusBar;
 use crate::tui::components::revert_dialog::RevertDialog;
 use crate::tui::components::thinking_panel::ThinkingPanel;
@@ -76,7 +75,7 @@ pub struct TuiState {
     /// Legacy application state (all existing fields preserved).
     pub app: App,
 
-    /// Component layout tree (rendered via render_engine::render_tree).
+    /// Component layout tree (kept for LayoutState management; sidebar rendered directly).
     pub layout_tree: LayoutTree,
 
     /// Chat view component (rendered directly after syncing from App).
@@ -128,6 +127,9 @@ pub struct TuiState {
 
     /// Todo panel displaying task list from TodoWrite tool calls.
     pub todo_panel: TodoPanel,
+
+    /// Active tab index in the sidebar (0=Context, 1=Changes, 2=Todo).
+    pub sidebar_active_tab: usize,
 
     /// Status bar at the bottom showing model, tokens, and system info.
     pub status_bar: StatusBar,
@@ -220,6 +222,7 @@ impl TuiState {
             animation_engine,
             frame_timer,
             render_profiler,
+            sidebar_active_tab: 0,
             accessibility,
             startup_phase: StartupPhase::Hidden,
             startup_start: Instant::now(),
@@ -306,26 +309,45 @@ impl TuiState {
             area
         };
 
-        // 1. Render layout tree (ChatView + TabGroup sidebar) in content area
+        // 1. Render chat view (70% left) + sidebar (30% right) in content area
         {
-            let render_state = render_engine::TuiState {
-                theme: skin.clone(),
-            };
-            let degraded = {
-                let _guard = self.render_profiler.guard("layout_tree");
-                match error_recovery::catch_render_panic("layout_tree", AssertUnwindSafe(|| {
-                    render_engine::render_tree(&mut self.layout_tree, frame, &render_state, content_area);
-                })) {
-                    RenderResult::Ok => None,
-                    RenderResult::Degraded(msg) => Some(msg),
-                }
-            };
-            if let Some(msg) = degraded {
-                self.add_message("system", &msg);
+            let chat_w = ((content_area.width as f32 * 0.7).round() as u16).min(content_area.width);
+            let sidebar_w = content_area.width.saturating_sub(chat_w);
+            let chat_area = ratatui::layout::Rect::new(0, 0, chat_w, content_area.height);
+            let sidebar_area = ratatui::layout::Rect::new(chat_w, 0, sidebar_w, content_area.height);
+
+            let mut ctx = RenderContext::new(frame, &skin);
+
+            // Render chat view (already synced above)
+            {
+                let _guard = self.render_profiler.guard("chat_view");
+                self.chat_view.render(&mut ctx, chat_area);
+            }
+
+            // Render sidebar: tab bar + active panel
+            let tab_height = 1u16;
+            let tab_labels = ["Context", "Changes", "Todo"];
+            let tab_area = ratatui::layout::Rect::new(
+                sidebar_area.x, sidebar_area.y, sidebar_area.width, tab_height,
+            );
+            let tabs = ratatui::widgets::Tabs::new(tab_labels).select(self.sidebar_active_tab);
+            ctx.frame_mut().render_widget(tabs, tab_area);
+
+            let panel_area = ratatui::layout::Rect::new(
+                sidebar_area.x,
+                sidebar_area.y.saturating_add(tab_height),
+                sidebar_area.width,
+                sidebar_area.height.saturating_sub(tab_height),
+            );
+            match self.sidebar_active_tab {
+                0 => self.context_panel.render(&mut ctx, panel_area),
+                1 => self.file_changes_panel.render(&mut ctx, panel_area),
+                2 => self.todo_panel.render(&mut ctx, panel_area),
+                _ => {}
             }
         }
 
-        // Sync back scroll/viewport state to App (after render_tree, before overlays)
+        // Sync back scroll/viewport state to App (after chat render, before overlays)
         self.chat_view.sync_to_app(&mut self.app);
 
         // 2. Render status bar at bottom
@@ -657,6 +679,21 @@ impl TuiState {
                 }
                 return ProcessedKey::Nothing;
             }
+        }
+
+        // ── Sidebar tab switching ──
+        // Tab / Shift+Tab: cycle through sidebar tabs (Context / Changes / Todo)
+        if key.code == KeyCode::Tab {
+            self.sidebar_active_tab = (self.sidebar_active_tab + 1) % 3;
+            return ProcessedKey::Nothing;
+        }
+        if key.code == KeyCode::BackTab {
+            self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
+                2
+            } else {
+                self.sidebar_active_tab - 1
+            };
+            return ProcessedKey::Nothing;
         }
 
         // ── Modal overrides (pick up where old input.rs left off) ──
