@@ -9,6 +9,9 @@
 
 #![allow(dead_code)]
 
+mod ansi_fallback;
+pub use ansi_fallback::{clear_cache, detect_truecolor, rgb_to_ansi8, to_terminal_color};
+
 mod palette;
 pub use palette::{parse_hex, Palette};
 
