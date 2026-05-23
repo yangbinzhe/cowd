@@ -34,6 +34,7 @@ use crate::tui::components::export_dialog::ExportDialog;
 use crate::tui::components::file_changes_panel::FileChangesPanel;
 use crate::tui::components::question_form::QuestionForm;
 use crate::tui::components::render_engine;
+use crate::tui::components::status_bar::StatusBar;
 use crate::tui::components::revert_dialog::RevertDialog;
 use crate::tui::components::thinking_panel::ThinkingPanel;
 use crate::tui::components::toast::{ToastManager, ToastVariant};
@@ -128,6 +129,9 @@ pub struct TuiState {
     /// Todo panel displaying task list from TodoWrite tool calls.
     pub todo_panel: TodoPanel,
 
+    /// Status bar at the bottom showing model, tokens, and system info.
+    pub status_bar: StatusBar,
+
     /// Frame-based animation engine for transitions and effects.
     pub animation_engine: AnimationEngine,
 
@@ -193,6 +197,7 @@ impl TuiState {
         let context_panel = ContextPanel::new();
         let file_changes_panel = FileChangesPanel::new();
         let todo_panel = TodoPanel::new();
+        let status_bar = StatusBar::with_default_sections();
         let animation_engine = AnimationEngine::new();
         let frame_timer = FrameTimer::new();
         let render_profiler = RenderProfiler::new();
@@ -218,6 +223,7 @@ impl TuiState {
             context_panel,
             file_changes_panel,
             todo_panel,
+            status_bar,
             animation_engine,
             frame_timer,
             render_profiler,
@@ -291,11 +297,16 @@ impl TuiState {
 
         // Sync sidebar panels from App state
         self.context_panel.sync_from_app(&self.app);
-        // FileChangesPanel uses load() not sync_from_app
-        // self.file_changes_panel stays as-is (populated by external load)
-        // TodoPanel extracts from timeline entries
+        // File changes: populated by external load() from session diff
+        // TodoPanel: extracts TodoWrite from timeline entries
+        self.file_changes_panel.load(vec![]);
+        self.todo_panel.load(vec![]);
 
-        // 1. Render layout tree (placeholder for future panels)
+        // Sync status bar from App state
+        self.status_bar.sync_from_app(&self.app);
+        self.status_bar.tick();
+
+        // 1. Render layout tree (ChatView + TabGroup sidebar)
         {
             let render_state = render_engine::TuiState {
                 theme: skin.clone(),
@@ -303,7 +314,7 @@ impl TuiState {
             let degraded = {
                 let _guard = self.render_profiler.guard("layout_tree");
                 match error_recovery::catch_render_panic("layout_tree", AssertUnwindSafe(|| {
-                    render_engine::render_tree(&mut self.layout_tree, frame, &render_state);
+                    render_engine::render_tree(&mut self.app.layout_tree, frame, &render_state);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
@@ -314,13 +325,22 @@ impl TuiState {
             }
         }
 
-        // 2. Render ChatView directly (needs prior sync)
+        // Sync back scroll/viewport state to App (after render_tree, before overlays)
+        self.chat_view.sync_to_app(&mut self.app);
+
+        // 2. Render status bar at bottom
         {
+            let status_area = ratatui::layout::Rect::new(
+                0,
+                area.height.saturating_sub(1),
+                area.width,
+                1,
+            );
             let degraded = {
                 let mut ctx = RenderContext::new(frame, &skin);
-                let _guard = self.render_profiler.guard("chat_view");
-                match error_recovery::catch_render_panic("chat_view", AssertUnwindSafe(|| {
-                    self.chat_view.render(&mut ctx, area);
+                let _guard = self.render_profiler.guard("status_bar");
+                match error_recovery::catch_render_panic("status_bar", AssertUnwindSafe(|| {
+                    self.status_bar.render(&mut ctx, status_area);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
@@ -347,9 +367,6 @@ impl TuiState {
                 self.add_message("system", &msg);
             }
         }
-
-        // Sync back scroll/viewport state to App
-        self.chat_view.sync_to_app(&mut self.app);
 
         // 4. Render agents overlay when visible
         if self.agents_overlay.visible {
