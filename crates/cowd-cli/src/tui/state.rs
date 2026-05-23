@@ -45,7 +45,7 @@ use crate::tui::event::dispatcher::EventDispatcher;
 use crate::tui::event::{ComponentId as EventComponentId, EventBus, EventPriority};
 use crate::tui::keybind::types::Action;
 use crate::tui::keybind::{default_bindings, KeybindEngine};
-use crate::tui::layout::{LayoutNode, LayoutTree, Split, SplitDirection};
+use crate::tui::layout::{LayoutNode, LayoutTree};
 use crate::tui::profiler::{FrameTimer, RenderProfiler};
 use crate::tui::theme::ThemeEngine;
 use crate::tui::TuiEvent;
@@ -170,15 +170,8 @@ impl TuiState {
     pub fn new(model: &str, session_id: &str) -> Self {
         let app = App::new(model, session_id);
 
-        // Layout tree with a simple placeholder split.
-        // Future tasks will add real panels (chat, file tree, etc.).
-        let layout_tree = LayoutTree {
-            root: LayoutNode::Split(Split {
-                direction: SplitDirection::Vertical,
-                ratio: 1.0,
-                children: vec![],
-            }),
-        };
+        // Layout tree with the default horizontal split: 70% chat / 30% sidebar.
+        let layout_tree = crate::tui::layout::defaults::build_default_layout();
 
         let chat_view = ChatView::new();
         let keybind_engine = KeybindEngine::new(default_bindings());
@@ -306,7 +299,14 @@ impl TuiState {
         self.status_bar.sync_from_app(&self.app);
         self.status_bar.tick();
 
-        // 1. Render layout tree (ChatView + TabGroup sidebar)
+        // Compute content area: exclude status bar (1 line) and input (3 lines) from bottom.
+        let content_area = if area.height > 4 {
+            ratatui::layout::Rect::new(0, 0, area.width, area.height.saturating_sub(4))
+        } else {
+            area
+        };
+
+        // 1. Render layout tree (ChatView + TabGroup sidebar) in content area
         {
             let render_state = render_engine::TuiState {
                 theme: skin.clone(),
@@ -314,7 +314,7 @@ impl TuiState {
             let degraded = {
                 let _guard = self.render_profiler.guard("layout_tree");
                 match error_recovery::catch_render_panic("layout_tree", AssertUnwindSafe(|| {
-                    render_engine::render_tree(&mut self.app.layout_tree, frame, &render_state);
+                    render_engine::render_tree(&mut self.layout_tree, frame, &render_state, content_area);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
@@ -341,6 +341,28 @@ impl TuiState {
                 let _guard = self.render_profiler.guard("status_bar");
                 match error_recovery::catch_render_panic("status_bar", AssertUnwindSafe(|| {
                     self.status_bar.render(&mut ctx, status_area);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
+        }
+
+        // 2.5. Render input widget (3 lines above status bar)
+        {
+            let input_area = ratatui::layout::Rect::new(
+                0,
+                area.height.saturating_sub(4),
+                area.width,
+                3,
+            );
+            let degraded = {
+                let _guard = self.render_profiler.guard("input");
+                match error_recovery::catch_render_panic("input", AssertUnwindSafe(|| {
+                    frame.render_widget(&self.app.input, input_area);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),

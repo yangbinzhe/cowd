@@ -36,8 +36,7 @@ impl Default for TuiState {
 /// - **TabGroup**: renders a tab bar + only the active tab's content.
 /// - **Panel**: renders a bordered block + the inner component.
 /// - **Leaf**: renders the component directly into the area.
-pub fn render_tree(tree: &mut LayoutTree, frame: &mut Frame, state: &TuiState) {
-    let area = frame.area();
+pub fn render_tree(tree: &mut LayoutTree, frame: &mut Frame, state: &TuiState, area: Rect) {
     render_node(&mut tree.root, frame, area, &state.theme);
 }
 
@@ -142,7 +141,7 @@ mod tests {
 
         let mut terminal = MockTerminal::new(80, 24);
         terminal.draw(|f| {
-            render_tree(&mut tree, f, &TuiState::default());
+            render_tree(&mut tree, f, &TuiState::default(), f.area());
         });
 
         terminal.assert_line_contains("LEFT");
@@ -181,7 +180,7 @@ mod tests {
 
         let mut terminal = MockTerminal::new(80, 24);
         terminal.draw(|f| {
-            render_tree(&mut tree, f, &TuiState::default());
+            render_tree(&mut tree, f, &TuiState::default(), f.area());
         });
 
         // Active tab content is rendered
@@ -221,7 +220,7 @@ mod tests {
 
         let mut terminal = MockTerminal::new(80, 24);
         terminal.draw(|f| {
-            render_tree(&mut tree, f, &TuiState::default());
+            render_tree(&mut tree, f, &TuiState::default(), f.area());
         });
 
         // Second tab is active, so SECOND should appear, not FIRST
@@ -242,7 +241,7 @@ mod tests {
 
         let mut terminal = MockTerminal::new(80, 24);
         terminal.draw(|f| {
-            render_tree(&mut tree, f, &TuiState::default());
+            render_tree(&mut tree, f, &TuiState::default(), f.area());
         });
 
         // Should not panic — just verify the terminal draws without crashing.
@@ -260,7 +259,7 @@ mod tests {
 
         let mut terminal = MockTerminal::new(80, 24);
         terminal.draw(|f| {
-            render_tree(&mut tree, f, &TuiState::default());
+            render_tree(&mut tree, f, &TuiState::default(), f.area());
         });
 
         // Should not panic — empty tab group renders nothing.
@@ -294,7 +293,7 @@ mod tests {
 
         let mut terminal = MockTerminal::new(80, 24);
         terminal.draw(|f| {
-            render_tree(&mut tree, f, &TuiState::default());
+            render_tree(&mut tree, f, &TuiState::default(), f.area());
         });
 
         terminal.assert_line_contains("TOP-LEFT");
@@ -320,7 +319,7 @@ mod tests {
 
         let mut terminal = MockTerminal::new(80, 24);
         terminal.draw(|f| {
-            render_tree(&mut tree, f, &TuiState::default());
+            render_tree(&mut tree, f, &TuiState::default(), f.area());
         });
 
         terminal.assert_line_contains("NESTED-PANEL-CONTENT");
@@ -342,7 +341,7 @@ mod tests {
 
         let mut terminal = MockTerminal::new(80, 24);
         terminal.draw(|f| {
-            render_tree(&mut tree, f, &TuiState::default());
+            render_tree(&mut tree, f, &TuiState::default(), f.area());
         });
 
         terminal.assert_line_contains("INSIDE");
@@ -357,7 +356,7 @@ mod tests {
 
         let mut terminal = MockTerminal::new(80, 24);
         terminal.draw(|f| {
-            render_tree(&mut tree, f, &TuiState::default());
+            render_tree(&mut tree, f, &TuiState::default(), f.area());
         });
 
         terminal.assert_line_contains("DIRECT-LEAF");
@@ -374,7 +373,7 @@ mod tests {
 
         let mut terminal = MockTerminal::new(80, 24);
         terminal.draw(|f| {
-            render_tree(&mut tree, f, &TuiState::default());
+            render_tree(&mut tree, f, &TuiState::default(), f.area());
         });
 
         // Just verify no panic
