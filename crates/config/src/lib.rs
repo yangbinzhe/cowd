@@ -1225,10 +1225,10 @@ impl UnifiedConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalConfig {
     /// When true, all non-critical commands bypass the approval flow.
-    #[serde(default, alias = "yolo_mode")]
+    #[serde(default)]
     pub solo_mode: bool,
     /// When true, even in SOLO mode, Critical-risk commands still require approval.
-    #[serde(default = "default_true_bool", alias = "yolo_honor_critical")]
+    #[serde(default = "default_true_bool")]
     pub solo_honor_critical: bool,
     /// Auto-pass commands detected as read-only (ls, cat, grep, git status, etc.).
     #[serde(default = "default_true_bool")]
