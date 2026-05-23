@@ -4,8 +4,12 @@
 
 pub mod base;
 pub mod dialog;
+pub mod diff_viewer;
+pub mod file_tree;
 pub mod render_engine;
 pub mod prompt;
+pub mod session_sidebar;
+pub mod status_bar;
 
 #[cfg(test)]
 mod base_test;

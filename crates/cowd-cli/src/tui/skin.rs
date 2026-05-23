@@ -51,9 +51,17 @@ impl SkinConfig {
     pub fn accent_color(&self) -> ratatui::style::Color {
         parse_hex(&self.colors.accent)
     }
+
+    pub fn fg_color(&self) -> ratatui::style::Color {
+        parse_hex(&self.colors.fg)
+    }
+
+    pub fn bg_color(&self) -> ratatui::style::Color {
+        parse_hex(&self.colors.bg)
+    }
 }
 
-fn parse_hex(hex: &str) -> ratatui::style::Color {
+pub(crate) fn parse_hex(hex: &str) -> ratatui::style::Color {
     let hex = hex.trim_start_matches('#');
     if hex.len() == 6 {
         if let (Ok(r), Ok(g), Ok(b)) = (

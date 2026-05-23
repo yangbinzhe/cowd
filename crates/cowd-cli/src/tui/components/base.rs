@@ -13,6 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::Frame;
 
 use crate::tui::skin::SkinConfig;
+use crate::tui::theme::ThemeEngine;
 
 // ── ComponentId ──────────────────────────────────────────────────
 
@@ -111,6 +112,7 @@ impl EventResult {
 pub struct RenderContext<'frame, 'buf, 'theme> {
     frame: &'frame mut Frame<'buf>,
     theme: &'theme SkinConfig,
+    theme_engine: Option<&'theme ThemeEngine>,
 }
 
 impl<'frame, 'buf, 'theme> RenderContext<'frame, 'buf, 'theme> {
@@ -120,7 +122,26 @@ impl<'frame, 'buf, 'theme> RenderContext<'frame, 'buf, 'theme> {
         frame: &'frame mut Frame<'buf>,
         theme: &'theme SkinConfig,
     ) -> Self {
-        Self { frame, theme }
+        Self {
+            frame,
+            theme,
+            theme_engine: None,
+        }
+    }
+
+    /// Create a render context with an optional theme engine for
+    /// semantic style computation via `ThemeEngine::compute_style()`.
+    #[must_use]
+    pub fn with_theme_engine(
+        frame: &'frame mut Frame<'buf>,
+        theme: &'theme SkinConfig,
+        theme_engine: Option<&'theme ThemeEngine>,
+    ) -> Self {
+        Self {
+            frame,
+            theme,
+            theme_engine,
+        }
     }
 
     /// Access the underlying [`ratatui::Frame`] for direct drawing operations.
@@ -133,6 +154,12 @@ impl<'frame, 'buf, 'theme> RenderContext<'frame, 'buf, 'theme> {
     #[must_use]
     pub fn theme(&self) -> &SkinConfig {
         self.theme
+    }
+
+    /// Access the optional theme engine for semantic style computation.
+    #[must_use]
+    pub fn theme_engine(&self) -> Option<&ThemeEngine> {
+        self.theme_engine
     }
 
     /// Shortcut for `self.frame.area()` — the full screen area.
