@@ -5998,7 +5998,23 @@ fn build_plugin_manager(
 ) -> PluginManager {
     let plugin_settings = runtime_config.plugins();
     let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
+    // Start with config.yaml's enabled_plugins (user-defined defaults)
     plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
+    // Merge plugin-state.json runtime overrides (take precedence over config.yaml)
+    let state_path = runtime::cowd_dirs::config_home_dir().join("plugin-state.json");
+    if let Ok(content) = std::fs::read_to_string(&state_path) {
+        if !content.trim().is_empty() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(map) = val.get("enabledPlugins").and_then(|v| v.as_object()) {
+                    for (k, v) in map {
+                        if let Some(enabled) = v.as_bool() {
+                            plugin_config.enabled_plugins.insert(k.clone(), enabled);
+                        }
+                    }
+                }
+            }
+        }
+    }
     plugin_config.external_dirs = plugin_settings
         .external_directories()
         .iter()
