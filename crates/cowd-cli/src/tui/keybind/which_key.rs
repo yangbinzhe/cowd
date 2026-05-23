@@ -304,8 +304,8 @@ mod tests {
             "buffer should contain 'SPC f':\n{full_buffer}"
         );
         assert!(
-            full_buffer.contains("Find file"),
-            "buffer should contain 'Find file':\n{full_buffer}"
+            full_buffer.contains("Find / search"),
+            "buffer should contain 'Find / search':\n{full_buffer}"
         );
     }
 

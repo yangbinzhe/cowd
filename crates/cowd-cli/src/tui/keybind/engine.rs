@@ -270,21 +270,17 @@ impl KeybindEngine {
 
 // ── Default Bindings ──────────────────────────────────────────────
 
-/// Build a `KeyMap` pre-populated with standard Vim / Emacs-like bindings.
+/// Build a `KeyMap` pre-populated with ALL keyboard shortcuts from input.rs.
 ///
-/// Includes:
-/// - Space as leader key (no single-key binding — prefix-only)
-/// - `j`/`k` scroll, `gg` collapse-toggle
-/// - `Ctrl-c` quit, `Ctrl-f` search, `Ctrl-h` help, `Ctrl-y` copy
-/// - Tab / Shift-Tab for panel navigation
-/// - Esc cancel, Enter submit
-/// - Space-leader chords: `SPC f` find, `SPC p` palette, `SPC q` quit,
-///   `SPC t` theme, `SPC h` help, `SPC j`/`SPC k` scroll-5
+/// Includes every shortcut: Enter, Esc, Ctrl+C, Tab, PgUp/Down, Home, End,
+/// Ctrl+T/Y/A/E/W/U/K/Z/M, Alt+↑↓, /, ?, n/N, j/k, gg, Space leader chords.
+/// Text-editing keys (Ctrl+A/E/W/U/K/Z, Shift+Enter) are NOT bound —
+/// they pass directly to the tui-textarea widget.
 #[must_use]
 pub fn default_bindings() -> KeyMap {
     let mut map = KeyMap::new();
 
-    // ── Navigation ──────────────────────────────────────────────────
+    // ── Navigation (j/k, arrows, PgUp/Dn, Home, End) ──
     map.add(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)],
@@ -299,8 +295,50 @@ pub fn default_bindings() -> KeyMap {
         Action::Scroll(-1),
         "Scroll up",
     );
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)],
+        },
+        Action::Scroll(-1),
+        "Cursor/scroll up",
+    );
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)],
+        },
+        Action::Scroll(1),
+        "Cursor/scroll down",
+    );
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)],
+        },
+        Action::ScrollPage(-1),
+        "Page up",
+    );
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)],
+        },
+        Action::ScrollPage(1),
+        "Page down",
+    );
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)],
+        },
+        Action::ScrollTop,
+        "Scroll to top",
+    );
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::End, KeyModifiers::NONE)],
+        },
+        Action::ScrollBottom,
+        "Scroll to bottom",
+    );
 
-    // ── Multi-chord ─────────────────────────────────────────────────
+    // ── Multi-chord ──
     map.add(
         KeyChord {
             keys: vec![
@@ -309,10 +347,10 @@ pub fn default_bindings() -> KeyMap {
             ],
         },
         Action::ExpandCollapse,
-        "Go to top / toggle",
+        "Toggle expand/collapse",
     );
 
-    // ── Ctrl keys ───────────────────────────────────────────────────
+    // ── Ctrl keys ──
     map.add(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)],
@@ -329,40 +367,88 @@ pub fn default_bindings() -> KeyMap {
     );
     map.add(
         KeyChord {
-            keys: vec![KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)],
+            keys: vec![KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)],
         },
-        Action::Search,
-        "Search",
-    );
-    map.add(
-        KeyChord {
-            keys: vec![KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)],
-        },
-        Action::ToggleHelp,
-        "Toggle help",
+        Action::ToggleTheme,
+        "Toggle theme",
     );
     map.add(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)],
         },
         Action::Copy,
-        "Copy (yank)",
+        "Copy focused entry",
+    );
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL)],
+        },
+        Action::NextModel,
+        "Switch model",
     );
 
-    // ── Special keys ────────────────────────────────────────────────
+    // ── Search ──
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)],
+        },
+        Action::Search,
+        "Search timeline",
+    );
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)],
+        },
+        Action::SearchNext,
+        "Next search match",
+    );
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE)],
+        },
+        Action::SearchPrev,
+        "Previous search match",
+    );
+
+    // ── Help / which-key ──
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)],
+        },
+        Action::ToggleHelp,
+        "Toggle which-key",
+    );
+
+    // ── History navigation ──
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)],
+        },
+        Action::HistoryBrowse(true),
+        "Input history (older)",
+    );
+    map.add(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)],
+        },
+        Action::HistoryBrowse(false),
+        "Input history (newer)",
+    );
+
+    // ── Special keys ──
     map.add(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)],
         },
         Action::NextPanel,
-        "Next panel",
+        "Next panel/tab",
     );
     map.add(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)],
         },
         Action::PrevPanel,
-        "Previous panel",
+        "Previous panel/tab",
     );
     map.add(
         KeyChord {
@@ -379,9 +465,7 @@ pub fn default_bindings() -> KeyMap {
         "Submit input",
     );
 
-    // ── Space-leader chords ────────────────────────────────────────
-    // Note: Space has NO single-key binding. Pressing Space alone
-    // creates a pending prefix that triggers the which-key overlay.
+    // ── Space-leader chords ──
     map.add(
         KeyChord {
             keys: vec![
@@ -390,7 +474,7 @@ pub fn default_bindings() -> KeyMap {
             ],
         },
         Action::Search,
-        "Find file",
+        "Find / search",
     );
     map.add(
         KeyChord {
@@ -430,7 +514,7 @@ pub fn default_bindings() -> KeyMap {
             ],
         },
         Action::ToggleHelp,
-        "Toggle help panel",
+        "Toggle which-key",
     );
     map.add(
         KeyChord {
@@ -440,7 +524,7 @@ pub fn default_bindings() -> KeyMap {
             ],
         },
         Action::Scroll(5),
-        "Scroll down 5 lines",
+        "Scroll down 5",
     );
     map.add(
         KeyChord {
@@ -450,7 +534,7 @@ pub fn default_bindings() -> KeyMap {
             ],
         },
         Action::Scroll(-5),
-        "Scroll up 5 lines",
+        "Scroll up 5",
     );
 
     map

@@ -39,18 +39,22 @@ impl Component for PlaceholderComponent {
 /// ```text
 /// Split(Horizontal, 0.7)
 ///   ├── Leaf("chat_view")           — 70 % of width
-///   └── TabGroup (4 tabs)           — 30 % of width
-///         ├── Tab 0: "files"        (📁)
-///         ├── Tab 1: "sessions"     (💬)
-///         ├── Tab 2: "diff"        (📊)
-///         └── Tab 3: "gateway"      (🌐)
+///   └── TabGroup (5 panel tabs)     — 30 % of width
+///         ├── Tab 0: "gateway"      (🌐)
+///         ├── Tab 1: "files"        (📁)
+///         ├── Tab 2: "memory"       (🧠)
+///         ├── Tab 3: "skills"       (⚙️)
+///         └── Tab 4: "delegates"    (📋)
 /// ```
-///
-/// Components are placeholders — replace with real components before
-/// passing the tree to the render engine.
 #[must_use]
 pub fn build_default_layout() -> LayoutTree {
     let sidebar_tabs = vec![
+        TabDef {
+            id: "gateway".to_string(),
+            label: "Gateway".to_string(),
+            icon: Some("🌐".to_string()),
+            content: Box::new(PlaceholderComponent { id: "gateway" }),
+        },
         TabDef {
             id: "files".to_string(),
             label: "Files".to_string(),
@@ -58,22 +62,22 @@ pub fn build_default_layout() -> LayoutTree {
             content: Box::new(PlaceholderComponent { id: "files" }),
         },
         TabDef {
-            id: "sessions".to_string(),
-            label: "Sessions".to_string(),
-            icon: Some("💬".to_string()),
-            content: Box::new(PlaceholderComponent { id: "sessions" }),
+            id: "memory".to_string(),
+            label: "Memory".to_string(),
+            icon: Some("🧠".to_string()),
+            content: Box::new(PlaceholderComponent { id: "memory" }),
         },
         TabDef {
-            id: "diff".to_string(),
-            label: "Diff".to_string(),
-            icon: Some("📊".to_string()),
-            content: Box::new(PlaceholderComponent { id: "diff" }),
+            id: "skills".to_string(),
+            label: "Skills".to_string(),
+            icon: Some("⚙️".to_string()),
+            content: Box::new(PlaceholderComponent { id: "skills" }),
         },
         TabDef {
-            id: "gateway".to_string(),
-            label: "Gateway".to_string(),
-            icon: Some("🌐".to_string()),
-            content: Box::new(PlaceholderComponent { id: "gateway" }),
+            id: "delegates".to_string(),
+            label: "Delegates".to_string(),
+            icon: Some("📋".to_string()),
+            content: Box::new(PlaceholderComponent { id: "delegates" }),
         },
     ];
 
@@ -262,18 +266,18 @@ mod tests {
                     "first child should be Leaf (chat_view)"
                 );
 
-                // Second child: TabGroup with 4 tabs
+                // Second child: TabGroup with 5 tabs
                 match &split.children[1] {
                     LayoutNode::TabGroup(tg) => {
-                        assert_eq!(tg.tabs.len(), 4, "expected 4 sidebar tabs");
+                        assert_eq!(tg.tabs.len(), 5, "expected 5 panel tabs");
                         assert_eq!(tg.active, 0, "first tab should be active by default");
 
-                        // Verify tab IDs and labels
                         let expected: &[(&str, &str)] = &[
-                            ("files", "Files"),
-                            ("sessions", "Sessions"),
-                            ("diff", "Diff"),
                             ("gateway", "Gateway"),
+                            ("files", "Files"),
+                            ("memory", "Memory"),
+                            ("skills", "Skills"),
+                            ("delegates", "Delegates"),
                         ];
                         for (i, (id, label)) in expected.iter().enumerate() {
                             assert_eq!(
@@ -527,26 +531,28 @@ mod tests {
     #[test]
     fn sidebar_tabgroup_navigation() {
         let mut tree = build_default_layout();
-
-        // Access the TabGroup in the sidebar (second child of Split)
         match &mut tree.root {
             LayoutNode::Split(split) => {
                 match &mut split.children[1] {
                     LayoutNode::TabGroup(ref mut tg) => {
                         assert_eq!(tg.active, 0);
-                        assert_eq!(tg.active_tab().unwrap().id, "files");
+                        assert_eq!(tg.active_tab().unwrap().id, "gateway");
 
                         tg.next_tab();
                         assert_eq!(tg.active, 1);
-                        assert_eq!(tg.active_tab().unwrap().id, "sessions");
+                        assert_eq!(tg.active_tab().unwrap().id, "files");
 
                         tg.next_tab();
                         assert_eq!(tg.active, 2);
-                        assert_eq!(tg.active_tab().unwrap().id, "diff");
+                        assert_eq!(tg.active_tab().unwrap().id, "memory");
 
                         tg.next_tab();
                         assert_eq!(tg.active, 3);
-                        assert_eq!(tg.active_tab().unwrap().id, "gateway");
+                        assert_eq!(tg.active_tab().unwrap().id, "skills");
+
+                        tg.next_tab();
+                        assert_eq!(tg.active, 4);
+                        assert_eq!(tg.active_tab().unwrap().id, "delegates");
 
                         // Wrap around
                         tg.next_tab();
@@ -554,7 +560,7 @@ mod tests {
 
                         // Wrap around with prev
                         tg.prev_tab();
-                        assert_eq!(tg.active, 3);
+                        assert_eq!(tg.active, 4);
                     }
                     _ => panic!("expected TabGroup as second child"),
                 }
@@ -572,10 +578,11 @@ mod tests {
             LayoutNode::Split(split) => {
                 match &split.children[1] {
                     LayoutNode::TabGroup(tg) => {
-                        assert_eq!(tg.tabs[0].icon.as_deref(), Some("📁"));
-                        assert_eq!(tg.tabs[1].icon.as_deref(), Some("💬"));
-                        assert_eq!(tg.tabs[2].icon.as_deref(), Some("📊"));
-                        assert_eq!(tg.tabs[3].icon.as_deref(), Some("🌐"));
+                        assert_eq!(tg.tabs[0].icon.as_deref(), Some("🌐"));
+                        assert_eq!(tg.tabs[1].icon.as_deref(), Some("📁"));
+                        assert_eq!(tg.tabs[2].icon.as_deref(), Some("🧠"));
+                        assert_eq!(tg.tabs[3].icon.as_deref(), Some("⚙️"));
+                        assert_eq!(tg.tabs[4].icon.as_deref(), Some("📋"));
                     }
                     _ => panic!("expected TabGroup as second child"),
                 }
@@ -628,7 +635,7 @@ mod tests {
         let mut tree = build_default_layout();
         let mut state = LayoutState::new();
 
-        // Switch to tab 2 (diff)
+        // Switch to tab 2 (memory)
         match &mut tree.root {
             LayoutNode::Split(split) => {
                 match &mut split.children[1] {

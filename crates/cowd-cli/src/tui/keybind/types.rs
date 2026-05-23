@@ -49,6 +49,12 @@ pub enum Action {
     OpenDialog(String),
     /// Scroll by `delta` lines (positive = down, negative = up).
     Scroll(i16),
+    /// Page up/down scroll (by viewport height).
+    ScrollPage(i16),
+    /// Scroll to top (offset = 0).
+    ScrollTop,
+    /// Scroll to bottom (auto-scroll on).
+    ScrollBottom,
     /// Expand or collapse the focused timeline entry.
     ExpandCollapse,
     /// Copy the focused content to clipboard.
@@ -61,14 +67,22 @@ pub enum Action {
     PrevPanel,
     /// Toggle between light and dark themes.
     ToggleTheme,
-    /// Toggle help panel visibility.
+    /// Toggle help panel / which-key visibility.
     ToggleHelp,
     /// Activate search / incremental-find mode.
     Search,
+    /// Navigate to next search match.
+    SearchNext,
+    /// Navigate to previous search match.
+    SearchPrev,
     /// Cancel the current operation (search, dialog, picker, etc.).
     Cancel,
     /// Submit the current input buffer as a message.
     SubmitInput,
+    /// Cycle to the next available model.
+    NextModel,
+    /// Browse input history (true = older, false = newer).
+    HistoryBrowse(bool),
     /// No operation — consumes the event without side effects.
     Noop,
 }

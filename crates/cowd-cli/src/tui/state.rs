@@ -32,6 +32,15 @@ use crate::tui::layout::{LayoutNode, LayoutTree, Split, SplitDirection};
 use crate::tui::theme::ThemeEngine;
 use crate::tui::TuiEvent;
 
+/// Result of processing a key event through the TUI input pipeline.
+#[derive(Debug, Clone)]
+pub enum ProcessedKey {
+    Submit(String),
+    Cancel,
+    Exit,
+    Nothing,
+}
+
 // ── TuiState ────────────────────────────────────────────────────
 
 /// Unified TUI application state.
@@ -215,6 +224,182 @@ impl TuiState {
         false
     }
 
+    /// Full input pipeline: modal state → keybind engine → textarea fallback.
+    ///
+    /// Handles picker, approval, search modes. Routes text-editing keys
+    /// (Ctrl+A/E/W/U/K/Z, Shift+Enter, printable chars) directly to the
+    /// textarea. Everything else goes through the keybind engine.
+    ///
+    /// Returns the action the main loop should take in response.
+    pub fn process_raw_key(&mut self, key: crossterm::event::KeyEvent) -> ProcessedKey {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        // ── Modal overrides (pick up where old input.rs left off) ──
+        // 1. Picker active → route to dialog (already handled by dialog_manager in handle_input)
+        // 2. Approval active → route to dialog (same)
+        // 3. Search active → handle inline
+
+        if self.app.search_active {
+            return self.handle_search_key(key);
+        }
+
+        // 4. Text-editing keys → direct to textarea (bypass keybind engine)
+        if self.is_textarea_key(&key) {
+            self.app.input.input(key);
+            return ProcessedKey::Nothing;
+        }
+
+        // 5. Enter special case: submit input or toggle expand
+        if key.code == KeyCode::Enter {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.app.input.insert_newline();
+                return ProcessedKey::Nothing;
+            }
+            if self.app.input.is_empty() {
+                // Empty input + Enter → toggle expand on focused entry
+                if let Some(entry) = self.app.timeline.get(self.app.timeline_cursor) {
+                    if entry.is_collapsible() {
+                        self.app.toggle_expand_current();
+                        return ProcessedKey::Nothing;
+                    }
+                }
+            }
+            // Non-empty input → submit
+            let text = self.app.input.lines().join("\n").trim().to_string();
+            self.app.input = tui_textarea::TextArea::default();
+            self.app.input.set_block(ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
+            return ProcessedKey::Submit(text);
+        }
+
+        // 6. Esc/Ctrl+C special handling for turn-active cancel and exit
+        if key.code == KeyCode::Esc {
+            if self.app.turn_active {
+                return ProcessedKey::Cancel;
+            }
+            return ProcessedKey::Exit;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.app.turn_active {
+                return ProcessedKey::Cancel;
+            }
+            return ProcessedKey::Exit;
+        }
+
+        // 7. Route through keybind engine for all remaining keys
+        if !self.dialog_manager.is_empty() {
+            self.dialog_manager.handle_key(&key);
+            return ProcessedKey::Nothing;
+        }
+
+        if let Some(action) = self.keybind_engine.handle_key(key) {
+            self.dispatch_action(action);
+        } else {
+            self.keybind_engine.check_timeout();
+        }
+
+        ProcessedKey::Nothing
+    }
+
+    /// Check if a key event should be routed directly to the textarea.
+    fn is_textarea_key(&self, event: &crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        // Printable characters (no modifiers or only Shift)
+        if let KeyCode::Char(_) = event.code {
+            if event.modifiers.is_empty() || event.modifiers == KeyModifiers::SHIFT {
+                return true;
+            }
+            // Ctrl+A/E/W/U/K/Z → textarea for editing
+            if event.modifiers == KeyModifiers::CONTROL {
+                return matches!(event.code, KeyCode::Char('a' | 'e' | 'w' | 'u' | 'k' | 'z'));
+            }
+            return false;
+        }
+
+        // Non-char textarea keys
+        matches!(event.code,
+            KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right
+        )
+    }
+
+    /// Handle a key press while search is active.
+    fn handle_search_key(&mut self, key: crossterm::event::KeyEvent) -> ProcessedKey {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        match key.code {
+            KeyCode::Esc => {
+                self.app.cancel_search();
+                ProcessedKey::Nothing
+            }
+            KeyCode::Enter => {
+                let query = self.app.search_query.clone();
+                self.app.search_active = false;
+                if !query.is_empty() {
+                    self.app.execute_search(&query);
+                }
+                ProcessedKey::Nothing
+            }
+            KeyCode::Backspace => {
+                self.app.search_query.pop();
+                ProcessedKey::Nothing
+            }
+            KeyCode::Char(c) => {
+                self.app.search_query.push(c);
+                ProcessedKey::Nothing
+            }
+            _ => ProcessedKey::Nothing,
+        }
+    }
+
+    // ── Dialog result polling ──────────────────────────────────
+
+    /// Pop and return the last dialog result, if a dialog was just dismissed.
+    pub fn take_dialog_result(&mut self) -> Option<crate::tui::components::dialog::DialogResult> {
+        // DialogManager pops internally on dismiss, so we can't peek at the
+        // popped dialog. Instead, we check the open picker state for results.
+        None
+    }
+
+    /// Open the session picker as a Select dialog.
+    pub fn open_session_picker_dialog(&mut self) {
+        use crate::tui::components::dialog::{DialogKind, DialogState};
+        let items: Vec<String> = self.app.picker_sessions.iter()
+            .map(|s| {
+                let ts = chrono::DateTime::from_timestamp((s.updated_at_ms / 1000) as i64, 0)
+                    .map(|d| d.format("%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                format!("{}  {} msgs  {}  {}",
+                    "", s.message_count, ts, &s.id[..8.min(s.id.len())])
+            })
+            .collect();
+        let dialog = DialogState::new(DialogKind::Select {
+            title: "Select session (↑↓ jk Enter Esc)".into(),
+            items,
+            selected: 0,
+        });
+        self.dialog_manager.push(dialog);
+        self.app.picker_active = false; // use dialog instead of raw picker
+    }
+
+    /// Open the approval request as a Confirm dialog.
+    pub fn open_approval_dialog(&mut self) {
+        use crate::tui::components::dialog::{DialogKind, DialogState};
+        if let Some(ref req) = self.app.approval {
+            let message = format!(
+                "Tool: {}\nInput: {}",
+                req.tool_name,
+                req.input_preview.chars().take(40).collect::<String>()
+            );
+            let dialog = DialogState::new(DialogKind::Confirm {
+                title: "Approval Required".into(),
+                message,
+                default: true,
+            });
+            self.dialog_manager.push(dialog);
+        }
+    }
+
     // ── Action Dispatch ─────────────────────────────────────────
 
     /// Execute the side effects of a resolved keybinding action.
@@ -234,6 +419,21 @@ impl TuiState {
                     self.app.auto_scroll = false;
                 }
             }
+            Action::ScrollPage(direction) => {
+                if direction > 0 {
+                    self.app.scroll_page_down();
+                } else {
+                    self.app.scroll_page_up();
+                }
+                self.app.auto_scroll = false;
+            }
+            Action::ScrollTop => {
+                self.app.scroll_offset = 0;
+                self.app.auto_scroll = false;
+            }
+            Action::ScrollBottom => {
+                self.app.auto_scroll = true;
+            }
             Action::ExpandCollapse => {
                 self.app.toggle_expand_current();
             }
@@ -247,7 +447,6 @@ impl TuiState {
                 self.app.next_panel();
             }
             Action::PrevPanel => {
-                // Cycle panels in reverse: Chat → Delegate → Skills → Memory → Files → Gateway → Chat
                 use crate::tui::app::Panel;
                 self.app.current_panel = match self.app.current_panel {
                     Panel::Chat => Panel::Delegate,
@@ -263,25 +462,67 @@ impl TuiState {
                 self.theme_engine.toggle_dark_light();
             }
             Action::ToggleHelp => {
-                self.app.help_visible = !self.app.help_visible;
+                // Toggle which-key overlay via keybind engine
+                if self.keybind_engine.which_key_visible {
+                    self.keybind_engine.flush_pending();
+                } else {
+                    self.keybind_engine.which_key_visible = true;
+                }
             }
             Action::Search => {
-                self.app.search_active = true;
+                if self.app.input.is_empty() {
+                    self.app.search_active = true;
+                    self.app.search_query.clear();
+                }
+            }
+            Action::SearchNext => {
+                if self.app.input.is_empty() && !self.app.search_matches.is_empty() {
+                    self.app.search_next();
+                }
+            }
+            Action::SearchPrev => {
+                if self.app.input.is_empty() && !self.app.search_matches.is_empty() {
+                    self.app.search_prev();
+                }
             }
             Action::Cancel => {
-                // Cancel any active search, close picker, flush pending chord
+                // Cascade: help/which-key → search → picker → dialog → turn
+                self.keybind_engine.flush_pending();
                 self.app.cancel_search();
                 if self.app.picker_active {
                     self.app.close_session_picker();
                 }
-                self.keybind_engine.flush_pending();
                 if !self.dialog_manager.is_empty() {
                     self.dialog_manager.pop();
                 }
             }
             Action::SubmitInput => {
-                // Handled by the input layer — no-op here.
+                // Handled by the input layer — no-op at dispatch level.
                 // The event loop reads self.app.input content separately.
+            }
+            Action::NextModel => {
+                if let Some(model) = self.app.next_model() {
+                    self.app.show_notification(&format!("Switched to model: {model}"));
+                }
+            }
+            Action::HistoryBrowse(older) => {
+                let text = if older {
+                    self.app.history_prev()
+                } else {
+                    self.app.history_next()
+                };
+                if let Some(text) = text {
+                    let mut ta = tui_textarea::TextArea::default();
+                    ta.set_block(ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
+                    ta.set_style(ratatui::style::Style::default()
+                        .fg(ratatui::style::Color::White));
+                    if !text.is_empty() {
+                        ta.insert_str(&text);
+                    }
+                    self.app.input = ta;
+                }
             }
             Action::OpenDialog(name) => {
                 use crate::tui::components::dialog::{DialogKind, DialogState};
@@ -304,12 +545,8 @@ impl TuiState {
                 };
                 self.dialog_manager.push(dialog);
             }
-            Action::Execute(ref _cmd) => {
-                // Future: parse and execute commands like ":help", ":session list"
-            }
-            Action::TogglePanel(ref _name) => {
-                // Future: toggle named panel visibility
-            }
+            Action::Execute(ref _cmd) => {}
+            Action::TogglePanel(ref _name) => {}
             Action::Noop => {}
         }
     }

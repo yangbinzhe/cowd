@@ -2636,13 +2636,15 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
 
 fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     use std::io;
+    use std::time::Duration;
     use crossterm::{
         execute,
-        event::{EnableMouseCapture, DisableMouseCapture},
+        event::{EnableMouseCapture, DisableMouseCapture, Event, KeyEventKind},
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, enable_raw_mode, disable_raw_mode},
     };
     use ratatui::backend::CrosstermBackend;
     use ratatui::Terminal;
+    use tui::state::{ProcessedKey, TuiState};
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2653,23 +2655,23 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     let (tui_tx, tui_rx) = tui::tui_event_channel();
 
     let session_id = cli.session.id.clone();
-    let mut app = tui::App::new(&cli.model, &session_id);
-    app.add_message("system", &cli.startup_banner());
-    app.add_message("system", &format_connected_line(&cli.model));
-    load_session_history(&mut app, &cli.runtime.session());
-    refresh_panels(&mut app, &workspace, &cli.runtime);
+    let mut state = TuiState::new(&cli.model, &session_id);
+    state.add_message("system", &cli.startup_banner());
+    state.add_message("system", &format_connected_line(&cli.model));
+    load_session_history(&mut state, &cli.runtime.session());
+    refresh_panels(&mut state, &workspace, &cli.runtime);
 
     let mut turn_handle: Option<std::thread::JoinHandle<tui::TurnOutcome>> = None;
     let mut abort_monitor: Option<HookAbortMonitor> = None;
     let mut abort_signal_for_turn: Option<runtime::HookAbortSignal> = None;
 
     let res = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let frame_budget = std::time::Duration::from_millis(8);
+        let frame_budget = Duration::from_millis(8);
         let mut last_render_time = std::time::Instant::now();
         loop {
             let frame_start = std::time::Instant::now();
 
-            drain_tui_events(&tui_rx, &mut app);
+            drain_tui_events_state(&tui_rx, &mut state);
 
             // Check if background turn completed
             if turn_handle.as_ref().is_some_and(|h| h.is_finished()) {
@@ -2679,23 +2681,23 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                             match outcome {
                                 tui::TurnOutcome::Success { runtime, .. } => {
                                     cli.replace_runtime(runtime)?;
-                                    app.is_loading = false;
-                                    app.token_count = cli.runtime.usage().cumulative_usage().total_tokens() as u64;
+                                    state.is_loading = false;
+                                    state.token_count = cli.runtime.usage().cumulative_usage().total_tokens() as u64;
                                 }
                                 tui::TurnOutcome::Cancelled => {
-                                    app.is_loading = false;
-                                    app.add_message("system", "Cancelled");
+                                    state.is_loading = false;
+                                    state.add_message("system", "Cancelled");
                                 }
                                 tui::TurnOutcome::Error(e) => {
-                                    app.is_loading = false;
-                                    app.add_message("system", &format!("Error: {e}"));
+                                    state.is_loading = false;
+                                    state.add_message("system", &format!("Error: {e}"));
                                 }
                             }
                             cli.persist_session()?;
-                            refresh_panels(&mut app, &workspace, &cli.runtime);
+                            refresh_panels(&mut state, &workspace, &cli.runtime);
                         }
                         Err(_) => {
-                            app.is_loading = false;
+                            state.is_loading = false;
                         }
                     }
                     turn_handle = None;
@@ -2703,106 +2705,123 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                     abort_signal_for_turn = None;
                 }
 
-            // Adaptive render throttle: 32ms when turn is active (CPU savings),
-            // 16ms when idle (responsive feel for navigating history).
-            let render_throttle = if app.turn_active {
-                std::time::Duration::from_millis(32)
+            // Adaptive render throttle
+            let render_throttle = if state.turn_active {
+                Duration::from_millis(32)
             } else {
-                std::time::Duration::from_millis(16)
+                Duration::from_millis(16)
             };
             let since_last_render = last_render_time.elapsed();
-            if since_last_render >= render_throttle || !app.turn_active {
-                terminal.draw(|f| tui::render::draw(f, &mut app))?;
+            if since_last_render >= render_throttle || !state.turn_active {
+                terminal.draw(|f| state.render(f))?;
                 last_render_time = std::time::Instant::now();
             }
 
-            match tui::input::handle_input(&mut app)? {
-                tui::input::InputResult::Submit(text) => {
-                    if text.is_empty() { continue; }
-                    if matches!(text.as_str(), "/exit" | "/quit") { break; }
-                    if text.starts_with('/') {
-                        let parsed = SlashCommand::parse(&text).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                        match parsed {
-                            Some(cmd) => {
-                                let output = capture_stdout(|| cli.handle_repl_command(cmd));
-                                match output {
-                                    Ok((true, captured)) => {
-                                        cli.persist_session()?;
-                                        // Extract command name from "/session list" -> "session"
-                                        let cmd_name = text
-                                            .strip_prefix('/')
-                                            .and_then(|s| s.split_whitespace().next())
-                                            .unwrap_or(&text);
-                                        app.add_slash_output(cmd_name, &captured);
-                                    }
-                                    Ok((false, captured)) => {
-                                        let cmd_name = text
-                                            .strip_prefix('/')
-                                            .and_then(|s| s.split_whitespace().next())
-                                            .unwrap_or(&text);
-                                        app.add_slash_output(cmd_name, &captured);
-                                    }
-                                    Err(e) => {
-                                        app.add_message("system", &format!("Error: {e}"));
+            // ── Input handling via TuiState engine ──
+            let poll_ms = if state.turn_active { 5u64 } else { 10u64 };
+            if crossterm::event::poll(Duration::from_millis(poll_ms))? {
+                if let Event::Key(key) = crossterm::event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        // Route picker/approval to dialogs
+                        if state.picker_active {
+                            state.open_session_picker_dialog();
+                        }
+                        if state.approval.is_some() && state.dialog_manager.is_empty() {
+                            state.open_approval_dialog();
+                        }
+
+                        match state.process_raw_key(key) {
+                            ProcessedKey::Submit(text) => {
+                                if text.is_empty() { continue; }
+                                if matches!(text.as_str(), "/exit" | "/quit") { break; }
+                                if text.starts_with('/') {
+                                    let parsed = SlashCommand::parse(&text)
+                                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                                    match parsed {
+                                        Some(cmd) => {
+                                            let output = capture_stdout(|| cli.handle_repl_command(cmd));
+                                            match output {
+                                                Ok((true, captured)) => {
+                                                    cli.persist_session()?;
+                                                    let cmd_name = text.strip_prefix('/')
+                                                        .and_then(|s| s.split_whitespace().next())
+                                                        .unwrap_or(&text);
+                                                    state.add_slash_output(cmd_name, &captured);
+                                                }
+                                                Ok((false, captured)) => {
+                                                    let cmd_name = text.strip_prefix('/')
+                                                        .and_then(|s| s.split_whitespace().next())
+                                                        .unwrap_or(&text);
+                                                    state.add_slash_output(cmd_name, &captured);
+                                                }
+                                                Err(e) => {
+                                                    state.add_message("system", &format!("Error: {e}"));
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        None => {}
                                     }
                                 }
-                                continue;
+                                if turn_handle.is_some() {
+                                    state.add_message("system", "Already processing, please wait...");
+                                    continue;
+                                }
+                                state.add_message("user", &text);
+                                state.is_loading = true;
+
+                                let callback: std::sync::Arc<dyn runtime::ToolCallback> =
+                                    std::sync::Arc::new(tui::TuiToolCallback::new(tui_tx.clone()));
+                                let (mut prepared, monitor, abort_signal) =
+                                    cli.prepare_turn_runtime(false, Some(callback), Some(tui_tx.clone()))?;
+                                abort_monitor = Some(monitor);
+                                abort_signal_for_turn = Some(abort_signal);
+
+                                let tx = tui_tx.clone();
+                                turn_handle = Some(std::thread::spawn(move || {
+                                    let _ = tx.send(tui::TuiEvent::TurnStarted);
+                                    match prepared.run_turn(&text, None) {
+                                        Ok(summary) => {
+                                            let final_text = final_assistant_text(&summary);
+                                            let _ = tx.send(tui::TuiEvent::TurnComplete {
+                                                assistant_text: final_text.clone(),
+                                                iterations: summary.iterations as u32,
+                                            });
+                                            tui::TurnOutcome::Success {
+                                                runtime: prepared,
+                                                message_count: summary.assistant_messages.len(),
+                                                iterations: summary.iterations,
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
+                                            tui::TurnOutcome::Error(e.to_string())
+                                        }
+                                    }
+                                }));
                             }
-                            None => {}
-                        }
-                    }
-                    if turn_handle.is_some() {
-                        app.add_message("system", "Already processing, please wait...");
-                        continue;
-                    }
-                    app.add_message("user", &text);
-                    app.is_loading = true;
-
-                    let callback: std::sync::Arc<dyn runtime::ToolCallback> =
-                        std::sync::Arc::new(tui::TuiToolCallback::new(tui_tx.clone()));
-                    let (mut prepared, monitor, abort_signal) = cli.prepare_turn_runtime(false, Some(callback), Some(tui_tx.clone()))?;
-                    abort_monitor = Some(monitor);
-                    abort_signal_for_turn = Some(abort_signal);
-
-                    let tx = tui_tx.clone();
-                    turn_handle = Some(std::thread::spawn(move || {
-                        let _ = tx.send(tui::TuiEvent::TurnStarted);
-                        match prepared.run_turn(&text, None) {
-                            Ok(summary) => {
-                                let final_text = final_assistant_text(&summary);
-                                let _ = tx.send(tui::TuiEvent::TurnComplete {
-                                    assistant_text: final_text.clone(),
-                                    iterations: summary.iterations as u32,
-                                });
-                                tui::TurnOutcome::Success {
-                                    runtime: prepared,
-                                    message_count: summary.assistant_messages.len(),
-                                    iterations: summary.iterations,
+                            ProcessedKey::Exit => break,
+                            ProcessedKey::Cancel => {
+                                if let Some(signal) = abort_signal_for_turn.take() {
+                                    signal.abort();
+                                }
+                                if let Some(monitor) = abort_monitor.take() {
+                                    monitor.stop();
+                                    state.add_message("system", "Interrupted");
                                 }
                             }
-                            Err(e) => {
-                                let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
-                                tui::TurnOutcome::Error(e.to_string())
-                            }
+                            ProcessedKey::Nothing => {}
                         }
-                    }));
-                }
-                tui::input::InputResult::ResumeSession(_id) => {
-                    app.add_message("system", "Session resume via picker");
-                }
-                tui::input::InputResult::Exit => break,
-                tui::input::InputResult::Cancel => {
-                    if let Some(signal) = abort_signal_for_turn.take() {
-                        signal.abort();
-                    }
-                    if let Some(monitor) = abort_monitor.take() {
-                        monitor.stop();
-                        app.add_message("system", "Interrupted");
                     }
                 }
-                tui::input::InputResult::Nothing => {}
             }
-            let budget = if app.turn_active { Duration::from_millis(2) } else { frame_budget };
+
+            // Tick for spinner + notification decay
+            if state.turn_active {
+                state.tick();
+            }
+
+            let budget = if state.turn_active { Duration::from_millis(2) } else { frame_budget };
             let elapsed = frame_start.elapsed();
             if elapsed < budget {
                 std::thread::sleep(budget - elapsed);
@@ -2816,6 +2835,20 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     res
+}
+
+/// Process all pending TuiEvents from the channel without blocking,
+/// routing through TuiState::apply_event for EventBus bridging.
+fn drain_tui_events_state(rx: &tui::TuiEventReceiver, state: &mut tui::state::TuiState) {
+    let mut count = 0;
+    let limit = if state.turn_active { 64 } else { 256 };
+    while let Ok(event) = rx.try_recv() {
+        state.apply_event(event);
+        count += 1;
+        if count >= limit {
+            break;
+        }
+    }
 }
 
 /// Process all pending TuiEvents from the channel without blocking.
