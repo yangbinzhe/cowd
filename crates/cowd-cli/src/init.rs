@@ -308,7 +308,7 @@ pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
 
     lines.push("## Working agreement".to_string());
     lines.push("- Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.".to_string());
-    lines.push("- Keep shared defaults in `.cowd.json`; reserve `.cowd/settings.local.json` for machine-local overrides.".to_string());
+    lines.push("- Keep shared defaults in `.cowd.json`; reserve `config.local.yaml` for machine-local overrides.".to_string());
     lines.push("- Do not overwrite existing `CLAUDE.md` content automatically; update it intentionally when repo workflows change.".to_string());
     lines.push(String::new());
 

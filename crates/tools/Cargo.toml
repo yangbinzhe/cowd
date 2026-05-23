@@ -16,6 +16,7 @@ runtime = { path = "../runtime" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+serde_yaml.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 urlencoding = "2"
 thiserror = "2"

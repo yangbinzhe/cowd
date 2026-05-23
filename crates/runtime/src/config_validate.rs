@@ -612,7 +612,7 @@ pub fn check_unsupported_format(file_path: &Path) -> Result<(), ConfigError> {
     if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
         if ext.eq_ignore_ascii_case("toml") {
             return Err(ConfigError::Parse(format!(
-                "{}: TOML config files are not supported. Use JSON (settings.json) instead",
+                "{}: TOML config files are not supported. Use YAML or JSON instead",
                 file_path.display()
             )));
         }

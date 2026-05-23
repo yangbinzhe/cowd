@@ -117,7 +117,7 @@ fn build_memory_config(
         .store_path
         .as_ref()
         .map(|p| expand_home(p))
-        .unwrap_or_else(|| cwd.join(".cowd").join("memory"));
+        .unwrap_or_else(|| runtime::cowd_dirs::config_home_dir().join("memory"));
 
     // Ensure the store directory exists before SQLite tries to open the database.
     if let Err(e) = std::fs::create_dir_all(&store_path) {

@@ -13,7 +13,6 @@ pub fn needs_bootstrap() -> bool {
         config_home.join("config.yaml"),
         config_home.join("config.yml"),
         config_home.join("config.json"),
-        config_home.join("settings.json"),
     ];
     
     // 同时检查 ~/.cc 目录（兼容 CC 配置）

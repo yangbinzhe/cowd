@@ -395,7 +395,7 @@ fn run_worker_create(input: WorkerCreateInput) -> Result<String, String> {
     to_pretty_json(worker)
 }
 
-/// Persist worker state to `.cowd/worker-state.json` in the worker's cwd.
+/// Persist worker state to `~/.cowd/worker-state.json`.
 fn persist_worker_state(worker: &Worker) -> std::io::Result<()> {
     use std::path::Path;
     let now = std::time::SystemTime::now()
@@ -4309,8 +4309,8 @@ fn normalize_config_value(spec: ConfigSettingSpec, value: ConfigValue) -> Result
 fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     Ok(match scope {
-        ConfigScope::Global => config_home_dir()?.join("settings.json"),
-        ConfigScope::Settings => cwd.join(".cowd").join("settings.local.json"),
+        ConfigScope::Global => config_home_dir()?.join("config.yaml"),
+        ConfigScope::Settings => cwd.join(".cowd").join("config.local.yaml"),
     })
 }
 
@@ -4335,11 +4335,14 @@ fn read_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, Strin
             if contents.trim().is_empty() {
                 return Ok(serde_json::Map::new());
             }
-            serde_json::from_str::<Value>(&contents)
-                .map_err(|error| error.to_string())?
-                .as_object()
+            // Try JSON first (fast path), fall back to YAML parser
+            // (YAML is a superset of JSON so both work)
+            let val = serde_json::from_str::<Value>(&contents)
+                .or_else(|_| serde_yaml::from_str::<Value>(&contents))
+                .map_err(|error| format!("failed to parse config (tried JSON then YAML): {error}"))?;
+            val.as_object()
                 .cloned()
-                .ok_or_else(|| String::from("config file must contain a JSON object"))
+                .ok_or_else(|| String::from("config file must contain a JSON/YAML object"))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Map::new()),
         Err(error) => Err(error.to_string()),
@@ -4350,6 +4353,7 @@ fn write_json_object(path: &Path, value: &serde_json::Map<String, Value>) -> Res
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
+    // Write as well-formatted JSON (which is valid YAML)
     std::fs::write(
         path,
         serde_json::to_string_pretty(value).map_err(|error| error.to_string())?,
@@ -4413,7 +4417,7 @@ fn remove_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str])
 fn plan_mode_state_file() -> Result<PathBuf, String> {
     Ok(config_file_for_scope(ConfigScope::Settings)?
         .parent()
-        .ok_or_else(|| String::from("settings.local.json has no parent directory"))?
+        .ok_or_else(|| String::from("config.local.yaml has no parent directory"))?
         .join("tool-state")
         .join("plan-mode.json"))
 }
@@ -4915,7 +4919,7 @@ mod tests {
     #[test]
     fn worker_create_merges_config_trusted_roots_without_per_call_override() {
         use std::fs;
-        // Write a .cowd/settings.json in a temp dir with trustedRoots
+        // Write a .cowd/config.yaml in a temp dir with trustedRoots
         let worktree = temp_path("config-trust-worktree");
         let cc_dir = worktree.join(".cowd");
         fs::create_dir_all(&cc_dir).expect("create .cc dir");
@@ -5091,7 +5095,7 @@ mod tests {
         let worktree = temp_path("recovery-loop-state");
         fs::create_dir_all(&worktree).expect("create worktree");
         let cwd = worktree.to_str().expect("utf-8").to_string();
-        let state_path = worktree.join(".cowd").join("worker-state.json");
+        let state_path = runtime::cowd_dirs::worker_state_path();
 
         // 1. Create worker WITHOUT trusted_roots
         let created = execute_tool("WorkerCreate", &json!({"cwd": cwd}))
@@ -7336,10 +7340,10 @@ mod tests {
         std::fs::create_dir_all(home.join(".cowd")).expect("home dir");
         std::fs::create_dir_all(cwd.join(".cowd")).expect("cwd dir");
         std::fs::write(
-            home.join(".cowd").join("settings.json"),
+            home.join(".cowd").join("config.yaml"),
             r#"{"verbose":false}"#,
         )
-        .expect("write global settings");
+        .expect("write global config");
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("COWD_CONFIG_HOME").ok();
@@ -7402,10 +7406,10 @@ mod tests {
         std::fs::create_dir_all(home.join(".cowd")).expect("home dir");
         std::fs::create_dir_all(cwd.join(".cowd")).expect("cwd dir");
         std::fs::write(
-            cwd.join(".cowd").join("settings.local.json"),
+            cwd.join(".cowd").join("config.local.yaml"),
             r#"{"permissions":{"defaultMode":"acceptEdits"}}"#,
         )
-        .expect("write local settings");
+        .expect("write local config");
 
         let original_home = std::env::var("HOME").ok();
         let original_config_home = std::env::var("COWD_CONFIG_HOME").ok();
@@ -7421,8 +7425,8 @@ mod tests {
         assert_eq!(enter_output["previousLocalMode"], "acceptEdits");
         assert_eq!(enter_output["currentLocalMode"], "plan");
 
-        let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("settings.local.json"))
-            .expect("local settings after enter");
+        let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("config.local.yaml"))
+            .expect("local config after enter");
         assert!(local_settings.contains(r#""defaultMode": "plan""#));
         let state =
             std::fs::read_to_string(cwd.join(".cowd").join("tool-state").join("plan-mode.json"))
@@ -7437,7 +7441,7 @@ mod tests {
         assert_eq!(exit_output["previousLocalMode"], "acceptEdits");
         assert_eq!(exit_output["currentLocalMode"], "acceptEdits");
 
-        let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("settings.local.json"))
+        let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("config.local.yaml"))
             .expect("local settings after exit");
         assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
         assert!(!cwd
@@ -7492,10 +7496,10 @@ mod tests {
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["currentLocalMode"], serde_json::Value::Null);
 
-        let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("settings.local.json"))
-            .expect("local settings after exit");
+        let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("config.local.yaml"))
+            .expect("local config after exit");
         let local_settings_json: serde_json::Value =
-            serde_json::from_str(&local_settings).expect("valid settings json");
+            serde_json::from_str(&local_settings).expect("valid config json");
         assert_eq!(
             local_settings_json.get("permissions"),
             None,
