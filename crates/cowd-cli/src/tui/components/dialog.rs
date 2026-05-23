@@ -95,12 +95,27 @@ impl DialogState {
 #[derive(Debug, Clone)]
 pub struct DialogManager {
     stack: Vec<DialogState>,
+    /// The result of the most recently dismissed dialog, if any.
+    /// Set just before popping in `handle_key`. Cleared by `take_last_dismissed_result()`.
+    last_dismissed_result: Option<DialogResult>,
 }
 
 impl DialogManager {
     /// Create a new empty dialog manager.
     pub fn new() -> Self {
-        Self { stack: Vec::new() }
+        Self {
+            stack: Vec::new(),
+            last_dismissed_result: None,
+        }
+    }
+
+    /// Take the last dismissed dialog result, if any.
+    ///
+    /// Returns `Some(result)` for the most recently dismissed dialog, or
+    /// `None` if no dialog has been dismissed since the last call.
+    /// Calling this clears the stored result.
+    pub fn take_last_dismissed_result(&mut self) -> Option<DialogResult> {
+        self.last_dismissed_result.take()
     }
 
     /// Push a new dialog onto the top of the stack.
@@ -226,6 +241,7 @@ impl DialogManager {
         }
 
         if dismiss {
+            self.last_dismissed_result = self.stack[idx].result.clone();
             self.stack.pop();
         }
 

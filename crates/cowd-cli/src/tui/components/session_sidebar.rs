@@ -16,8 +16,9 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem},
 };
 
-use crate::tui::app::SessionSummary;
+use crate::tui::app::{SessionSummary, TimelineEntry};
 use crate::tui::components::base::{Component, EventResult, RenderContext};
+use crate::tui::components::dialog::{DialogKind, DialogManager, DialogResult, DialogState};
 
 /// TUI sidebar for browsing and managing sessions.
 ///
@@ -65,6 +66,13 @@ pub struct SessionSidebar {
     pub pending_rename: Option<(usize, String)>,
     /// Set when user presses `n`.
     pub pending_new_session: bool,
+
+    // ── Fork state ──
+    /// Set when user presses `f` — signals parent to call `open_fork_dialog()`.
+    pub pending_fork: bool,
+    /// Fork target: `None` = full session, `Some(idx)` = user message index.
+    /// Only valid when `pending_fork` is `true`.
+    pub pending_fork_at: Option<usize>,
 }
 
 impl SessionSidebar {
@@ -85,6 +93,8 @@ impl SessionSidebar {
             pending_switch_idx: None,
             pending_rename: None,
             pending_new_session: false,
+            pending_fork: false,
+            pending_fork_at: None,
         }
     }
 
@@ -109,6 +119,8 @@ impl SessionSidebar {
         self.pending_switch_idx = None;
         self.pending_rename = None;
         self.pending_new_session = false;
+        self.pending_fork = false;
+        self.pending_fork_at = None;
 
         // If current session is in the list, select it; otherwise start at 0
         self.selected_idx = self
@@ -178,6 +190,82 @@ impl SessionSidebar {
         } else {
             self.selected_idx - 1
         };
+    }
+
+    // ── Fork dialog ─────────────────────────────────────────────────
+
+    /// Open a fork selection dialog listing user messages as fork points.
+    ///
+    /// Builds a `DialogKind::Select` with:
+    /// - Item 0: "⬡ Full session" — fork the entire session
+    /// - Item N+1: user message at index N, formatted as
+    ///   `"{timestamp} — {preview}"` where `preview` is the first 80
+    ///   characters of the message content.
+    ///
+    /// The dialog is pushed onto `dialog_manager` and rendered by the
+    /// TUI's dialog layer. After the user makes a selection, call
+    /// [`take_fork_result`](Self::take_fork_result) to consume the result.
+    pub fn open_fork_dialog(
+        &mut self,
+        dialog_manager: &mut DialogManager,
+        timeline: &[TimelineEntry],
+    ) {
+        let mut items: Vec<String> = Vec::new();
+        items.push("⬡ Full session".to_string());
+
+        for entry in timeline.iter() {
+            if let TimelineEntry::Message { role, content, timestamp } = entry {
+                if role == "user" {
+                    let preview: String = content.chars().take(80).collect();
+                    let preview = if content.len() > 80 {
+                        format!("{}…", preview)
+                    } else {
+                        preview
+                    };
+                    items.push(format!("{} — {}", timestamp, preview));
+                }
+            }
+        }
+
+        let dialog = DialogState::new(DialogKind::Select {
+            title: " Fork session at… ".to_string(),
+            items,
+            selected: 0,
+        });
+        dialog_manager.push(dialog);
+    }
+
+    /// Consume the result of a dismissed fork dialog.
+    ///
+    /// Call this after the fork dialog has been dismissed by the user.
+    /// Reads the result from the dialog manager's last dismissed result.
+    ///
+    /// Returns:
+    /// - `Some(None)` — user selected "Full session" (fork entire session)
+    /// - `Some(Some(idx))` — user selected message at index `idx`
+    /// - `None` — dialog was cancelled or no result available
+    ///
+    /// As a side effect, sets `pending_fork = true` and `pending_fork_at`
+    /// to the selected target (or `None` for full session).
+    pub fn take_fork_result(
+        &mut self,
+        dialog_manager: &mut DialogManager,
+    ) -> Option<Option<usize>> {
+        let result = dialog_manager.take_last_dismissed_result()?;
+        match result {
+            DialogResult::Selected(0) => {
+                self.pending_fork = true;
+                self.pending_fork_at = None;
+                Some(None)
+            }
+            DialogResult::Selected(idx) => {
+                let msg_idx = idx.saturating_sub(1);
+                self.pending_fork = true;
+                self.pending_fork_at = Some(msg_idx);
+                Some(Some(msg_idx))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -257,7 +345,7 @@ impl Component for SessionSidebar {
             );
         } else {
             items.push(
-                ListItem::from(" j/k↓↑ Enter r d n ")
+                ListItem::from(" j/k↓↑ Enter r d n f ")
                     .style(Style::default().fg(Color::DarkGray)),
             );
         }
@@ -366,6 +454,12 @@ impl SessionSidebar {
                 EventResult::Consumed
             }
 
+            // Fork dialog
+            KeyCode::Char('f') => {
+                self.pending_fork = true;
+                EventResult::Consumed
+            }
+
             _ => EventResult::NotConsumed,
         }
     }
@@ -378,6 +472,8 @@ impl SessionSidebar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::TimelineEntry;
+    use crate::tui::components::dialog::{DialogKind, DialogManager, DialogResult, DialogState};
     use crate::tui::components::RenderContext;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
@@ -821,5 +917,189 @@ mod tests {
         // Clean up: Esc
         let _ = sidebar.handle_key(&key_event(KeyCode::Esc));
         assert!(!sidebar.is_editing());
+    }
+
+    // ── Fork tests ──────────────────────────────────────────────────
+
+    /// Build a timeline with user and assistant messages for fork testing.
+    fn fork_timeline() -> Vec<TimelineEntry> {
+        vec![
+            TimelineEntry::Message {
+                role: "user".into(),
+                content: "What is the capital of France?".into(),
+                timestamp: "14:30".into(),
+            },
+            TimelineEntry::Message {
+                role: "assistant".into(),
+                content: "The capital is Paris.".into(),
+                timestamp: "14:31".into(),
+            },
+            TimelineEntry::Message {
+                role: "user".into(),
+                content: "And what about Italy?".into(),
+                timestamp: "14:32".into(),
+            },
+            TimelineEntry::Message {
+                role: "assistant".into(),
+                content: "Rome is the capital of Italy.".into(),
+                timestamp: "14:33".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn fork_dialog_lists_user_messages() {
+        let mut sidebar = SessionSidebar::new("sess-1");
+        let mut dm = DialogManager::new();
+        let timeline = fork_timeline();
+
+        sidebar.open_fork_dialog(&mut dm, &timeline);
+
+        // Dialog should be pushed and non-empty
+        assert!(!dm.is_empty(), "fork dialog should be pushed");
+
+        let current = dm.current().unwrap();
+        match &current.kind {
+            DialogKind::Select { title, items, selected } => {
+                assert_eq!(*selected, 0, "should start at index 0");
+                assert_eq!(title, " Fork session at… ", "dialog title");
+
+                // Item 0: "Full session"
+                assert_eq!(items[0], "⬡ Full session");
+
+                // Items 1+2: user messages only (2 users in timeline)
+                assert_eq!(items.len(), 3, "should have Full session + 2 user messages");
+                assert!(items[1].contains("14:30"), "first user timestamp");
+                assert!(items[1].contains("capital of France"), "first user content");
+                assert!(items[2].contains("14:32"), "second user timestamp");
+                assert!(items[2].contains("Italy"), "second user content");
+            }
+            _ => panic!("expected DialogKind::Select"),
+        }
+    }
+
+    #[test]
+    fn fork_full_session_option() {
+        let mut sidebar = SessionSidebar::new("sess-1");
+        let mut dm = DialogManager::new();
+        let timeline = fork_timeline();
+
+        sidebar.open_fork_dialog(&mut dm, &timeline);
+
+        // Select "Full session" (index 0) with Enter
+        let consumed = dm.handle_key(&key(KeyCode::Enter));
+        assert!(consumed, "Enter should be consumed");
+        assert!(dm.is_empty(), "dialog should be dismissed");
+
+        // Consume the fork result
+        let result = sidebar.take_fork_result(&mut dm);
+        assert_eq!(result, Some(None), "Full session → Some(None)");
+        assert!(sidebar.pending_fork, "pending_fork should be true");
+        assert_eq!(sidebar.pending_fork_at, None, "pending_fork_at = None for full session");
+    }
+
+    #[test]
+    fn fork_select_message_option() {
+        let mut sidebar = SessionSidebar::new("sess-1");
+        let mut dm = DialogManager::new();
+        let timeline = fork_timeline();
+
+        sidebar.open_fork_dialog(&mut dm, &timeline);
+
+        // Navigate down twice: index 0 → 1 → 2 (second user message)
+        let _ = dm.handle_key(&key(KeyCode::Down));
+        let _ = dm.handle_key(&key(KeyCode::Down));
+
+        // Verify selection is at index 2
+        let current = dm.current().unwrap();
+        match &current.kind {
+            DialogKind::Select { selected, .. } => assert_eq!(*selected, 2),
+            _ => panic!("expected Select"),
+        }
+
+        // Select with Enter
+        let consumed = dm.handle_key(&key(KeyCode::Enter));
+        assert!(consumed);
+        assert!(dm.is_empty());
+
+        // Consume the fork result
+        let result = sidebar.take_fork_result(&mut dm);
+        // Index 2 → message index 1 (because 0 is "Full session")
+        assert_eq!(result, Some(Some(1)), "item 2 → message idx 1");
+        assert!(sidebar.pending_fork);
+        assert_eq!(sidebar.pending_fork_at, Some(1));
+    }
+
+    #[test]
+    fn fork_navigation_select_cancel() {
+        let mut sidebar = SessionSidebar::new("sess-1");
+        let mut dm = DialogManager::new();
+        let timeline = fork_timeline();
+
+        sidebar.open_fork_dialog(&mut dm, &timeline);
+
+        // Check initial selection at index 0
+        assert_eq!(
+            match &dm.current().unwrap().kind {
+                DialogKind::Select { selected, .. } => *selected,
+                _ => unreachable!(),
+            },
+            0
+        );
+
+        // Down → index 1
+        let _ = dm.handle_key(&key(KeyCode::Down));
+        assert_eq!(
+            match &dm.current().unwrap().kind {
+                DialogKind::Select { selected, .. } => *selected,
+                _ => unreachable!(),
+            },
+            1
+        );
+
+        // Up → back to index 0
+        let _ = dm.handle_key(&key(KeyCode::Up));
+        assert_eq!(
+            match &dm.current().unwrap().kind {
+                DialogKind::Select { selected, .. } => *selected,
+                _ => unreachable!(),
+            },
+            0
+        );
+
+        // Press Esc to cancel
+        let consumed = dm.handle_key(&key(KeyCode::Esc));
+        assert!(consumed, "Esc should be consumed");
+        assert!(dm.is_empty(), "dialog should be dismissed after Esc");
+
+        // take_fork_result should return None (cancelled)
+        let result = sidebar.take_fork_result(&mut dm);
+        assert_eq!(result, None, "cancel should return None");
+        // pending_fork remains false since we cancelled
+        assert!(!sidebar.pending_fork, "cancelled fork should not set pending_fork");
+    }
+
+    #[test]
+    fn fork_pending_flag_on_f_key() {
+        let sessions = sessions_vec(&["sess-a", "sess-b"]);
+        let mut sidebar = make_sidebar(sessions, "sess-a");
+
+        // 'f' should set pending_fork
+        let result = sidebar.handle_key(&key_event(KeyCode::Char('f')));
+        assert!(result.is_consumed(), "'f' key should be consumed");
+        assert!(sidebar.pending_fork, "pending_fork should be set by 'f'");
+    }
+
+    #[test]
+    fn fork_reset_on_load() {
+        let mut sidebar = SessionSidebar::new("sess-1");
+        sidebar.pending_fork = true;
+        sidebar.pending_fork_at = Some(3);
+
+        let sessions = sessions_vec(&["sess-1"]);
+        sidebar.load(sessions);
+
+        assert!(!sidebar.pending_fork, "load should reset pending_fork");
+        assert_eq!(sidebar.pending_fork_at, None, "load should reset pending_fork_at");
     }
 }

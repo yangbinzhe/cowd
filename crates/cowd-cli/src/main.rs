@@ -2686,6 +2686,11 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     load_session_history(&mut state, &cli.runtime.session());
     refresh_panels(&mut state, &workspace, &cli.runtime);
 
+    // Startup phase: ready after init completes.
+    // If init <500ms the overlay never shows. If init >500ms,
+    // "Loading..." → "Finishing..." → Done (min 3s display).
+    let startup_ready = true;
+
     let mut turn_handle: Option<std::thread::JoinHandle<tui::TurnOutcome>> = None;
     let mut abort_monitor: Option<HookAbortMonitor> = None;
     let mut abort_signal_for_turn: Option<runtime::HookAbortSignal> = None;
@@ -2694,6 +2699,9 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
         let frame_budget = Duration::from_millis(8);
         loop {
             let frame_start = std::time::Instant::now();
+
+            // Tick startup phase state machine each frame
+            state.update_startup_phase(startup_ready);
 
             drain_tui_events_state(&tui_rx, &mut state);
 

@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 use std::panic::AssertUnwindSafe;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
@@ -96,6 +97,13 @@ pub struct TuiState {
 
     /// Accessibility settings (ARIA labels, high contrast, screen reader).
     pub accessibility: AccessibilityMode,
+
+    /// Startup phase for the loading overlay state machine.
+    pub startup_phase: StartupPhase,
+    /// Instant when TuiState was created (for show-delay calculation).
+    pub startup_start: Instant,
+    /// Instant when the overlay first became visible (for min-display calculation).
+    pub startup_show_time: Option<Instant>,
 }
 
 impl TuiState {
@@ -150,6 +158,9 @@ impl TuiState {
             frame_timer,
             render_profiler,
             accessibility,
+            startup_phase: StartupPhase::Hidden,
+            startup_start: Instant::now(),
+            startup_show_time: None,
         }
     }
 
@@ -258,6 +269,11 @@ impl TuiState {
             if let Some(msg) = degraded {
                 self.add_message("system", &msg);
             }
+        }
+
+        // 4. Render startup loading overlay (highest z-index, below dialogs)
+        if self.startup_phase != StartupPhase::Done {
+            self.render_startup_overlay(frame, area);
         }
 
         // Update last drawn version for render skip optimization
@@ -670,6 +686,79 @@ impl TuiState {
     pub fn hot_reload_theme(&mut self) -> bool {
         self.theme_engine.hot_reload()
     }
+
+    // ── Startup Loading ─────────────────────────────────────────
+
+    /// Update the startup phase based on the `ready` signal and elapsed time.
+    ///
+    /// Called each frame from the render cycle. Delegates to
+    /// `update_startup_phase_at` with `Instant::now()`.
+    pub fn update_startup_phase(&mut self, ready: bool) {
+        self.update_startup_phase_at(ready, Instant::now());
+    }
+
+    /// Time-controllable variant of `update_startup_phase` for testing.
+    fn update_startup_phase_at(&mut self, ready: bool, now: Instant) {
+        use self::StartupPhase::*;
+
+        const SHOW_DELAY: Duration = Duration::from_millis(STARTUP_SHOW_DELAY_MS);
+        const MIN_DISPLAY: Duration = Duration::from_millis(STARTUP_MIN_DISPLAY_MS);
+
+        match self.startup_phase {
+            Done => {}
+            Finishing => {
+                if ready {
+                    if let Some(show_time) = self.startup_show_time {
+                        if now.duration_since(show_time) >= MIN_DISPLAY {
+                            self.startup_phase = Done;
+                        }
+                    }
+                } else {
+                    self.startup_phase = Loading;
+                    self.startup_show_time = None;
+                }
+            }
+            Loading => {
+                if ready {
+                    self.startup_phase = Finishing;
+                    self.startup_show_time = Some(now);
+                }
+            }
+            Hidden => {
+                if ready {
+                    // Completed before show delay → never show overlay
+                    self.startup_phase = Done;
+                } else if now.duration_since(self.startup_start) >= SHOW_DELAY {
+                    self.startup_phase = Loading;
+                }
+            }
+        }
+    }
+
+    /// Render the startup loading overlay at the bottom of the screen.
+    fn render_startup_overlay(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        use ratatui::layout::Alignment;
+        use ratatui::style::Style;
+        use ratatui::text::Span;
+        use ratatui::widgets::Paragraph;
+
+        let text = match self.startup_phase {
+            StartupPhase::Loading => " ⟳ Loading plugins... ",
+            StartupPhase::Finishing => " ⟳ Finishing startup... ",
+            _ => return,
+        };
+
+        let fg = self.theme_engine.theme.palette.fg;
+        let bg = self.theme_engine.theme.palette.muted;
+
+        let overlay_y = area.height.saturating_sub(2);
+        let overlay_rect = ratatui::layout::Rect::new(0, overlay_y, area.width, 1);
+
+        let paragraph = Paragraph::new(Span::styled(text, Style::default().fg(fg).bg(bg)))
+            .alignment(Alignment::Center);
+
+        frame.render_widget(paragraph, overlay_rect);
+    }
 }
 
 // ── Delegation to App via Deref ─────────────────────────────────
@@ -688,12 +777,33 @@ impl std::ops::DerefMut for TuiState {
     }
 }
 
+// ── Startup Phase ──────────────────────────────────────────────
+
+/// Tracks the TUI startup loading overlay state machine.
+///
+/// - `Hidden`: startup just began, waiting for 500ms show delay
+/// - `Loading`: show delay elapsed, displaying "Loading..." overlay
+/// - `Finishing`: startup ready, displaying "Finishing startup..." (min 3s)
+/// - `Done`: overlay hidden, startup fully complete
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StartupPhase {
+    #[default]
+    Hidden,
+    Loading,
+    Finishing,
+    Done,
+}
+
+const STARTUP_SHOW_DELAY_MS: u64 = 500;
+const STARTUP_MIN_DISPLAY_MS: u64 = 3000;
+
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Duration;
 
     // ── Construction ────────────────────────────────────────────
 
@@ -1028,5 +1138,88 @@ mod tests {
 
         // ThemeEngine starts with dark builtin (no file), so hot_reload is a no-op
         assert!(!state.hot_reload_theme());
+    }
+
+    // ── startup_loading ─────────────────────────────────────────
+
+    #[test]
+    fn startup_shows_after_delay() {
+        let mut state = TuiState::new("m", "s");
+        assert_eq!(state.startup_phase, StartupPhase::Hidden);
+
+        // Before 500ms show delay → still Hidden
+        state.update_startup_phase_at(false, state.startup_start + Duration::from_millis(400));
+        assert_eq!(state.startup_phase, StartupPhase::Hidden);
+
+        // After 500ms show delay → Loading
+        state.update_startup_phase_at(false, state.startup_start + Duration::from_millis(501));
+        assert_eq!(state.startup_phase, StartupPhase::Loading);
+    }
+
+    #[test]
+    fn startup_hides_when_ready() {
+        let mut state = TuiState::new("m", "s");
+
+        // Advance past 500ms to Loading phase
+        state.update_startup_phase_at(false, state.startup_start + Duration::from_millis(501));
+        assert_eq!(state.startup_phase, StartupPhase::Loading);
+
+        // Signal ready → Finishing
+        let ready_time = state.startup_start + Duration::from_millis(501);
+        state.update_startup_phase_at(true, ready_time);
+        assert_eq!(state.startup_phase, StartupPhase::Finishing);
+
+        // Before min_display (3s) → still Finishing
+        state.update_startup_phase_at(true, ready_time + Duration::from_millis(2500));
+        assert_eq!(state.startup_phase, StartupPhase::Finishing);
+
+        // After min_display → Done
+        state.update_startup_phase_at(true, ready_time + Duration::from_secs(3));
+        assert_eq!(state.startup_phase, StartupPhase::Done);
+    }
+
+    #[test]
+    fn startup_min_display_3s() {
+        let mut state = TuiState::new("m", "s");
+
+        // Start showing Loading at t=500ms
+        state.update_startup_phase_at(false, state.startup_start + Duration::from_millis(500));
+        assert_eq!(state.startup_phase, StartupPhase::Loading);
+
+        // Signal ready at t=600ms → Finishing
+        let ready_time = state.startup_start + Duration::from_millis(600);
+        state.update_startup_phase_at(true, ready_time);
+        assert_eq!(state.startup_phase, StartupPhase::Finishing);
+
+        // 2.5s after ready → still Finishing (not yet 3s)
+        state.update_startup_phase_at(true, ready_time + Duration::from_millis(2500));
+        assert_eq!(state.startup_phase, StartupPhase::Finishing);
+
+        // 3s after ready → Done
+        state.update_startup_phase_at(true, ready_time + Duration::from_secs(3));
+        assert_eq!(state.startup_phase, StartupPhase::Done);
+    }
+
+    #[test]
+    fn startup_completes_before_delay_never_shows() {
+        let mut state = TuiState::new("m", "s");
+
+        // Ready at t=100ms (before 500ms show delay)
+        state.update_startup_phase_at(true, state.startup_start + Duration::from_millis(100));
+
+        // Should skip overlay entirely → Done immediately
+        assert_eq!(state.startup_phase, StartupPhase::Done);
+    }
+
+    #[test]
+    fn startup_loading_text_no_trailing_newline() {
+        let mut state = TuiState::new("m", "s");
+
+        state.update_startup_phase_at(false, state.startup_start + Duration::from_millis(501));
+        assert_eq!(state.startup_phase, StartupPhase::Loading, "should be Loading after delay");
+
+        // Signal ready
+        state.update_startup_phase_at(true, state.startup_start + Duration::from_millis(600));
+        assert_eq!(state.startup_phase, StartupPhase::Finishing, "should be Finishing when ready");
     }
 }
