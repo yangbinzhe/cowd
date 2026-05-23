@@ -3,6 +3,7 @@
 // This is Wave 1, Task 1 — the foundation for all TUI components.
 
 pub mod base;
+pub mod chat_view;
 pub mod dialog;
 pub mod diff_viewer;
 pub mod file_tree;

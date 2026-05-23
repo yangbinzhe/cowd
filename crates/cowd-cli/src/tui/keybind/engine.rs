@@ -315,6 +315,13 @@ pub fn default_bindings() -> KeyMap {
     // ── Ctrl keys ───────────────────────────────────────────────────
     map.add(
         KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)],
+        },
+        Action::TogglePanel("sidebar".into()),
+        "Toggle sidebar",
+    );
+    map.add(
+        KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
         },
         Action::Quit,
@@ -502,6 +509,15 @@ mod tests {
         assert_eq!(
             eng.handle_key(k(KeyCode::Enter)),
             Some(Action::SubmitInput)
+        );
+    }
+
+    #[test]
+    fn single_key_dispatch_ctrl_b_toggles_sidebar() {
+        let mut eng = engine();
+        assert_eq!(
+            eng.handle_key(k_ctrl('b')),
+            Some(Action::TogglePanel("sidebar".into()))
         );
     }
 

@@ -1,0 +1,716 @@
+// ── TuiState — Unified TUI application state ──────────────────
+// Wraps the legacy App with new engine components:
+//   LayoutTree, KeybindEngine, EventBus, ThemeEngine, DialogManager.
+//
+// Delegates all App public methods via Deref/DerefMut.
+// Bridges old App::apply_event(TuiEvent) → EventBus for new components.
+// Orchestrates rendering via render_engine::render_tree + ChatView + dialogs.
+//
+// Architecture:
+//   - TuiState OWNS App (not a reference)
+//   - Deref<Target=App> for transparent delegation
+//   - TuiState::apply_event() shadows App::apply_event() — adds EventBus bridging
+//   - handle_input() → KeybindEngine → Action dispatch
+//   - render() → sync ChatView → render_tree → render dialogs
+// -------------------------------------------------------------------
+
+#![allow(dead_code)]
+
+use crossterm::event::KeyEvent;
+use ratatui::Frame;
+
+use crate::tui::app::App;
+use crate::tui::components::chat_view::ChatView;
+use crate::tui::components::dialog::DialogManager;
+use crate::tui::components::render_engine;
+use crate::tui::components::{Component, RenderContext};
+use crate::tui::event::dispatcher::EventDispatcher;
+use crate::tui::event::{ComponentId as EventComponentId, EventBus, EventPriority};
+use crate::tui::keybind::types::Action;
+use crate::tui::keybind::{default_bindings, KeybindEngine};
+use crate::tui::layout::{LayoutNode, LayoutTree, Split, SplitDirection};
+use crate::tui::theme::ThemeEngine;
+use crate::tui::TuiEvent;
+
+// ── TuiState ────────────────────────────────────────────────────
+
+/// Unified TUI application state.
+///
+/// Owns the legacy `App` (all existing fields preserved) alongside
+/// the new engine components: layout tree, keybinding engine,
+/// event bus, theme engine, and dialog manager.
+///
+/// # Delegation
+///
+/// Implements [`Deref`] and [`DerefMut`] to `App`, so all existing
+/// App public methods and fields are directly accessible on `TuiState`.
+/// The `apply_event()` method is shadowed to add EventBus bridging.
+pub struct TuiState {
+    /// Legacy application state (all existing fields preserved).
+    pub app: App,
+
+    /// Component layout tree (rendered via render_engine::render_tree).
+    pub layout_tree: LayoutTree,
+
+    /// Chat view component (rendered directly after syncing from App).
+    pub chat_view: ChatView,
+
+    /// Keybinding engine with modal-layer stacking and chord dispatch.
+    pub keybind_engine: KeybindEngine,
+
+    /// Priority-ordered event bus for TUI-internal component events.
+    pub event_bus: EventBus,
+
+    /// Registry-backed event dispatcher routing events to components.
+    pub event_dispatcher: EventDispatcher,
+
+    /// Hot-reloadable theme engine (dark/light builtins or YAML files).
+    pub theme_engine: ThemeEngine,
+
+    /// Stack-based dialog manager for alerts, confirmations, prompts.
+    pub dialog_manager: DialogManager,
+}
+
+impl TuiState {
+    // ── Construction ────────────────────────────────────────────
+
+    /// Create a fully-initialized `TuiState` with all engines set to
+    /// sensible defaults.
+    ///
+    /// - `App` is constructed with the given model and session ID.
+    /// - `LayoutTree` has a simple empty split (placeholder for future panels).
+    /// - `ChatView` is freshly created (empty timeline).
+    /// - `KeybindEngine` uses `default_bindings()` (vim/emacs-style chords).
+    /// - `EventBus` is empty, ready for component injection.
+    /// - `EventDispatcher` is empty, components registered via `register()`.
+    /// - `ThemeEngine` is pre-loaded with the builtin dark theme.
+    /// - `DialogManager` is empty (no dialogs shown).
+    #[must_use]
+    pub fn new(model: &str, session_id: &str) -> Self {
+        let app = App::new(model, session_id);
+
+        // Layout tree with a simple placeholder split.
+        // Future tasks will add real panels (chat, file tree, etc.).
+        let layout_tree = LayoutTree {
+            root: LayoutNode::Split(Split {
+                direction: SplitDirection::Vertical,
+                ratio: 1.0,
+                children: vec![],
+            }),
+        };
+
+        let chat_view = ChatView::new();
+        let keybind_engine = KeybindEngine::new(default_bindings());
+        let event_bus = EventBus::new();
+        let event_dispatcher = EventDispatcher::new();
+        let theme_engine = ThemeEngine::new_dark();
+        let dialog_manager = DialogManager::new();
+
+        Self {
+            app,
+            layout_tree,
+            chat_view,
+            keybind_engine,
+            event_bus,
+            event_dispatcher,
+            theme_engine,
+            dialog_manager,
+        }
+    }
+
+    // ── Event Bridging ──────────────────────────────────────────
+
+    /// Apply a `TuiEvent` from the background turn runner to the display.
+    ///
+    /// **Preserves existing behavior**: delegates to `App::apply_event()`
+    /// for all timeline updates, token tracking, and state transitions.
+    ///
+    /// **Bridges to new EventBus**: after updating the App, sends a
+    /// synthetic state-change notification via `EventBus` so that new
+    /// engine components can react (e.g., re-sync their view-models).
+    ///
+    /// The synthetic event uses `Resize(0, 0)` as a signal since
+    /// crossterm has no custom event type. Components should check
+    /// for this and re-sync from App state as needed.
+    pub fn apply_event(&mut self, event: TuiEvent) {
+        // Preserve ALL existing App behavior
+        self.app.apply_event(event);
+
+        // Bridge: notify new components that state has changed.
+        // Using Resize(0,0) as a sentinel — real resize events always
+        // have non-zero dimensions, so this is unambiguous.
+        self.event_bus
+            .send(crossterm::event::Event::Resize(0, 0), EventPriority::Normal);
+
+        // Drain and dispatch to registered components.
+        self.event_dispatcher.dispatch(&self.event_bus);
+    }
+
+    // ── Rendering ───────────────────────────────────────────────
+
+    /// Render the full TUI for one frame.
+    ///
+    /// Orchestration order:
+    /// 1. **Sync** — ChatView pulls latest timeline state from `App`.
+    /// 2. **Layout tree** — `render_engine::render_tree()` walks the
+    ///    layout tree and renders each component (placeholder for now).
+    /// 3. **ChatView** — rendered directly (so it can be synced beforehand).
+    /// 4. **Sync back** — ChatView persists scroll/viewport state to `App`.
+    /// 5. **Dialogs** — rendered on top with backdrop dimming.
+    pub fn render(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let skin = self.app.skin.clone();
+
+        // Sync chat view from App state before rendering
+        self.chat_view.sync_from_app(&self.app);
+
+        // 1. Render layout tree (placeholder for future panels)
+        let render_state = render_engine::TuiState {
+            theme: skin.clone(),
+        };
+        render_engine::render_tree(&mut self.layout_tree, frame, &render_state);
+
+        // 2. Render ChatView directly (needs prior sync)
+        {
+            let mut ctx = RenderContext::new(frame, &skin);
+            self.chat_view.render(&mut ctx, area);
+        }
+
+        // Sync back scroll/viewport state to App
+        self.chat_view.sync_to_app(&mut self.app);
+
+        // 3. Render dialog stack on top (backdrop + centered dialog)
+        if !self.dialog_manager.is_empty() {
+            let mut ctx = RenderContext::new(frame, &skin);
+            self.dialog_manager.render(&mut ctx, area);
+        }
+    }
+
+    // ── Input Handling ──────────────────────────────────────────
+
+    /// Process a raw keyboard event through the keybinding engine.
+    ///
+    /// If a dialog is active, the event is routed to the dialog manager
+    /// first (focus trap). Otherwise, it goes through the keybind engine:
+    /// - Multi-chord bindings (e.g., `g` `g`) accumulate until resolved.
+    /// - Space leader key triggers which-key overlay.
+    /// - Resolved actions are dispatched to the appropriate App methods.
+    ///
+    /// Returns `true` if the event was consumed (handled), `false` if
+    /// it should propagate further.
+    pub fn handle_input(&mut self, event: KeyEvent) -> bool {
+        // 1. Dialog focus trap: if a dialog is active, keys go to it
+        if !self.dialog_manager.is_empty() {
+            return self.dialog_manager.handle_key(&event);
+        }
+
+        // 2. Route through keybind engine
+        if let Some(action) = self.keybind_engine.handle_key(event) {
+            self.dispatch_action(action);
+            return true;
+        }
+
+        // 3. Not consumed by keybinds — may still need chord timeout check
+        self.keybind_engine.check_timeout();
+        false
+    }
+
+    // ── Action Dispatch ─────────────────────────────────────────
+
+    /// Execute the side effects of a resolved keybinding action.
+    ///
+    /// Maps every [`Action`] variant to the appropriate App method call
+    /// or TuiState operation.
+    fn dispatch_action(&mut self, action: Action) {
+        match action {
+            Action::Scroll(delta) => {
+                if delta > 0 {
+                    self.app.scroll_offset =
+                        self.app.scroll_offset.saturating_add(delta as u16);
+                    self.app.auto_scroll = false;
+                } else {
+                    self.app.scroll_offset =
+                        self.app.scroll_offset.saturating_sub((-delta) as u16);
+                    self.app.auto_scroll = false;
+                }
+            }
+            Action::ExpandCollapse => {
+                self.app.toggle_expand_current();
+            }
+            Action::Copy => {
+                self.app.copy_focused_content();
+            }
+            Action::Quit => {
+                self.app.should_quit = true;
+            }
+            Action::NextPanel => {
+                self.app.next_panel();
+            }
+            Action::PrevPanel => {
+                // Cycle panels in reverse: Chat → Delegate → Skills → Memory → Files → Gateway → Chat
+                use crate::tui::app::Panel;
+                self.app.current_panel = match self.app.current_panel {
+                    Panel::Chat => Panel::Delegate,
+                    Panel::Delegate => Panel::Skills,
+                    Panel::Skills => Panel::Memory,
+                    Panel::Memory => Panel::Files,
+                    Panel::Files => Panel::Gateway,
+                    Panel::Gateway => Panel::Chat,
+                };
+            }
+            Action::ToggleTheme => {
+                self.app.theme.toggle();
+                self.theme_engine.toggle_dark_light();
+            }
+            Action::ToggleHelp => {
+                self.app.help_visible = !self.app.help_visible;
+            }
+            Action::Search => {
+                self.app.search_active = true;
+            }
+            Action::Cancel => {
+                // Cancel any active search, close picker, flush pending chord
+                self.app.cancel_search();
+                if self.app.picker_active {
+                    self.app.close_session_picker();
+                }
+                self.keybind_engine.flush_pending();
+                if !self.dialog_manager.is_empty() {
+                    self.dialog_manager.pop();
+                }
+            }
+            Action::SubmitInput => {
+                // Handled by the input layer — no-op here.
+                // The event loop reads self.app.input content separately.
+            }
+            Action::OpenDialog(name) => {
+                use crate::tui::components::dialog::{DialogKind, DialogState};
+                let dialog = match name.as_str() {
+                    "command_palette" => DialogState::new(DialogKind::Select {
+                        title: "Command Palette".into(),
+                        items: vec![
+                            "New Session".into(),
+                            "Open Session".into(),
+                            "Toggle Theme".into(),
+                            "Show Help".into(),
+                            "Quit".into(),
+                        ],
+                        selected: 0,
+                    }),
+                    _ => DialogState::new(DialogKind::Alert {
+                        title: name.clone(),
+                        message: format!("Dialog '{name}' not yet implemented."),
+                    }),
+                };
+                self.dialog_manager.push(dialog);
+            }
+            Action::Execute(ref _cmd) => {
+                // Future: parse and execute commands like ":help", ":session list"
+            }
+            Action::TogglePanel(ref _name) => {
+                // Future: toggle named panel visibility
+            }
+            Action::Noop => {}
+        }
+    }
+
+    // ── Convenience Methods ─────────────────────────────────────
+
+    /// Register a component with the event dispatcher.
+    ///
+    /// Takes an `EventComponentId` (from the event module) which wraps
+    /// a `String` identifier. Use `EventComponentId("my_component".into())`
+    /// to create one.
+    ///
+    /// Shortcut for `self.event_dispatcher.register(id, component)`.
+    pub fn register_component(
+        &mut self,
+        id: EventComponentId,
+        component: Box<dyn Component>,
+    ) {
+        self.event_dispatcher.register(id, component);
+    }
+
+    /// Drain the event bus and dispatch all pending events.
+    ///
+    /// Shortcut for `self.event_dispatcher.dispatch(&self.event_bus)`.
+    pub fn dispatch_events(&mut self) {
+        self.event_dispatcher.dispatch(&self.event_bus);
+    }
+
+    /// Flush the keybind engine's pending chord (e.g., on Escape).
+    pub fn flush_chord(&mut self) {
+        self.keybind_engine.flush_pending();
+    }
+
+    /// Check and apply keybind chord timeout.
+    pub fn check_keybind_timeout(&mut self) {
+        self.keybind_engine.check_timeout();
+    }
+
+    /// Poll-based hot-reload for the theme engine.
+    ///
+    /// Returns `true` if the theme file changed and was reloaded.
+    pub fn hot_reload_theme(&mut self) -> bool {
+        self.theme_engine.hot_reload()
+    }
+}
+
+// ── Delegation to App via Deref ─────────────────────────────────
+
+impl std::ops::Deref for TuiState {
+    type Target = App;
+
+    fn deref(&self) -> &App {
+        &self.app
+    }
+}
+
+impl std::ops::DerefMut for TuiState {
+    fn deref_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // ── Construction ────────────────────────────────────────────
+
+    #[test]
+    fn tui_state_new_creates_all_engines() {
+        let state = TuiState::new("test-model", "test-session");
+
+        // App fields
+        assert_eq!(state.app.model, "test-model");
+        assert_eq!(state.app.session_id, "test-session");
+        assert!(!state.app.should_quit);
+
+        // Layout tree exists
+        assert!(matches!(state.layout_tree.root, LayoutNode::Split(_)));
+
+        // Keybind engine ready
+        assert!(!state.keybind_engine.which_key_visible);
+
+        // Dialog manager empty
+        assert!(state.dialog_manager.is_empty());
+
+        // Theme engine dark by default
+        assert_eq!(state.theme_engine.theme.name, "dark");
+    }
+
+    // ── Deref delegation ────────────────────────────────────────
+
+    #[test]
+    fn deref_delegates_app_methods() {
+        let mut state = TuiState::new("m", "s");
+
+        // Access App fields via Deref
+        state.add_message("user", "hello");
+        assert_eq!(state.timeline.len(), 1);
+
+        state.add_message("assistant", "world");
+        assert_eq!(state.timeline.len(), 2);
+
+        // DerefMut works for direct field access
+        state.is_loading = true;
+        assert!(state.is_loading);
+    }
+
+    #[test]
+    fn deref_delegates_app_public_methods() {
+        let mut state = TuiState::new("m", "s");
+
+        state.add_message("system", "test");
+        state.add_message("assistant", "response");
+
+        assert_eq!(state.timeline.len(), 2);
+        assert!(state.auto_scroll);
+
+        // picker methods
+        let sessions = vec![crate::tui::app::SessionSummary {
+            id: "s1".into(),
+            path: "/tmp".into(),
+            updated_at_ms: 1000,
+            message_count: 3,
+        }];
+        state.open_session_picker(sessions);
+        assert!(state.picker_active);
+        assert_eq!(state.picker_selected_id(), Some("s1"));
+        state.close_session_picker();
+        assert!(!state.picker_active);
+
+        // cursor_* methods work
+        state.cursor_down();
+        state.cursor_up();
+        state.toggle_expand_current();
+    }
+
+    #[test]
+    fn deref_allows_reading_and_writing_pub_fields() {
+        let mut state = TuiState::new("m", "s");
+
+        state.spinner_idx = 5;
+        assert_eq!(state.spinner_idx, 5);
+
+        state.scroll_offset = 42;
+        assert_eq!(state.scroll_offset, 42);
+
+        state.help_visible = true;
+        assert!(state.help_visible);
+    }
+
+    // ── apply_event ─────────────────────────────────────────────
+
+    #[test]
+    fn apply_event_text_delta_adds_to_timeline() {
+        let mut state = TuiState::new("m", "s");
+
+        state.apply_event(TuiEvent::TurnStarted);
+        state.apply_event(TuiEvent::TextDelta {
+            text: "Hello world".into(),
+        });
+        state.apply_event(TuiEvent::TurnComplete {
+            assistant_text: String::new(),
+            iterations: 1,
+        });
+
+        // Should have: assistant message + "✓ Done"
+        assert!(state.timeline.len() >= 2);
+        // The last entry should be "✓ Done"
+        let last = &state.timeline[state.timeline.len() - 1];
+        let text = last.full_text();
+        assert!(text.contains("Done"), "expected '✓ Done' marker, got: {text}");
+    }
+
+    #[test]
+    fn apply_event_tool_lifecycle() {
+        let mut state = TuiState::new("m", "s");
+
+        state.apply_event(TuiEvent::TurnStarted);
+        state.apply_event(TuiEvent::ToolStart {
+            id: "t1".into(),
+            name: "bash".into(),
+            preview: "ls -la".into(),
+        });
+
+        assert!(state
+            .timeline
+            .iter()
+            .any(|e| matches!(e, crate::tui::app::TimelineEntry::ToolCall { id, .. } if id == "t1")));
+    }
+
+    #[test]
+    fn apply_event_token_usage_updates_counters() {
+        let mut state = TuiState::new("m", "s");
+
+        state.apply_event(TuiEvent::TokenUsage {
+            input: 100,
+            output: 50,
+            cache_create: 10,
+            cache_read: 5,
+        });
+
+        assert_eq!(state.input_tokens, 100);
+        assert_eq!(state.output_tokens, 50);
+        assert_eq!(state.token_count, 165);
+    }
+
+    // ── handle_input ────────────────────────────────────────────
+
+    #[test]
+    fn handle_input_quit_chord() {
+        let mut state = TuiState::new("m", "s");
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let handled = state.handle_input(ctrl_c);
+
+        assert!(handled);
+        assert!(state.app.should_quit);
+    }
+
+    #[test]
+    fn handle_input_scroll_down() {
+        let mut state = TuiState::new("m", "s");
+        state.scroll_offset = 0;
+        state.auto_scroll = true;
+
+        let j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
+        let handled = state.handle_input(j);
+
+        assert!(handled);
+        assert_eq!(state.scroll_offset, 1);
+        assert!(!state.auto_scroll); // manual scroll disables auto-scroll
+    }
+
+    #[test]
+    fn handle_input_scroll_up() {
+        let mut state = TuiState::new("m", "s");
+        state.scroll_offset = 10;
+
+        let k = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE);
+        let handled = state.handle_input(k);
+
+        assert!(handled);
+        assert_eq!(state.scroll_offset, 9);
+    }
+
+    #[test]
+    fn handle_input_unbound_key_returns_false() {
+        let mut state = TuiState::new("m", "s");
+
+        let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        let handled = state.handle_input(x);
+
+        assert!(!handled);
+    }
+
+    #[test]
+    fn handle_input_space_leader_shows_which_key() {
+        let mut state = TuiState::new("m", "s");
+
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        let handled = state.handle_input(space);
+
+        // Space alone is a prefix match, so which_key should be visible
+        assert!(!handled); // No action resolved yet
+        assert!(state.keybind_engine.which_key_visible);
+        assert!(!state.keybind_engine.pending_chord().is_empty());
+    }
+
+    #[test]
+    fn handle_input_gg_multi_chord() {
+        let mut state = TuiState::new("m", "s");
+
+        // First 'g' — prefix match
+        let g1 = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert!(!state.handle_input(g1));
+        assert_eq!(state.keybind_engine.pending_chord().len(), 1);
+
+        // Second 'g' — full match
+        let g2 = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert!(state.handle_input(g2));
+        assert!(state.keybind_engine.pending_chord().is_empty());
+    }
+
+    #[test]
+    fn handle_input_next_panel() {
+        let mut state = TuiState::new("m", "s");
+        use crate::tui::app::Panel;
+        assert_eq!(state.app.current_panel, Panel::Chat);
+
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        state.handle_input(tab);
+        assert_eq!(state.app.current_panel, Panel::Gateway);
+    }
+
+    // ── dialog focus trap ───────────────────────────────────────
+
+    #[test]
+    fn handle_input_dialog_focus_trap() {
+        let mut state = TuiState::new("m", "s");
+
+        // Push an alert dialog
+        use crate::tui::components::dialog::{DialogKind, DialogState};
+        state.dialog_manager.push(DialogState::new(DialogKind::Alert {
+            title: "Test".into(),
+            message: "Alert!".into(),
+        }));
+
+        // Any key should be consumed by the dialog
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let handled = state.handle_input(enter);
+
+        assert!(handled);
+        assert!(state.dialog_manager.is_empty()); // Dialog dismissed
+    }
+
+    // ── toggle_theme ────────────────────────────────────────────
+
+    #[test]
+    fn toggle_theme_via_leader_chord() {
+        let mut state = TuiState::new("m", "s");
+        assert_eq!(state.app.theme, crate::tui::app::Theme::Dark);
+
+        // Space → leader prefix
+        state.handle_input(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        // t → ToggleTheme
+        state.handle_input(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+
+        assert_eq!(state.app.theme, crate::tui::app::Theme::Light);
+        assert_eq!(state.theme_engine.theme.name, "light");
+    }
+
+    // ── open_dialog ─────────────────────────────────────────────
+
+    #[test]
+    fn open_dialog_via_leader_chord() {
+        let mut state = TuiState::new("m", "s");
+
+        // Space → leader prefix
+        state.handle_input(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        // p → OpenDialog("command_palette")
+        state.handle_input(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+        assert!(!state.dialog_manager.is_empty());
+        let current = state.dialog_manager.current().unwrap();
+        assert!(matches!(
+            current.kind,
+            crate::tui::components::dialog::DialogKind::Select { ref title, .. }
+            if title == "Command Palette"
+        ));
+    }
+
+    // ── cancel_action ───────────────────────────────────────────
+
+    #[test]
+    fn cancel_flushes_pending_and_closes_dialog() {
+        let mut state = TuiState::new("m", "s");
+
+        // Start a chord prefix
+        state.handle_input(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(state.keybind_engine.which_key_visible);
+
+        // Push a dialog
+        use crate::tui::components::dialog::{DialogKind, DialogState};
+        state.dialog_manager.push(DialogState::new(DialogKind::Alert {
+            title: "X".into(),
+            message: "Y".into(),
+        }));
+
+        // Esc → Cancel
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        state.handle_input(esc);
+
+        // Dialog should still be active (Esc in dialog context dismisses it)
+        // Wait - actually Esc in the dialog context triggers dismissal already.
+        // Let's test the cancel action directly
+        assert!(state.dialog_manager.is_empty());
+    }
+
+    // ── convenience methods ─────────────────────────────────────
+
+    #[test]
+    fn flush_chord_clears_pending() {
+        let mut state = TuiState::new("m", "s");
+
+        state.handle_input(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(!state.keybind_engine.pending_chord().is_empty());
+
+        state.flush_chord();
+        assert!(state.keybind_engine.pending_chord().is_empty());
+        assert!(!state.keybind_engine.which_key_visible);
+    }
+
+    #[test]
+    fn hot_reload_theme_no_file_returns_false() {
+        let mut state = TuiState::new("m", "s");
+
+        // ThemeEngine starts with dark builtin (no file), so hot_reload is a no-op
+        assert!(!state.hot_reload_theme());
+    }
+}

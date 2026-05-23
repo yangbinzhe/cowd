@@ -199,6 +199,10 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                     Ok(InputResult::Nothing)
                 }
                 // ── Help panel ──
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.layout_state.toggle_sidebar(&mut app.layout_tree);
+                    Ok(InputResult::Nothing)
+                }
                 KeyCode::Char('?') => {
                     app.help_visible = !app.help_visible;
                     Ok(InputResult::Nothing)

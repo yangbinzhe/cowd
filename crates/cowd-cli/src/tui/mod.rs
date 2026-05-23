@@ -12,6 +12,7 @@ pub mod callbacks;
 pub mod widgets;
 pub mod osc52;
 pub mod md_renderer;
+pub mod state;
 pub mod test_utils;
 pub mod theme;
 

@@ -2,6 +2,7 @@
 use tui_textarea::TextArea;
 use ratatui::widgets::{Block, Borders};
 use crate::tui::TuiEvent;
+use crate::tui::layout::{LayoutState, LayoutTree, build_default_layout};
 
 /// A single entry in the time-ordered conversation timeline.
 /// Replaces the old split model of Vec<ChatMessage> + Vec<ToolCard> + streaming_thinking.
@@ -214,6 +215,12 @@ pub struct App {
     // ── Notification ──
     pub notification: Option<String>,
     notification_ttl: u32,
+
+    // ── Layout ──
+    /// The current layout tree defining the TUI split structure.
+    pub layout_tree: LayoutTree,
+    /// Runtime layout state (sidebar visibility, split ratio).
+    pub layout_state: LayoutState,
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +361,9 @@ impl App {
 
             notification: None,
             notification_ttl: 0,
+
+            layout_tree: build_default_layout(),
+            layout_state: LayoutState::new(),
         }
     }
 
