@@ -25,9 +25,19 @@ use ratatui::Frame;
 use crate::tui::accessibility::AccessibilityMode;
 use crate::tui::animation::{AnimationEngine, AnimationKind};
 use crate::tui::app::App;
+use crate::tui::components::agents_overlay::AgentsOverlay;
 use crate::tui::components::chat_view::ChatView;
+use crate::tui::components::command_palette::CommandPalette;
+use crate::tui::components::context_panel::ContextPanel;
 use crate::tui::components::dialog::DialogManager;
+use crate::tui::components::export_dialog::ExportDialog;
+use crate::tui::components::file_changes_panel::FileChangesPanel;
+use crate::tui::components::question_form::QuestionForm;
 use crate::tui::components::render_engine;
+use crate::tui::components::revert_dialog::RevertDialog;
+use crate::tui::components::thinking_panel::ThinkingPanel;
+use crate::tui::components::toast::{ToastManager, ToastVariant};
+use crate::tui::components::todo_panel::TodoPanel;
 use crate::tui::components::{Component, RenderContext};
 use crate::tui::error_recovery::{self, RenderResult};
 use crate::tui::event::dispatcher::EventDispatcher;
@@ -86,6 +96,38 @@ pub struct TuiState {
     /// Stack-based dialog manager for alerts, confirmations, prompts.
     pub dialog_manager: DialogManager,
 
+    /// Toast notification manager for transient status messages.
+    pub toast_manager: ToastManager,
+
+    /// Agents overlay showing subagent tree hierarchy.
+    pub agents_overlay: AgentsOverlay,
+
+    /// Thinking panel for reasoning + tool progress during active turns.
+    pub thinking_panel: ThinkingPanel,
+
+    /// Command palette for fuzzy command search (Ctrl+P).
+    pub command_palette: CommandPalette,
+
+    /// Active multi-step question form (None = not shown).
+    pub question_form: Option<QuestionForm>,
+
+    /// Export dialog for session export options.
+    pub export_dialog: ExportDialog,
+    /// Whether the export dialog is currently shown.
+    pub export_dialog_active: bool,
+
+    /// Revert dialog helper for per-message revert confirmation.
+    pub revert_dialog: RevertDialog,
+
+    /// Context panel showing token usage and cost.
+    pub context_panel: ContextPanel,
+
+    /// File changes panel showing modified files with +/- counts.
+    pub file_changes_panel: FileChangesPanel,
+
+    /// Todo panel displaying task list from TodoWrite tool calls.
+    pub todo_panel: TodoPanel,
+
     /// Frame-based animation engine for transitions and effects.
     pub animation_engine: AnimationEngine,
 
@@ -140,6 +182,17 @@ impl TuiState {
         let event_dispatcher = EventDispatcher::new();
         let theme_engine = ThemeEngine::new_dark();
         let dialog_manager = DialogManager::new();
+        let toast_manager = ToastManager::new();
+        let agents_overlay = AgentsOverlay::new();
+        let thinking_panel = ThinkingPanel::new();
+        let command_palette = CommandPalette::new();
+        let question_form = None;
+        let export_dialog = ExportDialog::new();
+        let export_dialog_active = false;
+        let revert_dialog = RevertDialog::new();
+        let context_panel = ContextPanel::new();
+        let file_changes_panel = FileChangesPanel::new();
+        let todo_panel = TodoPanel::new();
         let animation_engine = AnimationEngine::new();
         let frame_timer = FrameTimer::new();
         let render_profiler = RenderProfiler::new();
@@ -154,6 +207,17 @@ impl TuiState {
             event_dispatcher,
             theme_engine,
             dialog_manager,
+            toast_manager,
+            agents_overlay,
+            thinking_panel,
+            command_palette,
+            question_form,
+            export_dialog,
+            export_dialog_active,
+            revert_dialog,
+            context_panel,
+            file_changes_panel,
+            todo_panel,
             animation_engine,
             frame_timer,
             render_profiler,
@@ -179,6 +243,16 @@ impl TuiState {
     /// crossterm has no custom event type. Components should check
     /// for this and re-sync from App state as needed.
     pub fn apply_event(&mut self, event: TuiEvent) {
+        // Push toast on errors
+        if let TuiEvent::TurnError { ref error } = event {
+            self.toast_manager.push(
+                ToastVariant::Error,
+                Some("Error".into()),
+                error.clone(),
+                5000,
+            );
+        }
+
         // Preserve ALL existing App behavior
         self.app.apply_event(event);
 
@@ -194,17 +268,6 @@ impl TuiState {
 
     // ── Rendering ───────────────────────────────────────────────
 
-    /// Render the full TUI for one frame.
-    ///
-    /// Orchestration order:
-    /// 1. **Sync** — ChatView pulls latest timeline state from `App`.
-    /// 2. **Layout tree** — `render_engine::render_tree()` walks the
-    ///    layout tree and renders each component (placeholder for now).
-    /// 3. **ChatView** — rendered directly (so it can be synced beforehand).
-    /// 4. **Sync back** — ChatView persists scroll/viewport state to `App`.
-    /// 5. **Dialogs** — rendered on top with backdrop dimming.
-    ///
-    /// Skips rendering if msg_version unchanged and frame budget allows.
     pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let skin = self.app.skin.clone();
@@ -212,8 +275,25 @@ impl TuiState {
         // Animation tick: advance all active animations
         self.animation_engine.tick();
 
+        // Toast tick: advance auto-dismiss timers
+        self.toast_manager.tick();
+
         // Sync chat view from App state before rendering
         self.chat_view.sync_from_app(&self.app);
+
+        // Sync agents overlay from App state
+        self.agents_overlay.sync_from_app(&self.app);
+        self.agents_overlay.tick();
+
+        // Sync thinking panel from App state
+        self.thinking_panel.sync_from_app(&self.app);
+        self.thinking_panel.tick();
+
+        // Sync sidebar panels from App state
+        self.context_panel.sync_from_app(&self.app);
+        // FileChangesPanel uses load() not sync_from_app
+        // self.file_changes_panel stays as-is (populated by external load)
+        // TodoPanel extracts from timeline entries
 
         // 1. Render layout tree (placeholder for future panels)
         {
@@ -251,10 +331,61 @@ impl TuiState {
             }
         }
 
+        // 3. Render thinking panel when turn is active
+        if self.app.turn_active {
+            let degraded = {
+                let mut ctx = RenderContext::new(frame, &skin);
+                let _guard = self.render_profiler.guard("thinking_panel");
+                match error_recovery::catch_render_panic("thinking_panel", AssertUnwindSafe(|| {
+                    self.thinking_panel.render(&mut ctx, area);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
+        }
+
         // Sync back scroll/viewport state to App
         self.chat_view.sync_to_app(&mut self.app);
 
-        // 3. Render dialog stack on top (backdrop + centered dialog)
+        // 4. Render agents overlay when visible
+        if self.agents_overlay.visible {
+            let degraded = {
+                let mut ctx = RenderContext::new(frame, &skin);
+                let _guard = self.render_profiler.guard("agents_overlay");
+                match error_recovery::catch_render_panic("agents_overlay", AssertUnwindSafe(|| {
+                    self.agents_overlay.render(&mut ctx, area);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
+        }
+
+        // 5. Render toast notifications at top-right
+        if !self.toast_manager.is_empty() {
+            let degraded = {
+                let mut ctx = RenderContext::new(frame, &skin);
+                let _guard = self.render_profiler.guard("toast_manager");
+                match error_recovery::catch_render_panic("toast_manager", AssertUnwindSafe(|| {
+                    self.toast_manager.render(&mut ctx, area);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
+        }
+
+        // 6. Render dialog stack on top (backdrop + centered dialog)
         if !self.dialog_manager.is_empty() {
             let degraded = {
                 let mut ctx = RenderContext::new(frame, &skin);
@@ -271,7 +402,63 @@ impl TuiState {
             }
         }
 
-        // 4. Render startup loading overlay (highest z-index, below dialogs)
+        // 7. Render command palette when open
+        if self.command_palette.is_open() {
+            let degraded = {
+                let mut ctx = RenderContext::new(frame, &skin);
+                let _guard = self.render_profiler.guard("command_palette");
+                match error_recovery::catch_render_panic("command_palette", AssertUnwindSafe(|| {
+                    self.command_palette.render(&mut ctx, area);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
+        }
+
+        // 8. Render question form when active
+        if let Some(ref mut qf) = self.question_form {
+            if qf.is_active() {
+                let degraded = {
+                    let mut ctx = RenderContext::new(frame, &skin);
+                    let _guard = self.render_profiler.guard("question_form");
+                    match error_recovery::catch_render_panic("question_form", AssertUnwindSafe(|| {
+                        qf.render(&mut ctx, area);
+                    })) {
+                        RenderResult::Ok => None,
+                        RenderResult::Degraded(msg) => Some(msg),
+                    }
+                };
+                if let Some(msg) = degraded {
+                    self.add_message("system", &msg);
+                }
+            }
+        }
+
+        // 9. Render export dialog when active
+        if self.export_dialog_active {
+            let degraded = {
+                let mut ctx = RenderContext::new(frame, &skin);
+                let _guard = self.render_profiler.guard("export_dialog");
+                match error_recovery::catch_render_panic("export_dialog", AssertUnwindSafe(|| {
+                    self.export_dialog.render(&mut ctx, area);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
+        }
+
+        // 10. Render Ctrl+O message menu
+        self.render_message_menu(frame, area, &skin);
+
+        // 11. Render startup loading overlay (highest z-index, below dialogs)
         if self.startup_phase != StartupPhase::Done {
             self.render_startup_overlay(frame, area);
         }
@@ -318,6 +505,120 @@ impl TuiState {
     /// Returns the action the main loop should take in response.
     pub fn process_raw_key(&mut self, key: crossterm::event::KeyEvent) -> ProcessedKey {
         use crossterm::event::{KeyCode, KeyModifiers};
+
+        // ── Modal overlays: route keys to the topmost active overlay ──
+
+        // 0. Message menu (Ctrl+O context menu)
+        if self.chat_view.pending_message_menu {
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.app.copy_focused_content();
+                    self.chat_view.pending_message_menu = false;
+                    self.toast_manager.push(
+                        ToastVariant::Success,
+                        Some("Copied".into()),
+                        "Entry content copied to clipboard".into(),
+                        2000,
+                    );
+                    return ProcessedKey::Nothing;
+                }
+                KeyCode::Char('e') => {
+                    self.app.toggle_expand_current();
+                    self.chat_view.pending_message_menu = false;
+                    return ProcessedKey::Nothing;
+                }
+                KeyCode::Char('r') => {
+                    self.chat_view.pending_message_menu = false;
+                    let idx = self.chat_view.pending_menu_entry_idx;
+                    let diff_text = String::new();
+                    self.revert_dialog.open_revert_dialog(
+                        &mut self.dialog_manager,
+                        idx,
+                        &diff_text,
+                    );
+                    return ProcessedKey::Nothing;
+                }
+                KeyCode::Esc => {
+                    self.chat_view.pending_message_menu = false;
+                    return ProcessedKey::Nothing;
+                }
+                _ => return ProcessedKey::Nothing,
+            }
+        }
+
+        // 1. Command palette open → route keys to it
+        if self.command_palette.is_open() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.command_palette.close();
+                    return ProcessedKey::Nothing;
+                }
+                _ => {
+                    let event = crossterm::event::Event::Key(key);
+                    let result = self.command_palette.handle_event(&event);
+                    if result == crate::tui::components::EventResult::Consumed {
+                        if let Some(action) = self.command_palette.take_action() {
+                            self.dispatch_action(action);
+                        }
+                    }
+                    return ProcessedKey::Nothing;
+                }
+            }
+        }
+
+        // 2. Question form active → route keys to it
+        if let Some(ref mut qf) = self.question_form {
+            if qf.is_active() {
+                let consumed = qf.handle_key(&key);
+                if consumed {
+                    if qf.is_confirmed() {
+                        let answers = qf.take_answers();
+                        self.toast_manager.push(
+                            ToastVariant::Info,
+                            Some("Answers".into()),
+                            format!("Received {} answers", answers.len()),
+                            3000,
+                        );
+                    }
+                    if qf.is_rejected() {
+                        self.toast_manager.push(
+                            ToastVariant::Warning,
+                            Some("Dismissed".into()),
+                            "Question form dismissed".into(),
+                            2000,
+                        );
+                    }
+                    return ProcessedKey::Nothing;
+                }
+            }
+        }
+
+        // 3. Export dialog active → route keys to it
+        if self.export_dialog_active {
+            let event = crossterm::event::Event::Key(key);
+            let result = self.export_dialog.handle_event(&event);
+            if result == crate::tui::components::EventResult::Consumed {
+                if let Some(ref result) = self.export_dialog.result {
+                    self.toast_manager.push(
+                        ToastVariant::Success,
+                        Some("Export".into()),
+                        format!("Exporting to {}...", result.filename),
+                        3000,
+                    );
+                    self.export_dialog_active = false;
+                }
+                if self.export_dialog.cancelled {
+                    self.toast_manager.push(
+                        ToastVariant::Info,
+                        Some("Cancelled".into()),
+                        "Export cancelled".into(),
+                        2000,
+                    );
+                    self.export_dialog_active = false;
+                }
+                return ProcessedKey::Nothing;
+            }
+        }
 
         // ── Modal overrides (pick up where old input.rs left off) ──
         // 1. Picker active → route to dialog (already handled by dialog_manager in handle_input)
@@ -523,7 +824,21 @@ impl TuiState {
                 self.app.toggle_expand_current();
             }
             Action::Copy => {
-                self.app.copy_focused_content();
+                if self.app.copy_focused_content() {
+                    self.toast_manager.push(
+                        ToastVariant::Success,
+                        Some("Copied".into()),
+                        "Entry content copied to clipboard".into(),
+                        2000,
+                    );
+                } else {
+                    self.toast_manager.push(
+                        ToastVariant::Warning,
+                        Some("Copy".into()),
+                        "Nothing to copy".into(),
+                        2000,
+                    );
+                }
             }
             Action::Quit => {
                 self.app.should_quit = true;
@@ -541,6 +856,16 @@ impl TuiState {
                     Panel::Files => Panel::Gateway,
                     Panel::Gateway => Panel::Chat,
                 };
+            }
+            Action::ToggleCommandPalette => {
+                if self.command_palette.is_open() {
+                    self.command_palette.close();
+                } else {
+                    self.command_palette.open();
+                }
+            }
+            Action::ToggleAgentsOverlay => {
+                self.agents_overlay.toggle();
             }
             Action::ToggleTheme => {
                 self.app.theme.toggle();
@@ -619,26 +944,34 @@ impl TuiState {
             }
             Action::OpenDialog(name) => {
                 use crate::tui::components::dialog::{DialogKind, DialogState};
-                let dialog = match name.as_str() {
-                    "command_palette" => DialogState::new(DialogKind::Select {
-                        title: "Command Palette".into(),
-                        items: vec![
-                            "New Session".into(),
-                            "Open Session".into(),
-                            "Toggle Theme".into(),
-                            "Show Help".into(),
-                            "Quit".into(),
-                        ],
-                        selected: 0,
-                    }),
-                    _ => DialogState::new(DialogKind::Alert {
-                        title: name.clone(),
-                        message: format!("Dialog '{name}' not yet implemented."),
-                    }),
-                };
-                self.dialog_manager.push(dialog);
-                self.animation_engine
-                    .start_one_shot(AnimationKind::DialogFade, 4);
+                match name.as_str() {
+                    "export" => {
+                        self.export_dialog.reset();
+                        self.export_dialog_active = true;
+                    }
+                    _ => {
+                        let dialog = match name.as_str() {
+                            "command_palette" => DialogState::new(DialogKind::Select {
+                                title: "Command Palette".into(),
+                                items: vec![
+                                    "New Session".into(),
+                                    "Open Session".into(),
+                                    "Toggle Theme".into(),
+                                    "Show Help".into(),
+                                    "Quit".into(),
+                                ],
+                                selected: 0,
+                            }),
+                            _ => DialogState::new(DialogKind::Alert {
+                                title: name.clone(),
+                                message: format!("Dialog '{name}' not yet implemented."),
+                            }),
+                        };
+                        self.dialog_manager.push(dialog);
+                        self.animation_engine
+                            .start_one_shot(AnimationKind::DialogFade, 4);
+                    }
+                }
             }
             Action::Execute(ref _cmd) => {}
             Action::TogglePanel(ref _name) => {}
@@ -733,6 +1066,64 @@ impl TuiState {
                 }
             }
         }
+    }
+
+    /// Render the Ctrl+O per-message action menu when pending.
+    fn render_message_menu(&mut self, frame: &mut Frame, area: ratatui::layout::Rect, skin: &crate::tui::skin::SkinConfig) {
+        if !self.chat_view.pending_message_menu {
+            return;
+        }
+
+        use ratatui::layout::{Constraint, Direction, Layout};
+        use ratatui::style::{Color, Modifier, Style, Stylize};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+        let menu_items = [
+            ("c", "Copy", "Copy focused entry to clipboard"),
+            ("e", "Expand/Collapse", "Toggle expand/collapse"),
+            ("r", "Revert to here", "Revert session to this point"),
+        ];
+        let n = menu_items.len();
+
+        let w = 42u16;
+        let h = (n as u16 + 4).min(area.height.saturating_sub(2));
+        let x = (area.width.saturating_sub(w)) / 2;
+        let y = (area.height.saturating_sub(h)) / 2;
+        let menu_rect = ratatui::layout::Rect::new(x, y, w, h);
+
+        frame.render_widget(Clear, menu_rect);
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            " Message Actions ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::raw(""));
+
+        for (key, label, _desc) in &menu_items {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  [{key}] "),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    *label,
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  Esc to dismiss",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+        let paragraph = Paragraph::new(lines).block(block);
+        frame.render_widget(paragraph, menu_rect);
     }
 
     /// Render the startup loading overlay at the bottom of the screen.

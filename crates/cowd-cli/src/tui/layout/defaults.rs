@@ -39,12 +39,15 @@ impl Component for PlaceholderComponent {
 /// ```text
 /// Split(Horizontal, 0.7)
 ///   ├── Leaf("chat_view")           — 70 % of width
-///   └── TabGroup (5 panel tabs)     — 30 % of width
+///   └── TabGroup (8 panel tabs)     — 30 % of width
 ///         ├── Tab 0: "gateway"      (🌐)
 ///         ├── Tab 1: "files"        (📁)
 ///         ├── Tab 2: "memory"       (🧠)
 ///         ├── Tab 3: "skills"       (⚙️)
-///         └── Tab 4: "delegates"    (📋)
+///         ├── Tab 4: "delegates"    (📋)
+///         ├── Tab 5: "context"      (📊)
+///         ├── Tab 6: "changes"      (📄)
+///         └── Tab 7: "todo"         (☑)
 /// ```
 #[must_use]
 pub fn build_default_layout() -> LayoutTree {
@@ -78,6 +81,24 @@ pub fn build_default_layout() -> LayoutTree {
             label: "Delegates".to_string(),
             icon: Some("📋".to_string()),
             content: Box::new(PlaceholderComponent { id: "delegates" }),
+        },
+        TabDef {
+            id: "context".to_string(),
+            label: "Context".to_string(),
+            icon: Some("📊".to_string()),
+            content: Box::new(PlaceholderComponent { id: "context" }),
+        },
+        TabDef {
+            id: "changes".to_string(),
+            label: "Changes".to_string(),
+            icon: Some("📄".to_string()),
+            content: Box::new(PlaceholderComponent { id: "changes" }),
+        },
+        TabDef {
+            id: "todo".to_string(),
+            label: "Todo".to_string(),
+            icon: Some("☑".to_string()),
+            content: Box::new(PlaceholderComponent { id: "todo" }),
         },
     ];
 
@@ -269,7 +290,7 @@ mod tests {
                 // Second child: TabGroup with 5 tabs
                 match &split.children[1] {
                     LayoutNode::TabGroup(tg) => {
-                        assert_eq!(tg.tabs.len(), 5, "expected 5 panel tabs");
+                        assert_eq!(tg.tabs.len(), 8, "expected 8 panel tabs");
                         assert_eq!(tg.active, 0, "first tab should be active by default");
 
                         let expected: &[(&str, &str)] = &[
@@ -278,6 +299,9 @@ mod tests {
                             ("memory", "Memory"),
                             ("skills", "Skills"),
                             ("delegates", "Delegates"),
+                            ("context", "Context"),
+                            ("changes", "Changes"),
+                            ("todo", "Todo"),
                         ];
                         for (i, (id, label)) in expected.iter().enumerate() {
                             assert_eq!(
@@ -554,13 +578,25 @@ mod tests {
                         assert_eq!(tg.active, 4);
                         assert_eq!(tg.active_tab().unwrap().id, "delegates");
 
+                        tg.next_tab();
+                        assert_eq!(tg.active, 5);
+                        assert_eq!(tg.active_tab().unwrap().id, "context");
+
+                        tg.next_tab();
+                        assert_eq!(tg.active, 6);
+                        assert_eq!(tg.active_tab().unwrap().id, "changes");
+
+                        tg.next_tab();
+                        assert_eq!(tg.active, 7);
+                        assert_eq!(tg.active_tab().unwrap().id, "todo");
+
                         // Wrap around
                         tg.next_tab();
                         assert_eq!(tg.active, 0);
 
                         // Wrap around with prev
                         tg.prev_tab();
-                        assert_eq!(tg.active, 4);
+                        assert_eq!(tg.active, 7);
                     }
                     _ => panic!("expected TabGroup as second child"),
                 }
@@ -583,6 +619,9 @@ mod tests {
                         assert_eq!(tg.tabs[2].icon.as_deref(), Some("🧠"));
                         assert_eq!(tg.tabs[3].icon.as_deref(), Some("⚙️"));
                         assert_eq!(tg.tabs[4].icon.as_deref(), Some("📋"));
+                        assert_eq!(tg.tabs[5].icon.as_deref(), Some("📊"));
+                        assert_eq!(tg.tabs[6].icon.as_deref(), Some("📄"));
+                        assert_eq!(tg.tabs[7].icon.as_deref(), Some("☑"));
                     }
                     _ => panic!("expected TabGroup as second child"),
                 }

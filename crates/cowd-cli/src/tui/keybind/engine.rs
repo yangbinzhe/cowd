@@ -410,6 +410,22 @@ pub fn default_bindings() -> KeyMap {
         "Switch model",
         GROUP_SESSION,
     );
+    map.add_grouped(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)],
+        },
+        Action::ToggleCommandPalette,
+        "Command palette",
+        GROUP_DIALOG,
+    );
+    map.add_grouped(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE)],
+        },
+        Action::ToggleAgentsOverlay,
+        "Toggle agents overlay",
+        GROUP_SYSTEM,
+    );
 
     // ── Search ──
     map.add_grouped(
@@ -543,6 +559,17 @@ pub fn default_bindings() -> KeyMap {
         Action::ToggleTheme,
         "Toggle theme",
         GROUP_DIALOG,
+    );
+    map.add_grouped(
+        KeyChord {
+            keys: vec![
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            ],
+        },
+        Action::OpenDialog("export".into()),
+        "Export session",
+        GROUP_SESSION,
     );
     map.add_grouped(
         KeyChord {
@@ -923,8 +950,8 @@ mod tests {
             );
         }
 
-        // 7 leader chords in default_bindings
-        assert_eq!(bindings.len(), 7);
+        // 8 leader chords in default_bindings
+        assert_eq!(bindings.len(), 8);
     }
 
     // ── active_modal_name ──────────────────────────────────────────

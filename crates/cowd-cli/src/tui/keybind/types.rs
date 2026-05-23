@@ -83,6 +83,10 @@ pub enum Action {
     NextModel,
     /// Browse input history (true = older, false = newer).
     HistoryBrowse(bool),
+    /// Toggle the command palette overlay.
+    ToggleCommandPalette,
+    /// Toggle the agents overlay visibility.
+    ToggleAgentsOverlay,
     /// No operation — consumes the event without side effects.
     Noop,
 }

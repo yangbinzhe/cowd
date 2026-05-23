@@ -73,6 +73,8 @@ pub struct SessionSidebar {
     /// Fork target: `None` = full session, `Some(idx)` = user message index.
     /// Only valid when `pending_fork` is `true`.
     pub pending_fork_at: Option<usize>,
+    /// Set when user presses `e` — signals parent to open export dialog.
+    pub pending_export: bool,
 }
 
 impl SessionSidebar {
@@ -95,6 +97,7 @@ impl SessionSidebar {
             pending_new_session: false,
             pending_fork: false,
             pending_fork_at: None,
+            pending_export: false,
         }
     }
 
@@ -121,6 +124,7 @@ impl SessionSidebar {
         self.pending_new_session = false;
         self.pending_fork = false;
         self.pending_fork_at = None;
+        self.pending_export = false;
 
         // If current session is in the list, select it; otherwise start at 0
         self.selected_idx = self
@@ -457,6 +461,12 @@ impl SessionSidebar {
             // Fork dialog
             KeyCode::Char('f') => {
                 self.pending_fork = true;
+                EventResult::Consumed
+            }
+
+            // Export dialog
+            KeyCode::Char('e') => {
+                self.pending_export = true;
                 EventResult::Consumed
             }
 

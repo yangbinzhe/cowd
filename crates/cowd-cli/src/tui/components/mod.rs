@@ -5,6 +5,7 @@
 pub mod agents_overlay;
 pub mod base;
 pub mod chat_view;
+pub mod command_palette;
 pub mod context_panel;
 pub mod dialog;
 pub mod diff_viewer;
