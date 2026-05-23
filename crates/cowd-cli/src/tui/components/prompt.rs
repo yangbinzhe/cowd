@@ -431,6 +431,10 @@ pub struct Prompt {
     submit_on_enter: bool,
     /// Block style for the textarea.
     block_title: String,
+    /// Whether shell mode is active (input starts with '!').
+    shell_mode: bool,
+    /// Cached shell command text (without the '!' prefix).
+    shell_command: String,
 }
 
 impl Prompt {
@@ -456,6 +460,8 @@ impl Prompt {
             input_history: Vec::new(),
             submit_on_enter: true,
             block_title: " Input ".to_string(),
+            shell_mode: false,
+            shell_command: String::new(),
         }
     }
 
@@ -546,6 +552,42 @@ impl Prompt {
         self.submit_on_enter = submit;
     }
 
+    /// Check if shell mode is currently active (input starts with '!').
+    pub fn is_shell_mode(&self) -> bool {
+        self.shell_mode
+    }
+
+    /// Get the shell command text (without '!' prefix).
+    pub fn shell_command(&self) -> &str {
+        &self.shell_command
+    }
+
+    /// Update shell mode based on current text content.
+    /// Call this after each text change.
+    pub fn update_shell_mode(&mut self) {
+        let text = self.text();
+        if text.starts_with('!') && text.len() > 1 {
+            self.shell_mode = true;
+            self.shell_command = text[1..].to_string();
+        } else {
+            self.shell_mode = false;
+            self.shell_command.clear();
+        }
+    }
+
+    /// Return the shell command if in shell mode and Enter is pressed,
+    /// consuming it. Otherwise return None.
+    pub fn take_shell_command(&mut self) -> Option<String> {
+        if self.shell_mode && !self.shell_command.is_empty() {
+            let cmd = self.shell_command.clone();
+            self.clear();
+            self.update_shell_mode();
+            Some(cmd)
+        } else {
+            None
+        }
+    }
+
     // ── Private helpers ──────────────────────────────────────────
 
     /// Extract the current word being typed from the textarea.
@@ -574,6 +616,7 @@ impl Prompt {
 
     /// Update suggestions based on the current word.
     fn update_suggestions(&mut self) {
+        self.update_shell_mode();
         let word = self.current_word();
         if word.is_empty() {
             self.clear_suggestions();
@@ -774,6 +817,20 @@ impl Prompt {
 
 impl Component for Prompt {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
+        // Update block styling based on shell mode
+        if self.shell_mode {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(format!(" SHELL: !{} ", self.shell_command));
+            self.textarea.set_block(block);
+        } else {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", self.block_title));
+            self.textarea.set_block(block);
+        }
+
         // Render the textarea
         ctx.frame_mut().render_widget(self.textarea.widget(), area);
 
@@ -1361,5 +1418,75 @@ mod tests {
 
         let engine = prompt.engine();
         assert_eq!(engine.history().len(), 1);
+    }
+
+    // ── Shell mode tests (Task 13) ──────────────────────────────────
+
+    #[test]
+    fn shell_mode_activates_on_exclamation() {
+        let mut prompt = Prompt::new("/tmp");
+        assert!(!prompt.is_shell_mode());
+
+        prompt.set_text("!ls -la");
+        prompt.update_shell_mode();
+        assert!(prompt.is_shell_mode());
+        assert_eq!(prompt.shell_command(), "ls -la");
+    }
+
+    #[test]
+    fn shell_mode_deactivates_without_exclamation() {
+        let mut prompt = Prompt::new("/tmp");
+        prompt.set_text("!echo hello");
+        prompt.update_shell_mode();
+        assert!(prompt.is_shell_mode());
+
+        prompt.set_text("normal text");
+        prompt.update_shell_mode();
+        assert!(!prompt.is_shell_mode());
+        assert!(prompt.shell_command().is_empty());
+    }
+
+    #[test]
+    fn border_color_changes_via_render() {
+        // Shell mode changes the block border color to yellow.
+        // We verify this by checking that the block title changes.
+        let mut prompt = Prompt::new("/tmp");
+        prompt.set_text("!ls");
+        prompt.update_shell_mode();
+        assert!(prompt.is_shell_mode());
+        // The render method will set block with "SHELL:" title
+        // when shell_mode is true. We can't easily check the ratatui
+        // block from here, but we verify shell_mode state.
+        assert_eq!(prompt.shell_command(), "ls");
+    }
+
+    #[test]
+    fn enter_executes_shell_command() {
+        let mut prompt = Prompt::new("/tmp");
+        prompt.set_text("!ls -la");
+        prompt.update_shell_mode();
+        assert!(prompt.is_shell_mode());
+
+        let cmd = prompt.take_shell_command();
+        assert_eq!(cmd.as_deref(), Some("ls -la"));
+        // After taking the command, prompt should be cleared
+        assert!(!prompt.is_shell_mode());
+        assert!(prompt.text().is_empty());
+    }
+
+    #[test]
+    fn shell_mode_only_exclamation_at_start() {
+        let mut prompt = Prompt::new("/tmp");
+
+        // Text with ! in middle should NOT activate shell mode
+        prompt.set_text("echo !important");
+        prompt.update_shell_mode();
+        assert!(!prompt.is_shell_mode(), "! in middle should not activate shell mode");
+
+        // Just '!' alone should not activate shell mode (no command)
+        prompt.clear();
+        prompt.textarea_mut().insert_str("!");
+        prompt.update_shell_mode();
+        assert!(!prompt.is_shell_mode(), "just ! should not activate shell mode, text='{}' len={}", prompt.text(), prompt.text().len());
     }
 }

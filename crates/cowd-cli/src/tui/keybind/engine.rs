@@ -21,6 +21,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::types::{Action, KeyBinding, KeyChord, KeyMap, ModalLayer};
 
+// ── Group constants for which-key ─────────────────────────────────
+pub const GROUP_NAVIGATION: &str = "Navigation";
+pub const GROUP_SESSION: &str = "Session";
+pub const GROUP_FILES: &str = "Files";
+pub const GROUP_DIALOG: &str = "Dialog";
+pub const GROUP_SYSTEM: &str = "System";
+
 // ── Constants ──────────────────────────────────────────────────────
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -67,6 +74,8 @@ pub struct KeybindEngine {
     last_key_time: Option<Instant>,
     /// Whether the which-key overlay is currently visible.
     pub which_key_visible: bool,
+    /// Which group is selected in the which-key overlay (index into ALL_GROUPS).
+    pub which_key_group: usize,
     timeout: Duration,
 }
 
@@ -81,6 +90,7 @@ impl KeybindEngine {
             pending_chord: Vec::new(),
             last_key_time: None,
             which_key_visible: false,
+            which_key_group: 0,
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -281,65 +291,73 @@ pub fn default_bindings() -> KeyMap {
     let mut map = KeyMap::new();
 
     // ── Navigation (j/k, arrows, PgUp/Dn, Home, End) ──
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)],
         },
         Action::Scroll(1),
         "Scroll down",
+        GROUP_NAVIGATION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)],
         },
         Action::Scroll(-1),
         "Scroll up",
+        GROUP_NAVIGATION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)],
         },
         Action::Scroll(-1),
         "Cursor/scroll up",
+        GROUP_NAVIGATION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)],
         },
         Action::Scroll(1),
         "Cursor/scroll down",
+        GROUP_NAVIGATION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)],
         },
         Action::ScrollPage(-1),
         "Page up",
+        GROUP_NAVIGATION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)],
         },
         Action::ScrollPage(1),
         "Page down",
+        GROUP_NAVIGATION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)],
         },
         Action::ScrollTop,
         "Scroll to top",
+        GROUP_NAVIGATION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::End, KeyModifiers::NONE)],
         },
         Action::ScrollBottom,
         "Scroll to bottom",
+        GROUP_NAVIGATION,
     );
 
     // ── Multi-chord ──
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![
                 KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
@@ -348,125 +366,141 @@ pub fn default_bindings() -> KeyMap {
         },
         Action::ExpandCollapse,
         "Toggle expand/collapse",
+        GROUP_NAVIGATION,
     );
 
     // ── Ctrl keys ──
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)],
         },
         Action::TogglePanel("sidebar".into()),
         "Toggle sidebar",
+        GROUP_FILES,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
         },
         Action::Quit,
         "Quit",
+        GROUP_SESSION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)],
         },
         Action::ToggleTheme,
         "Toggle theme",
+        GROUP_DIALOG,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)],
         },
         Action::Copy,
         "Copy focused entry",
+        GROUP_SESSION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL)],
         },
         Action::NextModel,
         "Switch model",
+        GROUP_SESSION,
     );
 
     // ── Search ──
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)],
         },
         Action::Search,
         "Search timeline",
+        GROUP_DIALOG,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)],
         },
         Action::SearchNext,
         "Next search match",
+        GROUP_DIALOG,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE)],
         },
         Action::SearchPrev,
         "Previous search match",
+        GROUP_DIALOG,
     );
 
     // ── Help / which-key ──
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)],
         },
         Action::ToggleHelp,
         "Toggle which-key",
+        GROUP_DIALOG,
     );
 
     // ── History navigation ──
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)],
         },
         Action::HistoryBrowse(true),
         "Input history (older)",
+        GROUP_SESSION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)],
         },
         Action::HistoryBrowse(false),
         "Input history (newer)",
+        GROUP_SESSION,
     );
 
     // ── Special keys ──
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)],
         },
         Action::NextPanel,
         "Next panel/tab",
+        GROUP_SESSION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)],
         },
         Action::PrevPanel,
         "Previous panel/tab",
+        GROUP_SESSION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)],
         },
         Action::Cancel,
         "Cancel",
+        GROUP_DIALOG,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)],
         },
         Action::SubmitInput,
         "Submit input",
+        GROUP_SESSION,
     );
 
     // ── Space-leader chords ──
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![
                 KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -475,8 +509,9 @@ pub fn default_bindings() -> KeyMap {
         },
         Action::Search,
         "Find / search",
+        GROUP_DIALOG,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![
                 KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -485,8 +520,9 @@ pub fn default_bindings() -> KeyMap {
         },
         Action::OpenDialog("command_palette".into()),
         "Command palette",
+        GROUP_DIALOG,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![
                 KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -495,8 +531,9 @@ pub fn default_bindings() -> KeyMap {
         },
         Action::Quit,
         "Quit",
+        GROUP_SESSION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![
                 KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -505,8 +542,9 @@ pub fn default_bindings() -> KeyMap {
         },
         Action::ToggleTheme,
         "Toggle theme",
+        GROUP_DIALOG,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![
                 KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -515,8 +553,9 @@ pub fn default_bindings() -> KeyMap {
         },
         Action::ToggleHelp,
         "Toggle which-key",
+        GROUP_DIALOG,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![
                 KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -525,8 +564,9 @@ pub fn default_bindings() -> KeyMap {
         },
         Action::Scroll(5),
         "Scroll down 5",
+        GROUP_NAVIGATION,
     );
-    map.add(
+    map.add_grouped(
         KeyChord {
             keys: vec![
                 KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -535,6 +575,7 @@ pub fn default_bindings() -> KeyMap {
         },
         Action::Scroll(-5),
         "Scroll up 5",
+        GROUP_NAVIGATION,
     );
 
     map
@@ -715,6 +756,7 @@ mod tests {
             action: Action::Noop,
             description: "j is noop in insert mode",
             modal: Some("insert".into()),
+            group: "System",
         });
         eng.push_modal(modal);
 
@@ -748,6 +790,7 @@ mod tests {
             action: Action::Copy,
             description: "Copy in special mode",
             modal: Some("special".into()),
+            group: "System",
         });
         eng.push_modal(modal);
 

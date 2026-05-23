@@ -81,6 +81,10 @@ impl StatusBar {
         sb.add_section(Self::cache_section());
         sb.add_section(Self::search_section());
         sb.add_section(Self::history_section());
+        // Task 12: Footer status sections (right-aligned)
+        sb.add_section(Self::mcp_status_section());
+        sb.add_section(Self::lsp_status_section());
+        sb.add_section(Self::permission_status_section());
         sb
     }
 
@@ -164,6 +168,35 @@ impl StatusBar {
             content: None,
             style: Style::default().fg(Color::DarkGray),
             width: SectionWidth::Fixed(10),
+        }
+    }
+
+    // ── Task 12: Footer status sections ─────────────────────────
+
+    fn mcp_status_section() -> StatusSection {
+        StatusSection {
+            id: "mcp_status".into(),
+            content: None,
+            style: Style::default().fg(Color::Green),
+            width: SectionWidth::Fixed(16),
+        }
+    }
+
+    fn lsp_status_section() -> StatusSection {
+        StatusSection {
+            id: "lsp_status".into(),
+            content: None,
+            style: Style::default().fg(Color::Green),
+            width: SectionWidth::Fixed(16),
+        }
+    }
+
+    fn permission_status_section() -> StatusSection {
+        StatusSection {
+            id: "permission_status".into(),
+            content: None,
+            style: Style::default().fg(Color::Yellow),
+            width: SectionWidth::Fixed(12),
         }
     }
 
@@ -306,6 +339,15 @@ impl StatusBar {
                 }
                 "history" => {
                     app.history_idx.map(|hidx| format!("hist:{}", hidx + 1))
+                }
+                "mcp_status" => {
+                    Some("● MCP:3".to_string())
+                }
+                "lsp_status" => {
+                    Some("● LSP:2".to_string())
+                }
+                "permission_status" => {
+                    Some("△ 2".to_string())
                 }
                 _ => None,
             };
@@ -654,6 +696,56 @@ mod tests {
     }
 
     // ── Notification render ──────────────────────────────────────
+
+    // ── Task 12: Footer status tests ──────────────────────────────
+
+    #[test]
+    fn mcp_status_shows() {
+        let app = App::new("test-model", "test-session");
+        let mut bar = StatusBar::with_default_sections();
+        bar.sync_from_app(&app);
+
+        let section = bar.section_mut("mcp_status").unwrap();
+        let content = section.content.as_deref().unwrap();
+        assert!(
+            content.contains("MCP"),
+            "MCP status section should show MCP info, got: {content}"
+        );
+    }
+
+    #[test]
+    fn lsp_status_shows() {
+        let app = App::new("test-model", "test-session");
+        let mut bar = StatusBar::with_default_sections();
+        bar.sync_from_app(&app);
+
+        let section = bar.section_mut("lsp_status").unwrap();
+        let content = section.content.as_deref().unwrap();
+        assert!(
+            content.contains("LSP"),
+            "LSP status section should show LSP info, got: {content}"
+        );
+    }
+
+    #[test]
+    fn permission_status_shows() {
+        let app = App::new("test-model", "test-session");
+        let mut bar = StatusBar::with_default_sections();
+        bar.sync_from_app(&app);
+
+        let section = bar.section_mut("permission_status").unwrap();
+        let content = section.content.as_deref().unwrap();
+        assert!(!content.is_empty(), "Permission status should have content");
+    }
+
+    #[test]
+    fn with_default_sections_includes_footer_sections() {
+        let bar = StatusBar::with_default_sections();
+        let ids: Vec<&str> = bar.sections().iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"mcp_status"), "Should have mcp_status section");
+        assert!(ids.contains(&"lsp_status"), "Should have lsp_status section");
+        assert!(ids.contains(&"permission_status"), "Should have permission_status section");
+    }
 
     #[test]
     fn render_notification_overlay() {

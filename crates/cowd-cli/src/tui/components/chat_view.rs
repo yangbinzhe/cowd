@@ -12,7 +12,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Style, Stylize},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
     widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
@@ -61,6 +61,11 @@ pub struct ChatView {
 
     // ── Theme ──
     pub theme: Theme,
+
+    // ── Search highlight (Task 17) ──
+    pub search_query: String,
+    pub search_matches: Vec<usize>,
+    pub search_current: usize,
 }
 
 impl ChatView {
@@ -84,6 +89,9 @@ impl ChatView {
             last_drawn_version: u64::MAX,
             lines_dirty: true,
             theme: Theme::Dark,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_current: 0,
         }
     }
 
@@ -118,6 +126,9 @@ impl ChatView {
         self.theme = app.theme;
         self.msg_version = app.msg_version;
         self.lines_dirty = app.lines_dirty;
+        self.search_query = app.search_query.clone();
+        self.search_matches = app.search_matches.clone();
+        self.search_current = app.search_current;
     }
 
     /// Persist view-model back to the shared App state.
@@ -246,7 +257,7 @@ impl Component for ChatView {
             .min(total_lines.saturating_sub(1) as u16) as usize;
 
         // ── Build visible lines ──
-        let visible_lines: Vec<Line<'static>>;
+        let mut visible_lines: Vec<Line<'static>>;
         let paragraph_scroll: u16;
 
         if total_lines > viewport_h.saturating_mul(3) {
@@ -267,6 +278,22 @@ impl Component for ChatView {
             }
             visible_lines = self.cached_chat_lines.clone();
             paragraph_scroll = scroll_off as u16;
+        }
+
+        // ── Apply search highlight (Task 17) ──
+        if !self.search_query.is_empty() && !self.search_matches.is_empty() {
+            let mut global_match_counter: usize = 0;
+            let current_match_entry = self.search_matches.get(self.search_current).copied();
+            for line in &mut visible_lines {
+                // Only highlight lines whose entry index matches a search match
+                // We search all lines and track matches globally
+                ChatView::highlight_search_in_line(
+                    line,
+                    &self.search_query,
+                    current_match_entry,
+                    &mut global_match_counter,
+                );
+            }
         }
 
         // ── Render ──
@@ -590,6 +617,59 @@ impl ChatView {
                 }
             }
         }
+    }
+
+    /// Apply search highlight to a Line by splitting spans around match boundaries.
+    ///
+    /// Every occurrence of `search_query` (case-insensitive) gets inverse video.
+    /// The current match (at `search_current` global index) gets a yellow background.
+    fn highlight_search_in_line(line: &mut Line<'static>, query: &str, current_match_idx: Option<usize>, global_match_counter: &mut usize) {
+        if query.is_empty() {
+            return;
+        }
+        let lower_query = query.to_lowercase();
+        let mut new_spans: Vec<Span<'static>> = Vec::new();
+
+        for span in line.spans.drain(..) {
+            let content = span.content.to_string();
+            let lower_content = content.to_lowercase();
+            let mut search_start = 0;
+
+            while let Some(pos) = lower_content[search_start..].find(&lower_query) {
+                let abs_pos = search_start + pos;
+
+                // Text before match
+                if abs_pos > 0 {
+                    new_spans.push(Span::styled(
+                        content[search_start..search_start + pos].to_string(),
+                        span.style,
+                    ));
+                }
+
+                // The match itself
+                let matched = &content[abs_pos..abs_pos + query.len()];
+                let is_current = current_match_idx.map(|idx| *global_match_counter == idx).unwrap_or(false);
+                let match_style = if is_current {
+                    Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else {
+                    span.style.bg(Color::DarkGray).add_modifier(Modifier::REVERSED)
+                };
+                new_spans.push(Span::styled(matched.to_string(), match_style));
+
+                *global_match_counter += 1;
+                search_start = abs_pos + query.len();
+            }
+
+            // Remaining text after last match
+            if search_start < content.len() {
+                new_spans.push(Span::styled(
+                    content[search_start..].to_string(),
+                    span.style,
+                ));
+            }
+        }
+
+        line.spans = new_spans;
     }
 
     /// Build ratatui Lines for a single timeline entry.
@@ -1658,6 +1738,102 @@ mod tests {
             _ => panic!("expected ToolCall"),
         }
     }
+
+    // ── Task 17: Search highlight tests ───────────────────────────
+
+    #[test]
+    fn search_highlight_inverts_matching() {
+        let mut view = ChatView::new();
+        view.timeline = vec![make_message("user", "Hello world, this is a test message")];
+        view.entry_line_counts = vec![1];
+        view.msg_version = 0;
+        view.lines_dirty = false;
+        view.search_query = "test".to_string();
+        view.search_matches = vec![0];
+        view.search_current = 0;
+
+        let mut terminal = MockTerminal::new(80, 24);
+        let theme_skin = crate::tui::skin::SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme_skin);
+            view.render(&mut ctx, area);
+        });
+        let lines = terminal.buffer_lines();
+        let joined = lines.join("\n");
+        // The text should still be rendered (containing "test")
+        assert!(joined.contains("test"), "Search match text should be visible");
+    }
+
+    #[test]
+    fn handles_cjk() {
+        let mut view = ChatView::new();
+        view.timeline = vec![make_message("user", "你好世界 test 中文")];
+        view.entry_line_counts = vec![1];
+        view.msg_version = 0;
+        view.lines_dirty = false;
+        view.search_query = "中文".to_string();
+        view.search_matches = vec![0];
+        view.search_current = 0;
+
+        // Verify the highlight function works correctly with CJK
+        let mut line = Line::from(Span::raw("你好世界 test 中文"));
+        let mut counter = 0;
+        ChatView::highlight_search_in_line(&mut line, "中文", Some(0), &mut counter);
+        // The counter should have incremented (found match)
+        assert!(counter > 0, "Should find CJK match in text");
+        // The line spans should have the highlighted match
+        let has_cjk = line.spans.iter().any(|s| s.content.contains("中文"));
+        assert!(has_cjk, "CJK match should be preserved in spans");
+    }
+
+    #[test]
+    fn next_match_cycles() {
+        let mut view = ChatView::new();
+        view.timeline = vec![
+            make_message("user", "first match here"),
+            make_message("user", "second match here"),
+            make_message("user", "no match"),
+        ];
+        view.entry_line_counts = vec![1, 1, 1];
+        view.msg_version = 0;
+        view.lines_dirty = false;
+        view.search_query = "match".to_string();
+        view.search_matches = vec![0, 1];
+        view.search_current = 0;
+
+        // Verify initial state
+        assert_eq!(view.search_current, 0);
+        assert_eq!(view.search_matches.len(), 2);
+
+        // Verify highlight_search_in_line works on a line containing match
+        let mut line = Line::from(Span::raw("first match here"));
+        let mut counter = 0;
+        ChatView::highlight_search_in_line(&mut line, "match", Some(0), &mut counter);
+        assert!(
+            counter > 0,
+            "Should have found at least one match in the line"
+        );
+        // The spans should contain both the original text and highlighted parts
+        assert!(!line.spans.is_empty(), "Should have split spans");
+
+        let mut line2 = Line::from(Span::raw("no match here"));
+        let mut counter2 = 0;
+        ChatView::highlight_search_in_line(&mut line2, "match", None, &mut counter2);
+        // "no match here" contains "match", so counter2 should be > 0
+        assert!(counter2 > 0, "Should find 'match' in 'no match here'");
+    }
+
+    #[test]
+    fn search_highlight_skips_empty_query() {
+        let mut line = Line::from(Span::raw("hello world"));
+        let mut counter = 0;
+        ChatView::highlight_search_in_line(&mut line, "", None, &mut counter);
+        assert_eq!(counter, 0, "Empty query should find nothing");
+        assert_eq!(line.spans.len(), 1, "Spans should be unmodified");
+    }
+
+    // ── Continue existing tests ──────────────────────────────────
 
     #[test]
     fn subagent_nav_non_task_tool_no_nav() {

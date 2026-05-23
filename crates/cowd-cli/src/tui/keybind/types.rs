@@ -94,6 +94,8 @@ pub struct KeyBinding {
     pub action: Action,
     pub description: &'static str,
     pub modal: Option<String>,
+    /// Group for which-key rendering: "Session" | "Navigation" | "Files" | "Dialog" | "System"
+    pub group: &'static str,
 }
 
 /// A flat map of keybindings with lookup and query methods.
@@ -126,12 +128,18 @@ impl KeyMap {
     }
 
     /// Add a keybinding without a modal scope.
-    pub fn add(&mut self, chord: KeyChord, action: Action, description: &'static str) {
+    pub fn add(
+        &mut self,
+        chord: KeyChord,
+        action: Action,
+        description: &'static str,
+    ) {
         self.bindings.push(KeyBinding {
             chord,
             action,
             description,
             modal: None,
+            group: "System",
         });
     }
 
@@ -148,6 +156,24 @@ impl KeyMap {
             action,
             description,
             modal: Some(modal),
+            group: "System",
+        });
+    }
+
+    /// Add a keybinding with a specified group.
+    pub fn add_grouped(
+        &mut self,
+        chord: KeyChord,
+        action: Action,
+        description: &'static str,
+        group: &'static str,
+    ) {
+        self.bindings.push(KeyBinding {
+            chord,
+            action,
+            description,
+            modal: None,
+            group,
         });
     }
 
