@@ -218,6 +218,12 @@ impl SessionStore {
         session_path: &Path,
         session: &Session,
     ) -> Result<(), SessionControlError> {
+        // Sessions stored in the user-level sessions root skip workspace validation
+        if !path_is_within_workspace(session_path, &self.workspace_root)
+            && session_path.starts_with(&self.sessions_root)
+        {
+            return Ok(());
+        }
         let Some(actual) = session.workspace_root() else {
             if path_is_within_workspace(session_path, &self.workspace_root) {
                 return Ok(());

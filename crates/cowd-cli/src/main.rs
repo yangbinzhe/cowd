@@ -10496,13 +10496,9 @@ UU conflicted.rs",
         let handle = create_managed_session_handle("session-alpha").expect("jsonl handle");
         assert!(handle.path.ends_with("session-alpha.jsonl"));
 
-        let legacy_path = workspace.join(".cowd/sessions/legacy.json");
-        std::fs::create_dir_all(
-            legacy_path
-                .parent()
-                .expect("legacy path should have parent directory"),
-        )
-        .expect("session dir should exist");
+        // Place a legacy session in the managed sessions dir to test resolution
+        let sessions_root = handle.path.parent().expect("handle path should have parent");
+        let legacy_path = sessions_root.join("legacy.json");
         Session::new()
             .with_workspace_root(workspace.clone())
             .with_persistence_path(legacy_path.clone())
