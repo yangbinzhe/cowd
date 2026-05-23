@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -83,8 +84,45 @@ pub enum PermissionPromptDecision {
 }
 
 /// Prompting interface used when policy requires interactive approval.
-pub trait PermissionPrompter {
+pub trait PermissionPrompter: Send + Sync + 'static {
     fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision;
+}
+
+/// Thread-safe, shared wrapper around an optional [`PermissionPrompter`].
+///
+/// Enables concurrent tool execution to share a single permission prompter
+/// without requiring `&mut self` on the runtime.
+pub struct SharedPrompter {
+    inner: Arc<std::sync::Mutex<Option<Box<dyn PermissionPrompter>>>>,
+}
+
+impl SharedPrompter {
+    /// Create a shared prompter wrapping the given implementation.
+    pub fn new(prompter: Box<dyn PermissionPrompter>) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(Some(prompter))),
+        }
+    }
+
+    /// Create a shared prompter with no backing implementation (always `None`).
+    pub fn none() -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Lock the inner prompter and return a guard.
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, Option<Box<dyn PermissionPrompter>>> {
+        self.inner.lock().expect("SharedPrompter lock poisoned")
+    }
+}
+
+impl Clone for SharedPrompter {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 /// Final authorization result after evaluating static rules and prompts.

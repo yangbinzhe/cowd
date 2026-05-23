@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::io;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use tui_textarea::TextArea;
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, MouseButton};
+use tui_textarea::{TextArea, CursorMove};
 use ratatui::widgets::{Block, Borders};
 use super::app::App;
 
@@ -135,7 +135,33 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                 KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if app.input.is_empty() {
                         app.copy_focused_content();
+                    } else {
+                        app.input.redo();
                     }
+                    Ok(InputResult::Nothing)
+                }
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.input.move_cursor(CursorMove::Head);
+                    Ok(InputResult::Nothing)
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.input.move_cursor(CursorMove::End);
+                    Ok(InputResult::Nothing)
+                }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.input.delete_word();
+                    Ok(InputResult::Nothing)
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.input.delete_line_by_head();
+                    Ok(InputResult::Nothing)
+                }
+                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.input.delete_line_by_end();
+                    Ok(InputResult::Nothing)
+                }
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.input.undo();
                     Ok(InputResult::Nothing)
                 }
                 // ── Model switching: Ctrl+M ──
@@ -180,6 +206,18 @@ pub fn handle_input(app: &mut App) -> io::Result<InputResult> {
                 _ => { app.input.input(key); Ok(InputResult::Nothing) }
             }
         }
+        Event::Mouse(mouse_event) => match mouse_event.kind {
+            MouseEventKind::ScrollDown => {
+                app.auto_scroll = false;
+                app.scroll_offset = app.scroll_offset.saturating_add(3);
+                Ok(InputResult::Nothing)
+            }
+            MouseEventKind::ScrollUp => {
+                app.scroll_offset = app.scroll_offset.saturating_sub(3);
+                Ok(InputResult::Nothing)
+            }
+            _ => Ok(InputResult::Nothing),
+        },
         _ => Ok(InputResult::Nothing),
     }
 }

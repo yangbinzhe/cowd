@@ -1283,7 +1283,7 @@ impl OpenAiApiClient {
 struct HttpToolExecutor;
 
 impl ToolExecutor for HttpToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+    fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         // Parse the input JSON
         let input_value: serde_json::Value = serde_json::from_str(input)
             .map_err(|e| ToolError::new(format!("invalid input JSON: {}", e)))?;

@@ -2638,6 +2638,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     use std::io;
     use crossterm::{
         execute,
+        event::{EnableMouseCapture, DisableMouseCapture},
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, enable_raw_mode, disable_raw_mode},
     };
     use ratatui::backend::CrosstermBackend;
@@ -2645,7 +2646,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -2655,7 +2656,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     let mut app = tui::App::new(&cli.model, &session_id);
     app.add_message("system", &cli.startup_banner());
     app.add_message("system", &format_connected_line(&cli.model));
-    load_session_history(&mut app, cli.runtime.session());
+    load_session_history(&mut app, &cli.runtime.session());
     refresh_panels(&mut app, &workspace, &cli.runtime);
 
     let mut turn_handle: Option<std::thread::JoinHandle<tui::TurnOutcome>> = None;
@@ -2664,7 +2665,6 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
     let res = (|| -> Result<(), Box<dyn std::error::Error>> {
         let frame_budget = std::time::Duration::from_millis(8);
-        let render_throttle = std::time::Duration::from_millis(16);
         let mut last_render_time = std::time::Instant::now();
         loop {
             let frame_start = std::time::Instant::now();
@@ -2703,8 +2703,13 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                     abort_signal_for_turn = None;
                 }
 
-            // Throttle rendering during active turns to avoid burning CPU
-            // on redundant terminal redraws. Events are still drained in real-time.
+            // Adaptive render throttle: 32ms when turn is active (CPU savings),
+            // 16ms when idle (responsive feel for navigating history).
+            let render_throttle = if app.turn_active {
+                std::time::Duration::from_millis(32)
+            } else {
+                std::time::Duration::from_millis(16)
+            };
             let since_last_render = last_render_time.elapsed();
             if since_last_render >= render_throttle || !app.turn_active {
                 terminal.draw(|f| tui::render::draw(f, &mut app))?;
@@ -2808,7 +2813,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
     cli.persist_session()?;
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     res
 }
@@ -3715,7 +3720,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Stats => {
-                let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
+                let usage = UsageTracker::from_session(&self.runtime.session()).cumulative_usage();
                 println!("{}", format_cost_report(usage));
                 false
             }
@@ -3874,7 +3879,7 @@ impl LiveCli {
         let session_entries = &self.runtime.session().prompt_history;
         let entries = if session_entries.is_empty() {
             if self.prompt_history.is_empty() {
-                collect_session_prompt_history(self.runtime.session())
+                collect_session_prompt_history(&self.runtime.session())
             } else {
                 self.prompt_history
                     .iter()
@@ -4190,8 +4195,8 @@ impl LiveCli {
         &self,
         requested_path: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let export_path = resolve_export_path(requested_path, self.runtime.session())?;
-        fs::write(&export_path, render_export_text(self.runtime.session()))?;
+        let export_path = resolve_export_path(requested_path, &self.runtime.session())?;
+        fs::write(&export_path, render_export_text(&self.runtime.session()))?;
         println!(
             "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
             export_path.display(),
@@ -4452,7 +4457,7 @@ impl LiveCli {
 
     fn run_debug_tool_call(&self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         validate_no_args("/debug-tool-call", args)?;
-        println!("{}", render_last_tool_debug_report(self.runtime.session())?);
+        println!("{}", render_last_tool_debug_report(&self.runtime.session())?);
         Ok(())
     }
 
@@ -7890,7 +7895,7 @@ impl CliToolExecutor {
 }
 
 impl ToolExecutor for CliToolExecutor {
-    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+    fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         if self
             .allowed_tools
             .as_ref()

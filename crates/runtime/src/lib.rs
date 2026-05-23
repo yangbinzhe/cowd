@@ -67,6 +67,7 @@ mod trust_resolver;
 mod usage;
 pub mod worker_boot;
 pub mod tool_orchestrator;
+pub mod tool_dispatch;
 pub mod agent;
 pub mod approval_gate;
 pub mod pairing;

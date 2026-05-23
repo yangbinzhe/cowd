@@ -333,6 +333,20 @@ pub fn build_entry(entry: &TimelineEntry, is_focused: bool, lines: &mut Vec<Line
             };
             let total_lines = content.lines().count();
             const MAX_LINES: usize = 500;
+            // Use full markdown rendering for assistant messages
+            if role == "assistant" {
+                let md_lines = super::super::md_renderer::render_markdown_lines(content, color);
+                for line in md_lines.into_iter().take(MAX_LINES) {
+                    lines.push(line);
+                }
+                if total_lines > MAX_LINES {
+                    lines.push(Line::from(Span::styled(
+                        format!("  ... ({} more lines truncated)", total_lines.saturating_sub(MAX_LINES)),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                return;
+            }
             for (i, line) in content.lines().enumerate() {
                 if i >= MAX_LINES {
                     lines.push(Line::from(Span::styled(
