@@ -7,18 +7,21 @@ use std::time::UNIX_EPOCH;
 use crate::session::{Session, SessionError};
 
 /// Per-worktree session store that namespaces on-disk session files by
-/// workspace fingerprint so that parallel `opencode serve` instances never
+/// workspace fingerprint so that parallel `cowd serve` instances never
 /// collide.
 ///
-/// Create via [`SessionStore::from_cwd`] (derives the store path from the
-/// server's working directory) or [`SessionStore::from_data_dir`] (honours an
-/// explicit `--data-dir` flag).  Both constructors produce a directory layout
-/// of `<data_dir>/sessions/<workspace_hash>/` where `<workspace_hash>` is a
-/// stable hex digest of the canonical workspace root.
+/// Sessions default to the **user-level** directory `~/.cowd/sessions/`
+/// to avoid scattering session data in project `.gitignore` paths.
+///
+/// Create via [`SessionStore::from_cwd`] (sessions go to
+/// `~/.cowd/sessions/projects/<workspace_hash>/`) or
+/// [`SessionStore::from_data_dir`] (honours an explicit `--data-dir` flag).
+/// Use [`SessionStore::from_project_dir`] for the legacy project-local layout
+/// (`<project>/.cowd/sessions/<hash>/`) when project-scoped isolation is
+/// explicitly required.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStore {
-    /// Resolved root of the session namespace, e.g.
-    /// `/home/user/project/.cowd/sessions/a1b2c3d4e5f60718/`.
+    /// Resolved root of the session namespace.
     sessions_root: PathBuf,
     /// The canonical workspace path that was fingerprinted.
     workspace_root: PathBuf,
@@ -27,24 +30,18 @@ pub struct SessionStore {
 impl SessionStore {
     /// Build a store from the server's current working directory.
     ///
-    /// The on-disk layout becomes `<cwd>/.cowd/sessions/<workspace_hash>/`.
+    /// Sessions go to `~/.cowd/sessions/projects/<workspace_hash>/`.
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
-        let sessions_root = cwd
-            .join(".cowd")
-            .join("sessions")
-            .join(workspace_fingerprint(cwd));
+        let fp = workspace_fingerprint(cwd);
+        let sessions_root = crate::cowd_dirs::user_project_sessions_dir(&fp);
         fs::create_dir_all(&sessions_root)?;
-        Ok(Self {
-            sessions_root,
-            workspace_root: cwd.to_path_buf(),
-        })
+        Ok(Self { sessions_root, workspace_root: cwd.to_path_buf() })
     }
 
     /// Build a store from an explicit `--data-dir` flag.
     ///
-    /// The on-disk layout becomes `<data_dir>/sessions/<workspace_hash>/`
-    /// where `<workspace_hash>` is derived from `workspace_root`.
+    /// Sessions go to `<data_dir>/sessions/<workspace_hash>/`.
     pub fn from_data_dir(
         data_dir: impl AsRef<Path>,
         workspace_root: impl AsRef<Path>,
@@ -55,10 +52,25 @@ impl SessionStore {
             .join("sessions")
             .join(workspace_fingerprint(workspace_root));
         fs::create_dir_all(&sessions_root)?;
-        Ok(Self {
-            sessions_root,
-            workspace_root: workspace_root.to_path_buf(),
-        })
+        Ok(Self { sessions_root, workspace_root: workspace_root.to_path_buf() })
+    }
+
+    /// Global session store: `~/.cowd/sessions/global/`.
+    /// Suitable for non-project temporary sessions.
+    pub fn global() -> Result<Self, SessionControlError> {
+        let sessions_root = crate::cowd_dirs::user_sessions_dir();
+        fs::create_dir_all(&sessions_root)?;
+        Ok(Self { sessions_root, workspace_root: PathBuf::from(".") })
+    }
+
+    /// Project-scoped session store: `<project>/.cowd/sessions/<hash>/`.
+    /// Opt-in legacy layout for projects that require isolation.
+    pub fn from_project_dir(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
+        let cwd = cwd.as_ref();
+        let fp = workspace_fingerprint(cwd);
+        let sessions_root = crate::cowd_dirs::project_sessions_dir(cwd, &fp);
+        fs::create_dir_all(&sessions_root)?;
+        Ok(Self { sessions_root, workspace_root: cwd.to_path_buf() })
     }
 
     /// The fully resolved sessions directory for this namespace.
@@ -832,9 +844,15 @@ mod tests {
         fs::create_dir_all(&workspace_a).expect("workspace a should exist");
         fs::create_dir_all(&workspace_b).expect("workspace b should exist");
 
-        let store_b = SessionStore::from_cwd(&workspace_b).expect("store b should build");
-        let legacy_root = workspace_b.join(".cowd").join("sessions");
-        fs::create_dir_all(&legacy_root).expect("legacy root should exist");
+        // Use from_project_dir for project-scoped session store
+        let store_b = SessionStore::from_project_dir(&workspace_b).expect("store b should build");
+        let sessions_root = workspace_b.join(".cowd").join("sessions");
+        let legacy_entry = fs::read_dir(&sessions_root)
+            .expect("sessions dir should exist")
+            .filter_map(|e| e.ok())
+            .next()
+            .expect("at least one session dir");
+        let legacy_root = legacy_entry.path();
         let legacy_path = legacy_root.join("legacy-cross.jsonl");
         let session = Session::new()
             .with_workspace_root(workspace_a.clone())
@@ -864,10 +882,9 @@ mod tests {
         // given
         let base = temp_dir();
         fs::create_dir_all(&base).expect("base dir should exist");
-        let store = SessionStore::from_cwd(&base).expect("store should build");
-        let legacy_root = base.join(".cowd").join("sessions");
-        let legacy_path = legacy_root.join("legacy-safe.jsonl");
-        fs::create_dir_all(&legacy_root).expect("legacy root should exist");
+        let store = SessionStore::from_project_dir(&base).expect("store should build");
+        let sessions_root = store.sessions_dir().to_path_buf();
+        let legacy_path = sessions_root.join("legacy-safe.jsonl");
         let session = Session::new()
             .with_workspace_root(base.clone())
             .with_persistence_path(legacy_path.clone());
@@ -892,10 +909,9 @@ mod tests {
         // given
         let base = temp_dir();
         fs::create_dir_all(&base).expect("base dir should exist");
-        let store = SessionStore::from_cwd(&base).expect("store should build");
-        let legacy_root = base.join(".cowd").join("sessions");
-        let legacy_path = legacy_root.join("legacy-unbound.json");
-        fs::create_dir_all(&legacy_root).expect("legacy root should exist");
+        let store = SessionStore::from_project_dir(&base).expect("store should build");
+        let sessions_root = store.sessions_dir().to_path_buf();
+        let legacy_path = sessions_root.join("legacy-unbound.json");
         let session = Session::new().with_persistence_path(legacy_path.clone());
         session
             .save_to_path(&legacy_path)

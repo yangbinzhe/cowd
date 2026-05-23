@@ -9,7 +9,7 @@ const STARTER_COWD_JSON: &str = concat!(
     "}\n",
 );
 const GITIGNORE_COMMENT: &str = "# Cowd local artifacts";
-const GITIGNORE_ENTRIES: [&str; 2] = [".cowd/settings.local.json", ".cowd/sessions/"];
+const GITIGNORE_ENTRIES: [&str; 1] = [".cowd/config.local.yaml"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InitStatus {
@@ -80,6 +80,25 @@ struct RepoDetection {
 pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::error::Error>> {
     let mut artifacts = Vec::new();
 
+    // User-level initialization (~/.cowd/): create all user-level directories
+    {
+        runtime::cowd_dirs::ensure_user_dirs()?;
+        artifacts.push(InitArtifact {
+            name: "~/.cowd/ (user-level)",
+            status: InitStatus::Created,
+        });
+        // User-level CLAUDE.md (global default instructions)
+        let user_claude_md = runtime::cowd_dirs::config_home_dir().join("CLAUDE.md");
+        if !user_claude_md.exists() {
+            let content = render_init_user_claude_md();
+            fs::write(&user_claude_md, &content)?;
+            artifacts.push(InitArtifact {
+                name: "~/.cowd/CLAUDE.md",
+                status: InitStatus::Created,
+            });
+        }
+    }
+
     // Migration: if .claude directory exists but .cowd does not, copy contents
     let cowd_dir = cwd.join(".cowd");
     let claude_dir = cwd.join(".claude");
@@ -119,21 +138,27 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
         status: ensure_gitignore_entries(&gitignore)?,
     });
 
-    // Migration: if CLAUDE.md exists but COWD.md does not, copy it
-    let cowd_md = cwd.join("COWD.md");
+    // Project-level CLAUDE.md (instructions)
     let claude_md_path = cwd.join("CLAUDE.md");
-    if claude_md_path.is_file() && !cowd_md.exists() {
-        let content = fs::read_to_string(&claude_md_path)?;
-        fs::write(&cowd_md, &content)?;
+    let legacy_cowd_md = cwd.join("COWD.md");
+    // Migration: if legacy COWD.md exists, rename to CLAUDE.md
+    if legacy_cowd_md.is_file() && !claude_md_path.exists() {
+        fs::rename(&legacy_cowd_md, &claude_md_path)?;
         artifacts.push(InitArtifact {
-            name: "COWD.md (migrated from CLAUDE.md)",
+            name: "CLAUDE.md (migrated from COWD.md)",
             status: InitStatus::Created,
+        });
+    } else if claude_md_path.is_file() {
+        artifacts.push(InitArtifact {
+            name: "CLAUDE.md",
+            status: InitStatus::Skipped,
         });
     } else {
         let content = render_init_claude_md(cwd);
+        fs::write(&claude_md_path, &content)?;
         artifacts.push(InitArtifact {
-            name: "COWD.md",
-            status: write_file_if_missing(&cowd_md, &content)?,
+            name: "CLAUDE.md",
+            status: InitStatus::Created,
         });
     }
 
@@ -211,10 +236,32 @@ fn ensure_gitignore_entries(path: &Path) -> Result<InitStatus, std::io::Error> {
     Ok(InitStatus::Updated)
 }
 
+pub(crate) fn render_init_user_claude_md() -> String {
+    format!(
+        r#"# User-level Cowd Instructions
+
+This file lives in ~/.cowd/CLAUDE.md and serves as the default instruction
+file for all Cowd sessions.  It is loaded before any project-level
+CLAUDE.md, so project-specific overrides can build on top of these
+instructions.
+
+## What to put here
+
+- Your personal coding style preferences
+- Default workflows and conventions
+- Global tools or MCP server preferences
+- Environment-specific settings (OS, editor, shell)
+
+Project-level CLAUDE.md (in the project root) inherits from this file and can
+override any settings here.
+"#,
+    )
+}
+
 pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
     let detection = detect_repo(cwd);
     let mut lines = vec![
-        "# COWD.md".to_string(),
+        "# CLAUDE.md".to_string(),
         String::new(),
         "This file provides guidance to Cowd (cowd.dev) when working with code in this repository.".to_string(),
         String::new(),
@@ -262,7 +309,7 @@ pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
     lines.push("## Working agreement".to_string());
     lines.push("- Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.".to_string());
     lines.push("- Keep shared defaults in `.cowd.json`; reserve `.cowd/settings.local.json` for machine-local overrides.".to_string());
-    lines.push("- Do not overwrite existing `COWD.md` content automatically; update it intentionally when repo workflows change.".to_string());
+    lines.push("- Do not overwrite existing `CLAUDE.md` content automatically; update it intentionally when repo workflows change.".to_string());
     lines.push(String::new());
 
     lines.join("\n")
@@ -410,10 +457,10 @@ mod tests {
         assert!(rendered.contains(".cowd.json"));
         assert!(rendered.contains("created"));
         assert!(rendered.contains(".gitignore       created"));
-        assert!(rendered.contains("COWD.md"));
+        assert!(rendered.contains("CLAUDE.md"));
         assert!(root.join(".cowd").is_dir());
         assert!(root.join(".cowd.json").is_file());
-        assert!(root.join("COWD.md").is_file());
+        assert!(root.join("CLAUDE.md").is_file());
         assert_eq!(
             fs::read_to_string(root.join(".cowd.json")).expect("read cowd json"),
             concat!(
@@ -425,9 +472,8 @@ mod tests {
             )
         );
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
-        assert!(gitignore.contains(".cowd/settings.local.json"));
-        assert!(gitignore.contains(".cowd/sessions/"));
-        let claude_md = fs::read_to_string(root.join("COWD.md")).expect("read claude md");
+        assert!(gitignore.contains(".cowd/config.local.yaml"));
+        let claude_md = fs::read_to_string(root.join("CLAUDE.md")).expect("read claude md");
         assert!(claude_md.contains("Languages: Rust."));
         assert!(claude_md.contains("cargo clippy --workspace --all-targets -- -D warnings"));
 
@@ -438,27 +484,26 @@ mod tests {
     fn initialize_repo_is_idempotent_and_preserves_existing_files() {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("create root");
-        fs::write(root.join("COWD.md"), "custom guidance\n").expect("write existing claude md");
-        fs::write(root.join(".gitignore"), ".cowd/settings.local.json\n").expect("write gitignore");
+        fs::write(root.join("CLAUDE.md"), "custom guidance\n").expect("write existing claude md");
+        fs::write(root.join(".gitignore"), ".cowd/config.local.yaml\n").expect("write gitignore");
 
         let first = initialize_repo(&root).expect("first init should succeed");
         assert!(first
             .render()
-            .contains("COWD.md") && first.render().contains("skipped (already exists)"));
+            .contains("CLAUDE.md") && first.render().contains("skipped (already exists)"));
         let second = initialize_repo(&root).expect("second init should succeed");
         let second_rendered = second.render();
         assert!(second_rendered.contains(".cowd/"));
         assert!(second_rendered.contains(".cowd.json"));
         assert!(second_rendered.contains("skipped (already exists)"));
         assert!(second_rendered.contains(".gitignore       skipped (already exists)"));
-        assert!(second_rendered.contains("COWD.md"));
+        assert!(second_rendered.contains("CLAUDE.md"));
         assert_eq!(
-            fs::read_to_string(root.join("COWD.md")).expect("read existing claude md"),
+            fs::read_to_string(root.join("CLAUDE.md")).expect("read existing claude md"),
             "custom guidance\n"
         );
         let gitignore = fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
-        assert_eq!(gitignore.matches(".cowd/settings.local.json").count(), 1);
-        assert_eq!(gitignore.matches(".cowd/sessions/").count(), 1);
+        assert_eq!(gitignore.matches(".cowd/config.local.yaml").count(), 1);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -189,7 +189,7 @@ fn prepare_command(
     create_dirs: bool,
 ) -> Command {
     if create_dirs {
-        prepare_sandbox_dirs(cwd);
+        prepare_sandbox_dirs();
     }
 
     if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
@@ -203,8 +203,8 @@ fn prepare_command(
     let mut prepared = Command::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".cowd/sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".cowd/sandbox-tmp"));
+        prepared.env("HOME", crate::cowd_dirs::sandbox_home_dir());
+        prepared.env("TMPDIR", crate::cowd_dirs::sandbox_tmp_dir());
     }
     prepared
 }
@@ -216,7 +216,7 @@ fn prepare_tokio_command(
     create_dirs: bool,
 ) -> TokioCommand {
     if create_dirs {
-        prepare_sandbox_dirs(cwd);
+        prepare_sandbox_dirs();
     }
 
     if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
@@ -230,15 +230,16 @@ fn prepare_tokio_command(
     let mut prepared = TokioCommand::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".cowd/sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".cowd/sandbox-tmp"));
+        prepared.env("HOME", crate::cowd_dirs::sandbox_home_dir());
+        prepared.env("TMPDIR", crate::cowd_dirs::sandbox_tmp_dir());
     }
     prepared
 }
 
-fn prepare_sandbox_dirs(cwd: &std::path::Path) {
-    let _ = std::fs::create_dir_all(cwd.join(".cowd/sandbox-home"));
-    let _ = std::fs::create_dir_all(cwd.join(".cowd/sandbox-tmp"));
+fn prepare_sandbox_dirs() {
+    use std::fs;
+    let _ = fs::create_dir_all(crate::cowd_dirs::sandbox_home_dir());
+    let _ = fs::create_dir_all(crate::cowd_dirs::sandbox_tmp_dir());
 }
 
 #[cfg(test)]

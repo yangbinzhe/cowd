@@ -200,29 +200,51 @@ pub fn prepend_bullets(items: Vec<String>) -> Vec<String> {
     items.into_iter().map(|item| format!(" - {item}")).collect()
 }
 
+/// Instruction file names searched in priority order (within each directory layer).
+/// AGENTS.md = system/architecture-level instructions (highest).
+/// CLAUDE.md = user/project-level behavioral instructions.
+/// Other names are legacy migration aliases.
+const INSTRUCTION_FILE_NAMES: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "instructions.md",
+];
+
 fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
-    let mut directories = Vec::new();
-    let mut cursor = Some(cwd);
+    let mut files = Vec::new();
+
+    // Layer 1: User-level instruction files (~/.cowd/)
+    let user_dir = crate::cowd_dirs::config_home_dir();
+    for name in &["AGENTS.md", "CLAUDE.md"][..] {
+        push_context_file(&mut files, user_dir.join(name))?;
+    }
+
+    // Layer 2: Project .cowd/ instruction files
+    let cowd_dir = cwd.join(".cowd");
+    for name in INSTRUCTION_FILE_NAMES {
+        push_context_file(&mut files, cowd_dir.join(name))?;
+    }
+
+    // Layer 3: Project root instruction files
+    for name in &["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"][..] {
+        push_context_file(&mut files, cwd.join(name))?;
+    }
+
+    // Layer 4: Ancestor chain (walk up for inherited instructions)
+    let mut cursor = cwd.parent();
     while let Some(dir) = cursor {
-        directories.push(dir.to_path_buf());
+        // Check ancestor root dir for common instruction files
+        for name in &["AGENTS.md", "CLAUDE.md", "CLAUDE.local.md"][..] {
+            push_context_file(&mut files, dir.join(name))?;
+        }
+        // Check ancestor's .cowd/ dir for managed instruction files
+        for name in INSTRUCTION_FILE_NAMES {
+            push_context_file(&mut files, dir.join(".cowd").join(name))?;
+        }
         cursor = dir.parent();
     }
-    directories.reverse();
 
-    let mut files = Vec::new();
-    for dir in directories {
-        for candidate in [
-            dir.join("COWD.md"),
-            dir.join("COWD.local.md"),
-            dir.join(".cowd").join("COWD.md"),
-            dir.join(".cowd").join("instructions.md"),
-            // Migration: discover legacy CLAUDE.md if COWD.md does not exist
-            dir.join("CLAUDE.md"),
-            dir.join("CLAUDE.local.md"),
-        ] {
-            push_context_file(&mut files, candidate)?;
-        }
-    }
     Ok(dedupe_instruction_files(files))
 }
 
@@ -553,22 +575,30 @@ mod tests {
 
     #[test]
     fn discovers_instruction_files_from_ancestor_chain() {
+        let _guard = env_lock();
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(nested.join(".cowd")).expect("nested cc dir");
-        fs::write(root.join("COWD.md"), "root instructions").expect("write root instructions");
-        fs::write(root.join("COWD.local.md"), "local instructions")
+
+        // Isolate user config dir to avoid interference from real ~/.cowd/
+        let config_home = root.join("user-cowd");
+        fs::create_dir_all(&config_home).expect("config home dir");
+        let prev = std::env::var_os("COWD_CONFIG_HOME");
+        std::env::set_var("COWD_CONFIG_HOME", &config_home);
+
+        fs::write(root.join("CLAUDE.md"), "root instructions").expect("write root instructions");
+        fs::write(root.join("CLAUDE.local.md"), "local instructions")
             .expect("write local instructions");
         fs::create_dir_all(root.join("apps")).expect("apps dir");
         fs::create_dir_all(root.join("apps").join(".cowd")).expect("apps cc dir");
-        fs::write(root.join("apps").join("COWD.md"), "apps instructions")
+        fs::write(root.join("apps").join("CLAUDE.md"), "apps instructions")
             .expect("write apps instructions");
         fs::write(
             root.join("apps").join(".cowd").join("instructions.md"),
             "apps dot cc instructions",
         )
         .expect("write apps dot cc instructions");
-        fs::write(nested.join(".cowd").join("COWD.md"), "nested rules")
+        fs::write(nested.join(".cowd").join("CLAUDE.md"), "nested rules")
             .expect("write nested rules");
         fs::write(
             nested.join(".cowd").join("instructions.md"),
@@ -586,24 +616,37 @@ mod tests {
         assert_eq!(
             contents,
             vec![
-                "root instructions",
-                "local instructions",
+                "nested rules",
+                "nested instructions",
                 "apps instructions",
                 "apps dot cc instructions",
-                "nested rules",
-                "nested instructions"
+                "root instructions",
+                "local instructions",
             ]
         );
+        if let Some(value) = prev {
+            std::env::set_var("COWD_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("COWD_CONFIG_HOME");
+        }
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
     fn dedupes_identical_instruction_content_across_scopes() {
+        let _guard = env_lock();
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(&nested).expect("nested dir");
-        fs::write(root.join("COWD.md"), "same rules\n\n").expect("write root");
-        fs::write(nested.join("COWD.md"), "same rules\n").expect("write nested");
+
+        // Isolate user config dir
+        let config_home = root.join("user-cowd");
+        fs::create_dir_all(&config_home).expect("config home dir");
+        let prev = std::env::var_os("COWD_CONFIG_HOME");
+        std::env::set_var("COWD_CONFIG_HOME", &config_home);
+
+        fs::write(root.join("CLAUDE.md"), "same rules\n\n").expect("write root");
+        fs::write(nested.join("CLAUDE.md"), "same rules\n").expect("write nested");
 
         let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
         assert_eq!(context.instruction_files.len(), 1);
@@ -611,6 +654,11 @@ mod tests {
             normalize_instruction_content(&context.instruction_files[0].content),
             "same rules"
         );
+        if let Some(value) = prev {
+            std::env::set_var("COWD_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("COWD_CONFIG_HOME");
+        }
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -631,8 +679,8 @@ mod tests {
     #[test]
     fn displays_context_paths_compactly() {
         assert_eq!(
-            display_context_path(Path::new("/tmp/project/.cowd/COWD.md")),
-            "COWD.md"
+            display_context_path(Path::new("/tmp/project/.cowd/CLAUDE.md")),
+            "CLAUDE.md"
         );
     }
 
@@ -647,7 +695,7 @@ mod tests {
             .current_dir(&root)
             .status()
             .expect("git init should run");
-        fs::write(root.join("COWD.md"), "rules").expect("write instructions");
+        fs::write(root.join("CLAUDE.md"), "rules").expect("write instructions");
         fs::write(root.join("tracked.txt"), "hello").expect("write tracked file");
 
         let context =
@@ -655,7 +703,7 @@ mod tests {
 
         let status = context.git_status.expect("git status should be present");
         assert!(status.contains("## No commits yet on") || status.contains("## "));
-        assert!(status.contains("?? COWD.md"));
+        assert!(status.contains("?? CLAUDE.md"));
         assert!(status.contains("?? tracked.txt"));
         assert!(context.git_diff.is_none());
 
@@ -792,7 +840,7 @@ mod tests {
     fn load_system_prompt_reads_claude_files_and_config() {
         let root = temp_dir();
         fs::create_dir_all(root.join(".cowd")).expect("cc dir");
-        fs::write(root.join("COWD.md"), "Project rules").expect("write instructions");
+        fs::write(root.join("CLAUDE.md"), "Project rules").expect("write instructions");
         fs::write(
             root.join(".cowd").join("config.yaml"),
             r#"{"permissionMode":"acceptEdits"}"#,
@@ -835,7 +883,7 @@ mod tests {
     fn renders_claude_code_style_sections_with_project_context() {
         let root = temp_dir();
         fs::create_dir_all(root.join(".cowd")).expect("cc dir");
-        fs::write(root.join("COWD.md"), "Project rules").expect("write COWD.md");
+        fs::write(root.join("CLAUDE.md"), "Project rules").expect("write instructions");
         fs::write(
             root.join(".cowd").join("config.yaml"),
             r#"{"permissionMode":"acceptEdits"}"#,
@@ -898,7 +946,7 @@ mod tests {
     #[test]
     fn renders_instruction_file_metadata() {
         let rendered = render_instruction_files(&[ContextFile {
-            path: PathBuf::from("/tmp/project/COWD.md"),
+            path: PathBuf::from("/tmp/project/CLAUDE.md"),
             content: "Project rules".to_string(),
         }]);
         assert!(rendered.contains("# Claude instructions"));

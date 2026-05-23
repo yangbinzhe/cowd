@@ -236,8 +236,8 @@ pub fn build_linux_sandbox_command(
     args.push("-lc".to_string());
     args.push(command.to_string());
 
-    let sandbox_home = cwd.join(".cowd/sandbox-home");
-    let sandbox_tmp = cwd.join(".cowd/sandbox-tmp");
+    let sandbox_home = crate::cowd_dirs::sandbox_home_dir();
+    let sandbox_tmp = crate::cowd_dirs::sandbox_tmp_dir();
     let mut env = vec![
         ("HOME".to_string(), sandbox_home.display().to_string()),
         ("TMPDIR".to_string(), sandbox_tmp.display().to_string()),

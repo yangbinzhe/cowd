@@ -1,4 +1,4 @@
-//! Brand constants for the Cowd project.
+//! Brand constants and path helpers for the Cowd project.
 //!
 //! All directory names, file names, environment variable prefixes, and binary
 //! names are defined here. Every crate should reference these constants instead
@@ -10,6 +10,16 @@
 //! via the `COWD_DIR_NAME` environment variable (e.g. `COWD_DIR_NAME=.myorg`).
 //! This allows organisations or individuals to customise the workspace folder
 //! name without recompiling.
+//!
+//! # Directory layering
+//!
+//! Cowd uses a three-layer directory model, inspired by Claude Code and Opencode:
+//!
+//! L1 — User-level (`~/.cowd/`): global config, sessions, sandbox, agents, skills, plugins, credentials.
+//! L2 — Project-level (`<project>/.cowd/`): project-specific config, CLAUDE.md, AGENTS.md.
+//! L3 — Local override (`<project>/.cowd/config.local.*`): machine-local overrides.
+
+use std::path::{Path, PathBuf};
 
 /// Default dot-directory name used for project-level and user-level config.
 ///
@@ -20,57 +30,142 @@ pub fn dot_dir() -> String {
 }
 
 /// Project-level dot-directory path under `cwd`.
-pub fn project_dot_dir(cwd: &std::path::Path) -> std::path::PathBuf {
+pub fn project_dot_dir(cwd: &Path) -> PathBuf {
     cwd.join(dot_dir())
 }
 
 /// User-level dot-directory path under home.
-pub fn user_dot_dir(home: &std::path::Path) -> std::path::PathBuf {
+pub fn user_dot_dir(home: &Path) -> PathBuf {
     home.join(dot_dir())
 }
 
-/// Environment variable prefix for all Cowd-specific env vars.
+/// Resolve the user's home directory.
+pub fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Resolve the default `~/.cowd` config home directory.
+/// Respects `COWD_CONFIG_HOME` env var override.
+pub fn config_home_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("COWD_CONFIG_HOME") {
+        return PathBuf::from(path);
+    }
+    user_dot_dir(&home_dir())
+}
+
+// ── Subdirectory names (constants) ──
+
 pub const ENV_PREFIX: &str = "COWD_";
-
-/// Binary name.
 pub const BIN_NAME: &str = "cowd";
-
-/// Main config file name (inside the dot-directory).
 pub const CONFIG_FILE_JSON: &str = "cowd.json";
-
-/// YAML config file name (inside the dot-directory).
 pub const CONFIG_FILE_YAML: &str = "config.yaml";
-
-/// Settings file name (legacy compatibility, inside the dot-directory).
 pub const SETTINGS_FILE: &str = "settings.json";
-
-/// Schema name advertised by generated settings files.
 pub const SETTINGS_SCHEMA_NAME: &str = "CowdSettingsSchema";
 
-/// Subdirectory name for agents within the dot-directory.
+/// Subdirectory names within the `.cowd` directory.
 pub const AGENTS_DIR: &str = "agents";
-
-/// Subdirectory name for skills within the dot-directory.
 pub const SKILLS_DIR: &str = "skills";
-
-/// Subdirectory name for sandbox HOME within the dot-directory.
-pub const SANDBOX_HOME_DIR: &str = "sandbox-home";
-
-/// Subdirectory name for sandbox TMP within the dot-directory.
-pub const SANDBOX_TMP_DIR: &str = "sandbox-tmp";
-
-/// Subdirectory name for worker state within the dot-directory.
+pub const PLUGINS_DIR: &str = "plugins";
+pub const CREDENTIALS_DIR: &str = "credentials";
 pub const WORKER_STATE_FILE: &str = "worker-state.json";
-
-/// Session file extension.
 pub const SESSION_EXT: &str = ".jsonl";
 
+// ── Session paths ──
+
+const SESSIONS_DIR: &str = "sessions";
+const GLOBAL_SESSIONS_DIR: &str = "global";
+const PROJECT_SESSIONS_DIR: &str = "projects";
+
+/// User-level global sessions: `~/.cowd/sessions/global/`
+pub fn user_sessions_dir() -> PathBuf {
+    config_home_dir().join(SESSIONS_DIR).join(GLOBAL_SESSIONS_DIR)
+}
+
+/// User-level project-scoped sessions: `~/.cowd/sessions/projects/<hash>/`
+pub fn user_project_sessions_dir(fingerprint: &str) -> PathBuf {
+    config_home_dir()
+        .join(SESSIONS_DIR)
+        .join(PROJECT_SESSIONS_DIR)
+        .join(fingerprint)
+}
+
+/// Project-level sessions: `<project>/.cowd/sessions/<hash>/` (opt-in)
+pub fn project_sessions_dir(cwd: &Path, fingerprint: &str) -> PathBuf {
+    project_dot_dir(cwd).join(SESSIONS_DIR).join(fingerprint)
+}
+
+// ── Sandbox paths ──
+
+const SANDBOX_DIR: &str = "sandbox";
+const SANDBOX_HOME_SUBDIR: &str = "home";
+const SANDBOX_TMP_SUBDIR: &str = "tmp";
+
+/// User-level sandbox home: `~/.cowd/sandbox/home/`
+pub fn sandbox_home_dir() -> PathBuf {
+    config_home_dir().join(SANDBOX_DIR).join(SANDBOX_HOME_SUBDIR)
+}
+
+/// User-level sandbox tmp: `~/.cowd/sandbox/tmp/`
+pub fn sandbox_tmp_dir() -> PathBuf {
+    config_home_dir().join(SANDBOX_DIR).join(SANDBOX_TMP_SUBDIR)
+}
+
+// ── User-level install dirs ──
+
+/// User-level agents: `~/.cowd/agents/`
+pub fn user_agents_dir() -> PathBuf {
+    config_home_dir().join(AGENTS_DIR)
+}
+
+/// User-level skills: `~/.cowd/skills/`
+pub fn user_skills_dir() -> PathBuf {
+    config_home_dir().join(SKILLS_DIR)
+}
+
+/// User-level plugins: `~/.cowd/plugins/`
+pub fn user_plugins_dir() -> PathBuf {
+    config_home_dir().join(PLUGINS_DIR)
+}
+
+/// User-level credentials: `~/.cowd/credentials/`
+pub fn user_credentials_dir() -> PathBuf {
+    config_home_dir().join(CREDENTIALS_DIR)
+}
+
+/// Ensure all user-level directories exist.
+pub fn ensure_user_dirs() -> std::io::Result<()> {
+    use std::fs;
+    for d in [
+        user_sessions_dir(),
+        sandbox_home_dir(),
+        sandbox_tmp_dir(),
+        user_agents_dir(),
+        user_skills_dir(),
+        user_plugins_dir(),
+        user_credentials_dir(),
+    ] {
+        fs::create_dir_all(&d)?;
+    }
+    Ok(())
+}
+
+// ── Legacy sandbox dir constants (deprecated, project-local) ──
+// Kept for migration detection; new code should use sandbox_home_dir() / sandbox_tmp_dir()
+pub const SANDBOX_HOME_DIR_LEGACY: &str = "sandbox-home";
+pub const SANDBOX_TMP_DIR_LEGACY: &str = "sandbox-tmp";
+
+/// Check if the project `.cowd` directory has legacy sandbox or session dirs
+/// that should be migrated to user-level.
+pub fn has_legacy_user_data(cwd: &Path) -> bool {
+    let p = project_dot_dir(cwd);
+    p.join(SANDBOX_HOME_DIR_LEGACY).exists()
+        || p.join(SANDBOX_TMP_DIR_LEGACY).exists()
+        || p.join(SESSIONS_DIR).exists()
+}
+
 /// Helper: build the env var name for a given key using the COWD_ prefix.
-///
-/// # Example
-/// ```
-/// assert_eq!(runtime::cowd_dirs::env_var("CONFIG_HOME"), "COWD_CONFIG_HOME");
-/// ```
 pub fn env_var(key: &str) -> String {
     let mut buf = String::with_capacity(ENV_PREFIX.len() + key.len());
     buf.push_str(ENV_PREFIX);
@@ -81,10 +176,10 @@ pub fn env_var(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn default_dot_dir_is_cowd() {
-        // Only test default when env var is not set
         if std::env::var("COWD_DIR_NAME").is_err() {
             assert_eq!(dot_dir(), ".cowd");
         }
@@ -97,9 +192,35 @@ mod tests {
 
     #[test]
     fn project_dot_dir_joins() {
-        let cwd = std::path::Path::new("/tmp/workspace");
+        let cwd = Path::new("/tmp/workspace");
         if std::env::var("COWD_DIR_NAME").is_err() {
-            assert_eq!(project_dot_dir(cwd), std::path::PathBuf::from("/tmp/workspace/.cowd"));
+            assert_eq!(project_dot_dir(cwd), PathBuf::from("/tmp/workspace/.cowd"));
         }
+    }
+
+    #[test]
+    fn sandbox_dirs_resolve_under_config_home() {
+        let home = sandbox_home_dir();
+        let tmp = sandbox_tmp_dir();
+        assert!(home.to_string_lossy().contains("sandbox/home"));
+        assert!(tmp.to_string_lossy().contains("sandbox/tmp"));
+    }
+
+    #[test]
+    fn user_sessions_dir_resolves_under_config_home() {
+        let path = user_sessions_dir();
+        assert!(path.to_string_lossy().contains("sessions/global"));
+    }
+
+    #[test]
+    fn user_project_sessions_contains_fingerprint() {
+        let path = user_project_sessions_dir("a1b2c3");
+        assert!(path.to_string_lossy().contains("projects/a1b2c3"));
+    }
+
+    #[test]
+    fn home_dir_returns_something() {
+        let h = home_dir();
+        assert!(!h.as_os_str().is_empty());
     }
 }

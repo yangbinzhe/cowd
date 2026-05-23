@@ -7,7 +7,7 @@
 //! Characteristics:
 //! - ~3000 token budget
 //! - Persistent across sessions within the same project scope
-//! - Can auto-discover context from COWD.md, .cowd.json etc.
+//! - Can auto-discover context from CLAUDE.md, .cowd.json etc.
 //! - `tick()` applies staleness decay
 
 use async_trait::async_trait;
@@ -33,7 +33,7 @@ const DEFAULT_MAX_TOKENS: u64 = 3000;
 
 /// Files that are recognised as project-context sources (in priority order).
 const PROJECT_CONTEXT_FILES: &[&str] = &[
-    "COWD.md",
+    "CLAUDE.md",
     ".cowd.json",
     "AGENTS.md",
     "CONTRIBUTING.md",
@@ -295,7 +295,7 @@ mod tests {
     async fn with_workspace_can_discover_context() {
         let drift = DriftConfig::default();
         let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("COWD.md"), "Test project.").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "Test project.").unwrap();
 
         let layer = ProjectLayer::with_workspace(in_memory(), tmp.path().to_path_buf(), 500, drift);
         assert_eq!(layer.max_tokens, 500);
@@ -345,24 +345,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_project_context_finds_cowd_md() {
+    async fn discover_project_context_finds_claude_md() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cowd_md = tmp.path().join("COWD.md");
-        std::fs::write(&cowd_md, "# Project\n\nA test project.").unwrap();
+        let claude_md = tmp.path().join("CLAUDE.md");
+        std::fs::write(&claude_md, "# Project\n\nA test project.").unwrap();
 
         let layer = ProjectLayer::with_workspace(
             in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
         );
         let files = layer.discover_project_context().await.unwrap();
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].0, "COWD.md");
+        assert_eq!(files[0].0, "CLAUDE.md");
         assert!(files[0].1.contains("Project"));
     }
 
     #[tokio::test]
     async fn discover_project_context_skips_empty_files() {
         let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("COWD.md"), "").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "").unwrap();
 
         let layer = ProjectLayer::with_workspace(
             in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
@@ -381,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_project_context_creates_entries() {
         let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("COWD.md"), "Test project.").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "Test project.").unwrap();
 
         let layer = ProjectLayer::with_workspace(
             in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
@@ -391,13 +391,13 @@ mod tests {
 
         let entries = layer.load().await.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].title, "project:COWD.md");
+        assert_eq!(entries[0].title, "project:CLAUDE.md");
     }
 
     #[tokio::test]
     async fn ingest_project_context_skips_already_ingested() {
         let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("COWD.md"), "Test.").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "Test.").unwrap();
 
         let layer = ProjectLayer::with_workspace(
             in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
