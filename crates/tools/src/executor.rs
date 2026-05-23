@@ -402,9 +402,10 @@ fn persist_worker_state(worker: &Worker) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let cwd = Path::new(&worker.cwd);
-    let cc_dir = cwd.join(".cowd");
-    std::fs::create_dir_all(&cc_dir)?;
+    let state_path = runtime::cowd_dirs::worker_state_path();
+    if let Some(parent) = state_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let state = serde_json::json!({
         "worker_id": worker.worker_id,
         "status": worker.status.to_string(),
@@ -412,7 +413,7 @@ fn persist_worker_state(worker: &Worker) -> std::io::Result<()> {
         "trust_gate_cleared": worker.trust_gate_cleared,
         "seconds_since_update": now.saturating_sub(worker.updated_at),
     });
-    std::fs::write(cc_dir.join("worker-state.json"), serde_json::to_string_pretty(&state)?)
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]

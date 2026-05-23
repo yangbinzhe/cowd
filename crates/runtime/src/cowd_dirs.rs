@@ -122,6 +122,22 @@ pub fn cron_jobs_path() -> PathBuf {
     config_home_dir().join(CRON_DIR).join(CRON_JOBS_FILE)
 }
 
+// ── Handoff paths ──
+
+const HANDOFFS_DIR: &str = "handoffs";
+
+/// User-level handoff directory: `~/.cowd/handoffs/`
+pub fn handoffs_dir() -> PathBuf {
+    config_home_dir().join(HANDOFFS_DIR)
+}
+
+// ── Worker-state paths ──
+
+/// User-level worker state file: `~/.cowd/worker-state.json`
+pub fn worker_state_path() -> PathBuf {
+    config_home_dir().join(WORKER_STATE_FILE)
+}
+
 // ── User-level install dirs ──
 
 /// User-level agents: `~/.cowd/agents/`
@@ -156,6 +172,7 @@ pub fn ensure_user_dirs() -> std::io::Result<()> {
         user_plugins_dir(),
         user_credentials_dir(),
         cron_jobs_path().parent().unwrap().to_path_buf(),
+        handoffs_dir(),
     ];
     for d in &dirs {
         fs::create_dir_all(d)?;

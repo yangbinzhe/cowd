@@ -14,8 +14,7 @@ use crate::{CliOutputFormat, VERSION};
 /// atomically writes state transitions here so external observers (cowd-orchestrator, orchestrators)
 /// can poll current `WorkerStatus` without needing an HTTP route on the opencode binary.
 pub(crate) fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let state_path = cwd.join(".cowd").join("worker-state.json");
+    let state_path = runtime::cowd_dirs::worker_state_path();
     if !state_path.exists() {
         // Emit a structured error, then return Err so the process exits 1.
         // Callers (scripts, CI) need a non-zero exit to detect "no state" without

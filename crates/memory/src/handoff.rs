@@ -28,8 +28,17 @@ use crate::{
 /// Result alias for handoff operations.
 pub type Result<T> = std::result::Result<T, MemoryError>;
 
-/// Default directory for handoff files (relative to the working directory).
-const DEFAULT_HANDOFF_DIR: &str = ".cowd/handoffs";
+/// Default directory for handoff files in the user-level config dir.
+/// Resolves via `COWD_CONFIG_HOME` env var, falling back to `~/.cowd/handoffs/`.
+fn default_handoff_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("COWD_CONFIG_HOME") {
+        PathBuf::from(path).join("handoffs")
+    } else {
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join(".cowd").join("handoffs"))
+            .unwrap_or_else(|| PathBuf::from(".cowd/handoffs"))
+    }
+}
 
 // ─── HandoffManager ───────────────────────────────────────────────────────────
 
@@ -47,7 +56,7 @@ impl HandoffManager {
     /// Create a manager using the default handoff directory (`.cowd/handoffs/`).
     #[must_use]
     pub fn new() -> Self {
-        Self::with_dir(PathBuf::from(DEFAULT_HANDOFF_DIR))
+        Self::with_dir(default_handoff_dir())
     }
 
     /// Create a manager with an explicit directory path.

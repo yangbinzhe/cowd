@@ -778,11 +778,11 @@ struct StateSnapshot<'a> {
 }
 
 fn emit_state_file(worker: &Worker) {
-    let state_dir = std::path::Path::new(&worker.cwd).join(".cowd");
-    if std::fs::create_dir_all(&state_dir).is_err() {
+    let state_path = crate::cowd_dirs::worker_state_path();
+    let state_dir = state_path.parent().unwrap();
+    if std::fs::create_dir_all(state_dir).is_err() {
         return;
     }
-    let state_path = state_dir.join("worker-state.json");
     let tmp_path = state_dir.join("worker-state.json.tmp");
 
     let now = now_secs();
