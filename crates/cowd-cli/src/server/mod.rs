@@ -462,9 +462,7 @@ async fn init_app_state(config: &HttpConfig) -> Result<HttpAppState, ServerError
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         ).unwrap_or_else(|_| PathBuf::from(".")),
         cron_scheduler: Arc::new(CronScheduler::new(
-            runtime::cowd_dirs::project_dot_dir(
-                &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            ).join("cron").join("jobs.json")
+            runtime::cowd_dirs::cron_jobs_path()
         )),
         usage_tracker: Arc::new(GlobalUsageTracker::new()),
         fact_checker: Arc::new(tokio::sync::Mutex::new(memory::FactChecker::new())),

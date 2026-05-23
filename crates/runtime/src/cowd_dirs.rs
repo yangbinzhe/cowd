@@ -112,6 +112,16 @@ pub fn sandbox_tmp_dir() -> PathBuf {
     config_home_dir().join(SANDBOX_DIR).join(SANDBOX_TMP_SUBDIR)
 }
 
+// ── Cron paths ──
+
+const CRON_DIR: &str = "cron";
+const CRON_JOBS_FILE: &str = "jobs.json";
+
+/// User-level cron jobs file: `~/.cowd/cron/jobs.json`
+pub fn cron_jobs_path() -> PathBuf {
+    config_home_dir().join(CRON_DIR).join(CRON_JOBS_FILE)
+}
+
 // ── User-level install dirs ──
 
 /// User-level agents: `~/.cowd/agents/`
@@ -137,7 +147,7 @@ pub fn user_credentials_dir() -> PathBuf {
 /// Ensure all user-level directories exist.
 pub fn ensure_user_dirs() -> std::io::Result<()> {
     use std::fs;
-    for d in [
+    let dirs = [
         user_sessions_dir(),
         sandbox_home_dir(),
         sandbox_tmp_dir(),
@@ -145,8 +155,10 @@ pub fn ensure_user_dirs() -> std::io::Result<()> {
         user_skills_dir(),
         user_plugins_dir(),
         user_credentials_dir(),
-    ] {
-        fs::create_dir_all(&d)?;
+        cron_jobs_path().parent().unwrap().to_path_buf(),
+    ];
+    for d in &dirs {
+        fs::create_dir_all(d)?;
     }
     Ok(())
 }
