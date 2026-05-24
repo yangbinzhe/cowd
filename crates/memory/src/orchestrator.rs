@@ -69,6 +69,8 @@ pub struct MemoryOrchestrator {
     active_scope: Mutex<MemoryScope>,
     /// Active agent ID for auto-filling new entries' source_agent.
     active_agent: Mutex<Option<String>>,
+    /// Active session ID for auto-filling new entries' session_id.
+    active_session: Mutex<Option<String>>,
     /// Closet rebuild counter for automatic periodic rebuild.
     closet_rebuild_counter: AtomicU32,
 }
@@ -143,6 +145,7 @@ impl MemoryOrchestrator {
             fact_checker: Mutex::new(Some(FactChecker::new())),
             active_scope: Mutex::new(MemoryScope::default()),
             active_agent: Mutex::new(None),
+            active_session: Mutex::new(None),
             closet_rebuild_counter: AtomicU32::new(0),
         })
     }
@@ -414,6 +417,16 @@ impl MemoryOrchestrator {
         *self.active_agent.lock() = Some(agent_id);
     }
 
+    /// Set the active session ID for auto-filling new entries.
+    pub fn set_active_session(&self, session_id: String) {
+        *self.active_session.lock() = Some(session_id);
+    }
+
+    /// Get the current active session ID (if set).
+    pub fn active_session_id(&self) -> Option<String> {
+        self.active_session.lock().clone()
+    }
+
     // -----------------------------------------------------------------------
     // Write API
     // -----------------------------------------------------------------------
@@ -432,6 +445,13 @@ impl MemoryOrchestrator {
         if entry.source_agent.is_none() {
             if let Some(ref agent) = *self.active_agent.lock() {
                 entry.source_agent = Some(agent.clone());
+            }
+        }
+
+        // Auto-fill session_id from the active session
+        if entry.session_id.is_none() {
+            if let Some(ref session) = *self.active_session.lock() {
+                entry.session_id = Some(session.clone());
             }
         }
 
@@ -668,6 +688,22 @@ impl MemoryOrchestrator {
         max_peers: usize,
     ) -> Result<Vec<MemoryEntry>> {
         self.l4.recall_peers(query, current_agent, max_per_peer, max_peers).await
+    }
+
+    /// Intra-turn real-time peer perception (T3).
+    ///
+    /// Delegates to [`SharedLayer::recall_peers_realtime`].  No 5-minute time
+    /// cutoff — filters by session_id instead so Agent B sees Agent A's writes
+    /// from the same turn.
+    pub async fn recall_peer_context_realtime(
+        &self,
+        query: &str,
+        current_agent: &str,
+        current_session_id: &str,
+        max_per_peer: usize,
+        max_peers: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.l4.recall_peers_realtime(query, current_agent, current_session_id, max_per_peer, max_peers).await
     }
 
     // -----------------------------------------------------------------------

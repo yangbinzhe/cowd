@@ -13,7 +13,14 @@
 //! 3. L3      – dynamically loaded deep memories (multi-signal relevance).
 //! 4. Seeds   – pre-authored fragments whose trigger condition fired.
 
-use std::{collections::HashSet, path::PathBuf, sync::Mutex};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+};
 
 use chrono::Utc;
 
@@ -35,7 +42,7 @@ use crate::{ MemoryScope, SessionResume,
     extractor::MemoryExtractor,
     handoff::HandoffManager,
     orchestrator::MemoryOrchestrator,
-    project_scope::build_project_kg,
+    project_scope::{build_project_kg, ProjectScopeManager},
     relevance::DynamicLoader,
     search::HybridSearcher,
     seeds::{DecisionThreadStore, SeedRegistry},
@@ -138,6 +145,14 @@ pub struct CognitiveContextManager {
     delegation_results: Mutex<Vec<DelegationResult>>,
     /// BM25-based session resume for context recovery from prior sessions.
     session_resume: Option<SessionResume>,
+    /// Optional project scope manager for KG staleness detection.
+    project_scope_mgr: Option<std::sync::Arc<ProjectScopeManager>>,
+    /// Path of the currently loaded project KG, used for auto-rebuild.
+    project_kg_path: Mutex<Option<PathBuf>>,
+    /// Tick counter for periodic KG rebuild (every 100 ticks).
+    kg_rebuild_tick_counter: AtomicU64,
+    /// Tick counter for cross-store consistency verification (every 50 ticks).
+    cross_store_verify_counter: AtomicU64,
 }
 
 impl CognitiveContextManager {
@@ -271,6 +286,10 @@ impl CognitiveContextManager {
             current_agent: Mutex::new(None),
             delegation_results: Mutex::new(Vec::new()),
             session_resume,
+            project_scope_mgr: None,
+            project_kg_path: Mutex::new(None),
+            kg_rebuild_tick_counter: AtomicU64::new(0),
+            cross_store_verify_counter: AtomicU64::new(0),
             config,
             orchestrator,
             pipeline,
@@ -330,6 +349,21 @@ impl CognitiveContextManager {
         *self.current_agent.lock().unwrap() = Some(agent_id);
     }
 
+    /// Set the active session ID for auto-filling new entries and intra-turn
+    /// peer perception.
+    pub fn set_active_session(&self, session_id: String) {
+        self.orchestrator.set_active_session(session_id);
+    }
+
+    /// Attach a [`ProjectScopeManager`] for KG staleness detection on turn end.
+    ///
+    /// When set, [`on_turn_end`] will check whether any indexed source files
+    /// have changed since the last KG build and auto-rebuild if stale.
+    pub fn with_project_scope(mut self, mgr: ProjectScopeManager) -> Self {
+        self.project_scope_mgr = Some(std::sync::Arc::new(mgr));
+        self
+    }
+
     /// Check whether a write to `layer` is allowed under the current guard.
     pub fn check_write_access(&self, layer: crate::types::MemoryLayer) -> crate::write_guard::WritePolicy {
         match &self.write_guard {
@@ -348,13 +382,15 @@ impl CognitiveContextManager {
     /// knowledge graph with the freshly built graph. This should be called
     /// whenever the active project is switched.
     pub fn load_project_kg(&self, project_path: &PathBuf) -> Result<()> {
-        let kg = build_project_kg(project_path);
+        let (kg, _mtimes) = build_project_kg(project_path);
         let entity_count = kg.list_entities().len();
         let mut guard = self
             .kg
             .lock()
             .map_err(|_| MemoryError::Other("kg lock poisoned".into()))?;
         *guard = kg;
+        // Track path for auto-rebuild on staleness
+        *self.project_kg_path.lock().unwrap() = Some(project_path.clone());
         tracing::info!(
             entity_count,
             path = %project_path.display(),
@@ -498,6 +534,45 @@ impl CognitiveContextManager {
                     source_agent: None,
                     visibility: crate::types::AgentVisibility::default(),
                 });
+            }
+
+            // ── Step 2c2: Intra-turn real-time peer perception (T3) ──────────
+            // Reads entries from L4 written by other agents in the SAME turn,
+            // without the 5-minute time cutoff. Uses session_id for filtering.
+            let current_session = self.orchestrator.active_session_id();
+            if let Some(ref session_id) = current_session {
+                let realtime_peers = self
+                    .orchestrator
+                    .recall_peer_context_realtime(query, agent, session_id, 2, 3)
+                    .await
+                    .unwrap_or_default();
+                for entry in realtime_peers {
+                    let peer_id = entry.source_agent.as_deref().unwrap_or("unknown");
+                    let prefixed_content = format!("[REALTIME PEER: {peer_id}] {}", entry.content);
+                    use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
+                    entries.push(MemoryEntry {
+                        id: uuid::Uuid::new_v4(),
+                        layer: MemoryLayer::L4,
+                        category: MemoryCategory::Shared,
+                        priority: Priority::High,
+                        source: MemorySource::Import,
+                        title: format!("Realtime peer context from {peer_id}"),
+                        content: prefixed_content,
+                        embedding: None,
+                        tags: vec!["peer".into(), "realtime".into(), "l4".into()],
+                        relations: vec![],
+                        confidence: 0.9,
+                        access_count: 0,
+                        staleness: 0.0,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        last_accessed_at: None,
+                        scope: MemoryScope::default(),
+                        session_id: None,
+                        source_agent: None,
+                        visibility: crate::types::AgentVisibility::default(),
+                    });
+                }
             }
         }
 
@@ -880,6 +955,57 @@ impl CognitiveContextManager {
 
         // ── 5. Run orchestrator maintenance tick ─────────────────────────────
         self.orchestrator.tick().await?;
+
+        // ── 5a. Check project KG staleness and auto-rebuild if needed ───────
+        if let Some(ref mgr) = self.project_scope_mgr {
+            if let Some(proj_path) = self.project_kg_path.lock().unwrap().as_ref() {
+                let pid = crate::project_scope::hash_path(proj_path);
+                if mgr.is_kg_stale(&pid).unwrap_or(false) {
+                    tracing::info!("project KG is stale, auto-rebuilding...");
+                    if let Err(e) = self.load_project_kg(proj_path) {
+                        tracing::warn!("auto-rebuild of project KG failed: {e}");
+                    }
+                }
+            }
+        }
+
+        // ── 5a2. Periodic KG rebuild every 100 ticks (T1) ───────────────────
+        // Rebuilds KG even when no file-change detected, catching rapid saves.
+        {
+            let tick = self.kg_rebuild_tick_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if tick % 100 == 0 {
+                if let Some(proj_path) = self.project_kg_path.lock().unwrap().as_ref() {
+                    tracing::info!(
+                        tick,
+                        path = %proj_path.display(),
+                        "periodic KG rebuild triggered (every 100 ticks)"
+                    );
+                    if let Err(e) = self.load_project_kg(proj_path) {
+                        tracing::warn!("periodic KG rebuild failed: {e}");
+                    } else {
+                        tracing::debug!("periodic KG rebuild succeeded");
+                    }
+                }
+            }
+        }
+
+        // ── 5a3. Cross-store consistency verification every 50 ticks (T2) ────
+        {
+            let tick = self.cross_store_verify_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if tick % 50 == 0 {
+                let warnings = self.cross_store_verify();
+                for w in &warnings {
+                    tracing::warn!("cross-store-verify: {w}");
+                }
+                if !warnings.is_empty() {
+                    tracing::warn!(
+                        count = warnings.len(),
+                        "cross-store consistency check found {} issues",
+                        warnings.len()
+                    );
+                }
+            }
+        }
 
         // ── 5b. Auto-rebuild Closet periodically ────────────────────────────
         if self.orchestrator.should_rebuild_closet() {
@@ -1590,6 +1716,147 @@ impl CognitiveContextManager {
             allocated_conversation: 0,
             available: role_available,
         }
+    }
+
+    /// Verify cross-store consistency: KG ↔ MemoryStore ↔ Verbatim ↔ Closet.
+    ///
+    /// Samples 10 random entries from each store and checks for referential
+    /// integrity. Returns a list of warning strings. Kept lightweight (<10ms).
+    fn cross_store_verify(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        // 1. KG entities → MemoryStore: check a random sample of KG entities
+        //    have corresponding MemoryStore entries.
+        {
+            let kg = match self.kg.lock() {
+                Ok(g) => g,
+                Err(_) => return vec!["kg lock poisoned".into()],
+            };
+            let entities: Vec<_> = kg.list_entities().into_iter().collect();
+            let sample_size = 10usize.min(entities.len());
+            if sample_size > 0 {
+                let store = self.orchestrator.store();
+                // Use a deterministic pseudo-random subset via modulo hash on entity id
+                let step = (entities.len() / sample_size).max(1);
+                let mut checked = 0usize;
+                for (i, entity) in entities.iter().enumerate() {
+                    if i % step != 0 || checked >= sample_size {
+                        continue;
+                    }
+                    checked += 1;
+                    // Check if entity name appears in store via FTS
+                    let found = tokio::runtime::Handle::current().block_on(async {
+                        store.search_fts(&entity.name, 1).await
+                    });
+                    match found {
+                        Ok(results) if results.is_empty() => {
+                            warnings.push(format!(
+                                "kg-orphan: entity '{}' ({}) not found in MemoryStore FTS",
+                                entity.name, entity.id
+                            ));
+                        }
+                        Err(e) => {
+                            warnings.push(format!(
+                                "kg-orphan-check: entity '{}' FTS query failed: {e}",
+                                entity.name
+                            ));
+                        }
+                        _ => {} // OK
+                    }
+                }
+            }
+        }
+
+        // 2. Closet pointers → MemoryStore: check a random sample of drawer_ids
+        //    exist in MemoryStore.
+        {
+            let closet_guard = self.closet.lock().unwrap();
+            if let Some(ref closet) = *closet_guard {
+                let all_ids: Vec<&str> = closet
+                    .pointers
+                    .iter()
+                    .flat_map(|p| p.drawer_ids.iter().map(String::as_str))
+                    .collect();
+                let sample_size = 10usize.min(all_ids.len());
+                if sample_size > 0 {
+                    let step = (all_ids.len() / sample_size).max(1);
+                    let store = self.orchestrator.store();
+                    let mut checked = 0usize;
+                    for (i, drawer_id) in all_ids.iter().enumerate() {
+                        if i % step != 0 || checked >= sample_size {
+                            continue;
+                        }
+                        checked += 1;
+                        let uuid = match uuid::Uuid::parse_str(drawer_id) {
+                            Ok(id) => id,
+                            Err(_) => continue,
+                        };
+                        let found = tokio::runtime::Handle::current().block_on(async {
+                            store.get(&uuid).await
+                        });
+                        match found {
+                            Ok(None) => {
+                                warnings.push(format!(
+                                    "closet-orphan: drawer_id '{drawer_id}' not found in MemoryStore"
+                                ));
+                            }
+                            Err(e) => {
+                                warnings.push(format!(
+                                    "closet-orphan-check: drawer_id '{drawer_id}' get failed: {e}"
+                                ));
+                            }
+                            _ => {} // OK
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Verbatim ↔ MemoryStore: sample MemoryStore entries and check
+        //    verbatim counterparts exist (reverse check since we can't list verbatim).
+        {
+            let store = self.orchestrator.store();
+            let all_entries = tokio::runtime::Handle::current().block_on(async {
+                store.list_all().await
+            });
+            match all_entries {
+                Ok(entries) if !entries.is_empty() => {
+                    let sample_size = 10usize.min(entries.len());
+                    let step = (entries.len() / sample_size).max(1);
+                    let mut checked = 0usize;
+                    for (i, entry) in entries.iter().enumerate() {
+                        if i % step != 0 || checked >= sample_size {
+                            continue;
+                        }
+                        checked += 1;
+                        let verbatim = tokio::runtime::Handle::current().block_on(async {
+                            store.load_verbatim_by_id(&entry.id.to_string()).await
+                        });
+                        match verbatim {
+                            Ok(None) => {
+                                warnings.push(format!(
+                                    "verbatim-missing: MemoryStore entry {} has no Verbatim counterpart",
+                                    entry.id
+                                ));
+                            }
+                            Err(e) => {
+                                warnings.push(format!(
+                                    "verbatim-check: entry {} verbatim load failed: {e}",
+                                    entry.id
+                                ));
+                            }
+                            _ => {} // OK
+                        }
+                    }
+                }
+                Ok(_) => {} // empty store, nothing to verify
+                Err(e) => {
+                    warnings.push(format!("cross-store-verify: list_all failed: {e}"));
+                }
+            }
+        }
+
+        warnings
     }
 
     /// Approximate token count for a slice of memory entries (chars / 4).

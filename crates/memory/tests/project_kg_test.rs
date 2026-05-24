@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cowd_memory::entity::EntityType;
-use cowd_memory::project_scope::build_project_kg;
+use cowd_memory::project_scope::{build_project_kg, ProjectScopeManager};
 
 fn write_file(dir: &Path, name: &str, content: &str) -> PathBuf {
     let path = dir.join(name);
@@ -49,7 +49,7 @@ impl Handler for Config {
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     // Should find at least main, helper_one, process_data
@@ -83,7 +83,7 @@ trait Database {}
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     let structs: Vec<_> = entities
@@ -127,7 +127,7 @@ impl SomeTrait for MyStruct {
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
     let names: Vec<_> = entities.iter().map(|e| e.name.as_str()).collect();
 
@@ -154,7 +154,7 @@ enum Status { Active, Inactive }
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
     let names: Vec<_> = entities.iter().map(|e| e.name.as_str()).collect();
 
@@ -181,7 +181,7 @@ interface Config {
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
     let names: Vec<_> = entities.iter().map(|e| e.name.as_str()).collect();
 
@@ -216,7 +216,7 @@ class MyComponent {}
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
     let names: Vec<_> = entities.iter().map(|e| e.name.as_str()).collect();
 
@@ -254,7 +254,7 @@ class ConfigLoader:
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
     let names: Vec<_> = entities.iter().map(|e| e.name.as_str()).collect();
 
@@ -302,7 +302,7 @@ type Handler interface {
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
     let names: Vec<_> = entities.iter().map(|e| e.name.as_str()).collect();
 
@@ -340,7 +340,7 @@ public interface Repository {
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
     let names: Vec<_> = entities.iter().map(|e| e.name.as_str()).collect();
 
@@ -386,7 +386,7 @@ def validate_input(data):
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let names: Vec<_> = kg.list_entities().iter().map(|e| e.name.as_str()).collect();
 
     assert!(
@@ -424,7 +424,7 @@ logging:
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     let config_keys: Vec<_> = entities
@@ -463,7 +463,7 @@ fn extracts_json_top_level_keys() {
 }"#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     let config_keys: Vec<_> = entities
@@ -503,7 +503,7 @@ serde = "1.0"
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
     let names: Vec<_> = entities
         .iter()
@@ -553,7 +553,7 @@ fn extracts_html_tags_as_data_fields() {
 </html>"#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     // Regular tags → DataField
@@ -650,7 +650,7 @@ fn extracts_css_selectors_and_keyframes() {
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     let data_fields: Vec<_> = entities
@@ -730,7 +730,7 @@ $primary: #333;
 "#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     let data_fields: Vec<_> = entities
@@ -783,7 +783,7 @@ export default {
 </style>"#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     // Component name → Concept
@@ -857,7 +857,7 @@ export default {
 </template>"#,
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     let concepts: Vec<_> = entities
@@ -885,7 +885,7 @@ fn unknown_text_file_uses_first_line_as_concept() {
         "id,name,email\n1,Alice,alice@example.com\n2,Bob,bob@example.com\n",
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     assert_eq!(
@@ -913,7 +913,7 @@ fn source_type_is_set_correctly() {
         "app:\n  name: test\n",
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     let code_entity = entities.iter().find(|e| e.name == "my_fn").unwrap();
@@ -935,7 +935,7 @@ fn source_ids_use_file_prefix() {
 
     write_file(tmp.path(), "src/main.rs", "fn main() {}");
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entity = kg.get_entity_by_name("main").expect("main should exist");
 
     assert_eq!(entity.source_ids.len(), 1);
@@ -963,8 +963,8 @@ fn second_project_kg_does_not_contaminate_first() {
     write_file(tmp1.path(), "src/main.rs", "fn unique_project_one() {}");
     write_file(tmp2.path(), "src/main.rs", "fn unique_project_two() {}");
 
-    let kg1 = build_project_kg(tmp1.path());
-    let kg2 = build_project_kg(tmp2.path());
+    let (kg1, _mtimes1) = build_project_kg(tmp1.path());
+    let (kg2, _mtimes2) = build_project_kg(tmp2.path());
 
     assert!(
         kg1.get_entity_by_name("unique_project_one").is_some(),
@@ -998,7 +998,7 @@ fn functions_get_tool_entity_type() {
         "fn compute() {}",
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entity = kg.get_entity_by_name("compute").expect("compute should exist");
     assert_eq!(
         entity.entity_type,
@@ -1017,7 +1017,7 @@ fn structs_and_traits_get_concept_entity_type() {
         "struct Data {} trait Validator {}",
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let data_entity = kg.get_entity_by_name("Data").expect("Data should exist");
     let validator_entity = kg
         .get_entity_by_name("Validator")
@@ -1035,7 +1035,7 @@ fn structs_and_traits_get_concept_entity_type() {
 fn empty_directory_returns_empty_kg() {
     let tmp = tempfile::TempDir::new().unwrap();
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     assert!(
         kg.list_entities().is_empty(),
         "empty directory should produce empty KG"
@@ -1052,7 +1052,7 @@ fn extracts_markdown_headings_and_terms() {
         "# Project\n\nSome **important** concept.\n\n## Getting Started\n\nAnother _emphasized_ term.\n",
     );
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
     // Should find headings
@@ -1088,7 +1088,7 @@ fn case_sensitive_lookup_with_get_entity_by_name() {
 
     write_file(tmp.path(), "main.rs", "fn MyFunc() {}");
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
 
     assert!(kg.get_entity_by_name("MyFunc").is_some());
     assert!(
@@ -1104,7 +1104,7 @@ fn entity_source_ids_track_origin_file() {
 
     write_file(tmp.path(), "src/foo.rs", "fn foo_fn() {}");
 
-    let kg = build_project_kg(tmp.path());
+    let (kg, _mtimes) = build_project_kg(tmp.path());
     let entity = kg.get_entity_by_name("foo_fn").expect("foo_fn should exist");
 
     assert_eq!(entity.source_ids.len(), 1);
@@ -1112,5 +1112,56 @@ fn entity_source_ids_track_origin_file() {
         entity.source_ids[0].contains("foo.rs"),
         "source_id should reference origin file, got: {}",
         entity.source_ids[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T0: File change triggers KG rebuild (staleness detection)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_file_change_triggers_kg_rebuild() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // 1. Create a project with a .rs file containing "fn old_function()"
+    let proj = tmp.path().join("my_proj");
+    fs::create_dir(&proj).unwrap();
+    fs::write(proj.join("lib.rs"), "fn old_function() {}\n").unwrap();
+
+    // 2. Register project and build KG
+    let mgr = ProjectScopeManager::new(tmp.path().join("global.db")).unwrap();
+    let pid = mgr.register_project(&proj).unwrap();
+
+    // 3. Assert: is_kg_stale() returns false immediately after registration
+    assert!(
+        !mgr.is_kg_stale(&pid).unwrap(),
+        "KG should NOT be stale immediately after registration"
+    );
+
+    // 4. Modify the file: add "fn new_function()"
+    // Small sleep to ensure mtime actually changes (some FS have 1s granularity)
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    fs::write(
+        proj.join("lib.rs"),
+        "fn old_function() {}\nfn new_function() {}\n",
+    )
+    .unwrap();
+
+    // 5. Assert: is_kg_stale() returns true
+    assert!(
+        mgr.is_kg_stale(&pid).unwrap(),
+        "KG should be stale after file modification"
+    );
+}
+
+#[test]
+fn test_is_kg_stale_unknown_project() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mgr = ProjectScopeManager::new(tmp.path().join("global.db")).unwrap();
+
+    let result = mgr.is_kg_stale("nonexistent_project_id");
+    assert!(
+        result.is_err(),
+        "is_kg_stale should return error for unknown project"
     );
 }

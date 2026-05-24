@@ -105,6 +105,10 @@ pub struct ProjectManifest {
     pub indexed_at: DateTime<Utc>,
     /// Timestamp of the most recent interaction.
     pub last_activity: DateTime<Utc>,
+    /// Modification timestamps (Unix seconds) of indexed source files,
+    /// keyed by absolute path.  Used to detect staleness so the KG
+    /// can be auto-rebuilt when source files change.
+    pub indexed_file_mtimes: HashMap<String, u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +223,7 @@ impl ProjectScopeManager {
             name: String::new(),
             indexed_at: now,
             last_activity: now,
+            indexed_file_mtimes: HashMap::new(),
         };
 
         inner.projects.insert(project_id.clone(), manifest);
@@ -227,7 +232,13 @@ impl ProjectScopeManager {
         drop(inner);
 
         // Auto-build project knowledge graph on registration
-        let _kg = build_project_kg(&canonical_clone);
+        let (_kg, file_mtimes) = build_project_kg(&canonical_clone);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(manifest) = inner.projects.get_mut(&project_id) {
+                manifest.indexed_file_mtimes = file_mtimes;
+            }
+        }
 
         if project_registered_cb.is_some() {
             let inner = self.inner.lock().unwrap();
@@ -278,6 +289,41 @@ impl ProjectScopeManager {
     pub fn global_store(&self) -> SqliteStore {
         self.inner.lock().unwrap().global_store.clone()
     }
+
+    /// Check whether the indexed files for a registered project have changed
+    /// since the last KG build.
+    ///
+    /// Compares the current on-disk modification time of each indexed file
+    /// against the timestamp stored in the manifest.  Returns `Ok(true)` if
+    /// any file has a different mtime (or was deleted), meaning the KG is
+    /// stale and should be rebuilt.
+    pub fn is_kg_stale(&self, project_id: &str) -> Result<bool, MemoryError> {
+        let inner = self.inner.lock().unwrap();
+        let manifest = inner
+            .projects
+            .get(project_id)
+            .ok_or_else(|| MemoryError::NotFound(format!("project not registered: {project_id}")))?;
+
+        for (file_path, stored_mtime) in &manifest.indexed_file_mtimes {
+            match std::fs::metadata(file_path) {
+                Ok(meta) => match meta.modified() {
+                    Ok(modified) => {
+                        let current_secs = modified
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if current_secs != *stored_mtime {
+                            return Ok(true);
+                        }
+                    }
+                    Err(_) => return Ok(true),
+                },
+                Err(_) => return Ok(true),
+            }
+        }
+
+        Ok(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +334,7 @@ impl ProjectScopeManager {
 ///
 /// Uses FNV-1a 64-bit (RFC 7353) which is deterministic across runs, unlike
 /// [`std::hash::DefaultHasher`] whose random seed changes per-process.
-fn hash_path(path: &Path) -> String {
+pub(crate) fn hash_path(path: &Path) -> String {
     // FNV-1a 64-bit constants.
     let offset_basis: u64 = 0xcbf29ce484222325;
     let prime: u64 = 0x100000001b3;
@@ -328,7 +374,10 @@ struct LangPatterns {
 /// | * (any other text)      | unknown   | Concept (first line)        |
 ///
 /// Binary files (null byte in first 512 bytes) and files > 1 MiB are skipped.
-pub fn build_project_kg(project_path: &Path) -> KnowledgeGraph {
+///
+/// Returns the knowledge graph and a map of indexed file paths to their
+/// modification timestamps (Unix seconds), used for staleness detection.
+pub fn build_project_kg(project_path: &Path) -> (KnowledgeGraph, HashMap<String, u64>) {
     // -- language definitions -------------------------------------------------
     #[allow(clippy::type_complexity)]
     let code_langs: &[(&[&str], &[(&str, EntityType)])] = &[
@@ -493,6 +542,7 @@ pub fn build_project_kg(project_path: &Path) -> KnowledgeGraph {
 
     // -- single walk ---------------------------------------------------------
     let mut kg = KnowledgeGraph::new();
+    let mut file_mtimes: HashMap<String, u64> = HashMap::new();
     let now = Utc::now();
 
     for entry in walkdir::WalkDir::new(project_path)
@@ -506,6 +556,14 @@ pub fn build_project_kg(project_path: &Path) -> KnowledgeGraph {
         if let Ok(meta) = std::fs::metadata(path) {
             if meta.len() > MAX_FILE_SIZE {
                 continue;
+            }
+            // Record mtime for staleness detection
+            if let Ok(modified) = meta.modified() {
+                let secs = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                file_mtimes.insert(path.to_string_lossy().to_string(), secs);
             }
         }
 
@@ -616,7 +674,7 @@ pub fn build_project_kg(project_path: &Path) -> KnowledgeGraph {
         }
     }
 
-    kg
+    (kg, file_mtimes)
 }
 
 // ---------------------------------------------------------------------------
