@@ -17,6 +17,7 @@ use parking_lot::Mutex;
 use crate::{
     config::MemoryConfig,
     context_fence::FenceRegistry,
+    context_sync::ContextSync,
     closet::{ClosetManager, Closet},
     error::MemoryError,
     fact_checker::{FactChecker, FactCheckResult},
@@ -73,6 +74,8 @@ pub struct MemoryOrchestrator {
     active_session: Mutex<Option<String>>,
     /// Closet rebuild counter for automatic periodic rebuild.
     closet_rebuild_counter: AtomicU32,
+    /// Cross-session context synchronisation store.
+    context_sync: Mutex<ContextSync>,
 }
 
 impl MemoryOrchestrator {
@@ -147,6 +150,7 @@ impl MemoryOrchestrator {
             active_agent: Mutex::new(None),
             active_session: Mutex::new(None),
             closet_rebuild_counter: AtomicU32::new(0),
+            context_sync: Mutex::new(ContextSync::new()),
         })
     }
 
@@ -687,7 +691,32 @@ impl MemoryOrchestrator {
         max_per_peer: usize,
         max_peers: usize,
     ) -> Result<Vec<MemoryEntry>> {
-        self.l4.recall_peers(query, current_agent, max_per_peer, max_peers).await
+        let mut entries = self.l4.recall_peers(query, current_agent, max_per_peer, max_peers).await?;
+
+        // Inject cross-session context from ContextSync
+        let session_id = self.active_session.lock().clone().unwrap_or_default();
+        if !session_id.is_empty() && !entries.is_empty() {
+            let sync = self.context_sync.lock();
+            let sync_count = sync.session_count();
+            if sync_count > 0 {
+                if let Some(first) = entries.first_mut() {
+                    let mut ctx = std::mem::take(&mut first.content);
+                    let injected = sync.inject_from_others(&session_id, &mut ctx);
+                    if injected > 0 {
+                        first.content = ctx;
+                        tracing::debug!(
+                            injected,
+                            sync_count,
+                            "context_sync: injected cross-session context into peer recall"
+                        );
+                    } else {
+                        first.content = ctx;
+                    }
+                }
+            }
+        }
+
+        Ok(entries)
     }
 
     /// Intra-turn real-time peer perception (T3).

@@ -44,6 +44,7 @@ use uuid::Uuid;
 use crate::{ MemoryScope,
     config::ExtractorConfig,
     error::MemoryError,
+    splitter,
     store::MemoryStore,
     types::{
         MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Message, MessageRole, Priority,
@@ -224,10 +225,13 @@ impl MemoryExtractor {
 
         let mut entries: Vec<MemoryEntry> = Vec::new();
 
-        entries.extend(self.extract_preferences(messages));
-        entries.extend(self.extract_decisions(messages));
-        entries.extend(self.extract_error_fixes(messages));
-        entries.extend(self.extract_patterns(messages));
+        // Pre-split large messages for better chunking
+        let chunked_messages = Self::chunk_large_messages(messages);
+
+        entries.extend(self.extract_preferences(&chunked_messages));
+        entries.extend(self.extract_decisions(&chunked_messages));
+        entries.extend(self.extract_error_fixes(&chunked_messages));
+        entries.extend(self.extract_patterns(&chunked_messages));
 
         // Filter by minimum confidence.
         entries.retain(|e| e.confidence >= self.config.min_confidence);
@@ -348,6 +352,24 @@ impl MemoryExtractor {
     // -----------------------------------------------------------------------
     // Private – extraction passes
     // -----------------------------------------------------------------------
+
+    /// Split messages > 2000 chars into smaller chunks for better extraction precision.
+    fn chunk_large_messages(messages: &[Message]) -> Vec<Message> {
+        let mut out = Vec::with_capacity(messages.len());
+        for msg in messages {
+            if msg.content.len() > 2000 {
+                let chunks = splitter::semantic_split(&msg.content, 1500);
+                for chunk in chunks {
+                    let mut chunk_msg = msg.clone();
+                    chunk_msg.content = chunk;
+                    out.push(chunk_msg);
+                }
+            } else {
+                out.push(msg.clone());
+            }
+        }
+        out
+    }
 
     /// Pass 1 – user preference extraction.
     fn extract_preferences(&self, messages: &[Message]) -> Vec<MemoryEntry> {

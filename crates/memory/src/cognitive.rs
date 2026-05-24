@@ -27,6 +27,7 @@ use chrono::Utc;
 use crate::{ MemoryScope, SessionResume,
     closet::{Closet, ClosetManager},
     code_indexer::CodeSymbol,
+    coherence,
     compression::{
         budget::BudgetManager,
         monitor::ContextWindowMonitor,
@@ -46,9 +47,11 @@ use crate::{ MemoryScope, SessionResume,
     relevance::DynamicLoader,
     search::HybridSearcher,
     seeds::{DecisionThreadStore, SeedRegistry},
+    state_rebuilder::StateRebuilder,
     store::{FtsSearchOptions, FtsSearchResult},
     store::sqlite::SqliteStore,
     store::vector::VectorIndex,
+    tool_sandbox::ToolOutputSandbox,
     types::{
         DecisionEntry, HandoffData, MatchedKeyword, MemoryEntry, MemoryId, MemoryLayer,
         MemoryCategory, MemorySource, Message, MessageRole, PreparedContext, Priority,
@@ -153,6 +156,12 @@ pub struct CognitiveContextManager {
     kg_rebuild_tick_counter: AtomicU64,
     /// Tick counter for cross-store consistency verification (every 50 ticks).
     cross_store_verify_counter: AtomicU64,
+    /// In-memory FTS5 sandbox for indexing large tool outputs.
+    tool_sandbox: Mutex<ToolOutputSandbox>,
+    /// State rebuilder for session restoration from previous session data.
+    state_rebuilder: Option<StateRebuilder>,
+    /// Cached workspace root for state_rebuilder and other path-dependent modules.
+    workspace_root: Option<PathBuf>,
 }
 
 impl CognitiveContextManager {
@@ -173,7 +182,7 @@ impl CognitiveContextManager {
     ) -> Result<Self> {
         // Build the orchestrator (opens SQLite, wires all layers).
         let orchestrator =
-            MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root).await?;
+            MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root.clone()).await?;
 
         // Build the compression pipeline from config.
         let pipeline = CompressionPipeline::from_config(&config.compression);
@@ -279,6 +288,17 @@ impl CognitiveContextManager {
             Mutex::new(registry)
         };
 
+        // Build state_rebuilder if workspace_root is available
+        let ws_root = workspace_root.clone();
+        let state_rebuilder = ws_root.as_ref().map(|ws| StateRebuilder::new(ws.clone()));
+        let tool_sandbox = match ToolOutputSandbox::new() {
+            Ok(ts) => Mutex::new(ts),
+            Err(e) => {
+                tracing::warn!("failed to initialize tool sandbox: {e}");
+                Mutex::new(ToolOutputSandbox::new().expect("tool sandbox retry"))
+            }
+        };
+
         Ok(Self {
             drift: DriftDetector::new(config.drift.clone()),
             fresh_ctx: FreshContextManager::new(config.budget.context_window),
@@ -290,6 +310,9 @@ impl CognitiveContextManager {
             project_kg_path: Mutex::new(None),
             kg_rebuild_tick_counter: AtomicU64::new(0),
             cross_store_verify_counter: AtomicU64::new(0),
+            tool_sandbox,
+            state_rebuilder,
+            workspace_root: ws_root,
             config,
             orchestrator,
             pipeline,
@@ -442,6 +465,66 @@ impl CognitiveContextManager {
                 Err(e) => {
                     tracing::warn!(error = %e, "session resume failed, continuing without it");
                 }
+            }
+        }
+
+        // ── Step 2a2: State rebuild from previous session state ──────────────
+        if let Some(ref rebuilder) = self.state_rebuilder {
+            let rebuilt = rebuilder.quick_rebuild().await;
+            if rebuilt.overall_confidence > 0.3 {
+                if let Some(ref summary) = rebuilt.context_summary {
+                    entries.push(MemoryEntry {
+                        id: uuid::Uuid::new_v4(),
+                        layer: MemoryLayer::L2,
+                        category: MemoryCategory::CompressedSummary,
+                        priority: Priority::Normal,
+                        source: MemorySource::AutoExtracted,
+                        title: "Rebuilt Context Summary".into(),
+                        content: format!("[REBUILT STATE confidence={:.2}] {}", rebuilt.overall_confidence, summary.data),
+                        embedding: None,
+                        tags: vec!["rebuilt".into(), "state".into()],
+                        relations: vec![],
+                        confidence: summary.confidence,
+                        access_count: 0,
+                        staleness: 0.0,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        last_accessed_at: None,
+                        scope: MemoryScope::default(),
+                        session_id: None,
+                        source_agent: None,
+                        visibility: crate::types::AgentVisibility::default(),
+                    });
+                }
+                for item in rebuilt.get_incomplete_work() {
+                    entries.push(MemoryEntry {
+                        id: uuid::Uuid::new_v4(),
+                        layer: MemoryLayer::L1,
+                        category: MemoryCategory::Reference,
+                        priority: item.priority,
+                        source: MemorySource::AutoExtracted,
+                        title: format!("Rebuilt: {}", item.title),
+                        content: format!("[REBUILT WORK ITEM] {}", item.description),
+                        embedding: None,
+                        tags: vec!["rebuilt".into(), "work".into()],
+                        relations: vec![],
+                        confidence: 0.7,
+                        access_count: 0,
+                        staleness: 0.0,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        last_accessed_at: None,
+                        scope: MemoryScope::default(),
+                        session_id: None,
+                        source_agent: None,
+                        visibility: crate::types::AgentVisibility::default(),
+                    });
+                }
+                tracing::info!(
+                    confidence = rebuilt.overall_confidence,
+                    work_items = rebuilt.get_incomplete_work().len(),
+                    "state_rebuilder: surfaced rebuilt state"
+                );
             }
         }
 
@@ -891,6 +974,23 @@ impl CognitiveContextManager {
                     tracing::warn!(
                         error = %e,
                         "on_turn_end: extraction failed (non-fatal)"
+                    );
+                }
+            }
+
+            // ── 0b. Index large tool outputs into sandbox ───────────────────
+            let mut sandbox = self.tool_sandbox.lock().unwrap();
+            for msg in messages.iter().filter(|m| matches!(m.role, MessageRole::Tool)) {
+                let call_id = msg.tool_use_id.as_deref().unwrap_or("unknown");
+                let tool_name = msg.tool_name.as_deref().unwrap_or("unknown_tool");
+                let threshold = 2000;
+                if let Some(summary) = sandbox.index_tool_output(call_id, tool_name, &msg.content, threshold) {
+                    tracing::info!(
+                        call_id,
+                        tool_name,
+                        total_lines = summary.total_lines,
+                        full_size = summary.full_size_bytes,
+                        "tool_sandbox: indexed large tool output"
                     );
                 }
             }
@@ -1852,6 +1952,51 @@ impl CognitiveContextManager {
                 Ok(_) => {} // empty store, nothing to verify
                 Err(e) => {
                     warnings.push(format!("cross-store-verify: list_all failed: {e}"));
+                }
+            }
+        }
+
+        // 4. Coherence check: verify KG entity names appear in at least one
+        //    MemoryStore entry with a minimum Jaccard similarity.
+        {
+            let kg = match self.kg.lock() {
+                Ok(g) => g,
+                Err(_) => return warnings,
+            };
+            let entities: Vec<_> = kg.list_entities().into_iter().collect();
+            if !entities.is_empty() {
+                let sample_size = 5usize.min(entities.len());
+                let step = (entities.len() / sample_size).max(1);
+                let store = self.orchestrator.store();
+                let mut checked = 0usize;
+                for (i, entity) in entities.iter().enumerate() {
+                    if i % step != 0 || checked >= sample_size {
+                        continue;
+                    }
+                    checked += 1;
+                    let results = tokio::runtime::Handle::current().block_on(async {
+                        store.search_fts(&entity.name, 3).await
+                    });
+                    match results {
+                        Ok(entries) => {
+                            let has_relevant = entries.iter().any(|e| {
+                                coherence::jaccard_similarity(&entity.name, &e.content) > 0.1
+                            });
+                            if !has_relevant && !entries.is_empty() {
+                                warnings.push(format!(
+                                    "coherence-low: entity '{}' has no relevant MemoryStore entry (best checked: {})",
+                                    entity.name,
+                                    entries.first().map(|e| e.title.as_str()).unwrap_or("none")
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            warnings.push(format!(
+                                "coherence-check: entity '{}' FTS search failed: {e}",
+                                entity.name
+                            ));
+                        }
+                    }
                 }
             }
         }
