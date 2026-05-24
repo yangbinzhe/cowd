@@ -49,7 +49,7 @@ use crate::tui::event::{ComponentId as EventComponentId, EventBus, EventPriority
 use crate::tui::keybind::types::Action;
 use crate::tui::keybind::which_key::WhichKey;
 use crate::tui::keybind::{default_bindings, KeybindEngine};
-use crate::tui::layout::{LayoutNode, LayoutTree};
+use crate::tui::layout::LayoutTree;
 use crate::tui::profiler::{FrameTimer, RenderProfiler};
 use crate::tui::theme::ThemeEngine;
 use crate::tui::TuiEvent;
@@ -1010,7 +1010,7 @@ impl TuiState {
 
     /// Handle a key press while search is active.
     fn handle_search_key(&mut self, key: crossterm::event::KeyEvent) -> ProcessedKey {
-        use crossterm::event::{KeyCode, KeyModifiers};
+        use crossterm::event::KeyCode;
         match key.code {
             KeyCode::Esc => {
                 self.app.cancel_search();
@@ -1376,13 +1376,13 @@ impl TuiState {
     }
 
     /// Render the Ctrl+O per-message action menu when pending.
-    fn render_message_menu(&mut self, frame: &mut Frame, area: ratatui::layout::Rect, skin: &crate::tui::skin::SkinConfig) {
+    fn render_message_menu(&mut self, frame: &mut Frame, area: ratatui::layout::Rect, _skin: &crate::tui::skin::SkinConfig) {
         if !self.chat_view.pending_message_menu {
             return;
         }
 
-        use ratatui::layout::{Constraint, Direction, Layout};
-        use ratatui::style::{Color, Modifier, Style, Stylize};
+        
+        use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 

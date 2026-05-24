@@ -39,6 +39,7 @@ pub mod provider;
 pub mod relevance;
 pub mod seeds;
 pub mod session_manager;
+pub mod session_store;
 pub mod shared;
 pub mod splitter;
 pub mod state_rebuilder;
@@ -69,6 +70,7 @@ pub use config::{MemoryConfig, VectorConfig};
 pub use fresh_context::{
     FreshContextManager, FreshEntry, SessionTokenBudget, SessionBudgetStatus,
 };
+pub use session_store::UnifiedSessionStore;
 pub use store::session::{SessionRecord, SessionSearchResult, SqliteSessionStore};
 pub use store::verbatim::{VerbatimEntry, VerbatimSink};
 pub use embedding::{EmbeddingClient, EmbeddingCapability};

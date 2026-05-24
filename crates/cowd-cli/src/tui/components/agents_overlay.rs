@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},

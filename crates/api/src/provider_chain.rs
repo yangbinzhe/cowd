@@ -196,7 +196,6 @@ impl ProviderChainConfig {
 pub struct ProviderChain {
     config: ProviderChainConfig,
     providers: Vec<ChainProvider>,
-    round_robin_index: usize,
 }
 
 impl ProviderChain {
@@ -205,7 +204,6 @@ impl ProviderChain {
         Self {
             config,
             providers: Vec::new(),
-            round_robin_index: 0,
         }
     }
 
@@ -229,65 +227,6 @@ impl ProviderChain {
             .iter()
             .filter(|p| p.config.enabled && p.health.is_healthy)
             .collect()
-    }
-
-    /// Select providers based on the configured strategy.
-    fn select_providers(&self) -> Vec<&ChainProvider> {
-        let healthy = self.healthy_providers();
-
-        if healthy.is_empty() {
-            // Fall back to all enabled providers if none are healthy
-            return self
-                .providers
-                .iter()
-                .filter(|p| p.config.enabled)
-                .collect();
-        }
-
-        match self.config.strategy {
-            SelectionStrategy::Sequential | SelectionStrategy::RoundRobin => healthy,
-            SelectionStrategy::WeightedRandom => {
-                // Sort by weight for weighted selection
-                let mut sorted = healthy.clone();
-                sorted.sort_by(|a, b| b.config.weight.cmp(&a.config.weight));
-                sorted
-            }
-            SelectionStrategy::Healthiest => {
-                // Sort by average response time (healthiest = fastest)
-                let mut sorted = healthy.clone();
-                sorted.sort_by(|a, b| {
-                    let a_time = a.health.avg_response_time_ms.unwrap_or(f64::MAX);
-                    let b_time = b.health.avg_response_time_ms.unwrap_or(f64::MAX);
-                    a_time.partial_cmp(&b_time).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                sorted
-            }
-        }
-    }
-
-    /// Get the next provider in round-robin order.
-    fn next_round_robin(&mut self) -> Option<usize> {
-        // First, get just the names of healthy providers without holding a borrow
-        let healthy_names: Vec<String> = self
-            .providers
-            .iter()
-            .filter(|p| p.config.enabled && p.health.is_healthy)
-            .map(|p| p.config.name.clone())
-            .collect();
-
-        if healthy_names.is_empty() {
-            return None;
-        }
-
-        let healthy_len = healthy_names.len();
-        let current_index = self.round_robin_index % healthy_len;
-        self.round_robin_index = (self.round_robin_index + 1) % healthy_len;
-
-        // Now search in providers using the selected name
-        let selected_name = &healthy_names[current_index];
-        self.providers
-            .iter()
-            .position(|p| p.config.name == *selected_name)
     }
 
     /// Send a message through the chain with failover.

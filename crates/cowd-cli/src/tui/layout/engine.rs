@@ -13,7 +13,6 @@ use ratatui::{
     Frame,
 };
 
-use crate::tui::components::{Component, EventResult, RenderContext};
 use super::types::{LayoutNode, PanelDef, SplitDirection, TabGroup};
 
 // ── TabBar ────────────────────────────────────────────────────────

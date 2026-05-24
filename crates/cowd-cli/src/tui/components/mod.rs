@@ -25,4 +25,4 @@ pub mod todo_panel;
 #[cfg(test)]
 mod base_test;
 
-pub use base::{Component, ComponentId, EventResult, RenderContext};
+pub use base::{Component, EventResult, RenderContext};

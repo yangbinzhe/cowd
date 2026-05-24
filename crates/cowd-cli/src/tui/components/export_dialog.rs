@@ -181,7 +181,7 @@ impl Component for ExportDialog {
             ])
         };
 
-        let mut items = vec![
+        let items = vec![
             Line::from(""), // spacer
             filename_line,
             Line::from(""), // spacer

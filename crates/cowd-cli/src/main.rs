@@ -108,7 +108,7 @@ fn expand_home(path: &std::path::Path) -> std::path::PathBuf {
 /// Returns None if memory is disabled in the config.
 fn build_memory_config(
     src: &runtime::MemoryConfig,
-    cwd: &std::path::Path,
+    _cwd: &std::path::Path,
 ) -> Option<memory::MemoryConfig> {
     if !src.enabled {
         return None;

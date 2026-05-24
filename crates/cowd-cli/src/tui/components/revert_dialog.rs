@@ -126,7 +126,7 @@ impl RevertDialog {
     pub fn open_revert_dialog(
         &mut self,
         dialog_manager: &mut DialogManager,
-        message_index: usize,
+        _message_index: usize,
         diff_text: &str,
     ) {
         let files = parse_diffs(diff_text);

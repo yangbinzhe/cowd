@@ -345,23 +345,6 @@ pub struct SessionBudgetStatus {
     pub usage_ratio: f32,
 }
 
-// ── Extension trait for CognitiveContextManager ────────────────────────────────
-
-/// Extension trait to add fresh context support to CognitiveContextManager.
-pub trait FreshContextExt {
-    /// Prepare fresh context for a session with GSD-style prioritization.
-    ///
-    /// This method:
-    /// 1. First recovers from handoff if available
-    /// 2. Loads entries sorted by freshness score
-    /// 3. Respects session-scoped token budget
-    async fn prepare_fresh_context(
-        &self,
-        session_id: &str,
-        query: &str,
-    ) -> Result<Vec<MemoryEntry>>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

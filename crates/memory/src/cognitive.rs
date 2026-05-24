@@ -160,8 +160,6 @@ pub struct CognitiveContextManager {
     tool_sandbox: Mutex<ToolOutputSandbox>,
     /// State rebuilder for session restoration from previous session data.
     state_rebuilder: Option<StateRebuilder>,
-    /// Cached workspace root for state_rebuilder and other path-dependent modules.
-    workspace_root: Option<PathBuf>,
 }
 
 impl CognitiveContextManager {
@@ -312,7 +310,6 @@ impl CognitiveContextManager {
             cross_store_verify_counter: AtomicU64::new(0),
             tool_sandbox,
             state_rebuilder,
-            workspace_root: ws_root,
             config,
             orchestrator,
             pipeline,

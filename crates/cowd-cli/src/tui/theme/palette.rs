@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use ratatui::style::Color;
-use serde::de::{self, Deserialize, Deserializer};
+use serde::de::{Deserialize, Deserializer};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 
 /// 8 semantic colors that make up a TUI theme palette.

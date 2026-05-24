@@ -230,7 +230,7 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
 ## TODOs
 
 <!-- Task 1-7: Wave 1 — 基础准备 -->
-- [ ] 1. 实现 UnifiedSessionStore + 统一 SqliteSessionStore 接口
+- [x] 1. 实现 UnifiedSessionStore + 统一 SqliteSessionStore 接口
 
   **What to do**:
   - 在 `crates/memory/src/session_store.rs` 创建新模块

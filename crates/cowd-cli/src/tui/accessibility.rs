@@ -12,7 +12,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use std::collections::HashMap;
 
-use crate::tui::theme::{Palette, StyleSheet, Theme, ThemeLoader, ThemeSource};
+use crate::tui::theme::{Palette, StyleSheet, Theme, ThemeSource};
 
 // ── Accessibility Mode ───────────────────────────────────────────
 

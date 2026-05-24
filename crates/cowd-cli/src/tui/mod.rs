@@ -26,7 +26,6 @@ pub mod accessibility;
 mod tui_integration_tests;
 
 pub use app::{App, FileEntry, DelegateTask, MemoryEntry, SkillSummary};
-pub use components::{Component, ComponentId, EventResult, RenderContext};
 pub use events::{TuiEvent, TuiEventReceiver, tui_event_channel};
 pub use runner::TurnOutcome;
 pub use callbacks::TuiToolCallback;

@@ -21,7 +21,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::tui::components::base::{Component, EventResult, RenderContext};
@@ -599,7 +599,7 @@ impl Prompt {
     /// Extract the current word being typed from the textarea.
     /// Returns the word as a string slice, or empty if none.
     fn current_word(&self) -> String {
-        let text = self.textarea.lines().join("\n");
+        let _text = self.textarea.lines().join("\n");
         let (row, col) = (self.textarea.cursor().0, self.textarea.cursor().1);
 
         // Get the line the cursor is on

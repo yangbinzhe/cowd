@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use std::hash::{Hash, Hasher};
 
 /// A sequence of key presses that triggers an action.

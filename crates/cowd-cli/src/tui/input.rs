@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use std::io;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, MouseButton};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use tui_textarea::{TextArea, CursorMove};
 use ratatui::widgets::{Block, Borders};
 use super::app::App;
