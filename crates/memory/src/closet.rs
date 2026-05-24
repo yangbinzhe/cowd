@@ -15,6 +15,18 @@ pub const CHAR_LIMIT: usize = 1500;
 /// Character window for extraction (borrowed from MemPalace: 5000).
 pub const EXTRACT_WINDOW: usize = 5000;
 
+/// What kind of entity a closet pointer references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointerKind {
+    /// Points to a text memory entry.
+    Memory,
+    /// Points to a code symbol.
+    CodeSymbol,
+}
+
+/// Identifier for a code symbol in the closet.
+pub type CodeSymbolId = String;
+
 /// A single pointer row in the closet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClosetPointer {
@@ -26,6 +38,12 @@ pub struct ClosetPointer {
     pub drawer_ids: Vec<String>,
     /// Relevance score for ranking.
     pub relevance_score: f64,
+    /// What kind of entity this pointer references.
+    pub kind: PointerKind,
+    /// Display name of the code symbol (when kind is CodeSymbol).
+    pub symbol_name: Option<String>,
+    /// Unique identifier for the code symbol (when kind is CodeSymbol).
+    pub symbol_id: Option<CodeSymbolId>,
 }
 
 /// The Closet index: a collection of pointer rows for fast topic routing.
@@ -61,6 +79,9 @@ impl Closet {
                         entities: entry.entities.clone(),
                         drawer_ids: vec![entry.id.clone()],
                         relevance_score: 0.5,
+                        kind: PointerKind::Memory,
+                        symbol_name: None,
+                        symbol_id: None,
                     };
                     pointers.push(ptr);
                 }
@@ -245,6 +266,57 @@ impl ClosetManager {
         matched
     }
 
+    /// Add a code-symbol pointer to the closet.
+    ///
+    /// The pointer is boosted by the given `boost` amount so that frequently
+    /// referenced symbols rise to the top of search results.
+    pub fn add_code_pointer(&mut self, symbol_name: &str, drawer_key: &str, boost: f32) {
+        let topic = symbol_name.to_lowercase();
+        let boost_f64 = f64::from(boost);
+
+        // Check if a pointer for this symbol already exists.
+        if let Some(ptr) = self.closet.pointers.iter_mut().find(|p| {
+            p.kind == PointerKind::CodeSymbol && p.symbol_name.as_deref() == Some(symbol_name)
+        }) {
+            ptr.relevance_score += boost_f64;
+            return;
+        }
+
+        // Create a new code-symbol pointer.
+        let ptr = ClosetPointer {
+            topic: topic.clone(),
+            entities: vec![symbol_name.to_string()],
+            drawer_ids: vec![drawer_key.to_string()],
+            relevance_score: f64::from(boost),
+            kind: PointerKind::CodeSymbol,
+            symbol_name: Some(symbol_name.to_string()),
+            symbol_id: Some(symbol_name.to_string()),
+        };
+
+        self.closet.pointers.push(ptr);
+        // Sort by relevance
+        self.closet.pointers.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    /// Look up a code symbol by name in the closet.
+    ///
+    /// Returns the symbol ID if a matching code-symbol pointer exists.
+    #[must_use]
+    pub fn lookup_code_symbol(&self, name: &str) -> Option<CodeSymbolId> {
+        self.closet
+            .pointers
+            .iter()
+            .find(|p| {
+                p.kind == PointerKind::CodeSymbol
+                    && p.symbol_name.as_deref() == Some(name)
+            })
+            .and_then(|p| p.symbol_id.clone())
+    }
+
     /// Return the total number of pointer rows in the closet.
     #[must_use]
     pub fn topic_count(&self) -> usize {
@@ -363,5 +435,72 @@ mod tests {
         assert!(kws.contains(&"react".to_string()));
         assert!(kws.contains(&"framework".to_string()));
         assert!(!kws.contains(&"the".to_string())); // stop word
+    }
+
+    // -----------------------------------------------------------------------
+    // T6: Hot symbol tracking — code pointer tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_add_code_pointer_and_lookup() {
+        let mut manager = ClosetManager::from_closet(Closet::default());
+
+        manager.add_code_pointer("authenticate_user", "src/auth.rs:10", 0.8);
+        manager.add_code_pointer("TokenManager", "src/auth.rs:25", 0.6);
+
+        assert_eq!(manager.topic_count(), 2);
+
+        let lookup = manager.lookup_code_symbol("authenticate_user");
+        assert!(lookup.is_some());
+        assert_eq!(lookup.unwrap(), "authenticate_user");
+
+        let missing = manager.lookup_code_symbol("nonexistent_fn");
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_hot_symbol_promotion() {
+        let mut manager = ClosetManager::from_closet(Closet::default());
+
+        // Add a symbol with initial boost
+        manager.add_code_pointer("handle_request", "src/server.rs:42", 0.5);
+
+        // Verify initial score
+        let ptrs = manager.search_topics("handle_request");
+        assert_eq!(ptrs.len(), 1);
+        let initial_score = ptrs[0].relevance_score;
+
+        // Boost the same symbol again (simulating frequent reference)
+        manager.add_code_pointer("handle_request", "src/server.rs:42", 0.4);
+
+        let ptrs2 = manager.search_topics("handle_request");
+        assert_eq!(ptrs2.len(), 1);
+        assert!(
+            ptrs2[0].relevance_score > initial_score,
+            "score should increase after boost"
+        );
+    }
+
+    #[test]
+    fn test_quick_lookup() {
+        let mut manager = ClosetManager::from_closet(Closet::default());
+
+        manager.add_code_pointer("UserService", "src/services.rs:15", 0.9);
+        manager.add_code_pointer("handle_auth", "src/auth.rs:30", 0.5);
+
+        // lookup_code_symbol should return the exact match
+        assert_eq!(
+            manager.lookup_code_symbol("UserService"),
+            Some("UserService".to_string())
+        );
+        assert_eq!(
+            manager.lookup_code_symbol("handle_auth"),
+            Some("handle_auth".to_string())
+        );
+
+        // Closet pointers should have CodeSymbol kind
+        let ptrs = manager.search_topics("UserService");
+        assert_eq!(ptrs[0].kind, PointerKind::CodeSymbol);
+        assert_eq!(ptrs[0].symbol_name.as_deref(), Some("UserService"));
     }
 }

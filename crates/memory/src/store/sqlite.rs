@@ -477,6 +477,16 @@ END",
     mtime     INTEGER NOT NULL,
     file_size INTEGER NOT NULL
 )",
+        // Phase 2: symbol ↔ memory conversation linking
+        r"CREATE TABLE IF NOT EXISTS symbol_references (
+    symbol_id      TEXT NOT NULL,
+    memory_id      TEXT NOT NULL,
+    turn_index     INTEGER,
+    reference_type TEXT,
+    timestamp      INTEGER NOT NULL
+)",
+        "CREATE INDEX IF NOT EXISTS idx_symbol_refs_symbol ON symbol_references(symbol_id)",
+        "CREATE INDEX IF NOT EXISTS idx_symbol_refs_memory ON symbol_references(memory_id)",
     ];
 
     for stmt in statements {
@@ -1443,6 +1453,52 @@ impl SqliteStore {
         Ok(symbols)
     }
 
+    // -------------------------------------------------------------------
+    // Symbol ↔ memory linking (Phase 2: L3 deep recall integration)
+    // -------------------------------------------------------------------
+
+    fn do_insert_symbol_reference(
+        conn: &Connection,
+        symbol_id: &str,
+        memory_id: &str,
+        turn_index: Option<i32>,
+        reference_type: &str,
+        timestamp: i64,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO symbol_references (symbol_id, memory_id, turn_index, reference_type, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![symbol_id, memory_id, turn_index, reference_type, timestamp],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn do_find_memories_by_symbol(conn: &Connection, symbol_name: &str) -> Result<Vec<MemoryId>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT memory_id FROM symbol_references
+                 WHERE symbol_id LIKE ?1 OR symbol_id = ?2
+                 ORDER BY timestamp DESC",
+            )
+            .map_err(sql_err)?;
+        let pattern = format!("%{}%", symbol_name.to_lowercase());
+        let rows = stmt
+            .query_map(params![pattern, symbol_name], |row| {
+                let id_str: String = row.get(0)?;
+                Ok(id_str)
+            })
+            .map_err(sql_err)?;
+        let mut ids = Vec::new();
+        for r in rows {
+            let id_str = r.map_err(sql_err)?;
+            if let Ok(uuid) = Uuid::parse_str(&id_str) {
+                ids.push(uuid);
+            }
+        }
+        Ok(ids)
+    }
+
     fn do_save_fingerprint(conn: &Connection, path: &str, fp: &FileFingerprint) -> Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO code_file_fingerprints (file_path, mtime, file_size)
@@ -1948,6 +2004,44 @@ impl MemoryStore for SqliteStore {
         .await
         .map_err(|e| MemoryError::Store(e.to_string()))?
     }
+
+    async fn link_symbol_to_memory(
+        &self,
+        symbol_id: &str,
+        memory_id: &MemoryId,
+        turn_index: Option<i32>,
+        reference_type: &str,
+        timestamp: i64,
+    ) -> Result<()> {
+        let store = self.clone();
+        let symbol_id = symbol_id.to_string();
+        let memory_id_str = memory_id.to_string();
+        let reference_type = reference_type.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_insert_symbol_reference(
+                &conn,
+                &symbol_id,
+                &memory_id_str,
+                turn_index,
+                &reference_type,
+                timestamp,
+            )
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn find_memories_by_symbol(&self, symbol_name: &str) -> Result<Vec<MemoryId>> {
+        let store = self.clone();
+        let symbol_name = symbol_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_find_memories_by_symbol(&conn, &symbol_name)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
 }
 
 #[cfg(test)]
@@ -2347,5 +2441,75 @@ mod tests {
         assert_eq!(callees.len(), 2, "main should call foo and bar");
         assert!(callees.iter().any(|s| s.name == "foo"));
         assert!(callees.iter().any(|s| s.name == "bar"));
+    }
+
+    // -------------------------------------------------------------------
+    // T5: Symbol ↔ memory conversation linking
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_symbol_conversation_link() {
+        let store = open_store();
+
+        let memory_id = Uuid::new_v4();
+        let symbol_id = "src/auth.rs:authenticate_user:10";
+        let timestamp = chrono::Utc::now().timestamp();
+
+        // Link a symbol to a memory entry
+        let result = store
+            .link_symbol_to_memory(symbol_id, &memory_id, Some(1), "tool_call", timestamp)
+            .await;
+        assert!(result.is_ok(), "linking symbol to memory should succeed");
+
+        // Link another reference of the same symbol
+        store
+            .link_symbol_to_memory(symbol_id, &memory_id, Some(3), "response", timestamp + 10)
+            .await
+            .unwrap();
+
+        // Find memories by symbol
+        let mem_ids = store.find_memories_by_symbol("authenticate_user").await.unwrap();
+        assert!(!mem_ids.is_empty(), "should find the linked memory");
+        assert!(mem_ids.contains(&memory_id));
+    }
+
+    #[tokio::test]
+    async fn test_find_conversations_by_symbol() {
+        let store = open_store();
+
+        let mem1 = Uuid::new_v4();
+        let mem2 = Uuid::new_v4();
+        let now = chrono::Utc::now().timestamp();
+
+        // Link symbol A to two different memories
+        store
+            .link_symbol_to_memory("src/auth.rs:authenticate_user:10", &mem1, Some(1), "tool_call", now)
+            .await
+            .unwrap();
+        store
+            .link_symbol_to_memory("src/auth.rs:authenticate_user:10", &mem2, Some(2), "reference", now + 1)
+            .await
+            .unwrap();
+
+        // Link a different symbol to mem1
+        store
+            .link_symbol_to_memory("src/auth.rs:TokenManager:25", &mem1, Some(2), "tool_call", now + 2)
+            .await
+            .unwrap();
+
+        // Find memories by authenticate_user
+        let auth_mems = store.find_memories_by_symbol("authenticate_user").await.unwrap();
+        assert_eq!(auth_mems.len(), 2, "authenticate_user should be linked to two memories");
+        assert!(auth_mems.contains(&mem1));
+        assert!(auth_mems.contains(&mem2));
+
+        // Find memories by TokenManager
+        let token_mems = store.find_memories_by_symbol("TokenManager").await.unwrap();
+        assert_eq!(token_mems.len(), 1, "TokenManager should be linked to one memory");
+        assert_eq!(token_mems[0], mem1);
+
+        // Find by non-existent symbol
+        let none = store.find_memories_by_symbol("nonexistent").await.unwrap();
+        assert!(none.is_empty());
     }
 }

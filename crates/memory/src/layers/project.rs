@@ -17,8 +17,10 @@ use std::{
     sync::Arc,
 };
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 use crate::{
+    code_indexer::{CodeIndexer, CodeSymbol, IndexStats},
     config::DriftConfig,
     layers::{LayerManager, Result},
     project_scope::MemoryScope,
@@ -46,6 +48,8 @@ pub struct ProjectLayer {
     max_tokens: u64,
     workspace_root: Option<PathBuf>,
     drift: DriftConfig,
+    /// Optional code indexer for project source code graph integration.
+    code_indexer: Option<CodeIndexer>,
 }
 
 impl ProjectLayer {
@@ -56,6 +60,7 @@ impl ProjectLayer {
             max_tokens: DEFAULT_MAX_TOKENS,
             workspace_root: None,
             drift: DriftConfig::default(),
+            code_indexer: None,
         }
     }
 
@@ -71,6 +76,7 @@ impl ProjectLayer {
             max_tokens,
             workspace_root: Some(workspace_root),
             drift,
+            code_indexer: None,
         }
     }
 
@@ -177,6 +183,62 @@ impl ProjectLayer {
             ids.push(id);
         }
         Ok(ids)
+    }
+
+    /// Initialise the code graph by indexing project source code.
+    ///
+    /// Creates a [`CodeIndexer`] for the given project root, walks all
+    /// source files, and persists extracted symbols to the backing store.
+    /// This is **optional** — only call when the project has source code
+    /// to index.
+    ///
+    /// Returns statistics about the indexing run.
+    pub async fn init_code_graph(&mut self, root: &Path) -> Result<IndexStats> {
+        let mut indexer = CodeIndexer::new(root)?;
+        let mut stats = IndexStats::default();
+
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let path = entry.path();
+            if crate::code_indexer::IndexLanguage::is_indexable(path) {
+                match indexer.index_file(path) {
+                    Ok((symbols, _edges)) => {
+                        stats.files_processed += 1;
+                        stats.symbols_found += symbols.len();
+                        // Persist each symbol via the store trait
+                        for sym in &symbols {
+                            if self.store.insert_symbol(sym).await.is_err() {
+                                // Continue even if one symbol fails
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        stats.files_processed += 1;
+                    }
+                }
+            }
+        }
+
+        self.code_indexer = Some(indexer);
+        Ok(stats)
+    }
+
+    /// Query the code graph for symbols relevant to the given search term.
+    ///
+    /// Uses FTS5 full-text search on the `code_symbols_fts` virtual table.
+    /// Returns an empty vector if no code indexer is available (graceful
+    /// degradation).
+    pub async fn find_relevant_symbols(&self, query: &str, limit: usize) -> Vec<CodeSymbol> {
+        if self.code_indexer.is_none() {
+            return Vec::new();
+        }
+        self.store
+            .search_symbols(query, limit)
+            .await
+            .unwrap_or_default()
     }
 }
 
@@ -430,5 +492,113 @@ mod tests {
     #[test]
     fn layer_returns_l2() {
         assert_eq!(ProjectLayer::new(in_memory()).layer(), MemoryLayer::L2);
+    }
+
+    // -----------------------------------------------------------------------
+    // T4: Code graph integration tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_no_symbols_when_no_code() {
+        let layer = ProjectLayer::new(in_memory());
+        let symbols = layer.find_relevant_symbols("auth", 5).await;
+        assert!(symbols.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_project_layer_injects_code_symbols() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+
+        // Create a sample Rust source file
+        let src_dir = project_root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let lib_rs = src_dir.join("lib.rs");
+        std::fs::write(
+            &lib_rs,
+            r#"
+/// Authenticate a user with the given credentials.
+pub fn authenticate_user(username: &str, password: &str) -> bool {
+    validate_credentials(username, password)
+}
+
+fn validate_credentials(username: &str, password: &str) -> bool {
+    !username.is_empty() && !password.is_empty()
+}
+
+pub struct AuthService {
+    pub enabled: bool,
+}
+
+pub enum AuthError {
+    InvalidCredentials,
+    ExpiredToken,
+}
+"#,
+        )
+        .unwrap();
+
+        // Create a ProjectLayer with workspace and code_indexer set to None initially
+        let mut layer = ProjectLayer::with_workspace(
+            in_memory(),
+            project_root.clone(),
+            3000,
+            DriftConfig::default(),
+        );
+
+        // Index the code
+        let stats = layer.init_code_graph(&project_root).await.unwrap();
+        assert!(stats.files_processed > 0);
+        assert!(stats.symbols_found > 0);
+
+        // Verify symbols were persisted — search via find_relevant_symbols
+        let symbols = layer.find_relevant_symbols("authenticate", 10).await;
+        assert!(!symbols.is_empty(), "should find authenticate_user symbol");
+        assert!(symbols.iter().any(|s| s.name.contains("authenticate_user")));
+
+        // Search for struct
+        let struct_syms = layer.find_relevant_symbols("AuthService", 10).await;
+        assert!(
+            struct_syms.iter().any(|s| s.name.contains("AuthService")),
+            "should find AuthService struct"
+        );
+
+        // Search for something not in the code
+        let missing = layer.find_relevant_symbols("nonexistent_function", 5).await;
+        assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_auto_index_on_init() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().to_path_buf();
+
+        // Create a Python source file
+        let py_file = project_root.join("auth.py");
+        std::fs::write(
+            &py_file,
+            "def authenticate_user(username, password):\n    return True\n\nclass TokenManager:\n    pass\n",
+        )
+        .unwrap();
+
+        let mut layer = ProjectLayer::with_workspace(
+            in_memory(),
+            project_root.clone(),
+            3000,
+            DriftConfig::default(),
+        );
+
+        // Init code graph should work for Python too
+        let stats = layer.init_code_graph(&project_root).await.unwrap();
+        assert!(stats.files_processed > 0);
+        assert!(stats.symbols_found > 0);
+
+        let symbols = layer.find_relevant_symbols("authenticate_user", 5).await;
+        assert!(!symbols.is_empty());
+        assert!(symbols.iter().any(|s| s.name == "authenticate_user"));
+
+        // TokenManager should also be indexed
+        let class_syms = layer.find_relevant_symbols("TokenManager", 5).await;
+        assert!(!class_syms.is_empty());
     }
 }

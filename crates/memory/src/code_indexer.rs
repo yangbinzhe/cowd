@@ -360,6 +360,11 @@ impl CodeIndexer {
         self.fingerprints = fps;
     }
 
+    /// Return a reference to stored file fingerprints.
+    pub fn fingerprints(&self) -> &HashMap<PathBuf, FileFingerprint> {
+        &self.fingerprints
+    }
+
     // -----------------------------------------------------------------------
     // Tree-sitter extraction helpers
     // -----------------------------------------------------------------------

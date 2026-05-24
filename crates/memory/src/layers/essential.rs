@@ -12,6 +12,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -30,12 +31,23 @@ use crate::{
 const DEFAULT_MAX_TOKENS: u64 = 2000;
 /// Staleness threshold above which Low-priority entries are evicted.
 const LOW_PRIORITY_PRUNE_THRESHOLD: f32 = 0.8;
+/// Maximum number of hot symbol slots in L1.
+const MAX_HOT_SYMBOLS: usize = 5;
+
+/// A tracked code symbol in the hot-symbol cache.
+#[derive(Debug, Clone)]
+pub struct HotSymbol {
+    pub name: String,
+    pub frequency: f32,
+    pub last_referenced: i64,
+}
 
 /// Manager for the L1 essential working-memory layer.
 pub struct EssentialLayer {
     store: Arc<dyn MemoryStore>,
     max_tokens: u64,
     drift: DriftConfig,
+    hot_symbols: Mutex<Vec<HotSymbol>>,
 }
 
 impl EssentialLayer {
@@ -45,6 +57,7 @@ impl EssentialLayer {
             store,
             max_tokens: DEFAULT_MAX_TOKENS,
             drift: DriftConfig::default(),
+            hot_symbols: Mutex::new(Vec::new()),
         }
     }
 
@@ -54,6 +67,7 @@ impl EssentialLayer {
             store,
             max_tokens,
             drift,
+            hot_symbols: Mutex::new(Vec::new()),
         }
     }
 
@@ -110,6 +124,53 @@ impl EssentialLayer {
             self.store.update(&entry).await?;
         }
         Ok(())
+    }
+
+    /// Promote a code symbol to the hot-symbol cache.
+    ///
+    /// Called by the background extractor when a symbol is frequently
+    /// referenced.  If the symbol is already tracked its frequency is
+    /// boosted; otherwise a new slot is allocated (evicting the lowest-
+    /// frequency symbol if the cache is full).
+    pub fn promote_symbol(&self, name: &str) {
+        let mut symbols = self.hot_symbols.lock();
+        let now = Utc::now().timestamp();
+
+        // Boost existing symbol
+        if let Some(sym) = symbols.iter_mut().find(|s| s.name == name) {
+            sym.frequency += 1.0;
+            sym.last_referenced = now;
+            return;
+        }
+
+        // Evict lowest-frequency if at capacity
+        if symbols.len() >= MAX_HOT_SYMBOLS {
+            symbols.sort_by(|a, b| {
+                a.frequency
+                    .partial_cmp(&b.frequency)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            symbols.remove(0);
+        }
+
+        symbols.push(HotSymbol {
+            name: name.to_string(),
+            frequency: 1.0,
+            last_referenced: now,
+        });
+    }
+
+    /// Return the current hot symbol slots, sorted by frequency (descending).
+    #[must_use]
+    pub fn get_hot_symbols(&self) -> Vec<HotSymbol> {
+        let symbols = self.hot_symbols.lock();
+        let mut syms: Vec<HotSymbol> = symbols.clone();
+        syms.sort_by(|a, b| {
+            b.frequency
+                .partial_cmp(&a.frequency)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        syms
     }
 }
 
@@ -177,6 +238,15 @@ impl LayerManager for EssentialLayer {
 
             self.store.update(&entry).await?;
         }
+
+        // Apply frequency decay to hot symbols and evict cold ones.
+        let mut symbols = self.hot_symbols.lock();
+        let hot_decay = (decay * 0.5) as f32; // slower decay for symbols
+        symbols.retain_mut(|sym| {
+            sym.frequency = (sym.frequency - hot_decay).max(0.0);
+            sym.frequency > 0.1
+        });
+
         Ok(())
     }
 }
@@ -391,5 +461,72 @@ mod tests {
     #[test]
     fn layer_returns_l1() {
         assert_eq!(EssentialLayer::new(in_memory()).layer(), MemoryLayer::L1);
+    }
+
+    // -----------------------------------------------------------------------
+    // T6: Hot symbol tracking tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_hot_symbol_promotion() {
+        let layer = EssentialLayer::new(in_memory());
+
+        // Initially no hot symbols
+        assert!(layer.get_hot_symbols().is_empty());
+
+        // Promote a symbol
+        layer.promote_symbol("authenticate_user");
+        let hot = layer.get_hot_symbols();
+        assert_eq!(hot.len(), 1);
+        assert_eq!(hot[0].name, "authenticate_user");
+        assert_eq!(hot[0].frequency, 1.0);
+
+        // Promote again — frequency should increase
+        layer.promote_symbol("authenticate_user");
+        let hot2 = layer.get_hot_symbols();
+        assert_eq!(hot2.len(), 1);
+        assert_eq!(hot2[0].frequency, 2.0);
+    }
+
+    #[test]
+    fn test_hot_symbol_eviction() {
+        let layer = EssentialLayer::new(in_memory());
+
+        // Fill the cache (max 5 slots)
+        for i in 0..6 {
+            layer.promote_symbol(&format!("symbol_{i}"));
+        }
+
+        let hot = layer.get_hot_symbols();
+        assert_eq!(hot.len(), 5, "should cap at 5 hot symbols");
+
+        // The lowest-frequency symbol (symbol_0 with frequency 1.0) should be evicted
+        // symbol_1 through symbol_5 should remain
+        let names: Vec<&str> = hot.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"symbol_0"), "symbol_0 should be evicted");
+        assert!(names.contains(&"symbol_1"), "symbol_1 should remain");
+        assert!(names.contains(&"symbol_5"), "symbol_5 should remain");
+    }
+
+    #[tokio::test]
+    async fn test_hot_symbol_decay_on_tick() {
+        let drift = DriftConfig {
+            staleness_decay_per_day: 0.4,
+            prune_threshold: 0.9,
+            ..Default::default()
+        };
+        let layer = EssentialLayer::with_config(in_memory(), 2000, drift);
+
+        // Add a hot symbol with moderate frequency
+        layer.promote_symbol("handle_request");
+        layer.promote_symbol("handle_request");
+        assert_eq!(layer.get_hot_symbols()[0].frequency, 2.0);
+
+        // One tick: hot decay = 0.4 * 0.5 = 0.2 → frequency becomes 1.8
+        layer.tick().await.unwrap();
+        let hot = layer.get_hot_symbols();
+        assert!(!hot.is_empty(), "symbol should survive one tick");
+        assert!(hot[0].frequency < 2.0, "frequency should decay");
+        assert!(hot[0].frequency > 1.0, "frequency decay should be moderate");
     }
 }

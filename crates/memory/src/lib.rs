@@ -142,7 +142,7 @@ pub use write_guard::{
     AuditOperation, IntegrityChecker, Anomaly, AnomalyReport,
 };
 pub use tool_sandbox::{ToolOutputSandbox, ToolOutputSummary};
-pub use closet::{Closet, ClosetPointer, ClosetEntry, ClosetManager, RANK_BOOSTS, CHAR_LIMIT};
+pub use closet::{Closet, ClosetPointer, ClosetEntry, ClosetManager, RANK_BOOSTS, CHAR_LIMIT, PointerKind, CodeSymbolId};
 pub use session_resume::SessionResume;
 pub use context_rot::{ContextRotMonitor, RotMetrics, RotAlert};
 pub use compression::token_estimation::{

@@ -163,4 +163,32 @@ pub trait MemoryStore: Send + Sync {
     async fn get_callees(&self, _symbol_id: &str) -> Result<Vec<CodeSymbol>> {
         Err(MemoryError::Store("code symbol callees not supported by this backend".into()))
     }
+
+    // -----------------------------------------------------------------------
+    // Symbol ↔ memory linking (Phase 2: L3 deep recall integration)
+    // -----------------------------------------------------------------------
+
+    /// Link a code symbol to a memory entry (conversation context).
+    ///
+    /// Each time a symbol is referenced during a conversation turn,
+    /// this records the association so that `find_memories_by_symbol`
+    /// can retrieve all conversations that mentioned a given symbol.
+    async fn link_symbol_to_memory(
+        &self,
+        _symbol_id: &str,
+        _memory_id: &MemoryId,
+        _turn_index: Option<i32>,
+        _reference_type: &str,
+        _timestamp: i64,
+    ) -> Result<()> {
+        Err(MemoryError::Store("symbol↔memory linking not supported by this backend".into()))
+    }
+
+    /// Find all memory entries that reference a given code symbol.
+    ///
+    /// Searches the `symbol_references` table for all memory IDs
+    /// linked to `symbol_name` (matched case-insensitively).
+    async fn find_memories_by_symbol(&self, _symbol_name: &str) -> Result<Vec<MemoryId>> {
+        Err(MemoryError::Store("symbol↔memory lookup not supported by this backend".into()))
+    }
 }
