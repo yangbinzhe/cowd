@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 
 use crate::{
+    code_indexer::CodeSymbol,
     entity::{Entity, Triple},
     error::MemoryError,
     project_scope::MemoryScope,
@@ -138,4 +139,28 @@ pub trait MemoryStore: Send + Sync {
     ///
     /// The caller should include `%` wildcards (e.g. `"%keyword%"`).
     async fn search_verbatim_by_content(&self, query: &str) -> Result<Vec<VerbatimEntry>>;
+
+    // -----------------------------------------------------------------------
+    // Code symbol persistence (Phase 1: code indexer storage)
+    // -----------------------------------------------------------------------
+
+    /// Persist a code symbol extracted from source code.
+    async fn insert_symbol(&self, _sym: &CodeSymbol) -> Result<()> {
+        Err(MemoryError::Store("code symbol storage not supported by this backend".into()))
+    }
+
+    /// Full-text search across indexed code symbols.
+    async fn search_symbols(&self, _query: &str, _limit: usize) -> Result<Vec<CodeSymbol>> {
+        Err(MemoryError::Store("code symbol search not supported by this backend".into()))
+    }
+
+    /// Find all symbols that call the given symbol (callers / upstream).
+    async fn get_callers(&self, _symbol_id: &str) -> Result<Vec<CodeSymbol>> {
+        Err(MemoryError::Store("code symbol callers not supported by this backend".into()))
+    }
+
+    /// Find all symbols called by the given symbol (callees / downstream).
+    async fn get_callees(&self, _symbol_id: &str) -> Result<Vec<CodeSymbol>> {
+        Err(MemoryError::Store("code symbol callees not supported by this backend".into()))
+    }
 }

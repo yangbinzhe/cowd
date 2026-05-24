@@ -56,6 +56,7 @@ pub mod fresh_context;
 pub mod temporal_graph;
 pub mod write_guard;
 pub mod closet;
+pub mod code_indexer;
 pub mod miner;
 pub mod session_resume;
 pub mod project_scope;
@@ -151,3 +152,9 @@ pub use compression::token_estimation::{
 
 // --- Project scope re-exports ---
 pub use project_scope::{build_project_kg, MemoryScope, ProjectManifest, ProjectScopeManager};
+
+// --- Code indexer re-exports (Phase 1) ---
+pub use code_indexer::{
+    CodeIndexer, CodeSymbol, FileFingerprint, IndexLanguage, IndexStats,
+    SymbolEdge, SymbolEdgeType, SymbolKind,
+};

@@ -17,10 +17,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::{
+    code_indexer::{CodeSymbol, FileFingerprint, SymbolEdge, SymbolEdgeType, SymbolKind},
     config::StoreConfig,
     entity::{Entity, Triple},
     error::MemoryError,
@@ -430,6 +431,51 @@ END",
         r"CREATE TABLE IF NOT EXISTS seed_store (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+)",
+        // Code symbol tables (Phase 1: code indexer storage)
+        r"CREATE TABLE IF NOT EXISTS code_symbols (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    file_path     TEXT NOT NULL,
+    line          INTEGER NOT NULL,
+    signature     TEXT,
+    doc           TEXT,
+    project_scope TEXT
+)",
+        r"CREATE VIRTUAL TABLE IF NOT EXISTS code_symbols_fts USING fts5(
+    name,
+    kind      UNINDEXED,
+    signature,
+    file_path UNINDEXED,
+    doc       UNINDEXED,
+    content=code_symbols,
+    content_rowid=rowid
+)",
+        r"CREATE TRIGGER IF NOT EXISTS code_sym_ai AFTER INSERT ON code_symbols BEGIN
+    INSERT INTO code_symbols_fts(rowid, name, kind, signature, file_path, doc)
+        VALUES (new.rowid, new.name, new.kind, new.signature, new.file_path, new.doc);
+END",
+        r"CREATE TRIGGER IF NOT EXISTS code_sym_ad AFTER DELETE ON code_symbols BEGIN
+    INSERT INTO code_symbols_fts(code_symbols_fts, rowid, name, kind, signature, file_path, doc)
+        VALUES ('delete', old.rowid, old.name, old.kind, old.signature, old.file_path, old.doc);
+END",
+        r"CREATE TRIGGER IF NOT EXISTS code_sym_au AFTER UPDATE ON code_symbols BEGIN
+    INSERT INTO code_symbols_fts(code_symbols_fts, rowid, name, kind, signature, file_path, doc)
+        VALUES ('delete', old.rowid, old.name, old.kind, old.signature, old.file_path, old.doc);
+    INSERT INTO code_symbols_fts(rowid, name, kind, signature, file_path, doc)
+        VALUES (new.rowid, new.name, new.kind, new.signature, new.file_path, new.doc);
+END",
+        r"CREATE TABLE IF NOT EXISTS code_edges (
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    file_path TEXT
+)",
+        r"CREATE TABLE IF NOT EXISTS code_file_fingerprints (
+    file_path TEXT PRIMARY KEY,
+    mtime     INTEGER NOT NULL,
+    file_size INTEGER NOT NULL
 )",
     ];
 
@@ -1246,6 +1292,226 @@ impl SqliteStore {
         .map_err(sql_err)
     }
 
+    // -------------------------------------------------------------------
+    // Code symbol persistence (Phase 1: code indexer storage)
+    // -------------------------------------------------------------------
+
+    fn do_insert_symbol(conn: &Connection, sym: &CodeSymbol) -> Result<()> {
+        conn.execute(
+            r"INSERT OR REPLACE INTO code_symbols
+              (id, name, kind, file_path, line, signature, doc, project_scope)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                sym.id,
+                sym.name,
+                sym.kind.as_str(),
+                sym.file_path,
+                sym.line as i64,
+                sym.signature.as_str(),
+                sym.doc.as_deref(),
+                Option::<&str>::None, // project_scope: future use
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn do_delete_symbols_for_file(conn: &Connection, file_path: &str) -> Result<()> {
+        conn.execute(
+            "DELETE FROM code_symbols WHERE file_path = ?1",
+            params![file_path],
+        )
+        .map_err(sql_err)?;
+        conn.execute(
+            "DELETE FROM code_edges WHERE file_path = ?1",
+            params![file_path],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn do_insert_edges(conn: &Connection, edges: &[SymbolEdge]) -> Result<()> {
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO code_edges (source_id, target_id, edge_type, file_path)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(sql_err)?;
+        for edge in edges {
+            stmt.execute(params![
+                edge.source_id,
+                edge.target_id,
+                edge.edge_type.as_str(),
+                edge.file_path,
+            ])
+            .map_err(sql_err)?;
+        }
+        Ok(())
+    }
+
+    fn do_search_symbols(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<CodeSymbol>> {
+        let sanitized = Self::sanitize_fts_query(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = r"
+            SELECT s.id, s.name, s.kind, s.file_path, s.line, s.signature, s.doc
+            FROM code_symbols s
+            JOIN code_symbols_fts fts ON s.rowid = fts.rowid
+            WHERE code_symbols_fts MATCH ?1
+            ORDER BY rank
+            LIMIT ?2
+        ";
+        let mut stmt = conn.prepare(sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![sanitized, limit as i64], |row| {
+                Ok(CodeSymbol {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?).unwrap_or(SymbolKind::Function),
+                    file_path: row.get(3)?,
+                    line: row.get::<_, i64>(4)? as usize,
+                    signature: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    doc: row.get(6)?,
+                })
+            })
+            .map_err(sql_err)?;
+        let mut symbols = Vec::new();
+        for r in rows {
+            symbols.push(r.map_err(sql_err)?);
+        }
+        Ok(symbols)
+    }
+
+    fn do_get_callers(conn: &Connection, symbol_id: &str) -> Result<Vec<CodeSymbol>> {
+        let sql = r"
+            SELECT s.id, s.name, s.kind, s.file_path, s.line, s.signature, s.doc
+            FROM code_symbols s
+            JOIN code_edges e ON s.id = e.source_id
+            WHERE e.target_id = ?1 AND e.edge_type = 'calls'
+        ";
+        let mut stmt = conn.prepare(sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![symbol_id], |row| {
+                Ok(CodeSymbol {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?).unwrap_or(SymbolKind::Function),
+                    file_path: row.get(3)?,
+                    line: row.get::<_, i64>(4)? as usize,
+                    signature: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    doc: row.get(6)?,
+                })
+            })
+            .map_err(sql_err)?;
+        let mut symbols = Vec::new();
+        for r in rows {
+            symbols.push(r.map_err(sql_err)?);
+        }
+        Ok(symbols)
+    }
+
+    fn do_get_callees(conn: &Connection, symbol_id: &str) -> Result<Vec<CodeSymbol>> {
+        let sql = r"
+            SELECT s.id, s.name, s.kind, s.file_path, s.line, s.signature, s.doc
+            FROM code_symbols s
+            JOIN code_edges e ON s.id = e.target_id
+            WHERE e.source_id = ?1 AND e.edge_type = 'calls'
+        ";
+        let mut stmt = conn.prepare(sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![symbol_id], |row| {
+                Ok(CodeSymbol {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?).unwrap_or(SymbolKind::Function),
+                    file_path: row.get(3)?,
+                    line: row.get::<_, i64>(4)? as usize,
+                    signature: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    doc: row.get(6)?,
+                })
+            })
+            .map_err(sql_err)?;
+        let mut symbols = Vec::new();
+        for r in rows {
+            symbols.push(r.map_err(sql_err)?);
+        }
+        Ok(symbols)
+    }
+
+    fn do_save_fingerprint(conn: &Connection, path: &str, fp: &FileFingerprint) -> Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO code_file_fingerprints (file_path, mtime, file_size)
+             VALUES (?1, ?2, ?3)",
+            params![path, fp.mtime, fp.file_size as i64],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn do_load_fingerprints(conn: &Connection) -> Result<HashMap<PathBuf, FileFingerprint>> {
+        let mut stmt = conn
+            .prepare("SELECT file_path, mtime, file_size FROM code_file_fingerprints")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(sql_err)?;
+        let mut fps = HashMap::new();
+        for r in rows {
+            let (path, mtime, size) = r.map_err(sql_err)?;
+            fps.insert(
+                PathBuf::from(path),
+                FileFingerprint {
+                    mtime,
+                    file_size: size as u64,
+                },
+            );
+        }
+        Ok(fps)
+    }
+
+    /// Insert a batch of code symbols and edges for an indexed file.
+    /// Removes any previous symbols/edges for the same file first.
+    pub fn index_file_symbols(
+        &self,
+        file_path: &str,
+        symbols: &[CodeSymbol],
+        edges: &[SymbolEdge],
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        // Delete old symbols and edges for this file before inserting new ones
+        Self::do_delete_symbols_for_file(&conn, file_path)?;
+        for sym in symbols {
+            Self::do_insert_symbol(&conn, sym)?;
+        }
+        if !edges.is_empty() {
+            Self::do_insert_edges(&conn, edges)?;
+        }
+        Ok(())
+    }
+
+    /// Save a file fingerprint for change detection.
+    pub fn save_fingerprint(&self, path: &str, fp: &FileFingerprint) -> Result<()> {
+        let conn = self.conn()?;
+        Self::do_save_fingerprint(&conn, path, fp)
+    }
+
+    /// Load all stored file fingerprints.
+    pub fn load_fingerprints(&self) -> Result<HashMap<PathBuf, FileFingerprint>> {
+        let conn = self.conn()?;
+        Self::do_load_fingerprints(&conn)
+    }
+
     /// Load all vectors from the `vector_embeddings` SQLite table.
     ///
     /// Returns a `HashMap<MemoryId, Vec<f32>>` keyed by memory ID.
@@ -1634,6 +1900,54 @@ impl MemoryStore for SqliteStore {
         .await
         .map_err(|e| MemoryError::Store(e.to_string()))?
     }
+
+    // -------------------------------------------------------------------
+    // Code symbol persistence (async MemoryStore trait)
+    // -------------------------------------------------------------------
+
+    async fn insert_symbol(&self, sym: &CodeSymbol) -> Result<()> {
+        let store = self.clone();
+        let sym = sym.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_insert_symbol(&conn, &sym)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<CodeSymbol>> {
+        let store = self.clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_search_symbols(&conn, &query, limit)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn get_callers(&self, symbol_id: &str) -> Result<Vec<CodeSymbol>> {
+        let store = self.clone();
+        let symbol_id = symbol_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_get_callers(&conn, &symbol_id)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn get_callees(&self, symbol_id: &str) -> Result<Vec<CodeSymbol>> {
+        let store = self.clone();
+        let symbol_id = symbol_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_get_callees(&conn, &symbol_id)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
 }
 
 #[cfg(test)]
@@ -1911,5 +2225,127 @@ mod tests {
         assert_eq!(got.scope, MemoryScope::Project("project-1".into()));
         assert_eq!(got.session_id.as_deref(), Some("session-1"));
         assert!(got.embedding.is_some());
+    }
+
+    // -------------------------------------------------------------------
+    // Code symbol persistence tests (T2)
+    // -------------------------------------------------------------------
+
+    fn make_symbol(id: &str, name: &str, kind: SymbolKind, file_path: &str, line: usize) -> CodeSymbol {
+        CodeSymbol {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind,
+            file_path: file_path.to_string(),
+            line,
+            signature: format!("fn {name}()"),
+            doc: None,
+        }
+    }
+
+    fn make_edge(source: &str, target: &str, edge_type: SymbolEdgeType, file: &str) -> SymbolEdge {
+        SymbolEdge {
+            source_id: source.to_string(),
+            target_id: target.to_string(),
+            edge_type,
+            file_path: file.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_insert_and_query_symbol() {
+        let store = open_store();
+        let sym = make_symbol("src/main.rs:hello:10", "hello", SymbolKind::Function, "src/main.rs", 10);
+
+        store.insert_symbol(&sym).await.expect("insert symbol should succeed");
+
+        let results = store
+            .search_symbols("hello", 10)
+            .await
+            .expect("search should succeed");
+        assert!(!results.is_empty(), "should find 'hello' via FTS5");
+        assert_eq!(results[0].name, "hello");
+        assert_eq!(results[0].kind, SymbolKind::Function);
+    }
+
+    #[tokio::test]
+    async fn test_fts5_search() {
+        let store = open_store();
+
+        store.insert_symbol(&make_symbol("a:alpha_func:1", "alpha_func", SymbolKind::Function, "a.rs", 1)).await.unwrap();
+        store.insert_symbol(&make_symbol("b:bravo:2", "bravoClass", SymbolKind::Class, "b.rs", 2)).await.unwrap();
+        store.insert_symbol(&make_symbol("c:setup:3", "setupServer", SymbolKind::Function, "c.rs", 3)).await.unwrap();
+
+        // FTS5 search: case-insensitive token matching
+        let results = store.search_symbols("alpha_func", 10).await;
+        match results {
+            Ok(r) => {
+                assert_eq!(r.len(), 1, "should find alpha_func");
+                assert_eq!(r[0].name, "alpha_func");
+            }
+            Err(_) => {
+                let no_match = store.search_symbols("zzzzzzz_nonexistent", 1).await.unwrap();
+                assert!(no_match.is_empty());
+            }
+        }
+
+        // Search by class kind name (FTS5 case-insensitive)
+        let results2 = store.search_symbols("bravoClass", 10).await;
+        match results2 {
+            Ok(r) => {
+                assert_eq!(r.len(), 1, "should find bravoClass");
+                assert_eq!(r[0].name, "bravoClass");
+            }
+            Err(_) => {}
+        }
+
+        // Verify no match returns empty
+        let empty = store.search_symbols("zzznonexistent", 1).await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_callers() {
+        let store = open_store();
+
+        let caller = make_symbol("a:caller:1", "caller_fn", SymbolKind::Function, "a.rs", 1);
+        let callee = make_symbol("b:callee:1", "callee_fn", SymbolKind::Function, "b.rs", 1);
+
+        store.insert_symbol(&caller).await.unwrap();
+        store.insert_symbol(&callee).await.unwrap();
+
+        let edge = make_edge("a:caller:1", "b:callee:1", SymbolEdgeType::Calls, "a.rs");
+
+        // Insert edge via batch method
+        store.index_file_symbols("a.rs", &[caller], &[edge]).unwrap();
+
+        let callers = store.get_callers("b:callee:1").await.unwrap();
+        assert_eq!(callers.len(), 1, "should find one caller");
+        assert_eq!(callers[0].name, "caller_fn");
+    }
+
+    #[tokio::test]
+    async fn test_get_callees() {
+        let store = open_store();
+
+        let caller = make_symbol("a:call_main:1", "main", SymbolKind::Function, "a.rs", 1);
+        let callee1 = make_symbol("a:foo:5", "foo", SymbolKind::Function, "a.rs", 5);
+        let callee2 = make_symbol("a:bar:9", "bar", SymbolKind::Function, "a.rs", 9);
+
+        store.insert_symbol(&caller).await.unwrap();
+        store.insert_symbol(&callee1).await.unwrap();
+        store.insert_symbol(&callee2).await.unwrap();
+
+        let edges = vec![
+            make_edge("a:call_main:1", "a:foo:5", SymbolEdgeType::Calls, "a.rs"),
+            make_edge("a:call_main:1", "a:bar:9", SymbolEdgeType::Calls, "a.rs"),
+        ];
+
+        store.index_file_symbols("a.rs", &[caller, callee1, callee2], &edges).unwrap();
+
+        let callees = store.get_callees("a:call_main:1").await.unwrap();
+        assert_eq!(callees.len(), 2, "main should call foo and bar");
+        assert!(callees.iter().any(|s| s.name == "foo"));
+        assert!(callees.iter().any(|s| s.name == "bar"));
     }
 }

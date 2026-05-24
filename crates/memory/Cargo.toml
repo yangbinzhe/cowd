@@ -21,6 +21,12 @@ parking_lot = "0.12"
 walkdir = "2"
 tempfile = "3"
 regex = "1"
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
 
 [lints.rust]
 unsafe_code = "allow"
