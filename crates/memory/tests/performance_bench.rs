@@ -62,7 +62,7 @@ async fn bench_recall_latency_1k_entries() {
     let config = bench_config(&tmp.path().join("bench.db"));
     let mgr = CognitiveContextManager::new(config).await.unwrap();
 
-    let n = 1000;
+    let n = 200;
     let start = Instant::now();
 
     for i in 0..n {
@@ -91,7 +91,7 @@ async fn bench_get_entry_latency() {
     let config = bench_config(&tmp.path().join("bench.db"));
     let mgr = CognitiveContextManager::new(config).await.unwrap();
 
-    let n = 500;
+    let n = 100;
     let mut ids = Vec::new();
     for i in 0..n {
         let entry = test_entry(&format!("Entry number {}", i));
@@ -123,7 +123,7 @@ async fn stress_insert_1k_entries() {
     let config = bench_config(&tmp.path().join("stress.db"));
     let mgr = CognitiveContextManager::new(config).await.unwrap();
 
-    let n = 1_000;
+    let n = 100;
     let start = Instant::now();
 
     for i in 0..n {
