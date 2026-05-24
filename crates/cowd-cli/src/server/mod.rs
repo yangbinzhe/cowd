@@ -1371,8 +1371,13 @@ async fn chat_handler(
             })
             .collect();
 
-        match mgr.prepare_context(&user_input, &mem_messages).await {
-            Ok(prepared) => {
+        let mgr_arc = Arc::clone(mgr);
+        let query_owned = user_input.clone();
+        match tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async { mgr_arc.prepare_context(&query_owned, &mem_messages).await })
+        }).await {
+            Ok(Ok(prepared)) => {
                 tracing::debug!(
                     entries = prepared.entries.len(),
                     tokens = prepared.total_tokens,
@@ -1380,8 +1385,12 @@ async fn chat_handler(
                 );
                 build_memory_context_block(&prepared)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "memory: prepare_context failed");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "memory: prepare_context spawn failed");
                 None
             }
         }
@@ -1541,14 +1550,11 @@ async fn chat_handler(
                     mem_messages.insert(0, to_memory_message("user", &user_input_for_mem));
                     tracing::debug!("SSE stream ended, triggering on_turn_end for chat");
 
-                    let mgr_clone = Arc::clone(mgr);
-                    tokio::spawn(async move {
-                        // B7 fix: removed unnecessary 100ms sleep before on_turn_end
-                        match mgr_clone.on_turn_end(&mut mem_messages).await {
-                            Ok(_) => tracing::debug!("on_turn_end completed for chat"),
-                            Err(e) => tracing::warn!("on_turn_end failed: {}", e),
-                        }
-                    });
+                    let mgr_arc = Arc::clone(mgr);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let rt = tokio::runtime::Handle::current();
+                        rt.block_on(async { mgr_arc.on_turn_end(&mut mem_messages).await })
+                    }).await;
                 }
             }
             Ok(Err(e)) => {
@@ -1667,13 +1673,11 @@ async fn chat_handler(
                     mem_messages.insert(0, to_memory_message("user", &user_input_for_mem));
 
                     tracing::debug!("Non-streaming chat complete, triggering on_turn_end");
-                    let mgr_clone = Arc::clone(mgr);
-                    tokio::spawn(async move {
-                        match mgr_clone.on_turn_end(&mut mem_messages).await {
-                            Ok(_) => tracing::debug!("on_turn_end completed for chat"),
-                            Err(e) => tracing::warn!("on_turn_end failed: {}", e),
-                        }
-                    });
+                    let mgr_arc = Arc::clone(mgr);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let rt = tokio::runtime::Handle::current();
+                        rt.block_on(async { mgr_arc.on_turn_end(&mut mem_messages).await })
+                    }).await;
                 }
 
                 Json(resp).into_response()
@@ -2374,7 +2378,9 @@ async fn create_memory_entry_handler(
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         last_accessed_at: None,
-        scope: None,
+        scope: Default::default(),
+        source_agent: None,
+        visibility: Default::default(),
         session_id: None,
     };
 
@@ -2450,7 +2456,9 @@ async fn create_handoff_handler(
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         last_accessed_at: None,
-        scope: None,
+        scope: Default::default(),
+        source_agent: None,
+        visibility: Default::default(),
         session_id: Some(handoff_id.clone()),
     }).await;
 
@@ -3986,7 +3994,7 @@ async fn send_message_handler(
     AxumState(state): AxumState<HttpAppState>,
     Path(session_id): Path<String>,
     Json(params): Json<SendMessageParams>,
-) -> axum::response::Response {
+) -> impl IntoResponse {
     let user_content = params.content.clone();
     let broadcast_tx = state.session_broadcast.clone();
     let cognitive_manager = state.cognitive_manager.clone();
@@ -4010,7 +4018,11 @@ async fn send_message_handler(
         let user_msg = to_memory_message("user", &user_content);
         let assistant_msg = to_memory_message("assistant", &response_text);
         let mut mem_messages = vec![user_msg, assistant_msg];
-        let _ = mgr.on_turn_end(&mut mem_messages).await;
+        let mgr_arc = Arc::clone(mgr);
+        let _ = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async { mgr_arc.on_turn_end(&mut mem_messages).await })
+        }).await;
     }
 
     let response = serde_json::json!({
@@ -5175,6 +5187,7 @@ async fn check_facts_handler(
         confidence: 1.0,
         source_memory_id: None,
         source_file: None,
+        source_agent: None,
     };
     let result = checker.check_triple(&triple);
     Json(result).into_response()
