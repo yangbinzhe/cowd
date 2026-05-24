@@ -80,7 +80,7 @@ async fn test_consistent_facts_unchanged() {
 async fn test_multi_agent_entries_survive_restart() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db = tmp.path().join("ma.db");
-    let e1_id = uuid::Uuid::new_v4();
+    let _e1_id = uuid::Uuid::new_v4();
     let e2_id = uuid::Uuid::new_v4();
 
     {

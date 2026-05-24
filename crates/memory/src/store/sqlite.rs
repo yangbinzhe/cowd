@@ -2059,7 +2059,7 @@ impl MemoryStore for SqliteStore {
 mod tests {
     use super::*;
     use crate::code_indexer::SymbolEdgeType;
-    use crate::types::{MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority};
+    use crate::types::{MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Priority};
     use uuid::Uuid;
 
     fn uid(s: &str) -> Uuid {

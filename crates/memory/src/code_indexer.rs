@@ -1213,7 +1213,7 @@ def standalone_func():
         );
 
         let mut indexer = CodeIndexer::new(dir.path()).expect("failed to create indexer");
-        let (symbols, edges) = indexer.index_file(&path).expect("failed to index");
+        let (symbols, _edges) = indexer.index_file(&path).expect("failed to index");
 
         let classes: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
         assert!(!classes.is_empty(), "should find MyClass");

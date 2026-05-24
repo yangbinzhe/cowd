@@ -1119,7 +1119,7 @@ mod tests {
     use crate::MemoryScope;
     use uuid::Uuid;
 
-    fn make_entry(id: &str, layer: MemoryLayer) -> MemoryEntry {
+    fn make_entry(_id: &str, layer: MemoryLayer) -> MemoryEntry {
         MemoryEntry {
             id: Uuid::new_v4(),
             layer,

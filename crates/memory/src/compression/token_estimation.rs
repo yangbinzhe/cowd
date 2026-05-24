@@ -158,8 +158,8 @@ mod tests {
 
         // Short English text: "I will help you with that."
         let text = "I will help you with that.";
-        let simple = est_simple.estimate(text);
-        let heuristic = est_heuristic.estimate(text);
+        let _simple = est_simple.estimate(text);
+        let _heuristic = est_heuristic.estimate(text);
 
         // Simple should be closer to actual (~7 tokens) than heuristic
         // heuristic: 27/4 = 7, so they're similar for short text

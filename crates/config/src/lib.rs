@@ -2008,7 +2008,7 @@ mod tests {
 
     #[test]
     fn providers_config_methods() {
-        let mut cfg = ProvidersConfig::default();
+        let cfg = ProvidersConfig::default();
         assert!(cfg.is_empty());
         assert!(cfg.resolve("nonexistent").is_none());
         assert!(cfg.get("none").is_none());

@@ -5440,7 +5440,7 @@ mod tests {
     fn subagent_tool_executor_denies_blocked_tool_before_dispatch() {
         // given
         let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
-        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from("write_file")]))
+        let executor = SubagentToolExecutor::new(BTreeSet::from([String::from("write_file")]))
             .with_enforcer(PermissionEnforcer::new(policy));
 
         // when

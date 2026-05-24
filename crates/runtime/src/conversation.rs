@@ -200,7 +200,7 @@ impl TurnCallback {
 pub struct ConversationRuntime<C, T> {
     session: Arc<RwLock<Session>>,
     api_client: C,
-    tool_executor: T,
+    tool_executor: Arc<T>,
     permission_policy: PermissionPolicy,
     system_prompt: Vec<String>,
     max_iterations: usize,
@@ -300,7 +300,7 @@ where
         Self {
             session,
             api_client,
-            tool_executor,
+            tool_executor: Arc::new(tool_executor),
             permission_policy,
             system_prompt,
             max_iterations: usize::MAX,
@@ -884,9 +884,17 @@ self.record_turn_completed(&summary);
                     callback.on_tool_start(tool_use_id, tool_name, &preview);
                 }
 
-                let (output, mut is_error) = match self.tool_executor.execute(tool_name, &effective_input) {
-                    Ok(output) => (output, false),
-                    Err(error) => (error.to_string(), true),
+                let (output, mut is_error) = {
+                    let tool_exec = Arc::clone(&self.tool_executor);
+                    let tname = tool_name.to_string();
+                    let tinput = effective_input.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        tool_exec.execute(&tname, &tinput)
+                    }).await {
+                        Ok(Ok(output)) => (output, false),
+                        Ok(Err(error)) => (error.to_string(), true),
+                        Err(join_error) => (format!("tool execution panicked: {join_error}"), true),
+                    }
                 };
 
                 if let Some(callback) = &self.tool_callback {
@@ -1881,9 +1889,9 @@ mod tests {
     #![allow(deprecated)]
 
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        ApiClient, ApiRequest,
+        AssistantEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        StaticToolExecutor,
     };
     use std::pin::Pin;
     use futures::stream::Stream;
@@ -2524,7 +2532,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_empty_session_no_memory_crash() {
         let session = Session::new();
-        let mut rt = ConversationRuntime::new(
+        let rt = ConversationRuntime::new(
             session, MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
@@ -2537,7 +2545,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_budget_cap_without_memory_returns_system_prompt() {
         let session = Session::new();
-        let mut rt = ConversationRuntime::new(
+        let rt = ConversationRuntime::new(
             session, MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
@@ -2550,7 +2558,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_structured_xml_format_present() {
         let session = Session::new();
-        let mut rt = ConversationRuntime::new(
+        let rt = ConversationRuntime::new(
             session, MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
@@ -2563,7 +2571,7 @@ mod tests {
     #[test]
     fn m2_error_propagation_returns_result() {
         let session = Session::new();
-        let mut rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
+        let rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["sys".to_string()]);
         let r = rt.run_memory_post_turn();
         assert!(r.is_ok(), "run_memory_post_turn should return Ok when no memory manager");
@@ -2572,7 +2580,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_structured_injection_has_memory_context_tag() {
         let session = Session::new();
-        let mut rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
+        let rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["system".to_string()]);
         let prompt = rt.prepare_memory_context("test").await;
         assert!(prompt.len() >= 1);
@@ -2592,7 +2600,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_budget_cap_applied_on_prepare() {
         let session = Session::new();
-        let mut rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
+        let rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["base".to_string()]);
         // Verify that prepare_memory_context doesn't panic with empty session
         let result = rt.prepare_memory_context("any query").await;
@@ -2605,7 +2613,7 @@ mod tests {
     async fn m2_l2_budget_enforcement_limits_system_prompt() {
         // M2-L2-2: verify memory context doesn't exceed budget proportions
         let session = Session::new();
-        let mut rt = ConversationRuntime::new(session, MockApi,
+        let rt = ConversationRuntime::new(session, MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system prompt".to_string()]);
@@ -2632,7 +2640,7 @@ mod tests {
     fn m2_l2_handoff_roundtrip_preserves_data() {
         // M2-L2-1: cross-session handoff creates/restores handoff data
         let session = Session::new();
-        let mut rt = ConversationRuntime::new(session, MockApi,
+        let rt = ConversationRuntime::new(session, MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()]);

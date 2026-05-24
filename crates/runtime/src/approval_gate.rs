@@ -468,7 +468,6 @@ impl SmartApprovalGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permission_enforcer::RiskLevel;
     use std::path::PathBuf;
 
     fn make_gate(config: ApprovalConfig) -> SmartApprovalGate {
@@ -526,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn bash_destructive_command_needs_approval() {
-        let gate = make_gate(ApprovalConfig::default());
+        let _gate = make_gate(ApprovalConfig::default());
         // This will try to send SSE and block — since no SSE sender, it will
         // register in pending and timeout. For unit testing, we just verify
         // it doesn't auto-pass.

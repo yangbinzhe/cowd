@@ -929,9 +929,9 @@ fn register_facts_from_content(checker: &mut FactChecker, content: &str, source_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BudgetConfig, MemoryConfig, StoreConfig};
+    use crate::config::{BudgetConfig, MemoryConfig};
     use crate::store::sqlite::SqliteStore;
-    use crate::types::{MemoryCategory, MemorySource, Priority, TokenBudget};
+    use crate::types::{MemoryCategory, MemorySource, Priority};
 
     fn in_memory_store() -> Arc<dyn MemoryStore> {
         let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));

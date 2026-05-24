@@ -28,7 +28,7 @@ mod tests {
     use crate::permissions::{PermissionMode, PermissionPolicy};
     use crate::session::Session;
     use std::pin::Pin;
-    use futures::stream::{self, Stream};
+    use futures::stream::{Stream};
 
     struct EchoClient;
     impl ApiClient for EchoClient {

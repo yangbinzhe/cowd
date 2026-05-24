@@ -5,7 +5,6 @@
 
 use std::io::Write;
 
-use walkdir::WalkDir;
 
 use cowd_memory::{
     CodeIndexer, CodeSymbol, CognitiveContextManager, ImpactReport, MemoryConfig,

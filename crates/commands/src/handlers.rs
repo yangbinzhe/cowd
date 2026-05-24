@@ -143,7 +143,7 @@ mod tests {
         DefinitionSource, SkillOrigin, SkillRoot,
     };
     use crate::specs::{SkillSlashDispatch, SlashCommand};
-    use crate::skill_tools::{SkillDeleteInput, SkillGenerateInput, SkillManager, SkillViewInput};
+    
     use plugins::{
         PluginError, PluginKind, PluginLoadFailure, PluginManager, PluginManagerConfig,
         PluginMetadata, PluginSummary,
@@ -1099,7 +1099,7 @@ mod tests {
     #[test]
     fn resolves_project_skills_and_legacy_commands_from_shared_registry() {
         let workspace = temp_dir("resolve-project-skills");
-        let project_skills = workspace.join(".cowd").join("skills");
+        let _project_skills = workspace.join(".cowd").join("skills");
         let project_skills = workspace.join(".cowd").join("skills");
         let legacy_commands = workspace.join(".cowd").join("commands");
 

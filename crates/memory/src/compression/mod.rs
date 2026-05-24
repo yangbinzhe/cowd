@@ -398,14 +398,14 @@ mod tests {
             msg(MessageRole::Assistant, "Created project with Cargo.toml"),
         ];
 
-        let len_before = msgs.iter().map(|m| m.content.len()).sum::<usize>();
+        let _len_before = msgs.iter().map(|m| m.content.len()).sum::<usize>();
         pipeline.micro_compact(&mut msgs);
 
         // Add more conversation
         msgs.push(msg(MessageRole::User, "Add logging support"));
         msgs.push(msg(MessageRole::Assistant, "Added log4rs with rolling file appender"));
 
-        let len_after = msgs.iter().map(|m| m.content.len()).sum::<usize>();
+        let _len_after = msgs.iter().map(|m| m.content.len()).sum::<usize>();
         pipeline.micro_compact(&mut msgs);
 
         // RED: the first compaction's content should influence the second.
