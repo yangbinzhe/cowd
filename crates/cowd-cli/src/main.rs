@@ -82,9 +82,9 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
-const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/cowd-code";
-const OFFICIAL_REPO_SLUG: &str = "ultraworkers/cowd-code";
-const DEPRECATED_INSTALL_COMMAND: &str = "cargo install cowd-code";
+const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/cowd";
+const OFFICIAL_REPO_SLUG: &str = "ultraworkers/cowd";
+const DEPRECATED_INSTALL_COMMAND: &str = "cargo install cowd";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 
@@ -712,7 +712,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "-p" => {
-                // Claw Code compat: -p "prompt" = one-shot prompt
+                // Legacy compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
                 if prompt.trim().is_empty() {
                     return Err("-p requires a prompt string".to_string());
@@ -731,7 +731,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 });
             }
             "--print" => {
-                // Claw Code compat: --print makes output non-interactive
+                // Legacy compat: --print makes output non-interactive
                 output_format = CliOutputFormat::Text;
                 index += 1;
             }
@@ -3473,10 +3473,6 @@ impl LiveCli {
     }
 
     fn startup_banner(&self) -> String {
-        let cwd = env::current_dir().map_or_else(
-            |_| "<unknown>".to_string(),
-            |path| path.display().to_string(),
-        );
         let status = status_context(None).ok();
         let git_branch = status
             .as_ref()
@@ -3486,33 +3482,23 @@ impl LiveCli {
             || "unknown".to_string(),
             |context| context.git_summary.headline(),
         );
-        let session_path = self.session.path.strip_prefix(Path::new(&cwd)).map_or_else(
-            |_| self.session.path.display().to_string(),
-            |path| path.display().to_string(),
-        );
         format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
-  \x1b[2mModel\x1b[0m            {}\n\
-  \x1b[2mPermissions\x1b[0m      {}\n\
-  \x1b[2mBranch\x1b[0m           {}\n\
-  \x1b[2mWorkspace\x1b[0m        {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\
-  \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
+            "\x1b[1;36m\
+  ██████╗  ██████╗ ██╗    ██╗██████╗ \n\
+ ██╔════╝ ██╔═══██╗██║    ██║██╔══██╗\n\
+ ██║      ██║   ██║██║ █╗ ██║██║  ██║\n\
+ ██║      ██║   ██║██║███╗██║██║  ██║\n\
+ ╚██████╗ ╚██████╔╝╚███╔███╔╝██████╔╝\n\
+  ╚═════╝  ╚═════╝  ╚══╝╚══╝ ╚═════╝\x1b[0m\n\n\
+   \x1b[2mModel\x1b[0m       {}\n\
+   \x1b[2mWorkspace\x1b[0m    {}\n\
+   \x1b[2mBranch\x1b[0m       {}\n\
+   \x1b[2mSession\x1b[0m      {}\n\n\
+   \x1b[1m/help\x1b[0m · \x1b[1m/status\x1b[0m · \x1b[2mTab\x1b[0m sidebar · \x1b[2mSpace\x1b[0m shortcuts · \x1b[2mShift+Enter\x1b[0m newline",
             self.model,
-            self.permission_mode.as_str(),
-            git_branch,
             workspace,
-            cwd,
+            git_branch,
             self.session.id,
-            session_path,
         )
     }
 
@@ -10010,7 +9996,7 @@ mod tests {
         });
 
         assert!(banner.contains("Tab"));
-        assert!(banner.contains("workflow completions"));
+        assert!(banner.contains("sidebar"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -10170,8 +10156,8 @@ mod tests {
         assert!(help.contains("cowd mcp"));
         assert!(help.contains("cowd skills"));
         assert!(help.contains("cowd /skills"));
-        assert!(help.contains("ultraworkers/cowd-code"));
-        assert!(help.contains("cargo install cowd-code"));
+        assert!(help.contains("ultraworkers/cowd"));
+        assert!(help.contains("cargo install cowd"));
         assert!(!help.contains("cowd login"));
         assert!(!help.contains("cowd logout"));
     }

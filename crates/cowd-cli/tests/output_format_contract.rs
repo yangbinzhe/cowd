@@ -237,11 +237,11 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .expect("install source check");
     assert_eq!(
         install_source["official_repo"],
-        "https://github.com/ultraworkers/cowd-code"
+        "https://github.com/ultraworkers/cowd"
     );
     assert_eq!(
         install_source["deprecated_install"],
-        "cargo install cowd-code"
+        "cargo install cowd"
     );
 
     let workspace = checks
