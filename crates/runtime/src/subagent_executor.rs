@@ -10,8 +10,11 @@ impl<C: crate::conversation::ApiClient, T: crate::conversation::ToolExecutor> Su
     pub fn new(_config: SubAgentConfig, runtime: ConversationRuntime<C, T>) -> Self {
         Self { runtime }
     }
-    pub fn execute_sync(&mut self, task: &str, prompter: Option<&mut dyn PermissionPrompter>) -> Result<SubAgentResult, RuntimeError> {
-        let summary = self.runtime.run_turn(task, prompter)?;
+    pub fn execute_sync(&mut self, task: &str, _prompter: Option<&mut dyn PermissionPrompter>) -> Result<SubAgentResult, RuntimeError> {
+        let shared = crate::permissions::SharedPrompter::none();
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tokio::runtime::Runtime::new().expect("tokio runtime fallback").handle().clone());
+        let summary = handle.block_on(self.runtime.run_turn_async(task, &shared))?;
         let output = self.runtime.session().messages.last().map(|m| m.blocks.iter().filter_map(|b| match b { crate::session::ContentBlock::Text{text}=>Some(text.clone()), _=>None }).collect::<Vec<_>>().join(" ")).unwrap_or_default();
         Ok(SubAgentResult { output, tool_call_count: summary.tool_results.len(), tokens_used: summary.usage.total_tokens() as usize, completed_normally: true, memory_write_attempts: 0, memory_writes_denied: 0 })
     }

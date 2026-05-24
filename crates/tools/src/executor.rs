@@ -22,7 +22,7 @@ use runtime::{
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
     LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket, ToolError, ToolExecutor,
+    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, SharedPrompter, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2579,8 +2579,11 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    let summary = runtime
-        .run_turn(job.prompt.clone(), None)
+    let shared = SharedPrompter::none();
+    let handle = tokio::runtime::Handle::try_current()
+        .unwrap_or_else(|_| tokio::runtime::Runtime::new().expect("tokio runtime fallback").handle().clone());
+    let summary = handle
+        .block_on(runtime.run_turn_async(job.prompt.clone(), &shared))
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)

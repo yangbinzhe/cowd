@@ -36,7 +36,7 @@ mod mcp_stdio;
 pub mod mcp_tool_bridge;
 mod oauth;
 pub mod permission_enforcer;
-mod permissions;
+pub mod permissions;
 pub mod lifecycle_hooks;
 pub mod plugin_lifecycle;
 pub mod provider_pool;
@@ -158,7 +158,7 @@ pub use oauth::{
 };
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
-    PermissionPromptDecision, PermissionPrompter, PermissionRequest,
+    PermissionPromptDecision, PermissionPrompter, PermissionRequest, SharedPrompter,
 };
 pub use plugin_lifecycle::{
     DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,

@@ -264,71 +264,12 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
     Evidence: .omo/evidence/task-1-session-store.{ext}
   ```
 
-- [ ] 2. 修复 TextArea::widget() 废弃调用
-
-  **What to do**:
-  - 将 `crates/cowd-cli/src/tui/components/prompt.rs:934` 的 `self.textarea.widget()` 改为 `&self.textarea`
-
-  **Reference**:
-  - `crates/cowd-cli/src/tui/components/prompt.rs:934`
-
-  **Acceptance Criteria**:
-  - [ ] 修改后无 `use of deprecated method` 警告
-  - [ ] TUI 编译通过
-
-  **QA Scenarios**:
-  ```
-  Scenario: 检查废弃警告消失
-    Tool: Bash
-    Steps:
-      1. grep 确认 "textbox.widget" 不再存在
-      2. cargo build --release -p cowd-cli 2>&1 | grep "widget" → 无匹配
-    Evidence: .omo/evidence/task-2-textarea.{ext}
-  ```
-
-- [ ] 3. 修复 deep.rs 未使用导入 (MemoryMeta)
-
-  **What to do**:
-  - 从 `crates/memory/src/layers/deep.rs:26` import 行移除 `MemoryMeta`
-
-  **Reference**:
-  - `crates/memory/src/layers/deep.rs:26`
-
-  **Acceptance Criteria**:
-  - [ ] grep "MemoryMeta" deep.rs 不再在 import 行出现
-  - [ ] `cargo test -p cowd-memory` 通过
-
-- [ ] 4. 修复 project.rs 未使用导入 (WalkDir)
-
-  **What to do**:
-  - 移除 `crates/memory/src/layers/project.rs:20` 的 `use walkdir::WalkDir;`
-  - 保留完全限定路径 `walkdir::WalkDir::new` 调用
-
-  **Reference**:
-  - `crates/memory/src/layers/project.rs:20,200`
-
-  **Acceptance Criteria**:
-  - [ ] `cargo build --release -p cowd-memory` 无 WalkDir 警告
-
-- [ ] 5. 修复 sqlite.rs 未使用导入 (SymbolEdgeType)
-
-  **What to do**:
-  - 将 `crates/memory/src/store/sqlite.rs:24` 的 `SymbolEdgeType` 移动到 `#[cfg(test)]` 块内
-  - 确认非测试代码不需要此类型
-
-  **Acceptance Criteria**:
-  - [ ] `cargo build --release -p cowd-memory` 无 SymbolEdgeType 警告
-
-- [ ] 6. 修复 executor.rs 重复导入 + sandbox.rs 未使用参数
-
-  **What to do**:
-  - B4: `executor.rs:400` — 移除重复的 `use std::path::Path;`
-  - C5: `sandbox.rs:213` — 将 `cwd: &Path` 参数标记为 `_cwd` 或移除
-
-  **Acceptance Criteria**:
-  - [ ] `cargo build --release` 减 2 个警告
-
-- [ ] 7. 修复 conversation.rs 未使用 mut + 其他小型清理
+- [x] 2. 修复 TextArea::widget() 废弃调用
+- [x] 3. 修复 deep.rs 未使用导入 (MemoryMeta)
+- [x] 4. 修复 project.rs 未使用导入 (WalkDir)
+- [x] 5. 修复 sqlite.rs 未使用导入 (SymbolEdgeType)
+- [x] 6. 修复 executor.rs 重复导入 + sandbox.rs 未使用参数
+- [x] 7. 修复 conversation.rs 未使用 mut + 其他小型清理
 
   **What to do**:
   - C6: 将 `conversation.rs:854` 的 `mut prompt` 改为 `prompt`
@@ -336,7 +277,7 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
   **Acceptance Criteria**:
   - [ ] `cargo build --release` 减 1 个警告
 
-- [ ] 8. SqliteSessionStore 调用点迁移
+- [x] 8. SqliteSessionStore 调用点迁移
 
   **What to do**:
   - 将 `server/mod.rs:42` 从 `SqliteSessionStore` 导入改为 `UnifiedSessionStore`
@@ -363,7 +304,7 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
     Evidence: .omo/evidence/task-8-migration.{ext}
   ```
 
-- [ ] 9. 移除废弃的 SqliteSessionStore struct
+- [~] 9. 移除废弃的 SqliteSessionStore struct — DEFERRED: UnifiedSessionStore wraps SqliteSessionStore internally; removal blocked until backend is abstracted
 
   **What to do**:
   - 在 `store/session.rs` 中将 `SqliteSessionStore` 标记为 `#[deprecated]` → 添加 `#[allow(deprecated)]` 在桥接代码 → 最终移除 struct 定义和 impl 块
