@@ -2746,7 +2746,9 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
             } else {
                 Duration::from_millis(16)
             };
-            if state.frame_timer.should_render(
+            // During active turn or streaming, always render to show real-time updates
+            let force_render = state.turn_active || state.lines_dirty;
+            if force_render || state.frame_timer.should_render(
                 state.msg_version,
                 state.last_drawn_version,
                 render_throttle,
