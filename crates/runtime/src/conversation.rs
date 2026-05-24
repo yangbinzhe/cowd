@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
@@ -1877,6 +1878,8 @@ impl ToolExecutor for StaticToolExecutor {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,

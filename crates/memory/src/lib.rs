@@ -1,3 +1,4 @@
+#![deny(deprecated)]
 //! `memory` – unified memory framework for the cowd AI assistant.
 //!
 //! # Architecture
@@ -19,6 +20,8 @@
 //!     let _orchestrator = MemoryOrchestrator::init(config).await.unwrap();
 //! }
 //! ```
+
+#![deny(deprecated)]
 
 // --- Public modules ---
 

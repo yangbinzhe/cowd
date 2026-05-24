@@ -1,8 +1,12 @@
+#![deny(deprecated)]
+#![deny(unused_imports)]
 //! Core runtime primitives for the `cowd` CLI and supporting crates.
 //!
 //! This crate owns session persistence, permission evaluation, prompt assembly,
 //! MCP plumbing, tool-facing file operations, and the core conversation loop
 //! that drives interactive and one-shot turns.
+
+#![deny(deprecated)]
 
 pub mod cowd_dirs;
 pub mod error;

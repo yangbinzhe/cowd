@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Unified session store — the canonical wrapper for session persistence.
 //!
 //! `UnifiedSessionStore` delegates to [`SqliteSessionStore`] internally,

@@ -4,6 +4,7 @@
     clippy::unused_self,
     dead_code
 )]
+#![deny(deprecated, unused_imports)]
 mod bootstrap;
 mod cli;
 mod init;

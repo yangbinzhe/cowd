@@ -196,6 +196,7 @@ impl FeishuAdapter {
     /// Process a webhook event payload.
     pub fn process_webhook_event(&self, payload: &[u8]) -> PlatformResult<Option<InboundMessage>> {
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         struct WebhookEvent {
             schema: String,
             header: WebhookHeader,
@@ -206,6 +207,7 @@ impl FeishuAdapter {
         }
 
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         struct WebhookHeader {
             event_id: String,
             event_type: String,
@@ -216,6 +218,7 @@ impl FeishuAdapter {
         }
 
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         struct MessageContent {
             message_id: String,
             root_id: Option<String>,
@@ -227,6 +230,7 @@ impl FeishuAdapter {
         }
 
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         struct SenderInfo {
             sender_id: SenderId,
             sender_type: String,

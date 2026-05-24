@@ -397,7 +397,7 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
   - [ ] FreshContextExt trait 不存在
   - [ ] `cargo test -p cowd-memory` 通过
 
-- [ ] 17. ProviderChain 死代码清理
+- [x] 17. ProviderChain 死代码清理
 
   **What to do**:
   - 移除 `provider_chain.rs:199` 的 `round_robin_index` 字段
@@ -414,7 +414,7 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
   - 将 `build_linux_sandbox_command(command: &str, cwd: &Path, ...)` 的 `cwd` 参数标记为弃用
   - 或从签名中移除（检查所有调用方）
 
-- [ ] 19. TUI 39 个未使用导入批量清理
+- [x] 19. TUI 39 个未使用导入批量清理
 
   **What to do**:
   - 逐个检查 TUI 文件中的未使用导入并移除
@@ -425,7 +425,7 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
   **Reference**:
   - 见上方 Category B 完整列表
 
-- [ ] 20. 质量门禁: #![deny(deprecated)] 和 #![deny(unused_imports)]
+- [x] 20. 质量门禁: #![deny(deprecated)] 和 #![deny(unused_imports)]
 
   **What to do**:
   - 在 `crates/memory/src/lib.rs` 顶部添加 `#![deny(deprecated)]`
@@ -439,7 +439,7 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
   **Reference**:
   - Oracle 分析：缺乏强制是代码累积的核心原因
 
-- [ ] 21. 全 workspace 零警告验证
+- [x] 21. 全 workspace 零警告验证
 
   **What to do**:
   - 运行 `cargo build --release` 并捕获所有输出
@@ -450,13 +450,10 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
 
 ## Final Verification Wave
 
-- [ ] F1. **Plan Compliance Audit** — 检查每个 TODO 是否按计划执行
-
-- [ ] F2. **Code Quality Review** — 代码质量 + 边界检查
-
-- [ ] F3. **Real Manual QA** — 全量测试通过 + 构建零警告
-
-- [ ] F4. **Scope Fidelity Check** — 无超出范围的修改，无新特性引入
+- [x] F1. **Plan Compliance Audit** — 检查每个 TODO 是否按计划执行
+- [x] F2. **Code Quality Review** — 代码质量 + 边界检查
+- [x] F3. **Real Manual QA** — 全量测试通过 + 构建零警告
+- [x] F4. **Scope Fidelity Check** — 无超出范围的修改，无新特性引入
 
 ---
 

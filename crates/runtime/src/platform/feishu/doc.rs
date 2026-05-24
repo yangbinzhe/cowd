@@ -278,6 +278,7 @@ impl DocumentClient {
         }
 
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         struct BlocksData {
             items: Option<Vec<serde_json::Value>>,
             page_token: Option<String>,
