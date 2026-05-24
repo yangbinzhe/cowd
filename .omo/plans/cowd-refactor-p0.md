@@ -314,7 +314,7 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
   - [ ] SqliteSessionStore struct 定义移除
   - [ ] `cargo build --release` 通过
 
-- [ ] 10. server/mod.rs run_turn → run_turn_async
+- [x] 10. server/mod.rs run_turn → run_turn_async
 
   **What to do**:
   - 4 个调用点: SSE streaming (1463), non-streaming (1613), summarize (3031), doctor (4049)
@@ -329,7 +329,7 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
   - [ ] 4 个调用点全部迁移
   - [ ] `cargo test -p cowd-cli` 通过
 
-- [ ] 11. subagent_executor.rs run_turn → run_turn_async
+- [x] 11. subagent_executor.rs run_turn → run_turn_async
 
   **What to do**:
   - `subagent_executor.rs:14` — 此函数是同步的（`SubAgentExecutor::execute_sync`）
@@ -340,26 +340,26 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
   - `crates/runtime/src/subagent_executor.rs:14`
   - `crates/tools/src/executor.rs:2584`（同样是同步上下文中的 run_turn）
 
-- [ ] 12. tools/executor.rs run_turn → run_turn_async
+- [x] 12. tools/executor.rs run_turn → run_turn_async
 
   **What to do**:
   - `executor.rs:2584` — 同步上下文中的 run_turn
   - 与 task 11 相同策略：block_on 包装或调用改为 async
 
-- [ ] 13. main.rs LiveCli run_turn → run_turn_async (直接路径)
+- [x] 13. main.rs LiveCli run_turn → run_turn_async (直接路径)
 
   **What to do**:
   - 5 个直接 run_turn 调用点: 2822 (TUI), 3559 (run_turn 实现), 3607 (compact), 3620 (json), 4482 (internal)
   - TUI 路径 (2822) 在 `spawn_blocking` 中 — 需要重构
   - Prompt 路径 (3559/3607/3620) 在同步函数中 — block_on 包装
 
-- [ ] 14. main.rs 间接路径迁移
+- [x] 14. main.rs 间接路径迁移
 
   **What to do**:
   - 332 (run_turn_with_output) — 顶层 CLI 入口
   - 3765/3853-3855/3874 — slash command 路径
 
-- [ ] 15. 移除 CognitiveContextManager.workspace_root 死字段
+- [x] 15. 移除 CognitiveContextManager.workspace_root 死字段
 
   **What to do**:
   - 移除 `cognitive.rs:164` 的 `workspace_root: Option<PathBuf>` 字段
@@ -383,7 +383,7 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
     Evidence: .omo/evidence/task-15-workspace-root.{ext}
   ```
 
-- [ ] 16. 移除 FreshContextExt 死 trait
+- [x] 16. 移除 FreshContextExt 死 trait
 
   **What to do**:
   - 移除 `fresh_context.rs:351-362` 的整个 `FreshContextExt` trait 定义
@@ -408,7 +408,7 @@ Critical Path: 1 → 8 → 9 → 10-12 → 13-14 → 15-19 → 20-21 → F1-F4
   **Reference**:
   - `crates/api/src/provider_chain.rs:199,235,269`
 
-- [ ] 18. 修复 sandbox.rs 未使用 cwd 参数
+- [x] 18. 修复 sandbox.rs 未使用 cwd 参数
 
   **What to do**:
   - 将 `build_linux_sandbox_command(command: &str, cwd: &Path, ...)` 的 `cwd` 参数标记为弃用

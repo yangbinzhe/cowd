@@ -200,9 +200,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
 /// Pass `":memory:"` as the path.  Note that because every call opens a new
 /// connection, in-memory databases are **not** shared between calls – use a
 /// file path for anything beyond isolated unit tests.
-#[deprecated(since = "0.2.0", note = "use crate::session_store::UnifiedSessionStore")]
 #[derive(Debug, Clone)]
-pub struct SqliteSessionStore {
+pub(crate) struct SqliteSessionStore {
     db_path: String,
 }
 

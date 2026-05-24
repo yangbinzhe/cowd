@@ -39,7 +39,7 @@ use api::{
 };
 use memory::{
     cognitive::CognitiveContextManager,
-    store::session::SqliteSessionStore,
+    UnifiedSessionStore,
     types::Message as MemMessage,
     MemoryConfig, PreparedContext,
 };
@@ -309,7 +309,7 @@ struct HttpAppState {
     /// Cognitive memory manager (optional)
     cognitive_manager: Option<Arc<CognitiveContextManager>>,
     /// Session store for persistence (required)
-    session_store: Arc<SqliteSessionStore>,
+    session_store: Arc<UnifiedSessionStore>,
     /// Memory store path for status
     memory_store_path: String,
     /// Pending streaming replies
@@ -396,7 +396,7 @@ async fn init_app_state(config: &HttpConfig) -> Result<HttpAppState, ServerError
         ServerError("session_store_path is required for HTTP server".to_string())
     })?;
     
-    let session_store = match SqliteSessionStore::open(session_store_path) {
+    let session_store = match UnifiedSessionStore::open(session_store_path) {
         Ok(store) => {
             tracing::info!("Session store initialized at {:?}", session_store_path);
             Arc::new(store)
@@ -1460,7 +1460,8 @@ async fn chat_handler(
         // Run the conversation turn in a blocking thread to avoid
         // blocking the tokio worker thread (3A-1 fix).
         let run_result = tokio::task::spawn_blocking(move || {
-            runtime.run_turn(user_input, None)
+            tokio::runtime::Handle::current()
+                .block_on(runtime.run_turn_async(user_input, &runtime::permissions::SharedPrompter::none()))
         }).await;
 
         match run_result {
@@ -1610,7 +1611,8 @@ async fn chat_handler(
         // Run the conversation turn in a blocking thread to avoid
         // blocking the tokio worker thread (3A-1 fix).
         let run_result = tokio::task::spawn_blocking(move || {
-            runtime.run_turn(user_input, None)
+            tokio::runtime::Handle::current()
+                .block_on(runtime.run_turn_async(user_input, &runtime::permissions::SharedPrompter::none()))
         }).await;
 
         match run_result {
@@ -3028,7 +3030,8 @@ async fn handle_ws(mut socket: WebSocket, addr: std::net::SocketAddr, state: Htt
             // P0-1: Attach smart approval gate
             runtime = runtime.with_approval_gate(state.approval_gate.clone());
 
-            match runtime.run_turn(&user_input, None) {
+            match tokio::runtime::Handle::current()
+                .block_on(runtime.run_turn_async(&user_input, &runtime::permissions::SharedPrompter::none())) {
                 Ok(summary) => Ok(summary
                     .assistant_messages
                     .iter()
@@ -4045,8 +4048,11 @@ fn server_execute_turn(input: &str) -> Result<String, Box<dyn std::error::Error 
         true, false, None,
         runtime::PermissionMode::DangerFullAccess, None, None, None,
     ).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
-    let mut prompter = crate::CliPermissionPrompter::new(runtime::PermissionMode::DangerFullAccess);
-    let summary = runtime.run_turn(input, Some(&mut prompter))
+    let prompter = runtime::permissions::SharedPrompter::new(Box::new(
+        crate::CliPermissionPrompter::new(runtime::PermissionMode::DangerFullAccess)
+    ));
+    let summary = tokio::runtime::Handle::current()
+        .block_on(runtime.run_turn_async(input, &prompter))
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
     let text = summary.assistant_messages.last()
         .and_then(|m| m.blocks.iter().find_map(|b| match b {

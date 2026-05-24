@@ -2835,7 +2835,8 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                 let tx = tui_tx.clone();
                                 turn_handle = Some(std::thread::spawn(move || {
                                     let _ = tx.send(tui::TuiEvent::TurnStarted);
-                                    match prepared.run_turn(&text, None) {
+                                    match tokio::runtime::Handle::current()
+                                        .block_on(prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none())) {
                                         Ok(summary) => {
                                             let final_text = final_assistant_text(&summary);
                                             let _ = tx.send(tui::TuiEvent::TurnComplete {
@@ -3571,8 +3572,11 @@ impl LiveCli {
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let prompter = runtime::permissions::SharedPrompter::new(Box::new(
+            CliPermissionPrompter::new(self.permission_mode),
+        ));
+        let result = tokio::runtime::Handle::current()
+            .block_on(runtime.run_turn_async(input, &prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
@@ -3619,8 +3623,11 @@ impl LiveCli {
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor, _) = self.prepare_turn_runtime(false, None, None)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let prompter = runtime::permissions::SharedPrompter::new(Box::new(
+            CliPermissionPrompter::new(self.permission_mode),
+        ));
+        let result = tokio::runtime::Handle::current()
+            .block_on(runtime.run_turn_async(input, &prompter));
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -3632,8 +3639,11 @@ impl LiveCli {
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor, _) = self.prepare_turn_runtime(false, None, None)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let prompter = runtime::permissions::SharedPrompter::new(Box::new(
+            CliPermissionPrompter::new(self.permission_mode),
+        ));
+        let result = tokio::runtime::Handle::current()
+            .block_on(runtime.run_turn_async(input, &prompter));
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
@@ -4494,8 +4504,11 @@ impl LiveCli {
             None,
             None,
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
+        let prompter = runtime::permissions::SharedPrompter::new(Box::new(
+            CliPermissionPrompter::new(self.permission_mode),
+        ));
+        let summary = tokio::runtime::Handle::current()
+            .block_on(runtime.run_turn_async(prompt, &prompter))?;
         let text = final_assistant_text(&summary).trim().to_string();
         runtime.shutdown_plugins()?;
         Ok(text)
