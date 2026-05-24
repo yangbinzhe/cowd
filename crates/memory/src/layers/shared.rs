@@ -244,6 +244,53 @@ impl SharedLayer {
         Ok(capped)
     }
 
+    /// Recall peer agent entries from L4 for intra-turn real-time perception.
+    ///
+    /// Unlike [`recall_peers`], this does NOT apply a 5-minute time cutoff.
+    /// Instead it filters by `session_id` so entries written by Agent A in the
+    /// current turn are visible to Agent B in the same turn's prepare_context.
+    /// Caps at `max_per_peer` entries per agent and `max_peers` total peers.
+    pub async fn recall_peers_realtime(
+        &self,
+        query: &str,
+        current_agent: &str,
+        current_session_id: &str,
+        max_per_peer: usize,
+        max_peers: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        let results = self.store.search_fts(query, max_peers * max_per_peer * 2).await?;
+        let peer_entries: Vec<MemoryEntry> = results
+            .into_iter()
+            .filter(|e| {
+                e.layer == MemoryLayer::L4
+                    && e.visibility == crate::types::AgentVisibility::Shared
+                    && e.source_agent.as_deref() != Some(current_agent)
+                    // Match entries from the same session (intra-turn)
+                    && e.session_id.as_deref() == Some(current_session_id)
+            })
+            .collect();
+
+        // Group by source_agent, cap per peer, then cap total peers.
+        let mut seen_peers: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut capped = Vec::new();
+        for entry in peer_entries {
+            let agent_key = entry.source_agent.clone().unwrap_or_default();
+            let count = seen_peers.get(&agent_key).copied().unwrap_or(0);
+            if count >= max_per_peer {
+                continue;
+            }
+            if seen_peers.len() >= max_peers && !seen_peers.contains_key(&agent_key) {
+                continue;
+            }
+            seen_peers.insert(agent_key, count + 1);
+            capped.push(entry);
+        }
+        Ok(capped)
+    }
+
     /// Sync: re-read L4 entries from the store and update staleness.
     ///
     /// In a real multi-agent system this would pull from a remote shared store.
