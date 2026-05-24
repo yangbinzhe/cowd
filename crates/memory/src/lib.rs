@@ -155,6 +155,6 @@ pub use project_scope::{build_project_kg, MemoryScope, ProjectManifest, ProjectS
 
 // --- Code indexer re-exports (Phase 1) ---
 pub use code_indexer::{
-    CodeIndexer, CodeSymbol, FileFingerprint, IndexLanguage, IndexStats,
+    CodeIndexer, CodeSymbol, FileFingerprint, ImpactReport, IndexLanguage, IndexStats,
     SymbolEdge, SymbolEdgeType, SymbolKind,
 };

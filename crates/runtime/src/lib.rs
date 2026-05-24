@@ -109,9 +109,9 @@ pub use doc_ingestion::{
     DocumentMetadata, IngestionResult,
 };
 pub use gates::{
-    AbortGate, EscalationGate, Gate, GateContext, GateError, GateEvaluator, GateResult,
-    HardStop, PreFlightGate, PreFlightCheck, RevisionCheck, RevisionGate, ViolationSeverity,
-    ViolationType,
+    AbortGate, ApprovalGate, EscalationGate, Gate, GateContext, GateError, GateEvaluator,
+    GateResult, HardStop, ImpactRiskLevel, ImpactSummary, PreFlightGate, PreFlightCheck,
+    RevisionCheck, RevisionGate, ViolationSeverity, ViolationType,
 };
 pub use wave::{
     DependencyGraph, ErrorPolicy, TaskContext, TaskId, TaskResult, TaskStatus, Wave, WaveConfig, WaveError,

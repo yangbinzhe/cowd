@@ -222,6 +222,7 @@ impl LayerManager for DeepLayer {
             budget: budget.clone(),
             depth_scale: 0.5,
             prepared_at: Utc::now(),
+            code_context: None,
         })
     }
 

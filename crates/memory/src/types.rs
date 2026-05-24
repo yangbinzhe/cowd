@@ -487,6 +487,9 @@ pub struct PreparedContext {
     pub budget: TokenBudget,
     pub depth_scale: f32,
     pub prepared_at: DateTime<Utc>,
+    /// Optional code symbol context injected by the code indexer.
+    /// Set when the query is code-related and the code indexer is available.
+    pub code_context: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

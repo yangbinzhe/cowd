@@ -148,6 +148,7 @@ impl LayerManager for IdentityLayer {
             budget: budget.clone(),
             depth_scale: 1.0,
             prepared_at: Utc::now(),
+            code_context: None,
         })
     }
 

@@ -345,6 +345,7 @@ impl CompressionPipeline {
             budget,
             depth_scale: 1.0,
             prepared_at: chrono::Utc::now(),
+            code_context: None,
         })
     }
 }

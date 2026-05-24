@@ -324,6 +324,7 @@ impl LayerManager for SharedLayer {
                 budget: budget.clone(),
                 depth_scale: 0.4,
                 prepared_at: Utc::now(),
+                code_context: None,
             });
         }
 
@@ -338,6 +339,7 @@ impl LayerManager for SharedLayer {
             budget: budget.clone(),
             depth_scale: 0.4,
             prepared_at: Utc::now(),
+            code_context: None,
         })
     }
 

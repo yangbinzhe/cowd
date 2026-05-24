@@ -276,6 +276,7 @@ impl LayerManager for ProjectLayer {
             budget: budget.clone(),
             depth_scale: 0.7,
             prepared_at: Utc::now(),
+            code_context: None,
         })
     }
 

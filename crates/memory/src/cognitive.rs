@@ -19,6 +19,7 @@ use chrono::Utc;
 
 use crate::{ MemoryScope, SessionResume,
     closet::{Closet, ClosetManager},
+    code_indexer::CodeSymbol,
     compression::{
         budget::BudgetManager,
         monitor::ContextWindowMonitor,
@@ -662,6 +663,21 @@ impl CognitiveContextManager {
             });
         }
 
+        // ── Step 7: auto-inject relevant code symbols (when applicable) ─────
+        let code_context = if is_code_query(query) {
+            let symbols = self
+                .orchestrator
+                .find_relevant_symbols(query, 5)
+                .await;
+            if symbols.is_empty() {
+                None
+            } else {
+                Some(format_code_context(&symbols))
+            }
+        } else {
+            None
+        };
+
         // ── Assemble PreparedContext ─────────────────────────────────────────
         let total_tokens = self.estimate_tokens_entries(&entries);
         let depth_scale = if total_tokens > budget.available {
@@ -676,7 +692,21 @@ impl CognitiveContextManager {
             budget,
             depth_scale,
             prepared_at: Utc::now(),
+            code_context,
         })
+    }
+
+    /// Public entry point: prepare context with automatic code symbol injection.
+    ///
+    /// This wraps [`prepare_context`] and additionally injects relevant code
+    /// symbols from the code indexer into [`PreparedContext::code_context`]
+    /// when the query appears to be code-related.
+    pub async fn build_context_with_code(
+        &self,
+        query: &str,
+        messages: &[Message],
+    ) -> Result<PreparedContext> {
+        self.prepare_context(query, messages).await
     }
 
     // -----------------------------------------------------------------------
@@ -1645,6 +1675,64 @@ fn truncate_summary(content: &str, max_len: usize) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Code context injection helpers
+// ---------------------------------------------------------------------------
+
+/// Heuristic to detect whether a user query is code-related.
+///
+/// Returns `true` if the query contains file extensions (`.rs`, `.py`, `.ts`, etc.)
+/// or code-related keywords (`function`, `class`, `bug`, `fix`, `struct`, etc.).
+fn is_code_query(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    let code_extensions = [".rs", ".py", ".ts", ".tsx", ".go", ".java", ".js", ".cpp", ".h"];
+    let code_keywords = [
+        "function", "class", "bug", "fix", "struct", "interface", "enum",
+        "fn ", "impl", "trait", "module", "import", "def ", "async", "await",
+        "refactor", "compile", "compiler", "syntax", "type", "error", "warning",
+        "unwra", "panic", "debug", "trace", "cargo", "npm", "node", "runtime",
+    ];
+
+    code_extensions.iter().any(|ext| lower.contains(ext))
+        || code_keywords.iter().any(|kw| lower.contains(kw))
+}
+
+/// Format a list of code symbols into a context block for LLM injection.
+///
+/// Output format:
+/// ```text
+/// ## Relevant Code Symbols
+/// - authenticate_user (src/auth.rs:42) — validates JWT token
+///   Kind: Function
+/// - MyService (src/service.rs:15) — service class
+///   Kind: Class
+/// ```
+fn format_code_context(symbols: &[CodeSymbol]) -> String {
+    let mut lines = vec!["## Relevant Code Symbols".to_string()];
+    for sym in symbols {
+        let desc = sym
+            .doc
+            .as_deref()
+            .unwrap_or(&sym.signature)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let desc_short = if desc.len() > 80 {
+            format!("{}...", &desc[..77])
+        } else {
+            desc
+        };
+        lines.push(format!(
+            "- {} ({}:{}) — {}",
+            sym.name, sym.file_path, sym.line, desc_short
+        ));
+        lines.push(format!("  Kind: {}", sym.kind.as_str()));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1726,5 +1814,108 @@ mod tests {
 
         let mgr = CognitiveContextManager::new(cfg).await.unwrap();
         assert_eq!(mgr.vector_index_stats().count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // T7: Code context injection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_code_query_rust_file() {
+        assert!(is_code_query("fix bug in src/main.rs"));
+        assert!(is_code_query("how does this function work?"));
+        assert!(is_code_query("refactor the auth class"));
+        assert!(is_code_query("add a new struct for user"));
+        assert!(is_code_query("cargo build error"));
+    }
+
+    #[test]
+    fn test_is_code_query_non_code() {
+        assert!(!is_code_query("hello world"));
+        assert!(!is_code_query("what is the weather today?"));
+        assert!(!is_code_query("tell me a joke"));
+        assert!(!is_code_query("create a summary of the meeting"));
+        assert!(!is_code_query(""));
+    }
+
+    #[test]
+    fn test_format_code_context() {
+        let symbols = vec![
+            CodeSymbol {
+                id: "src/auth.rs:authenticate_user:42".into(),
+                name: "authenticate_user".into(),
+                kind: crate::code_indexer::SymbolKind::Function,
+                file_path: "src/auth.rs".into(),
+                line: 42,
+                signature: "pub fn authenticate_user(token: &str) -> Result<User>".into(),
+                doc: Some("validates JWT token and returns user".into()),
+            },
+            CodeSymbol {
+                id: "src/service.rs:MyService:15".into(),
+                name: "MyService".into(),
+                kind: crate::code_indexer::SymbolKind::Class,
+                file_path: "src/service.rs".into(),
+                line: 15,
+                signature: "class MyService { ... }".into(),
+                doc: None,
+            },
+        ];
+
+        let context = format_code_context(&symbols);
+        assert!(context.contains("## Relevant Code Symbols"));
+        assert!(context.contains("authenticate_user"));
+        assert!(context.contains("src/auth.rs:42"));
+        assert!(context.contains("validates JWT token"));
+        assert!(context.contains("Kind: Function"));
+        assert!(context.contains("MyService"));
+        assert!(context.contains("Kind: Class"));
+    }
+
+    #[test]
+    fn test_format_code_context_empty() {
+        let context = format_code_context(&[]);
+        assert_eq!(context, "## Relevant Code Symbols");
+    }
+
+    #[tokio::test]
+    async fn test_auto_inject_on_code_query() {
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+        let query = "fix bug in src/auth.rs";
+        let ctx = mgr.prepare_context(query, &[]).await.unwrap();
+
+        // code_context may be None (no code indexer in test config) or Some
+        // This test primarily validates the pipeline doesn't crash
+        assert_eq!(ctx.entries.len(), 0); // empty project has no entries
+    }
+
+    #[tokio::test]
+    async fn test_no_inject_on_non_code_query() {
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+        let query = "tell me a joke";
+        let ctx = mgr.prepare_context(query, &[]).await.unwrap();
+
+        // code_context should be None for non-code queries
+        assert!(ctx.code_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_context_with_code_delegates() {
+        let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+        let ctx = mgr.build_context_with_code("hello", &[]).await.unwrap();
+
+        // build_context_with_code wraps prepare_context
+        assert!(ctx.code_context.is_none()); // non-code query
     }
 }

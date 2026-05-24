@@ -768,6 +768,165 @@ impl Default for GateEvaluator {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ApprovalGate — edit-time impact analysis
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Summary of an impact analysis for a file edit operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactSummary {
+    pub symbol_name: String,
+    pub direct_callers: Vec<String>,
+    pub indirect: Vec<String>,
+    pub affected_files: Vec<String>,
+    pub risk_level: ImpactRiskLevel,
+}
+
+/// Risk level classification for code changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactRiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl ImpactRiskLevel {
+    pub fn from_caller_count(direct: usize, indirect: usize) -> Self {
+        let total = direct + indirect;
+        match total {
+            0 => Self::Low,
+            1..=3 => Self::Medium,
+            4..=10 => Self::High,
+            _ => Self::Critical,
+        }
+    }
+}
+
+/// A gate that performs impact analysis before allowing file edits.
+///
+/// This gate queries a code indexer (via the provided impact function) to
+/// determine the blast radius of editing a given symbol. The report is
+/// surfaced in the gate result's warnings/suggestions for the user to review.
+pub struct ApprovalGate<F>
+where
+    F: Fn(&str, usize) -> ImpactSummary + Send + Sync,
+{
+    enabled: bool,
+    impact_fn: F,
+    depth: usize,
+}
+
+impl<F> ApprovalGate<F>
+where
+    F: Fn(&str, usize) -> ImpactSummary + Send + Sync,
+{
+    /// Create a new ApprovalGate with the given impact analysis function.
+    pub fn new(impact_fn: F) -> Self {
+        Self {
+            enabled: true,
+            impact_fn,
+            depth: 2,
+        }
+    }
+
+    /// Set the analysis depth (default: 2).
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// Set whether the gate is enabled.
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Analyse the impact of editing a file that contains the given symbol.
+    pub fn analyse_impact(&self, symbol_name: &str) -> ImpactSummary {
+        (self.impact_fn)(symbol_name, self.depth)
+    }
+}
+
+impl<F> Gate for ApprovalGate<F>
+where
+    F: Fn(&str, usize) -> ImpactSummary + Send + Sync,
+{
+    fn name(&self) -> &str {
+        "approval"
+    }
+
+    fn description(&self) -> &str {
+        "Impact analysis gate: checks blast radius before allowing file edits."
+    }
+
+    fn evaluate(&self, context: &GateContext) -> GateResult {
+        if !self.enabled {
+            return GateResult::pass(self.name(), "Approval gate disabled");
+        }
+
+        let mut warnings = Vec::new();
+        let mut suggestions = Vec::new();
+
+        for file in &context.changed_files {
+            // Extract symbol name from file path (e.g., "src/auth/login.rs" -> "login")
+            let symbol_name = file
+                .rsplit('/')
+                .next()
+                .unwrap_or(file)
+                .split('.')
+                .next()
+                .unwrap_or("unknown");
+
+            let impact = (self.impact_fn)(symbol_name, self.depth);
+
+            if !impact.direct_callers.is_empty() || !impact.indirect.is_empty() {
+                let caller_list: Vec<String> = impact
+                    .direct_callers
+                    .iter()
+                    .chain(impact.indirect.iter())
+                    .cloned()
+                    .collect();
+
+                warnings.push(format!(
+                    "File edit impact: {} has {} direct + {} indirect callers",
+                    file,
+                    impact.direct_callers.len(),
+                    impact.indirect.len()
+                ));
+
+                if impact.risk_level == ImpactRiskLevel::High
+                    || impact.risk_level == ImpactRiskLevel::Critical
+                {
+                    suggestions.push(format!(
+                        "HIGH IMPACT: changing {} affects {} callers across {} files. Review carefully.",
+                        impact.symbol_name,
+                        caller_list.len(),
+                        impact.affected_files.len()
+                    ));
+                }
+
+                if !caller_list.is_empty() {
+                    suggestions.push(format!("Affected callers: {}", caller_list.join(", ")));
+                }
+            }
+        }
+
+        if warnings.is_empty() {
+            GateResult::pass(self.name(), "No impact concerns detected")
+        } else {
+            GateResult::pass(self.name(), "Impact analysis completed")
+                .with_warning(warnings.join("; "))
+                .with_suggestion(suggestions.join("; "))
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,5 +980,78 @@ mod tests {
 
         assert!(all_passed || !results.is_empty());
         assert!(!results.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // T8: ApprovalGate impact analysis tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_impact_risk_level() {
+        assert_eq!(ImpactRiskLevel::from_caller_count(0, 0), ImpactRiskLevel::Low);
+        assert_eq!(ImpactRiskLevel::from_caller_count(2, 0), ImpactRiskLevel::Medium);
+        assert_eq!(ImpactRiskLevel::from_caller_count(5, 0), ImpactRiskLevel::High);
+        assert_eq!(ImpactRiskLevel::from_caller_count(1, 10), ImpactRiskLevel::Critical);
+    }
+
+    #[test]
+    fn test_approval_gate_impact_warning() {
+        let impact_fn = |name: &str, _depth: usize| ImpactSummary {
+            symbol_name: name.to_string(),
+            direct_callers: vec!["caller_a".to_string(), "caller_b".to_string()],
+            indirect: vec!["indirect_c".to_string()],
+            affected_files: vec!["src/auth.rs".to_string(), "src/middleware.rs".to_string()],
+            risk_level: ImpactRiskLevel::High,
+        };
+
+        let gate = ApprovalGate::new(impact_fn);
+        let context = GateContext {
+            repo_path: "/test/repo".to_string(),
+            branch: "main".to_string(),
+            commit_message: "fix: update auth logic".to_string(),
+            changed_files: vec!["src/auth/login.rs".to_string()],
+            diff: "fn authenticate() { ... }".to_string(),
+            author: "Test User".to_string(),
+            author_email: "test@example.com".to_string(),
+            violations: Vec::new(),
+        };
+
+        let result = gate.evaluate(&context);
+        assert!(result.passed); // ApprovalGate always passes, warns instead
+        assert!(!result.warnings.is_empty(), "should have impact warnings");
+        assert!(!result.suggestions.is_empty(), "should have impact suggestions");
+    }
+
+    #[test]
+    fn test_approval_gate_no_impact() {
+        let impact_fn = |name: &str, _depth: usize| ImpactSummary {
+            symbol_name: name.to_string(),
+            direct_callers: vec![],
+            indirect: vec![],
+            affected_files: vec![],
+            risk_level: ImpactRiskLevel::Low,
+        };
+
+        let gate = ApprovalGate::new(impact_fn);
+        let context = create_test_context();
+        let result = gate.evaluate(&context);
+        assert!(result.passed);
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_approval_gate_disabled() {
+        let impact_fn = |name: &str, _depth: usize| ImpactSummary {
+            symbol_name: name.to_string(),
+            direct_callers: vec!["caller".to_string()],
+            indirect: vec![],
+            affected_files: vec![],
+            risk_level: ImpactRiskLevel::Medium,
+        };
+
+        let gate = ApprovalGate::new(impact_fn).with_enabled(false);
+        let context = create_test_context();
+        let result = gate.evaluate(&context);
+        assert!(result.passed);
     }
 }

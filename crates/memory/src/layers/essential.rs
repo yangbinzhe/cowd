@@ -208,6 +208,7 @@ impl LayerManager for EssentialLayer {
             budget: budget.clone(),
             depth_scale: 0.8,
             prepared_at: Utc::now(),
+            code_context: None,
         })
     }
 

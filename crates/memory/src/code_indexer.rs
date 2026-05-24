@@ -9,9 +9,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tree_sitter::{Parser, TreeCursor};
 
 use crate::error::MemoryError;
+use crate::store::MemoryStore;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -150,6 +152,24 @@ pub struct IndexStats {
     pub edges_found: usize,
 }
 
+/// Impact report for a code symbol — what would break if this symbol changes.
+///
+/// Depth-based classification:
+/// - d=1: WILL BREAK (direct callers)
+/// - d=2: LIKELY AFFECTED (indirect callers)
+/// - d=3: MAY NEED TESTING (transitive)
+#[derive(Debug, Clone, Default)]
+pub struct ImpactReport {
+    pub symbol_name: String,
+    pub symbol_id: String,
+    /// Direct callers — d=1: WILL BREAK.
+    pub direct_callers: Vec<String>,
+    /// Indirect callers — d=2: LIKELY AFFECTED.
+    pub indirect: Vec<String>,
+    /// All affected file paths.
+    pub affected_files: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // CodeIndexer
 // ---------------------------------------------------------------------------
@@ -166,6 +186,8 @@ pub struct CodeIndexer {
     project_root: PathBuf,
     /// Fingerprints of previously indexed files: (mtime, file_size).
     fingerprints: HashMap<PathBuf, FileFingerprint>,
+    /// Optional store handle for impact analysis queries.
+    store: Option<Arc<dyn MemoryStore>>,
 }
 
 impl CodeIndexer {
@@ -219,6 +241,7 @@ impl CodeIndexer {
             parsers,
             project_root: project_root.to_path_buf(),
             fingerprints: HashMap::new(),
+            store: None,
         })
     }
 
@@ -363,6 +386,81 @@ impl CodeIndexer {
     /// Return a reference to stored file fingerprints.
     pub fn fingerprints(&self) -> &HashMap<PathBuf, FileFingerprint> {
         &self.fingerprints
+    }
+
+    /// Attach a memory store handle for impact analysis.
+    #[must_use]
+    pub fn with_store(mut self, store: Arc<dyn MemoryStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Analyse the impact of changing a code symbol.
+    ///
+    /// Returns an [`ImpactReport`] with direct callers (d=1: WILL BREAK),
+    /// indirect callers (d=2: LIKELY AFFECTED), and affected files.
+    ///
+    /// If `symbol_name` is provided, attempts to look up the symbol by name
+    /// first (via FTS5 search), then queries callers using the store's
+    /// code-edges table.
+    ///
+    /// Returns an empty report if no store is attached or no symbol is found.
+    pub async fn get_impact(&self, symbol_name: &str, depth: usize) -> ImpactReport {
+        let store = match &self.store {
+            Some(s) => s.clone(),
+            None => {
+                return ImpactReport {
+                    symbol_name: symbol_name.to_string(),
+                    ..Default::default()
+                };
+            }
+        };
+
+        // Find the symbol by name via FTS5 search
+        let symbols = store.search_symbols(symbol_name, 1).await.unwrap_or_default();
+        let target = match symbols.first() {
+            Some(s) => s.clone(),
+            None => {
+                return ImpactReport {
+                    symbol_name: symbol_name.to_string(),
+                    ..Default::default()
+                };
+            }
+        };
+
+        let mut report = ImpactReport {
+            symbol_name: target.name.clone(),
+            symbol_id: target.id.clone(),
+            ..Default::default()
+        };
+
+        // d=1: direct callers
+        let callers = store.get_callers(&target.id).await.unwrap_or_default();
+        for c in &callers {
+            report.direct_callers.push(c.name.clone());
+            if !report.affected_files.contains(&c.file_path) {
+                report.affected_files.push(c.file_path.clone());
+            }
+            // Also add the symbol's own file
+            if !report.affected_files.contains(&target.file_path) {
+                report.affected_files.push(target.file_path.clone());
+            }
+        }
+
+        // d=2: indirect callers (only if depth >= 2)
+        if depth >= 2 {
+            for caller in &callers {
+                let indirect = store.get_callers(&caller.id).await.unwrap_or_default();
+                for c in &indirect {
+                    report.indirect.push(c.name.clone());
+                    if !report.affected_files.contains(&c.file_path) {
+                        report.affected_files.push(c.file_path.clone());
+                    }
+                }
+            }
+        }
+
+        report
     }
 
     // -----------------------------------------------------------------------
@@ -1317,5 +1415,81 @@ fn foo() -> i32 {
         assert_eq!(IndexLanguage::from_extension("java"), Some(IndexLanguage::Java));
         assert_eq!(IndexLanguage::from_extension("txt"), None);
         assert_eq!(IndexLanguage::from_extension("md"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // T8: Impact analysis tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_impact_analysis_returns_callers() {
+        use crate::store::sqlite::SqliteStore;
+        use crate::store::MemoryStore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sqlite = SqliteStore::open_path(&tmp.path().join("impact.db")).unwrap();
+
+        let caller = CodeSymbol {
+            id: "a.rs:caller_fn:1".into(),
+            name: "caller_fn".into(),
+            kind: SymbolKind::Function,
+            file_path: "a.rs".into(),
+            line: 1,
+            signature: "fn caller_fn()".into(),
+            doc: None,
+        };
+        let callee = CodeSymbol {
+            id: "b.rs:target_fn:5".into(),
+            name: "target_fn".into(),
+            kind: SymbolKind::Function,
+            file_path: "b.rs".into(),
+            line: 5,
+            signature: "fn target_fn()".into(),
+            doc: None,
+        };
+
+        sqlite.insert_symbol(&caller).await.unwrap();
+        sqlite.insert_symbol(&callee).await.unwrap();
+
+        let edge = SymbolEdge {
+            source_id: "a.rs:caller_fn:1".into(),
+            target_id: "b.rs:target_fn:5".into(),
+            edge_type: SymbolEdgeType::Calls,
+            file_path: "a.rs".into(),
+        };
+        sqlite.index_file_symbols("a.rs", &[caller.clone(), callee.clone()], &[edge]).unwrap();
+
+        // Wrap in Arc<dyn MemoryStore> for CodeIndexer
+        let store: std::sync::Arc<dyn MemoryStore> = std::sync::Arc::new(sqlite);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let indexer = CodeIndexer::new(dir.path())
+            .unwrap()
+            .with_store(store);
+
+        let report = indexer.get_impact("target_fn", 2).await;
+        assert!(!report.direct_callers.is_empty(), "should have direct callers");
+        assert!(report.direct_callers.contains(&"caller_fn".to_string()));
+        assert!(report.affected_files.contains(&"a.rs".to_string()));
+        assert!(report.affected_files.contains(&"b.rs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_impact_report_empty_without_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let indexer = CodeIndexer::new(dir.path()).unwrap();
+        let report = indexer.get_impact("nonexistent", 1).await;
+        assert_eq!(report.symbol_name, "nonexistent");
+        assert!(report.direct_callers.is_empty());
+        assert!(report.indirect.is_empty());
+    }
+
+    #[test]
+    fn test_impact_report_default() {
+        let report = ImpactReport::default();
+        assert!(report.symbol_name.is_empty());
+        assert!(report.direct_callers.is_empty());
+        assert!(report.indirect.is_empty());
+        assert!(report.affected_files.is_empty());
     }
 }

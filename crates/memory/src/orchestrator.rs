@@ -166,6 +166,18 @@ impl MemoryOrchestrator {
         self.l2.load().await
     }
 
+    /// Find code symbols relevant to the given query.
+    ///
+    /// Delegates to the L2 project layer's code indexer.
+    /// Returns an empty vector if no code indexer is available (graceful degradation).
+    pub async fn find_relevant_symbols(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Vec<crate::code_indexer::CodeSymbol> {
+        self.l2.find_relevant_symbols(query, limit).await
+    }
+
     /// Recall relevant memories on-demand (L3 + L4), pre-routed through
     /// the Closet index for topic-aware drawer selection.
     ///
@@ -304,6 +316,7 @@ impl MemoryOrchestrator {
             budget,
             depth_scale: 1.0,
             prepared_at: Utc::now(),
+            code_context: None,
         })
     }
 
@@ -343,6 +356,7 @@ impl MemoryOrchestrator {
             budget,
             depth_scale: 1.0,
             prepared_at: Utc::now(),
+            code_context: None,
         })
     }
 
