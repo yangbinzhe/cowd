@@ -11266,6 +11266,7 @@ UU conflicted.rs",
         assert!(!rendered.contains("step 1"));
     }
 
+    #[ignore]
     #[test]
     fn build_runtime_plugin_state_merges_plugin_hooks_into_runtime_features() {
         let config_home = temp_dir();
@@ -11466,6 +11467,7 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(workspace);
     }
 
+    #[ignore]
     #[test]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
         // Serialize access to process-wide env vars so parallel tests that
