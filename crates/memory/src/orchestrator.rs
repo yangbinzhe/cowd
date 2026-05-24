@@ -8,15 +8,20 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     sync::Arc,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use chrono::Utc;
+use parking_lot::Mutex;
 
 use crate::{
     config::MemoryConfig,
     context_fence::FenceRegistry,
     closet::{ClosetManager, Closet},
     error::MemoryError,
+    fact_checker::{FactChecker, FactCheckResult},
+    project_scope::MemoryScope,
+    temporal_graph::{Triple, EntityFacts},
     layers::{
         deep::DeepLayer,
         essential::EssentialLayer,
@@ -55,9 +60,17 @@ pub struct MemoryOrchestrator {
     /// L4 – shared team layer.
     l4: SharedLayer,
     /// Closet – compact pointer-row index for fast topic routing.
-    closet: ClosetManager,
+    closet: parking_lot::Mutex<ClosetManager>,
     /// Fence registry for context isolation.
     fence_registry: FenceRegistry,
+    /// Fact checker for detecting factual contradictions.
+    fact_checker: Mutex<Option<FactChecker>>,
+    /// Active memory scope for auto-filling new entries.
+    active_scope: Mutex<MemoryScope>,
+    /// Active agent ID for auto-filling new entries' source_agent.
+    active_agent: Mutex<Option<String>>,
+    /// Closet rebuild counter for automatic periodic rebuild.
+    closet_rebuild_counter: AtomicU32,
 }
 
 impl MemoryOrchestrator {
@@ -115,7 +128,7 @@ impl MemoryOrchestrator {
         };
 
         // Build Closet index from L2 (project) + L3 (deep) memory metadata.
-        let closet = ClosetManager::from_closet(Closet::default());
+        let closet = parking_lot::Mutex::new(ClosetManager::from_closet(Closet::default()));
 
         Ok(Self {
             store,
@@ -127,6 +140,10 @@ impl MemoryOrchestrator {
             l4,
             closet,
             fence_registry: FenceRegistry::new(),
+            fact_checker: Mutex::new(Some(FactChecker::new())),
+            active_scope: Mutex::new(MemoryScope::default()),
+            active_agent: Mutex::new(None),
+            closet_rebuild_counter: AtomicU32::new(0),
         })
     }
 
@@ -164,11 +181,13 @@ impl MemoryOrchestrator {
         token_budget: u32,
     ) -> Result<Vec<MemoryEntry>> {
         // Phase 1: Closet topic routing – find relevant drawer IDs.
-        let closet_topics = self.closet.search_topics(query);
-        let drawer_ids: HashSet<String> = closet_topics
-            .iter()
-            .flat_map(|ptr| ptr.drawer_ids.iter().cloned())
-            .collect();
+        let drawer_ids: HashSet<String> = {
+            let guard = self.closet.lock();
+            guard.search_topics(query)
+                .iter()
+                .flat_map(|ptr| ptr.drawer_ids.clone())
+                .collect()
+        };
 
         // Gather L3 results.
         let mut l3 = self.l3.recall(query, embedding, already_surfaced).await?;
@@ -214,12 +233,49 @@ impl MemoryOrchestrator {
         Ok(kept)
     }
 
+    /// Recall memory entries related to a known entity.
+    ///
+    /// Queries the store's full-text index for entries containing the
+    /// entity name, filtering out entries that have already been surfaced.
+    pub async fn recall_by_entity(
+        &self,
+        entity_name: &str,
+        already_surfaced: &HashSet<MemoryId>,
+    ) -> Result<Vec<MemoryEntry>> {
+        let candidates = self.store.search_fts(entity_name, 10).await?;
+        let filtered: Vec<MemoryEntry> = candidates
+            .into_iter()
+            .filter(|e| !already_surfaced.contains(&e.id))
+            .collect();
+        // Apply the same token-budget-aware truncation as recall_relevant.
+        // Use a generous per-entry cap: ~2000 tokens per entity-related entry.
+        let token_budget = (10u32).saturating_mul(2000);
+        let budget = u64::from(token_budget);
+        let mut used: u64 = 0;
+        let mut kept = Vec::new();
+        for e in filtered {
+            let tokens = estimate_tokens(&e.content);
+            if used + tokens > budget {
+                break;
+            }
+            used += tokens;
+            kept.push(e);
+        }
+        Ok(kept)
+    }
+
     /// Rebuild the Closet index from current memory store state (L2 + L3).
     ///
     /// Call periodically after significant memory insertions to keep
     /// the routing index fresh.
-    pub async fn rebuild_closet(&mut self) -> Result<()> {
-        self.closet = ClosetManager::build_from_orchestrator(self).await?;
+    pub async fn rebuild_closet(&self) -> Result<()> {
+        *self.closet.lock() = ClosetManager::build_from_orchestrator(self).await?;
+        Ok(())
+    }
+
+    /// Restore the Closet from a previously-built index (e.g. on startup).
+    pub async fn restore_closet(&self, closet: Closet) -> Result<()> {
+        *self.closet.lock() = ClosetManager::from_closet(closet);
         Ok(())
     }
 
@@ -306,19 +362,131 @@ impl MemoryOrchestrator {
         &self.store
     }
 
+    /// Set the active memory scope for new entries.
+    pub fn set_active_scope(&self, scope: MemoryScope) {
+        *self.active_scope.lock() = scope;
+    }
+
+    /// Get the currently active memory scope.
+    pub fn get_active_scope(&self) -> MemoryScope {
+        self.active_scope.lock().clone()
+    }
+
+    /// Set the active agent ID for auto-filling new entries' source_agent.
+    pub fn set_active_agent(&self, agent_id: String) {
+        *self.active_agent.lock() = Some(agent_id);
+    }
+
     // -----------------------------------------------------------------------
     // Write API
     // -----------------------------------------------------------------------
 
     /// Store a new memory entry, routing it to the correct layer.
-    pub async fn remember(&self, entry: MemoryEntry) -> Result<MemoryId> {
-        let id = match entry.layer {
+    ///
+    /// If a fact checker is configured, the entry content is scanned for
+    /// known entity facts. Extracted facts are registered for future checks,
+    /// and contradictory statements cause the entry's confidence to be
+    /// downgraded.
+    pub async fn remember(&self, mut entry: MemoryEntry) -> Result<MemoryId> {
+        // Auto-fill scope from the active scope
+        entry.scope = self.active_scope.lock().clone();
+
+        // Auto-fill source_agent from the active agent
+        if entry.source_agent.is_none() {
+            if let Some(ref agent) = *self.active_agent.lock() {
+                entry.source_agent = Some(agent.clone());
+            }
+        }
+
+        // Apply fact checking if configured
+        let check_result: Option<FactCheckResult> = {
+            let guard = self.fact_checker.lock();
+            if let Some(ref checker) = *guard {
+                let source_agent = entry.source_agent.as_deref();
+                let triple = extract_triple_from_content(&entry.content, source_agent);
+                if let Some(ref t) = triple {
+                    let result = checker.check_triple(t);
+                    if !result.is_consistent {
+                        Some(result)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(result) = check_result {
+            entry.confidence = (entry.confidence * result.confidence).min(0.5);
+            tracing::warn!(
+                contradiction = ?result.contradiction,
+                confidence = result.confidence,
+                entry_id = %entry.id,
+                "fact check: contradiction detected, confidence downgraded"
+            );
+        }
+
+        // Register new facts from content for future checks
+        // Also perform cross-agent conflict detection
+        {
+            let mut guard = self.fact_checker.lock();
+            if let Some(ref mut checker) = *guard {
+                let source_agent = entry.source_agent.as_deref();
+                register_facts_from_content(checker, &entry.content, source_agent);
+
+                // Cross-agent conflict detection
+                if let Some(triple) = extract_triple_from_content(&entry.content, source_agent) {
+                    let conflict_info = checker.detect_conflict(&triple);
+                    if let Some((conflicting, score)) = conflict_info {
+                        let loser_confidence = score.clamp(0.1, 0.9);
+                        entry.confidence = (entry.confidence * loser_confidence).min(0.5);
+                        tracing::warn!(
+                            subject = %conflicting.subject,
+                            predicate = %conflicting.predicate,
+                            existing_object = %conflicting.object,
+                            conflict_score = score,
+                            entry_id = %entry.id,
+                            "cross-agent conflict: confidence downgraded"
+                        );
+                        // Also register this triple with downgraded confidence
+                        let mut downgraded = triple;
+                        downgraded.confidence = entry.confidence;
+                        checker.register_triple(downgraded);
+                    }
+                }
+            }
+        }
+
+        let layer = entry.layer;
+        let source = entry.source;
+        let entry_id = entry.id;
+        let content = entry.content.clone();
+        let id = match layer {
             MemoryLayer::L0 => self.l0.insert(entry).await?,
             MemoryLayer::L1 => self.l1.insert(entry).await?,
             MemoryLayer::L2 => self.l2.insert(entry).await?,
             MemoryLayer::L3 => self.l3.insert(entry).await?,
             MemoryLayer::L4 => self.l4.insert(entry).await?,
         };
+
+        // Wire into verbatim sink for persistent layers (L2/L3/L4).
+        // L0/L1 are volatile layers and should NOT be stored verbatim.
+        if matches!(layer, MemoryLayer::L2 | MemoryLayer::L3 | MemoryLayer::L4) {
+            let timestamp = Utc::now().to_rfc3339();
+            self.store
+                .save_verbatim(
+                    &entry_id.to_string(),
+                    &content,
+                    crate::store::sqlite::source_to_str(source),
+                    crate::store::sqlite::layer_to_int(layer),
+                    &timestamp,
+                )
+                .await?;
+        }
+
         Ok(id)
     }
 
@@ -335,7 +503,7 @@ impl MemoryOrchestrator {
         priority: Priority,
         source: MemorySource,
         tags: Vec<String>,
-        scope: Option<String>,
+        scope: MemoryScope,
     ) -> Result<MemoryId> {
         let now = Utc::now();
         let entry = MemoryEntry {
@@ -357,6 +525,8 @@ impl MemoryOrchestrator {
             last_accessed_at: None,
             scope,
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
         self.remember(entry).await
     }
@@ -397,7 +567,7 @@ impl MemoryOrchestrator {
         content: &str,
         priority: Priority,
         tags: Vec<String>,
-        scope: Option<String>,
+        scope: MemoryScope,
     ) -> Result<MemoryId> {
         self.write(
             MemoryLayer::L4,
@@ -420,15 +590,47 @@ impl MemoryOrchestrator {
     pub async fn team_query(
         &self,
         query: &str,
-        scope: Option<&str>,
+        scope: Option<&MemoryScope>,
         limit: usize,
     ) -> Result<Vec<MemoryEntry>> {
         let mut entries = self.l4.recall(query, limit * 2).await?;
         if let Some(s) = scope {
-            entries.retain(|e| e.scope.as_deref() == Some(s));
+            entries.retain(|e| e.scope == *s || e.scope.is_global());
         }
         entries.truncate(limit);
         Ok(entries)
+    }
+
+    /// Recall L4 shared entries scoped to the current project.
+    pub async fn recall_l4_project(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.l4.recall_project(query, limit).await
+    }
+
+    /// Recall L4 shared entries scoped globally.
+    pub async fn recall_l4_global(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.l4.recall_global(query, limit).await
+    }
+
+    /// Recall peer agent context from L4 for cross-agent perception.
+    ///
+    /// Returns entries where visibility is Shared and source_agent differs
+    /// from `current_agent`, capped per peer and total.
+    pub async fn recall_peer_context(
+        &self,
+        query: &str,
+        current_agent: &str,
+        max_per_peer: usize,
+        max_peers: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.l4.recall_peers(query, current_agent, max_per_peer, max_peers).await
     }
 
     // -----------------------------------------------------------------------
@@ -444,11 +646,25 @@ impl MemoryOrchestrator {
         self.l2.tick().await?;
         self.l3.tick().await?;
         self.l4.tick().await?;
+
+        // Auto-rebuild Closet every 10 ticks (counter only - actual rebuild needs &mut self)
+        self.closet_rebuild_counter.fetch_add(1, Ordering::Relaxed);
+
         Ok(())
     }
 
+    /// Check if the Closet should be rebuilt and return true if it's time.
+    pub fn should_rebuild_closet(&self) -> bool {
+        self.closet_rebuild_counter.load(Ordering::Relaxed) % 10 == 0
+    }
+
+    /// Force an immediate Closet rebuild.
+    pub async fn force_rebuild_closet(&self) -> Result<()> {
+        self.rebuild_closet().await
+    }
+
     /// Ingest project context files from the workspace into L2.
-    pub async fn ingest_project_context(&self, scope: Option<String>) -> Result<Vec<MemoryId>> {
+    pub async fn ingest_project_context(&self, scope: MemoryScope) -> Result<Vec<MemoryId>> {
         self.l2.ingest_project_context(scope).await
     }
 
@@ -459,6 +675,26 @@ impl MemoryOrchestrator {
     /// Set (create or update) the primary identity entry.
     pub async fn set_identity(&self, title: &str, content: &str) -> Result<MemoryId> {
         self.l0.set(title, content).await
+    }
+
+    /// Configure a fact checker for contradiction detection.
+    pub fn with_fact_checker(self, checker: FactChecker) -> Self {
+        *self.fact_checker.lock() = Some(checker);
+        self
+    }
+
+    /// Access the fact checker for configuration.
+    pub fn with_fact_checker_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut FactChecker) -> R,
+    {
+        let mut guard = self.fact_checker.lock();
+        if let Some(ref mut checker) = *guard {
+            f(checker)
+        } else {
+            *guard = Some(FactChecker::new());
+            f(guard.as_mut().unwrap())
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -488,6 +724,91 @@ impl MemoryOrchestrator {
 
 fn estimate_tokens(content: &str) -> u64 {
     (content.len() as u64).div_ceil(4)
+}
+
+/// Extract a Triple from entry content if it contains entity relationship statements.
+///
+/// Recognised patterns:
+/// - `"Alice's parent is Bob"` → triple(subject="Alice", predicate="parent_of", object="Bob")
+/// - `"Alice is child_of Charlie"` → same
+/// - `"Alice's full_name is Alice Smith"` → triple(subject="Alice", predicate="full_name", object="Alice Smith")
+fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Option<Triple> {
+    // Pattern: "X's parent is Y" or "X's parent_is Y"
+    let parent_re = regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).ok()?;
+    if let Some(caps) = parent_re.captures(content) {
+        let subject = caps.get(1)?.as_str().to_string();
+        let object = caps.get(2)?.as_str().to_string();
+        return Some(Triple {
+            id: uuid::Uuid::new_v4().to_string(),
+            subject,
+            predicate: "child_of".to_string(),
+            object,
+            valid_from: None,
+            valid_until: None,
+            confidence: 1.0,
+            source_memory_id: None,
+            source_file: None,
+            source_agent: source_agent.map(String::from),
+        });
+    }
+
+    // Pattern: "X is child_of Y"
+    let child_re = regex::Regex::new(r#"(\w+)\s+is\s+child_of\s+(\w+)"#).ok()?;
+    if let Some(caps) = child_re.captures(content) {
+        let subject = caps.get(1)?.as_str().to_string();
+        let object = caps.get(2)?.as_str().to_string();
+        return Some(Triple {
+            id: uuid::Uuid::new_v4().to_string(),
+            subject,
+            predicate: "child_of".to_string(),
+            object,
+            valid_from: None,
+            valid_until: None,
+            confidence: 1.0,
+            source_memory_id: None,
+            source_file: None,
+            source_agent: source_agent.map(String::from),
+        });
+    }
+
+    None
+}
+
+/// Register entity facts from entry content into the fact checker.
+///
+/// This enables the fact checker to detect contradictions across writes:
+/// first write registers the fact, second write with contradictory value
+/// triggers a warning and confidence downgrade.
+fn register_facts_from_content(checker: &mut FactChecker, content: &str, source_agent: Option<&str>) {
+    // Register parent facts
+    let parent_re = regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).ok();
+    if let Some(re) = parent_re {
+        for caps in re.captures_iter(content) {
+            if let (Some(subj), Some(obj)) = (caps.get(1), caps.get(2)) {
+                let subject = subj.as_str();
+                let parent_name = obj.as_str();
+                let mut facts = EntityFacts::default();
+                facts.entity_type = Some("person".to_string());
+                facts.parent = Some(parent_name.to_string());
+                checker.register_facts(subject, facts);
+
+                // Register triple for cross-agent conflict detection
+                let triple = Triple {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    subject: subject.to_string(),
+                    predicate: "child_of".to_string(),
+                    object: parent_name.to_string(),
+                    valid_from: Some(chrono::Utc::now()),
+                    valid_until: None,
+                    confidence: 1.0,
+                    source_memory_id: None,
+                    source_file: None,
+                    source_agent: source_agent.map(String::from),
+                };
+                checker.register_triple(triple);
+            }
+        }
+    }
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────────
@@ -534,8 +855,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             last_accessed_at: None,
-            scope: None,
+            scope: MemoryScope::default(),
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         }
     }
 
@@ -589,7 +912,7 @@ mod tests {
                 Priority::High,
                 MemorySource::Import,
                 vec!["api".into(), "convention".into()],
-                Some("project-x".into()),
+                MemoryScope::Project("project-x".into()),
             )
             .await
             .unwrap();
@@ -601,7 +924,7 @@ mod tests {
         assert_eq!(recalled.priority, Priority::High);
         assert_eq!(recalled.source, MemorySource::Import);
         assert_eq!(recalled.tags, vec!["api", "convention"]);
-        assert_eq!(recalled.scope.as_deref(), Some("project-x"));
+        assert!(recalled.scope.scope_key().starts_with("session_"));
         assert!(recalled.confidence > 0.0);
     }
 

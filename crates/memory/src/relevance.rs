@@ -716,6 +716,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::types::{MemoryCategory, MemoryLayer, MemorySource};
+    use crate::MemoryScope;
 
     fn make_entry(title: &str, content: &str, tags: Vec<&str>) -> MemoryEntry {
         MemoryEntry {
@@ -735,8 +736,10 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_accessed_at: None,
-            scope: None,
+            scope: MemoryScope::default(),
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         }
     }
 

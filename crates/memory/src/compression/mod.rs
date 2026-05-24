@@ -35,6 +35,7 @@ use crate::{
     types::{CompactionResult, Message, PreparedContext},
 };
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 /// Result alias for compression operations.
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -80,6 +81,14 @@ pub struct CompressionPipeline {
     guard: CompressionGuard,
     /// Whether stage-3 deep compression is enabled (requires an LLM call).
     pub enable_deep: bool,
+    /// Previous summary for iterative update.
+    pub previous_summary: StdMutex<Option<String>>,
+    /// Savings percentage from last compaction (anti-thrashing).
+    pub last_compression_savings_pct: StdMutex<f32>,
+    /// Consecutive ineffective compressions (anti-thrashing).
+    pub ineffective_compression_count: StdMutex<u32>,
+    /// Cooldown timestamp for LLM summary failures.
+    pub summary_cooldown_until: StdMutex<Option<std::time::Instant>>,
 }
 
 impl CompressionPipeline {
@@ -92,6 +101,10 @@ impl CompressionPipeline {
             deep: DeepCompactor::new(),
             guard: CompressionGuard::new(),
             enable_deep,
+            previous_summary: StdMutex::new(None),
+            last_compression_savings_pct: StdMutex::new(100.0),
+            ineffective_compression_count: StdMutex::new(0),
+            summary_cooldown_until: StdMutex::new(None),
         }
     }
 
@@ -121,6 +134,10 @@ impl CompressionPipeline {
             deep: DeepCompactor::from_config(config),
             guard: CompressionGuard::new(),
             enable_deep: config.enable_deep_compression,
+            previous_summary: StdMutex::new(None),
+            last_compression_savings_pct: StdMutex::new(100.0),
+            ineffective_compression_count: StdMutex::new(0),
+            summary_cooldown_until: StdMutex::new(None),
         };
 
         // Attach LLM summarizer to compactors that support it
@@ -187,6 +204,16 @@ impl CompressionPipeline {
     /// Return `true` when Stage-2 (session) compression should be triggered.
     #[must_use]
     pub fn should_session_compact(&self, messages: &[Message]) -> bool {
+        // Anti-thrashing: skip if too many recent compressions were ineffective
+        if *self.ineffective_compression_count.lock().unwrap() >= 2 {
+            return false;
+        }
+        // Cooldown: skip if LLM summarizer recently failed
+        if let Some(cooldown) = *self.summary_cooldown_until.lock().unwrap() {
+            if std::time::Instant::now() < cooldown {
+                return false;
+            }
+        }
         !self.guard.is_open() && self.session.should_compact(messages)
     }
 
@@ -195,13 +222,31 @@ impl CompressionPipeline {
     /// Splits the message list, generates a structured summary, writes key
     /// decisions to L2 and the summary to L3, then replaces the list with
     /// `[summary_message, …recent…]`.
+    ///
+    /// When a previous summary exists in `self.previous_summary`, it is passed
+    /// to the compactor so the new summary is built iteratively on top of it.
+    /// After successful compaction, the field is updated with the new summary.
     pub async fn session_compact(
         &self,
         messages: &mut Vec<Message>,
         orchestrator: &MemoryOrchestrator,
     ) -> Result<CompactionResult> {
         let _scope = self.guard.enter()?;
-        self.session.compact(messages, orchestrator).await
+        let prev = self.previous_summary.lock().unwrap().clone();
+        let result = self
+            .session
+            .compact(messages, orchestrator, prev.as_deref())
+            .await?;
+
+        // Store the new summary for future iterative updates.
+        // The first message after compaction is the pinned summary message.
+        if let Some(summary_msg) = messages.first() {
+            if summary_msg.pinned {
+                *self.previous_summary.lock().unwrap() = Some(summary_msg.content.clone());
+            }
+        }
+
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -307,5 +352,175 @@ impl CompressionPipeline {
 impl Default for CompressionPipeline {
     fn default() -> Self {
         Self::new(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Message, MessageRole};
+
+    fn msg(role: MessageRole, content: &str) -> Message {
+        Message {
+            turn_index: 0,
+            role,
+            content: content.to_string(),
+            tool_use_id: None,
+            tool_name: None,
+            pinned: false,
+        }
+    }
+
+    fn tool_msg(tool_name: &str, content: &str) -> Message {
+        Message {
+            turn_index: 0,
+            role: MessageRole::Tool,
+            content: content.to_string(),
+            tool_use_id: Some("call_1".to_string()),
+            tool_name: Some(tool_name.to_string()),
+            pinned: false,
+        }
+    }
+
+    // ===================================================================
+    // Task 9: Iterative summary update tests
+    // These verify that micro_compact preserves content across calls.
+    // Currently no iterative logic exists, so the second compaction
+    // loses info from the first. The test asserts that it SHOULD NOT.
+    // ===================================================================
+
+    #[test]
+    fn test_iterative_summary_preserves_previous_info() {
+        let pipeline = CompressionPipeline::new(true);
+        let mut msgs = vec![
+            msg(MessageRole::User, "Initial: set up the project"),
+            msg(MessageRole::Assistant, "Created project with Cargo.toml"),
+        ];
+
+        let len_before = msgs.iter().map(|m| m.content.len()).sum::<usize>();
+        pipeline.micro_compact(&mut msgs);
+
+        // Add more conversation
+        msgs.push(msg(MessageRole::User, "Add logging support"));
+        msgs.push(msg(MessageRole::Assistant, "Added log4rs with rolling file appender"));
+
+        let len_after = msgs.iter().map(|m| m.content.len()).sum::<usize>();
+        pipeline.micro_compact(&mut msgs);
+
+        // RED: the first compaction's content should influence the second.
+        // Currently each micro_compact is independent, so the content from
+        // the first compaction is lost. After iterative update, the second
+        // compaction should preserve "Cargo.toml" from the first exchange.
+        // This test FAILS because no previous_summary mechanism exists.
+        let all_content: String = msgs.iter().map(|m| m.content.as_str()).collect();
+        assert!(
+            all_content.contains("Cargo.toml"),
+            "RED: Iterative compaction should preserve 'Cargo.toml' from first turn. \
+             Without previous_summary, the first compaction loses this info."
+        );
+    }
+
+    #[test]
+    fn test_second_compaction_content_not_lost() {
+        let pipeline = CompressionPipeline::new(true);
+        let mut msgs = vec![
+            msg(MessageRole::User, "Implement auth module"),
+            msg(MessageRole::Assistant, "Added JWT-based authentication with refresh tokens"),
+        ];
+
+        pipeline.micro_compact(&mut msgs);
+
+        // Second exchange
+        msgs.push(msg(MessageRole::User, "Add rate limiting"));
+        msgs.push(msg(MessageRole::Assistant, "Added token bucket rate limiter"));
+
+        pipeline.micro_compact(&mut msgs);
+
+        // RED: "JWT" from the first exchange should survive to the second compaction
+        let all_content: String = msgs.iter().map(|m| m.content.as_str()).collect();
+        assert!(
+            all_content.contains("JWT"),
+            "RED: 'JWT' from the first turn should survive two compactions. \
+             Without iterative updates, content from earlier turns is lost."
+        );
+    }
+
+    // ===================================================================
+    // Task 10: Smart tool output pruning tests
+    // These verify that different tool types get appropriate summaries.
+    // Currently MicroCompactor uses generic truncation for ALL tools.
+    // ===================================================================
+
+    #[test]
+    fn test_terminal_output_summarized_with_exit_code() {
+        use crate::compression::micro::MicroCompactor;
+        let compactor = MicroCompactor::new();
+
+        let terminal_output = concat!(
+            r#"{"exit_code": 1, "output": "test failed at line 42"}"#,
+            "\n",
+            "error: assertion failed\n",
+            "     at src/main.rs:42\n",
+        );
+        let mut msgs = vec![
+            msg(MessageRole::Assistant, "Running tests..."),
+            tool_msg("terminal", terminal_output),
+            msg(MessageRole::Assistant, "Tests failed, fixing"),
+        ];
+
+        compactor.compact(&mut msgs);
+
+        let tool_content = &msgs[1].content;
+        assert!(
+            tool_content.len() < terminal_output.len(),
+            "Terminal tool output should be compressed"
+        );
+        assert!(
+            tool_content.contains("exit"),
+            "RED: Terminal summary should mention exit code. \
+             Currently uses generic truncation without exit code awareness."
+        );
+    }
+
+    #[test]
+    fn test_read_file_output_summarized_with_path_context() {
+        use crate::compression::micro::MicroCompactor;
+        let compactor = MicroCompactor::new();
+
+        let read_content = "fn main() {\n    let x = 42;\n    println!(\"{}\", x);\n}\n";
+        let mut msgs = vec![
+            msg(MessageRole::Assistant, "Reading src/main.rs..."),
+            tool_msg("read_file", read_content),
+            msg(MessageRole::Assistant, "Found the main function"),
+        ];
+
+        compactor.compact(&mut msgs);
+
+        let tool_content = &msgs[1].content;
+        assert!(
+            tool_content.len() <= read_content.len(),
+            "Read file output should at minimum not grow"
+        );
+    }
+
+    #[test]
+    fn test_unknown_tool_falls_back_to_generic_truncation() {
+        use crate::compression::micro::MicroCompactor;
+        let compactor = MicroCompactor::new();
+
+        let long_content = "result data: ".to_string() + &"x".repeat(3000);
+        let mut msgs = vec![
+            msg(MessageRole::Assistant, "Running custom transform..."),
+            tool_msg("custom_tool", &long_content),
+            msg(MessageRole::Assistant, "Done"),
+        ];
+
+        compactor.compact(&mut msgs);
+
+        let tool_content = &msgs[1].content;
+        assert!(
+            tool_content.len() < long_content.len(),
+            "Long unknown tool output should still be compacted"
+        );
     }
 }

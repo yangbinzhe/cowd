@@ -37,7 +37,7 @@ use chrono::Utc;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::{
+use crate::{ MemoryScope,
     config::DriftConfig,
     layers::{LayerManager, Result},
     store::MemoryStore,
@@ -56,7 +56,7 @@ pub struct SharedLayer {
     enabled: bool,
     max_tokens: u64,
     /// Scope key used to tag all entries written by this layer.
-    shared_scope: Option<String>,
+    shared_scope: Option<MemoryScope>,
     drift: DriftConfig,
 }
 
@@ -88,7 +88,7 @@ impl SharedLayer {
     pub fn with_config(
         store: Arc<dyn MemoryStore>,
         enabled: bool,
-        shared_scope: Option<String>,
+        shared_scope: Option<MemoryScope>,
         max_tokens: u64,
         drift: DriftConfig,
     ) -> Self {
@@ -147,8 +147,10 @@ impl SharedLayer {
             created_at: now,
             updated_at: now,
             last_accessed_at: None,
-            scope: self.shared_scope.clone(),
+            scope: self.shared_scope.clone().unwrap_or_default(),
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
         let id = self.store.insert(&entry).await?;
         Ok(id)
@@ -168,6 +170,80 @@ impl SharedLayer {
         Ok(filtered)
     }
 
+    /// Recall L4 entries scoped to a Project scope via FTS.
+    pub async fn recall_project(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        let scope = self.shared_scope.clone().unwrap_or_default();
+        let results = self.store.search_fts_scoped(query, &scope, limit * 2).await?;
+        let filtered: Vec<MemoryEntry> = results
+            .into_iter()
+            .filter(|e| e.layer == MemoryLayer::L4)
+            .take(limit)
+            .collect();
+        Ok(filtered)
+    }
+
+    /// Recall L4 entries scoped to the Global scope via FTS.
+    pub async fn recall_global(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        let results = self.store.search_fts_scoped(query, &MemoryScope::Global, limit * 2).await?;
+        let filtered: Vec<MemoryEntry> = results
+            .into_iter()
+            .filter(|e| e.layer == MemoryLayer::L4)
+            .take(limit)
+            .collect();
+        Ok(filtered)
+    }
+
+    /// Recall peer agent entries from L4 for cross-agent perception.
+    ///
+    /// Filters for entries with visibility==Shared from other agents,
+    /// within a 5-minute time window. Caps at `max_per_peer` entries
+    /// per agent and `max_peers` total peer agents.
+    pub async fn recall_peers(
+        &self,
+        query: &str,
+        current_agent: &str,
+        max_per_peer: usize,
+        max_peers: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        let cutoff = Utc::now() - chrono::Duration::minutes(5);
+        let results = self.store.search_fts(query, max_peers * max_per_peer * 2).await?;
+        let peer_entries: Vec<MemoryEntry> = results
+            .into_iter()
+            .filter(|e| {
+                e.layer == MemoryLayer::L4
+                    && e.visibility == crate::types::AgentVisibility::Shared
+                    && e.source_agent.as_deref() != Some(current_agent)
+                    && e.created_at >= cutoff
+            })
+            .collect();
+
+        // Group by source_agent, cap per peer, then cap total peers.
+        let mut seen_peers: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut capped = Vec::new();
+        for entry in peer_entries {
+            let agent_key = entry.source_agent.clone().unwrap_or_default();
+            let count = seen_peers.get(&agent_key).copied().unwrap_or(0);
+            if count >= max_per_peer {
+                continue;
+            }
+            if seen_peers.len() >= max_peers && !seen_peers.contains_key(&agent_key) {
+                continue;
+            }
+            seen_peers.insert(agent_key, count + 1);
+            capped.push(entry);
+        }
+        Ok(capped)
+    }
+
     /// Sync: re-read L4 entries from the store and update staleness.
     ///
     /// In a real multi-agent system this would pull from a remote shared store.
@@ -183,6 +259,31 @@ impl SharedLayer {
             self.store.update(&entry).await?;
         }
         Ok(())
+    }
+
+    /// Return frequently occurring tags within a time window.
+    ///
+    /// Scans all L4 entries created within `window_secs` from now, counts tag
+    /// frequencies, and returns tags ordered by frequency (descending).
+    pub async fn hot_topics(&self, window_secs: i64) -> Vec<String> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let cutoff = Utc::now() - chrono::Duration::seconds(window_secs);
+        let entries = self.store.search_by_layer(MemoryLayer::L4).await.unwrap_or_default();
+
+        let mut tag_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for entry in &entries {
+            if entry.created_at >= cutoff {
+                for tag in &entry.tags {
+                    *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut sorted: Vec<(String, usize)> = tag_counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.into_iter().map(|(tag, _)| tag).collect()
     }
 }
 
@@ -201,8 +302,8 @@ impl LayerManager for SharedLayer {
             return Ok(Uuid::nil());
         }
         entry.layer = MemoryLayer::L4;
-        if entry.scope.is_none() {
-            entry.scope = self.shared_scope.clone();
+        if let Some(ref s) = self.shared_scope {
+            entry.scope = s.clone();
         }
         let id = self.store.insert(&entry).await?;
         Ok(id)
@@ -293,6 +394,7 @@ fn estimate_tokens(content: &str) -> u64 {
 // ---------------------------------------------------------------------------
 
 use crate::types::MemoryMeta;
+use crate::entity::{Entity, Triple};
 
 /// A no-op store used when the `SharedLayer` is disabled.
 struct NoopStore;
@@ -343,6 +445,44 @@ impl crate::store::MemoryStore for NoopStore {
         Ok(Vec::new())
     }
     async fn list_all(&self) -> crate::store::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
+
+    async fn save_entities(&self, _entities: &[Entity]) -> crate::store::Result<()> {
+        Ok(())
+    }
+
+    async fn load_entities(&self) -> crate::store::Result<Vec<Entity>> {
+        Ok(Vec::new())
+    }
+
+    async fn save_triples(&self, _triples: &[Triple]) -> crate::store::Result<()> {
+        Ok(())
+    }
+
+    async fn load_triples(&self) -> crate::store::Result<Vec<Triple>> {
+        Ok(Vec::new())
+    }
+
+    async fn save_verbatim(
+        &self,
+        _id: &str,
+        _content: &str,
+        _source: &str,
+        _layer: i32,
+        _timestamp: &str,
+    ) -> crate::store::Result<()> {
+        Ok(())
+    }
+
+    async fn load_verbatim_by_id(&self, _id: &str) -> crate::store::Result<Option<crate::store::VerbatimEntry>> {
+        Ok(None)
+    }
+
+    async fn search_verbatim_by_content(
+        &self,
+        _query: &str,
+    ) -> crate::store::Result<Vec<crate::store::VerbatimEntry>> {
         Ok(Vec::new())
     }
 }
@@ -417,7 +557,8 @@ mod tests {
             title: "t".into(), content: "c".into(), embedding: None,
             tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
             staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            last_accessed_at: None, scope: None, session_id: None,
+            last_accessed_at: None, scope: MemoryScope::default(), session_id: None,
+            source_agent: None, visibility: crate::types::AgentVisibility::default(),
         };
         let id = layer.insert(entry).await.unwrap();
         assert_eq!(id, uuid::Uuid::nil());
@@ -432,7 +573,8 @@ mod tests {
             title: "t".into(), content: "c".into(), embedding: None,
             tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
             staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            last_accessed_at: None, scope: None, session_id: None,
+            last_accessed_at: None, scope: MemoryScope::default(), session_id: None,
+            source_agent: None, visibility: crate::types::AgentVisibility::default(),
         };
         let id = layer.insert(entry).await.unwrap();
         assert_ne!(id, uuid::Uuid::nil());

@@ -799,6 +799,7 @@ fn category_display_name(category: &MemoryCategory) -> String {
         MemoryCategory::Reference => "参考资料 (Reference)",
         MemoryCategory::Shared => "共享知识 (Shared)",
         MemoryCategory::CompressedSummary => "压缩摘要 (CompressedSummary)",
+        MemoryCategory::ProjectKnowledge => "项目知识 (ProjectKnowledge)",
     }
     .to_string()
 }
@@ -1115,6 +1116,7 @@ impl Default for FenceConfig {
 mod tests {
     use super::*;
     use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
+    use crate::MemoryScope;
     use uuid::Uuid;
 
     fn make_entry(id: &str, layer: MemoryLayer) -> MemoryEntry {
@@ -1135,8 +1137,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             last_accessed_at: None,
-            scope: None,
+            scope: MemoryScope::default(),
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         }
     }
 
@@ -1420,8 +1424,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             last_accessed_at: None,
-            scope: None,
+            scope: MemoryScope::default(),
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         }
     }
 

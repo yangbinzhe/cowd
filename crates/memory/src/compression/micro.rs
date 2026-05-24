@@ -102,6 +102,15 @@ impl MicroCompactor {
             }
             if msg.content.len() > max {
                 msg.content = truncate_content(&msg.content, max);
+            } else if let Some(ref tool_name) = msg.tool_name {
+                let summary = summarize_tool_output(tool_name, &msg.content);
+                if summary.len() < msg.content.len() && msg.content.len() > 50 {
+                    msg.content = summary;
+                } else if summary.len() >= msg.content.len() && msg.content.len() > 2000 {
+                    msg.content = truncate_content(&msg.content, 2000);
+                }
+            } else if msg.content.len() > 2000 {
+                msg.content = truncate_content(&msg.content, 2000);
             }
         }
     }
@@ -244,4 +253,201 @@ fn truncate_content(text: &str, max_chars: usize) -> String {
         &text[..head_end],
         &text[tail_start..]
     )
+}
+
+/// Smart summarization of tool output based on tool type.
+///
+/// Returns a concise one-line summary (<200 chars) that captures the key
+/// information (exit code, file path, match count, URL, etc.) for known tool
+/// types.  For unknown tools, returns the full content unchanged (caller will
+/// fall back to generic truncation).
+///
+/// Match order matters: more-specific prefixes (browser_, lsp_, web_search)
+/// are checked before broader patterns (search, read, write) to avoid false
+/// matches.
+fn summarize_tool_output(tool_name: &str, content: &str) -> String {
+    let content_len = content.len();
+    let line_count = content.lines().count().max(1);
+
+    match tool_name {
+        // ── browser_* tools (before "search" to avoid grep arm) ──────────
+        n if n.starts_with("browser_") => {
+            let url_re = regex::Regex::new(r#""url"\s*:\s*"([^"]+)""#).ok();
+            let url = url_re
+                .and_then(|re| re.captures(content))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str());
+            if let Some(url) = url {
+                format!("[browser] {url} ({content_len} chars)")
+            } else {
+                format!("[browser] ({content_len} chars)")
+            }
+        }
+
+        // ── web_search / web_extract (before grep/search arm) ────────────
+        n if n.contains("web_search") => {
+            let query_re = regex::Regex::new(r#""query"\s*:\s*"([^"]+)""#).ok();
+            let query = query_re
+                .and_then(|re| re.captures(content))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str())
+                .unwrap_or("?");
+            let short_q = if query.len() > 60 {
+                format!("{}...", &query[..57])
+            } else {
+                query.to_string()
+            };
+            format!("[web_search] '{short_q}' ({content_len} chars)")
+        }
+        n if n.contains("web_extract") => {
+            format!("[web_extract] ({content_len} chars)")
+        }
+
+        // ── lsp_* tools ──────────────────────────────────────────────────
+        n if n.starts_with("lsp_") => {
+            if n.contains("diagnostics") {
+                format!("[lsp_diagnostics] {line_count} results")
+            } else if n.contains("references") || n.contains("find_references") {
+                format!("[lsp_find_references] {line_count} references")
+            } else if n.contains("definition") {
+                format!("[lsp_goto_definition] {line_count} results")
+            } else if n.contains("rename") {
+                format!("[lsp_rename] {line_count} results")
+            } else if n.contains("symbols") {
+                format!("[lsp_symbols] {line_count} results")
+            } else {
+                format!("[lsp] ({content_len} chars)")
+            }
+        }
+
+        // ── execute_code ─────────────────────────────────────────────────
+        n if n.contains("execute_code") => {
+            format!("[execute_code] {line_count} lines output ({content_len} chars)")
+        }
+
+        // ── patch ────────────────────────────────────────────────────────
+        n if n.contains("patch") => {
+            let path_re = regex::Regex::new(r#""(?:path|file)"\s*:\s*"([^"]+)""#).ok();
+            let path = path_re
+                .and_then(|re| re.captures(content))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str())
+                .unwrap_or("?");
+            format!("[patch] {path} ({content_len} chars)")
+        }
+
+        // ── terminal / bash ──────────────────────────────────────────────
+        n if n.contains("terminal") || n.contains("bash") => {
+            let exit_regex = regex::Regex::new(r#""exit_code"\s*:\s*(-?\d+)"#).ok();
+            let exit_code = exit_regex
+                .and_then(|re| re.captures(content))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str())
+                .unwrap_or("?");
+            format!("[terminal] exit {}, {} lines output", exit_code, line_count)
+        }
+
+        // ── read_file / cat ──────────────────────────────────────────────
+        n if n.contains("read") || n.contains("cat") => {
+            let path_regex = regex::Regex::new(r#""(?:path|file)"\s*:\s*"([^"]+)""#).ok();
+            let path = path_regex
+                .and_then(|re| re.captures(content))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            if !path.is_empty() {
+                format!(
+                    "[read_file] read {} ({} chars, {} lines)",
+                    path, content_len, line_count
+                )
+            } else {
+                format!("[read_file] ({} chars, {} lines)", content_len, line_count)
+            }
+        }
+
+        // ── write_file (improved — path extraction) ──────────────────────
+        n if n.contains("write") => {
+            let path_regex = regex::Regex::new(r#""(?:path|file)"\s*:\s*"([^"]+)""#).ok();
+            let path = path_regex
+                .and_then(|re| re.captures(content))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            if !path.is_empty() {
+                format!("[write_file] wrote {path} ({line_count} lines)")
+            } else {
+                format!("[write_file] wrote {line_count} lines")
+            }
+        }
+
+        // ── grep / search (after web_search to avoid conflict) ───────────
+        n if n.contains("grep") || n.contains("search") => {
+            let pattern = regex::Regex::new(r#""pattern"\s*:\s*"([^"]+)""#).ok();
+            let pat = pattern
+                .and_then(|re| re.captures(content))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str())
+                .unwrap_or("?");
+            format!("[search] '{}' -> {} matches", pat, line_count / 2)
+        }
+
+        // ── delegate_task (improved — subagent type) ─────────────────────
+        n if n.contains("delegate") => {
+            let subagent_re =
+                regex::Regex::new(r#""subagent_type"\s*:\s*"([^"]+)""#).ok();
+            let subagent = subagent_re
+                .and_then(|re| re.captures(content))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str())
+                .unwrap_or("task");
+            let goal = regex::Regex::new(r#""goal"\s*:\s*"([^"]+)""#).ok();
+            let g = goal
+                .and_then(|re| re.captures(content))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str())
+                .unwrap_or("?");
+            let short_goal = if g.len() > 60 {
+                format!("{}...", &g[..57])
+            } else {
+                g.to_string()
+            };
+            format!("[delegate:{subagent}] '{short_goal}' ({content_len} chars)")
+        }
+
+        // ── skill_view / skills_list ─────────────────────────────────────
+        n if n.contains("skill") => {
+            format!("[skill] ({content_len} chars)")
+        }
+
+        // ── unknown tool — return unchanged ──────────────────────────────
+        _ => content.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_summarize_terminal_with_exit_code() {
+        let content = r#"{"exit_code": 1, "output": "test failed"}"#;
+        let result = summarize_tool_output("terminal", content);
+        assert!(result.contains("exit 1"), "Should contain exit code, got: {}", result);
+        assert!(result.contains("lines"), "Should contain line count");
+        assert!(result.len() < content.len(), "Should be compressed");
+    }
+
+    #[test]
+    fn test_summarize_read_file_with_path() {
+        let content = r#"{"path": "src/main.rs", "content": "fn main() {}"}"#;
+        let result = summarize_tool_output("read_file", content);
+        assert!(result.contains("src/main.rs"), "Should contain file path");
+    }
+
+    #[test]
+    fn test_summarize_unknown_tool_unchanged() {
+        let content = "some long output data here";
+        let result = summarize_tool_output("custom_tool", content);
+        assert_eq!(result, content, "Unknown tool output should be unchanged");
+    }
 }

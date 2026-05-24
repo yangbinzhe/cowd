@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     layers::{LayerManager, Result},
+    project_scope::MemoryScope,
     store::MemoryStore,
     types::{
         MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, PreparedContext,
@@ -80,8 +81,10 @@ impl IdentityLayer {
             created_at: now,
             updated_at: now,
             last_accessed_at: None,
-            scope: None,
+            scope: MemoryScope::default(),
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
         let id = self.store.insert(&entry).await?;
         Ok(id)
@@ -225,8 +228,10 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             last_accessed_at: None,
-            scope: None,
+            scope: MemoryScope::default(),
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
         let id = layer.insert(entry).await.unwrap();
         let got = layer.load().await.unwrap().into_iter().find(|e| e.id == id).unwrap();

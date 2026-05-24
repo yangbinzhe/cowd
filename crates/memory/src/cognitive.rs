@@ -17,33 +17,54 @@ use std::{collections::HashSet, path::PathBuf, sync::Mutex};
 
 use chrono::Utc;
 
-use crate::{
+use crate::{ MemoryScope,
+    closet::{Closet, ClosetManager},
     compression::{
         budget::BudgetManager,
         monitor::ContextWindowMonitor,
         CompressionPipeline,
     },
     config::MemoryConfig,
+    context_rot::{ContextRotMonitor, RotAlert, RotMetrics},
     drift::DriftDetector,
+    embedding::EmbeddingCapability,
+    entity::KnowledgeGraph,
     error::MemoryError,
+    fresh_context::FreshContextManager,
     extractor::MemoryExtractor,
     handoff::HandoffManager,
     orchestrator::MemoryOrchestrator,
+    project_scope::build_project_kg,
     relevance::DynamicLoader,
+    search::HybridSearcher,
     seeds::{DecisionThreadStore, SeedRegistry},
     store::{FtsSearchOptions, FtsSearchResult},
+    store::sqlite::SqliteStore,
     store::vector::VectorIndex,
     types::{
-        DecisionEntry, HandoffData, MatchedKeyword, MemoryEntry, MemoryId, Message,
-        MessageRole, PreparedContext, SearchMemoriesRequest, SearchMemoriesResult,
-        SearchMode, SearchSnippet, TokenBudget,
+        DecisionEntry, HandoffData, MatchedKeyword, MemoryEntry, MemoryId, MemoryLayer,
+        MemoryCategory, MemorySource, Message, MessageRole, PreparedContext, Priority,
+        SearchMemoriesRequest, SearchMemoriesResult, SearchMode, SearchSnippet, Seed, TokenBudget,
     },
     write_guard::{AuditLog, AuditOperation, AuditEntry, MemoryWriteGuard, WriteSource},
-    embedding::EmbeddingCapability,
 };
 
 /// Result alias used throughout this module.
 pub type Result<T> = std::result::Result<T, MemoryError>;
+
+// ---------------------------------------------------------------------------
+// Delegation Types
+// ---------------------------------------------------------------------------
+
+/// Result of a child agent delegation.
+#[derive(Debug, Clone)]
+pub struct DelegationResult {
+    pub agent_role: String,
+    pub task: String,
+    pub result: String,
+    pub parent_session_id: Option<String>,
+    pub timestamp: chrono::DateTime<Utc>,
+}
 
 // ---------------------------------------------------------------------------
 // Session Restoration Types
@@ -78,7 +99,10 @@ pub struct CognitiveContextManager {
     #[allow(dead_code)] // Design: reserved for future dynamic memory loading
     loader: DynamicLoader,
     /// In-process vector index for semantic search.
-    vector_index: VectorIndex,
+    vector_index: Mutex<VectorIndex>,
+    /// Hybrid (BM25+vector) searcher for re-ranking.
+    #[allow(dead_code)]
+    hybrid_searcher: HybridSearcher,
     /// Real-time context window pressure monitor.
     monitor: ContextWindowMonitor,
     /// Cross-session handoff manager.
@@ -87,6 +111,10 @@ pub struct CognitiveContextManager {
     seeds: Mutex<SeedRegistry>,
     /// Persistent decision thread log.
     decisions: Mutex<DecisionThreadStore>,
+    /// Persisted Closet index, loaded from SQLite on startup.
+    closet: Mutex<Option<Closet>>,
+    /// SQLite store handle for Closet/Seeds persistence.
+    sqlite_store: SqliteStore,
     /// Staleness and contradiction detector.
     drift: DriftDetector,
     /// Write guard for anti-corruption control.
@@ -97,6 +125,16 @@ pub struct CognitiveContextManager {
     embedding_capability: EmbeddingCapability,
     /// Heuristic memory extractor.
     extractor: MemoryExtractor,
+    /// In-memory knowledge graph for entity relationships.
+    kg: Mutex<KnowledgeGraph>,
+    /// Freshness-priority context manager for session budget management.
+    fresh_ctx: FreshContextManager,
+    /// Context rotation monitor for GSD-style health warnings.
+    context_rot_monitor: Mutex<ContextRotMonitor>,
+    /// Active agent ID for peer context discovery.
+    current_agent: Mutex<Option<String>>,
+    /// Queue of child agent delegation results, consumed by on_turn_end.
+    delegation_results: Mutex<Vec<DelegationResult>>,
 }
 
 impl CognitiveContextManager {
@@ -131,8 +169,10 @@ impl CognitiveContextManager {
             1536
         };
         let persist_path = config.store.blob_dir.join("vector_index.json");
-        let vector_index = VectorIndex::load(persist_path, dimension)
-            .map_err(|e| MemoryError::Store(format!("load vector index: {e}")))?;
+        let vector_index = Mutex::new(
+            VectorIndex::load(persist_path, dimension)
+                .map_err(|e| MemoryError::Store(format!("load vector index: {e}")))?,
+        );
 
         // Build the context window monitor.
         let budget_mgr = BudgetManager::new(config.budget.clone());
@@ -144,25 +184,96 @@ impl CognitiveContextManager {
         // Build the memory extractor.
         let extractor = MemoryExtractor::new(config.extractor.clone());
 
+        // Load knowledge graph from persistent store.
+        let kg = {
+            let entities = orchestrator.store().load_entities().await.unwrap_or_default();
+            let triples = orchestrator.store().load_triples().await.unwrap_or_default();
+            let mut graph = KnowledgeGraph::new();
+            for e in entities {
+                graph.add_entity(e);
+            }
+            for t in triples {
+                graph.add_triple_raw(t);
+            }
+            // Self-healing: run consistency check after KG load
+            let fixes = graph.run_consistency_check();
+            for fix in &fixes {
+                tracing::info!("self-healing: {fix}");
+            }
+            if !fixes.is_empty() {
+                tracing::warn!(
+                    fix_count = fixes.len(),
+                    "KG self-healing applied {} fixes",
+                    fixes.len()
+                );
+            }
+            tokio::task::yield_now().await;
+            if graph.list_entities().is_empty() && graph.list_triples().is_empty() {
+                tracing::debug!("KG loaded: empty (no persisted data)");
+            } else {
+                tracing::debug!(
+                    "KG loaded: {} entities, {} triples",
+                    graph.list_entities().len(),
+                    graph.list_triples().len()
+                );
+            }
+            Mutex::new(graph)
+        };
+
+        // Build the SQLite store for Closet / Seeds persistence.
+        let sqlite_store = SqliteStore::open(&config.store)?;
+
+        // Restore Closet from SQLite and re-inject into orchestrator.
+        let closet: Option<Closet> = sqlite_store
+            .load_closet()
+            .unwrap_or(None)
+            .and_then(|json| {
+                serde_json::from_str::<Vec<crate::closet::ClosetPointer>>(&json)
+                    .ok()
+                    .map(|pointers| Closet { pointers })
+            });
+        if let Some(ref c) = closet {
+            orchestrator.restore_closet(c.clone()).await?;
+        }
+
+        // Restore Seeds from SQLite.
+        let saved_seeds: Vec<Seed> = sqlite_store
+            .load_seeds()
+            .unwrap_or(None)
+            .and_then(|json| serde_json::from_str::<Vec<Seed>>(&json).ok())
+            .unwrap_or_default();
+        let seeds = {
+            let mut registry = SeedRegistry::new();
+            let _ = registry.bootstrap_system_seeds();
+            for seed in saved_seeds {
+                registry.register(seed);
+            }
+            Mutex::new(registry)
+        };
+
         Ok(Self {
             drift: DriftDetector::new(config.drift.clone()),
+            fresh_ctx: FreshContextManager::new(config.budget.context_window),
+            context_rot_monitor: Mutex::new(ContextRotMonitor::new(RotMetrics::default())),
+            current_agent: Mutex::new(None),
+            delegation_results: Mutex::new(Vec::new()),
             config,
             orchestrator,
             pipeline,
             loader: DynamicLoader::new(),
             vector_index,
+            hybrid_searcher: HybridSearcher::new(),
             monitor,
             handoff_mgr: HandoffManager::new(),
-            seeds: {
-                let mut registry = SeedRegistry::new();
-                let _ = registry.bootstrap_system_seeds();
-                Mutex::new(registry)
-            },
+            seeds,
             decisions: Mutex::new(DecisionThreadStore::new()),
+            closet: Mutex::new(closet),
+            sqlite_store,
             write_guard: None,
             audit_log: None,
             embedding_capability,
             extractor,
+            kg,
         })
     }
 
@@ -188,6 +299,12 @@ impl CognitiveContextManager {
         self
     }
 
+    /// Set the active agent for source_agent tagging and peer context discovery.
+    pub fn set_active_agent(&self, agent_id: String) {
+        self.orchestrator.set_active_agent(agent_id.clone());
+        *self.current_agent.lock().unwrap() = Some(agent_id);
+    }
+
     /// Check whether a write to `layer` is allowed under the current guard.
     pub fn check_write_access(&self, layer: crate::types::MemoryLayer) -> crate::write_guard::WritePolicy {
         match &self.write_guard {
@@ -199,6 +316,27 @@ impl CognitiveContextManager {
     // -----------------------------------------------------------------------
     // Core: prepare_context
     // -----------------------------------------------------------------------
+
+    /// Build and load the project knowledge graph (P1 KG) from source files.
+    ///
+    /// Scans `project_path` for code symbols, replaces the current in-memory
+    /// knowledge graph with the freshly built graph. This should be called
+    /// whenever the active project is switched.
+    pub fn load_project_kg(&self, project_path: &PathBuf) -> Result<()> {
+        let kg = build_project_kg(project_path);
+        let entity_count = kg.list_entities().len();
+        let mut guard = self
+            .kg
+            .lock()
+            .map_err(|_| MemoryError::Other("kg lock poisoned".into()))?;
+        *guard = kg;
+        tracing::info!(
+            entity_count,
+            path = %project_path.display(),
+            "project knowledge graph loaded"
+        );
+        Ok(())
+    }
 
     /// Assemble the optimal context for the upcoming model turn.
     ///
@@ -224,7 +362,118 @@ impl CognitiveContextManager {
         entries.extend(project);
 
         // Track which IDs are already loaded so L3 can skip them.
-        let already_surfaced: HashSet<MemoryId> = entries.iter().map(|e| e.id).collect();
+        let mut already_surfaced: HashSet<MemoryId> = entries.iter().map(|e| e.id).collect();
+
+        // ── Step 2b: P1 project knowledge graph query ───────────────────────
+        // Tokenize the query and look up matching code-symbol entities from the
+        // project's knowledge graph. Matching entities are surfaced as L2-level
+        // ProjectKnowledge entries.
+        {
+            let kg = self
+                .kg
+                .lock()
+                .map_err(|_| MemoryError::Other("kg lock poisoned".into()))?;
+            let query_tokens: Vec<String> = query
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .collect();
+            let mut seen: HashSet<String> = HashSet::new();
+            for token in &query_tokens {
+                if seen.contains(token) {
+                    continue;
+                }
+                if let Some(entity) = kg.get_entity_by_name(token) {
+                    seen.insert(token.clone());
+                    use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
+                    entries.push(MemoryEntry {
+                        id: uuid::Uuid::new_v4(),
+                        layer: MemoryLayer::L2,
+                        category: MemoryCategory::ProjectKnowledge,
+                        priority: Priority::Normal,
+                        source: MemorySource::AutoExtracted,
+                        title: format!("KG entity: {}", entity.name),
+                        content: format!(
+                            "Project entity '{}' (type: {}, confidence: {:.2})",
+                            entity.name, entity.entity_type, entity.confidence
+                        ),
+                        embedding: None,
+                        tags: vec!["kg".into(), "project".into()],
+                        relations: vec![],
+                        confidence: entity.confidence as f32,
+                        access_count: 0,
+                        staleness: 0.0,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        last_accessed_at: None,
+                        scope: MemoryScope::default(),
+                        session_id: None,
+                        source_agent: None,
+                        visibility: crate::types::AgentVisibility::default(),
+                    });
+                    tracing::debug!(
+                        entity = %entity.name,
+                        entity_type = %entity.entity_type,
+                        "P1 KG: surfaced project entity"
+                    );
+                }
+            }
+        }
+
+        // ── Step 2c: Peer context perception from L4 ────────────────────────
+        let current_agent = self.current_agent.lock().unwrap().clone();
+        if let Some(ref agent) = current_agent {
+            let peer_entries = self
+                .orchestrator
+                .recall_peer_context(query, agent, 3, 5)
+                .await
+                .unwrap_or_default();
+            for entry in peer_entries {
+                let peer_id = entry.source_agent.as_deref().unwrap_or("unknown");
+                let prefixed_content = format!("[PEER: {peer_id}] {}", entry.content);
+                use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
+                entries.push(MemoryEntry {
+                    id: uuid::Uuid::new_v4(),
+                    layer: MemoryLayer::L4,
+                    category: MemoryCategory::Shared,
+                    priority: Priority::Normal,
+                    source: MemorySource::Import,
+                    title: format!("Peer context from {peer_id}"),
+                    content: prefixed_content,
+                    embedding: None,
+                    tags: vec!["peer".into(), "l4".into()],
+                    relations: vec![],
+                    confidence: 0.8,
+                    access_count: 0,
+                    staleness: 0.0,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    last_accessed_at: None,
+                    scope: MemoryScope::default(),
+                    session_id: None,
+                    source_agent: None,
+                    visibility: crate::types::AgentVisibility::default(),
+                });
+            }
+        }
+
+        // ── Step 2d: Dual-scope L4 recall (50/50 project/global) ─────────────
+        let l4_limit = 10;
+        let l4_project = self
+            .orchestrator
+            .recall_l4_project(query, l4_limit / 2)
+            .await
+            .unwrap_or_default();
+        let l4_global = self
+            .orchestrator
+            .recall_l4_global(query, l4_limit / 2)
+            .await
+            .unwrap_or_default();
+        for entry in l4_project.into_iter().chain(l4_global) {
+            if !already_surfaced.contains(&entry.id) {
+                already_surfaced.insert(entry.id);
+                entries.push(entry);
+            }
+        }
 
         // ── Step 3: dynamic deep memories (L3) ──────────────────────────────
         let budget = self.compute_budget();
@@ -233,13 +482,45 @@ impl CognitiveContextManager {
             .saturating_sub(self.estimate_tokens_entries(&entries))
             .min(u64::from(u32::MAX)) as u32;
 
-        // Use orchestrator.recall_relevant which internally combines L3 + L4 with
-        // budget-aware truncation.  The DynamicLoader is available for callers
-        // that have access to a concrete MemoryStore reference.
+        // Generate query embedding for hybrid search if available
+        let query_embedding = if self.embedding_capability.supports_semantic() {
+            match &self.embedding_capability {
+                EmbeddingCapability::Remote { client } => {
+                    match client.embed_one(query).await {
+                        Ok(embed) => {
+                            tracing::debug!(
+                                dim = embed.len(),
+                                "query embedding generated for hybrid search"
+                            );
+                            Some(embed)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "embedding failed, falling back to FTS5 search"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let deep_entries = self
             .orchestrator
-            .recall_relevant(query, None, &already_surfaced, memory_budget)
+            .recall_relevant(
+                query,
+                query_embedding.as_deref(),
+                &already_surfaced,
+                memory_budget,
+            )
             .await?;
+        for e in &deep_entries {
+            already_surfaced.insert(e.id);
+        }
         entries.extend(deep_entries);
 
         // ── Step 4: check seed triggers ─────────────────────────────────────
@@ -277,8 +558,10 @@ impl CognitiveContextManager {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 last_accessed_at: None,
-                scope: None,
+                scope: MemoryScope::default(),
                 session_id: None,
+                source_agent: None,
+                visibility: crate::types::AgentVisibility::default(),
             });
         }
 
@@ -290,6 +573,28 @@ impl CognitiveContextManager {
         let total_entry_tokens: u64 = self.estimate_tokens_entries(&entries);
         let used_tokens = total_message_tokens + total_entry_tokens;
         let _monitor_snapshot = self.monitor.sample(used_tokens);
+
+        // ── Step 5b: freshness-priority loading when budget is tight ─────────
+        // When token usage exceeds 80% of the available budget, switch to
+        // freshness-priority loading via FreshContextManager.
+        let budget_usage_ratio = if budget.available > 0 {
+            used_tokens as f32 / budget.available as f32
+        } else {
+            1.0
+        };
+        if budget_usage_ratio > 0.8 {
+            tracing::info!(
+                ratio = %budget_usage_ratio,
+                used = %used_tokens,
+                available = %budget.available,
+                "freshness priority activated: budget > 80%"
+            );
+            let entry_count = entries.len();
+            entries = self
+                .fresh_ctx
+                .load_fresh_entries("cognitive-default", entries, entry_count)
+                .await;
+        }
 
         // ── Step 6: compress messages if necessary ──────────────────────────
         // Note: pipeline.run takes a mutable Vec; here we work non-destructively
@@ -325,8 +630,47 @@ impl CognitiveContextManager {
     /// 4. Checks seed trigger conditions for turn-end keywords.
     /// 5. Persists vector index for durability.
     pub async fn on_turn_end(&self, messages: &mut Vec<Message>) -> Result<()> {
+        // ── Delegation observation ────────────────────────────────────────────
+        // Write child agent results to L4 with parent_session_id.
+        {
+            let mut delegation_queue = self
+                .delegation_results
+                .lock()
+                .map_err(|_| MemoryError::Other("delegation_results lock poisoned".into()))?;
+            for d in delegation_queue.drain(..) {
+                let title = format!("delegation:{}:{}", d.agent_role, &d.task[..d.task.len().min(40)]);
+                let content = format!(
+                    "Agent: {}\nTask: {}\nResult: {}",
+                    d.agent_role, d.task, d.result
+                );
+                let tags = vec!["delegation".into(), d.agent_role.clone()];
+                if let Err(e) = self
+                    .orchestrator
+                    .write(
+                        MemoryLayer::L4,
+                        MemoryCategory::Shared,
+                        &title,
+                        &content,
+                        Priority::Normal,
+                        MemorySource::AutoExtracted,
+                        tags,
+                        MemoryScope::default(),
+                    )
+                    .await
+                {
+                    tracing::warn!("delegation observation write failed: {e}");
+                } else {
+                    tracing::info!(
+                        agent_role = %d.agent_role,
+                        "delegation result written to L4"
+                    );
+                }
+            }
+        }
+
         // ── 0. Extract and persist memories ──────────────────────────────────
         // Only extract if we have enough messages (requirement from extractor).
+        let mut pending_embeddings: Vec<(MemoryId, String)> = Vec::new();
         if messages.len() >= 2 {
             // Record pre-extraction state for debugging.
             tracing::debug!(
@@ -350,9 +694,12 @@ impl CognitiveContextManager {
                         entries.len()
                     );
                     for entry in entries {
+                        let entry_id = entry.id;
+                        let entry_content = entry.content.clone();
                         match self.orchestrator.remember(entry).await {
                             Ok(_) => {
                                 tracing::debug!("on_turn_end: memory persisted successfully");
+                                pending_embeddings.push((entry_id, entry_content));
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -432,9 +779,132 @@ impl CognitiveContextManager {
         // ── 5. Run orchestrator maintenance tick ─────────────────────────────
         self.orchestrator.tick().await?;
 
+        // ── 5b. Auto-rebuild Closet periodically ────────────────────────────
+        if self.orchestrator.should_rebuild_closet() {
+            if let Err(e) = self.orchestrator.force_rebuild_closet().await {
+                tracing::warn!("auto closet rebuild failed: {e}");
+            }
+        }
+
         // ── 6. Persist vector index ─────────────────────────────────────────
-        if let Err(e) = self.vector_index.persist() {
+        if let Err(e) = self.vector_index.lock().unwrap().persist() {
             tracing::warn!("failed to persist vector index: {}", e);
+        }
+
+        // ── 7. Persist knowledge graph (every 10 ticks) ──────────────────────
+        {
+            let kg = self.kg.lock().map_err(|_| MemoryError::Other("kg lock poisoned".into()))?;
+            let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
+            let triples: Vec<_> = kg.list_triples().into_iter().cloned().collect();
+            if !entities.is_empty() || !triples.is_empty() {
+                if let Err(e) = self.orchestrator.store().save_entities(&entities).await {
+                    tracing::warn!("failed to persist KG entities: {}", e);
+                }
+                if let Err(e) = self.orchestrator.store().save_triples(&triples).await {
+                    tracing::warn!("failed to persist KG triples: {}", e);
+                }
+            }
+        }
+
+        // ── 8. Context rotation health check ────────────────────────────────
+        {
+            let total_tokens: u64 = messages
+                .iter()
+                .map(|m| u64::from(m.token_estimate()))
+                .sum();
+            let budget = self.compute_budget();
+            let mut monitor = self
+                .context_rot_monitor
+                .lock()
+                .map_err(|_| MemoryError::Other("context_rot lock poisoned".into()))?;
+            match monitor.check(total_tokens, budget.total) {
+                crate::context_rot::RotAlert::Warning(msg) => {
+                    tracing::warn!("{msg}");
+                }
+                crate::context_rot::RotAlert::Critical(msg) => {
+                    tracing::error!("{msg}");
+                }
+                crate::context_rot::RotAlert::None => {}
+            }
+        }
+
+        // ── 9. Save Closet to SQLite ────────────────────────────────────────
+        match ClosetManager::build_from_orchestrator(&self.orchestrator).await {
+            Ok(manager) => {
+                let pointers = &manager.closet().pointers;
+                match serde_json::to_string(pointers) {
+                    Ok(json) => {
+                        if let Err(e) = self.sqlite_store.save_closet(&json) {
+                            tracing::warn!("failed to save closet: {}", e);
+                        } else {
+                            let mut closet_guard = self.closet.lock().unwrap();
+                            *closet_guard = Some(manager.closet().clone());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to serialize closet pointers: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to build closet: {}", e);
+            }
+        }
+
+        // ── 10. Save Seeds to SQLite ────────────────────────────────────────
+        {
+            let reg = self
+                .seeds
+                .lock()
+                .map_err(|_| MemoryError::Other("seeds lock poisoned".into()))?;
+            match serde_json::to_string(reg.all_seeds()) {
+                Ok(json) => {
+                    if let Err(e) = self.sqlite_store.save_seeds(&json) {
+                        tracing::warn!("failed to save seeds: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("failed to serialize seeds: {}", e);
+                }
+            }
+        }
+
+        // ── 11. Batch-embed new entries ─────────────────────────────────────
+        if !pending_embeddings.is_empty() {
+            match &self.embedding_capability {
+                EmbeddingCapability::Remote { client } => {
+                    let texts: Vec<&str> = pending_embeddings
+                        .iter()
+                        .map(|(_, c)| c.as_str())
+                        .collect();
+                    match client.embed(&texts).await {
+                        Ok(embeddings) => {
+                            tracing::info!(
+                                count = embeddings.len(),
+                                "batch embedded {} entries",
+                                embeddings.len()
+                            );
+                            let mut vi = self.vector_index.lock().unwrap();
+                            for ((id, _), embedding) in
+                                pending_embeddings.iter().zip(embeddings.into_iter())
+                            {
+                                if let Err(e) = vi.upsert(*id, embedding) {
+                                    tracing::warn!("batch embed upsert failed for {}: {}", id, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("batch embedding failed: {}", e);
+                        }
+                    }
+                }
+                _ => {
+                    tracing::debug!(
+                        count = pending_embeddings.len(),
+                        "skipping batch embed: no remote embedding client configured"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -443,6 +913,32 @@ impl CognitiveContextManager {
     // -----------------------------------------------------------------------
     // remember / recall
     // -----------------------------------------------------------------------
+
+    /// Observe a child agent delegation result for later processing.
+    ///
+    /// Delegation results are queued and written to L4 in [`on_turn_end`].
+    pub fn observe_delegation(
+        &self,
+        agent_role: &str,
+        task: &str,
+        result: &str,
+        parent_session_id: Option<&str>,
+    ) {
+        let d = DelegationResult {
+            agent_role: agent_role.to_string(),
+            task: task.to_string(),
+            result: result.to_string(),
+            parent_session_id: parent_session_id.map(String::from),
+            timestamp: Utc::now(),
+        };
+        if let Ok(mut queue) = self.delegation_results.lock() {
+            queue.push(d);
+            tracing::debug!(
+                agent_role = %agent_role,
+                "delegation result queued"
+            );
+        }
+    }
 
     /// Write a memory entry to the appropriate layer.
     ///
@@ -626,6 +1122,8 @@ impl CognitiveContextManager {
     /// for explicit checkpointing.
     pub fn persist_vector_index(&self) -> Result<()> {
         self.vector_index
+            .lock()
+            .unwrap()
             .persist()
             .map_err(|e| MemoryError::Store(format!("persist vector index: {e}")))
     }
@@ -633,14 +1131,14 @@ impl CognitiveContextManager {
     /// Get the number of vectors currently indexed.
     #[must_use]
     pub fn vector_index_count(&self) -> usize {
-        self.vector_index.count()
+        self.vector_index.lock().unwrap().count()
     }
 
     /// Get vector index statistics.
     #[must_use]
     pub fn vector_index_stats(&self) -> VectorIndexStats {
         VectorIndexStats {
-            count: self.vector_index.count(),
+            count: self.vector_index.lock().unwrap().count(),
         }
     }
 
@@ -893,8 +1391,10 @@ impl CognitiveContextManager {
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                     last_accessed_at: None,
-                    scope: None,
+                    scope: MemoryScope::default(),
                     session_id: Some(session_id.to_string()),
+                    source_agent: None,
+                    visibility: crate::types::AgentVisibility::default(),
                 };
 
                 if let Err(e) = self.orchestrator.remember(entry).await {
@@ -952,20 +1452,41 @@ impl CognitiveContextManager {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    /// Build a [`TokenBudget`] from the current config.
+    /// Build a [`TokenBudget`] from the current config, allocating by agent role.
+    ///
+    /// Role multipliers: Planner=0.40, Executor=0.25, Reviewer=0.15, Orchestrator=0.50.
+    /// Unknown roles default to Orchestrator (0.50).
     fn compute_budget(&self) -> TokenBudget {
+        let role = self
+            .current_agent
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| "Orchestrator".to_string());
+        self.compute_role_budget(&role)
+    }
+
+    /// Build a [`TokenBudget`] with a specific agent role multiplier.
+    fn compute_role_budget(&self, role: &str) -> TokenBudget {
         let c = &self.config.budget;
         let available = c
             .context_window
             .saturating_sub(c.reserved_system)
             .saturating_sub(c.reserved_response);
+        let role_multiplier = match role {
+            "Planner" => 0.40,
+            "Executor" => 0.25,
+            "Reviewer" => 0.15,
+            "Orchestrator" | _ => 0.50,
+        };
+        let role_available = ((available as f32) * role_multiplier) as u64;
         TokenBudget {
             total: c.context_window,
             reserved_system: c.reserved_system,
             reserved_response: c.reserved_response,
             allocated_memory: 0,
             allocated_conversation: 0,
-            available,
+            available: role_available,
         }
     }
 
@@ -975,6 +1496,52 @@ impl CognitiveContextManager {
             .iter()
             .map(|e| (e.content.len() as u64).div_ceil(4))
             .sum()
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent self-aware diagnostics
+    // -----------------------------------------------------------------------
+
+    /// Return the current context window health as a [`RotAlert`].
+    ///
+    /// This is a **read-only** diagnostic — it does not modify any internal
+    /// state, trigger debounce logic, or update counters.  Callers can use
+    /// this for agent-facing health checks without side effects.
+    ///
+    /// The method reads the stored `context_usage_ratio` from the
+    /// [`ContextRotMonitor`] metrics and maps it to the appropriate alert
+    /// level:
+    ///
+    /// | Ratio      | Alert    |
+    /// |------------|----------|
+    /// | ≤ 0.65     | `None`   |
+    /// | 0.65–0.75  | `Warning`|
+    /// | > 0.75     | `Critical`|
+    #[must_use]
+    pub fn ctx_health(&self) -> RotAlert {
+        let monitor = match self.context_rot_monitor.lock() {
+            Ok(m) => m,
+            Err(_) => return RotAlert::None,
+        };
+        let ratio = monitor.metrics.context_usage_ratio;
+        let total = self.config.budget.context_window as u64;
+        let used = (ratio * total as f32) as u64;
+
+        if ratio > 0.75 {
+            RotAlert::Critical(format!(
+                "⚠ CONTEXT ROT: {:.1}% usage ({} / {} tokens). Auto-record session state.",
+                ratio * 100.0,
+                used,
+                total
+            ))
+        } else if ratio > 0.65 {
+            RotAlert::Warning(format!(
+                "⚠ Context usage at {:.1}% — inject agent-facing message.",
+                ratio * 100.0
+            ))
+        } else {
+            RotAlert::None
+        }
     }
 }
 

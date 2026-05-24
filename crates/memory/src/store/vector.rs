@@ -19,7 +19,7 @@
 //! ```
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     io::Write,
     path::PathBuf,
@@ -28,6 +28,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{error::MemoryError, types::MemoryId};
+use crate::store::sqlite::SqliteStore;
 
 // ─── Serialisation envelope ───────────────────────────────────────────────────
 
@@ -48,6 +49,12 @@ pub struct VectorIndex {
     persist_path: PathBuf,
     /// Expected dimensionality; validated on [`upsert`].
     dimension: u32,
+    /// Maximum entries before LRU eviction kicks in.
+    max_entries: usize,
+    /// Insertion order for LRU eviction (front = oldest).
+    insert_order: VecDeque<MemoryId>,
+    /// Optional SQLite store for dual persistence (JSON + BLOB).
+    sqlite_store: Option<SqliteStore>,
 }
 
 impl VectorIndex {
@@ -60,42 +67,105 @@ impl VectorIndex {
             vectors: HashMap::new(),
             persist_path,
             dimension,
+            max_entries: 50_000,
+            insert_order: VecDeque::new(),
+            sqlite_store: None,
         })
+    }
+
+    /// Attach a [`SqliteStore`] for dual persistence (SQLite BLOB + JSON file).
+    ///
+    /// When set, [`persist`] writes to both the JSON file and the SQLite
+    /// `vector_embeddings` table.  [`load`] tries SQLite first, falling back
+    /// to the JSON file if the table is empty.
+    pub fn set_sqlite_store(&mut self, store: SqliteStore) {
+        self.sqlite_store = Some(store);
     }
 
     /// Load a previously persisted index from disk.
     ///
-    /// Returns an empty index (with the given `dimension`) if the file does not
-    /// exist, making cold-start initialisation transparent.
+    /// If a [`SqliteStore`] has been attached via [`set_sqlite_store`], tries to
+    /// load from the `vector_embeddings` table first.  Falls back to the JSON
+    /// file if the table is empty or no store is configured.
+    ///
+    /// Returns an empty index (with the given `dimension`) if neither source has
+    /// data, making cold-start initialisation transparent.
     pub fn load(persist_path: PathBuf, dimension: u32) -> Result<Self, MemoryError> {
-        match fs::read_to_string(&persist_path) {
+        Self::load_with_store(persist_path, dimension, None)
+    }
+
+    pub fn load_with_store(
+        persist_path: PathBuf,
+        dimension: u32,
+        sqlite_store: Option<SqliteStore>,
+    ) -> Result<Self, MemoryError> {
+        let mut idx = Self {
+            vectors: HashMap::new(),
+            persist_path,
+            dimension,
+            max_entries: 50_000,
+            insert_order: VecDeque::new(),
+            sqlite_store,
+        };
+
+        if let Some(ref store) = idx.sqlite_store {
+            match store.load_vectors_from_sqlite() {
+                Ok(vectors) if !vectors.is_empty() => {
+                    let dim = vectors.values().next().map_or(0, |v| v.len() as u32);
+                    if dim != dimension {
+                        return Err(MemoryError::InvalidArgument(format!(
+                            "dimension mismatch: index has {dim}, requested {dimension}"
+                        )));
+                    }
+                    idx.vectors = vectors;
+                    return Ok(idx);
+                }
+                Ok(_) => {
+                    // Table exists but is empty — fall through to JSON.
+                }
+                Err(_) => {
+                    // Table might not exist yet — fall through to JSON.
+                }
+            }
+        }
+
+        // JSON fallback
+        match fs::read_to_string(&idx.persist_path) {
             Ok(json) => {
                 let snap: IndexSnapshot = serde_json::from_str(&json)
                     .map_err(|e| MemoryError::Store(format!("deserialise vector index: {e}")))?;
-                if snap.dimension != dimension {
+                if snap.dimension != idx.dimension {
                     return Err(MemoryError::InvalidArgument(format!(
                         "dimension mismatch: index has {}, requested {}",
-                        snap.dimension, dimension
+                        snap.dimension, idx.dimension
                     )));
                 }
-                Ok(Self {
-                    vectors: snap.vectors,
-                    persist_path,
-                    dimension,
-                })
+                idx.vectors = snap.vectors;
+                Ok(idx)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Self::new(persist_path, dimension)
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(idx),
             Err(e) => Err(MemoryError::Store(format!("read vector index: {e}"))),
         }
     }
 
     /// Persist the index to [`persist_path`] atomically.
     ///
+    /// If a [`SqliteStore`] has been attached, also writes to the
+    /// `vector_embeddings` table for dual persistence.
+    ///
     /// Uses write-to-temp-then-rename to avoid corruption on interrupted writes.
     pub fn persist(&self) -> Result<(), MemoryError> {
-        // Ensure the parent directory exists.
+        // Persist to JSON (always).
+        self.persist_json()?;
+
+        // Persist to SQLite (if configured).
+        if let Some(ref store) = self.sqlite_store {
+            store.save_vectors_to_sqlite(&self.vectors, self.dimension)?;
+        }
+        Ok(())
+    }
+
+    fn persist_json(&self) -> Result<(), MemoryError> {
         if let Some(parent) = self.persist_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 MemoryError::Store(format!("create vector index dir: {e}"))
@@ -123,6 +193,28 @@ impl VectorIndex {
         Ok(())
     }
 
+    /// Persist vectors to the attached [`SqliteStore`] only (JSON file is not
+    /// written by this method).
+    pub fn persist_to_sqlite(&self) -> Result<(), MemoryError> {
+        let store = self
+            .sqlite_store
+            .as_ref()
+            .ok_or_else(|| MemoryError::Store("no SqliteStore configured".into()))?;
+        store.save_vectors_to_sqlite(&self.vectors, self.dimension)
+    }
+
+    /// Load vectors from a [`SqliteStore`] into a new `VectorIndex`.
+    ///
+    /// The JSON `persist_path` is still required for the file-backed fallback.
+    /// If the `vector_embeddings` table is empty, returns an empty index.
+    pub fn load_from_sqlite(
+        persist_path: PathBuf,
+        dimension: u32,
+        store: SqliteStore,
+    ) -> Result<Self, MemoryError> {
+        Self::load_with_store(persist_path, dimension, Some(store))
+    }
+
     // ─── Mutation ─────────────────────────────────────────────────────────────
 
     /// Insert or replace the embedding for `id`.
@@ -132,6 +224,20 @@ impl VectorIndex {
     /// match [`dimension`].
     pub fn upsert(&mut self, id: MemoryId, embedding: Vec<f32>) -> Result<(), MemoryError> {
         self.check_dimension(&embedding)?;
+
+        // Evict oldest entry if at capacity
+        if self.vectors.len() >= self.max_entries && !self.vectors.contains_key(&id) {
+            if let Some(oldest) = self.insert_order.pop_front() {
+                self.vectors.remove(&oldest);
+                tracing::debug!("LRU evicted {} from vector index", oldest);
+            }
+        }
+
+        // Track insertion order for LRU
+        if !self.vectors.contains_key(&id) {
+            self.insert_order.push_back(id);
+        }
+
         self.vectors.insert(id, embedding);
         Ok(())
     }
@@ -139,7 +245,23 @@ impl VectorIndex {
     /// Remove the entry for `id` (no-op if absent).
     pub fn remove(&mut self, id: &MemoryId) -> Result<(), MemoryError> {
         self.vectors.remove(id);
+        // Clean up insert_order (linear scan, acceptable for VecDeque < 50K)
+        if let Some(pos) = self.insert_order.iter().position(|x| x == id) {
+            self.insert_order.remove(pos);
+        }
         Ok(())
+    }
+
+    /// Set the maximum number of entries (triggers immediate eviction if needed).
+    pub fn set_max_entries(&mut self, max: usize) {
+        self.max_entries = max;
+        while self.vectors.len() > self.max_entries {
+            if let Some(oldest) = self.insert_order.pop_front() {
+                self.vectors.remove(&oldest);
+            } else {
+                break;
+            }
+        }
     }
 
     // ─── Query ────────────────────────────────────────────────────────────────

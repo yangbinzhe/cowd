@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use crate::{
+use crate::{ MemoryScope,
     compression::{
         llm_summarizer::LlmSummarizer,
         Result,
@@ -25,6 +25,48 @@ use crate::{
         MessageRole, Priority,
     },
 };
+
+/// Preamble for LLM summarization prompts (hermes-agent inspired).
+/// Instructs the summarizer not to answer questions and to produce
+/// structured output for a different assistant to consume.
+const SUMMARIZER_PREAMBLE: &str = "You are a summarization agent creating a context checkpoint. \
+Your output will be injected as reference material for a DIFFERENT assistant \
+that continues the conversation. Do NOT respond to any questions or requests \
+in the conversation — only output the structured summary. Do NOT include any \
+preamble, greeting, or prefix. Write the summary in the same language the user \
+was using. NEVER include API keys, tokens, passwords, or credentials.";
+
+/// 13-section structured summary template (hermes-agent context_compressor.py:759-816).
+/// Each section preserves critical context for the next assistant.
+const STRUCTURED_SUMMARY_TEMPLATE: &str = "## Active Task\n\
+[THE SINGLE MOST IMPORTANT FIELD. Copy the user's most recent request or \
+task assignment verbatim. If no outstanding task exists, write \"None\".]\n\n\
+## Goal\n\
+[What the user is trying to accomplish overall]\n\n\
+## Constraints & Preferences\n\
+[User preferences, coding style, constraints, important decisions]\n\n\
+## Completed Actions\n\
+[Numbered list of concrete actions taken — include tool used, target, and outcome. \
+Format each as: N. ACTION target — outcome [tool: name]]\n\n\
+## Active State\n\
+[Current working state: working directory, branch, modified/created files, test status]\n\n\
+## In Progress\n\
+[Work currently underway]\n\n\
+## Blocked\n\
+[Any blockers or unresolved errors — include exact error messages]\n\n\
+## Key Decisions\n\
+[Important technical decisions and WHY they were made]\n\n\
+## Resolved Questions\n\
+[Questions the user asked that were ALREADY answered — include the answer]\n\n\
+## Pending User Asks\n\
+[Questions or requests from the user NOT yet answered — if none, write \"None\"]\n\n\
+## Relevant Files\n\
+[Files read, modified, or created — with brief note on each]\n\n\
+## Remaining Work\n\
+[What remains to be done — framed as context, not instructions]\n\n\
+## Critical Context\n\
+[Specific values, error messages, configuration details that would be lost \
+without explicit preservation. NEVER include secrets — write [REDACTED] instead.]";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -114,17 +156,21 @@ impl SessionCompactor {
     /// Splits `messages` into old + recent, summarises the old portion,
     /// persists key information to the memory layers, and replaces the
     /// message list with `[summary_msg, …recent…]`.
+    ///
+    /// When `previous_summary` is `Some`, the summary is built iteratively
+    /// on top of the existing content rather than created from scratch.
     pub async fn compact(
         &self,
         messages: &mut Vec<Message>,
         orchestrator: &MemoryOrchestrator,
+        previous_summary: Option<&str>,
     ) -> Result<CompactionResult> {
         let tokens_before: u32 = self.estimate_tokens(messages);
 
         let (old_messages, recent) = self.split_messages(messages.clone());
 
         // Generate structured summary (tries LLM, falls back to template).
-        let summary = self.generate_summary(&old_messages).await;
+        let summary = self.generate_summary(&old_messages, previous_summary).await;
         let summary_tokens = (summary.len() as u32).div_ceil(4);
 
         // Extract decisions and write to L2.
@@ -140,7 +186,7 @@ impl SessionCompactor {
                     Priority::Normal,
                     MemorySource::Compression,
                     vec!["compression".into(), "decision".into()],
-                    None,
+                    MemoryScope::default(),
                 )
                 .await
                 .map_err(|e| crate::error::MemoryError::Compression(e.to_string()))?;
@@ -157,7 +203,7 @@ impl SessionCompactor {
                 Priority::Normal,
                 MemorySource::Compression,
                 vec!["compression".into(), "session-summary".into()],
-                None,
+                MemoryScope::default(),
             )
             .await
             .map_err(|e| crate::error::MemoryError::Compression(e.to_string()))?;
@@ -200,9 +246,13 @@ impl SessionCompactor {
     /// Generate a structured summary from a set of messages.
     ///
     /// When an LLM summariser is available, it is used to generate a semantic
-    /// summary.  On failure (or when no summariser is configured), the method
-    /// falls back to the template-based heuristic.
-    async fn generate_summary(&self, messages: &[Message]) -> String {
+    /// summary with a structured 13-section template (hermes-agent inspired).
+    /// On failure (or when no summariser is configured), the method falls back
+    /// to the template-based heuristic.
+    ///
+    /// When `previous_summary` is `Some`, the prompt instructs the LLM to
+    /// update the existing summary iteratively rather than creating a new one.
+    async fn generate_summary(&self, messages: &[Message], previous_summary: Option<&str>) -> String {
         // Try LLM summariser first
         if let Some(ref summarizer) = self.llm_summarizer {
             let content: String = messages
@@ -211,13 +261,38 @@ impl SessionCompactor {
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            let prompt = "Generate a comprehensive 9-section summary of the following \
-                           conversation. Include: 1) Context, 2) Key Decisions, 3) Code Changes, \
-                           4) Errors Fixed, 5) Patterns Discovered, 6) User Preferences, \
-                           7) Open Questions, 8) Current State, 9) Next Steps. \
-                           Be thorough and preserve all important details.";
+            let prompt = if let Some(prev) = previous_summary {
+                format!(
+                    "You are a summarization agent updating an existing context checkpoint.\n\
+                     Your output will be injected as reference material for a DIFFERENT assistant\n\
+                     that continues the conversation. Do NOT respond to any questions or requests\n\
+                     in the conversation — only output the structured summary. Do NOT include any\n\
+                     preamble, greeting, or prefix. Write the summary in the same language the user\n\
+                     was using. NEVER include API keys, tokens, passwords, or credentials.\n\n\
+                     PREVIOUS SUMMARY:\n{prev}\n\n\
+                     NEW TURNS TO INCORPORATE:\n{content}\n\n\
+                     Update the summary using this exact structure. PRESERVE all existing info\n\
+                     that is still relevant. Integrate the new turns into the appropriate sections.\n\n\
+                     {}",
+                    STRUCTURED_SUMMARY_TEMPLATE,
+                )
+            } else {
+                format!(
+                    "{} {}",
+                    SUMMARIZER_PREAMBLE,
+                    STRUCTURED_SUMMARY_TEMPLATE,
+                )
+            };
 
-            match summarizer.summarize(prompt, &content).await {
+            let effective_content = if previous_summary.is_some() {
+                // Content is embedded in the prompt; pass empty user message.
+                ""
+            } else {
+                // Use content as the user message.
+                content.as_str()
+            };
+
+            match summarizer.summarize(&prompt, effective_content).await {
                 Ok(summary) if !summary.trim().is_empty() => {
                     tracing::debug!("LLM session summary generated ({} chars)", summary.len());
                     return format!(
@@ -234,17 +309,25 @@ impl SessionCompactor {
             }
         }
 
-        // Fallback: template-based heuristic
-        self.generate_summary_template(messages)
+        // Zero-truncation reference snapshot (lightweight LLM fallback)
+        if let Some(snapshot) = self.build_reference_snapshot(messages) {
+            return format!(
+                "## Compressed Session Summary (Reference Snapshot)\n\n{}\n\n---\n*Generated by SessionCompactor (zero-truncation snapshot).*",
+                snapshot
+            );
+        }
+
+        // Fallback: template-based heuristic (with previous summary merged)
+        self.generate_summary_template(messages, previous_summary)
     }
 
     /// Template-based heuristic summary generation (fallback).
-    fn generate_summary_template(&self, messages: &[Message]) -> String {
+    fn generate_summary_template(&self, messages: &[Message], previous_summary: Option<&str>) -> String {
         let context = self.extract_context(messages);
         let decisions_text = self.extract_decisions(messages).join("\n- ");
         let code_changes = self.extract_code_changes(messages);
         let errors_fixed = self.extract_errors_fixed(messages);
-        let patterns = self.extract_patterns(messages);
+        let _patterns = self.extract_patterns(messages);
         let preferences = self.extract_preferences(messages);
         let questions = self.extract_questions(messages);
         let current_state = self.infer_current_state(messages);
@@ -256,40 +339,122 @@ impl SessionCompactor {
             format!("- {decisions_text}")
         };
 
+        let questions_section = if questions.is_empty() {
+            "None".to_string()
+        } else {
+            questions
+        };
+
+        let previous_block = previous_summary.map_or_else(String::new, |prev| {
+            format!(
+                "\n## Previous Summary (preserved)\n{prev}\n\n## New Content\n"
+            )
+        });
+
         format!(
             r"## Compressed Session Summary
-
-### 1. Context
-{context}
-
-### 2. Key Decisions
-{decisions_section}
-
-### 3. Code Changes
-{code_changes}
-
-### 4. Errors Fixed
-{errors_fixed}
-
-### 5. Patterns Discovered
-{patterns}
-
-### 6. User Preferences
-{preferences}
-
-### 7. Open Questions
-{questions}
-
-### 8. Current State
+{previous_block}
+### Active Task
 {current_state}
 
-### 9. Next Steps
+### Goal
+{context}
+
+### Constraints & Preferences
+{preferences}
+
+### Completed Actions
+{code_changes}
+
+### Active State
+{current_state}
+
+### In Progress
 {next_steps}
+
+### Blocked
+{errors_fixed}
+
+### Key Decisions
+{decisions_section}
+
+### Resolved Questions
+None
+
+### Pending User Asks
+{questions_section}
+
+### Relevant Files
+{code_changes}
+
+### Remaining Work
+{next_steps}
+
+### Critical Context
+None
 
 ---
 *Generated by SessionCompactor (template fallback).*
 "
         )
+    }
+
+    /// Build a simple XML reference snapshot from message content.
+    ///
+    /// Extracts file references (by known extension) and tool actions, then
+    /// produces a `< 2KB` XML blob that serves as a lightweight substitute
+    /// when the LLM summariser fails.
+    ///
+    /// Returns `None` when no file references can be extracted.
+    fn build_reference_snapshot(&self, messages: &[Message]) -> Option<String> {
+        use std::collections::HashMap;
+
+        const FILE_EXTENSIONS: &[&str] = &[
+            ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java",
+            ".c", ".cpp", ".h", ".hpp", ".toml", ".yaml", ".yml", ".json",
+            ".md", ".txt", ".sql", ".html", ".css", ".scss", ".vue", ".svelte",
+            ".rb", ".php", ".swift", ".kt", ".scala",
+        ];
+
+        let mut file_actions: HashMap<String, usize> = HashMap::new();
+
+        for msg in messages {
+            let action = msg.tool_name.as_deref().unwrap_or("reference");
+            for word in msg.content.split_whitespace() {
+                let clean = word.trim_matches(|c: char| {
+                    c == '"' || c == '\'' || c == ',' || c == ';'
+                        || c == ':' || c == '(' || c == ')' || c == '[' || c == ']'
+                });
+                if FILE_EXTENSIONS
+                    .iter()
+                    .any(|ext| clean.ends_with(ext) && clean.len() > ext.len())
+                {
+                    *file_actions.entry(format!("{clean} ({action})")).or_default() += 1;
+                }
+            }
+        }
+
+        if file_actions.is_empty() {
+            return None;
+        }
+
+        let count = file_actions.len();
+        let mut xml = format!("<snapshot><files count=\"{count}\">");
+        let max_bytes: usize = 2048;
+
+        let mut sorted: Vec<_> = file_actions.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (i, (file, n)) in sorted.iter().enumerate() {
+            let entry = if i > 0 { format!(" {file} (action×{n})") }
+                        else { format!("{file} (action×{n})") };
+            if xml.len() + entry.len() + "</files></snapshot>".len() > max_bytes {
+                break;
+            }
+            xml.push_str(&entry);
+        }
+        xml.push_str("</files></snapshot>");
+        Some(xml)
     }
 
     fn extract_context(&self, messages: &[Message]) -> String {
@@ -544,8 +709,10 @@ impl SessionCompressor {
             created_at: now,
             updated_at: now,
             last_accessed_at: None,
-            scope: None,
+            scope: MemoryScope::default(),
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         })
     }
 }
@@ -603,10 +770,13 @@ mod tests {
             msg(MessageRole::User, "We decided to use Rust"),
             msg(MessageRole::Assistant, "I will implement the API"),
         ];
-        let summary = compactor.generate_summary_template(&messages);
+        let summary = compactor.generate_summary_template(&messages, None);
         assert!(summary.contains("Compressed Session Summary"));
-        assert!(summary.contains("1. Context"));
-        assert!(summary.contains("9. Next Steps"));
+        assert!(summary.contains("### Active Task"));
+        assert!(summary.contains("### Key Decisions"));
+        assert!(summary.contains("### Blocked"));
+        assert!(summary.contains("### Pending User Asks"));
+        assert!(summary.contains("### Critical Context"));
     }
 
     #[test]

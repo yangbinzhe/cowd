@@ -62,7 +62,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_activity TEXT NOT NULL,
     message_count INTEGER NOT NULL DEFAULT 0,
     reset_policy  TEXT NOT NULL,
-    metadata_json TEXT
+    metadata_json TEXT,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE TABLE IF NOT EXISTS session_memories (
@@ -153,6 +156,12 @@ pub struct SessionRecord {
     pub reset_policy: String,
     /// Optional JSON blob for arbitrary extra metadata.
     pub metadata_json: Option<String>,
+    /// Cumulative input tokens (prompt).
+    pub input_tokens: i64,
+    /// Cumulative output tokens (completion).
+    pub output_tokens: i64,
+    /// Estimated total cost in USD.
+    pub estimated_cost_usd: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +180,9 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         message_count: row.get(7)?,
         reset_policy: row.get(8)?,
         metadata_json: row.get(9)?,
+        input_tokens: row.get(10)?,
+        output_tokens: row.get(11)?,
+        estimated_cost_usd: row.get(12)?,
     })
 }
 
@@ -253,8 +265,9 @@ impl SqliteSessionStore {
         conn.execute(
             r"INSERT OR IGNORE INTO sessions
                (session_id, platform, chat_id, user_id, model,
-                created_at, last_activity, message_count, reset_policy, metadata_json)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                created_at, last_activity, message_count, reset_policy, metadata_json,
+                input_tokens, output_tokens, estimated_cost_usd)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 session.session_id,
                 session.platform,
@@ -266,6 +279,9 @@ impl SqliteSessionStore {
                 session.message_count,
                 session.reset_policy,
                 session.metadata_json,
+                session.input_tokens,
+                session.output_tokens,
+                session.estimated_cost_usd,
             ],
         )
         .map_err(sql_err)?;
@@ -277,7 +293,8 @@ impl SqliteSessionStore {
         let conn = self.conn()?;
         conn.query_row(
             r"SELECT session_id, platform, chat_id, user_id, model,
-                      created_at, last_activity, message_count, reset_policy, metadata_json
+                      created_at, last_activity, message_count, reset_policy, metadata_json,
+                      input_tokens, output_tokens, estimated_cost_usd
                FROM sessions WHERE session_id = ?1",
             params![session_id],
             row_to_record,
@@ -301,7 +318,10 @@ impl SqliteSessionStore {
                last_activity = ?6,
                message_count = ?7,
                reset_policy  = ?8,
-               metadata_json = ?9
+               metadata_json = ?9,
+               input_tokens  = ?10,
+               output_tokens = ?11,
+               estimated_cost_usd = ?12
                WHERE session_id = ?1",
             params![
                 session.session_id,
@@ -313,6 +333,9 @@ impl SqliteSessionStore {
                 session.message_count,
                 session.reset_policy,
                 session.metadata_json,
+                session.input_tokens,
+                session.output_tokens,
+                session.estimated_cost_usd,
             ],
         )
         .map_err(sql_err)?;
@@ -328,8 +351,9 @@ impl SqliteSessionStore {
         conn.execute(
             r"INSERT OR REPLACE INTO sessions
                (session_id, platform, chat_id, user_id, model,
-                created_at, last_activity, message_count, reset_policy, metadata_json)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                created_at, last_activity, message_count, reset_policy, metadata_json,
+                input_tokens, output_tokens, estimated_cost_usd)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 session.session_id,
                 session.platform,
@@ -341,6 +365,9 @@ impl SqliteSessionStore {
                 session.message_count,
                 session.reset_policy,
                 session.metadata_json,
+                session.input_tokens,
+                session.output_tokens,
+                session.estimated_cost_usd,
             ],
         )
         .map_err(sql_err)?;
@@ -370,7 +397,8 @@ impl SqliteSessionStore {
         let mut stmt = conn
             .prepare(
                 r"SELECT session_id, platform, chat_id, user_id, model,
-                          created_at, last_activity, message_count, reset_policy, metadata_json
+                          created_at, last_activity, message_count, reset_policy, metadata_json,
+                          input_tokens, output_tokens, estimated_cost_usd
                    FROM sessions ORDER BY last_activity DESC",
             )
             .map_err(sql_err)?;
@@ -388,7 +416,8 @@ impl SqliteSessionStore {
         let mut stmt = conn
             .prepare(
                 r"SELECT session_id, platform, chat_id, user_id, model,
-                          created_at, last_activity, message_count, reset_policy, metadata_json
+                          created_at, last_activity, message_count, reset_policy, metadata_json,
+                          input_tokens, output_tokens, estimated_cost_usd
                    FROM sessions WHERE platform = ?1 ORDER BY last_activity DESC",
             )
             .map_err(sql_err)?;
@@ -590,6 +619,9 @@ mod tests {
             message_count: 1,
             reset_policy: "None".to_string(),
             metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
         }
     }
 

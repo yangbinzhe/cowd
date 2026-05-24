@@ -6,14 +6,19 @@
 use async_trait::async_trait;
 
 use crate::{
+    entity::{Entity, Triple},
     error::MemoryError,
+    project_scope::MemoryScope,
     types::{MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta},
 };
+
+pub use verbatim::VerbatimEntry;
 
 pub mod blob;
 pub mod session;
 pub mod sqlite;
 pub mod vector;
+pub mod verbatim;
 
 /// Unified result type used throughout the store module.
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -58,6 +63,18 @@ pub trait MemoryStore: Send + Sync {
     /// Full-text search across `title` and `content` fields.
     async fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>>;
 
+    /// Full-text search with scope filtering — only returns entries matching
+    /// the requested scope, plus globally-scoped entries.
+    async fn search_fts_scoped(
+        &self,
+        query: &str,
+        scope: &MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let _ = scope;
+        self.search_fts(query, limit).await
+    }
+
     /// Advanced FTS search with filtering and snippets.
     async fn search_fts_advanced(
         &self,
@@ -83,4 +100,42 @@ pub trait MemoryStore: Send + Sync {
 
     /// List all entries across all layers (for temporal graph queries).
     async fn list_all(&self) -> Result<Vec<MemoryEntry>>;
+
+    // -----------------------------------------------------------------------
+    // Knowledge-graph persistence
+    // -----------------------------------------------------------------------
+
+    /// Save all entities to persistent storage.
+    async fn save_entities(&self, entities: &[Entity]) -> Result<()>;
+
+    /// Load all entities from persistent storage.
+    async fn load_entities(&self) -> Result<Vec<Entity>>;
+
+    /// Save all triples to persistent storage.
+    async fn save_triples(&self, triples: &[Triple]) -> Result<()>;
+
+    /// Load all triples from persistent storage.
+    async fn load_triples(&self) -> Result<Vec<Triple>>;
+
+    // -----------------------------------------------------------------------
+    // Verbatim sink (zero-loss raw storage)
+    // -----------------------------------------------------------------------
+
+    /// Store a verbatim entry that never passes through compression.
+    async fn save_verbatim(
+        &self,
+        id: &str,
+        content: &str,
+        source: &str,
+        layer: i32,
+        timestamp: &str,
+    ) -> Result<()>;
+
+    /// Retrieve a verbatim entry by its ID.
+    async fn load_verbatim_by_id(&self, id: &str) -> Result<Option<VerbatimEntry>>;
+
+    /// Search verbatim entries whose content matches a SQL LIKE pattern.
+    ///
+    /// The caller should include `%` wildcards (e.g. `"%keyword%"`).
+    async fn search_verbatim_by_content(&self, query: &str) -> Result<Vec<VerbatimEntry>>;
 }

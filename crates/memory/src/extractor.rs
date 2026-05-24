@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
-use crate::{
+use crate::{ MemoryScope,
     config::ExtractorConfig,
     error::MemoryError,
     store::MemoryStore,
@@ -562,8 +562,10 @@ impl MemoryExtractor {
             created_at: now,
             updated_at: now,
             last_accessed_at: None,
-            scope: None,
+            scope: MemoryScope::default(),
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         }
     }
 

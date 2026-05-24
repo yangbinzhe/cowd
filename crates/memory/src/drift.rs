@@ -124,6 +124,7 @@ mod tests {
     use super::*;
     use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
     use chrono::Utc;
+    use crate::MemoryScope;
     use uuid::Uuid;
 
     fn make_entry(content: &str, layer: MemoryLayer, staleness: f32) -> MemoryEntry {
@@ -144,8 +145,10 @@ mod tests {
             embedding: None,
             tags: vec![],
             access_count: 0,
-            scope: None,
+            scope: MemoryScope::default(),
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         }
     }
 

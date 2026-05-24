@@ -8,6 +8,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::project_scope::MemoryScope;
+
 // --- Primitive type aliases ---
 
 pub type MemoryId = Uuid;
@@ -39,6 +41,7 @@ pub enum MemoryCategory {
     Reference,
     Shared,
     CompressedSummary,
+    ProjectKnowledge,
 }
 
 /// Priority of a memory entry, used during budget allocation.
@@ -57,6 +60,23 @@ pub enum MemorySource {
     AutoExtracted,
     Compression,
     Import,
+}
+
+/// Visibility level for multi-agent memory sharing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentVisibility {
+    /// Visible only to the source agent.
+    Private,
+    /// Visible to all agents in the same scope.
+    Shared,
+    /// Visible to agents within the specified team.
+    TeamScoped(String),
+}
+
+impl Default for AgentVisibility {
+    fn default() -> Self {
+        Self::Private
+    }
 }
 
 // --- Memory entry ---
@@ -88,10 +108,14 @@ pub struct MemoryEntry {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_accessed_at: Option<DateTime<Utc>>,
-    /// Project or workspace scope; `None` means global.
-    pub scope: Option<String>,
+    /// Project or workspace scope; defaults to Session.
+    pub scope: MemoryScope,
     /// Session ID that created this entry.
     pub session_id: Option<String>,
+    /// Agent that created this entry; auto-filled by orchestrator.
+    pub source_agent: Option<String>,
+    /// Agent visibility level for cross-agent sharing.
+    pub visibility: AgentVisibility,
 }
 
 // --- Memory metadata (frontmatter) ---
