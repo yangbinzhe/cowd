@@ -2836,8 +2836,11 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                 let tx = tui_tx.clone();
                                 turn_handle = Some(std::thread::spawn(move || {
                                     let _ = tx.send(tui::TuiEvent::TurnStarted);
-                                    match tokio::runtime::Handle::current()
-                                        .block_on(prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none())) {
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .expect("build tokio rt for turn");
+                                    match rt.block_on(prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none())) {
                                         Ok(summary) => {
                                             let final_text = final_assistant_text(&summary);
                                             let _ = tx.send(tui::TuiEvent::TurnComplete {
