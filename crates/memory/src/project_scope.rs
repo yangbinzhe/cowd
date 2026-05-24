@@ -282,113 +282,438 @@ fn hash_path(path: &Path) -> String {
 // Project Knowledge Graph Building
 // ---------------------------------------------------------------------------
 
-/// Regex patterns per language for extracting code symbols.
-struct CodePatterns {
-    extensions: &'static [&'static str],
-    patterns: &'static [(&'static str, EntityType)],
+/// Maximum file size to scan (1 MiB). Larger files are skipped.
+const MAX_FILE_SIZE: u64 = 1_048_576;
+
+/// Pre-compiled patterns for a language group.
+struct LangPatterns {
+    extensions: Vec<String>,
+    compiled: Vec<(regex::Regex, EntityType)>,
 }
 
-/// Scan project files and build a [`KnowledgeGraph`] of code symbols.
+/// Scan project files and build a [`KnowledgeGraph`] of all discoverable symbols.
 ///
-/// Walks `project_path` for source files (`.rs`, `.ts`, `.py`) and uses
-/// regex-based extraction to register functions, structs, traits, classes,
-/// and interfaces as KG entities.
+/// Walks `project_path` **once** and dispatches to specialised extractors by
+/// extension:
 ///
-/// # Returns
+/// | Extension(s)           | Extractor | Entity types                |
+/// |------------------------|-----------|-----------------------------|
+/// | .rs .ts .py .go .java …| code      | Tool / Concept              |
+/// | .md .rst .txt .adoc     | doc       | DocHeading / DocTerm        |
+/// | .yaml .toml .json       | config    | ConfigKey                   |
+/// | .html .xml .svg         | web       | DataField                   |
+/// | * (any other text)      | unknown   | Concept (first line)        |
 ///
-/// A freshly built [`KnowledgeGraph`] containing all extracted symbols.
+/// Binary files (null byte in first 512 bytes) and files > 1 MiB are skipped.
 pub fn build_project_kg(project_path: &Path) -> KnowledgeGraph {
-    let lang_patterns: &[CodePatterns] = &[
-        CodePatterns {
-            extensions: &["rs"],
-            patterns: &[
+    // -- language definitions -------------------------------------------------
+    #[allow(clippy::type_complexity)]
+    let code_langs: &[(&[&str], &[(&str, EntityType)])] = &[
+        // Rust
+        (
+            &["rs"],
+            &[
                 ("(?:pub(?:\\s+async)?\\s+)?fn\\s+(\\w+)\\s*[<(]", EntityType::Tool),
                 ("struct (\\w+)", EntityType::Concept),
                 ("trait (\\w+)", EntityType::Concept),
                 ("impl (\\w+)", EntityType::Concept),
                 ("enum (\\w+)", EntityType::Concept),
             ],
-        },
-        CodePatterns {
-            extensions: &["ts", "tsx"],
-            patterns: &[
+        ),
+        // TypeScript / JavaScript
+        (
+            &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
+            &[
                 ("(?:export\\s+)?(?:async\\s+)?function\\s+(\\w+)", EntityType::Tool),
                 ("class (\\w+)", EntityType::Concept),
                 ("interface (\\w+)", EntityType::Concept),
             ],
-        },
-        CodePatterns {
-            extensions: &["py"],
-            patterns: &[
+        ),
+        // Python
+        (
+            &["py"],
+            &[
                 ("(?:async\\s+)?def\\s+(\\w+)", EntityType::Tool),
                 ("class (\\w+)", EntityType::Concept),
             ],
-        },
+        ),
+        // Go
+        (
+            &["go"],
+            &[
+                ("func\\s+(?:\\([^)]*\\)\\s*)?(\\w+)\\s*\\(", EntityType::Tool),
+                ("type\\s+(\\w+)\\s+(?:struct|interface)", EntityType::Concept),
+            ],
+        ),
+        // Java
+        (
+            &["java"],
+            &[
+                ("class\\s+(\\w+)", EntityType::Concept),
+                ("interface\\s+(\\w+)", EntityType::Concept),
+                (
+                    "(?:public|private|protected|static|\\s)+[\\w<>\\[\\]]+\\s+(\\w+)\\s*\\(",
+                    EntityType::Tool,
+                ),
+            ],
+        ),
+        // C / C++
+        (
+            &["c", "cpp", "cc", "cxx", "h", "hpp", "hxx"],
+            &[
+                (
+                    "(?:void|int|bool|char|float|double|long|short|size_t|auto)\\s+(\\w+)\\s*\\(",
+                    EntityType::Tool,
+                ),
+                ("struct\\s+(\\w+)", EntityType::Concept),
+                ("class\\s+(\\w+)", EntityType::Concept),
+            ],
+        ),
+        // Swift
+        (
+            &["swift"],
+            &[
+                ("func\\s+(\\w+)", EntityType::Tool),
+                ("class\\s+(\\w+)", EntityType::Concept),
+                ("struct\\s+(\\w+)", EntityType::Concept),
+                ("protocol\\s+(\\w+)", EntityType::Concept),
+            ],
+        ),
+        // Kotlin
+        (
+            &["kt", "kts"],
+            &[
+                ("fun\\s+(\\w+)", EntityType::Tool),
+                ("class\\s+(\\w+)", EntityType::Concept),
+                ("interface\\s+(\\w+)", EntityType::Concept),
+            ],
+        ),
+        // Ruby
+        (
+            &["rb"],
+            &[
+                ("def\\s+(\\w+)", EntityType::Tool),
+                ("class\\s+(\\w+)", EntityType::Concept),
+                ("module\\s+(\\w+)", EntityType::Concept),
+            ],
+        ),
+        // Shell
+        (
+            &["sh", "bash", "zsh"],
+            &[
+                ("(?m)^(\\w+)\\s*\\(\\s*\\)", EntityType::Tool),
+                ("function\\s+(\\w+)", EntityType::Tool),
+            ],
+        ),
+        // SQL
+        (
+            &["sql"],
+            &[
+                ("(?i)CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)", EntityType::Concept),
+                ("(?i)CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)", EntityType::Concept),
+            ],
+        ),
     ];
 
-    let mut kg = KnowledgeGraph::new();
-    let now = Utc::now();
-
-    for lang in lang_patterns {
-        // Compile regexes once per language group.
-        let compiled: Vec<(regex::Regex, EntityType)> = lang
-            .patterns
+    // Pre-compile code regexes per language group ----------------------------
+    let mut compiled_langs: Vec<LangPatterns> = Vec::with_capacity(code_langs.len());
+    for (exts, patterns) in code_langs {
+        let compiled: Vec<(regex::Regex, EntityType)> = patterns
             .iter()
             .filter_map(|(pat, etype)| regex::Regex::new(pat).ok().map(|re| (re, *etype)))
             .collect();
+        if !compiled.is_empty() {
+            compiled_langs.push(LangPatterns {
+                extensions: exts.iter().map(|s| (*s).to_string()).collect(),
+                compiled,
+            });
+        }
+    }
 
-        if compiled.is_empty() {
+    // Collect all code patterns for fenced-code-block scanning inside docs
+    let all_code_patterns: Vec<(regex::Regex, EntityType)> = compiled_langs
+        .iter()
+        .flat_map(|l| l.compiled.clone())
+        .collect();
+
+    // Doc patterns -----------------------------------------------------------
+    let heading_re = regex::Regex::new(r"(?m)^#{1,6}\s+(.+)").ok();
+    let bold_re = regex::Regex::new(r"\*\*(.+?)\*\*").ok();
+    let code_fence_re = regex::Regex::new(r"(?s)```(\w*)\s*\n(.*?)```").ok();
+
+    // Config patterns --------------------------------------------------------
+    let yaml_key_re = regex::Regex::new(r"(?m)^([\w][\w._-]*)\s*:").ok();
+    let toml_key_re = regex::Regex::new(r"(?m)^([\w][\w._-]*)\s*=").ok();
+    let json_key_re = regex::Regex::new(r#""(\w[\w_-]*)"\s*:"#).ok();
+    let toml_section_re = regex::Regex::new(r"(?m)^\[(\w[\w_.-]*)\]").ok();
+
+    // Web patterns -----------------------------------------------------------
+    let tag_re = regex::Regex::new(r"<([\w-]+)").ok();
+
+    // -- single walk ---------------------------------------------------------
+    let mut kg = KnowledgeGraph::new();
+    let now = Utc::now();
+
+    for entry in walkdir::WalkDir::new(project_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+
+        // Skip oversized files
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_FILE_SIZE {
+                continue;
+            }
+        }
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Skip binary (null byte in first 512 bytes)
+        if content.as_bytes().iter().take(512).any(|&b| b == 0) {
             continue;
         }
 
-        // Walk the project directory, filtering by extension.
-        for ext in lang.extensions {
-            for entry in walkdir::WalkDir::new(project_path)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_type().is_file()
-                        && e.path()
-                            .extension()
-                            .map(|os| os == *ext)
-                            .unwrap_or(false)
-                })
-            {
-                let content = match std::fs::read_to_string(entry.path()) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
 
-                for (re, etype) in &compiled {
-                    for cap in re.captures_iter(&content) {
-                        if let Some(m) = cap.get(1) {
-                            let name = m.as_str().to_string();
-                            if name.is_empty() {
-                                continue;
+        let source_file = format!("file:{}", path.to_string_lossy());
+
+        // Dispatch
+        if let Some(lang) = compiled_langs.iter().find(|l| l.extensions.iter().any(|e| e == &ext))
+        {
+            process_code(&content, &source_file, &lang.compiled, "code", &now, &mut kg);
+        } else {
+            match ext.as_str() {
+                "md" | "mdx" | "rst" | "adoc" | "txt" | "text" => process_doc(
+                    &content,
+                    &source_file,
+                    heading_re.as_ref(),
+                    bold_re.as_ref(),
+                    code_fence_re.as_ref(),
+                    &all_code_patterns,
+                    &now,
+                    &mut kg,
+                ),
+                "yaml" | "yml" => {
+                    process_config(&content, &source_file, yaml_key_re.as_ref(), "config", &now, &mut kg);
+                }
+                "toml" => {
+                    process_config(&content, &source_file, toml_key_re.as_ref(), "config", &now, &mut kg);
+                    // Also extract [section] headers
+                    if let Some(re) = toml_section_re.as_ref() {
+                        for cap in re.captures_iter(&content) {
+                            if let Some(m) = cap.get(1) {
+                                add_entity(
+                                    m.as_str(),
+                                    EntityType::ConfigKey,
+                                    0.7,
+                                    &source_file,
+                                    "config",
+                                    &now,
+                                    &mut kg,
+                                );
                             }
-                            let entity = Entity {
-                                id: format!(
-                                    "project-kg-{}-{}",
-                                    etype,
-                                    uuid::Uuid::new_v4().as_simple()
-                                ),
-                                name,
-                                entity_type: *etype,
-                                confidence: 0.8,
-                                frequency: 1,
-                                first_seen: now,
-                                last_seen: now,
-                                source_ids: vec![entry.path().to_string_lossy().to_string()],
-                            };
-                            kg.add_entity(entity);
+                        }
+                    }
+                }
+                "json" | "jsonc" | "json5" => {
+                    process_config(&content, &source_file, json_key_re.as_ref(), "config", &now, &mut kg);
+                }
+                "html" | "htm" | "xml" | "svg" => {
+                    process_web(&content, &source_file, tag_re.as_ref(), &now, &mut kg);
+                }
+                _ => process_unknown(&content, &source_file, &now, &mut kg),
+            }
+        }
+    }
+
+    kg
+}
+
+// ---------------------------------------------------------------------------
+// Extractor helpers (file-private)
+// ---------------------------------------------------------------------------
+
+/// Run compiled code patterns against `content` and insert matches as entities.
+fn process_code(
+    content: &str,
+    source_file: &str,
+    patterns: &[(regex::Regex, EntityType)],
+    source_type: &str,
+    now: &DateTime<Utc>,
+    kg: &mut KnowledgeGraph,
+) {
+    for (re, etype) in patterns {
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let name = m.as_str().to_string();
+                if !name.is_empty() {
+                    add_entity(&name, *etype, 0.8, source_file, source_type, now, kg);
+                }
+            }
+        }
+    }
+}
+
+/// Extract headings, bold terms, and code-block symbols from doc-like files.
+fn process_doc(
+    content: &str,
+    source_file: &str,
+    heading_re: Option<&regex::Regex>,
+    bold_re: Option<&regex::Regex>,
+    code_fence_re: Option<&regex::Regex>,
+    all_code_patterns: &[(regex::Regex, EntityType)],
+    now: &DateTime<Utc>,
+    kg: &mut KnowledgeGraph,
+) {
+    // Headings
+    if let Some(re) = heading_re {
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let heading = m.as_str().trim();
+                if !heading.is_empty() && heading.len() <= 120 {
+                    add_entity(heading, EntityType::DocHeading, 0.7, source_file, "doc", now, kg);
+                }
+            }
+        }
+    }
+
+    // Bold / strong terms
+    if let Some(re) = bold_re {
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let term = m.as_str().trim();
+                if !term.is_empty() && term.len() <= 80 && !term.contains('\n') {
+                    add_entity(term, EntityType::DocTerm, 0.5, source_file, "doc", now, kg);
+                }
+            }
+        }
+    }
+
+    // Fenced code blocks → run all code patterns
+    if let Some(re) = code_fence_re {
+        for cap in re.captures_iter(content) {
+            if let Some(block) = cap.get(2) {
+                let code = block.as_str();
+                if code.len() > 100_000 {
+                    continue; // skip giant blocks
+                }
+                for (pattern_re, etype) in all_code_patterns {
+                    for m in pattern_re.captures_iter(code) {
+                        if let Some(n) = m.get(1) {
+                            let name = n.as_str().to_string();
+                            if !name.is_empty() {
+                                add_entity(&name, *etype, 0.6, source_file, "doc", now, kg);
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
 
-    kg
+/// Shared config-key extractor (YAML / TOML / JSON).
+fn process_config(
+    content: &str,
+    source_file: &str,
+    key_re: Option<&regex::Regex>,
+    source_type: &str,
+    now: &DateTime<Utc>,
+    kg: &mut KnowledgeGraph,
+) {
+    if let Some(re) = key_re {
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let key = m.as_str();
+                if !key.is_empty() && key.len() <= 80 {
+                    add_entity(key, EntityType::ConfigKey, 0.7, source_file, source_type, now, kg);
+                }
+            }
+        }
+    }
+}
+
+/// Extract tag / element names from HTML / XML / SVG.
+fn process_web(
+    content: &str,
+    source_file: &str,
+    tag_re: Option<&regex::Regex>,
+    now: &DateTime<Utc>,
+    kg: &mut KnowledgeGraph,
+) {
+    if let Some(re) = tag_re {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let tag = m.as_str().to_lowercase();
+                // Skip structural boilerplate
+                if matches!(
+                    tag.as_str(),
+                    "html" | "head" | "body" | "meta" | "link" | "script" | "style"
+                        | "br" | "hr" | "!doctype" | "!DOCTYPE"
+                ) {
+                    continue;
+                }
+                if tag.len() <= 60 && seen.insert(tag.clone()) {
+                    add_entity(&tag, EntityType::DataField, 0.6, source_file, "data", now, kg);
+                }
+            }
+        }
+    }
+}
+
+/// Fallback for unrecognised text: use the first non-empty line as a Concept.
+fn process_unknown(
+    content: &str,
+    source_file: &str,
+    now: &DateTime<Utc>,
+    kg: &mut KnowledgeGraph,
+) {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let name = &trimmed[..trimmed.len().min(100)];
+            add_entity(name, EntityType::Concept, 0.3, source_file, "unknown", now, kg);
+            break;
+        }
+    }
+}
+
+/// Convenience: build and insert an [`Entity`].
+fn add_entity(
+    name: &str,
+    entity_type: EntityType,
+    confidence: f64,
+    source_file: &str,
+    source_type: &str,
+    now: &DateTime<Utc>,
+    kg: &mut KnowledgeGraph,
+) {
+    let entity = Entity {
+        id: format!(
+            "project-kg-{}-{}",
+            entity_type,
+            uuid::Uuid::new_v4().as_simple()
+        ),
+        name: name.to_string(),
+        entity_type,
+        confidence,
+        frequency: 1,
+        first_seen: *now,
+        last_seen: *now,
+        source_ids: vec![source_file.to_string()],
+        source_type: source_type.to_string(),
+    };
+    kg.add_entity(entity);
 }
 
 // ---------------------------------------------------------------------------

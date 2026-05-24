@@ -20,6 +20,14 @@ pub enum EntityType {
     Organization,
     Location,
     Concept,
+    /// Markdown / reStructuredText heading.
+    DocHeading,
+    /// Bold or italic term extracted from documentation.
+    DocTerm,
+    /// Top-level key in a YAML / TOML / JSON config file.
+    ConfigKey,
+    /// Element / tag name extracted from HTML / XML / SVG.
+    DataField,
 }
 
 impl std::fmt::Display for EntityType {
@@ -31,6 +39,10 @@ impl std::fmt::Display for EntityType {
             EntityType::Organization => write!(f, "Organization"),
             EntityType::Location => write!(f, "Location"),
             EntityType::Concept => write!(f, "Concept"),
+            EntityType::DocHeading => write!(f, "DocHeading"),
+            EntityType::DocTerm => write!(f, "DocTerm"),
+            EntityType::ConfigKey => write!(f, "ConfigKey"),
+            EntityType::DataField => write!(f, "DataField"),
         }
     }
 }
@@ -46,6 +58,7 @@ pub struct Entity {
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub source_ids: Vec<String>,
+    pub source_type: String,
 }
 
 /// A triple in the knowledge graph (subject-predicate-object).
@@ -185,6 +198,7 @@ impl EntityDetector {
                 first_seen: now,
                 last_seen: now,
                 source_ids: Vec::new(),
+                source_type: String::new(),
             };
 
             seen.entry(key)
@@ -347,6 +361,7 @@ impl KnowledgeGraph {
                     first_seen: now,
                     last_seen: now,
                     source_ids: vec![t.id.clone()],
+                    source_type: String::new(),
                 };
                 fixes.push(format!(
                     "orphan-subject: created placeholder {} for subject_id {} in triple {}",
@@ -364,6 +379,7 @@ impl KnowledgeGraph {
                     first_seen: now,
                     last_seen: now,
                     source_ids: vec![t.id.clone()],
+                    source_type: String::new(),
                 };
                 fixes.push(format!(
                     "orphan-object: created placeholder {} for object_id {} in triple {}",
@@ -474,6 +490,7 @@ mod tests {
             first_seen: Utc::now(),
             last_seen: Utc::now(),
             source_ids: vec![],
+            source_type: String::new(),
         };
         kg.add_entity(person);
 
@@ -486,6 +503,7 @@ mod tests {
             first_seen: Utc::now(),
             last_seen: Utc::now(),
             source_ids: vec![],
+            source_type: String::new(),
         };
         kg.add_entity(project);
 
@@ -508,6 +526,7 @@ mod tests {
             first_seen: Utc::now(),
             last_seen: Utc::now(),
             source_ids: vec![],
+            source_type: String::new(),
         };
         kg.add_entity(e);
         let tid = kg.add_triple("e1", "relates_to", "e1", None, None, 0.5);
