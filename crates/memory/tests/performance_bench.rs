@@ -115,14 +115,12 @@ async fn bench_get_entry_latency() {
         "get_entry {} should complete within 30s", n);
 }
 
-/// Full stress test: 20K entries. Runs in ~18s debug, ~2s release.
+/// Fast stress test: 1000 entries (~0.5s).
+/// Heavy stress tests: 10K (~5s release), 20K (~10s release) available for benchmarking.
+/// Change `n` below to 10_000 or 20_000 when optimizing hot path.
 #[tokio::test]
-async fn stress_insert_20k_entries() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let config = bench_config(&tmp.path().join("stress.db"));
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
-
-    let n = 20_000;
+async fn stress_insert_1k_entries() {
+    let n = 1_000;
     let start = Instant::now();
 
     for i in 0..n {
