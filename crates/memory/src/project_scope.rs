@@ -450,6 +450,24 @@ pub fn build_project_kg(project_path: &Path) -> KnowledgeGraph {
     // Web patterns -----------------------------------------------------------
     let tag_re = regex::Regex::new(r"<([\w-]+)").ok();
 
+    // HTML-specific patterns -------------------------------------------------
+    let custom_elem_re = regex::Regex::new(r"<([a-z]+-[a-z][\w-]*)").ok();
+    let aria_role_re = regex::Regex::new(r#"role="([^"]+)""#).ok();
+    let semantic_tags: &[&str] = &["main", "nav", "article", "section", "header", "footer"];
+
+    // CSS patterns -----------------------------------------------------------
+    let css_class_re = regex::Regex::new(r"\.([a-zA-Z][\w-]+)").ok();
+    let css_id_re = regex::Regex::new(r"#([a-zA-Z][\w-]+)").ok();
+    let css_keyframes_re = regex::Regex::new(r"@keyframes\s+([\w-]+)").ok();
+    let css_media_re = regex::Regex::new(r"@media").ok();
+
+    // Vue patterns -----------------------------------------------------------
+    let vue_script_re = regex::Regex::new(r"(?s)<script[^>]*>(.*?)</script>").ok();
+    let vue_template_re = regex::Regex::new(r"(?s)<template[^>]*>(.*?)</template>").ok();
+    let vue_component_name_re = regex::Regex::new(r#"(?s)export\s+default\s*\{[^}]*?name\s*:\s*['\"]([^'\"]+)['\"]"#).ok();
+    let vue_method_re = regex::Regex::new(r"(?m)^\s*(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{").ok();
+    let vue_arrow_fn_re = regex::Regex::new(r"(?m)(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(").ok();
+
     // -- single walk ---------------------------------------------------------
     let mut kg = KnowledgeGraph::new();
     let now = Utc::now();
@@ -527,8 +545,48 @@ pub fn build_project_kg(project_path: &Path) -> KnowledgeGraph {
                 "json" | "jsonc" | "json5" => {
                     process_config(&content, &source_file, json_key_re.as_ref(), "config", &now, &mut kg);
                 }
-                "html" | "htm" | "xml" | "svg" => {
+                "html" | "htm" => {
+                    process_html(
+                        &content,
+                        &source_file,
+                        tag_re.as_ref(),
+                        custom_elem_re.as_ref(),
+                        aria_role_re.as_ref(),
+                        semantic_tags,
+                        &now,
+                        &mut kg,
+                    );
+                }
+                "xml" | "svg" => {
                     process_web(&content, &source_file, tag_re.as_ref(), &now, &mut kg);
+                }
+                "css" | "scss" | "less" => {
+                    process_css(
+                        &content,
+                        &source_file,
+                        css_class_re.as_ref(),
+                        css_id_re.as_ref(),
+                        css_keyframes_re.as_ref(),
+                        css_media_re.as_ref(),
+                        &now,
+                        &mut kg,
+                    );
+                }
+                "vue" => {
+                    process_vue(
+                        &content,
+                        &source_file,
+                        path,
+                        vue_script_re.as_ref(),
+                        vue_template_re.as_ref(),
+                        vue_component_name_re.as_ref(),
+                        vue_method_re.as_ref(),
+                        vue_arrow_fn_re.as_ref(),
+                        tag_re.as_ref(),
+                        &all_code_patterns,
+                        &now,
+                        &mut kg,
+                    );
                 }
                 _ => process_unknown(&content, &source_file, &now, &mut kg),
             }
@@ -669,6 +727,366 @@ fn process_web(
             }
         }
     }
+}
+
+/// Extract meaningful entities from HTML: custom elements, semantic tags,
+/// aria-roles, and remaining structural tag names.
+fn process_html(
+    content: &str,
+    source_file: &str,
+    tag_re: Option<&regex::Regex>,
+    custom_elem_re: Option<&regex::Regex>,
+    aria_role_re: Option<&regex::Regex>,
+    semantic_tags: &[&str],
+    now: &DateTime<Utc>,
+    kg: &mut KnowledgeGraph,
+) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Extract custom elements (dash-case tags) → Concept
+    if let Some(re) = custom_elem_re {
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let name = m.as_str().to_lowercase();
+                if name.len() <= 60 && seen.insert(name.clone()) {
+                    add_entity(&name, EntityType::Concept, 0.8, source_file, "frontend", now, kg);
+                }
+            }
+        }
+    }
+
+    // Extract aria-role values → ConfigKey
+    if let Some(re) = aria_role_re {
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let role = m.as_str().trim().to_lowercase();
+                if !role.is_empty() && role.len() <= 60 && seen.insert(role.clone()) {
+                    add_entity(&role, EntityType::ConfigKey, 0.7, source_file, "frontend", now, kg);
+                }
+            }
+        }
+    }
+
+    // Extract all tags, classify by type
+    if let Some(re) = tag_re {
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let tag = m.as_str().to_lowercase();
+                // Skip structural boilerplate
+                if matches!(
+                    tag.as_str(),
+                    "html" | "head" | "body" | "meta" | "link" | "script" | "style"
+                        | "br" | "hr" | "!doctype"
+                ) {
+                    continue;
+                }
+                if tag.len() > 60 {
+                    continue;
+                }
+                if !seen.insert(tag.clone()) {
+                    continue;
+                }
+
+                if semantic_tags.contains(&tag.as_str()) {
+                    add_entity(&tag, EntityType::DocHeading, 0.7, source_file, "frontend", now, kg);
+                } else if tag.contains('-') {
+                    // Already handled by custom_elem_re above; skip duplicates
+                } else {
+                    add_entity(&tag, EntityType::DataField, 0.6, source_file, "frontend", now, kg);
+                }
+            }
+        }
+    }
+}
+
+/// Extract selectors, keyframes, and media queries from CSS / SCSS / LESS.
+fn process_css(
+    content: &str,
+    source_file: &str,
+    class_re: Option<&regex::Regex>,
+    id_re: Option<&regex::Regex>,
+    keyframes_re: Option<&regex::Regex>,
+    media_re: Option<&regex::Regex>,
+    now: &DateTime<Utc>,
+    kg: &mut KnowledgeGraph,
+) {
+    // Class selectors → DataField
+    if let Some(re) = class_re {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let name = m.as_str();
+                if !name.is_empty() && name.len() <= 60 && seen.insert(name.to_string()) {
+                    add_entity(name, EntityType::DataField, 0.7, source_file, "style", now, kg);
+                }
+            }
+        }
+    }
+
+    // ID selectors → DataField
+    if let Some(re) = id_re {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let name = m.as_str();
+                if !name.is_empty() && name.len() <= 60 && seen.insert(name.to_string()) {
+                    add_entity(name, EntityType::DataField, 0.7, source_file, "style", now, kg);
+                }
+            }
+        }
+    }
+
+    // @keyframes names → Concept
+    if let Some(re) = keyframes_re {
+        for cap in re.captures_iter(content) {
+            if let Some(m) = cap.get(1) {
+                let name = m.as_str();
+                if !name.is_empty() && name.len() <= 60 {
+                    add_entity(name, EntityType::Concept, 0.8, source_file, "style", now, kg);
+                }
+            }
+        }
+    }
+
+    // @media queries: count them
+    if let Some(re) = media_re {
+        let count = re.find_iter(content).count();
+        if count > 0 {
+            add_entity(
+                &format!("{}-media-queries", count),
+                EntityType::DataField,
+                0.4,
+                source_file,
+                "style",
+                now,
+                kg,
+            );
+        }
+    }
+}
+
+/// Parse Vue single-file components: extract component name, scan `<script>`
+/// for JS/TS patterns, and scan `<template>` for HTML elements.
+fn process_vue(
+    content: &str,
+    source_file: &str,
+    path: &Path,
+    script_re: Option<&regex::Regex>,
+    template_re: Option<&regex::Regex>,
+    component_name_re: Option<&regex::Regex>,
+    method_re: Option<&regex::Regex>,
+    arrow_fn_re: Option<&regex::Regex>,
+    tag_re: Option<&regex::Regex>,
+    all_code_patterns: &[(regex::Regex, EntityType)],
+    now: &DateTime<Utc>,
+    kg: &mut KnowledgeGraph,
+) {
+    // Derive component name from filename (fallback)
+    let filename_component = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    // Scan <script> section
+    let mut found_component_name = false;
+    if let Some(re) = script_re {
+        for cap in re.captures_iter(content) {
+            if let Some(block) = cap.get(1) {
+                let script = block.as_str();
+                if script.len() > 200_000 {
+                    continue;
+                }
+
+                // Extract component name from `export default { name: 'X' }`
+                if let Some(name_re) = component_name_re {
+                    if let Some(nc) = name_re.captures(script) {
+                        if let Some(m) = nc.get(1) {
+                            let name = m.as_str();
+                            if !name.is_empty() && name.len() <= 80 {
+                                add_entity(
+                                    name,
+                                    EntityType::Concept,
+                                    0.9,
+                                    source_file,
+                                    "frontend",
+                                    now,
+                                    kg,
+                                );
+                                found_component_name = true;
+                            }
+                        }
+                    }
+                }
+
+                // Detect method shorthand: `methodName() {` or `async methodName() {`
+                if let Some(re) = method_re {
+                    for m in re.captures_iter(script) {
+                        if let Some(n) = m.get(1) {
+                            let name = n.as_str().to_string();
+                            if !name.is_empty()
+                                && name.len() <= 80
+                                && !name.starts_with("__")
+                                && !is_js_keyword(&name)
+                            {
+                                add_entity(
+                                    &name,
+                                    EntityType::Tool,
+                                    0.7,
+                                    source_file,
+                                    "frontend",
+                                    now,
+                                    kg,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Detect arrow function consts: `const fnName = (...) =>`
+                if let Some(re) = arrow_fn_re {
+                    for m in re.captures_iter(script) {
+                        if let Some(n) = m.get(1) {
+                            let name = n.as_str().to_string();
+                            if !name.is_empty()
+                                && name.len() <= 80
+                                && !name.starts_with("__")
+                                && !is_js_keyword(&name)
+                            {
+                                add_entity(
+                                    &name,
+                                    EntityType::Tool,
+                                    0.7,
+                                    source_file,
+                                    "frontend",
+                                    now,
+                                    kg,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Run JS/TS code patterns on the script content
+                for (pattern_re, etype) in all_code_patterns {
+                    for m in pattern_re.captures_iter(script) {
+                        if let Some(n) = m.get(1) {
+                            let name = n.as_str().to_string();
+                            if !name.is_empty()
+                                && name.len() <= 80
+                                && !name.starts_with("__")
+                            {
+                                add_entity(
+                                    &name,
+                                    *etype,
+                                    0.7,
+                                    source_file,
+                                    "frontend",
+                                    now,
+                                    kg,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: use filename as component name if not found in <script>
+    if !found_component_name && !filename_component.is_empty() {
+        add_entity(
+            &filename_component,
+            EntityType::Concept,
+            0.7,
+            source_file,
+            "frontend",
+            now,
+            kg,
+        );
+    }
+
+    // Scan <template> section for HTML elements
+    if let Some(re) = template_re {
+        if let Some(tag_re) = tag_re {
+            for cap in re.captures_iter(content) {
+                if let Some(block) = cap.get(1) {
+                    let template = block.as_str();
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for tc in tag_re.captures_iter(template) {
+                        if let Some(m) = tc.get(1) {
+                            let tag = m.as_str().to_lowercase();
+                            if matches!(
+                                tag.as_str(),
+                                "html" | "head" | "body" | "meta" | "link"
+                                    | "script" | "style" | "br" | "hr"
+                                    | "!doctype"
+                            ) {
+                                continue;
+                            }
+                            if tag.len() <= 60 && seen.insert(tag.clone()) {
+                                add_entity(
+                                    &tag,
+                                    EntityType::DataField,
+                                    0.6,
+                                    source_file,
+                                    "frontend",
+                                    now,
+                                    kg,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Filter out JavaScript keywords that would be false positives in method detection.
+fn is_js_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "else"
+            | "for"
+            | "while"
+            | "do"
+            | "switch"
+            | "case"
+            | "try"
+            | "catch"
+            | "finally"
+            | "throw"
+            | "return"
+            | "break"
+            | "continue"
+            | "typeof"
+            | "instanceof"
+            | "new"
+            | "delete"
+            | "void"
+            | "in"
+            | "of"
+            | "default"
+            | "export"
+            | "import"
+            | "from"
+            | "as"
+            | "class"
+            | "extends"
+            | "super"
+            | "this"
+            | "true"
+            | "false"
+            | "null"
+            | "undefined"
+            | "let"
+            | "var"
+            | "const"
+            | "async"
+            | "await"
+    )
 }
 
 /// Fallback for unrecognised text: use the first non-empty line as a Concept.

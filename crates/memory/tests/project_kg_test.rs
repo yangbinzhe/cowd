@@ -541,10 +541,14 @@ fn extracts_html_tags_as_data_fields() {
 <html>
 <head><meta charset="utf-8"><title>My Page</title></head>
 <body>
-  <div class="container">
-    <h1>Welcome</h1>
-    <custom-widget></custom-widget>
-  </div>
+  <main>
+    <nav aria-label="Main">
+      <custom-widget role="button"></custom-widget>
+    </nav>
+    <div class="container">
+      <h1>Welcome</h1>
+    </div>
+  </main>
 </body>
 </html>"#,
     );
@@ -552,26 +556,318 @@ fn extracts_html_tags_as_data_fields() {
     let kg = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
 
-    let tags: Vec<_> = entities
+    // Regular tags → DataField
+    let data_fields: Vec<_> = entities
         .iter()
         .filter(|e| e.entity_type == EntityType::DataField)
         .map(|e| e.name.as_str())
         .collect();
+    assert!(data_fields.contains(&"div"), "should find div tag as DataField, got: {data_fields:?}");
+    assert!(data_fields.contains(&"h1"), "should find h1 tag as DataField, got: {data_fields:?}");
 
-    assert!(tags.contains(&"div"), "should find div tag, got: {tags:?}");
-    assert!(tags.contains(&"h1"), "should find h1 tag, got: {tags:?}");
+    // Custom elements (dash-case) → Concept
+    let concepts: Vec<_> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Concept)
+        .map(|e| e.name.as_str())
+        .collect();
     assert!(
-        tags.contains(&"custom-widget"),
-        "should find custom-widget tag, got: {tags:?}"
+        concepts.contains(&"custom-widget"),
+        "custom-widget should be Concept, got: {concepts:?}"
     );
+
+    // Semantic tags → DocHeading
+    let headings: Vec<_> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::DocHeading)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(headings.contains(&"main"), "main should be DocHeading, got: {headings:?}");
+    assert!(headings.contains(&"nav"), "nav should be DocHeading, got: {headings:?}");
+
+    // Aria roles → ConfigKey
+    let config_keys: Vec<_> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::ConfigKey)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(
+        config_keys.contains(&"button"),
+        "role=button should be ConfigKey, got: {config_keys:?}"
+    );
+
     // Structural tags should be excluded
+    let all_names: Vec<_> = entities.iter().map(|e| e.name.as_str()).collect();
     assert!(
-        !tags.contains(&"html"),
-        "html tag should be excluded, got: {tags:?}"
+        !all_names.contains(&"html"),
+        "html tag should be excluded, got: {all_names:?}"
     );
     assert!(
-        !tags.contains(&"head"),
-        "head tag should be excluded, got: {tags:?}"
+        !all_names.contains(&"head"),
+        "head tag should be excluded, got: {all_names:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CSS / SCSS / LESS extraction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extracts_css_selectors_and_keyframes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    write_file(
+        tmp.path(),
+        "styles.css",
+        r#"
+.container {
+    display: flex;
+}
+
+#main-header {
+    background: red;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@media (max-width: 768px) {
+    .container { flex-direction: column; }
+}
+
+@media (min-width: 1024px) {
+    .container { flex-direction: row; }
+}
+
+.card-title {
+    font-size: 1.5rem;
+}
+#sidebar {
+    width: 300px;
+}
+"#,
+    );
+
+    let kg = build_project_kg(tmp.path());
+    let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
+
+    let data_fields: Vec<_> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::DataField)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(
+        data_fields.contains(&"container"),
+        "should extract .container class, got: {data_fields:?}"
+    );
+    assert!(
+        data_fields.contains(&"card-title"),
+        "should extract .card-title class, got: {data_fields:?}"
+    );
+
+    // ID selectors → DataField
+    assert!(
+        data_fields.contains(&"main-header"),
+        "should extract #main-header id, got: {data_fields:?}"
+    );
+    assert!(
+        data_fields.contains(&"sidebar"),
+        "should extract #sidebar id, got: {data_fields:?}"
+    );
+
+    // @keyframes names → Concept
+    let concepts: Vec<_> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Concept)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(
+        concepts.contains(&"fadeIn"),
+        "should extract @keyframes fadeIn as Concept, got: {concepts:?}"
+    );
+
+    // @media queries counted
+    let media_entity = entities
+        .iter()
+        .find(|e| e.name.contains("media-queries"));
+    assert!(
+        media_entity.is_some(),
+        "should have a media-queries count entity, got {count} entities",
+        count = entities.len()
+    );
+}
+
+#[test]
+fn extracts_scss_and_less_selectors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    write_file(
+        tmp.path(),
+        "theme.scss",
+        r#"
+$primary: #333;
+
+.navbar {
+    color: $primary;
+    &.active {
+        font-weight: bold;
+    }
+}
+"#,
+    );
+
+    write_file(
+        tmp.path(),
+        "theme.less",
+        r#"
+@primary: #333;
+
+.sidebar {
+    color: @primary;
+}
+"#,
+    );
+
+    let kg = build_project_kg(tmp.path());
+    let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
+
+    let data_fields: Vec<_> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::DataField)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(
+        data_fields.contains(&"navbar"),
+        "should extract .navbar from scss, got: {data_fields:?}"
+    );
+    assert!(
+        data_fields.contains(&"sidebar"),
+        "should extract .sidebar from less, got: {data_fields:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Vue SFC extraction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extracts_vue_component_name_and_template_elements() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    write_file(
+        tmp.path(),
+        "src/App.vue",
+        r#"<script>
+export default {
+    name: 'AppLayout',
+    methods: {
+        handleClick() {
+            console.log('clicked');
+        }
+    }
+};
+</script>
+
+<template>
+  <div class="app">
+    <nav-bar></nav-bar>
+    <main-content></main-content>
+    <custom-footer :items="links"></custom-footer>
+  </div>
+</template>
+
+<style scoped>
+.app { display: flex; }
+</style>"#,
+    );
+
+    let kg = build_project_kg(tmp.path());
+    let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
+
+    // Component name → Concept
+    let concepts: Vec<_> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Concept)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(
+        concepts.contains(&"AppLayout"),
+        "should extract component name AppLayout as Concept, got: {concepts:?}"
+    );
+
+    // Script methods → Tool
+    let tools: Vec<_> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Tool)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(
+        tools.contains(&"handleClick"),
+        "should extract method handleClick as Tool, got: {tools:?}"
+    );
+
+    // Template elements → DataField
+    let data_fields: Vec<_> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::DataField)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(
+        data_fields.contains(&"div"),
+        "should extract div from template, got: {data_fields:?}"
+    );
+    assert!(
+        data_fields.contains(&"nav-bar"),
+        "should extract nav-bar from template, got: {data_fields:?}"
+    );
+    assert!(
+        data_fields.contains(&"main-content"),
+        "should extract main-content from template, got: {data_fields:?}"
+    );
+    assert!(
+        data_fields.contains(&"custom-footer"),
+        "should extract custom-footer from template, got: {data_fields:?}"
+    );
+
+    // source_type should be "frontend"
+    let app_entity = entities
+        .iter()
+        .find(|e| e.name == "AppLayout")
+        .unwrap();
+    assert_eq!(app_entity.source_type, "frontend");
+}
+
+#[test]
+fn vue_fallback_component_name_from_filename() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    write_file(
+        tmp.path(),
+        "src/MyWidget.vue",
+        r#"<script>
+export default {
+    props: ['title']
+};
+</script>
+
+<template>
+  <span>{{ title }}</span>
+</template>"#,
+    );
+
+    let kg = build_project_kg(tmp.path());
+    let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
+
+    let concepts: Vec<_> = entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Concept)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(
+        concepts.contains(&"MyWidget"),
+        "should use filename as fallback component name, got: {concepts:?}"
     );
 }
 
