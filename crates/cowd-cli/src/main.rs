@@ -2759,7 +2759,21 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
             // ── Input handling via TuiState engine ──
             let poll_ms = if state.turn_active { 5u64 } else { 10u64 };
             if crossterm::event::poll(Duration::from_millis(poll_ms))? {
-                if let Event::Key(key) = crossterm::event::read()? {
+                let ev = crossterm::event::read()?;
+                // Mouse scroll handling
+                if let Event::Mouse(mouse) = &ev {
+                    if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollDown) {
+                        state.scroll_offset = state.scroll_offset.saturating_add(3);
+                        state.auto_scroll = false;
+                        continue;
+                    }
+                    if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp) {
+                        state.scroll_offset = state.scroll_offset.saturating_sub(3);
+                        state.auto_scroll = false;
+                        continue;
+                    }
+                }
+                if let Event::Key(key) = ev {
                     if key.kind == KeyEventKind::Press {
                         // Route picker/approval to dialogs
                         if state.picker_active {
