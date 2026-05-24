@@ -336,19 +336,33 @@ impl TuiState {
         }
         self.session_sidebar.set_current_session(&self.app.session_id);
 
-        // Sync prompt textarea from App input
-        let input_text = self.app.input.lines().join("\n");
-        if self.prompt.text() != input_text {
-            self.prompt.set_text(&input_text);
+        // BUG 1 FIX: No bidirectional sync — app.input is the single source of truth.
+        // Prompt is used only for autocomplete suggestions (rendered as overlay dropdown).
+
+        // BUG 5 FIX: Real-time token count update.
+        // During active turns, ensure token_count reflects cumulative usage.
+        // This acts as a fallback if background TokenUsage events are delayed.
+        if self.app.turn_active {
+            let turn_total = self.app.turn_input_tokens + self.app.turn_output_tokens;
+            let base_total = self.app.input_tokens + self.app.output_tokens;
+            // token_count should reflect the highest known total
+            if turn_total > 0 && base_total + turn_total > self.app.token_count {
+                self.app.token_count = base_total + turn_total;
+            }
         }
 
         // Sync status bar from App state
         self.status_bar.sync_from_app(&self.app);
         self.status_bar.tick();
 
-        // Compute content area: exclude status bar (1 line) and input (3 lines) from bottom.
-        let content_area = if area.height > 4 {
-            ratatui::layout::Rect::new(0, 0, area.width, area.height.saturating_sub(4))
+        // BUG 2 FIX: Dynamic input height based on line count.
+        let input_lines = self.app.input.lines().len().max(1) as u16;
+        let max_input = (area.height / 2).max(3);
+        let input_h = (input_lines + 2).min(max_input).max(3);
+
+        // Compute content area: exclude status bar (1 line) and dynamic input from bottom.
+        let content_area = if area.height > input_h + 1 {
+            ratatui::layout::Rect::new(0, 0, area.width, area.height.saturating_sub(input_h + 1))
         } else {
             area
         };
@@ -409,8 +423,22 @@ impl TuiState {
             }
         }
 
-        // Sync back scroll/viewport state to App (after chat render, before overlays)
-        self.chat_view.sync_to_app(&mut self.app);
+        // BUG 3 FIX: Sync back only viewport height to App.
+        // scroll_offset stays in app as single source of truth.
+        // Auto-scroll during streaming is handled here directly.
+        if self.app.auto_scroll {
+            // Compute bottom position from chat_view's total lines
+            let total = self.chat_view.total_lines();
+            let vh = self.app.viewport_height as usize;
+            if total > vh {
+                self.app.scroll_offset = (total - vh) as u16;
+            } else {
+                self.app.scroll_offset = 0;
+            }
+        }
+        // Re-sync chat_view's scroll state from app after potential update
+        self.chat_view.scroll_offset = self.app.scroll_offset;
+        self.chat_view.auto_scroll = self.app.auto_scroll;
 
         // 2. Render status bar at bottom
         {
@@ -435,26 +463,58 @@ impl TuiState {
             }
         }
 
-        // 2.5. Render prompt with autocomplete (3 lines above status bar)
+        // BUG 4: Search bar overlay when search is active
+        if self.app.search_active {
+            let search_area = ratatui::layout::Rect::new(
+                0,
+                content_area.y,
+                area.width,
+                1,
+            );
+            let search_text = if self.app.search_query.is_empty() {
+                "/ ".to_string()
+            } else {
+                format!("/ {}", self.app.search_query)
+            };
+            let search_line = ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(
+                    search_text,
+                    ratatui::style::Style::default()
+                        .fg(ratatui::style::Color::Yellow)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+                ratatui::text::Span::styled(
+                    "  Esc:cancel Enter:search",
+                    ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+                ),
+            ]);
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(search_line),
+                search_area,
+            );
+        }
+
+        // 2.5. Render input directly from app.input (BUG 1 FIX: single source of truth)
         {
+            let input_y = area.height.saturating_sub(1 + input_h);
             let input_area = ratatui::layout::Rect::new(
                 0,
-                area.height.saturating_sub(4),
+                input_y,
                 area.width,
-                3,
+                input_h,
             );
-            let degraded = {
+            // Render app.input widget directly — NOT through prompt
+            {
+                let _guard = self.render_profiler.guard("input");
+                frame.render_widget(self.app.input.widget(), input_area);
+            }
+            // Render prompt's autocomplete dropdown as overlay
+            {
                 let mut ctx = RenderContext::new(frame, &skin);
-                let _guard = self.render_profiler.guard("prompt");
-                match error_recovery::catch_render_panic("prompt", AssertUnwindSafe(|| {
-                    self.prompt.render(&mut ctx, input_area);
-                })) {
-                    RenderResult::Ok => None,
-                    RenderResult::Degraded(msg) => Some(msg),
-                }
-            };
-            if let Some(msg) = degraded {
-                self.add_message("system", &msg);
+                let _guard = self.render_profiler.guard("prompt_dropdown");
+                let _ = error_recovery::catch_render_panic("prompt_dropdown", AssertUnwindSafe(|| {
+                    self.prompt.render_dropdown(&mut ctx, input_area);
+                }));
             }
         }
 
@@ -762,8 +822,12 @@ impl TuiState {
 
         // ── Prompt autocomplete routing (Tab / Shift+Tab / Esc) ──
         // Route these keys through the prompt component before sidebar cycling.
+        // BUG 1 FIX: Sync prompt textarea from app.input on-demand (not every frame).
+        // This eliminates the bidirectional sync race condition.
         if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
-            // Refresh suggestions from current text, then handle Tab
+            // Sync prompt textarea from app.input, then refresh suggestions and handle Tab
+            let input_text = self.app.input.lines().join("\n");
+            self.prompt.set_text(&input_text);
             self.prompt.refresh_suggestions();
             let event = crossterm::event::Event::Key(key);
             let result = self.prompt.handle_event(&event);
@@ -771,11 +835,10 @@ impl TuiState {
                 // Sync accepted suggestion back to app.input
                 let new_text = self.prompt.text();
                 let mut ta = tui_textarea::TextArea::default();
+                // Preserve the input block style
                 ta.set_block(ratatui::widgets::Block::default()
                     .borders(ratatui::widgets::Borders::ALL)
                     .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
-                ta.set_style(ratatui::style::Style::default()
-                    .fg(ratatui::style::Color::White));
                 if !new_text.is_empty() {
                     ta.insert_str(&new_text);
                 }
@@ -785,6 +848,9 @@ impl TuiState {
             // Fall through to sidebar tab cycling
         }
         if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT) {
+            let input_text = self.app.input.lines().join("\n");
+            self.prompt.set_text(&input_text);
+            self.prompt.refresh_suggestions();
             let event = crossterm::event::Event::Key(key);
             let result = self.prompt.handle_event(&event);
             if result == crate::tui::components::EventResult::Consumed {
@@ -829,7 +895,9 @@ impl TuiState {
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)
         if self.is_textarea_key(&key) {
             self.app.input.input(key);
-            self.prompt.refresh_suggestions();
+            // BUG 1 FIX: Refresh suggestions from app.input text, not prompt's stale textarea
+            let text = self.app.input.lines().join("\n");
+            self.prompt.refresh_suggestions_from_text(&text);
             return ProcessedKey::Nothing;
         }
 

@@ -703,6 +703,50 @@ impl Prompt {
         self.textarea.insert_str(new_text);
     }
 
+    /// Get the currently highlighted suggestion text (without applying it).
+    /// Returns None if no suggestions are available.
+    pub fn highlighted_suggestion_text(&self) -> Option<String> {
+        if !self.show_suggestions || self.suggestions.is_empty() {
+            return None;
+        }
+        Some(self.suggestions[self.highlighted].text.clone())
+    }
+
+    /// Get the current autocomplete prefix being matched.
+    pub fn current_prefix_str(&self) -> &str {
+        &self.current_prefix
+    }
+
+    /// Apply a suggestion to an external text line (does not touch internal textarea).
+    /// Returns the new full text with the current prefix replaced by the suggestion.
+    pub fn apply_suggestion_to_text(&self, full_text: &str) -> Option<String> {
+        let suggestion = self.highlighted_suggestion_text()?;
+        let prefix = &self.current_prefix;
+        if full_text.ends_with(prefix) {
+            let base = &full_text[..full_text.len() - prefix.len()];
+            Some(format!("{}{}", base, suggestion))
+        } else {
+            // Fallback: just replace the last occurrence of prefix
+            None
+        }
+    }
+
+    /// Record use of highlighted suggestion for frecency.
+    pub fn record_highlighted_use(&mut self) {
+        if !self.show_suggestions || self.suggestions.is_empty() {
+            return;
+        }
+        let suggestion = self.suggestions[self.highlighted].clone();
+        self.engine.record_use(&suggestion);
+        // If it's a directory, re-trigger suggestions; otherwise clear
+        if suggestion.text.ends_with('/') {
+            // Keep suggestions open for directory navigation
+            self.update_suggestions();
+        } else {
+            self.clear_suggestions();
+        }
+    }
+
     /// Clear all suggestion state.
     fn clear_suggestions(&mut self) {
         self.suggestions.clear();
@@ -757,8 +801,57 @@ impl Prompt {
         }
     }
 
-    /// Render the suggestion dropdown below the textarea area.
-    fn render_dropdown(&self, ctx: &mut RenderContext, base_area: Rect) {
+    /// Refresh autocomplete suggestions based on external text (without touching textarea).
+    /// Use this when the text source is external (e.g., App.input).
+    pub fn refresh_suggestions_from_text(&mut self, text: &str) {
+        self.update_shell_mode();
+        // Extract the current word from the text at the right position
+        // Since we don't have cursor position, use the end of text
+        let word = self.current_word_from_text(text);
+        if word.is_empty() {
+            self.clear_suggestions();
+            return;
+        }
+        self.current_prefix = word.clone();
+        self.suggestions = self.engine.suggest(&word);
+        self.highlighted = 0;
+        self.show_suggestions = !self.suggestions.is_empty();
+
+        self.inline_preview = if self.show_suggestions {
+            let top = &self.suggestions[self.highlighted].text;
+            if top.starts_with(&self.current_prefix) {
+                top[self.current_prefix.len()..].to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+    }
+
+    /// Extract the word being typed from a raw text string (uses end of text as cursor).
+    fn current_word_from_text(&self, text: &str) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.is_empty() {
+            return String::new();
+        }
+        let last_line = lines[lines.len() - 1];
+        let col = last_line.len();
+        let chars: Vec<char> = last_line.chars().collect();
+        let mut start = col;
+        while start > 0 {
+            let c = chars[start - 1];
+            if c.is_whitespace() {
+                break;
+            }
+            start -= 1;
+        }
+        chars[start..col].iter().collect()
+    }
+
+    /// Render the suggestion dropdown below the input area.
+    /// Public so TuiState can call it after rendering app.input directly.
+    pub fn render_dropdown(&self, ctx: &mut RenderContext, base_area: Rect) {
         if !self.show_suggestions || self.suggestions.is_empty() {
             return;
         }

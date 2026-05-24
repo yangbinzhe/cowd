@@ -222,7 +222,7 @@ impl ChatView {
     // ── Line computation (internal) ───────────────────────────────
 
     /// Total number of content lines (including separator blanks and spinner).
-    fn total_lines(&self) -> usize {
+    pub fn total_lines(&self) -> usize {
         let mut total: usize = self
             .entry_line_counts
             .iter()
