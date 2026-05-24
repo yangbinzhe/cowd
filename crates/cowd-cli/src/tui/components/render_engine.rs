@@ -380,4 +380,3 @@ mod tests {
         terminal.assert_line_count(24);
     }
 }
-*/
