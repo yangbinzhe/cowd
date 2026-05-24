@@ -1165,3 +1165,115 @@ fn test_is_kg_stale_unknown_project() {
         "is_kg_stale should return error for unknown project"
     );
 }
+
+// ---------------------------------------------------------------------------
+// TDD: unified_scan tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_unified_scan_produces_both_entities_and_symbols() {
+    use cowd_memory::code_indexer::CodeIndexer;
+    use cowd_memory::project_scope::unified_scan;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    write_file(
+        tmp.path(),
+        "src/lib.rs",
+        r#"
+/// Authenticate a user with the given credentials.
+pub fn authenticate_user(username: &str, password: &str) -> bool {
+    validate_credentials(username, password)
+}
+
+fn validate_credentials(username: &str, password: &str) -> bool {
+    !username.is_empty() && !password.is_empty()
+}
+
+pub struct AuthService {
+    pub enabled: bool,
+}
+
+pub enum AuthError {
+    InvalidCredentials,
+    ExpiredToken,
+}
+"#,
+    );
+
+    let mut indexer = CodeIndexer::new(tmp.path()).expect("create code indexer");
+    let result = unified_scan(tmp.path(), Some(&mut indexer));
+
+    // Regex-based KG extraction should find entities
+    let entities: Vec<_> = result.kg.list_entities().into_iter().cloned().collect();
+    let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"authenticate_user"),
+        "regex should find fn authenticate_user, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"AuthService"),
+        "regex should find struct AuthService, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"AuthError"),
+        "regex should find enum AuthError, got: {names:?}"
+    );
+
+    // Tree-sitter extraction should find code symbols
+    let sym_names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        !sym_names.is_empty(),
+        "tree-sitter should find symbols, got empty"
+    );
+    assert!(
+        sym_names.contains(&"authenticate_user"),
+        "tree-sitter should find authenticate_user, got: {sym_names:?}"
+    );
+    assert!(
+        sym_names.contains(&"AuthService"),
+        "tree-sitter should find AuthService, got: {sym_names:?}"
+    );
+
+    // mtimes should be tracked
+    assert!(!result.mtimes.is_empty(), "should track file mtimes");
+
+    // Edge edges should be found (authenticate_user calls validate_credentials)
+    let has_calls = result.edges.iter().any(|e| {
+        e.edge_type == cowd_memory::code_indexer::SymbolEdgeType::Calls
+    });
+    assert!(has_calls, "should find call edges between functions");
+}
+
+#[test]
+fn test_regex_cached_on_second_call() {
+    use cowd_memory::project_scope::unified_scan;
+    use std::time::Instant;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Create several files for a non-trivial scan
+    write_file(tmp.path(), "src/lib.rs", "fn foo() {}\nfn bar() {}\nstruct S {}\n");
+    write_file(tmp.path(), "src/main.rs", "fn main() {}\nfn helper() {}\n");
+    write_file(tmp.path(), "README.md", "# Project\n\nSome **important** text.\n");
+    write_file(tmp.path(), "config.yaml", "app:\n  name: test\n  version: 1\n");
+
+    // First call: cold (regexes compiled and cached)
+    let start1 = Instant::now();
+    let _result1 = unified_scan(tmp.path(), None);
+    let duration1 = start1.elapsed();
+
+    // Second call: warm (regexes served from OnceLock cache)
+    let start2 = Instant::now();
+    let _result2 = unified_scan(tmp.path(), None);
+    let duration2 = start2.elapsed();
+
+    // The second call should NOT be significantly slower than the first.
+    // With caching, it should be at least as fast (usually faster since
+    // regex compilation is skipped).
+    let ratio = duration2.as_nanos() as f64 / duration1.as_nanos().max(1) as f64;
+    assert!(
+        ratio <= 1.15,
+        "second call ({duration2:?}) should not be >15% slower than first ({duration1:?}), got ratio {ratio:.2}"
+    );
+}

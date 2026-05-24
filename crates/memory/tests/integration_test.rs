@@ -5,6 +5,8 @@
 
 use std::io::Write;
 
+use walkdir::WalkDir;
+
 use cowd_memory::{
     CodeIndexer, CodeSymbol, CognitiveContextManager, ImpactReport, MemoryConfig,
     SymbolEdge, SymbolEdgeType, SymbolKind, TokenBudget,
@@ -67,9 +69,28 @@ fn authenticate_user(token: &str) -> bool {
     );
 
     let mut indexer = CodeIndexer::new(tmp.path()).unwrap();
-    let stats = indexer.index_all().unwrap();
-    assert!(stats.symbols_found > 0, "should find symbols");
-    assert!(stats.files_processed > 0, "should process files");
+    let mut symbols_found = 0usize;
+    let mut files_processed = 0usize;
+    for entry in walkdir::WalkDir::new(tmp.path())
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        if cowd_memory::IndexLanguage::is_indexable(path) {
+            match indexer.index_file(path) {
+                Ok((symbols, _edges)) => {
+                    files_processed += 1;
+                    symbols_found += symbols.len();
+                }
+                Err(_) => {
+                    files_processed += 1;
+                }
+            }
+        }
+    }
+    assert!(symbols_found > 0, "should find symbols");
+    assert!(files_processed > 0, "should process files");
 }
 
 #[tokio::test]

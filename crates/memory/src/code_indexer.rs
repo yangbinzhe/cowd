@@ -293,36 +293,56 @@ impl CodeIndexer {
         Ok((symbols, edges))
     }
 
-    /// Walk the project root and index all supported source files.
+    /// Index source code from pre-read content (no separate file I/O).
     ///
-    /// Respects `.gitignore` files via the `ignore` crate if available;
-    /// otherwise falls back to walking all files and filtering by extension.
-    pub fn index_all(&mut self) -> Result<IndexStats, MemoryError> {
-        let mut stats = IndexStats::default();
-        let root = self.project_root.clone();
+    /// Accepts already-read content and a file path.  The path is used to
+    /// determine the language (via extension) and for computing relative
+    /// paths.  Returns extracted symbols and edges.
+    ///
+    /// This is designed to be called from a unified walkdir pass that reads
+    /// each file once and dispatches to multiple extractors.
+    pub fn index_content(
+        &mut self,
+        content: &str,
+        path: &Path,
+    ) -> Result<(Vec<CodeSymbol>, Vec<SymbolEdge>), MemoryError> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let lang = IndexLanguage::from_extension(ext).ok_or_else(|| {
+            MemoryError::InvalidArgument(format!("unsupported file extension: {ext}"))
+        })?;
 
-        for entry in walkdir::WalkDir::new(&root)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let path = entry.path();
-            if IndexLanguage::is_indexable(path) {
-                match self.index_file(path) {
-                    Ok((symbols, edges)) => {
-                        stats.files_processed += 1;
-                        stats.symbols_found += symbols.len();
-                        stats.edges_found += edges.len();
-                    }
-                    Err(_e) => {
-                        // Skip files that fail to parse (e.g., syntax errors)
-                        stats.files_processed += 1;
-                    }
-                }
-            }
-        }
+        let parser = self
+            .parsers
+            .get_mut(&lang)
+            .expect("parser initialised in new()");
 
-        Ok(stats)
+        let tree = parser
+            .parse(content, None)
+            .ok_or_else(|| MemoryError::Store(format!("parse failed for {path:?}")))?;
+
+        let relative_path = path
+            .strip_prefix(&self.project_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
+        let mut symbols = Vec::new();
+        let mut edges = Vec::new();
+
+        let mut cursor = tree.walk();
+        self.extract_symbols(
+            &mut cursor,
+            content,
+            &relative_path,
+            lang,
+            &mut symbols,
+            &mut edges,
+        );
+
+        Ok((symbols, edges))
     }
 
     // -----------------------------------------------------------------------

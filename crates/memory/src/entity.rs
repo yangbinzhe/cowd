@@ -224,6 +224,7 @@ impl Default for EntityDetector {
 // ---------------------------------------------------------------------------
 
 /// In-memory knowledge graph for entity relationships.
+#[derive(Debug, Clone)]
 pub struct KnowledgeGraph {
     entities: HashMap<String, Entity>,
     triples: Vec<Triple>,

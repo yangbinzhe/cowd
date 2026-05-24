@@ -7,11 +7,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::code_indexer::{CodeIndexer, CodeSymbol, SymbolEdge};
 use crate::config::StoreConfig;
 use crate::entity::{Entity, EntityType, KnowledgeGraph};
 use crate::error::MemoryError;
@@ -360,188 +361,42 @@ struct LangPatterns {
     compiled: Vec<(regex::Regex, EntityType)>,
 }
 
-/// Scan project files and build a [`KnowledgeGraph`] of all discoverable symbols.
+// ---------------------------------------------------------------------------
+// Unified scan result
+// ---------------------------------------------------------------------------
+
+/// Result of a unified single-pass project scan.
 ///
-/// Walks `project_path` **once** and dispatches to specialised extractors by
-/// extension:
+/// Combines regex-based knowledge-graph entities and tree-sitter-based code
+/// symbols in a single struct, produced by one walkdir traversal.
+#[derive(Debug, Clone)]
+pub struct UnifiedScanResult {
+    /// Knowledge graph entities discovered via regex extraction.
+    pub kg: KnowledgeGraph,
+    /// Code symbols discovered via tree-sitter extraction (5 supported languages).
+    pub symbols: Vec<CodeSymbol>,
+    /// Edges between code symbols (calls, imports, etc.).
+    pub edges: Vec<SymbolEdge>,
+    /// Map of indexed file paths to their modification timestamps (Unix seconds).
+    pub mtimes: HashMap<String, u64>,
+}
+
+/// Scan project files in a **single walkdir pass**, producing both regex-based
+/// knowledge-graph entities and tree-sitter-based code symbols/edges.
 ///
-/// | Extension(s)           | Extractor | Entity types                |
-/// |------------------------|-----------|-----------------------------|
-/// | .rs .ts .py .go .java …| code      | Tool / Concept              |
-/// | .md .rst .txt .adoc     | doc       | DocHeading / DocTerm        |
-/// | .yaml .toml .json       | config    | ConfigKey                   |
-/// | .html .xml .svg         | web       | DataField                   |
-/// | * (any other text)      | unknown   | Concept (first line)        |
+/// When `indexer` is `Some`, supported language files (Rust, Python,
+/// TypeScript, Go, Java) are additionally parsed with tree-sitter to extract
+/// structured symbols.  When `None`, only regex extraction is performed.
 ///
-/// Binary files (null byte in first 512 bytes) and files > 1 MiB are skipped.
-///
-/// Returns the knowledge graph and a map of indexed file paths to their
-/// modification timestamps (Unix seconds), used for staleness detection.
-pub fn build_project_kg(project_path: &Path) -> (KnowledgeGraph, HashMap<String, u64>) {
-    // -- language definitions -------------------------------------------------
-    #[allow(clippy::type_complexity)]
-    let code_langs: &[(&[&str], &[(&str, EntityType)])] = &[
-        // Rust
-        (
-            &["rs"],
-            &[
-                ("(?:pub(?:\\s+async)?\\s+)?fn\\s+(\\w+)\\s*[<(]", EntityType::Tool),
-                ("struct (\\w+)", EntityType::Concept),
-                ("trait (\\w+)", EntityType::Concept),
-                ("impl (\\w+)", EntityType::Concept),
-                ("enum (\\w+)", EntityType::Concept),
-            ],
-        ),
-        // TypeScript / JavaScript
-        (
-            &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
-            &[
-                ("(?:export\\s+)?(?:async\\s+)?function\\s+(\\w+)", EntityType::Tool),
-                ("class (\\w+)", EntityType::Concept),
-                ("interface (\\w+)", EntityType::Concept),
-            ],
-        ),
-        // Python
-        (
-            &["py"],
-            &[
-                ("(?:async\\s+)?def\\s+(\\w+)", EntityType::Tool),
-                ("class (\\w+)", EntityType::Concept),
-            ],
-        ),
-        // Go
-        (
-            &["go"],
-            &[
-                ("func\\s+(?:\\([^)]*\\)\\s*)?(\\w+)\\s*\\(", EntityType::Tool),
-                ("type\\s+(\\w+)\\s+(?:struct|interface)", EntityType::Concept),
-            ],
-        ),
-        // Java
-        (
-            &["java"],
-            &[
-                ("class\\s+(\\w+)", EntityType::Concept),
-                ("interface\\s+(\\w+)", EntityType::Concept),
-                (
-                    "(?:public|private|protected|static|\\s)+[\\w<>\\[\\]]+\\s+(\\w+)\\s*\\(",
-                    EntityType::Tool,
-                ),
-            ],
-        ),
-        // C / C++
-        (
-            &["c", "cpp", "cc", "cxx", "h", "hpp", "hxx"],
-            &[
-                (
-                    "(?:void|int|bool|char|float|double|long|short|size_t|auto)\\s+(\\w+)\\s*\\(",
-                    EntityType::Tool,
-                ),
-                ("struct\\s+(\\w+)", EntityType::Concept),
-                ("class\\s+(\\w+)", EntityType::Concept),
-            ],
-        ),
-        // Swift
-        (
-            &["swift"],
-            &[
-                ("func\\s+(\\w+)", EntityType::Tool),
-                ("class\\s+(\\w+)", EntityType::Concept),
-                ("struct\\s+(\\w+)", EntityType::Concept),
-                ("protocol\\s+(\\w+)", EntityType::Concept),
-            ],
-        ),
-        // Kotlin
-        (
-            &["kt", "kts"],
-            &[
-                ("fun\\s+(\\w+)", EntityType::Tool),
-                ("class\\s+(\\w+)", EntityType::Concept),
-                ("interface\\s+(\\w+)", EntityType::Concept),
-            ],
-        ),
-        // Ruby
-        (
-            &["rb"],
-            &[
-                ("def\\s+(\\w+)", EntityType::Tool),
-                ("class\\s+(\\w+)", EntityType::Concept),
-                ("module\\s+(\\w+)", EntityType::Concept),
-            ],
-        ),
-        // Shell
-        (
-            &["sh", "bash", "zsh"],
-            &[
-                ("(?m)^(\\w+)\\s*\\(\\s*\\)", EntityType::Tool),
-                ("function\\s+(\\w+)", EntityType::Tool),
-            ],
-        ),
-        // SQL
-        (
-            &["sql"],
-            &[
-                ("(?i)CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)", EntityType::Concept),
-                ("(?i)CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)", EntityType::Concept),
-            ],
-        ),
-    ];
-
-    // Pre-compile code regexes per language group ----------------------------
-    let mut compiled_langs: Vec<LangPatterns> = Vec::with_capacity(code_langs.len());
-    for (exts, patterns) in code_langs {
-        let compiled: Vec<(regex::Regex, EntityType)> = patterns
-            .iter()
-            .filter_map(|(pat, etype)| regex::Regex::new(pat).ok().map(|re| (re, *etype)))
-            .collect();
-        if !compiled.is_empty() {
-            compiled_langs.push(LangPatterns {
-                extensions: exts.iter().map(|s| (*s).to_string()).collect(),
-                compiled,
-            });
-        }
-    }
-
-    // Collect all code patterns for fenced-code-block scanning inside docs
-    let all_code_patterns: Vec<(regex::Regex, EntityType)> = compiled_langs
-        .iter()
-        .flat_map(|l| l.compiled.clone())
-        .collect();
-
-    // Doc patterns -----------------------------------------------------------
-    let heading_re = regex::Regex::new(r"(?m)^#{1,6}\s+(.+)").ok();
-    let bold_re = regex::Regex::new(r"\*\*(.+?)\*\*").ok();
-    let code_fence_re = regex::Regex::new(r"(?s)```(\w*)\s*\n(.*?)```").ok();
-
-    // Config patterns --------------------------------------------------------
-    let yaml_key_re = regex::Regex::new(r"(?m)^([\w][\w._-]*)\s*:").ok();
-    let toml_key_re = regex::Regex::new(r"(?m)^([\w][\w._-]*)\s*=").ok();
-    let json_key_re = regex::Regex::new(r#""(\w[\w_-]*)"\s*:"#).ok();
-    let toml_section_re = regex::Regex::new(r"(?m)^\[(\w[\w_.-]*)\]").ok();
-
-    // Web patterns -----------------------------------------------------------
-    let tag_re = regex::Regex::new(r"<([\w-]+)").ok();
-
-    // HTML-specific patterns -------------------------------------------------
-    let custom_elem_re = regex::Regex::new(r"<([a-z]+-[a-z][\w-]*)").ok();
-    let aria_role_re = regex::Regex::new(r#"role="([^"]+)""#).ok();
-    let semantic_tags: &[&str] = &["main", "nav", "article", "section", "header", "footer"];
-
-    // CSS patterns -----------------------------------------------------------
-    let css_class_re = regex::Regex::new(r"\.([a-zA-Z][\w-]+)").ok();
-    let css_id_re = regex::Regex::new(r"#([a-zA-Z][\w-]+)").ok();
-    let css_keyframes_re = regex::Regex::new(r"@keyframes\s+([\w-]+)").ok();
-    let css_media_re = regex::Regex::new(r"@media").ok();
-
-    // Vue patterns -----------------------------------------------------------
-    let vue_script_re = regex::Regex::new(r"(?s)<script[^>]*>(.*?)</script>").ok();
-    let vue_template_re = regex::Regex::new(r"(?s)<template[^>]*>(.*?)</template>").ok();
-    let vue_component_name_re = regex::Regex::new(r#"(?s)export\s+default\s*\{[^}]*?name\s*:\s*['\"]([^'\"]+)['\"]"#).ok();
-    let vue_method_re = regex::Regex::new(r"(?m)^\s*(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{").ok();
-    let vue_arrow_fn_re = regex::Regex::new(r"(?m)(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(").ok();
-
-    // -- single walk ---------------------------------------------------------
+/// Returns a [`UnifiedScanResult`] with all collected data.
+pub fn unified_scan(
+    project_path: &Path,
+    mut indexer: Option<&mut CodeIndexer>,
+) -> UnifiedScanResult {
+    let patterns = get_patterns();
     let mut kg = KnowledgeGraph::new();
+    let mut symbols = Vec::new();
+    let mut edges = Vec::new();
     let mut file_mtimes: HashMap<String, u64> = HashMap::new();
     let now = Utc::now();
 
@@ -585,8 +440,11 @@ pub fn build_project_kg(project_path: &Path) -> (KnowledgeGraph, HashMap<String,
 
         let source_file = format!("file:{}", path.to_string_lossy());
 
-        // Dispatch
-        if let Some(lang) = compiled_langs.iter().find(|l| l.extensions.iter().any(|e| e == &ext))
+        // --- Regex extraction (all files) ---
+        if let Some(lang) = patterns
+            .code_langs
+            .iter()
+            .find(|l| l.extensions.iter().any(|e| e == &ext))
         {
             process_code(&content, &source_file, &lang.compiled, "code", &now, &mut kg);
         } else {
@@ -594,20 +452,34 @@ pub fn build_project_kg(project_path: &Path) -> (KnowledgeGraph, HashMap<String,
                 "md" | "mdx" | "rst" | "adoc" | "txt" | "text" => process_doc(
                     &content,
                     &source_file,
-                    heading_re.as_ref(),
-                    bold_re.as_ref(),
-                    code_fence_re.as_ref(),
-                    &all_code_patterns,
+                    patterns.heading_re.as_ref(),
+                    patterns.bold_re.as_ref(),
+                    patterns.code_fence_re.as_ref(),
+                    &patterns.all_code_patterns,
                     &now,
                     &mut kg,
                 ),
                 "yaml" | "yml" => {
-                    process_config(&content, &source_file, yaml_key_re.as_ref(), "config", &now, &mut kg);
+                    process_config(
+                        &content,
+                        &source_file,
+                        patterns.yaml_key_re.as_ref(),
+                        "config",
+                        &now,
+                        &mut kg,
+                    );
                 }
                 "toml" => {
-                    process_config(&content, &source_file, toml_key_re.as_ref(), "config", &now, &mut kg);
+                    process_config(
+                        &content,
+                        &source_file,
+                        patterns.toml_key_re.as_ref(),
+                        "config",
+                        &now,
+                        &mut kg,
+                    );
                     // Also extract [section] headers
-                    if let Some(re) = toml_section_re.as_ref() {
+                    if let Some(re) = patterns.toml_section_re.as_ref() {
                         for cap in re.captures_iter(&content) {
                             if let Some(m) = cap.get(1) {
                                 add_entity(
@@ -624,31 +496,38 @@ pub fn build_project_kg(project_path: &Path) -> (KnowledgeGraph, HashMap<String,
                     }
                 }
                 "json" | "jsonc" | "json5" => {
-                    process_config(&content, &source_file, json_key_re.as_ref(), "config", &now, &mut kg);
+                    process_config(
+                        &content,
+                        &source_file,
+                        patterns.json_key_re.as_ref(),
+                        "config",
+                        &now,
+                        &mut kg,
+                    );
                 }
                 "html" | "htm" => {
                     process_html(
                         &content,
                         &source_file,
-                        tag_re.as_ref(),
-                        custom_elem_re.as_ref(),
-                        aria_role_re.as_ref(),
-                        semantic_tags,
+                        patterns.tag_re.as_ref(),
+                        patterns.custom_elem_re.as_ref(),
+                        patterns.aria_role_re.as_ref(),
+                        patterns.semantic_tags,
                         &now,
                         &mut kg,
                     );
                 }
                 "xml" | "svg" => {
-                    process_web(&content, &source_file, tag_re.as_ref(), &now, &mut kg);
+                    process_web(&content, &source_file, patterns.tag_re.as_ref(), &now, &mut kg);
                 }
                 "css" | "scss" | "less" => {
                     process_css(
                         &content,
                         &source_file,
-                        css_class_re.as_ref(),
-                        css_id_re.as_ref(),
-                        css_keyframes_re.as_ref(),
-                        css_media_re.as_ref(),
+                        patterns.css_class_re.as_ref(),
+                        patterns.css_id_re.as_ref(),
+                        patterns.css_keyframes_re.as_ref(),
+                        patterns.css_media_re.as_ref(),
                         &now,
                         &mut kg,
                     );
@@ -658,13 +537,13 @@ pub fn build_project_kg(project_path: &Path) -> (KnowledgeGraph, HashMap<String,
                         &content,
                         &source_file,
                         path,
-                        vue_script_re.as_ref(),
-                        vue_template_re.as_ref(),
-                        vue_component_name_re.as_ref(),
-                        vue_method_re.as_ref(),
-                        vue_arrow_fn_re.as_ref(),
-                        tag_re.as_ref(),
-                        &all_code_patterns,
+                        patterns.vue_script_re.as_ref(),
+                        patterns.vue_template_re.as_ref(),
+                        patterns.vue_component_name_re.as_ref(),
+                        patterns.vue_method_re.as_ref(),
+                        patterns.vue_arrow_fn_re.as_ref(),
+                        patterns.tag_re.as_ref(),
+                        &patterns.all_code_patterns,
                         &now,
                         &mut kg,
                     );
@@ -672,9 +551,242 @@ pub fn build_project_kg(project_path: &Path) -> (KnowledgeGraph, HashMap<String,
                 _ => process_unknown(&content, &source_file, &now, &mut kg),
             }
         }
+
+        // --- Tree-sitter extraction (5 supported langs) ---
+        if let Some(ref mut idx) = indexer {
+            if crate::code_indexer::IndexLanguage::from_extension(&ext).is_some() {
+                if let Ok((file_symbols, file_edges)) = idx.index_content(&content, path) {
+                    symbols.extend(file_symbols);
+                    edges.extend(file_edges);
+                }
+            }
+        }
     }
 
-    (kg, file_mtimes)
+    UnifiedScanResult {
+        kg,
+        symbols,
+        edges,
+        mtimes: file_mtimes,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cached pattern store (OnceLock)
+// ---------------------------------------------------------------------------
+
+/// All compiled regex patterns, initialised once and reused across scans.
+struct AllPatterns {
+    code_langs: Vec<LangPatterns>,
+    all_code_patterns: Vec<(regex::Regex, EntityType)>,
+    heading_re: Option<regex::Regex>,
+    bold_re: Option<regex::Regex>,
+    code_fence_re: Option<regex::Regex>,
+    yaml_key_re: Option<regex::Regex>,
+    toml_key_re: Option<regex::Regex>,
+    json_key_re: Option<regex::Regex>,
+    toml_section_re: Option<regex::Regex>,
+    tag_re: Option<regex::Regex>,
+    custom_elem_re: Option<regex::Regex>,
+    aria_role_re: Option<regex::Regex>,
+    semantic_tags: &'static [&'static str],
+    css_class_re: Option<regex::Regex>,
+    css_id_re: Option<regex::Regex>,
+    css_keyframes_re: Option<regex::Regex>,
+    css_media_re: Option<regex::Regex>,
+    vue_script_re: Option<regex::Regex>,
+    vue_template_re: Option<regex::Regex>,
+    vue_component_name_re: Option<regex::Regex>,
+    vue_method_re: Option<regex::Regex>,
+    vue_arrow_fn_re: Option<regex::Regex>,
+}
+
+static PATTERNS: OnceLock<AllPatterns> = OnceLock::new();
+
+/// Return a reference to the statically-cached compiled regex patterns.
+fn get_patterns() -> &'static AllPatterns {
+    PATTERNS.get_or_init(|| {
+        #[allow(clippy::type_complexity)]
+        let code_langs_raw: &[(&[&str], &[(&str, EntityType)])] = &[
+            // Rust
+            (
+                &["rs"],
+                &[
+                    ("(?:pub(?:\\s+async)?\\s+)?fn\\s+(\\w+)\\s*[<(]", EntityType::Tool),
+                    ("struct (\\w+)", EntityType::Concept),
+                    ("trait (\\w+)", EntityType::Concept),
+                    ("impl (\\w+)", EntityType::Concept),
+                    ("enum (\\w+)", EntityType::Concept),
+                ],
+            ),
+            // TypeScript / JavaScript
+            (
+                &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
+                &[
+                    ("(?:export\\s+)?(?:async\\s+)?function\\s+(\\w+)", EntityType::Tool),
+                    ("class (\\w+)", EntityType::Concept),
+                    ("interface (\\w+)", EntityType::Concept),
+                ],
+            ),
+            // Python
+            (
+                &["py"],
+                &[
+                    ("(?:async\\s+)?def\\s+(\\w+)", EntityType::Tool),
+                    ("class (\\w+)", EntityType::Concept),
+                ],
+            ),
+            // Go
+            (
+                &["go"],
+                &[
+                    ("func\\s+(?:\\([^)]*\\)\\s*)?(\\w+)\\s*\\(", EntityType::Tool),
+                    ("type\\s+(\\w+)\\s+(?:struct|interface)", EntityType::Concept),
+                ],
+            ),
+            // Java
+            (
+                &["java"],
+                &[
+                    ("class\\s+(\\w+)", EntityType::Concept),
+                    ("interface\\s+(\\w+)", EntityType::Concept),
+                    (
+                        "(?:public|private|protected|static|\\s)+[\\w<>\\[\\]]+\\s+(\\w+)\\s*\\(",
+                        EntityType::Tool,
+                    ),
+                ],
+            ),
+            // C / C++
+            (
+                &["c", "cpp", "cc", "cxx", "h", "hpp", "hxx"],
+                &[
+                    (
+                        "(?:void|int|bool|char|float|double|long|short|size_t|auto)\\s+(\\w+)\\s*\\(",
+                        EntityType::Tool,
+                    ),
+                    ("struct\\s+(\\w+)", EntityType::Concept),
+                    ("class\\s+(\\w+)", EntityType::Concept),
+                ],
+            ),
+            // Swift
+            (
+                &["swift"],
+                &[
+                    ("func\\s+(\\w+)", EntityType::Tool),
+                    ("class\\s+(\\w+)", EntityType::Concept),
+                    ("struct\\s+(\\w+)", EntityType::Concept),
+                    ("protocol\\s+(\\w+)", EntityType::Concept),
+                ],
+            ),
+            // Kotlin
+            (
+                &["kt", "kts"],
+                &[
+                    ("fun\\s+(\\w+)", EntityType::Tool),
+                    ("class\\s+(\\w+)", EntityType::Concept),
+                    ("interface\\s+(\\w+)", EntityType::Concept),
+                ],
+            ),
+            // Ruby
+            (
+                &["rb"],
+                &[
+                    ("def\\s+(\\w+)", EntityType::Tool),
+                    ("class\\s+(\\w+)", EntityType::Concept),
+                    ("module\\s+(\\w+)", EntityType::Concept),
+                ],
+            ),
+            // Shell
+            (
+                &["sh", "bash", "zsh"],
+                &[
+                    ("(?m)^(\\w+)\\s*\\(\\s*\\)", EntityType::Tool),
+                    ("function\\s+(\\w+)", EntityType::Tool),
+                ],
+            ),
+            // SQL
+            (
+                &["sql"],
+                &[
+                    ("(?i)CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)", EntityType::Concept),
+                    ("(?i)CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(\\w+)", EntityType::Concept),
+                ],
+            ),
+        ];
+
+        let mut code_langs: Vec<LangPatterns> = Vec::with_capacity(code_langs_raw.len());
+        for (exts, pats) in code_langs_raw {
+            let compiled: Vec<(regex::Regex, EntityType)> = pats
+                .iter()
+                .filter_map(|(pat, etype)| regex::Regex::new(pat).ok().map(|re| (re, *etype)))
+                .collect();
+            if !compiled.is_empty() {
+                code_langs.push(LangPatterns {
+                    extensions: exts.iter().map(|s| (*s).to_string()).collect(),
+                    compiled,
+                });
+            }
+        }
+
+        let all_code_patterns: Vec<(regex::Regex, EntityType)> = code_langs
+            .iter()
+            .flat_map(|l| l.compiled.clone())
+            .collect();
+
+        AllPatterns {
+            code_langs,
+            all_code_patterns,
+            heading_re: regex::Regex::new(r"(?m)^#{1,6}\s+(.+)").ok(),
+            bold_re: regex::Regex::new(r"\*\*(.+?)\*\*").ok(),
+            code_fence_re: regex::Regex::new(r"(?s)```(\w*)\s*\n(.*?)```").ok(),
+            yaml_key_re: regex::Regex::new(r"(?m)^([\w][\w._-]*)\s*:").ok(),
+            toml_key_re: regex::Regex::new(r"(?m)^([\w][\w._-]*)\s*=").ok(),
+            json_key_re: regex::Regex::new(r#""(\w[\w_-]*)"\s*:"#).ok(),
+            toml_section_re: regex::Regex::new(r"(?m)^\[(\w[\w_.-]*)\]").ok(),
+            tag_re: regex::Regex::new(r"<([\w-]+)").ok(),
+            custom_elem_re: regex::Regex::new(r"<([a-z]+-[a-z][\w-]*)").ok(),
+            aria_role_re: regex::Regex::new(r#"role="([^"]+)""#).ok(),
+            semantic_tags: &["main", "nav", "article", "section", "header", "footer"],
+            css_class_re: regex::Regex::new(r"\.([a-zA-Z][\w-]+)").ok(),
+            css_id_re: regex::Regex::new(r"#([a-zA-Z][\w-]+)").ok(),
+            css_keyframes_re: regex::Regex::new(r"@keyframes\s+([\w-]+)").ok(),
+            css_media_re: regex::Regex::new(r"@media").ok(),
+            vue_script_re: regex::Regex::new(r"(?s)<script[^>]*>(.*?)</script>").ok(),
+            vue_template_re: regex::Regex::new(r"(?s)<template[^>]*>(.*?)</template>").ok(),
+            vue_component_name_re: regex::Regex::new(
+                r#"(?s)export\s+default\s*\{[^}]*?name\s*:\s*['\"]([^'\"]+)['\"]"#,
+            )
+            .ok(),
+            vue_method_re: regex::Regex::new(r"(?m)^\s*(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{").ok(),
+            vue_arrow_fn_re: regex::Regex::new(r"(?m)(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(")
+                .ok(),
+        }
+    })
+}
+
+/// Scan project files and build a [`KnowledgeGraph`] of all discoverable symbols.
+///
+/// Convenience wrapper around [`unified_scan`] that only returns the knowledge
+/// graph and file mtimes (no tree-sitter extraction).
+///
+/// Walks `project_path` **once** and dispatches to specialised extractors by
+/// extension:
+///
+/// | Extension(s)           | Extractor | Entity types                |
+/// |------------------------|-----------|-----------------------------|
+/// | .rs .ts .py .go .java …| code      | Tool / Concept              |
+/// | .md .rst .txt .adoc     | doc       | DocHeading / DocTerm        |
+/// | .yaml .toml .json       | config    | ConfigKey                   |
+/// | .html .xml .svg         | web       | DataField                   |
+/// | * (any other text)      | unknown   | Concept (first line)        |
+///
+/// Binary files (null byte in first 512 bytes) and files > 1 MiB are skipped.
+///
+/// Returns the knowledge graph and a map of indexed file paths to their
+/// modification timestamps (Unix seconds), used for staleness detection.
+pub fn build_project_kg(project_path: &Path) -> (KnowledgeGraph, HashMap<String, u64>) {
+    let result = unified_scan(project_path, None);
+    (result.kg, result.mtimes)
 }
 
 // ---------------------------------------------------------------------------
