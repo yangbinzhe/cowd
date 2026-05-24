@@ -13,6 +13,7 @@ use std::{
 
 use chrono::Utc;
 use parking_lot::Mutex;
+use std::sync::OnceLock;
 
 use crate::{
     config::MemoryConfig,
@@ -842,8 +843,10 @@ fn estimate_tokens(content: &str) -> u64 {
 /// - `"Alice is child_of Charlie"` → same
 /// - `"Alice's full_name is Alice Smith"` → triple(subject="Alice", predicate="full_name", object="Alice Smith")
 fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Option<Triple> {
-    // Pattern: "X's parent is Y" or "X's parent_is Y"
-    let parent_re = regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).ok()?;
+    static PARENT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static CHILD_RE: OnceLock<regex::Regex> = OnceLock::new();
+    
+    let parent_re = PARENT_RE.get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).unwrap());
     if let Some(caps) = parent_re.captures(content) {
         let subject = caps.get(1)?.as_str().to_string();
         let object = caps.get(2)?.as_str().to_string();
@@ -862,7 +865,7 @@ fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Opt
     }
 
     // Pattern: "X is child_of Y"
-    let child_re = regex::Regex::new(r#"(\w+)\s+is\s+child_of\s+(\w+)"#).ok()?;
+    let child_re = CHILD_RE.get_or_init(|| regex::Regex::new(r#"(\w+)\s+is\s+child_of\s+(\w+)"#).unwrap());
     if let Some(caps) = child_re.captures(content) {
         let subject = caps.get(1)?.as_str().to_string();
         let object = caps.get(2)?.as_str().to_string();
@@ -889,8 +892,9 @@ fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Opt
 /// first write registers the fact, second write with contradictory value
 /// triggers a warning and confidence downgrade.
 fn register_facts_from_content(checker: &mut FactChecker, content: &str, source_agent: Option<&str>) {
-    // Register parent facts
-    let parent_re = regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).ok();
+    static REGISTER_PARENT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    
+    let parent_re = Some(REGISTER_PARENT_RE.get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).unwrap()));
     if let Some(re) = parent_re {
         for caps in re.captures_iter(content) {
             if let (Some(subj), Some(obj)) = (caps.get(1), caps.get(2)) {
