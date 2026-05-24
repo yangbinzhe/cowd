@@ -15,8 +15,13 @@ use serde::{Deserialize, Serialize};
 use crate::code_indexer::{CodeIndexer, CodeSymbol, SymbolEdge};
 use crate::config::StoreConfig;
 use crate::entity::{Entity, EntityType, KnowledgeGraph};
+use crate::entity_registry::EntityRegistry;
 use crate::error::MemoryError;
+use crate::miner::{MemoryMiner, MiningMode};
 use crate::store::sqlite::SqliteStore;
+
+/// Module-level entity registry for dedup during KG building.
+static ENTITY_REGISTRY: OnceLock<Mutex<EntityRegistry>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // MemoryScope
@@ -241,6 +246,40 @@ impl ProjectScopeManager {
             }
         }
 
+        // Seed initial knowledge via MemoryMiner (fire-and-forget)
+        {
+            let project_path = canonical_clone.clone();
+            match tokio::runtime::Handle::try_current() {
+                Ok(_handle) => {
+                    tokio::spawn(async move {
+                        let miner = MemoryMiner::new(MiningMode::Project);
+                        match miner.mine_project(&project_path).await {
+                            Ok(entries) => {
+                                tracing::info!(
+                                    count = entries.len(),
+                                    path = %project_path.display(),
+                                    "miner: seeded {} entries from project structure",
+                                    entries.len()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    path = %project_path.display(),
+                                    "miner: project mining failed (non-fatal)"
+                                );
+                            }
+                        }
+                    });
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "miner: no tokio runtime available, skipping project mining"
+                    );
+                }
+            }
+        }
+
         if project_registered_cb.is_some() {
             let inner = self.inner.lock().unwrap();
             if let Some(ref cb) = inner.on_project_registered {
@@ -393,6 +432,9 @@ pub fn unified_scan(
     project_path: &Path,
     mut indexer: Option<&mut CodeIndexer>,
 ) -> UnifiedScanResult {
+    // Initialize the module-level entity registry for dedup
+    ENTITY_REGISTRY.get_or_init(|| Mutex::new(EntityRegistry::new()));
+
     let patterns = get_patterns();
     let mut kg = KnowledgeGraph::new();
     let mut symbols = Vec::new();
@@ -1309,6 +1351,14 @@ fn add_entity(
     now: &DateTime<Utc>,
     kg: &mut KnowledgeGraph,
 ) {
+    // Dedup via module-level entity_registry
+    if let Some(reg_lock) = ENTITY_REGISTRY.get() {
+        if let Ok(reg) = reg_lock.lock() {
+            if reg.resolve(name, Some(source_type)).is_some() {
+                return;
+            }
+        }
+    }
     let entity = Entity {
         id: format!(
             "project-kg-{}-{}",
