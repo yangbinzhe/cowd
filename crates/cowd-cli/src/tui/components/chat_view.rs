@@ -223,10 +223,12 @@ impl ChatView {
 
     /// Total number of content lines (including separator blanks and spinner).
     pub fn total_lines(&self) -> usize {
+        let count = self.entry_line_counts.len();
         let mut total: usize = self
             .entry_line_counts
             .iter()
-            .map(|&c| c as usize + 1)
+            .enumerate()
+            .map(|(i, &c)| c as usize + if i + 1 < count { 1 } else { 0 })
             .sum();
         if total == 0 && self.timeline.is_empty() {
             total = 1;
@@ -250,7 +252,7 @@ impl Component for ChatView {
 
         // ── Auto-scroll ──
         if self.auto_scroll && total_lines > viewport_h {
-            self.scroll_offset = (total_lines - viewport_h) as u16;
+            self.scroll_offset = (total_lines.saturating_sub(viewport_h)) as u16;
         }
         let scroll_off = self
             .scroll_offset
