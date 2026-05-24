@@ -205,13 +205,19 @@ impl ProjectLayer {
             let path = entry.path();
             if crate::code_indexer::IndexLanguage::is_indexable(path) {
                 match indexer.index_file(path) {
-                    Ok((symbols, _edges)) => {
+                    Ok((symbols, edges)) => {
                         stats.files_processed += 1;
                         stats.symbols_found += symbols.len();
                         // Persist each symbol via the store trait
                         for sym in &symbols {
                             if self.store.insert_symbol(sym).await.is_err() {
                                 // Continue even if one symbol fails
+                            }
+                        }
+                        // Persist each edge (calls/imports/extends/implements)
+                        for edge in &edges {
+                            if self.store.insert_edge(edge).await.is_err() {
+                                // Continue even if one edge fails
                             }
                         }
                     }

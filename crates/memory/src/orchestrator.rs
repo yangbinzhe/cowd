@@ -6,7 +6,7 @@
 
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -176,6 +176,29 @@ impl MemoryOrchestrator {
         limit: usize,
     ) -> Vec<crate::code_indexer::CodeSymbol> {
         self.l2.find_relevant_symbols(query, limit).await
+    }
+
+    /// Record that source files were accessed by a tool.
+    ///
+    /// Automatically promotes relevant symbols to the hot-symbol cache
+    /// in the essential layer (L1), so that frequently-accessed code
+    /// symbols are tracked and surfaced in future context preparation.
+    ///
+    /// Call this after each tool invocation that touches source files
+    /// (e.g., `read_file`, `edit_file`, `grep_search`, `glob_search`).
+    pub async fn note_file_access(&self, file_paths: &[&str]) {
+        for path_str in file_paths {
+            let path = Path::new(path_str);
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if stem.is_empty() {
+                    continue;
+                }
+                let symbols = self.l2.find_relevant_symbols(stem, 3).await;
+                for sym in &symbols {
+                    self.l1.promote_symbol(&sym.name);
+                }
+            }
+        }
     }
 
     /// Recall relevant memories on-demand (L3 + L4), pre-routed through

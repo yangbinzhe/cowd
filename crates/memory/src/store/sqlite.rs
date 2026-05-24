@@ -1972,6 +1972,17 @@ impl MemoryStore for SqliteStore {
         .map_err(|e| MemoryError::Store(e.to_string()))?
     }
 
+    async fn insert_edge(&self, edge: &SymbolEdge) -> Result<()> {
+        let store = self.clone();
+        let edge = edge.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_insert_edges(&conn, &[edge])
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
     async fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<CodeSymbol>> {
         let store = self.clone();
         let query = query.to_string();

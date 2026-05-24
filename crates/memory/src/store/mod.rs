@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 
 use crate::{
-    code_indexer::CodeSymbol,
+    code_indexer::{CodeSymbol, SymbolEdge},
     entity::{Entity, Triple},
     error::MemoryError,
     project_scope::MemoryScope,
@@ -152,6 +152,11 @@ pub trait MemoryStore: Send + Sync {
     /// Full-text search across indexed code symbols.
     async fn search_symbols(&self, _query: &str, _limit: usize) -> Result<Vec<CodeSymbol>> {
         Err(MemoryError::Store("code symbol search not supported by this backend".into()))
+    }
+
+    /// Persist a code edge (call/import/extends/implements) between two symbols.
+    async fn insert_edge(&self, _edge: &SymbolEdge) -> Result<()> {
+        Err(MemoryError::Store("code edge storage not supported by this backend".into()))
     }
 
     /// Find all symbols that call the given symbol (callers / upstream).
