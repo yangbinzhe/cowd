@@ -3867,6 +3867,9 @@ async fn create_session_handler(
         message_count: 0,
         reset_policy: "none".to_string(),
         metadata_json: None,
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0.0,
     };
 
     if let Err(e) = state.session_store.create_session(&record) {

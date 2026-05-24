@@ -1,12 +1,20 @@
 use async_trait::async_trait;
-use crate::types::MemoryEntry;
+use crate::types::{MemoryEntry, Message};
 
 #[async_trait]
 pub trait MemoryProvider: Send + Sync {
     async fn store(&self, entry: MemoryEntry) -> Result<(), String>;
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>, String>;
-    async fn on_turn_end(&self, _messages: &[crate::types::Message]) -> Result<(), String> { Ok(()) }
+    async fn on_turn_end(&self, _messages: &[Message]) -> Result<(), String> { Ok(()) }
     async fn shutdown(&self) -> Result<(), String> { Ok(()) }
+
+    // Lifecycle hooks (hermes-agent inspired, all no-op by default)
+    async fn on_session_start(&self, _session_id: &str) -> Result<(), String> { Ok(()) }
+    async fn on_turn_start(&self, _turn_number: u32, _message: &str) -> Result<(), String> { Ok(()) }
+    async fn on_pre_compress(&self, _messages: &[Message]) -> Result<String, String> { Ok(String::new()) }
+    async fn on_session_switch(&self, _new_id: &str, _reset: bool) -> Result<(), String> { Ok(()) }
+    async fn on_delegation(&self, _task: &str, _result: &str) -> Result<(), String> { Ok(()) }
+    async fn on_memory_write(&self, _action: &str, _target: &str, _content: &str) -> Result<(), String> { Ok(()) }
 }
 
 pub struct NoopMemoryProvider;

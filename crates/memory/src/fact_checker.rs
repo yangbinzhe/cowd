@@ -74,19 +74,103 @@ const UNIVERSAL_PREDICATES: &[&str] = &[
 pub struct FactChecker {
     /// Registered entity facts keyed by entity name (lowercased).
     entity_facts: HashMap<String, EntityFacts>,
+    /// Stored triples for cross-agent conflict detection and consensus.
+    triples: Vec<Triple>,
+    /// Per-agent reliability weights. Default: Orchestrator=1.0, Reviewer=0.8, Executor=0.6, unknown=0.4.
+    pub agent_weights: HashMap<String, f32>,
+    /// Count of successful fact writes (used for weight adjustment logic).
+    pub success_count: u32,
 }
 
 impl FactChecker {
     /// Create a new fact checker with no registered facts.
     pub fn new() -> Self {
+        let mut agent_weights = HashMap::new();
+        agent_weights.insert("Orchestrator".to_string(), 1.0);
+        agent_weights.insert("Reviewer".to_string(), 0.8);
+        agent_weights.insert("Executor".to_string(), 0.6);
+        agent_weights.insert("unknown".to_string(), 0.4);
         Self {
             entity_facts: HashMap::new(),
+            triples: Vec::new(),
+            agent_weights,
+            success_count: 0,
         }
     }
 
     /// Register known facts about an entity.
     pub fn register_facts(&mut self, entity: &str, facts: EntityFacts) {
         self.entity_facts.insert(entity.to_lowercase(), facts);
+    }
+
+    /// Store a triple for cross-agent conflict detection and consensus.
+    pub fn register_triple(&mut self, triple: Triple) {
+        self.success_count = self.success_count.wrapping_add(1);
+        self.triples.push(triple);
+    }
+
+    /// Adjust an agent's reliability weight by `delta` (±0.05 per event).
+    pub fn adjust_agent_weight(&mut self, agent: &str, delta: f32) {
+        let key = if agent.is_empty() { "unknown" } else { agent };
+        let entry = self.agent_weights.entry(key.to_string()).or_insert(0.4);
+        *entry = (*entry + delta).clamp(0.1, 2.0);
+    }
+
+    /// Detect cross-agent conflict: same subject+predicate, different object, different source_agent.
+    ///
+    /// Returns the conflicting triple and a conflict score if found.
+    /// Score = 0.4*confidence + 0.3*recency + 0.3*agent_weight.
+    pub fn detect_conflict(&self, triple: &Triple) -> Option<(&Triple, f32)> {
+        let agent = triple.source_agent.as_deref().unwrap_or("unknown");
+        let weight = self
+            .agent_weights
+            .get(agent)
+            .copied()
+            .unwrap_or(0.4);
+        let now = chrono::Utc::now();
+
+        for existing in self.triples.iter().rev() {
+            if existing.subject == triple.subject
+                && existing.predicate == triple.predicate
+                && existing.object != triple.object
+                && existing.source_agent != triple.source_agent
+                && existing.valid_until.is_none()
+            {
+                let age_hours = existing
+                    .valid_from
+                    .map(|t| (now - t).num_hours().max(0) as f32)
+                    .unwrap_or(24.0);
+                let recency_factor = (1.0 / (1.0 + age_hours)).clamp(0.0, 1.0);
+                let score = 0.4 * existing.confidence + 0.3 * recency_factor + 0.3 * weight;
+                return Some((existing, score));
+            }
+        }
+        None
+    }
+
+    /// Check if 3+ distinct agents agree on the same (subject, predicate, object).
+    pub fn detect_consensus(&self, subject: &str, predicate: &str, object: &str) -> bool {
+        let agents: std::collections::HashSet<&str> = self
+            .triples
+            .iter()
+            .filter(|t| {
+                t.subject == subject
+                    && t.predicate == predicate
+                    && t.object == object
+                    && t.valid_until.is_none()
+            })
+            .filter_map(|t| t.source_agent.as_deref())
+            .collect();
+        agents.len() >= 3
+    }
+
+    /// Get the consensus confidence for a fact (0.95 if 3+ agents agree, otherwise original).
+    pub fn consensus_confidence(&self, triple: &Triple) -> f32 {
+        if self.detect_consensus(&triple.subject, &triple.predicate, &triple.object) {
+            0.95
+        } else {
+            triple.confidence
+        }
     }
 
     /// Check a single triple against known facts.
@@ -269,6 +353,7 @@ mod tests {
             confidence: 1.0,
             source_memory_id: None,
             source_file: None,
+            source_agent: None,
         };
 
         let result = checker.check_triple(&triple);
@@ -294,6 +379,7 @@ mod tests {
             confidence: 1.0,
             source_memory_id: None,
             source_file: None,
+            source_agent: None,
         };
 
         let result = checker.check_triple(&triple);
@@ -319,6 +405,7 @@ mod tests {
             confidence: 1.0,
             source_memory_id: None,
             source_file: None,
+            source_agent: None,
         };
 
         let result = checker.check_triple(&triple);
@@ -340,6 +427,7 @@ mod tests {
             confidence: 0.8,
             source_memory_id: None,
             source_file: None,
+            source_agent: None,
         };
 
         let result = checker.check_triple(&triple);

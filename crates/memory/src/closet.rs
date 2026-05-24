@@ -167,28 +167,26 @@ pub struct ClosetManager {
 impl ClosetManager {
     /// Build a [`Closet`] index from L2 (project) and L3 (deep) memory layers.
     ///
-    /// Extracts memory metadata, converts to [`ClosetEntry`] items, and runs
-    /// [`Closet::build`] to create the pointer-row index.
+    /// Loads the **full content** of each entry so that keyword extraction
+    /// operates on meaningful text rather than bare metadata.
     pub async fn build_from_orchestrator(
         orchestrator: &MemoryOrchestrator,
     ) -> Result<Self, crate::error::MemoryError> {
-        // Collect entries from L2 and L3 layers.
         let l2_metas = orchestrator.list_layer(MemoryLayer::L2).await?;
         let l3_metas = orchestrator.list_layer(MemoryLayer::L3).await?;
 
-        let entries: Vec<ClosetEntry> = l2_metas
-            .into_iter()
-            .chain(l3_metas)
-            .map(|meta| ClosetEntry {
+        let mut entries: Vec<ClosetEntry> = Vec::new();
+        for meta in l2_metas.into_iter().chain(l3_metas) {
+            let Some(full_entry) = orchestrator.recall(&meta.id).await? else {
+                continue;
+            };
+            entries.push(ClosetEntry {
                 id: meta.id.to_string(),
                 title: meta.title.clone(),
-                content: format!(
-                    "{} (category: {:?}, priority: {:?})",
-                    meta.title, meta.category, meta.priority
-                ),
+                content: full_entry.content,
                 entities: meta.tags,
-            })
-            .collect();
+            });
+        }
 
         Ok(Self {
             closet: Closet::build(&entries),

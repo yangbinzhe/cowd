@@ -745,6 +745,83 @@ impl AaakCompressor {
             .collect::<Vec<&str>>()
             .join(" ")
     }
+
+    /// Generate a compact AAC pointer row from verbatim content.
+    pub fn aac_index(&self, text: &str) -> String {
+        let zid = {
+            let hash = self.hash_string(text);
+            format!("Z{:04x}", (hash & 0xFFFF) as u16)
+        };
+
+        let entities: Vec<&str> = {
+            let mut caps: Vec<&str> = text
+                .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+                .filter(|w| {
+                    w.len() >= 2
+                        && w.chars().next().map_or(false, |c| c.is_uppercase())
+                        && w.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                })
+                .collect();
+            caps.sort();
+            caps.dedup();
+            caps.truncate(5);
+            caps
+        };
+        let entity_str = if entities.is_empty() {
+            String::from("-")
+        } else {
+            entities.join(",")
+        };
+
+        let key_quote = {
+            let first_sent = text
+                .split(|c: char| c == '.' || c == '!' || c == '?' || c == '\n')
+                .next()
+                .unwrap_or("")
+                .trim();
+            let truncated: String = first_sent.chars().take(20).collect();
+            if first_sent.len() > 20 {
+                format!("\"{}…\"", truncated)
+            } else {
+                format!("\"{}\"", truncated)
+            }
+        };
+
+        let weight = {
+            let len = text.len();
+            if len < 200 {
+                "W1"
+            } else if len < 1000 {
+                "W2"
+            } else {
+                "W3"
+            }
+        };
+
+        let mut flags = Vec::new();
+        let lower = text.to_lowercase();
+        if lower.contains("origin") || lower.contains("source") || lower.contains("最初") {
+            flags.push("O");
+        }
+        if lower.contains("core") || lower.contains("essential") || lower.contains("核心") {
+            flags.push("C");
+        }
+        if lower.contains("decision") || lower.contains("决定") || lower.contains("选择") {
+            flags.push("D");
+        }
+        if lower.contains("technical") || lower.contains("技术")
+            || lower.contains("config") || lower.contains("fn ") || lower.contains("def ")
+        {
+            flags.push("T");
+        }
+        let flag_str: String = if flags.is_empty() {
+            "F-".into()
+        } else {
+            format!("F{}", flags.join(""))
+        };
+
+        format!("{zid} | {entity_str} | {key_quote} | {weight} | {flag_str}")
+    }
 }
 
 /// P1-9: Compression mode selector.

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use crate::{
+    MemoryScope,
     compression::{
         llm_summarizer::LlmSummarizer,
         Result,
@@ -138,7 +139,7 @@ impl DeepCompactor {
                 Priority::High,
                 MemorySource::Compression,
                 vec!["compression".into(), "deep-summary".into()],
-                None,
+                MemoryScope::default(),
             )
             .await
             .map_err(|e| crate::error::MemoryError::Compression(e.to_string()))?;
@@ -155,7 +156,7 @@ impl DeepCompactor {
                     Priority::High,
                     MemorySource::Compression,
                     vec!["compression".into(), "deep-decision".into()],
-                    None,
+                    MemoryScope::default(),
                 )
                 .await
                 .map_err(|e| crate::error::MemoryError::Compression(e.to_string()))?;

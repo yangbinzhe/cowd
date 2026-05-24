@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 
 use crate::error::MemoryError;
 use crate::handoff::HandoffManager;
+use crate::MemoryScope;
 use crate::types::{MemoryEntry, MemoryLayer, Priority};
 
 /// Result type for fresh context operations.
@@ -246,8 +247,10 @@ impl FreshContextManager {
                     created_at: chrono::DateTime::from_timestamp(now_secs, 0).unwrap_or_default(),
                     updated_at: chrono::DateTime::from_timestamp(now_secs, 0).unwrap_or_default(),
                     last_accessed_at: None,
-                    scope: None,
+                    scope: MemoryScope::default(),
                     session_id: Some(session_id.to_string()),
+                    source_agent: None,
+                    visibility: crate::types::AgentVisibility::default(),
                 });
             }
 
@@ -277,8 +280,10 @@ impl FreshContextManager {
                     created_at: chrono::DateTime::from_timestamp(now_secs, 0).unwrap_or_default(),
                     updated_at: chrono::DateTime::from_timestamp(now_secs, 0).unwrap_or_default(),
                     last_accessed_at: None,
-                    scope: None,
+                    scope: MemoryScope::default(),
                     session_id: Some(session_id.to_string()),
+                    source_agent: None,
+                    visibility: crate::types::AgentVisibility::default(),
                 });
             }
 
@@ -306,8 +311,10 @@ impl FreshContextManager {
                     created_at: chrono::DateTime::from_timestamp(now_secs, 0).unwrap_or_default(),
                     updated_at: chrono::DateTime::from_timestamp(now_secs, 0).unwrap_or_default(),
                     last_accessed_at: None,
-                    scope: None,
+                    scope: MemoryScope::default(),
                     session_id: Some(session_id.to_string()),
+                    source_agent: None,
+                    visibility: crate::types::AgentVisibility::default(),
                 });
             }
 
@@ -396,8 +403,10 @@ mod tests {
             created_at: chrono::DateTime::from_timestamp(now_secs - 3600, 0).unwrap_or_default(),
             updated_at: chrono::DateTime::from_timestamp(now_secs - 3600, 0).unwrap_or_default(),
             last_accessed_at: None,
-            scope: None,
+            scope: MemoryScope::default(),
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
 
         let fresh = FreshEntry::from_entry(recent_entry.clone(), now_secs);

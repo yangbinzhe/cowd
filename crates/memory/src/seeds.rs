@@ -148,6 +148,12 @@ impl SeedRegistry {
         self.seeds.is_empty()
     }
 
+    /// Return all seeds (active + inactive) for serialization/persistence.
+    #[must_use]
+    pub fn all_seeds(&self) -> &[Seed] {
+        &self.seeds
+    }
+
     // ─── Bootstrapping ──────────────────────────────────────────────────────
 
     /// Bootstrap the registry with common system seeds.

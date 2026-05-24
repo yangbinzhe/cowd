@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::{
     config::DriftConfig,
     layers::{LayerManager, Result},
+    project_scope::MemoryScope,
     store::MemoryStore,
     types::{
         MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, PreparedContext,
@@ -88,7 +89,7 @@ impl ProjectLayer {
         priority: Priority,
         source: MemorySource,
         tags: Vec<String>,
-        scope: Option<String>,
+        scope: MemoryScope,
     ) -> Result<MemoryId> {
         let now = Utc::now();
         let entry = MemoryEntry {
@@ -110,6 +111,8 @@ impl ProjectLayer {
             last_accessed_at: None,
             scope,
             session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
         let id = self.store.insert(&entry).await?;
         Ok(id)
@@ -142,7 +145,7 @@ impl ProjectLayer {
     /// Ingest project context files into the store as L2 entries.
     ///
     /// Already-ingested files (matched by title) are skipped.
-    pub async fn ingest_project_context(&self, scope: Option<String>) -> Result<Vec<MemoryId>> {
+    pub async fn ingest_project_context(&self, scope: MemoryScope) -> Result<Vec<MemoryId>> {
         let files = self.discover_project_context().await?;
         let existing = self.store.search_by_layer(MemoryLayer::L2).await?;
         let existing_titles: std::collections::HashSet<String> =
@@ -313,7 +316,7 @@ mod tests {
                 Priority::High,
                 MemorySource::Import,
                 vec!["style".into()],
-                Some("repo-1".into()),
+                MemoryScope::Project("repo-1".into()),
             )
             .await
             .unwrap();
@@ -324,7 +327,7 @@ mod tests {
         assert_eq!(entries[0].layer, MemoryLayer::L2);
         assert_eq!(entries[0].category, MemoryCategory::ProjectConvention);
         assert_eq!(entries[0].title, "coding-standard");
-        assert_eq!(entries[0].scope.as_deref(), Some("repo-1"));
+        assert_eq!(entries[0].scope, MemoryScope::Project("repo-1".into()));
     }
 
     #[tokio::test]
@@ -336,7 +339,8 @@ mod tests {
             title: "t".into(), content: "c".into(), embedding: None,
             tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
             staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            last_accessed_at: None, scope: None, session_id: None,
+            last_accessed_at: None, scope: MemoryScope::default(), session_id: None,
+            source_agent: None, visibility: crate::types::AgentVisibility::default(),
         };
         let id = layer.insert(entry).await.unwrap();
         let loaded = layer.load().await.unwrap().into_iter().find(|e| e.id == id).unwrap();
@@ -385,7 +389,7 @@ mod tests {
         let layer = ProjectLayer::with_workspace(
             in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
         );
-        let ids = layer.ingest_project_context(Some("p1".into())).await.unwrap();
+        let ids = layer.ingest_project_context(MemoryScope::Project("p1".into())).await.unwrap();
         assert_eq!(ids.len(), 1);
 
         let entries = layer.load().await.unwrap();
@@ -401,9 +405,9 @@ mod tests {
         let layer = ProjectLayer::with_workspace(
             in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
         );
-        let ids1 = layer.ingest_project_context(None).await.unwrap();
+        let ids1 = layer.ingest_project_context(MemoryScope::default()).await.unwrap();
         assert_eq!(ids1.len(), 1);
-        let ids2 = layer.ingest_project_context(None).await.unwrap();
+        let ids2 = layer.ingest_project_context(MemoryScope::default()).await.unwrap();
         assert!(ids2.is_empty());
     }
 
@@ -416,7 +420,7 @@ mod tests {
         };
         let layer = ProjectLayer::with_workspace(in_memory(), std::path::PathBuf::from("/tmp/test"), 3000, drift);
         layer
-            .add(MemoryCategory::ProjectConvention, "T", "C", Priority::Low, MemorySource::Import, vec![], None)
+            .add(MemoryCategory::ProjectConvention, "T", "C", Priority::Low, MemorySource::Import, vec![], MemoryScope::default())
             .await
             .unwrap();
         layer.tick().await.unwrap();

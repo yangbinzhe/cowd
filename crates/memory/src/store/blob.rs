@@ -248,6 +248,7 @@ fn category_str(cat: MemoryCategory) -> &'static str {
         MemoryCategory::Reference => "reference",
         MemoryCategory::Shared => "shared",
         MemoryCategory::CompressedSummary => "compressed_summary",
+        MemoryCategory::ProjectKnowledge => "project_knowledge",
     }
 }
 

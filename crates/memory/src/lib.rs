@@ -49,6 +49,7 @@ pub mod aaak_compression;
 pub mod aaak_index;
 pub mod coherence;
 pub mod context_fence;
+pub mod context_rot;
 pub mod context_sync;
 pub mod fact_checker;
 pub mod fresh_context;
@@ -56,6 +57,8 @@ pub mod temporal_graph;
 pub mod write_guard;
 pub mod closet;
 pub mod miner;
+pub mod session_resume;
+pub mod project_scope;
 pub mod tool_sandbox;
 
 // --- Convenience re-exports ---
@@ -66,6 +69,7 @@ pub use fresh_context::{
     FreshContextManager, FreshEntry, SessionTokenBudget, SessionBudgetStatus,
 };
 pub use store::session::{SessionRecord, SessionSearchResult, SqliteSessionStore};
+pub use store::verbatim::{VerbatimEntry, VerbatimSink};
 pub use embedding::{EmbeddingClient, EmbeddingCapability};
 pub use error::MemoryError;
 pub use orchestrator::MemoryOrchestrator;
@@ -79,6 +83,7 @@ pub use hot_reload::{
     HotReloadHandle, SharedConfigReloader,
 };
 pub use types::{
+    AgentVisibility,
     AlertLevel,
     Blocker,
     ContextAction,
@@ -137,7 +142,12 @@ pub use write_guard::{
 };
 pub use tool_sandbox::{ToolOutputSandbox, ToolOutputSummary};
 pub use closet::{Closet, ClosetPointer, ClosetEntry, ClosetManager, RANK_BOOSTS, CHAR_LIMIT};
+pub use session_resume::SessionResume;
+pub use context_rot::{ContextRotMonitor, RotMetrics, RotAlert};
 pub use compression::token_estimation::{
     TokenEstimator, HeuristicEstimator, SimpleTokenEstimator,
     estimate_tokens_text, estimate_tokens_messages,
 };
+
+// --- Project scope re-exports ---
+pub use project_scope::{build_project_kg, MemoryScope, ProjectManifest, ProjectScopeManager};

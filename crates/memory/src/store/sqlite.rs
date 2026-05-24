@@ -16,15 +16,18 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::Path;
 use uuid::Uuid;
 
 use crate::{
     config::StoreConfig,
+    entity::{Entity, Triple},
     error::MemoryError,
-    store::{FtsSearchOptions, FtsSearchResult, MemoryStore, Result},
+    project_scope::MemoryScope,
+    store::{FtsSearchOptions, FtsSearchResult, MemoryStore, Result, VerbatimEntry},
     types::{
-        MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta, MemorySource, Priority,
+        AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta, MemorySource, Priority,
         Relation,
     },
 };
@@ -55,11 +58,19 @@ fn sql_err(e: rusqlite::Error) -> MemoryError {
     MemoryError::Store(e.to_string())
 }
 
+/// Open a fresh WAL-enabled connection for use by the [`VerbatimSink`].
+///
+/// Exposed so that [`VerbatimSink`](super::verbatim::VerbatimSink) can share
+/// the same database file without depending on [`SqliteStore`] directly.
+pub fn open_conn_for_verbatim(db_path: &str) -> Result<Connection> {
+    open_conn(db_path)
+}
+
 // ---------------------------------------------------------------------------
 // Helper: enum ↔ integer / string conversions
 // ---------------------------------------------------------------------------
 
-fn layer_to_int(l: MemoryLayer) -> i32 {
+pub(crate) fn layer_to_int(l: MemoryLayer) -> i32 {
     match l {
         MemoryLayer::L0 => 0,
         MemoryLayer::L1 => 1,
@@ -88,6 +99,7 @@ fn category_to_str(c: MemoryCategory) -> &'static str {
         MemoryCategory::Reference => "Reference",
         MemoryCategory::Shared => "Shared",
         MemoryCategory::CompressedSummary => "CompressedSummary",
+        MemoryCategory::ProjectKnowledge => "ProjectKnowledge",
     }
 }
 
@@ -99,6 +111,7 @@ fn str_to_category(s: &str) -> std::result::Result<MemoryCategory, MemoryError> 
         "Reference" => Ok(MemoryCategory::Reference),
         "Shared" => Ok(MemoryCategory::Shared),
         "CompressedSummary" => Ok(MemoryCategory::CompressedSummary),
+        "ProjectKnowledge" => Ok(MemoryCategory::ProjectKnowledge),
         _ => Err(MemoryError::Store(format!("unknown category: {s}"))),
     }
 }
@@ -122,7 +135,7 @@ fn int_to_priority(v: i32) -> std::result::Result<Priority, MemoryError> {
     }
 }
 
-fn source_to_str(s: MemorySource) -> &'static str {
+pub(crate) fn source_to_str(s: MemorySource) -> &'static str {
     match s {
         MemorySource::UserExplicit => "UserExplicit",
         MemorySource::AutoExtracted => "AutoExtracted",
@@ -174,7 +187,17 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let updated_at_str: String = row.get(14)?;
     let last_accessed_str: Option<String> = row.get(15)?;
     let scope: Option<String> = row.get(16)?;
+    let scope = scope
+        .as_deref()
+        .map(|s| s.parse::<MemoryScope>().unwrap_or_default())
+        .unwrap_or_default();
     let session_id: Option<String> = row.get(17)?;
+    let source_agent: Option<String> = row.get(18).unwrap_or(None);
+    let visibility_str: Option<String> = row.get(19).unwrap_or(None);
+    let visibility: AgentVisibility = visibility_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
 
     let id = Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -239,6 +262,8 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         last_accessed_at,
         scope,
         session_id,
+        source_agent,
+        visibility,
     })
 }
 
@@ -326,29 +351,31 @@ fn init_schema(conn: &Connection) -> Result<()> {
     created_at       TEXT    NOT NULL,
     updated_at       TEXT    NOT NULL,
     last_accessed_at TEXT,
-    scope            TEXT,
-    session_id       TEXT
+            scope            TEXT,
+            session_id       TEXT,
+            source_agent     TEXT,
+            visibility       TEXT
 )",
         r"CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     id      UNINDEXED,
     title,
     content,
-    tags,
+    tags_json,
     content=memories,
     content_rowid=rowid
 )",
         r"CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-    INSERT INTO memories_fts(rowid, id, title, content, tags)
+    INSERT INTO memories_fts(rowid, id, title, content, tags_json)
         VALUES (new.rowid, new.id, new.title, new.content, new.tags_json);
 END",
         r"CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, id, title, content, tags)
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, content, tags_json)
         VALUES ('delete', old.rowid, old.id, old.title, old.content, old.tags_json);
 END",
         r"CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, id, title, content, tags)
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, content, tags_json)
         VALUES ('delete', old.rowid, old.id, old.title, old.content, old.tags_json);
-    INSERT INTO memories_fts(rowid, id, title, content, tags)
+    INSERT INTO memories_fts(rowid, id, title, content, tags_json)
         VALUES (new.rowid, new.id, new.title, new.content, new.tags_json);
 END",
         r"CREATE TABLE IF NOT EXISTS memory_meta (
@@ -379,11 +406,40 @@ END",
         "CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations(subject_id)",
         "CREATE INDEX IF NOT EXISTS idx_relations_object  ON relations(object_id)",
         "CREATE INDEX IF NOT EXISTS idx_entities_type     ON entities(entity_type)",
+        r"CREATE TABLE IF NOT EXISTS kg_store (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)",
+        r"CREATE TABLE IF NOT EXISTS verbatim_entries (
+    id        TEXT    PRIMARY KEY,
+    content   TEXT    NOT NULL,
+    source    TEXT    NOT NULL,
+    layer     INTEGER NOT NULL,
+    timestamp TEXT    NOT NULL
+)",
+        r"CREATE TABLE IF NOT EXISTS vector_embeddings (
+    memory_id TEXT    PRIMARY KEY,
+    embedding BLOB    NOT NULL,
+    dimension INTEGER NOT NULL,
+    created_at TEXT   NOT NULL
+)",
+        r"CREATE TABLE IF NOT EXISTS closet_store (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)",
+        r"CREATE TABLE IF NOT EXISTS seed_store (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)",
     ];
 
     for stmt in statements {
         conn.execute_batch(stmt).map_err(sql_err)?;
     }
+
+    // Phase 1 migration: add source_agent and visibility columns.
+    let _ = conn.execute_batch("ALTER TABLE memories ADD COLUMN source_agent TEXT");
+    let _ = conn.execute_batch("ALTER TABLE memories ADD COLUMN visibility TEXT");
     Ok(())
 }
 
@@ -468,8 +524,8 @@ impl SqliteStore {
                (id, layer, category, priority, source, title, content,
                 embedding_json, tags_json, relations_json, confidence,
                 access_count, staleness, created_at, updated_at,
-                last_accessed_at, scope, session_id)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                last_accessed_at, scope, session_id, source_agent, visibility)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 entry.id.to_string(),
                 layer_to_int(entry.layer),
@@ -487,8 +543,10 @@ impl SqliteStore {
                 entry.created_at.to_rfc3339(),
                 entry.updated_at.to_rfc3339(),
                 entry.last_accessed_at.map(|dt| dt.to_rfc3339()),
-                entry.scope.as_deref(),
+                entry.scope.to_string().as_str(),
                 entry.session_id.as_deref(),
+                entry.source_agent.as_deref(),
+                serde_json::to_string(&entry.visibility).ok().as_deref(),
             ],
         )
         .map_err(sql_err)?;
@@ -502,7 +560,7 @@ impl SqliteStore {
                 r"SELECT id, layer, category, priority, source, title, content,
                           embedding_json, tags_json, relations_json, confidence,
                           access_count, staleness, created_at, updated_at,
-                          last_accessed_at, scope, session_id
+                          last_accessed_at, scope, session_id, source_agent, visibility
                    FROM memories WHERE id = ?1",
                 params![id_str],
                 row_to_entry,
@@ -536,7 +594,7 @@ impl SqliteStore {
                title = ?6, content = ?7, embedding_json = ?8, tags_json = ?9,
                relations_json = ?10, confidence = ?11, access_count = ?12,
                staleness = ?13, updated_at = ?14, last_accessed_at = ?15,
-               scope = ?16, session_id = ?17
+               scope = ?16, session_id = ?17, source_agent = ?18, visibility = ?19
                WHERE id = ?1",
             params![
                 entry.id.to_string(),
@@ -554,8 +612,10 @@ impl SqliteStore {
                 entry.staleness,
                 entry.updated_at.to_rfc3339(),
                 entry.last_accessed_at.map(|dt| dt.to_rfc3339()),
-                entry.scope.as_deref(),
+                entry.scope.to_string().as_str(),
                 entry.session_id.as_deref(),
+                entry.source_agent.as_deref(),
+                serde_json::to_string(&entry.visibility).ok().as_deref(),
             ],
         )
         .map_err(sql_err)?;
@@ -590,22 +650,40 @@ impl SqliteStore {
             .join(" AND ")
     }
 
-    fn do_search_fts(conn: &Connection, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
-        let sql = r"
+    fn do_search_fts(conn: &Connection, query: &str, limit: usize, scope: Option<&str>) -> Result<Vec<MemoryEntry>> {
+        let sql = if scope.is_some() {
+            r"
             SELECT m.id, m.layer, m.category, m.priority, m.source, m.title, m.content,
                    m.embedding_json, m.tags_json, m.relations_json, m.confidence,
                    m.access_count, m.staleness, m.created_at, m.updated_at,
-                   m.last_accessed_at, m.scope, m.session_id
+                   m.last_accessed_at, m.scope, m.session_id, m.source_agent, m.visibility
+            FROM memories m
+            JOIN memories_fts fts ON m.id = fts.id
+            WHERE memories_fts MATCH ?1
+              AND (m.scope = 'global' OR m.scope = ?2)
+            ORDER BY rank
+            LIMIT ?3
+        "
+        } else {
+            r"
+            SELECT m.id, m.layer, m.category, m.priority, m.source, m.title, m.content,
+                   m.embedding_json, m.tags_json, m.relations_json, m.confidence,
+                   m.access_count, m.staleness, m.created_at, m.updated_at,
+                   m.last_accessed_at, m.scope, m.session_id, m.source_agent, m.visibility
             FROM memories m
             JOIN memories_fts fts ON m.id = fts.id
             WHERE memories_fts MATCH ?1
             ORDER BY rank
             LIMIT ?2
-        ";
+        "
+        };
         let mut stmt = conn.prepare(sql).map_err(sql_err)?;
-        let rows = stmt
-            .query_map(params![query, limit as i64], row_to_entry)
-            .map_err(sql_err)?;
+        let rows = if let Some(s) = scope {
+            stmt.query_map(params![query, s, limit as i64], row_to_entry)
+        } else {
+            stmt.query_map(params![query, limit as i64], row_to_entry)
+        }
+        .map_err(sql_err)?;
         let mut entries = Vec::new();
         for r in rows {
             entries.push(r.map_err(sql_err)?);
@@ -640,7 +718,7 @@ impl SqliteStore {
             r"SELECT m.id, m.layer, m.category, m.priority, m.source, m.title, m.content,
                       m.embedding_json, m.tags_json, m.relations_json, m.confidence,
                       m.access_count, m.staleness, m.created_at, m.updated_at,
-                      m.last_accessed_at, m.scope, m.session_id
+                      m.last_accessed_at, m.scope, m.session_id, m.source_agent, m.visibility
                FROM memories m
                JOIN memories_fts fts ON m.id = fts.id
                WHERE {}
@@ -841,7 +919,7 @@ impl SqliteStore {
                          embedding_json, tags_json, relations_json,
                          confidence, access_count, staleness,
                          created_at, updated_at, last_accessed_at,
-                         scope, session_id
+                         scope, session_id, source_agent, visibility
                   FROM memories ORDER BY created_at DESC",
             )
             .map_err(sql_err)?;
@@ -1046,6 +1124,157 @@ impl SqliteStore {
         let conn = self.conn()?;
         Self::do_traverse(&conn, start_id, max_hops)
     }
+
+    // -------------------------------------------------------------------
+    // Vector-index persistence helpers
+    // -------------------------------------------------------------------
+
+    /// Serialize a `Vec<f32>` into a little-endian byte blob.
+    fn vec_f32_to_blob(vec: &[f32]) -> Vec<u8> {
+        vec.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    /// Deserialize a byte blob back into a `Vec<f32>`.
+    fn blob_to_vec_f32(blob: &[u8]) -> Result<Vec<f32>> {
+        if blob.len() % 4 != 0 {
+            return Err(MemoryError::Store(
+                "invalid BLOB size for f32 vector embedding".into(),
+            ));
+        }
+        Ok(blob
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect())
+    }
+
+    /// Persist all vectors to the `vector_embeddings` SQLite table.
+    ///
+    /// Each embedding is stored as a little-endian BLOB alongside its
+    /// dimension and a creation timestamp.
+    pub fn save_vectors_to_sqlite(
+        &self,
+        vectors: &HashMap<MemoryId, Vec<f32>>,
+        dimension: u32,
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        for (id, vec) in vectors {
+            let blob = Self::vec_f32_to_blob(vec);
+            conn.execute(
+                "INSERT OR REPLACE INTO vector_embeddings (memory_id, embedding, dimension, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id.to_string(), blob, dimension, &now],
+            )
+            .map_err(sql_err)?;
+        }
+
+        // Clean up entries that are no longer in the in-memory map.
+        let keep_ids: Vec<String> = vectors.keys().map(|id| id.to_string()).collect();
+        if keep_ids.is_empty() {
+            conn.execute("DELETE FROM vector_embeddings", [])
+                .map_err(sql_err)?;
+        } else {
+            // SQLite parameter limit is 999; for large sets we chunk.
+            for chunk in keep_ids.chunks(900) {
+                let placeholders: Vec<String> =
+                    chunk.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+                let sql = format!(
+                    "DELETE FROM vector_embeddings WHERE memory_id NOT IN ({})",
+                    placeholders.join(",")
+                );
+                let params: Vec<&dyn rusqlite::types::ToSql> =
+                    chunk.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+                conn.execute(&sql, params.as_slice()).map_err(sql_err)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Closet persistence
+    // -------------------------------------------------------------------
+
+    /// Save closet pointers as JSON to the `closet_store` table.
+    pub fn save_closet(&self, pointers_json: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO closet_store (key, value) VALUES (?1, ?2)",
+            params!["pointers", pointers_json],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Load closet pointers JSON from the `closet_store` table.
+    pub fn load_closet(&self) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT value FROM closet_store WHERE key = ?1",
+            params!["pointers"],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_err)
+    }
+
+    // -------------------------------------------------------------------
+    // Seeds persistence
+    // -------------------------------------------------------------------
+
+    /// Save seeds as JSON to the `seed_store` table.
+    pub fn save_seeds(&self, seeds_json: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO seed_store (key, value) VALUES (?1, ?2)",
+            params!["seeds", seeds_json],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Load seeds JSON from the `seed_store` table.
+    pub fn load_seeds(&self) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT value FROM seed_store WHERE key = ?1",
+            params!["seeds"],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_err)
+    }
+
+    /// Load all vectors from the `vector_embeddings` SQLite table.
+    ///
+    /// Returns a `HashMap<MemoryId, Vec<f32>>` keyed by memory ID.
+    /// Deserialises each BLOB back into a `Vec<f32>` vector.
+    pub fn load_vectors_from_sqlite(&self) -> Result<HashMap<MemoryId, Vec<f32>>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare("SELECT memory_id, embedding FROM vector_embeddings")
+            .map_err(sql_err)?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((id_str, blob))
+            })
+            .map_err(sql_err)?;
+
+        let mut vectors = HashMap::new();
+        for r in rows {
+            let (id_str, blob) = r.map_err(sql_err)?;
+            let id = Uuid::parse_str(&id_str).map_err(|e| {
+                MemoryError::Store(format!("invalid memory_id in vector_embeddings: {e}"))
+            })?;
+            let vec = Self::blob_to_vec_f32(&blob)?;
+            vectors.insert(id, vec);
+        }
+        Ok(vectors)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,7 +1336,27 @@ impl MemoryStore for SqliteStore {
         }
         tokio::task::spawn_blocking(move || {
             let conn = store.conn()?;
-            Self::do_search_fts(&conn, &sanitized, limit)
+            Self::do_search_fts(&conn, &sanitized, limit, None)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn search_fts_scoped(
+        &self,
+        query: &str,
+        scope: &MemoryScope,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let store = self.clone();
+        let sanitized = Self::sanitize_fts_query(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope_key = scope.scope_key();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_search_fts(&conn, &sanitized, limit, Some(&scope_key))
         })
         .await
         .map_err(|e| MemoryError::Store(e.to_string()))?
@@ -1213,6 +1462,178 @@ impl MemoryStore for SqliteStore {
         .await
         .map_err(|e| MemoryError::Store(e.to_string()))?
     }
+
+    // -------------------------------------------------------------------
+    // Knowledge-graph persistence
+    // -------------------------------------------------------------------
+
+    async fn save_entities(&self, entities: &[Entity]) -> Result<()> {
+        let store = self.clone();
+        let json = serde_json::to_string(entities)
+            .map_err(|e| MemoryError::Store(format!("serialize entities: {e}")))?;
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            conn.execute(
+                "INSERT OR REPLACE INTO kg_store (key, value) VALUES (?1, ?2)",
+                params!["entities", &json],
+            )
+            .map_err(sql_err)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn load_entities(&self) -> Result<Vec<Entity>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let result: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM kg_store WHERE key = ?1",
+                    params!["entities"],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_err)?;
+            match result {
+                Some(json) => serde_json::from_str(&json)
+                    .map_err(|e| MemoryError::Store(format!("deserialize entities: {e}"))),
+                None => Ok(Vec::new()),
+            }
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn save_triples(&self, triples: &[Triple]) -> Result<()> {
+        let store = self.clone();
+        let json = serde_json::to_string(triples)
+            .map_err(|e| MemoryError::Store(format!("serialize triples: {e}")))?;
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            conn.execute(
+                "INSERT OR REPLACE INTO kg_store (key, value) VALUES (?1, ?2)",
+                params!["triples", &json],
+            )
+            .map_err(sql_err)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn load_triples(&self) -> Result<Vec<Triple>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let result: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM kg_store WHERE key = ?1",
+                    params!["triples"],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_err)?;
+            match result {
+                Some(json) => serde_json::from_str(&json)
+                    .map_err(|e| MemoryError::Store(format!("deserialize triples: {e}"))),
+                None => Ok(Vec::new()),
+            }
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    // -------------------------------------------------------------------
+    // Verbatim sink methods
+    // -------------------------------------------------------------------
+
+    async fn save_verbatim(
+        &self,
+        id: &str,
+        content: &str,
+        source: &str,
+        layer: i32,
+        timestamp: &str,
+    ) -> Result<()> {
+        let store = self.clone();
+        let id = id.to_string();
+        let content = content.to_string();
+        let source = source.to_string();
+        let timestamp = timestamp.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            conn.execute(
+                "INSERT OR REPLACE INTO verbatim_entries (id, content, source, layer, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, content, source, layer, timestamp],
+            )
+            .map_err(sql_err)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn load_verbatim_by_id(&self, id: &str) -> Result<Option<VerbatimEntry>> {
+        let store = self.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            conn.query_row(
+                "SELECT id, content, source, layer, timestamp FROM verbatim_entries WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(VerbatimEntry {
+                        id: row.get(0)?,
+                        content: row.get(1)?,
+                        source: row.get(2)?,
+                        layer: row.get(3)?,
+                        timestamp: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql_err)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn search_verbatim_by_content(&self, query: &str) -> Result<Vec<VerbatimEntry>> {
+        let store = self.clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, content, source, layer, timestamp
+                     FROM verbatim_entries
+                     WHERE content LIKE ?1
+                     ORDER BY timestamp DESC",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![query], |row| {
+                    Ok(VerbatimEntry {
+                        id: row.get(0)?,
+                        content: row.get(1)?,
+                        source: row.get(2)?,
+                        layer: row.get(3)?,
+                        timestamp: row.get(4)?,
+                    })
+                })
+                .map_err(sql_err)?;
+            let mut entries = Vec::new();
+            for r in rows {
+                entries.push(r.map_err(sql_err)?);
+            }
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
 }
 
 #[cfg(test)]
@@ -1250,8 +1671,10 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             last_accessed_at: None,
-            scope: None,
+            scope: MemoryScope::default(),
             session_id: None,
+            source_agent: None,
+            visibility: AgentVisibility::default(),
         }
     }
 
@@ -1466,8 +1889,10 @@ mod tests {
             created_at: now,
             updated_at: now,
             last_accessed_at: Some(now),
-            scope: Some("project-1".into()),
+            scope: MemoryScope::Project("project-1".into()),
             session_id: Some("session-1".into()),
+            source_agent: None,
+            visibility: AgentVisibility::default(),
         };
         store.insert(&e).await.unwrap();
 
@@ -1483,7 +1908,7 @@ mod tests {
         assert_eq!(got.access_count, 5);
         assert_eq!(got.staleness, 0.1);
         assert_eq!(got.tags, vec!["rust", "async"]);
-        assert_eq!(got.scope.as_deref(), Some("project-1"));
+        assert_eq!(got.scope, MemoryScope::Project("project-1".into()));
         assert_eq!(got.session_id.as_deref(), Some("session-1"));
         assert!(got.embedding.is_some());
     }

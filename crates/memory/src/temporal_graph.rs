@@ -60,6 +60,8 @@ pub struct Triple {
     pub source_memory_id: Option<MemoryId>,
     /// Source file path (like MemPalace's source_file)
     pub source_file: Option<String>,
+    /// Agent that produced this triple (for cross-agent attribution).
+    pub source_agent: Option<String>,
 }
 
 /// Entity facts for seeding the knowledge graph.
@@ -234,6 +236,7 @@ impl KnowledgeGraph {
             confidence: 1.0,
             source_memory_id,
             source_file,
+            source_agent: None,
         });
 
         triple_id
@@ -852,6 +855,7 @@ mod tests {
             confidence: 1.0,
             source_memory_id: None,
             source_file: Some("/path/to/file.md".to_string()),
+            source_agent: None,
         };
         assert!(triple.source_file.is_some());
         assert_eq!(triple.source_file.unwrap(), "/path/to/file.md");

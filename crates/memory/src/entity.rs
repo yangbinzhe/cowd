@@ -60,6 +60,7 @@ pub struct Triple {
     pub source: Option<String>,
     pub confidence: f64,
     pub created_at: DateTime<Utc>,
+    pub source_agent: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +241,13 @@ impl KnowledgeGraph {
         self.entities.get(id)
     }
 
+    /// Add a pre-built triple (from deserialized persistence) directly.
+    /// Unlike `add_triple`, this preserves the existing ID rather than
+    /// generating a new one.
+    pub fn add_triple_raw(&mut self, triple: Triple) {
+        self.triples.push(triple);
+    }
+
     /// Add a triple (subject-predicate-object) relationship.
     pub fn add_triple(
         &mut self,
@@ -260,6 +268,7 @@ impl KnowledgeGraph {
             source,
             confidence,
             created_at: Utc::now(),
+            source_agent: None,
         };
         let id = triple.id.clone();
         self.triples.push(triple);
@@ -319,6 +328,96 @@ impl KnowledgeGraph {
             }
         }
         results
+    }
+
+    /// Run self-healing consistency check, returning a list of fixes applied.
+    pub fn run_consistency_check(&mut self) -> Vec<String> {
+        let now = Utc::now();
+        let mut fixes: Vec<String> = Vec::new();
+
+        // Pass 1: Orphan triples — create placeholder entities for missing refs
+        for t in &self.triples {
+            if !self.entities.contains_key(&t.subject_id) {
+                let placeholder = Entity {
+                    id: t.subject_id.clone(),
+                    name: format!("[orphan:{}]", &t.subject_id[..t.subject_id.len().min(8)]),
+                    entity_type: EntityType::Concept,
+                    confidence: 0.1,
+                    frequency: 1,
+                    first_seen: now,
+                    last_seen: now,
+                    source_ids: vec![t.id.clone()],
+                };
+                fixes.push(format!(
+                    "orphan-subject: created placeholder {} for subject_id {} in triple {}",
+                    placeholder.id, t.subject_id, t.id
+                ));
+                self.entities.insert(placeholder.id.clone(), placeholder);
+            }
+            if !self.entities.contains_key(&t.object_id) {
+                let placeholder = Entity {
+                    id: t.object_id.clone(),
+                    name: format!("[orphan:{}]", &t.object_id[..t.object_id.len().min(8)]),
+                    entity_type: EntityType::Concept,
+                    confidence: 0.1,
+                    frequency: 1,
+                    first_seen: now,
+                    last_seen: now,
+                    source_ids: vec![t.id.clone()],
+                };
+                fixes.push(format!(
+                    "orphan-object: created placeholder {} for object_id {} in triple {}",
+                    placeholder.id, t.object_id, t.id
+                ));
+                self.entities.insert(placeholder.id.clone(), placeholder);
+            }
+        }
+
+        // Pass 2: Expired triples — log already-expired triples
+        for t in &mut self.triples {
+            if let Some(valid_to) = t.valid_to {
+                if valid_to < now {
+                    fixes.push(format!(
+                        "expired: triple {} ({}-[{}]->{}) valid_to={} before now",
+                        t.id, t.subject_id, t.predicate, t.object_id, valid_to
+                    ));
+                }
+            }
+        }
+
+        // Pass 3: Conflicts — same (subject,predicate), different object
+        let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        for (idx, t) in self.triples.iter().enumerate() {
+            groups
+                .entry((t.subject_id.clone(), t.predicate.clone()))
+                .or_default()
+                .push(idx);
+        }
+        for (_key, indices) in &groups {
+            if indices.len() < 2 {
+                continue;
+            }
+            let mut sorted = indices.clone();
+            sorted.sort_by(|a, b| {
+                self.triples[*b].created_at.cmp(&self.triples[*a].created_at)
+            });
+            let newest_obj = self.triples[sorted[0]].object_id.clone();
+            for &idx in &sorted[1..] {
+                if self.triples[idx].object_id != newest_obj
+                    && self.triples[idx].valid_to.is_none()
+                {
+                    let before = self.triples[idx].confidence;
+                    self.triples[idx].confidence *= 0.5;
+                    fixes.push(format!(
+                        "conflict: triple {} confidence {}→{} (newer triple {} conflicts)",
+                        self.triples[idx].id, before, self.triples[idx].confidence,
+                        self.triples[sorted[0]].id,
+                    ));
+                }
+            }
+        }
+
+        fixes
     }
 }
 

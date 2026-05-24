@@ -11,6 +11,7 @@
 
 use crate::search::bm25::BM25Scorer;
 use serde::Serialize;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// Identifier for memory entries in search results.
@@ -173,6 +174,84 @@ impl HybridSearcher {
         // Step 7: Return top-n
         results.into_iter().take(n_results).collect()
     }
+
+    /// Reciprocal Rank Fusion (RRF) – fuses porter and trigram result lists.
+    ///
+    /// Each result list contributes `1/(K + rank)` to the fused score.
+    /// Documents appearing in both lists receive boosted scores.
+    /// K=60 follows the Cormack et al. 2009 standard.
+    ///
+    /// If only one result set is provided (the other is empty), returns
+    /// that set as-is with its original ordering preserved.
+    pub fn search_rrf(
+        &self,
+        _query: &str,
+        porter_results: &[(MemoryId, f64)],
+        trigram_results: &[(MemoryId, f64)],
+    ) -> Vec<SearchResult> {
+        const K: f64 = 60.0;
+
+        if porter_results.is_empty() && trigram_results.is_empty() {
+            return Vec::new();
+        }
+
+        // Single-list fallback: return as-is
+        if trigram_results.is_empty() {
+            return porter_results
+                .iter()
+                .map(|(id, score)| SearchResult {
+                    id: id.clone(),
+                    content: String::new(),
+                    vector_score: 0.0,
+                    bm25_score: 0.0,
+                    hybrid_score: *score,
+                    source: "porter".to_string(),
+                })
+                .collect();
+        }
+        if porter_results.is_empty() {
+            return trigram_results
+                .iter()
+                .map(|(id, score)| SearchResult {
+                    id: id.clone(),
+                    content: String::new(),
+                    vector_score: 0.0,
+                    bm25_score: 0.0,
+                    hybrid_score: *score,
+                    source: "trigram".to_string(),
+                })
+                .collect();
+        }
+
+        // RRF fusion: accumulate 1/(K + rank + 1) from each list
+        let mut scores: HashMap<MemoryId, f64> = HashMap::new();
+        for (rank, (idx, _score)) in porter_results.iter().enumerate() {
+            *scores.entry(idx.clone()).or_default() += 1.0 / (K + rank as f64 + 1.0);
+        }
+        for (rank, (idx, _score)) in trigram_results.iter().enumerate() {
+            *scores.entry(idx.clone()).or_default() += 1.0 / (K + rank as f64 + 1.0);
+        }
+
+        let mut fused: Vec<SearchResult> = scores
+            .into_iter()
+            .map(|(id, rrf_score)| SearchResult {
+                id,
+                content: String::new(),
+                vector_score: 0.0,
+                bm25_score: 0.0,
+                hybrid_score: rrf_score,
+                source: "rrf".to_string(),
+            })
+            .collect();
+
+        fused.sort_by(|a, b| {
+            b.hybrid_score
+                .partial_cmp(&a.hybrid_score)
+                .unwrap_or(Ordering::Equal)
+        });
+
+        fused
+    }
 }
 
 /// Min-Max normalisation to [0, 1].
@@ -235,5 +314,103 @@ mod tests {
         assert_eq!(normalise(None, 0.0, 1.0), 0.0);
         // When min == max, return 1.0 for present values
         assert_eq!(normalise(Some(5.0), 5.0, 5.0), 1.0);
+    }
+
+    // --- RRF tests ---
+
+    #[test]
+    fn test_rrf_fusion_combines_ranks() {
+        // doc_a: rank 0 in porter, rank 2 in trigram
+        // doc_b: rank 1 in porter, rank 0 in trigram  → highest RRF (both lists near top)
+        // doc_c: rank 2 in porter only
+        // doc_d: rank 1 in trigram only
+        let porter = vec![
+            ("doc_a".to_string(), 0.95),
+            ("doc_b".to_string(), 0.80),
+            ("doc_c".to_string(), 0.60),
+        ];
+        let trigram = vec![
+            ("doc_b".to_string(), 0.90),
+            ("doc_d".to_string(), 0.70),
+            ("doc_a".to_string(), 0.50),
+        ];
+
+        let searcher = HybridSearcher::new();
+        let results = searcher.search_rrf("test query", &porter, &trigram);
+
+        assert_eq!(results.len(), 4, "should fuse to 4 unique documents");
+
+        // doc_b: 1/(60+2) + 1/(60+1) = 1/62 + 1/61 ≈ 0.03252
+        // doc_a: 1/(60+1) + 1/(60+3) = 1/61 + 1/63 ≈ 0.03226
+        assert_eq!(results[0].id, "doc_b", "doc_b appears near top of both lists");
+        assert_eq!(results[1].id, "doc_a", "doc_a appears in both lists, rank 0 + rank 2");
+
+        assert!(results[0].hybrid_score > results[1].hybrid_score);
+        assert!(results[1].hybrid_score > results[2].hybrid_score);
+        assert!(results[2].hybrid_score > results[3].hybrid_score);
+
+        // All fused results should have source "rrf"
+        for r in &results {
+            assert_eq!(r.source, "rrf");
+            assert!(r.hybrid_score > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_rrf_single_list_fallback_porter() {
+        let porter = vec![
+            ("doc_a".to_string(), 0.95),
+            ("doc_b".to_string(), 0.80),
+        ];
+
+        let searcher = HybridSearcher::new();
+        let results = searcher.search_rrf("test", &porter, &[]);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].source, "porter");
+        assert_eq!(results[1].source, "porter");
+        // Original ordering preserved
+        assert_eq!(results[0].id, "doc_a");
+        assert_eq!(results[1].id, "doc_b");
+        // Original scores preserved
+        assert!((results[0].hybrid_score - 0.95).abs() < 1e-10);
+        assert!((results[1].hybrid_score - 0.80).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_rrf_single_list_fallback_trigram() {
+        let trigram = vec![("doc_x".to_string(), 0.88)];
+
+        let searcher = HybridSearcher::new();
+        let results = searcher.search_rrf("test", &[], &trigram);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, "trigram");
+        assert_eq!(results[0].id, "doc_x");
+        assert!((results[0].hybrid_score - 0.88).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_rrf_empty_input() {
+        let searcher = HybridSearcher::new();
+        let results = searcher.search_rrf("test", &[], &[]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_rrf_boost_for_overlapping_docs() {
+        // Single doc in both lists gets score from both ranks (boosted)
+        let porter = vec![("doc_z".to_string(), 0.99)];
+        let trigram = vec![("doc_z".to_string(), 0.99)];
+
+        let searcher = HybridSearcher::new();
+        let results = searcher.search_rrf("test", &porter, &trigram);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "doc_z");
+        assert_eq!(results[0].source, "rrf");
+        // RRF score: 1/(60+1) + 1/(60+1) = 2/61 ≈ 0.03279
+        let expected = 1.0 / (60.0 + 1.0) + 1.0 / (60.0 + 1.0);
+        assert!((results[0].hybrid_score - expected).abs() < 1e-10);
     }
 }

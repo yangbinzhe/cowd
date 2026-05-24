@@ -96,6 +96,7 @@ pub fn estimate_full_injection_tokens(entries: &[MemoryEntry]) -> u64 {
 mod tests {
     use super::*;
     use crate::types::{MemoryCategory, MemorySource, Priority};
+    use crate::MemoryScope;
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -107,7 +108,8 @@ mod tests {
             embedding: None, tags: vec![], relations: vec![],
             confidence, access_count: 0, staleness: 0.0,
             created_at: Utc::now(), updated_at: Utc::now(),
-            last_accessed_at: None, scope: None, session_id: None,
+            last_accessed_at: None, scope: MemoryScope::default(), session_id: None,
+            source_agent: None, visibility: crate::types::AgentVisibility::default(),
         }
     }
 
