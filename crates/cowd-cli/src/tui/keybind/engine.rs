@@ -523,9 +523,9 @@ pub fn default_bindings() -> KeyMap {
                 KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
             ],
         },
-        Action::Search,
-        "Find / search",
-        GROUP_DIALOG,
+        Action::FocusFileTree,
+        "Focus file tree",
+        GROUP_FILES,
     );
     map.add_grouped(
         KeyChord {
@@ -603,6 +603,28 @@ pub fn default_bindings() -> KeyMap {
         Action::Scroll(-5),
         "Scroll up 5",
         GROUP_NAVIGATION,
+    );
+    map.add_grouped(
+        KeyChord {
+            keys: vec![
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            ],
+        },
+        Action::FocusDiff,
+        "Show diff viewer",
+        GROUP_FILES,
+    );
+    map.add_grouped(
+        KeyChord {
+            keys: vec![
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            ],
+        },
+        Action::FocusSessions,
+        "Focus sessions",
+        GROUP_SESSION,
     );
 
     map
@@ -726,17 +748,17 @@ mod tests {
     }
 
     #[test]
-    fn space_leader_chord_f_dispatches_search() {
+    fn space_leader_chord_f_dispatches_focus_file_tree() {
         let mut eng = engine();
 
         // Space → prefix, which-key shows
         assert_eq!(eng.handle_key(k(KeyCode::Char(' '))), None);
         assert!(eng.which_key_visible);
 
-        // f completes SPC-f → Search
+        // f completes SPC-f → FocusFileTree
         assert_eq!(
             eng.handle_key(k(KeyCode::Char('f'))),
-            Some(Action::Search)
+            Some(Action::FocusFileTree)
         );
         assert!(eng.pending_chord().is_empty());
         assert!(!eng.which_key_visible);
@@ -950,8 +972,8 @@ mod tests {
             );
         }
 
-        // 8 leader chords in default_bindings
-        assert_eq!(bindings.len(), 8);
+        // 10 leader chords in default_bindings
+        assert_eq!(bindings.len(), 10);
     }
 
     // ── active_modal_name ──────────────────────────────────────────

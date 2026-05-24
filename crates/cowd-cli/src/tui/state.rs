@@ -30,9 +30,13 @@ use crate::tui::components::chat_view::ChatView;
 use crate::tui::components::command_palette::CommandPalette;
 use crate::tui::components::context_panel::ContextPanel;
 use crate::tui::components::dialog::DialogManager;
+use crate::tui::components::diff_viewer::DiffViewer;
 use crate::tui::components::export_dialog::ExportDialog;
 use crate::tui::components::file_changes_panel::FileChangesPanel;
+use crate::tui::components::file_tree::FileTree;
+use crate::tui::components::prompt::Prompt;
 use crate::tui::components::question_form::QuestionForm;
+use crate::tui::components::session_sidebar::SessionSidebar;
 use crate::tui::components::status_bar::StatusBar;
 use crate::tui::components::revert_dialog::RevertDialog;
 use crate::tui::components::thinking_panel::ThinkingPanel;
@@ -43,6 +47,7 @@ use crate::tui::error_recovery::{self, RenderResult};
 use crate::tui::event::dispatcher::EventDispatcher;
 use crate::tui::event::{ComponentId as EventComponentId, EventBus, EventPriority};
 use crate::tui::keybind::types::Action;
+use crate::tui::keybind::which_key::WhichKey;
 use crate::tui::keybind::{default_bindings, KeybindEngine};
 use crate::tui::layout::{LayoutNode, LayoutTree};
 use crate::tui::profiler::{FrameTimer, RenderProfiler};
@@ -128,7 +133,19 @@ pub struct TuiState {
     /// Todo panel displaying task list from TodoWrite tool calls.
     pub todo_panel: TodoPanel,
 
-    /// Active tab index in the sidebar (0=Context, 1=Changes, 2=Todo).
+    /// Diff viewer component for unified/split diff display.
+    pub diff_viewer: DiffViewer,
+
+    /// Prompt component with autocomplete, frecency scoring, @file completion.
+    pub prompt: Prompt,
+
+    /// File tree browser with git status overlay.
+    pub file_tree: FileTree,
+
+    /// Session list browser with rename/delete/switch/fork actions.
+    pub session_sidebar: SessionSidebar,
+
+    /// Active tab index in the sidebar (0=Context, 1=Changes, 2=Todo, 3=Diff, 4=Files, 5=Sessions).
     pub sidebar_active_tab: usize,
 
     /// Status bar at the bottom showing model, tokens, and system info.
@@ -198,6 +215,12 @@ impl TuiState {
         let render_profiler = RenderProfiler::new();
         let accessibility = AccessibilityMode::new();
 
+        let diff_viewer = DiffViewer::new("Diff");
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let prompt = Prompt::new(cwd);
+        let file_tree = FileTree::new();
+        let session_sidebar = SessionSidebar::new(session_id);
+
         Self {
             app,
             layout_tree,
@@ -222,6 +245,10 @@ impl TuiState {
             animation_engine,
             frame_timer,
             render_profiler,
+            diff_viewer,
+            prompt,
+            file_tree,
+            session_sidebar,
             sidebar_active_tab: 0,
             accessibility,
             startup_phase: StartupPhase::Hidden,
@@ -298,6 +325,23 @@ impl TuiState {
         self.file_changes_panel.load(vec![]);
         self.todo_panel.load(vec![]);
 
+        // Sync file tree from App file_entries
+        if !self.app.file_entries.is_empty() {
+            self.file_tree.rebuild(&self.app.file_entries);
+        }
+
+        // Sync session sidebar from App picker_sessions
+        if !self.app.picker_sessions.is_empty() {
+            self.session_sidebar.load(self.app.picker_sessions.clone());
+        }
+        self.session_sidebar.set_current_session(&self.app.session_id);
+
+        // Sync prompt textarea from App input
+        let input_text = self.app.input.lines().join("\n");
+        if self.prompt.text() != input_text {
+            self.prompt.set_text(&input_text);
+        }
+
         // Sync status bar from App state
         self.status_bar.sync_from_app(&self.app);
         self.status_bar.tick();
@@ -326,7 +370,7 @@ impl TuiState {
 
             // Render sidebar: tab bar + active panel
             let tab_height = 1u16;
-            let tab_labels = ["Context", "Changes", "Todo"];
+            let tab_labels = ["Context", "Changes", "Todo", "Diff", "Files", "Sessions"];
             let tab_area = ratatui::layout::Rect::new(
                 sidebar_area.x, sidebar_area.y, sidebar_area.width, tab_height,
             );
@@ -343,6 +387,24 @@ impl TuiState {
                 0 => self.context_panel.render(&mut ctx, panel_area),
                 1 => self.file_changes_panel.render(&mut ctx, panel_area),
                 2 => self.todo_panel.render(&mut ctx, panel_area),
+                3 => {
+                    let _guard = self.render_profiler.guard("diff_viewer");
+                    let _ = error_recovery::catch_render_panic("diff_viewer", AssertUnwindSafe(|| {
+                        self.diff_viewer.render(&mut ctx, panel_area);
+                    }));
+                }
+                4 => {
+                    let _guard = self.render_profiler.guard("file_tree");
+                    let _ = error_recovery::catch_render_panic("file_tree", AssertUnwindSafe(|| {
+                        self.file_tree.render(&mut ctx, panel_area);
+                    }));
+                }
+                5 => {
+                    let _guard = self.render_profiler.guard("session_sidebar");
+                    let _ = error_recovery::catch_render_panic("session_sidebar", AssertUnwindSafe(|| {
+                        self.session_sidebar.render(&mut ctx, panel_area);
+                    }));
+                }
                 _ => {}
             }
         }
@@ -373,7 +435,7 @@ impl TuiState {
             }
         }
 
-        // 2.5. Render input widget (3 lines above status bar)
+        // 2.5. Render prompt with autocomplete (3 lines above status bar)
         {
             let input_area = ratatui::layout::Rect::new(
                 0,
@@ -382,9 +444,10 @@ impl TuiState {
                 3,
             );
             let degraded = {
-                let _guard = self.render_profiler.guard("input");
-                match error_recovery::catch_render_panic("input", AssertUnwindSafe(|| {
-                    frame.render_widget(&self.app.input, input_area);
+                let mut ctx = RenderContext::new(frame, &skin);
+                let _guard = self.render_profiler.guard("prompt");
+                match error_recovery::catch_render_panic("prompt", AssertUnwindSafe(|| {
+                    self.prompt.render(&mut ctx, input_area);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
@@ -522,6 +585,22 @@ impl TuiState {
         // 11. Render startup loading overlay (highest z-index, below dialogs)
         if self.startup_phase != StartupPhase::Done {
             self.render_startup_overlay(frame, area);
+        }
+
+        // 12. Render which-key overlay when Space leader is active
+        if self.keybind_engine.which_key_visible {
+            let degraded = {
+                let _guard = self.render_profiler.guard("which_key");
+                match error_recovery::catch_render_panic("which_key", AssertUnwindSafe(|| {
+                    WhichKey::draw(frame, area, &self.keybind_engine);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
         }
 
         // Update last drawn version for render skip optimization
@@ -681,15 +760,57 @@ impl TuiState {
             }
         }
 
+        // ── Prompt autocomplete routing (Tab / Shift+Tab / Esc) ──
+        // Route these keys through the prompt component before sidebar cycling.
+        if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
+            // Refresh suggestions from current text, then handle Tab
+            self.prompt.refresh_suggestions();
+            let event = crossterm::event::Event::Key(key);
+            let result = self.prompt.handle_event(&event);
+            if result == crate::tui::components::EventResult::Consumed {
+                // Sync accepted suggestion back to app.input
+                let new_text = self.prompt.text();
+                let mut ta = tui_textarea::TextArea::default();
+                ta.set_block(ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
+                ta.set_style(ratatui::style::Style::default()
+                    .fg(ratatui::style::Color::White));
+                if !new_text.is_empty() {
+                    ta.insert_str(&new_text);
+                }
+                self.app.input = ta;
+                return ProcessedKey::Nothing;
+            }
+            // Fall through to sidebar tab cycling
+        }
+        if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT) {
+            let event = crossterm::event::Event::Key(key);
+            let result = self.prompt.handle_event(&event);
+            if result == crate::tui::components::EventResult::Consumed {
+                return ProcessedKey::Nothing;
+            }
+            // Fall through to sidebar tab cycling
+        }
+        if key.code == KeyCode::Esc {
+            let event = crossterm::event::Event::Key(key);
+            let result = self.prompt.handle_event(&event);
+            if result == crate::tui::components::EventResult::Consumed {
+                return ProcessedKey::Nothing;
+            }
+            // Fall through to normal Esc handling
+        }
+
         // ── Sidebar tab switching ──
-        // Tab / Shift+Tab: cycle through sidebar tabs (Context / Changes / Todo)
+        // Tab / Shift+Tab: cycle through sidebar tabs (Context / Changes / Todo / Diff / Files / Sessions)
+        const SIDEBAR_TAB_COUNT: usize = 6;
         if key.code == KeyCode::Tab {
-            self.sidebar_active_tab = (self.sidebar_active_tab + 1) % 3;
+            self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
             return ProcessedKey::Nothing;
         }
         if key.code == KeyCode::BackTab {
             self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
-                2
+                SIDEBAR_TAB_COUNT - 1
             } else {
                 self.sidebar_active_tab - 1
             };
@@ -708,6 +829,7 @@ impl TuiState {
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)
         if self.is_textarea_key(&key) {
             self.app.input.input(key);
+            self.prompt.refresh_suggestions();
             return ProcessedKey::Nothing;
         }
 
@@ -728,6 +850,7 @@ impl TuiState {
             }
             // Non-empty input → submit
             let text = self.app.input.lines().join("\n").trim().to_string();
+            self.prompt.add_history(text.clone());
             self.app.input = tui_textarea::TextArea::default();
             self.app.input.set_block(ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
@@ -1048,6 +1171,15 @@ impl TuiState {
                             .start_one_shot(AnimationKind::DialogFade, 4);
                     }
                 }
+            }
+            Action::FocusDiff => {
+                self.sidebar_active_tab = 3;
+            }
+            Action::FocusFileTree => {
+                self.sidebar_active_tab = 4;
+            }
+            Action::FocusSessions => {
+                self.sidebar_active_tab = 5;
             }
             Action::Execute(ref _cmd) => {}
             Action::TogglePanel(ref _name) => {}

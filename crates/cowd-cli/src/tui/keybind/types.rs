@@ -87,6 +87,12 @@ pub enum Action {
     ToggleCommandPalette,
     /// Toggle the agents overlay visibility.
     ToggleAgentsOverlay,
+    /// Focus the Diff sidebar tab.
+    FocusDiff,
+    /// Focus the File Tree sidebar tab.
+    FocusFileTree,
+    /// Focus the Sessions sidebar tab.
+    FocusSessions,
     /// No operation — consumes the event without side effects.
     Noop,
 }

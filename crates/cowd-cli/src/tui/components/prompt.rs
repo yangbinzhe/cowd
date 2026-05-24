@@ -588,6 +588,12 @@ impl Prompt {
         }
     }
 
+    /// Refresh autocomplete suggestions based on the current textarea content.
+    /// Call this after external text changes to keep suggestions in sync.
+    pub fn refresh_suggestions(&mut self) {
+        self.update_suggestions();
+    }
+
     // ── Private helpers ──────────────────────────────────────────
 
     /// Extract the current word being typed from the textarea.
