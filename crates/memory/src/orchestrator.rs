@@ -637,6 +637,13 @@ impl MemoryOrchestrator {
     // Maintenance
     // -----------------------------------------------------------------------
 
+    /// Return frequently occurring tags (hot topics) from the L4 shared
+    /// layer within the given time window in seconds.  Delegates to
+    /// [`SharedLayer::hot_topics`].
+    pub async fn hot_topics(&self, window_secs: i64) -> Vec<String> {
+        self.l4.hot_topics(window_secs).await
+    }
+
     /// Run periodic maintenance across all layers.
     ///
     /// Should be called once per session tick (e.g. after each user turn).

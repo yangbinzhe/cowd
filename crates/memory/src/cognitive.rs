@@ -17,7 +17,7 @@ use std::{collections::HashSet, path::PathBuf, sync::Mutex};
 
 use chrono::Utc;
 
-use crate::{ MemoryScope,
+use crate::{ MemoryScope, SessionResume,
     closet::{Closet, ClosetManager},
     compression::{
         budget::BudgetManager,
@@ -135,6 +135,8 @@ pub struct CognitiveContextManager {
     current_agent: Mutex<Option<String>>,
     /// Queue of child agent delegation results, consumed by on_turn_end.
     delegation_results: Mutex<Vec<DelegationResult>>,
+    /// BM25-based session resume for context recovery from prior sessions.
+    session_resume: Option<SessionResume>,
 }
 
 impl CognitiveContextManager {
@@ -236,6 +238,16 @@ impl CognitiveContextManager {
             orchestrator.restore_closet(c.clone()).await?;
         }
 
+        // Build SessionResume from recent entries for BM25-based session recovery.
+        let session_resume = {
+            let recent_entries = orchestrator.store().list_all().await.unwrap_or_default();
+            if recent_entries.is_empty() {
+                None
+            } else {
+                Some(SessionResume::new(recent_entries))
+            }
+        };
+
         // Restore Seeds from SQLite.
         let saved_seeds: Vec<Seed> = sqlite_store
             .load_seeds()
@@ -257,6 +269,7 @@ impl CognitiveContextManager {
             context_rot_monitor: Mutex::new(ContextRotMonitor::new(RotMetrics::default())),
             current_agent: Mutex::new(None),
             delegation_results: Mutex::new(Vec::new()),
+            session_resume,
             config,
             orchestrator,
             pipeline,
@@ -363,6 +376,26 @@ impl CognitiveContextManager {
 
         // Track which IDs are already loaded so L3 can skip them.
         let mut already_surfaced: HashSet<MemoryId> = entries.iter().map(|e| e.id).collect();
+
+        // ── Step 2a: Session resume via BM25 ──────────────────────────────────
+        if let Some(ref resume) = self.session_resume {
+            let store: &dyn crate::store::MemoryStore = self.orchestrator.store().as_ref();
+            match resume.resume_recent("default", Some(store), 5).await {
+                Ok(resumed) => {
+                    for mut entry in resumed {
+                        if !already_surfaced.contains(&entry.id) {
+                            entry.content = format!("[SESSION RESUME] {}", entry.content);
+                            entry.tags.push("session_resume".into());
+                            already_surfaced.insert(entry.id);
+                            entries.push(entry);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "session resume failed, continuing without it");
+                }
+            }
+        }
 
         // ── Step 2b: P1 project knowledge graph query ───────────────────────
         // Tokenize the query and look up matching code-symbol entities from the
@@ -600,6 +633,34 @@ impl CognitiveContextManager {
         // Note: pipeline.run takes a mutable Vec; here we work non-destructively
         // by returning the final PreparedContext based on current state.
         // Full pipeline run is triggered in on_turn_end.
+
+        // ── Step 6b: inject current swarm hot topics from L4 ────────────────
+        let hot_topics = self.orchestrator.hot_topics(300).await;
+        if !hot_topics.is_empty() {
+            let topics_str = hot_topics.join(", ");
+            entries.push(MemoryEntry {
+                id: uuid::Uuid::new_v4(),
+                layer: MemoryLayer::L4,
+                category: MemoryCategory::Shared,
+                priority: Priority::Low,
+                source: MemorySource::AutoExtracted,
+                title: "Swarm Hot Topics".into(),
+                content: format!("Active swarm topics: {topics_str}"),
+                embedding: None,
+                tags: vec!["swarm".into(), "hot_topics".into()],
+                relations: vec![],
+                confidence: 0.8,
+                access_count: 0,
+                staleness: 0.0,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                last_accessed_at: None,
+                scope: MemoryScope::default(),
+                session_id: None,
+                source_agent: None,
+                visibility: crate::types::AgentVisibility::default(),
+            });
+        }
 
         // ── Assemble PreparedContext ─────────────────────────────────────────
         let total_tokens = self.estimate_tokens_entries(&entries);
