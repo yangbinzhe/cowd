@@ -228,6 +228,8 @@ bus: Option<crate::bus::EventBus>,
     effect_handler: Option<Arc<dyn crate::effect::EffectHandler>>,
     /// P2-2: Current project phase (Discovery→Planning→Building→Reviewing→Shipping→Graduated).
     project_phase: String,
+    /// Optional commit quality gate evaluator (PreFlight, Revision, Escalation, Abort).
+    gate_evaluator: Option<Arc<crate::gates::GateEvaluator>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -329,6 +331,7 @@ where
             approval_gate: None,
             effect_handler: None,
             project_phase: "Discovery".to_string(),
+            gate_evaluator: None,
         }
     }
 
@@ -432,6 +435,16 @@ where
     pub fn with_memory_manager(mut self, manager: Arc<CognitiveContextManager>) -> Self {
         self.memory_manager = Some(manager);
         self
+    }
+
+    pub fn with_gate_evaluator(mut self, evaluator: crate::gates::GateEvaluator) -> Self {
+        self.gate_evaluator = Some(Arc::new(evaluator));
+        self
+    }
+
+    /// Run all commit quality gates against the current state.
+    pub fn check_commit_gates(&self, context: crate::gates::GateContext) -> Option<(bool, Vec<crate::gates::GateResult>)> {
+        self.gate_evaluator.as_ref().map(|evaluator| evaluator.evaluate_all(&context))
     }
 
     /// Explicitly disable the memory subsystem, regardless of feature config.
@@ -1548,6 +1561,15 @@ self.record_turn_completed(&summary);
                     if rel_count > 15 { break; }
                 }
                 if rel_count > 0 { context.push_str("</knowledge_graph>\n"); }
+
+                // P1: Inject code symbols from tree-sitter code indexer
+                if let Some(ref cc) = prepared.code_context {
+                    if !cc.is_empty() {
+                        context.push_str("\n# Relevant Code Symbols\n");
+                        context.push_str(cc);
+                        context.push('\n');
+                    }
+                }
 
                 let actual_memory_high = prepared.entries.iter()
                     .filter(|e| matches!(e.layer, MemoryLayer::L0 | MemoryLayer::L1))

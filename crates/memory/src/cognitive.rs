@@ -291,6 +291,17 @@ impl CognitiveContextManager {
         })
     }
 
+    /// Initialise the manager and auto-load the project knowledge graph when
+    /// workspace_root is provided.
+    pub async fn new_with_project_kg(
+        config: MemoryConfig,
+        workspace_root: PathBuf,
+    ) -> Result<Self> {
+        let mgr = Self::new_with_workspace(config, Some(workspace_root.clone())).await?;
+        let _ = mgr.load_project_kg(&workspace_root);
+        Ok(mgr)
+    }
+
     // -----------------------------------------------------------------------
     // Write guard configuration
     // -----------------------------------------------------------------------

@@ -123,6 +123,8 @@ struct Inner {
     active_project: Option<String>,
     /// Cached per-project stores, keyed by project ID.
     project_stores: HashMap<String, SqliteStore>,
+    /// Optional callback invoked after each project registration.
+    on_project_registered: Option<Box<dyn Fn(&PathBuf) + Send + Sync>>,
 }
 
 /// Manages global and per-project memory stores.
@@ -161,8 +163,21 @@ impl ProjectScopeManager {
                 projects: HashMap::new(),
                 active_project: None,
                 project_stores: HashMap::new(),
+                on_project_registered: None,
             }),
         })
+    }
+
+    /// Set a callback to be invoked after each successful project registration.
+    ///
+    /// The callback receives the canonical project path and is called after
+    /// the project store is opened and the project knowledge graph is built.
+    pub fn on_project_registered<F>(self, callback: F) -> Self
+    where
+        F: Fn(&PathBuf) + Send + Sync + 'static,
+    {
+        self.inner.lock().unwrap().on_project_registered = Some(Box::new(callback));
+        self
     }
 
     /// Register a project at `path`, returning its derived project ID.
@@ -208,11 +223,19 @@ impl ProjectScopeManager {
 
         inner.projects.insert(project_id.clone(), manifest);
         inner.project_stores.insert(project_id.clone(), store.clone());
+        let project_registered_cb = inner.on_project_registered.as_ref().map(|_| ());
         drop(inner);
 
         // Auto-build project knowledge graph on registration
         let _kg = build_project_kg(&canonical_clone);
-        
+
+        if project_registered_cb.is_some() {
+            let inner = self.inner.lock().unwrap();
+            if let Some(ref cb) = inner.on_project_registered {
+                cb(&canonical_clone);
+            }
+        }
+
         Ok(project_id)
     }
 
