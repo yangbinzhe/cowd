@@ -360,117 +360,25 @@ impl TuiState {
         let max_input = (area.height / 2).max(3);
         let input_h = (input_lines + 2).min(max_input).max(3);
 
-        // Compute content area: exclude status bar (1 line) and dynamic input from bottom.
-        let content_area = if area.height > input_h + 1 {
-            ratatui::layout::Rect::new(0, 0, area.width, area.height.saturating_sub(input_h + 1))
+        // FIX A: When search is active, reserve top 1 line for search bar.
+        // This prevents search bar from overlapping chat content.
+        let search_bar_h: u16 = if self.app.search_active { 1 } else { 0 };
+
+        // Compute content area: exclude status bar (1 line), dynamic input from bottom,
+        // and search bar (1 line from top when active).
+        let bottom_reserved = input_h + 1; // input + status bar
+        let top_reserved = search_bar_h;
+        let content_y = top_reserved;
+        let content_h = area.height.saturating_sub(bottom_reserved + top_reserved);
+        let content_area = if content_h > 0 {
+            ratatui::layout::Rect::new(0, content_y, area.width, content_h)
         } else {
-            area
+            ratatui::layout::Rect::new(0, content_y, area.width, 0)
         };
 
-        // 1. Render chat view (70% left) + sidebar (30% right) in content area
-        {
-            let chat_w = ((content_area.width as f32 * 0.7).round() as u16).min(content_area.width);
-            let sidebar_w = content_area.width.saturating_sub(chat_w);
-            let chat_area = ratatui::layout::Rect::new(0, 0, chat_w, content_area.height);
-            let sidebar_area = ratatui::layout::Rect::new(chat_w, 0, sidebar_w, content_area.height);
-
-            let mut ctx = RenderContext::new(frame, &skin);
-
-            // Render chat view (already synced above)
-            {
-                let _guard = self.render_profiler.guard("chat_view");
-                self.chat_view.render(&mut ctx, chat_area);
-            }
-
-            // Render sidebar: tab bar + active panel
-            let tab_height = 1u16;
-            let tab_labels = ["Context", "Changes", "Todo", "Diff", "Files", "Sessions"];
-            let tab_area = ratatui::layout::Rect::new(
-                sidebar_area.x, sidebar_area.y, sidebar_area.width, tab_height,
-            );
-            let tabs = ratatui::widgets::Tabs::new(tab_labels).select(self.sidebar_active_tab);
-            ctx.frame_mut().render_widget(tabs, tab_area);
-
-            let panel_area = ratatui::layout::Rect::new(
-                sidebar_area.x,
-                sidebar_area.y.saturating_add(tab_height),
-                sidebar_area.width,
-                sidebar_area.height.saturating_sub(tab_height),
-            );
-            match self.sidebar_active_tab {
-                0 => self.context_panel.render(&mut ctx, panel_area),
-                1 => self.file_changes_panel.render(&mut ctx, panel_area),
-                2 => self.todo_panel.render(&mut ctx, panel_area),
-                3 => {
-                    let _guard = self.render_profiler.guard("diff_viewer");
-                    let _ = error_recovery::catch_render_panic("diff_viewer", AssertUnwindSafe(|| {
-                        self.diff_viewer.render(&mut ctx, panel_area);
-                    }));
-                }
-                4 => {
-                    let _guard = self.render_profiler.guard("file_tree");
-                    let _ = error_recovery::catch_render_panic("file_tree", AssertUnwindSafe(|| {
-                        self.file_tree.render(&mut ctx, panel_area);
-                    }));
-                }
-                5 => {
-                    let _guard = self.render_profiler.guard("session_sidebar");
-                    let _ = error_recovery::catch_render_panic("session_sidebar", AssertUnwindSafe(|| {
-                        self.session_sidebar.render(&mut ctx, panel_area);
-                    }));
-                }
-                _ => {}
-            }
-        }
-
-        // BUG 3 FIX: Sync back only viewport height to App.
-        // scroll_offset stays in app as single source of truth.
-        // Auto-scroll during streaming is handled here directly.
-        if self.app.auto_scroll {
-            // Compute bottom position from chat_view's total lines
-            let total = self.chat_view.total_lines();
-            let vh = self.app.viewport_height as usize;
-            if total > vh {
-                self.app.scroll_offset = (total - vh) as u16;
-            } else {
-                self.app.scroll_offset = 0;
-            }
-        }
-        // Re-sync chat_view's scroll state from app after potential update
-        self.chat_view.scroll_offset = self.app.scroll_offset;
-        self.chat_view.auto_scroll = self.app.auto_scroll;
-
-        // 2. Render status bar at bottom
-        {
-            let status_area = ratatui::layout::Rect::new(
-                0,
-                area.height.saturating_sub(1),
-                area.width,
-                1,
-            );
-            let degraded = {
-                let mut ctx = RenderContext::new(frame, &skin);
-                let _guard = self.render_profiler.guard("status_bar");
-                match error_recovery::catch_render_panic("status_bar", AssertUnwindSafe(|| {
-                    self.status_bar.render(&mut ctx, status_area);
-                })) {
-                    RenderResult::Ok => None,
-                    RenderResult::Degraded(msg) => Some(msg),
-                }
-            };
-            if let Some(msg) = degraded {
-                self.add_message("system", &msg);
-            }
-        }
-
-        // BUG 4: Search bar overlay when search is active
+        // FIX A: Render search bar BEFORE content to prevent overlap
         if self.app.search_active {
-            let search_area = ratatui::layout::Rect::new(
-                0,
-                content_area.y,
-                area.width,
-                1,
-            );
+            let search_area = ratatui::layout::Rect::new(0, 0, area.width, 1);
             let search_text = if self.app.search_query.is_empty() {
                 "/ ".to_string()
             } else {
@@ -494,7 +402,116 @@ impl TuiState {
             );
         }
 
+        // ── Main content: one RenderContext for chat, sidebar, status, input ──
+        let mut main_ctx: RenderContext = RenderContext::new(frame, &skin);
+
+        // 1. Render chat view (70% left) + sidebar (30% right) in content area
+        {
+            let chat_w = ((content_area.width as f32 * 0.7).round() as u16).min(content_area.width);
+            let sidebar_w = content_area.width.saturating_sub(chat_w);
+            let chat_area = ratatui::layout::Rect::new(0, 0, chat_w, content_area.height);
+            let sidebar_area = ratatui::layout::Rect::new(chat_w, 0, sidebar_w, content_area.height);
+
+            // Render chat view (already synced above)
+            {
+                let _guard = self.render_profiler.guard("chat_view");
+                self.chat_view.render(&mut main_ctx, chat_area);
+            }
+
+            // Render sidebar: tab bar + active panel
+            let tab_height = 1u16;
+            let tab_labels = ["Context", "Changes", "Todo", "Diff", "Files", "Sessions"];
+            let tab_area = ratatui::layout::Rect::new(
+                sidebar_area.x, sidebar_area.y, sidebar_area.width, tab_height,
+            );
+            let tabs = ratatui::widgets::Tabs::new(tab_labels).select(self.sidebar_active_tab);
+            main_ctx.frame_mut().render_widget(tabs, tab_area);
+
+            let panel_area = ratatui::layout::Rect::new(
+                sidebar_area.x,
+                sidebar_area.y.saturating_add(tab_height),
+                sidebar_area.width,
+                sidebar_area.height.saturating_sub(tab_height),
+            );
+            match self.sidebar_active_tab {
+                0 => {
+                    let _ = error_recovery::catch_render_panic("context_panel", AssertUnwindSafe(|| {
+                        self.context_panel.render(&mut main_ctx, panel_area);
+                    }));
+                }
+                1 => {
+                    let _ = error_recovery::catch_render_panic("file_changes_panel", AssertUnwindSafe(|| {
+                        self.file_changes_panel.render(&mut main_ctx, panel_area);
+                    }));
+                }
+                2 => {
+                    let _ = error_recovery::catch_render_panic("todo_panel", AssertUnwindSafe(|| {
+                        self.todo_panel.render(&mut main_ctx, panel_area);
+                    }));
+                }
+                3 => {
+                    let _guard = self.render_profiler.guard("diff_viewer");
+                    let _ = error_recovery::catch_render_panic("diff_viewer", AssertUnwindSafe(|| {
+                        self.diff_viewer.render(&mut main_ctx, panel_area);
+                    }));
+                }
+                4 => {
+                    let _guard = self.render_profiler.guard("file_tree");
+                    let _ = error_recovery::catch_render_panic("file_tree", AssertUnwindSafe(|| {
+                        self.file_tree.render(&mut main_ctx, panel_area);
+                    }));
+                }
+                5 => {
+                    let _guard = self.render_profiler.guard("session_sidebar");
+                    let _ = error_recovery::catch_render_panic("session_sidebar", AssertUnwindSafe(|| {
+                        self.session_sidebar.render(&mut main_ctx, panel_area);
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        // BUG 3 FIX: Sync back only viewport height to App.
+        // scroll_offset stays in app as single source of truth.
+        // Auto-scroll during streaming is handled here directly.
+        if self.app.auto_scroll {
+            // Compute bottom position from chat_view's total lines
+            let total = self.chat_view.total_lines();
+            let vh = self.app.viewport_height as usize;
+            if total > vh {
+                self.app.scroll_offset = (total - vh) as u16;
+            } else {
+                self.app.scroll_offset = 0;
+            }
+        }
+        // Re-sync chat_view's scroll state from app after potential update
+        self.chat_view.scroll_offset = self.app.scroll_offset;
+        self.chat_view.auto_scroll = self.app.auto_scroll;
+
+        // 2. Render status bar at bottom (reuses main_ctx)
+        {
+            let status_area = ratatui::layout::Rect::new(
+                0,
+                area.height.saturating_sub(1),
+                area.width,
+                1,
+            );
+            let degraded = {
+                let _guard = self.render_profiler.guard("status_bar");
+                match error_recovery::catch_render_panic("status_bar", AssertUnwindSafe(|| {
+                    self.status_bar.render(&mut main_ctx, status_area);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
+        }
+
         // 2.5. Render input directly from app.input (BUG 1 FIX: single source of truth)
+        // FIX B: Set block on textarea before rendering for cursor visibility
         {
             let input_y = area.height.saturating_sub(1 + input_h);
             let input_area = ratatui::layout::Rect::new(
@@ -503,28 +520,34 @@ impl TuiState {
                 area.width,
                 input_h,
             );
+            self.app.input.set_block(
+                ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+            );
             // Render app.input widget directly — NOT through prompt
             {
                 let _guard = self.render_profiler.guard("input");
-                frame.render_widget(self.app.input.widget(), input_area);
+                main_ctx.frame_mut().render_widget(&self.app.input, input_area);
             }
             // Render prompt's autocomplete dropdown as overlay
             {
-                let mut ctx = RenderContext::new(frame, &skin);
                 let _guard = self.render_profiler.guard("prompt_dropdown");
                 let _ = error_recovery::catch_render_panic("prompt_dropdown", AssertUnwindSafe(|| {
-                    self.prompt.render_dropdown(&mut ctx, input_area);
+                    self.prompt.render_dropdown(&mut main_ctx, input_area);
                 }));
             }
         }
 
+        // ── Overlays: one RenderContext for all conditional overlays ──
+        let mut overlay_ctx: RenderContext = RenderContext::new(frame, &skin);
+
         // 3. Render thinking panel when turn is active
         if self.app.turn_active {
             let degraded = {
-                let mut ctx = RenderContext::new(frame, &skin);
                 let _guard = self.render_profiler.guard("thinking_panel");
                 match error_recovery::catch_render_panic("thinking_panel", AssertUnwindSafe(|| {
-                    self.thinking_panel.render(&mut ctx, area);
+                    self.thinking_panel.render(&mut overlay_ctx, area);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
@@ -538,10 +561,9 @@ impl TuiState {
         // 4. Render agents overlay when visible
         if self.agents_overlay.visible {
             let degraded = {
-                let mut ctx = RenderContext::new(frame, &skin);
                 let _guard = self.render_profiler.guard("agents_overlay");
                 match error_recovery::catch_render_panic("agents_overlay", AssertUnwindSafe(|| {
-                    self.agents_overlay.render(&mut ctx, area);
+                    self.agents_overlay.render(&mut overlay_ctx, area);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
@@ -555,10 +577,9 @@ impl TuiState {
         // 5. Render toast notifications at top-right
         if !self.toast_manager.is_empty() {
             let degraded = {
-                let mut ctx = RenderContext::new(frame, &skin);
                 let _guard = self.render_profiler.guard("toast_manager");
                 match error_recovery::catch_render_panic("toast_manager", AssertUnwindSafe(|| {
-                    self.toast_manager.render(&mut ctx, area);
+                    self.toast_manager.render(&mut overlay_ctx, area);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
@@ -572,10 +593,9 @@ impl TuiState {
         // 6. Render dialog stack on top (backdrop + centered dialog)
         if !self.dialog_manager.is_empty() {
             let degraded = {
-                let mut ctx = RenderContext::new(frame, &skin);
                 let _guard = self.render_profiler.guard("dialog_manager");
                 match error_recovery::catch_render_panic("dialog_manager", AssertUnwindSafe(|| {
-                    self.dialog_manager.render(&mut ctx, area);
+                    self.dialog_manager.render(&mut overlay_ctx, area);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
@@ -589,10 +609,9 @@ impl TuiState {
         // 7. Render command palette when open
         if self.command_palette.is_open() {
             let degraded = {
-                let mut ctx = RenderContext::new(frame, &skin);
                 let _guard = self.render_profiler.guard("command_palette");
                 match error_recovery::catch_render_panic("command_palette", AssertUnwindSafe(|| {
-                    self.command_palette.render(&mut ctx, area);
+                    self.command_palette.render(&mut overlay_ctx, area);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
@@ -607,10 +626,9 @@ impl TuiState {
         if let Some(ref mut qf) = self.question_form {
             if qf.is_active() {
                 let degraded = {
-                    let mut ctx = RenderContext::new(frame, &skin);
                     let _guard = self.render_profiler.guard("question_form");
                     match error_recovery::catch_render_panic("question_form", AssertUnwindSafe(|| {
-                        qf.render(&mut ctx, area);
+                        qf.render(&mut overlay_ctx, area);
                     })) {
                         RenderResult::Ok => None,
                         RenderResult::Degraded(msg) => Some(msg),
@@ -625,10 +643,9 @@ impl TuiState {
         // 9. Render export dialog when active
         if self.export_dialog_active {
             let degraded = {
-                let mut ctx = RenderContext::new(frame, &skin);
                 let _guard = self.render_profiler.guard("export_dialog");
                 match error_recovery::catch_render_panic("export_dialog", AssertUnwindSafe(|| {
-                    self.export_dialog.render(&mut ctx, area);
+                    self.export_dialog.render(&mut overlay_ctx, area);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
@@ -890,6 +907,20 @@ impl TuiState {
 
         if self.app.search_active {
             return self.handle_search_key(key);
+        }
+
+        // FIX D: Empty input + j/k → navigate timeline cursor (open code behavior)
+        // When input is empty, j/k move the cursor between entries instead of scrolling.
+        if self.app.input.is_empty()
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('j' | 'k'))
+        {
+            if key.code == KeyCode::Char('j') {
+                self.app.cursor_down();
+            } else {
+                self.app.cursor_up();
+            }
+            return ProcessedKey::Nothing;
         }
 
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)

@@ -1,3 +1,7 @@
+// Legacy render module: kept for reference, not called by new TuiState render path.
+// TuiState::render() handles all rendering directly via components.
+#![allow(dead_code)]
+
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     Frame,
