@@ -210,7 +210,7 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
 #[must_use]
 pub fn build_linux_sandbox_command(
     command: &str,
-    cwd: &Path,
+    _cwd: &Path,
     status: &SandboxStatus,
 ) -> Option<LinuxSandboxCommand> {
     if !cfg!(target_os = "linux")

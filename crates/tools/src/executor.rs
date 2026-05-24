@@ -397,7 +397,6 @@ fn run_worker_create(input: WorkerCreateInput) -> Result<String, String> {
 
 /// Persist worker state to `~/.cowd/worker-state.json`.
 fn persist_worker_state(worker: &Worker) -> std::io::Result<()> {
-    use std::path::Path;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

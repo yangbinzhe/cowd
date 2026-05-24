@@ -17,7 +17,6 @@ use std::{
     sync::Arc,
 };
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 use crate::{
     code_indexer::{CodeIndexer, CodeSymbol, IndexStats},

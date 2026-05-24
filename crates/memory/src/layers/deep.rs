@@ -23,7 +23,7 @@ use crate::{
     project_scope::MemoryScope,
     store::MemoryStore,
     types::{
-        MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta, MemorySource,
+        MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource,
         PreparedContext, Priority, TokenBudget,
     },
 };

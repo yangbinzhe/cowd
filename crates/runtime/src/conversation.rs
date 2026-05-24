@@ -851,7 +851,7 @@ self.record_turn_completed(&summary);
             PermissionOutcome::Deny {
                 reason: format!("PreToolUse hook denied tool `{tool_name}`"),
             }
-        } else if let Some(mut prompt) = prompter.lock().as_mut() {
+        } else if let Some(prompt) = prompter.lock().as_mut() {
             self.permission_policy.authorize_with_context(
                 tool_name, &effective_input, &permission_context, Some(prompt.as_mut()),
             )

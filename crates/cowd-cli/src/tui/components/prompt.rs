@@ -836,9 +836,8 @@ impl Prompt {
             return String::new();
         }
         let last_line = lines[lines.len() - 1];
-        let col = last_line.len();
         let chars: Vec<char> = last_line.chars().collect();
-        let mut start = col;
+        let mut start = chars.len();
         while start > 0 {
             let c = chars[start - 1];
             if c.is_whitespace() {
@@ -846,7 +845,7 @@ impl Prompt {
             }
             start -= 1;
         }
-        chars[start..col].iter().collect()
+        chars[start..chars.len()].iter().collect()
     }
 
     /// Render the suggestion dropdown below the input area.
@@ -931,7 +930,7 @@ impl Component for Prompt {
         }
 
         // Render the textarea
-        ctx.frame_mut().render_widget(self.textarea.widget(), area);
+        ctx.frame_mut().render_widget(&self.textarea, area);
 
         // Render inline preview: dimmed text after the cursor
         if !self.inline_preview.is_empty() {
@@ -1587,5 +1586,38 @@ mod tests {
         prompt.textarea_mut().insert_str("!");
         prompt.update_shell_mode();
         assert!(!prompt.is_shell_mode(), "just ! should not activate shell mode, text='{}' len={}", prompt.text(), prompt.text().len());
+    }
+
+    #[test]
+    fn utf8_word_extraction() {
+        let prompt = Prompt::new("/tmp");
+
+        // Multi-byte UTF-8 only: "你好世界" (6 bytes, 4 chars) - was crashing
+        let result = prompt.current_word_from_text("你好世界");
+        assert_eq!(result, "你好世界", "full UTF-8 text should be returned as the current word");
+
+        // English text should still work
+        let result = prompt.current_word_from_text("hello world");
+        assert_eq!(result, "world", "last word in ASCII should be returned");
+
+        // Mixed CJK with whitespace
+        let result = prompt.current_word_from_text("test 你好");
+        assert_eq!(result, "你好", "last CJK word after space should be returned");
+
+        // Empty string
+        let result = prompt.current_word_from_text("");
+        assert_eq!(result, "", "empty text should return empty string");
+
+        // Whitespace at end (empty word context)
+        let result = prompt.current_word_from_text("hello ");
+        assert_eq!(result, "", "trailing space should return empty string");
+
+        // Multi-line with CJK
+        let result = prompt.current_word_from_text("first line\nsecond 测试");
+        assert_eq!(result, "测试", "last word on last line with CJK should work");
+
+        // Single CJK character
+        let result = prompt.current_word_from_text("中");
+        assert_eq!(result, "中", "single CJK character should work");
     }
 }

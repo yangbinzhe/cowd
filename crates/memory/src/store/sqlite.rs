@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::{
-    code_indexer::{CodeSymbol, FileFingerprint, SymbolEdge, SymbolEdgeType, SymbolKind},
+        code_indexer::{CodeSymbol, FileFingerprint, SymbolEdge, SymbolKind},
     config::StoreConfig,
     entity::{Entity, Triple},
     error::MemoryError,
@@ -2058,6 +2058,7 @@ impl MemoryStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code_indexer::SymbolEdgeType;
     use crate::types::{MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority};
     use uuid::Uuid;
 
