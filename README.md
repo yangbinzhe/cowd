@@ -1,7 +1,7 @@
 # COWD — AI 编程智能体框架
 
-> **Rust 原生高性能 AI 编程智能体** | 273 源文件 · 173K 行 · 524 测试
-> CLI / TUI / WebUI · 内存系统 · 代码图谱 · MCP · 插件系统
+> **Rust 原生多智能体编程框架** | 273 源文件 · 173K 行 · 524 测试
+> 内存系统 · 代码智能 · 权限管控 · MCP 协议 · 多平台接入
 
 ---
 
@@ -22,256 +22,318 @@
 
 ---
 
-## TUI 终端界面
+## 设计哲学
 
-### 组件系统 (19 组件, ~31K 行)
+cowd 解决一个核心问题：**AI 编程智能体如何拥有可靠、持久、可进化的认知能力？**
 
-```
-┌─────────────────────────────┬──────────────────┐
-│  ChatView (70%)             │  侧边栏 (30%)     │
-│  · 消息时间线               │  Context | Changes │
-│  · 流式渲染 + 虚拟滚动      │  Todo | Diff       │
-│  · 搜索高亮                 │  Files | Sessions  │
-│                             │  ── 6 个标签页     │
-├─────────────────────────────┴──────────────────┤
-│  Prompt (自动补全 + frecency + @file 引用)       │
-├────────────────────────────────────────────────┤
-│  状态栏 (模型 / Token / MCP / LSP / 权限)       │
-└────────────────────────────────────────────────┘
-+ Toast · Dialog · CommandPalette · WhichKey
-+ ThinkingPanel · AgentsOverlay · QuestionForm
-```
+不是提示词工程，也不是工具集合。cowd 是一套**智能体运行时系统**——它不回答"这一轮该说什么"，而是回答"这个智能体如何存在、如何感知、如何安全行动、如何记住、如何学习"。
 
-| 能力 | 实现 | 能力 | 实现 |
-|------|------|------|------|
-| Component trait 抽象 | `base.rs` | Diff Viewer (unified/split) | `diff_viewer.rs` |
-| LayoutTree 布局引擎 | `layout/` | Command Palette (Ctrl+P) | `command_palette.rs` |
-| Keybind + Which-Key | `keybind/` | Session Sidebar | `session_sidebar.rs` |
-| Dialog (Alert/Confirm/Select/Prompt) | `dialog.rs` | File Tree Browser | `file_tree.rs` |
-| Toast 通知 | `toast.rs` | Export Dialog | `export_dialog.rs` |
-| Theme Engine (热加载) | `theme/` | Session Fork | `session_sidebar.rs` |
-| Prompt 自动补全 (frecency) | `prompt.rs` | Multi-Stage Permission | `dialog.rs` |
-| Question 多问题表单 | `question_form.rs` | Sub-Agent 导航 | `chat_view.rs` |
-| Startup Loading | `state.rs` | Clipboard (OSC52 + 图像) | `clipboard.rs` |
-| Infinite Scroll | `app.rs` | ANSI 颜色降级 | `ansi_fallback.rs` |
-| Animation 引擎 | `animation.rs` | Error Recovery | `error_recovery.rs` |
-| Accessibility (WCAG AA) | `accessibility.rs` | Perf Profiler | `profiler.rs` |
+核心信念：
+
+1. **智能体需要记忆架构，而不只是上下文窗口**。窗口是瞬态的，记忆是持久的。没有记忆的智能体每轮对话都是第一次见面，永远无法理解项目的深层脉络。
+2. **知识必须分层，不能平铺**。身份(L0)不应与项目细节(L2)混在一起，对话历史(L3)不应与共享共识(L4)共同竞争上下文预算。分层是认知的基础设施。
+3. **安全不是策略，是架构**。权限不是事后检查，而是写死在 Gate 流水线和 WriteGuard 中的不可绕过控制。
+4. **智能体应能理解代码结构，而不仅仅是文本**。tree-sitter AST 代码索引让 cowd 理解函数边界、调用关系、继承层次——不依赖 LLM 的幻觉推断。
+5. **多智能体需要共享知识，但必须防冲突**。L4 共享层 + 三元信号仲裁让多个 Agent 协作时不会互相覆盖，而是形成加权共识。
 
 ---
 
-## 内存系统 (36 模块 · 32K 行 · 524 测试)
+## 五大子系统 · 有机连接
 
-内存子系统是 cowd 的知识核心——一套多智能体、分层感知的知识管理系统，实现知识从流入、存储、索引、检索、演化、衰减到重建的完整闭环。
+### 1. 对话运行时 (Conversation Runtime) — 循环中枢
 
-### 核心架构：三维模型
+这是驱动每一轮智能体交互的核心循环。它不只是一个 LLM 调用封装，而是**上下文准备 → LLM 调用 → 工具执行 → 记忆写入**的完整闭环。
 
-| 维度 | 枚举值 | 说明 |
-|------|--------|------|
-| **范围(Scope)** | Global / Project / Session / Agent | 知识所属的隔离域，每项目独立 SQLite 存储 |
-| **层级(Layer)** | L0 Identity / L1 Essential / L2 Project / L3 Deep / L4 Shared | 记忆的分层存储与检索策略 |
-| **状态(State)** | Stable / Transient / Rotting / Archived | 记忆的生命周期状态及老化策略 |
-
-每维正交组合形成一个记忆定位点，系统据此决定写入位置、检索策略、压缩优先级和衰减速率。
-
-### 五层存储
+核心流程：
 
 ```
-L0 Identity   — 用户身份信息，跨所有会话不变
-L1 Essential  — 热记忆(15条) + 热符号(5个代码槽位)，容量饱和时驱逐低频项
-L2 Project    — 项目级上下文(~3000 token) + 项目知识图谱 + 逐字存储
-L3 Deep       — SQLite FTS5 全文检索 + 时序知识图谱 + 符号↔对话关联
-L4 Shared     — 多智能体共享知识 + 冲突检测 + 共识裁决
+  用户输入
+      │
+      ▼
+  prepare_context()     ← 内存系统注入：身份/项目/代码/同伴/历史/种子
+      │
+      ▼
+  LLM 流式推理          ← Provider 适配层 + Prompt Caching
+      │
+      ▼
+  流式回传用户          ← TUI 渲染 / Server SSE 推送
+      │
+      ▼
+  工具调用 (tool_call)  ← MCP 桥接 → 权限 Gate → 沙箱执行
+      │
+      ▼
+  on_turn_end()         ← 记忆写入/提取/漂移/嵌入/压缩/持久化
 ```
 
-### 知识生命周期
+**关键连接**：
+- 对话运行时依赖 **内存系统** 的 `CognitiveContextManager.prepare_context()` 构建上下文，依赖 `on_turn_end()` 写入本轮收获
+- 工具调用经过 **权限系统** 的 Gate 流水线（PreFlight → Approval → Revision）才能执行
+- 复杂工具链由 **Wave 编排引擎** 拆解为并行任务图，每个子任务可委派给 **SubAgent**
+- 运行时可被 Platform 事件(飞书消息/邮件/Webhook)触发
+
+### 2. 内存系统 (Memory System) — 智能体的大脑
+
+cowd 的核心原创。36 个模块组成的认知架构，不是数据库，不是缓存，而是一套**完整的知识生命周期管理系统**。
+
+三维架构：
 
 ```
-  流入                        感知                        演化
-  ┌─────────┐    ┌─────────────────────┐    ┌───────────────────┐
-  │ Extractor│───▶│ prepare_context()  │───▶│ KnowledgeGraph    │
-  │ Miner    │    │ · Peer Perception  │    │ · Entity dedup    │
-  │ Verbatim │    │ · Session Resume   │    │ · Temporal edges  │
-  │ Tool     │    │ · Fresh Context    │    │ · Coherence check │
-  │ Sandbox  │    │ · Hot Topics       │    │ · Drift detection │
-  └─────────┘    │ · Conflict Detect  │    └───────────────────┘
-                 └─────────────────────┘           │
-                                                   ▼
-  检索                        衰减                重建
-  ┌─────────┐    ┌─────────────────────┐    ┌───────────────────┐
-  │ FTS5    │    │ ContextRot          │    │ StateRebuilder    │
-  │ BM25    │◀───│ · Token window      │───▶│ · Recover L0-L3   │
-  │ Hybrid  │    │ Drift               │    │ Handoff protocol  │
-  │ Embed   │    │ · Stale KG cleanup  │    └───────────────────┘
-  └─────────┘    └─────────────────────┘
+         Scope轴 (知识属于谁)
+    Global ─── Project ─── Session ─── Agent
+          \        |         |       /
+           ───◎ 记忆定位点 ◎───
+          /        |         |       \
+    L0 ── L1 ──── L2 ───── L3 ──── L4
+         Layer轴 (知识如何存储)
+              ↑
+           State轴 (知识处于什么阶段)
+       Stable ─── Transient ─── Rotting ─── Archived
 ```
 
-### 36 个模块详解
+每个知识条目都被这三个轴定位，系统据此决定：
+- **写**：写入哪个 SQLite 存储？进入哪一层？用什么写策略？
+- **读**：什么范围可用 FTS5？什么范围需要 BM25 重排序？什么范围直接注入？
+- **衰减**：Stable 永不压缩，Transient 逐代降级，Rotting 标记重建，Archived 冻结
 
-#### 调度中枢 (3)
+**内存不是配角，而是主架构**。整个智能体的感知、决策、行动都围绕它展开：
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| **CognitiveContextManager** | `cognitive.rs` | 统一入口门面，编排 `prepare_context()`(13步，含 L0+L2 预加载→BM25 恢复→同伴感知→L4 查询→L3 混合→种子压缩→热主题→代码注入) 和 `on_turn_end()`(14步，含提取→工具沙箱→微观→会话→漂移→种子→tick→KG 陈旧→跨存储校验→壁橱→向量→KG 持久化→腐烂→种子保存→批量嵌入) 完整生命周期 |
-| **MemoryOrchestrator** | `orchestrator.rs` | 顶层协调器：`remember()` 带记忆分层写入和 OnceLock 缓存正则(~10,000×提速)，`recall_peer_context()` 跨会话同伴召回，`detect_conflict()` 冲突检测触发 |
-| **SessionManager** | `session_manager.rs` | 统一会话管理，支持会话创建、切换、fork、搜索、续接 |
+```
+  ┌─────────────────────────────────────────────────────────┐
+  │                    记忆生命周期                          │
+  │                                                         │
+  │  流入层        感知层         演化层         检索层       │
+  │  Extractor──▶ prepare──▶ KnowledgeGraph──▶ FTS5/BM25   │
+  │  Miner       context()     TemporalGraph   Embeddings   │
+  │  ToolOutput  13步注入       Coherence       HybridRank   │
+  │  Verbatim    Dual L4       ConflictDetect               │
+  │              代码注入       EntityDedup                  │
+  │                            DriftUpdate                  │
+  │                                  │                      │
+  │                                  ▼                      │
+  │                       衰减层           重建层             │
+  │                       ContextRot──▶ StateRebuilder      │
+  │                       KG Stale       HandoffProtocol    │
+  │                       CrossStoreVerify                  │
+  └─────────────────────────────────────────────────────────┘
+```
 
-#### 范围隔离 (1)
+22 个核心模块按角色划分为 10 组，但真正的架构不是模块列表，而是**它们之间的数据流**：
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| **ProjectScopeManager** | `project_scope.rs` | 每项目独立 SQLite 存储(`memory_{hash}.db`)，范围感知(Global/Project/Session/Agent)查询过滤，`unified_scan()` 单次目录遍历双输出：正则知识图谱实体(14+语言+文档+配置+前端) + tree-sitter 代码符号 |
+| 组 | 模块 | 连接关系 |
+|----|------|----------|
+| 调度中枢 | Cognitive, Orchestrator, SessionManager | 所有生命周期的入口和编排者 |
+| 范围隔离 | ProjectScopeManager | 每项目独立 SQLite，决定知识的可见边界 |
+| 代码智能 | CodeIndexer, ProjectKG, HotSymbols | tree-sitter AST → KnowledgeGraph → L1 热槽注入 → prepare_context |
+| 检索引擎 | FTS5, BM25, FreshContext, Relevance | 从 4 个不同维度召回知识，混合排序后注入上下文 |
+| 知识提取 | Extractor, Miner, ToolSandbox | 对话/工具输出/文件 → 结构化知识，on_turn_end 入口 |
+| 共享层 | SharedMemoryManager | 跨 Agent/跨会话的 L4 中介，peer perception + hot topics |
+| 审计控制 | VerbatimSink, WriteGuard, Drift, ContextRot | 写什么、谁能写、何时腐烂、何时清理 |
+| 重建恢复 | StateRebuilder, Handoff, Seeds | 会话中断恢复 + 决策点回溯 + 跨会话交接 |
+| 压缩路由 | AAAK, AAAK Index, Closet | 70-85% 压缩率 + 主题指针索引，保持可检索性 |
+| 一致性 | FactChecker, Coherence, EntityRegistry, ContextFence | 多个 Agent 写入的知识不冲突、不重复、不污染 |
 
-#### 代码智能 (3)
+### 3. 安全与管控 (Safety & Control) — 不可绕过的防护
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| **CodeIndexer** | `code_indexer.rs` | tree-sitter 嵌入式 AST 引擎：5 语言解析(Rust/Python/TypeScript/Go/Java)，提取函数/类/方法/接口/结构体/枚举，生成调用/导入/继承/实现边，增量索引+文件指纹变更检测 |
-| **ProjectKG** | `entity.rs` | 知识图谱：Entity 节点(函数/类/模块等，带 `source_type` 标记运行时/空间/MCP/代码库)，Triple 边(调用/导入/继承/定义/引用，带时间戳+Agent归属) |
-| **HotSymbols** | 内置 | L1 5 个热符号槽位，文件访问后自动提升为热符号，LLM 调用前自动注入 |
+安全不是附加功能，而是架构中**不可绕过的一层**。智能体可以访问文件系统、执行命令、调用 API——这些能力如果没有管控就是灾难。
 
-#### 检索系统 (4)
+四层防护：
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| **FTS5 Search** | `store/sqlite.rs` | 全量 SQLite FTS5 全文搜索，支持范围限定查询 |
-| **BM25 Session Resume** | `session_resume.rs` | BM25 算法重排序会话历史，`prepare_context()` Step 2a 注入最相关的 L3 条目 |
-| **FreshContextManager** | `fresh_context.rs` | 新鲜上下文管理：80% 预算给当前轮次核心意图，20% 给辅助上下文 |
-| **RelevanceScorer** | `relevance.rs` | 多信号相关性评分：语义相似度(BM25 向量混合)+时间衰减+来源信任度，动态加载最相关记忆 |
+```
+  权限判定     → PermissionMode: read-only / workspace-write / danger-full-access
+  Gate 流水线  → PreFlight(预检) → Approval(审批) → Revision(修正) → Escalation(升级) → Abort(终止)
+  WriteGuard   → 控制谁(L0/L1/Agent/External)可以写哪些内存层，全部审计日志
+  沙箱隔离     → Linux Sandbox: 容器隔离 + 文件系统隔离 + 网络限制
+```
 
-#### 知识提取 (2)
+Gate 系统特别值得一提。它不是简单的"放行/拒绝"二元判断——它是一个完整的事件流水线，包含：
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| **Extractor** | `extractor.rs` | 后台实体+关系自动提取，`on_turn_end()` Step 0 将对话内容解析为结构化知识写入 KG |
-| **Miner** | `miner.rs` | 多模式知识挖掘：项目扫描(文件结构+依赖+配置)、对话挖掘(决策+模式+约束)、通用文本提取 |
+- **PreFlightGate**：执行前检查影响范围，触发 impact analysis
+- **ApprovalGate**：根据策略自动批准或转人工审批
+- **RevisionGate**：检测修改是否超出预期范围，触发修正建议
+- **EscalationGate**：风险升级，重新评估权限
+- **AbortGate**：硬终止，回滚到上一个安全状态
 
-#### L4 共享层 (1)
+Gate 与 **PolicyEngine** 协同——PolicyEngine 定义规则，Gate 执行检查，两个组件都在运行时内存中，不需要外部服务。
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| **SharedMemoryManager** | `shared.rs` | 跨会话/跨 Agent 同步：`recall_peers()` 5 分钟窗口同伴召回，`recall_peers_realtime()` 无窗口实时感知，团队/项目/全局多级查询，热主题聚合 |
+### 4. 编排引擎 (Orchestration) — 复杂任务分解
 
-#### 版本控制与审计 (7)
+单个 LLM 调用能做的事情有限。真正的编程工作需要：并行修改多个文件 → 运行测试 → 分析错误 → 修复 → 重建。cowd 通过两个组件解决：
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| **VerbatimSink** | `cognitive.rs`/`project_scope.rs` | 逐字存储——原始观察内容永久保存，永不覆盖或摘要化，支持精确恢复 |
-| **WriteGuard** | `write_guard.rs` | 写保护：控制来源(L0 用户/L1 系统/Agent/外部)可写哪些层，所有写入审计日志 |
-| **Drift** | `drift.rs` | 陈旧度检测：KG 三元组时间戳衰减评分，超过阈值标记为腐烂触发重建 |
-| **ContextRot** | `context_rot.rs` | 上下文窗口健康监控：跟踪 Token 水位线，向 Agent 反馈窗口压力告警和驱逐建议 |
-| **StateRebuilder** | `state_rebuilder.rs` | 状态重建：在上下文丢失或会话中断后，从持久化存储恢复 L0→L3 层级状态 |
-| **Handoff** | `handoff.rs` | 跨会话交接协议：序列化当前上下文状态包，支持→new session 无缝迁移 |
-| **Seeds** | `seeds.rs` | 种子决策线程：标记关键决策点，支持回溯、展开和分支探索 |
+**Wave**：依赖图 + 并行执行引擎
+```
+  Task A ──→ Task C ──→ Task E
+      \        ↑            ↑
+       → Task B ──→ Task D ─┘
+      
+  Wave 1: A, B (并行)
+  Wave 2: C, D (A,B 完成后并行)
+  Wave 3: E (C,D 完成后)
+```
 
-#### 压缩与路由 (3)
+**SubAgent**：受限执行的子智能体
+- 每个 SubAgent 获得有限的工具列表（比如只有文件读写）
+- WriteGuard 限制只能写入 L3/L4，不能写 L0/L1
+- Token 预算上限（默认 20K）
+- 超时控制
+- 执行结果汇总到父 Agent
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| **AAAK** | `aaak_compression.rs` | 自适应缩写知识压缩：符号化压缩 70-85%，保留语义完整性 |
-| **AAAK Index** | `aaak_index.rs` | 符号指针索引：记忆条目的快速符号路由层 |
-| **Closet** | `closet.rs` | 紧凑指针行索引：快速主题路由，无需全文扫描即可定位相关记忆簇 |
+Wave + SubAgent 的组合让 cowd 可以处理复杂的多步骤任务，同时每个子任务的权限范围都被精确控制。
 
-#### 一致性保障 (4)
+### 5. 平台与集成 (Platform & Integration) — 全渠道接入
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| **FactChecker** | `fact_checker.rs` | 事实一致性：`detect_conflict()` 三信号仲裁(置信度×0.4 + 新近度×0.3 + Agent 权重×0.3)，`detect_consensus()` 3+ Agent 一致则提权至 0.95 |
-| **Coherence** | `coherence.rs` | 记忆连贯性评分：Jaccard 相似度评估记忆-上下文相关性，标识不一致簇 |
-| **Entity Registry** | `entity_registry.rs` | 实体消歧合并：同名实体指纹匹配，跨存储实体一致性维护 |
-| **ContextFence** | `context_fence.rs` | 上下文围栏：基于规则的记忆隔离，确保跨会话引用不会引入无关上下文 |
+cowd 不只是一个 TUI 工具。它可以嵌入到：
 
-#### 运行时辅助 (5)
+- **API Server**：REST API，支持认证和 CORS，WebUI 捆绑
+- **飞书机器人**：接收飞书消息，返回智能体回答，支持富文本和交互卡片
+- **企微机器人**：企业微信适配
+- **邮件**：邮件收发，自动推理和回复
+- **CLI**：`cowd prompt "xxx"` 单次问答，`cowd --resume` 续接会话
 
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| **ToolSandbox** | `tool_sandbox.rs` | 工具输出沙箱：内存 FTS5 索引 + 摘要替换，防止工具原始输出污染上下文窗口 |
-| **TemporalGraph** | `temporal_graph.rs` | 时序知识图谱：实体-关系三元组按时间轴组织，支持时间窗口查询和趋势分析 |
-| **Splitter** | `splitter.rs` | 语义分割器：在语义边界(主题切换、段落结束、代码/文本切换)分割文本 |
-| **ContextSync** | `context_sync.rs` | 跨会话上下文同步：在 Agent 团队间共享活跃上下文片段 |
-| **Embedding** | `embedding.rs` | 远程嵌入客户端：对接外部嵌入服务实现向量化检索 |
+所有平台共享同一个运行时核心，通过 `EventBus` 注入外部事件：
 
-### 13 步上下文准备 (prepare_context)
-
-| 步骤 | 动作 | 数据源 |
-|------|------|--------|
-| 1 | L0 身份 + L2 项目预加载 | ProjectScope SQLite |
-| 2a | BM25 会话恢复(重排序) | SQLite FTS5 |
-| 2b | P1 项目知识图谱注入 | KnowledgeGraph |
-| 2c | 同伴感知(5 分钟窗口) | L4 Shared |
-| 2c2 | 实时同伴感知(无窗口) | L4 Shared |
-| 2d | 双 L4 查询(团队+项目) | L4 Shared |
-| 3 | L3 深度回忆 + 混合排序 | BM25 + Embedding |
-| 4 | 种子决策线程注入 | Seeds |
-| 5 | 上下文压力评估 | ContextRot |
-| 5b | 新鲜度预算切换 | FreshContextManager |
-| 6 | AAAK 压缩 + Closet 路由 | AAAK + Closet |
-| 6b | 热主题聚合 | L4 Shared |
-| 7 | tree-sitter 代码注入 | CodeIndexer |
-
-### 14 步轮次结束 (on_turn_end)
-
-| 步骤 | 动作 |
-|------|------|
-| 0 | Extractor/Miner 知识提取 |
-| 0b | ToolSandbox 工具输出索引 |
-| 1 | L1 微观记忆写入 |
-| 2 | L3 会话持久化 |
-| 3 | Drift 陈旧度更新 |
-| 4 | Seeds 决策点标记 |
-| 5 | Tick 计数器递增 |
-| 5a | KG 陈旧实体清理 |
-| 5a2 | 周期性 KG 重建 |
-| 5a3 | 跨存储一致性校验(含 Coherence) |
-| 5b | Closet 更新 |
-| 6 | Embedding 异步生成 |
-| 7 | KG 边持久化 |
-| 8 | ContextRot 窗口维护 |
-| 9 | Closet 持久化 |
-| 10 | Seeds 持久化 |
-| 11 | Batch 嵌入写入 |
-
-### 关键设计决策
-
-- **Per-Project SQLite**: 每项目独立 `memory_{hash}.db`，杜绝跨项目记忆污染，Global 范围保持单实例共享
-- **OnceLock 正则缓存**: `remember()` 热路径正则从 30 次编译降为 3 次(OneLock)，实测 10,000× 加速
-- **统一单遍扫描**: `unified_scan()` 一次 walkdir 同时产出 KG 实体(正则 14+ 语言)和代码符号(tree-sitter 5 语言)，避免两次 IO 遍历
-- **三元信号仲裁**: 冲突检测使用置信度(0.4)+新近度(0.3)+Agent 权重(0.3)加权裁决，3+ Agent 一致自动共识提权
-- **Agent 角色预算**: Planner 40%/Executor 25%/Reviewer 15% L4 写入预算，防止单一 Agent 主宰共享知识
-- **逐字永存(Verbatim)**: 原始内容永久保存，永不覆盖或摘要化，确保 LLM 调用前能从原始记录精确恢复
+```
+  飞书消息 ──→ EventBus ──→ ConversationRuntime ──→ LLM → 回复飞书
+  API请求  ──→ EventBus ──→ ConversationRuntime ──→ LLM → 回传API
+  CLI输入  ──→ EventBus ──→ ConversationRuntime ──→ LLM → TUI渲染
+```
 
 ---
 
-## 运行时核心 (81 文件 · 45K 行)
+## 当前状态评估
 
-| 类别 | 模块 |
-|------|------|
-| **会话** | session, session_control, conversation, cached_prompt, summary_compression |
-| **权限** | permissions, approval_gate, permission_enforcer, policy_engine |
-| **MCP** | mcp_server, mcp_client, mcp_stdio, mcp_tool_bridge, mcp_lifecycle_hardened |
-| **工具** | tool_orchestrator, tool_dispatch, subagent_executor, task_graph |
-| **Gates** | gates (PreFlight/Revision/Escalation/Abort + Impact Analysis) |
-| **Wave** | wave (依赖图+并行编排引擎) |
-| **平台** | platform (API Server/飞书/企微/邮件) |
-| **Agent** | agent, worker_boot, task_registry, team_cron_registry |
-| **其他** | sandbox, effect, bus, mirror, pairing, profile, recovery_recipes |
+### 已完成的核心能力
+
+| 领域 | 完成度 | 关键指标 |
+|------|--------|----------|
+| 内存系统 36 模块 | 100% | 524 测试，全生命周期闭环 |
+| 3D 记忆架构 | 100% | Scope×Layer×State，14+语言扫描 |
+| tree-sitter 代码索引 | 100% | 5 语言 AST，增量索引，关系图谱 |
+| 会话运行时 | 95% | ConversationRuntime，自动压缩，续接 |
+| Gate 流水线 | 90% | 5 种 Gate，PolicyEngine 协同 |
+| Wave 编排 | 85% | 依赖图引擎，并行执行 |
+| SubAgent | 85% | 受限执行，WriteGuard，Token 预算 |
+| MCP 工具协议 | 90% | Stdio/SSE/Remote，生命周期管理 |
+| 权限系统 | 90% | 3 种模式，Gate 集成 |
+| 平台适配 | 70% | API Server 完善，飞书/企微/邮件可用 |
+| TUI | 85% | 19 组件，主题引擎，无障碍 |
+| 性能 | 80% | OnceLock 加速，1K/10K/20K 基准测试 |
+
+### 存在的薄弱环节
+
+1. **内存-运行时深度集成尚未完成**。CognitiveContextManager 和 ConversationRuntime 目前的集成方式是"调用-返回"模式，还不是"订阅-推送"模式。内存应该在后台持续学习变化，而不是每次轮次被动调用。
+
+2. **多智能体团队尚未实战**。L4 共享层、冲突检测、角色预算这些能力已经构建，但缺少一个完整的"多 Agent 协同解决复杂问题"的端到端工作流。现在能并行执行子任务，但子任务之间无法通过 L4 实时协商。
+
+3. **Gate 执行流水线缺少自动修复**。PreFlight 可以检测到问题，但修正策略需要手动指定。下一步是 Gate + 自动修正：检测到 lint 错误 → 自动 fix → 重新验证。
+
+4. **平台适配器是单向的**。飞书/企微可以接收消息并回复，但不能将外部事件（如代码仓库 webhook）触发到 cowd 的主动推理循环。
+
+5. **性能基线没有 CI 护栏**。1K 测试是手动运行的，没有自动化的性能回归门禁。10K/20K 是优化参考，但缺少持续监控。
 
 ---
 
-## Provider 支持
+## 下一阶段演进方向
 
-| Provider | 方式 |
-|----------|------|
-| Anthropic (Claude) | 原生 · OAuth + API Key · Prompt Caching |
-| OpenAI 兼容 | GPT / OpenRouter / Ollama / StepFun |
-| DeepSeek | reasoning_content 回传 |
-| Qwen / DashScope | 前缀路由 |
-| Grok / xAI | 模型别名 |
-| Kimi / Moonshot | 前缀路由 |
-| 自定义 | config.yaml 任意 OpenAI 兼容接口 |
+### 方向一：记忆驱动的认知架构（内存 2.0）
+
+当前的内存系统是"被动人库"——调用时检索，轮次结束时写入。进化方向是**主动认知**：
+
+- **后台知识流**：Extractor 在对话之间持续运行，将 Git 提交、文件变更、文档更新自动摄入 KG，不需要等待用户提问
+- **预测性预取**：根据当前会话的主题趋势和 Agent 行为模式，提前从 L3/L4 加载可能需要的上下文，降低 LLM 调用延迟
+- **语义记忆压缩**：AAAK 现在是符号化压缩，下一步是语义压缩——识别重复知识模式，合并相似实体，主动遗忘冗余
+- **跨会话叙事链**：不仅保留单次会话，而是建立跨会话的"叙事弧"——知识图谱中的实体随时间演化，形成项目的深层脉络
+
+```
+  当前                          进化
+  ────                          ────
+  用户提问 → 检索 → 回答        用户提问 → 预测预取 → 检索 → 增强 → 回答
+                                          ↕
+  轮次结束 → 写入                持续知识流 ← Git/文件/文档变更
+```
+
+### 方向二：真正的多智能体团队协作（蜂群 1.0）
+
+现在：一个 Agent 自主行动，SubAgent 作为受限执行器。
+
+进化：**多个对等 Agent 组成虚拟团队，通过 L4 共享记忆协商决策**。
+
+- **职责分配代理**：接收到复杂任务后，主 Agent 分解子任务并通过 L4 发布招标，其他 Agent 根据专业领域竞标
+- **实时观点交换**：不只共享知识（L4 key-value），而是共享推理链——Agent A 说"我建议重构 X 因为 Y"，Agent B 通过 L4 读到并回应
+- **加权投票决策**：FactChecker 的三元仲裁从冲突检测扩展到决策表决——多个 Agent 对技术方案投票，按角色权重加权
+- **记忆驱动的角色固化**：某个 Agent 如果持续在 Rust 性能优化领域输出高质量结果，它在 L4 的领域权重提升，未来相关任务自动偏向它
+
+### 方向三：安全自动化和可审计执行（Gates 2.0）
+
+当前 Gate 系统是"检查-通过/拒绝"。进化方向是**防御性执行**：
+
+- **自动修正 Gate**：PreFlight 检测到 lint/style/import 问题 → 自动修改 → 重新验证 → 通过。无需人类介入
+- **影响预测反馈**：在执行前，显示"此修改将影响 3 个模块、2 个执行流、1 个公共 API"，并在执行后验证预测的准确性
+- **可回滚事务式执行**：文件编辑、工具调用、记忆写入作为一个事务——如果某一步失败，前面的所有修改自动回滚
+- **策略自学习**：PolicyEngine 从过去的人工审批决策中学习——如果人类总是批准"修改测试文件"，Gate 自动放行这类操作
+
+### 方向四：性能持续优化和可观测性（运维 1.0）
+
+当前有基准但没有护栏。进化方向：
+
+- **CI 性能门禁**：每次 PR 自动运行 1K 压力测试，比较与基线的偏差，超过 5% 则阻止合并
+- **内存剖析仪表盘**：通过 ContextRot 和 Profiler 暴露实时指标——检索延迟、压缩率、分层使用率、冲突频率
+- **自适应存储策略**：L3 数据量增长时自动触发归档，高频访问的条目自动提升到 L1/L2，冷数据降级到 SQLite WAL 压缩
+
+### 方向五：平台深度集成（Platform 2.0）
+
+当前平台适配器是"通道"。进化方向是**双向事件驱动**：
+
+- **代码仓库 Webhook → 记忆注入**：Git push / PR merge 事件自动触发 ExtractionPipeline，将代码变更录入 KG
+- **飞书/企微 → 主动推送**：异常检测（如 ContextRot 告警）主动推送通知到即时通讯
+- **API Server → 服务化**：提供 WebSocket 实时流、Admin API（查看记忆统计、Gate 日志、Agent 状态），支持外部系统编排
 
 ---
 
-## 快速开始
+## 架构总览
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                       接入层 (Platform)                          │
+  │   CLI        TUI        API Server    飞书/企微/邮件   WebUI     │
+  └──────────┬──────────┬──────────────────────┬────────────────────┘
+             │          │                      │
+             ▼          ▼                      ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                       运行时核心 (Runtime)                       │
+  │                                                                  │
+  │  ┌──────────────┐  ┌──────────┐  ┌─────────────────────────┐   │
+  │  │ Conversation │  │   Wave   │  │    Gate Pipeline        │   │
+  │  │   Runtime    │──│  Engine  │──│ PreFlight→Approval→Abort│   │
+  │  │              │  │          │  │                         │   │
+  │  │ prepare_ctx  │  │ TaskGraph│  │ PolicyEngine            │   │
+  │  │ LLM call     │  │ SubAgent │  │ WriteGuard + Audit      │   │
+  │  │ tool_exec    │  │ Parallel │  │ Sandbox Isolation       │   │
+  │  │ on_turn_end  │  │          │  │                         │   │
+  │  └──────┬───────┘  └──────────┘  └─────────────────────────┘   │
+  │         │                                                       │
+  │         ▼                                                       │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │                 内存系统 (Memory)                         │   │
+  │  │                                                          │   │
+  │  │  L0 Identity  │  L1 Essential  │  L2 Project            │   │
+  │  │  L3 Deep      │  L4 Shared     │  (Scope×Layer×State)   │   │
+  │  │                                                          │   │
+  │  │  CodeIndexer(tree-sitter) → ProjectKG → HotSymbols      │   │
+  │  │  Extractor → Miner → KG    │  FTS5 → BM25 → Embeddings │   │
+  │  │  FactChecker → Coherence   │  Drift → ContextRot       │   │
+  │  │  AAAK → Closet → FreshCtx  │  StateRebuilder → Handoff │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  │                                                                  │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │                   Provider 适配层                        │   │
+  │  │   Anthropic(原生) │ OpenAI兼容 │ DeepSeek │ Qwen │ Grok  │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 启动方式
 
 ```bash
 # 编译
@@ -289,7 +351,7 @@ cowd --model deepseek-v4-pro "写一个排序函数"
 # 启动 Web 服务
 cowd serve --port 8080
 
-# 继续会话
+# 续接会话
 cowd --resume latest
 ```
 
@@ -298,12 +360,8 @@ cowd --resume latest
 ## 开发
 
 ```bash
-# 测试
-cargo test -p cowd-cli     # 812 tests
 cargo test -p cowd-memory  # 524 tests
 cargo test --workspace     # 1000+ tests
-
-# 编译
 cargo build --release      # → target/release/cowd (~28MB)
 ```
 
