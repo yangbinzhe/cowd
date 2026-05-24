@@ -223,13 +223,13 @@ impl ChatView {
 
     /// Total number of content lines (including separator blanks and spinner).
     pub fn total_lines(&self) -> usize {
-        let count = self.entry_line_counts.len();
+        let n = self.entry_line_counts.len();
         let mut total: usize = self
             .entry_line_counts
             .iter()
-            .enumerate()
-            .map(|(i, &c)| c as usize + if i + 1 < count { 1 } else { 0 })
-            .sum();
+            .map(|&c| c as usize)
+            .sum::<usize>()
+            + n.saturating_sub(1); // separators between entries, not after last
         if total == 0 && self.timeline.is_empty() {
             total = 1;
         }
@@ -332,6 +332,12 @@ impl Component for ChatView {
                 .viewport_content_length(viewport_h);
             frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scroll_state);
         }
+
+        // Clamp scroll_offset to prevent ghost scroll space
+        let max_scroll = total_lines.saturating_sub(viewport_h);
+        if self.scroll_offset > max_scroll as u16 {
+            self.scroll_offset = max_scroll as u16;
+        }
     }
 
     fn handle_event(&mut self, event: &Event) -> EventResult {
@@ -432,7 +438,9 @@ impl ChatView {
         for (idx, entry) in self.timeline.iter().enumerate() {
             let is_focused = idx == self.timeline_cursor;
             Self::build_entry(entry, is_focused, &mut lines, &self.theme);
-            lines.push(Line::raw(""));
+            if idx < self.timeline.len() - 1 {
+                lines.push(Line::raw(""));
+            }
         }
 
         if self.turn_active {
@@ -474,7 +482,6 @@ impl ChatView {
             .truncate(prefix_count.min(self.cached_chat_lines.len()));
         let before_len = self.cached_chat_lines.len();
         Self::build_entry(&last_entry, is_focused, &mut self.cached_chat_lines, &theme);
-        self.cached_chat_lines.push(Line::raw(""));
 
         if let Some(count) = self.entry_line_counts.get_mut(n - 1) {
             *count = (self.cached_chat_lines.len() - before_len) as u16;
@@ -503,14 +510,18 @@ impl ChatView {
         }
 
         for (idx, entry) in self.timeline.iter().enumerate() {
+            let is_last = idx == self.timeline.len() - 1;
             let entry_lines =
-                self.entry_line_counts.get(idx).copied().unwrap_or(1) as usize + 1;
+                self.entry_line_counts.get(idx).copied().unwrap_or(1) as usize
+                    + if is_last { 0 } else { 1 };
             let entry_end = cumulative + entry_lines;
 
             if entry_end > scroll_offset && cumulative < viewport_end {
                 let is_focused = idx == self.timeline_cursor;
                 Self::build_entry(entry, is_focused, &mut lines, &self.theme);
-                lines.push(Line::raw(""));
+                if !is_last {
+                    lines.push(Line::raw(""));
+                }
             }
 
             cumulative = entry_end;

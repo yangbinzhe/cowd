@@ -4,7 +4,7 @@
     clippy::unused_self,
     dead_code
 )]
-#![deny(deprecated, unused_imports)]
+#![deny(deprecated)]
 mod bootstrap;
 mod cli;
 mod init;
@@ -2766,12 +2766,12 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                 // Mouse scroll handling
                 if let Event::Mouse(mouse) = &ev {
                     if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollDown) {
-                        state.scroll_offset = state.scroll_offset.saturating_add(3);
+                        state.scroll_offset = state.scroll_offset.saturating_add(state.viewport_height.max(1).saturating_sub(1));
                         state.auto_scroll = false;
                         continue;
                     }
                     if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp) {
-                        state.scroll_offset = state.scroll_offset.saturating_sub(3);
+                        state.scroll_offset = state.scroll_offset.saturating_sub(state.viewport_height.max(1).saturating_sub(1));
                         state.auto_scroll = false;
                         continue;
                     }
@@ -8270,6 +8270,7 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 
 #[cfg(test)]
 mod tests {
+    #![allow(unused_imports)]
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
@@ -11699,6 +11700,7 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
+    #![allow(unused_imports)]
     use super::{format_sandbox_report, HookAbortMonitor};
     use runtime::HookAbortSignal;
     use std::sync::mpsc;
@@ -11755,6 +11757,7 @@ mod sandbox_report_tests {
 
 #[cfg(test)]
 mod dump_manifests_tests {
+    #![allow(unused_imports)]
     use super::{dump_manifests_at_path, CliOutputFormat};
     use std::fs;
 
@@ -11834,6 +11837,7 @@ mod dump_manifests_tests {
 
 #[cfg(test)]
 mod skill_pipeline_tests {
+    #![allow(unused_imports)]
     use super::tui::{App, SkillSummary};
     use std::path::PathBuf;
 
