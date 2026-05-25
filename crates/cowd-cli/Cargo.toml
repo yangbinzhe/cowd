@@ -16,7 +16,7 @@ memory = { package = "cowd-memory", path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
 commands = { path = "../commands" }
 compat-harness = { path = "../compat-harness" }
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 libc = "0.2"
 pulldown-cmark = "0.13"

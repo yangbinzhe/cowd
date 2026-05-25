@@ -62,6 +62,9 @@ use tools::{
     GlobalToolRegistry, RuntimeToolDefinition,
 };
 
+use crossterm::event::EventStream;
+use futures::StreamExt;
+
 pub(crate) const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
     cli::max_tokens_for_model(model)
@@ -2603,164 +2606,133 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     let mut abort_monitor: Option<HookAbortMonitor> = None;
     let mut abort_signal_for_turn: Option<runtime::HookAbortSignal> = None;
 
-    let res = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let frame_budget = Duration::from_millis(8);
+    let res = SHARED_RT.block_on(async {
+        let mut reader = crossterm::event::EventStream::new();
         loop {
-            let frame_start = std::time::Instant::now();
-
-            // Tick startup phase state machine each frame
-            state.update_startup_phase(startup_ready);
-
-            drain_tui_events_state(&tui_rx, &mut state);
-
-            // Check if background turn completed
-            if turn_handle.as_ref().is_some_and(|h| h.is_finished()) {
-                turn_handle = None;
-                state.is_loading = false;
-            }
-
-            // ── Render using FrameTimer for skip optimization ──
-            let render_throttle = if state.turn_active {
-                Duration::from_millis(32)
-            } else {
-                Duration::from_millis(16)
-            };
-            // During active turn or streaming, always render to show real-time updates
-            let force_render = state.turn_active || state.lines_dirty;
-            if force_render || state.frame_timer.should_render(
-                state.msg_version,
-                state.last_drawn_version,
-                render_throttle,
-            ) {
-                terminal.draw(|f| state.render(f))?;
-                state.frame_timer.mark_rendered();
-            }
-            state.frame_timer.end_frame();
-
-            // ── Input handling via TuiState engine ──
-            let poll_ms = if state.turn_active { 5u64 } else { 10u64 };
-            if crossterm::event::poll(Duration::from_millis(poll_ms))? {
-                let ev = crossterm::event::read()?;
-                // Mouse scroll handling
-                if let Event::Mouse(mouse) = &ev {
-                    if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollDown) {
-                        state.scroll_offset = state.scroll_offset.saturating_add(state.viewport_height.max(1).saturating_sub(1));
-                        state.auto_scroll = false;
-                        continue;
-                    }
-                    if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp) {
-                        state.scroll_offset = state.scroll_offset.saturating_sub(state.viewport_height.max(1).saturating_sub(1));
-                        state.auto_scroll = false;
-                        continue;
-                    }
-                }
-                if let Event::Key(key) = ev {
-                    if key.kind == KeyEventKind::Press {
-                        // Route picker/approval to dialogs
-                        if state.picker_active {
-                            state.open_session_picker_dialog();
+            tokio::select! {
+                Some(Ok(event)) = reader.next() => {
+                    // Mouse scroll handling
+                    if let Event::Mouse(mouse) = &event {
+                        if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollDown) {
+                            state.scroll_offset = state.scroll_offset.saturating_add(state.viewport_height.max(1).saturating_sub(1));
+                            state.auto_scroll = false;
+                            continue;
                         }
-                        if state.approval.is_some() && state.dialog_manager.is_empty() {
-                            state.open_approval_dialog();
+                        if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp) {
+                            state.scroll_offset = state.scroll_offset.saturating_sub(state.viewport_height.max(1).saturating_sub(1));
+                            state.auto_scroll = false;
+                            continue;
                         }
+                    }
+                    if let Event::Key(key) = event {
+                        if key.kind == KeyEventKind::Press {
+                            // Route picker/approval to dialogs
+                            if state.picker_active {
+                                state.open_session_picker_dialog();
+                            }
+                            if state.approval.is_some() && state.dialog_manager.is_empty() {
+                                state.open_approval_dialog();
+                            }
 
-                        match state.process_raw_key(key) {
-                            ProcessedKey::Submit(text) => {
-                                if text.is_empty() { continue; }
-                                if matches!(text.as_str(), "/exit" | "/quit") { break; }
-                                if text.starts_with('/') {
-                                    let parsed = SlashCommand::parse(&text)
-                                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                                    match parsed {
-                                        Some(cmd) => {
-                                            let output = capture_stdout(|| cli.handle_repl_command(cmd));
-                                            match output {
-                                                Ok((true, captured)) => {
-                                                    cli.persist_session()?;
-                                                    let cmd_name = text.strip_prefix('/')
-                                                        .and_then(|s| s.split_whitespace().next())
-                                                        .unwrap_or(&text);
-                                                    state.add_slash_output(cmd_name, &captured);
+                            match state.process_raw_key(key) {
+                                ProcessedKey::Submit(text) => {
+                                    if text.is_empty() { continue; }
+                                    if matches!(text.as_str(), "/exit" | "/quit") { break; }
+                                    if text.starts_with('/') {
+                                        let parsed = SlashCommand::parse(&text)
+                                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                                        match parsed {
+                                            Some(cmd) => {
+                                                let output = capture_stdout(|| cli.handle_repl_command(cmd));
+                                                match output {
+                                                    Ok((true, captured)) => {
+                                                        cli.persist_session()?;
+                                                        let cmd_name = text.strip_prefix('/')
+                                                            .and_then(|s| s.split_whitespace().next())
+                                                            .unwrap_or(&text);
+                                                        state.add_slash_output(cmd_name, &captured);
+                                                    }
+                                                    Ok((false, captured)) => {
+                                                        let cmd_name = text.strip_prefix('/')
+                                                            .and_then(|s| s.split_whitespace().next())
+                                                            .unwrap_or(&text);
+                                                        state.add_slash_output(cmd_name, &captured);
+                                                    }
+                                                    Err(e) => {
+                                                        state.add_message("system", &format!("Error: {e}"));
+                                                    }
                                                 }
-                                                Ok((false, captured)) => {
-                                                    let cmd_name = text.strip_prefix('/')
-                                                        .and_then(|s| s.split_whitespace().next())
-                                                        .unwrap_or(&text);
-                                                    state.add_slash_output(cmd_name, &captured);
-                                                }
-                                                Err(e) => {
-                                                    state.add_message("system", &format!("Error: {e}"));
-                                                }
+                                                continue;
                                             }
-                                            continue;
-                                        }
-                                        None => {}
-                                    }
-                                }
-                                if turn_handle.is_some() {
-                                    state.add_message("system", "Already processing, please wait...");
-                                    continue;
-                                }
-                                state.add_message("user", &text);
-                                state.is_loading = true;
-
-                                let callback: std::sync::Arc<dyn runtime::ToolCallback> =
-                                    std::sync::Arc::new(tui::TuiToolCallback::new(tui_tx.clone()));
-                                let (mut prepared, monitor, abort_signal) =
-                                    cli.prepare_turn_runtime(false, Some(callback), Some(tui_tx.clone()))?;
-                                abort_monitor = Some(monitor);
-                                abort_signal_for_turn = Some(abort_signal);
-
-                                let tx = tui_tx.clone();
-                                let task = SHARED_RT.spawn(async move {
-                                    let _ = tx.send(tui::TuiEvent::TurnStarted);
-                                    match prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await {
-                                        Ok(summary) => {
-                                            let final_text = final_assistant_text(&summary);
-                                            let _ = tx.send(tui::TuiEvent::TurnComplete {
-                                                assistant_text: final_text.clone(),
-                                                iterations: summary.iterations as u32,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
+                                            None => {}
                                         }
                                     }
-                                });
-                                turn_handle = Some(task);
+                                    if turn_handle.is_some() {
+                                        state.add_message("system", "Already processing, please wait...");
+                                        continue;
+                                    }
+                                    state.add_message("user", &text);
+                                    state.is_loading = true;
+
+                                    let callback: std::sync::Arc<dyn runtime::ToolCallback> =
+                                        std::sync::Arc::new(tui::TuiToolCallback::new(tui_tx.clone()));
+                                    let (mut prepared, monitor, abort_signal) =
+                                        cli.prepare_turn_runtime(false, Some(callback), Some(tui_tx.clone()))?;
+                                    abort_monitor = Some(monitor);
+                                    abort_signal_for_turn = Some(abort_signal);
+
+                                    let tx = tui_tx.clone();
+                                    let task = SHARED_RT.spawn(async move {
+                                        let _ = tx.send(tui::TuiEvent::TurnStarted);
+                                        match prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await {
+                                            Ok(summary) => {
+                                                let final_text = final_assistant_text(&summary);
+                                                let _ = tx.send(tui::TuiEvent::TurnComplete {
+                                                    assistant_text: final_text.clone(),
+                                                    iterations: summary.iterations as u32,
+                                                });
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
+                                            }
+                                        }
+                                    });
+                                    turn_handle = Some(task);
+                                }
+                                ProcessedKey::Exit => break,
+                                ProcessedKey::Cancel => {
+                                    if let Some(signal) = abort_signal_for_turn.take() {
+                                        signal.abort();
+                                    }
+                                    if let Some(monitor) = abort_monitor.take() {
+                                        monitor.stop();
+                                        state.add_message("system", "Interrupted");
+                                    }
+                                    if let Some(handle) = turn_handle.take() {
+                                        handle.abort();
+                                    }
+                                }
+                                ProcessedKey::Nothing => {}
                             }
-                            ProcessedKey::Exit => break,
-                            ProcessedKey::Cancel => {
-                                if let Some(signal) = abort_signal_for_turn.take() {
-                                    signal.abort();
-                                }
-                                if let Some(monitor) = abort_monitor.take() {
-                                    monitor.stop();
-                                    state.add_message("system", "Interrupted");
-                                }
-                                if let Some(handle) = turn_handle.take() {
-                                    handle.abort();
-                                }
-                            }
-                            ProcessedKey::Nothing => {}
                         }
                     }
                 }
+                _ = tokio::time::sleep(Duration::from_millis(16)) => {
+                    drain_tui_events_state(&tui_rx, &mut state);
+                    if turn_handle.as_ref().is_some_and(|h| h.is_finished()) {
+                        turn_handle = None;
+                        state.is_loading = false;
+                    }
+                    state.update_startup_phase(startup_ready);
+                    if state.turn_active {
+                        state.tick();
+                    }
+                }
             }
-
-            // Tick for spinner + notification decay
-            if state.turn_active {
-                state.tick();
-            }
-
-            let budget = if state.turn_active { Duration::from_millis(2) } else { frame_budget };
-            let elapsed = frame_start.elapsed();
-            if elapsed < budget {
-                std::thread::sleep(budget - elapsed);
-            }
+            terminal.draw(|f| state.render(f))?;
         }
-        Ok(())
-    })();
+        Ok::<(), Box<dyn std::error::Error>>(())
+    });
 
     cli.persist_session()?;
     disable_raw_mode()?;
