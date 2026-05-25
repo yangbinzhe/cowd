@@ -6232,32 +6232,75 @@ impl AnthropicRuntimeClient {
             ..Default::default()
         };
 
-        SHARED_RT.block_on(async {
-            // When resuming after tool execution, apply a stall timeout on the
-            // first stream event.  If the model does not respond within the
-            // deadline we drop the stalled connection and re-send the request as
-            // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+        let max_attempts: usize = if is_post_tool { 2 } else { 1 };
 
-            for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
-                    .await;
-                match result {
-                    Ok(events) => return Ok(events),
-                    Err(error)
-                        if error.to_string().contains("post-tool stall")
-                            && attempt < max_attempts =>
-                    {
-                        // Stalled after tool completion — nudge the model by
-                        // re-sending the same request.
-                    }
-                    Err(error) => return Err(error),
-                }
+        // Clone fields needed for standalone execution when inside a runtime.
+        let client = self.client.clone();
+        let session_id = self.session_id.clone();
+        let emit_output = self.emit_output;
+        let stream_callback = self.stream_callback.clone();
+
+        // When resuming after tool execution, apply a stall timeout on the
+        // first stream event.  If the model does not respond within the
+        // deadline we drop the stalled connection and re-send the request as
+        // a continuation nudge (one retry only).
+
+        // If we are already inside a tokio runtime, calling block_on again
+        // will panic with "nested enter_runtime". Spawn a dedicated OS thread
+        // with its own single-threaded runtime to avoid the nesting.
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("stream_collect rt");
+                    let result = rt.block_on(async {
+                        for attempt in 1..=max_attempts {
+                            let apply_stall = is_post_tool && attempt == 1;
+                            let result = consume_stream_standalone(
+                                client.clone(),
+                                session_id.clone(),
+                                emit_output,
+                                stream_callback.clone(),
+                                message_request.clone(),
+                                apply_stall,
+                            )
+                            .await;
+                            match result {
+                                Ok(events) => return Ok(events),
+                                Err(error)
+                                    if error.to_string().contains("post-tool stall")
+                                        && attempt < max_attempts => continue,
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(RuntimeError::new("post-tool continuation nudge exhausted"))
+                    });
+                    let _ = tx.send(result);
+                });
+                rx.recv()
+                    .map_err(|_| RuntimeError::new("stream thread panicked"))?
             }
-
-            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
-        })
+            Err(_) => {
+                // Not inside a runtime — use SHARED_RT directly (original path).
+                SHARED_RT.block_on(async {
+                    for attempt in 1..=max_attempts {
+                        let apply_stall = is_post_tool && attempt == 1;
+                        let result = self.consume_stream(&message_request, apply_stall).await;
+                        match result {
+                            Ok(events) => return Ok(events),
+                            Err(error)
+                                if error.to_string().contains("post-tool stall")
+                                    && attempt < max_attempts => continue,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(RuntimeError::new("post-tool continuation nudge exhausted"))
+                })
+            }
+        }
     }
 }
 
@@ -6431,6 +6474,178 @@ impl AnthropicRuntimeClient {
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
     }
+}
+
+/// Standalone version of `consume_stream` that takes owned parameters
+/// instead of `&self`. Used from `stream_collect` when we are already
+/// inside a tokio runtime and must spawn a dedicated OS thread with its
+/// own single-threaded runtime to avoid nested `enter_runtime` panics.
+#[allow(clippy::too_many_lines)]
+async fn consume_stream_standalone(
+    client: ApiProviderClient,
+    session_id: String,
+    emit_output: bool,
+    stream_callback: Option<std::sync::mpsc::SyncSender<crate::tui::TuiEvent>>,
+    message_request: MessageRequest,
+    apply_stall_timeout: bool,
+) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    let mut stream = client
+        .stream_message(&message_request)
+        .await
+        .map_err(|error| {
+            RuntimeError::new(format_user_visible_api_error(&session_id, &error))
+        })?;
+    let mut stdout = io::stdout();
+    let mut sink = io::sink();
+    let out: &mut dyn Write = if emit_output {
+        &mut stdout
+    } else {
+        &mut sink
+    };
+    let renderer = TerminalRenderer::new();
+    let mut markdown_stream = MarkdownStreamState::default();
+    let mut events = Vec::new();
+    let mut pending_tool: Option<(String, String, String)> = None;
+    let mut block_has_thinking_summary = false;
+    let mut saw_stop = false;
+    let mut received_any_event = false;
+
+    loop {
+        let next = if apply_stall_timeout && !received_any_event {
+            match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
+                Ok(inner) => inner.map_err(|error| {
+                    RuntimeError::new(format_user_visible_api_error(&session_id, &error))
+                })?,
+                Err(_elapsed) => {
+                    return Err(RuntimeError::new(
+                        "post-tool stall: model did not respond within timeout",
+                    ));
+                }
+            }
+        } else {
+            stream.next_event().await.map_err(|error| {
+                RuntimeError::new(format_user_visible_api_error(&session_id, &error))
+            })?
+        };
+
+        let Some(event) = next else {
+            break;
+        };
+        received_any_event = true;
+
+        match event {
+            ApiStreamEvent::MessageStart(start) => {
+                for block in start.message.content {
+                    push_output_block(
+                        block,
+                        out,
+                        &mut events,
+                        &mut pending_tool,
+                        true,
+                        &mut block_has_thinking_summary,
+                    )?;
+                }
+            }
+            ApiStreamEvent::ContentBlockStart(start) => {
+                push_output_block(
+                    start.content_block,
+                    out,
+                    &mut events,
+                    &mut pending_tool,
+                    true,
+                    &mut block_has_thinking_summary,
+                )?;
+            }
+            ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
+                ContentBlockDelta::TextDelta { text } => {
+                    if !text.is_empty() {
+                        if let Some(rendered) = markdown_stream.push(&renderer, &text) {
+                            write!(out, "{rendered}")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
+                        events.push(AssistantEvent::TextDelta(text.clone()));
+                        if let Some(ref cb) = stream_callback {
+                            let _ = cb.try_send(crate::tui::TuiEvent::TextDelta { text });
+                        }
+                    }
+                }
+                ContentBlockDelta::InputJsonDelta { partial_json } => {
+                    if let Some((_, _, input)) = &mut pending_tool {
+                        input.push_str(&partial_json);
+                    }
+                }
+                ContentBlockDelta::ThinkingDelta { thinking } => {
+                    if !block_has_thinking_summary {
+                        render_thinking_block_summary(out, None, false)?;
+                        block_has_thinking_summary = true;
+                    }
+                    events.push(AssistantEvent::ThinkingDelta(thinking.clone()));
+                    if let Some(ref cb) = stream_callback {
+                        let _ = cb.try_send(crate::tui::TuiEvent::ThinkingDelta { thinking });
+                    }
+                }
+                ContentBlockDelta::SignatureDelta { .. } => {}
+            },
+            ApiStreamEvent::ContentBlockStop(_) => {
+                block_has_thinking_summary = false;
+                if let Some(rendered) = markdown_stream.flush(&renderer) {
+                    write!(out, "{rendered}")
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                }
+                if let Some((id, name, input)) = pending_tool.take() {
+                    writeln!(out, "\n{}", format_tool_call_start(&name, &input))
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    events.push(AssistantEvent::ToolUse { id, name, input });
+                }
+            }
+            ApiStreamEvent::MessageDelta(delta) => {
+                events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+            }
+            ApiStreamEvent::MessageStop(_) => {
+                saw_stop = true;
+                if let Some(rendered) = markdown_stream.flush(&renderer) {
+                    write!(out, "{rendered}")
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                }
+                events.push(AssistantEvent::MessageStop);
+            }
+        }
+    }
+
+    push_prompt_cache_record(&client, &mut events);
+
+    if !saw_stop
+        && events.iter().any(|event| {
+            matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+                || matches!(event, AssistantEvent::ToolUse { .. })
+        })
+    {
+        events.push(AssistantEvent::MessageStop);
+    }
+
+    if events
+        .iter()
+        .any(|event| matches!(event, AssistantEvent::MessageStop))
+    {
+        return Ok(events);
+    }
+
+    let response = client
+        .send_message(&MessageRequest {
+            stream: false,
+            ..message_request.clone()
+        })
+        .await
+        .map_err(|error| {
+            RuntimeError::new(format_user_visible_api_error(&session_id, &error))
+        })?;
+    let mut events = response_to_events(response, out)?;
+    push_prompt_cache_record(&client, &mut events);
+    Ok(events)
 }
 
 /// Returns `true` when the conversation ends with a tool-result message,
