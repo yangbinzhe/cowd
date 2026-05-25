@@ -716,9 +716,12 @@ fn client_runtime_block_on<F, T>(future: F) -> Result<T, ApiError>
 where
     F: std::future::Future<Output = Result<T, ApiError>>,
 {
-    tokio::runtime::Runtime::new()
-        .map_err(ApiError::from)?
-        .block_on(future)
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(future),
+        Err(_) => tokio::runtime::Runtime::new()
+            .map_err(ApiError::from)?
+            .block_on(future),
+    }
 }
 
 fn load_saved_oauth_token() -> Result<Option<OAuthTokenSet>, ApiError> {
