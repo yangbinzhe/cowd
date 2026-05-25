@@ -40,6 +40,7 @@ pub mod layers;
 pub mod orchestrator;
 pub mod provider;
 pub mod relevance;
+pub mod resolution;
 pub mod seeds;
 pub mod session_manager;
 pub mod session_store;
