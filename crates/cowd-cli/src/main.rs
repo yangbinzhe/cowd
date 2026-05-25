@@ -66,8 +66,12 @@ pub(crate) const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
     cli::max_tokens_for_model(model)
 }
-static TOKIO_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    tokio::runtime::Runtime::new().expect("tokio runtime")
+static SHARED_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("shared tokio runtime")
 });
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
@@ -263,8 +267,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         io::stdin().read_line(&mut input).ok();
     }
 
-    // Force-initialize TOKIO_RT on main thread where no tokio runtime exists yet
-    let _ = TOKIO_RT.handle();
+    // Force-initialize SHARED_RT on main thread where no tokio runtime exists yet
+    let _ = SHARED_RT.handle();
 
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
@@ -2844,14 +2848,13 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
                                 let tx = tui_tx.clone();
                                 turn_handle = Some(std::thread::spawn(move || {
-                                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     let _ = tx.send(tui::TuiEvent::TurnStarted);
-                                    let rt = tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build()
-                                        .expect("build tokio rt for turn");
-                                    match rt.block_on(prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none())) {
-                                        Ok(summary) => {
+                                    let handle = SHARED_RT.handle().clone();
+                                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        handle.block_on(prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()))
+                                    }));
+                                    match result {
+                                        Ok(Ok(summary)) => {
                                             let final_text = final_assistant_text(&summary);
                                             let _ = tx.send(tui::TuiEvent::TurnComplete {
                                                 assistant_text: final_text.clone(),
@@ -2863,18 +2866,17 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                                 iterations: summary.iterations,
                                             }
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
                                             let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
                                             tui::TurnOutcome::Error(e.to_string())
                                         }
+                                        Err(_) => {
+                                            let _ = tx.send(tui::TuiEvent::TurnError {
+                                                error: "tokio nested runtime panic".to_string()
+                                            });
+                                            tui::TurnOutcome::Error("nested runtime".to_string())
+                                        }
                                     }
-                                    }));
-                                    result.unwrap_or_else(|_| {
-                                        let _ = tx.send(tui::TuiEvent::TurnError {
-                                            error: "tokio runtime panic — nested block_on detected".to_string()
-                                        });
-                                        tui::TurnOutcome::Error("tokio runtime nested block_on".to_string())
-                                    })
                                 }));
                             }
                             ProcessedKey::Exit => break,
@@ -3601,7 +3603,7 @@ impl LiveCli {
             CliPermissionPrompter::new(self.permission_mode),
         ));
         let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| TOKIO_RT.handle().clone());
+            .unwrap_or_else(|_| SHARED_RT.handle().clone());
         let result = handle
             .block_on(runtime.run_turn_async(input, &prompter));
         hook_abort_monitor.stop();
@@ -3654,7 +3656,7 @@ impl LiveCli {
             CliPermissionPrompter::new(self.permission_mode),
         ));
         let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| TOKIO_RT.handle().clone());
+            .unwrap_or_else(|_| SHARED_RT.handle().clone());
         let result = handle
             .block_on(runtime.run_turn_async(input, &prompter));
         hook_abort_monitor.stop();
@@ -3672,7 +3674,7 @@ impl LiveCli {
             CliPermissionPrompter::new(self.permission_mode),
         ));
         let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| TOKIO_RT.handle().clone());
+            .unwrap_or_else(|_| SHARED_RT.handle().clone());
         let result = handle
             .block_on(runtime.run_turn_async(input, &prompter));
         hook_abort_monitor.stop();
@@ -4539,7 +4541,7 @@ impl LiveCli {
             CliPermissionPrompter::new(self.permission_mode),
         ));
         let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| TOKIO_RT.handle().clone());
+            .unwrap_or_else(|_| SHARED_RT.handle().clone());
         let summary = handle
             .block_on(runtime.run_turn_async(prompt, &prompter))?;
         let text = final_assistant_text(&summary).trim().to_string();
@@ -6823,7 +6825,7 @@ impl AnthropicRuntimeClient {
             ..Default::default()
         };
 
-        TOKIO_RT.block_on(async {
+        SHARED_RT.block_on(async {
             // When resuming after tool execution, apply a stall timeout on the
             // first stream event.  If the model does not respond within the
             // deadline we drop the stalled connection and re-send the request as

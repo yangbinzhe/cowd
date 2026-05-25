@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command as TokioCommand;
-use tokio::runtime::Builder;
 use tokio::time::timeout;
 
 use crate::sandbox::{
@@ -98,13 +97,17 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         });
     }
 
-    let runtime = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            return handle.block_on(execute_bash_async(input, sandbox_status, cwd));
-        }
-        Err(_) => Builder::new_current_thread().enable_all().build()?,
-    };
-    runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+    let handle = tokio::runtime::Handle::try_current()
+        .unwrap_or_else(|_| {
+            // Fallback: create a small runtime for bash execution
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("bash tokio rt")
+                .handle()
+                .clone()
+        });
+    handle.block_on(execute_bash_async(input, sandbox_status, cwd))
 }
 
 async fn execute_bash_async(

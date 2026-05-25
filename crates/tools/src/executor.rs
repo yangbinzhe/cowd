@@ -2581,7 +2581,12 @@ fn run_agent_job(job: &AgentJob) -> Result<(), String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     let shared = SharedPrompter::none();
     let handle = tokio::runtime::Handle::try_current()
-        .unwrap_or_else(|_| tokio::runtime::Runtime::new().expect("tokio runtime fallback").handle().clone());
+        .unwrap_or_else(|_| tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime fallback")
+            .handle()
+            .clone());
     let summary = handle
         .block_on(runtime.run_turn_async(job.prompt.clone(), &shared))
         .map_err(|error| error.to_string())?;
@@ -3118,13 +3123,10 @@ impl ProviderRuntimeClient {
             }
         }
         Ok(Self {
-            runtime: match tokio::runtime::Handle::try_current() {
-                Ok(_) => tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| error.to_string())?,
-                Err(_) => tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
-            },
+            runtime: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?,
             chain,
             allowed_tools,
         })
