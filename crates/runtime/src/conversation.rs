@@ -121,6 +121,9 @@ pub trait ToolCallback: Send + Sync {
     fn on_tool_progress(&self, id: &str, name: &str, progress: &str);
     /// Called when a tool finishes executing.
     fn on_tool_complete(&self, id: &str, name: &str, result_summary: &str, exit_code: Option<i32>);
+    /// Called when token usage data is available (typically after each stream completes).
+    /// Default implementation is a no-op so existing implementors don't break.
+    fn on_usage(&self, _usage: &crate::usage::TokenUsage) {}
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -700,6 +703,9 @@ pub async fn run_turn_async(
 
             if let Some(usage) = turn_usage {
                 self.usage_tracker.record(usage);
+                if let Some(cb) = &self.tool_callback {
+                    cb.on_usage(&usage);
+                }
             }
 
             // Build assistant message with text + tool_use blocks

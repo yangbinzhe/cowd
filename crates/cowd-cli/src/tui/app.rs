@@ -860,6 +860,10 @@ impl App {
                 self.turn_output_tokens = output.saturating_sub(self.pre_turn_output);
             }
 
+            TuiEvent::ContextWindow(ctx) => {
+                self.context_window = ctx;
+            }
+
             TuiEvent::TurnStarted => {
                 self.is_loading = true;
                 self.turn_active = true;

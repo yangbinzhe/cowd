@@ -29,6 +29,8 @@ pub enum TuiEvent {
     TokenUsage { input: u64, output: u64, cache_create: u64, cache_read: u64 },
 
     // ── Turn lifecycle ──
+    /// Current model context window size (sent at turn start)
+    ContextWindow(u64),
     /// A new turn has started (user input being processed)
     TurnStarted,
     /// Turn completed successfully with summary data

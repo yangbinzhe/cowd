@@ -37,6 +37,15 @@ impl ToolCallback for TuiToolCallback {
             exit_code,
         });
     }
+
+    fn on_usage(&self, usage: &runtime::TokenUsage) {
+        let _ = self.tx.try_send(TuiEvent::TokenUsage {
+            input: usage.input_tokens as u64,
+            output: usage.output_tokens as u64,
+            cache_create: usage.cache_creation_input_tokens as u64,
+            cache_read: usage.cache_read_input_tokens as u64,
+        });
+    }
 }
 
 #[cfg(test)]

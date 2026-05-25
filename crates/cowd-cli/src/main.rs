@@ -6542,7 +6542,7 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
-            stream_callback,
+            stream_callback.clone(),
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -6555,6 +6555,9 @@ fn build_runtime_with_plugin_state(
         &feature_config,
     );
     runtime = runtime.with_model_context_window(model_ctx);
+    if let Some(ref tx) = stream_callback {
+        let _ = tx.try_send(crate::tui::TuiEvent::ContextWindow(model_ctx as u64));
+    }
     if let Some(callback) = tool_callback {
         runtime = runtime.with_tool_callback(callback);
     }
