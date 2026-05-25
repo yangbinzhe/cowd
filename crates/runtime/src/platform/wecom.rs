@@ -117,7 +117,7 @@ impl WeComCrypto {
             .decode(encrypted)
             .map_err(|e| PlatformError::ConfigError(format!("base64 decode failed: {}", e)))?;
 
-        let iv: [u8; 16] = self.key[..16].try_into().unwrap();
+        let iv: [u8; 16] = self.key.get(..16).and_then(|s| s.try_into().ok()).ok_or_else(|| PlatformError::ConfigError("encryption key too short".into()))?;
 
         let plaintext = Aes256CbcDec::new(&self.key.into(), &iv.into())
             .decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(&ciphertext)
@@ -128,7 +128,7 @@ impl WeComCrypto {
             return Err(PlatformError::ConfigError("decrypted payload too short".to_string()));
         }
 
-        let content_len = u32::from_be_bytes(plaintext[16..20].try_into().unwrap()) as usize;
+        let content_len = u32::from_be_bytes(plaintext.get(16..20).and_then(|s| s.try_into().ok()).ok_or_else(|| PlatformError::ConfigError("message content too short".into()))?) as usize;
         if plaintext.len() < 20 + content_len {
             return Err(PlatformError::ConfigError("decrypted payload truncated".to_string()));
         }
@@ -169,7 +169,7 @@ impl WeComCrypto {
         let padding = block_size - (data.len() % block_size);
         data.extend(std::iter::repeat(padding as u8).take(padding));
 
-        let iv: [u8; 16] = self.key[..16].try_into().unwrap();
+        let iv: [u8; 16] = self.key.get(..16).and_then(|s| s.try_into().ok()).ok_or_else(|| PlatformError::ConfigError("encryption key too short".into()))?;
 
         let ciphertext = Aes256CbcEnc::new(&self.key.into(), &iv.into())
             .encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(&data);
@@ -376,8 +376,8 @@ impl WeComAdapter {
             if let Some(sig) = &callback.msg_signature {
                 if self.config.is_crypto_configured() {
                     let crypto = WeComCrypto::new(
-                        self.config.encoding_aes_key.as_deref().unwrap(),
-                        self.config.token.as_deref().unwrap(),
+                        self.config.encoding_aes_key.as_deref().ok_or_else(|| PlatformError::ConfigError("missing encoding_aes_key".into()))?,
+                        self.config.token.as_deref().ok_or_else(|| PlatformError::ConfigError("missing token".into()))?,
                         &self.config.corp_id,
                     )?;
 
@@ -491,8 +491,8 @@ impl WeComAdapter {
         }
 
         let crypto = WeComCrypto::new(
-            self.config.encoding_aes_key.as_deref().unwrap(),
-            self.config.token.as_deref().unwrap(),
+            self.config.encoding_aes_key.as_deref().ok_or_else(|| PlatformError::ConfigError("missing encoding_aes_key".into()))?,
+            self.config.token.as_deref().ok_or_else(|| PlatformError::ConfigError("missing token".into()))?,
             &self.config.corp_id,
         )?;
 
@@ -513,15 +513,15 @@ impl WeComAdapter {
         }
 
         let crypto = WeComCrypto::new(
-            self.config.encoding_aes_key.as_deref().unwrap(),
-            self.config.token.as_deref().unwrap(),
+            self.config.encoding_aes_key.as_deref().ok_or_else(|| PlatformError::ConfigError("missing encoding_aes_key".into()))?,
+            self.config.token.as_deref().ok_or_else(|| PlatformError::ConfigError("missing token".into()))?,
             &self.config.corp_id,
         )?;
 
         let encrypted = crypto.encrypt(reply)?;
         let signature = {
             use sha1::{Sha1, Digest};
-            let mut parts = vec![self.config.token.as_deref().unwrap(), timestamp, nonce, &encrypted];
+            let mut parts = vec![self.config.token.as_deref().ok_or_else(|| PlatformError::ConfigError("missing token".into()))?, timestamp, nonce, &encrypted];
             parts.sort();
             let mut hasher = Sha1::new();
             for part in &parts {

@@ -172,9 +172,9 @@ impl EmailAdapter {
             return Ok(Vec::new());
         }
 
-        let imap_host = self.config.imap_host.clone().unwrap();
+        let imap_host = self.config.imap_host.clone().ok_or_else(|| PlatformError::ConfigError("missing imap_host".into()))?;
         let imap_port = self.config.imap_port.unwrap_or(993);
-        let imap_user = self.config.imap_username.clone().unwrap();
+        let imap_user = self.config.imap_username.clone().ok_or_else(|| PlatformError::ConfigError("missing imap_username".into()))?;
         let imap_pass = self.config.imap_password.clone().unwrap_or_default();
 
         // IMAP is blocking, run in spawn_blocking
