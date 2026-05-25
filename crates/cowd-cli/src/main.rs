@@ -2844,9 +2844,9 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
                                 let tx = tui_tx.clone();
                                 turn_handle = Some(std::thread::spawn(move || {
+                                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     let _ = tx.send(tui::TuiEvent::TurnStarted);
-                                    let rt = tokio::runtime::Builder::new_multi_thread()
-                                        .worker_threads(1)
+                                    let rt = tokio::runtime::Builder::new_current_thread()
                                         .enable_all()
                                         .build()
                                         .expect("build tokio rt for turn");
@@ -2868,6 +2868,13 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                             tui::TurnOutcome::Error(e.to_string())
                                         }
                                     }
+                                    }));
+                                    result.unwrap_or_else(|_| {
+                                        let _ = tx.send(tui::TuiEvent::TurnError {
+                                            error: "tokio runtime panic — nested block_on detected".to_string()
+                                        });
+                                        tui::TurnOutcome::Error("tokio runtime nested block_on".to_string())
+                                    })
                                 }));
                             }
                             ProcessedKey::Exit => break,
