@@ -803,7 +803,7 @@ pub async fn run_turn_async(
         }
 
         let auto_compaction = self.maybe_auto_compact();
-        let _ = self.run_memory_post_turn();
+        let _ = self.run_memory_post_turn().await;
 
         let summary = TurnSummary {
             assistant_messages,
@@ -1201,7 +1201,10 @@ self.record_turn_completed(&summary);
         let auto_compaction = self.maybe_auto_compact();
 
         // ── Memory: post-turn housekeeping ───────────────────────────────
-        let _ = self.run_memory_post_turn();
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().handle().clone()
+        });
+        let _ = handle.block_on(self.run_memory_post_turn());
 
         let summary = TurnSummary {
             assistant_messages,
@@ -1597,7 +1600,7 @@ self.record_turn_completed(&summary);
     /// Perform post-turn memory housekeeping (micro-compact, drift, seeds).
     ///
     /// Errors are logged and swallowed so a memory failure never aborts a turn.
-    fn run_memory_post_turn(&self) -> Result<(), RuntimeError> {
+    async fn run_memory_post_turn(&self) -> Result<(), RuntimeError> {
         let Some(mgr) = self.memory_manager.as_ref() else {
             return Ok(());
         };
@@ -1639,17 +1642,7 @@ self.record_turn_completed(&summary);
                 MemMessage { turn_index: idx, role, content, tool_use_id, tool_name, pinned: false }
             }).collect();
 
-        // Fire-and-forget on_turn_end on a blocking thread to avoid nested enter_runtime
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return Ok(()),
-        };
-        let mgr = mgr.clone();
-        tokio::task::spawn_blocking(move || {
-            handle.block_on(async {
-                let _ = mgr.on_turn_end(&mut mem_messages).await;
-            });
-        });
+        let _ = mgr.on_turn_end(&mut mem_messages).await;
         Ok(())
     }
 }
@@ -2541,7 +2534,7 @@ mod tests {
             vec!["system".to_string()],
         );
         let _ = rt.prepare_memory_context("query").await;
-        let _ = rt.run_memory_post_turn();
+        let _ = rt.run_memory_post_turn().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2575,7 +2568,10 @@ mod tests {
         let session = Session::new();
         let rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["sys".to_string()]);
-        let r = rt.run_memory_post_turn();
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().handle().clone()
+        });
+        let r = handle.block_on(rt.run_memory_post_turn());
         assert!(r.is_ok(), "run_memory_post_turn should return Ok when no memory manager");
     }
 
