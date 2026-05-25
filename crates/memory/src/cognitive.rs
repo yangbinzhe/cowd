@@ -39,8 +39,9 @@ use crate::{ MemoryScope, SessionResume,
     embedding::EmbeddingCapability,
     entity::KnowledgeGraph,
     error::MemoryError,
-    fresh_context::FreshContextManager,
+    fact_checker::FactChecker,
     extractor::MemoryExtractor,
+    fresh_context::FreshContextManager,
     handoff::HandoffManager,
     orchestrator::MemoryOrchestrator,
     project_scope::{build_project_kg, ProjectScopeManager},
@@ -158,6 +159,8 @@ pub struct CognitiveContextManager {
     cross_store_verify_counter: AtomicU64,
     /// In-memory FTS5 sandbox for indexing large tool outputs.
     tool_sandbox: Mutex<ToolOutputSandbox>,
+    /// Knowledge-graph fact checker for cross-agent conflict detection and auto-correction.
+    fact_checker: Mutex<FactChecker>,
     /// State rebuilder for session restoration from previous session data.
     state_rebuilder: Option<StateRebuilder>,
 }
@@ -309,6 +312,7 @@ impl CognitiveContextManager {
             kg_rebuild_tick_counter: AtomicU64::new(0),
             cross_store_verify_counter: AtomicU64::new(0),
             tool_sandbox,
+            fact_checker: Mutex::new(FactChecker::new()),
             state_rebuilder,
             config,
             orchestrator,
@@ -996,6 +1000,24 @@ impl CognitiveContextManager {
                 messages_count = messages.len(),
                 "on_turn_end: skipped (insufficient messages)"
             );
+        }
+
+        // ── 0c. Auto-correct contradictions via fact checker ──────────────
+        match self.fact_checker.lock() {
+            Ok(mut fc) => {
+                let report = fc.auto_correct();
+                if report.corrected > 0 || report.pruned > 0 {
+                    tracing::info!(
+                        corrected = report.corrected,
+                        pruned = report.pruned,
+                        flagged = report.flagged,
+                        "auto-correction applied"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("fact_checker lock poisoned: {}", e);
+            }
         }
 
         // ── 1. Micro compact ────────────────────────────────────────────────

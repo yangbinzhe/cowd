@@ -3107,6 +3107,10 @@ impl RuntimeMcpState {
             return Ok(None);
         }
 
+        // Avoid nested-runtime crash: skip MCP discovery if already inside a runtime
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Ok(None);
+        }
         let runtime = tokio::runtime::Runtime::new()?;
         let discovery = runtime.block_on(manager.discover_tools_best_effort());
         let pending_servers = discovery
