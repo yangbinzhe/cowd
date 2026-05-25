@@ -2708,9 +2708,10 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     // "Loading..." → "Finishing..." → Done (min 3s display).
     let startup_ready = true;
 
-    let mut turn_handle: Option<std::thread::JoinHandle<tui::TurnOutcome>> = None;
+    let mut turn_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut abort_monitor: Option<HookAbortMonitor> = None;
     let mut abort_signal_for_turn: Option<runtime::HookAbortSignal> = None;
+    let mut prepared_holder: Option<Arc<Mutex<Option<BuiltRuntime>>>> = None;
 
     let res = (|| -> Result<(), Box<dyn std::error::Error>> {
         let frame_budget = Duration::from_millis(8);
@@ -2724,35 +2725,21 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
             // Check if background turn completed
             if turn_handle.as_ref().is_some_and(|h| h.is_finished()) {
-                let handle = turn_handle.take().unwrap();
-                match handle.join() {
-                        Ok(outcome) => {
-                            match outcome {
-                                tui::TurnOutcome::Success { runtime, .. } => {
-                                    cli.replace_runtime(runtime)?;
-                                    state.is_loading = false;
-                                    state.token_count = cli.runtime.usage().cumulative_usage().total_tokens() as u64;
-                                }
-                                tui::TurnOutcome::Cancelled => {
-                                    state.is_loading = false;
-                                    state.add_message("system", "Cancelled");
-                                }
-                                tui::TurnOutcome::Error(e) => {
-                                    state.is_loading = false;
-                                    state.add_message("system", &format!("Error: {e}"));
-                                }
-                            }
-                            cli.persist_session()?;
-                            refresh_panels(&mut state, &workspace, &cli.runtime);
-                        }
-                        Err(_) => {
-                            state.is_loading = false;
-                        }
+                turn_handle = None;
+                // Retrieve prepared runtime from Arc
+                if let Some(ref holder) = prepared_holder {
+                    if let Some(runtime) = holder.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        cli.replace_runtime(runtime)?;
+                        state.token_count = cli.runtime.usage().cumulative_usage().total_tokens() as u64;
                     }
-                    turn_handle = None;
-                    abort_monitor = None;
-                    abort_signal_for_turn = None;
                 }
+                // Outcome is already handled via TuiEvent::TurnComplete/TurnError events
+                state.is_loading = false;
+                cli.persist_session()?;
+                refresh_panels(&mut state, &workspace, &cli.runtime);
+                abort_monitor = None;
+                abort_signal_for_turn = None;
+            }
 
             // ── Render using FrameTimer for skip optimization ──
             let render_throttle = if state.turn_active {
@@ -2847,37 +2834,41 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                 abort_signal_for_turn = Some(abort_signal);
 
                                 let tx = tui_tx.clone();
-                                turn_handle = Some(std::thread::spawn(move || {
+                                let prepared_arc: Arc<Mutex<Option<BuiltRuntime>>> = Arc::new(Mutex::new(Some(prepared)));
+                                prepared_holder = Some(prepared_arc.clone());
+                                let prepared_clone = prepared_arc.clone();
+                                // Outer spawn on SHARED_RT provides tokio context; inner
+                                // spawn_blocking + current_thread runtime handles the
+                                // non-Send future from run_turn_async without nested panic.
+                                let task = SHARED_RT.spawn(async move {
                                     let _ = tx.send(tui::TuiEvent::TurnStarted);
-                                    let handle = SHARED_RT.handle().clone();
-                                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        handle.block_on(prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()))
-                                    }));
-                                    match result {
-                                        Ok(Ok(summary)) => {
-                                            let final_text = final_assistant_text(&summary);
-                                            let _ = tx.send(tui::TuiEvent::TurnComplete {
-                                                assistant_text: final_text.clone(),
-                                                iterations: summary.iterations as u32,
-                                            });
-                                            tui::TurnOutcome::Success {
-                                                runtime: prepared,
-                                                message_count: summary.assistant_messages.len(),
-                                                iterations: summary.iterations,
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let rt = tokio::runtime::Builder::new_current_thread()
+                                            .enable_all()
+                                            .build()
+                                            .expect("current-thread runtime for turn");
+                                        rt.block_on(async {
+                                            let mut prepared_guard = prepared_clone.lock().unwrap_or_else(|e| e.into_inner());
+                                            let mut prepared = prepared_guard.take().expect("prepared runtime");
+                                            drop(prepared_guard);
+                                            match prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await {
+                                                Ok(summary) => {
+                                                    let final_text = final_assistant_text(&summary);
+                                                    let _ = tx.send(tui::TuiEvent::TurnComplete {
+                                                        assistant_text: final_text.clone(),
+                                                        iterations: summary.iterations as u32,
+                                                    });
+                                                    *prepared_arc.lock().unwrap_or_else(|e| e.into_inner()) = Some(prepared);
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
+                                                    *prepared_arc.lock().unwrap_or_else(|e| e.into_inner()) = Some(prepared);
+                                                }
                                             }
-                                        }
-                                        Ok(Err(e)) => {
-                                            let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
-                                            tui::TurnOutcome::Error(e.to_string())
-                                        }
-                                        Err(_) => {
-                                            let _ = tx.send(tui::TuiEvent::TurnError {
-                                                error: "tokio nested runtime panic".to_string()
-                                            });
-                                            tui::TurnOutcome::Error("nested runtime".to_string())
-                                        }
-                                    }
-                                }));
+                                        });
+                                    }).await;
+                                });
+                                turn_handle = Some(task);
                             }
                             ProcessedKey::Exit => break,
                             ProcessedKey::Cancel => {
@@ -2887,6 +2878,9 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                 if let Some(monitor) = abort_monitor.take() {
                                     monitor.stop();
                                     state.add_message("system", "Interrupted");
+                                }
+                                if let Some(handle) = turn_handle.take() {
+                                    handle.abort();
                                 }
                             }
                             ProcessedKey::Nothing => {}
