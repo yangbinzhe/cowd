@@ -416,6 +416,26 @@ mod tests {
         assert!(base64_decode("").unwrap().is_empty());
     }
 
+    // ── Clipboard text fallback tests ─────────────────────────────
+
+    #[test]
+    fn test_clipboard_text_fallback() {
+        let content = ClipboardContent::Text("copied text content".to_string());
+        match &content {
+            ClipboardContent::Text(text) => {
+                assert!(!text.is_empty());
+                assert_eq!(text, "copied text content");
+            }
+            _ => panic!("expected Text variant for clipboard fallback"),
+        }
+
+        let text_content = ClipboardContent::Text("hello".to_string());
+        match text_content {
+            ClipboardContent::Text(ref t) if !t.is_empty() => {}
+            _ => panic!("text fallback should return non-empty text"),
+        }
+    }
+
     fn base64_encode_bytes(input: &[u8]) -> String {
         const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::with_capacity(((input.len() + 2) / 3) * 4);

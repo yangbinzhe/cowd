@@ -135,6 +135,12 @@ impl TodoPanel {
         // Silently skip if can't parse (graceful degradation)
     }
 
+    /// Sync todo items from timeline entries by extracting ToolCall outputs
+    /// where name="TodoWrite". Delegates to extract_from_timeline.
+    pub fn sync_from_timeline(&mut self, timeline: &[crate::tui::app::TimelineEntry]) {
+        self.extract_from_timeline(timeline);
+    }
+
     /// Populate with pre-parsed items (for testing).
     pub fn load(&mut self, items: Vec<TodoItem>) {
         self.items = items;
@@ -407,5 +413,36 @@ mod tests {
         let panel = TodoPanel::new();
         assert!(panel.focusable());
         assert_eq!(panel.id(), "todo_panel");
+    }
+
+    // ── Test: sync_from_timeline extracts TodoWrite items ───────────
+
+    #[test]
+    fn test_todo_from_timeline() {
+        let mut panel = TodoPanel::new();
+        let json = r#"[
+            {"content": "Fix bug", "status": "in_progress", "priority": "high"},
+            {"content": "Write docs", "status": "pending", "priority": "medium"}
+        ]"#;
+        let timeline = vec![
+            crate::tui::app::TimelineEntry::ToolCall {
+                id: "tc1".to_string(),
+                name: "TodoWrite".to_string(),
+                preview: "todo".to_string(),
+                output: json.to_string(),
+                done: true,
+                expanded: false,
+                exit_code: Some(0),
+            },
+        ];
+
+        panel.sync_from_timeline(&timeline);
+        assert_eq!(panel.len(), 2);
+        assert_eq!(panel.items[0].content, "Fix bug");
+        assert_eq!(panel.items[0].status, "in_progress");
+        assert_eq!(panel.items[0].priority, "high");
+        assert_eq!(panel.items[1].content, "Write docs");
+        assert_eq!(panel.items[1].status, "pending");
+        assert_eq!(panel.items[1].priority, "medium");
     }
 }

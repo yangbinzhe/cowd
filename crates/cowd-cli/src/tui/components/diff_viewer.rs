@@ -165,6 +165,48 @@ impl DiffViewer {
         self.scroll_offset = 0;
     }
 
+    /// Sync the diff viewer from the App state by extracting diff text
+    /// from timeline entries (ToolCall outputs containing unified diff format).
+    ///
+    /// Scans all timeline entries for ToolCall outputs that contain
+    /// `diff --git` and `@@ -` patterns, concatenates them, and loads
+    /// the result into the viewer.
+    ///
+    /// If no diff-like text is found, the viewer state is unchanged.
+    pub fn sync_from_app(&mut self, app: &crate::tui::App) {
+        let timeline = app.timeline_clone_vec();
+
+        // Collect diff text from ToolCall outputs
+        let mut diff_text = String::new();
+        for entry in &timeline {
+            if let crate::tui::app::TimelineEntry::ToolCall { output, .. } = entry {
+                if output.is_empty() {
+                    continue;
+                }
+                // Check if the output contains diff-like content
+                if output.contains("diff --git") || output.contains("@@ -") {
+                    if !diff_text.is_empty() {
+                        diff_text.push('\n');
+                    }
+                    diff_text.push_str(output);
+                }
+            }
+        }
+
+        // Only load if we found diff content and it's different from current
+        if !diff_text.is_empty() {
+            let current_text = self.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
+            let parsed = parse_unified_diff(&diff_text);
+            let new_text = parsed.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
+            if current_text != new_text {
+                self.files = parsed;
+                self.selected_file = 0;
+                self.selected_hunk = 0;
+                self.scroll_offset = 0;
+            }
+        }
+    }
+
     /// Returns the number of files in the diff.
     #[must_use]
     pub fn file_count(&self) -> usize {
@@ -725,7 +767,6 @@ impl DiffViewer {
 // ═══════════════════════════════════════════════════════════════════
 // Component trait implementation
 // ═══════════════════════════════════════════════════════════════════
-
 impl Component for DiffViewer {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         if area.height < 4 || area.width < 20 {

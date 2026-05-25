@@ -320,37 +320,16 @@ impl TuiState {
 
         // Sync sidebar panels from App state
         self.context_panel.sync_from_app(&self.app);
-        // File changes: populated by external load() from session diff
-        // TodoPanel: extracts TodoWrite from timeline entries
-        // Extract file changes from timeline ToolCall outputs
-        let file_changes: Vec<crate::tui::components::file_changes_panel::FileChangeEntry> = {
-            let mut changes = Vec::new();
-            for entry in self.app.timeline_clone_vec() {
-                if let crate::tui::app::TimelineEntry::ToolCall { name, output, .. } = &entry {
-                    if name == "edit_file" || name == "write_file" || name == "patch_file" || name == "apply_diff" {
-                        // Extract filename and line counts from tool output
-                        let lines: Vec<&str> = output.lines().collect();
-                        let adds = lines.iter().filter(|l| l.starts_with('+')).count();
-                        let dels = lines.iter().filter(|l| l.starts_with('-')).count();
-                        for line in &lines {
-                            if let Some(path) = line.strip_prefix("Updated file: ").or_else(|| line.strip_prefix("File: ")).or_else(|| line.strip_prefix("### ")) {
-                                changes.push(crate::tui::components::file_changes_panel::FileChangeEntry {
-                                    path: path.trim().to_string(),
-                                    added: adds,
-                                    removed: dels,
-                                });
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            changes
-        };
-        if !file_changes.is_empty() {
-            self.file_changes_panel.load(file_changes);
-        }
-        self.todo_panel.extract_from_timeline(&self.app.timeline_clone_vec());
+
+        // Sync file changes panel from timeline (ToolCall outputs with file change info)
+        let timeline = self.app.timeline_clone_vec();
+        self.file_changes_panel.sync_from_timeline(&timeline);
+
+        // Sync todo panel from timeline (TodoWrite ToolCall outputs)
+        self.todo_panel.sync_from_timeline(&timeline);
+
+        // Sync diff viewer from App (extract diff text from timeline ToolCall outputs)
+        self.diff_viewer.sync_from_app(&self.app);
 
         // Sync file tree from App file_entries
         if !self.app.file_entries.is_empty() {
@@ -1017,7 +996,21 @@ impl TuiState {
             return ProcessedKey::Exit;
         }
 
-        // 7. Route through keybind engine for all remaining keys
+        // 7. Ctrl+V: paste from system clipboard
+        if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            match crate::tui::clipboard::read_clipboard() {
+                Some(crate::tui::clipboard::ClipboardContent::Text(text)) => {
+                    self.app.input.insert_str(&text);
+                }
+                Some(crate::tui::clipboard::ClipboardContent::Image { .. }) => {
+                    self.app.input.insert_str("[Image]");
+                }
+                None => {}
+            }
+            return ProcessedKey::Nothing;
+        }
+
+        // 8. Route through keybind engine for all remaining keys
         if !self.dialog_manager.is_empty() {
             self.dialog_manager.handle_key(&key);
             return ProcessedKey::Nothing;

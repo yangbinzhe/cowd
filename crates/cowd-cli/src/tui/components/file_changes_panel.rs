@@ -59,6 +59,50 @@ impl FileChangesPanel {
         self.collapsed = self.files.len() > self.collapse_limit;
     }
 
+    /// Sync file changes from timeline entries by extracting ToolCall outputs
+    /// that contain file change information (edit_file, write_file, patch_file,
+    /// apply_diff, Bash with diff output).
+    ///
+    /// Extracts filename from output prefixes like "Updated file: ", "File: ",
+    /// or "### " and counts +/- lines for add/delete stats.
+    pub fn sync_from_timeline(&mut self, timeline: &[crate::tui::app::TimelineEntry]) {
+        let mut changes = Vec::new();
+
+        for entry in timeline {
+            if let crate::tui::app::TimelineEntry::ToolCall { name, output, .. } = entry {
+                if name == "edit_file"
+                    || name == "write_file"
+                    || name == "patch_file"
+                    || name == "apply_diff"
+                    || name == "Bash"
+                {
+                    let lines: Vec<&str> = output.lines().collect();
+                    let adds = lines.iter().filter(|l| l.starts_with('+')).count();
+                    let dels = lines.iter().filter(|l| l.starts_with('-')).count();
+
+                    for line in &lines {
+                        let path_opt = line
+                            .strip_prefix("Updated file: ")
+                            .or_else(|| line.strip_prefix("File: "))
+                            .or_else(|| line.strip_prefix("### "));
+                        if let Some(path) = path_opt {
+                            changes.push(FileChangeEntry {
+                                path: path.trim().to_string(),
+                                added: adds,
+                                removed: dels,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !changes.is_empty() {
+            self.load(changes);
+        }
+    }
+
     /// Return the number of files.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -443,5 +487,50 @@ mod tests {
         let panel = FileChangesPanel::new();
         assert!(panel.focusable());
         assert_eq!(panel.id(), "file_changes_panel");
+    }
+
+    // ── Test: sync_from_timeline with ToolCall outputs ─────────────
+
+    #[test]
+    fn test_file_changes_from_timeline() {
+        let mut panel = FileChangesPanel::new();
+        let timeline = vec![
+            crate::tui::app::TimelineEntry::ToolCall {
+                id: "tc1".to_string(),
+                name: "edit_file".to_string(),
+                preview: "editing main.rs".to_string(),
+                output: "Updated file: src/main.rs\n+fn new_func() {}\n-old_func();\n context line\n".to_string(),
+                done: true,
+                expanded: false,
+                exit_code: Some(0),
+            },
+            crate::tui::app::TimelineEntry::ToolCall {
+                id: "tc2".to_string(),
+                name: "write_file".to_string(),
+                preview: "writing lib.rs".to_string(),
+                output: "File: src/lib.rs\n+pub fn hello() {}\n+pub fn world() {}\n".to_string(),
+                done: true,
+                expanded: false,
+                exit_code: Some(0),
+            },
+        ];
+
+        panel.sync_from_timeline(&timeline);
+
+        assert_eq!(panel.len(), 2);
+        assert_eq!(panel.files()[0].path, "src/main.rs");
+        assert_eq!(panel.files()[0].added, 1);
+        assert_eq!(panel.files()[0].removed, 1);
+        assert_eq!(panel.files()[1].path, "src/lib.rs");
+        assert_eq!(panel.files()[1].added, 2);
+        assert_eq!(panel.files()[1].removed, 0);
+    }
+
+    #[test]
+    fn test_empty_timeline() {
+        let mut panel = FileChangesPanel::new();
+        let timeline: Vec<crate::tui::app::TimelineEntry> = vec![];
+        panel.sync_from_timeline(&timeline);
+        assert!(panel.is_empty());
     }
 }
