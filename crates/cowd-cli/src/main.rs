@@ -2708,7 +2708,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     // "Loading..." → "Finishing..." → Done (min 3s display).
     let startup_ready = true;
 
-    let mut turn_handle: Option<std::thread::JoinHandle<()>> = None;
+    let mut turn_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut abort_monitor: Option<HookAbortMonitor> = None;
     let mut abort_signal_for_turn: Option<runtime::HookAbortSignal> = None;
 
@@ -2825,28 +2825,22 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                 abort_signal_for_turn = Some(abort_signal);
 
                                 let tx = tui_tx.clone();
-                                turn_handle = Some(std::thread::spawn(move || {
+                                turn_handle = Some(SHARED_RT.spawn_blocking(move || {
                                     let _ = tx.send(tui::TuiEvent::TurnStarted);
-                                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        SHARED_RT.block_on(async {
-                                            prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await
-                                        })
-                                    }));
-                                    match result {
-                                        Ok(Ok(summary)) => {
-                                            let final_text = final_assistant_text(&summary);
-                                            let _ = tx.send(tui::TuiEvent::TurnComplete {
-                                                assistant_text: final_text.clone(),
-                                                iterations: summary.iterations as u32,
-                                            });
+                                    SHARED_RT.block_on(async move {
+                                        match prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await {
+                                            Ok(summary) => {
+                                                let final_text = final_assistant_text(&summary);
+                                                let _ = tx.send(tui::TuiEvent::TurnComplete {
+                                                    assistant_text: final_text.clone(),
+                                                    iterations: summary.iterations as u32,
+                                                });
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
+                                            }
                                         }
-                                        Ok(Err(e)) => {
-                                            let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
-                                        }
-                                        Err(_) => {
-                                            let _ = tx.send(tui::TuiEvent::TurnError { error: "runtime panic".to_string() });
-                                        }
-                                    }
+                                    });
                                 }));
                             }
                             ProcessedKey::Exit => break,
@@ -2859,7 +2853,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                     state.add_message("system", "Interrupted");
                                 }
                                 if let Some(handle) = turn_handle.take() {
-                                    drop(handle);
+                                    handle.abort();
                                 }
                             }
                             ProcessedKey::Nothing => {}
@@ -6769,7 +6763,7 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
 
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
-    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
         match self.stream_collect(request) {
             Ok(events) => Box::pin(futures::stream::iter(events.into_iter().map(Ok))),
             Err(e) => Box::pin(futures::stream::iter(std::iter::once(Err(e)))),

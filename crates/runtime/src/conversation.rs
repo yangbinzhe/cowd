@@ -86,7 +86,7 @@ pub trait ApiClient {
     fn stream(
         &mut self,
         request: ApiRequest,
-    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>>;
+    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>;
 
     /// Convenience: collect all events synchronously (backward compat).
     fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -992,12 +992,26 @@ self.record_turn_completed(&summary);
                 system_prompt: effective_system_prompt.clone(),
                 messages: self.session.read().unwrap_or_else(|e| e.into_inner()).messages.clone(),
             };
-            let events = match self.api_client.stream_collect(request) {
-                Ok(events) => events,
-                Err(error) => {
-                    self.record_turn_failed(iterations, &error);
-                    return Err(error);
-                }
+            let events = {
+                let handle = tokio::runtime::Handle::current();
+                let stream = self.api_client.stream(request);
+                let result = handle.block_on(async {
+                    use futures::StreamExt;
+                    let mut pinned = stream;
+                    let mut events = Vec::new();
+                    while let Some(event) = pinned.next().await {
+                        events.push(event?);
+                    }
+                    Ok(events)
+                });
+                let events = match result {
+                    Ok(events) => events,
+                    Err(error) => {
+                        self.record_turn_failed(iterations, &error);
+                        return Err(error);
+                    }
+                };
+                events
             };
             let (assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events) {
@@ -1907,7 +1921,7 @@ mod tests {
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
     // M1 helper: convert Vec<AssistantEvent> into a Stream for test mocks
-    fn to_stream(events: Vec<AssistantEvent>) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + 'static>> {
+    fn to_stream(events: Vec<AssistantEvent>) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>> {
         Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
     }
 
@@ -1916,9 +1930,9 @@ mod tests {
     }
 
     impl ApiClient for ScriptedApiClient {
-        fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+        fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             use futures::stream;
-            fn wrap(v: Vec<AssistantEvent>) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + 'static>> {
+            fn wrap(v: Vec<AssistantEvent>) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>> {
                 Box::pin(stream::iter(v.into_iter().map(Ok)))
             }
             self.call_count += 1;
@@ -2047,7 +2061,7 @@ mod tests {
 
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
                 if request
                     .messages
                     .iter()
@@ -2092,7 +2106,7 @@ mod tests {
     fn denies_tool_use_when_pre_tool_hook_blocks() {
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
                 if request
                     .messages
                     .iter()
@@ -2154,7 +2168,7 @@ mod tests {
     fn denies_tool_use_when_pre_tool_hook_fails() {
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
                 if request
                     .messages
                     .iter()
@@ -2222,7 +2236,7 @@ mod tests {
         }
 
         impl ApiClient for TwoCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
                 self.calls += 1;
                 match self.calls {
                     1 => to_stream(vec![
@@ -2297,7 +2311,7 @@ mod tests {
         }
 
         impl ApiClient for TwoCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
                 self.calls += 1;
                 match self.calls {
                     1 => to_stream(vec![
@@ -2376,7 +2390,7 @@ mod tests {
             fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
                 Box::pin(futures::stream::iter(vec![
                     Ok(AssistantEvent::TextDelta("done".to_string())),
                     Ok(AssistantEvent::MessageStop),
@@ -2418,7 +2432,7 @@ mod tests {
             fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
                 Box::pin(futures::stream::iter(vec![
                     Ok(AssistantEvent::TextDelta("done".to_string())),
                     Ok(AssistantEvent::MessageStop),
@@ -2460,7 +2474,7 @@ mod tests {
             fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
                 Box::pin(futures::stream::iter(vec![
                     Ok(AssistantEvent::TextDelta("done".to_string())),
                     Ok(AssistantEvent::MessageStop),
@@ -2510,7 +2524,7 @@ mod tests {
 
     struct MockApi;
     impl ApiClient for MockApi {
-        fn stream(&mut self, _request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+        fn stream(&mut self, _request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             Box::pin(futures::stream::iter(vec![Ok(AssistantEvent::MessageStop)]))
         }
     }

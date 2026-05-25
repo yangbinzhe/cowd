@@ -32,7 +32,7 @@ mod tests {
 
     struct EchoClient;
     impl ApiClient for EchoClient {
-        fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+        fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             Box::pin(futures::stream::iter(vec![
                 Ok(AssistantEvent::TextDelta("done".into())),
                 Ok(AssistantEvent::MessageStop),

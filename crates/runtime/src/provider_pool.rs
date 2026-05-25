@@ -41,7 +41,7 @@ impl ProviderPool {
 }
 
 impl ApiClient for ProviderPool {
-    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
         let idx = self.current.load(Ordering::Relaxed) % self.clients.len().max(1);
         self.clients[idx].stream(request)
     }
@@ -55,7 +55,7 @@ mod tests {
 
     struct DummyClient(usize);
     impl ApiClient for DummyClient {
-        fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+        fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             Box::pin(stream::iter(vec![Ok(AssistantEvent::TextDelta(self.0.to_string())), Ok(AssistantEvent::MessageStop)]))
         }
     }

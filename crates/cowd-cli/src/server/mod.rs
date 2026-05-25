@@ -1158,7 +1158,7 @@ impl OpenAiApiClient {
 }
 
 impl RuntimeApiClient for OpenAiApiClient {
-    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
         match self.stream_collect(request) {
             Ok(events) => Box::pin(futures::stream::iter(events.into_iter().map(Ok))),
             Err(e) => Box::pin(futures::stream::iter(std::iter::once(Err(e)))),

@@ -3152,7 +3152,7 @@ fn load_provider_fallback_config() -> ProviderFallbackConfig {
 }
 
 impl ApiClient for ProviderRuntimeClient {
-    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
         match self.stream_collect_inner(request) {
             Ok(events) => Box::pin(futures::stream::iter(events.into_iter().map(Ok))),
             Err(e) => Box::pin(futures::stream::iter(std::iter::once(Err(e)))),
@@ -6756,7 +6756,7 @@ mod tests {
     }
 
     impl runtime::ApiClient for MockSubagentApiClient {
-        fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + '_>> {
+fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             self.calls += 1;
             let events: Result<Vec<AssistantEvent>, RuntimeError> = match self.calls {
                 1 => {
