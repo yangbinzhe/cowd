@@ -275,9 +275,7 @@ where
             let mem_cfg = build_cc_memory_config(feature_config);
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
-                    let result = tokio::task::block_in_place(|| {
-                        handle.block_on(CognitiveContextManager::new(mem_cfg))
-                    });
+                    let result = handle.block_on(CognitiveContextManager::new(mem_cfg));
                     match result {
                     Ok(mgr) => {
                         tracing::debug!("memory: CognitiveContextManager initialised");
@@ -1649,9 +1647,7 @@ self.record_turn_completed(&summary);
             Ok(h) => h,
             Err(_) => return Ok(()),
         };
-        tokio::task::block_in_place(|| {
-            handle.block_on(mgr.on_turn_end(&mut mem_messages))
-        })
+        handle.block_on(mgr.on_turn_end(&mut mem_messages))
             .map_err(|err| RuntimeError::new(format!("memory on_turn_end: {err}")))
     }
 }
