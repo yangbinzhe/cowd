@@ -2602,7 +2602,8 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     // "Loading..." → "Finishing..." → Done (min 3s display).
     let startup_ready = true;
 
-    let mut turn_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut turn_handle: Option<std::thread::JoinHandle<()>> = None;
+    let mut abort_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
     let mut abort_monitor: Option<HookAbortMonitor> = None;
     let mut abort_signal_for_turn: Option<runtime::HookAbortSignal> = None;
 
@@ -2682,20 +2683,26 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                     abort_signal_for_turn = Some(abort_signal);
 
                                     let tx = tui_tx.clone();
-                                    let task = SHARED_RT.spawn(async move {
+                                    let rt_handle = SHARED_RT.handle().clone();
+                                    let abort_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                    abort_flag = Some(abort_signal.clone());
+                                    let task = std::thread::spawn(move || {
                                         let _ = tx.send(tui::TuiEvent::TurnStarted);
-                                        match prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await {
-                                            Ok(summary) => {
-                                                let final_text = final_assistant_text(&summary);
-                                                let _ = tx.send(tui::TuiEvent::TurnComplete {
-                                                    assistant_text: final_text.clone(),
-                                                    iterations: summary.iterations as u32,
-                                                });
+                                        if abort_signal.load(std::sync::atomic::Ordering::Relaxed) { return; }
+                                        rt_handle.block_on(async move {
+                                            match prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await {
+                                                Ok(summary) => {
+                                                    let final_text = final_assistant_text(&summary);
+                                                    let _ = tx.send(tui::TuiEvent::TurnComplete {
+                                                        assistant_text: final_text.clone(),
+                                                        iterations: summary.iterations as u32,
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
+                                                }
                                             }
-                                            Err(e) => {
-                                                let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
-                                            }
-                                        }
+                                        });
                                     });
                                     turn_handle = Some(task);
                                 }
@@ -2708,8 +2715,8 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                         monitor.stop();
                                         state.add_message("system", "Interrupted");
                                     }
-                                    if let Some(handle) = turn_handle.take() {
-                                        handle.abort();
+                                    if let Some(flag) = abort_flag.take() {
+                                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
                                     }
                                 }
                                 ProcessedKey::Nothing => {}

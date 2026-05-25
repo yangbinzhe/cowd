@@ -1,6 +1,8 @@
 use std::env;
 use std::io;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -97,17 +99,16 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         });
     }
 
-    let handle = tokio::runtime::Handle::try_current()
-        .unwrap_or_else(|_| {
-            // Fallback: create a small runtime for bash execution
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("bash tokio rt")
-                .handle()
-                .clone()
-        });
-    handle.block_on(execute_bash_async(input, sandbox_status, cwd))
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("bash tokio rt");
+        let result = rt.block_on(execute_bash_async(input, sandbox_status, cwd));
+        let _ = tx.send(result);
+    });
+    rx.recv().map_err(|_| io::Error::new(io::ErrorKind::Other, "bash thread panicked"))?
 }
 
 async fn execute_bash_async(
