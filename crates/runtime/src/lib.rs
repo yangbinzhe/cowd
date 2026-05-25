@@ -58,6 +58,7 @@ pub mod sandbox;
 mod session;
 pub use session::workspace_sessions_dir;
 pub mod session_control;
+pub mod session_manager;
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
