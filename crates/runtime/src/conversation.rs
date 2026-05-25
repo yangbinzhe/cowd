@@ -271,24 +271,51 @@ where
         let (memory_manager, memory_status) = if feature_config.memory().enabled {
             let mem_cfg = build_cc_memory_config(feature_config);
             match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    let result = handle.block_on(CognitiveContextManager::new(mem_cfg));
-                    match result {
-                    Ok(mgr) => {
-                        tracing::debug!("memory: CognitiveContextManager initialised");
-                        (Some(Arc::new(mgr)), None)
+                Ok(_) => {
+                    // Inside a runtime — spawn a fresh thread with its own runtime
+                    // to avoid nested enter_runtime panic.
+                    let mem_cfg = mem_cfg.clone();
+                    let handle = std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to create memory init runtime");
+                        rt.block_on(CognitiveContextManager::new(mem_cfg))
+                    });
+                    match handle.join().expect("memory init thread panicked") {
+                        Ok(mgr) => {
+                            tracing::debug!("memory: CognitiveContextManager initialised");
+                            (Some(Arc::new(mgr)), None)
+                        }
+                        Err(err) => {
+                            let msg = format!("Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory.");
+                            tracing::error!("{msg}");
+                            (None, Some(msg))
+                        }
                     }
-                    Err(err) => {
-                        let msg = format!("Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory.");
-                        tracing::error!("{msg}");
-                        (None, Some(msg))
-                    }
-                    }
-                },
+                }
                 Err(_) => {
-                    let msg = "Memory system unavailable: no async runtime available. Memory features will NOT work.".to_string();
-                    tracing::error!("{msg}");
-                    (None, Some(msg))
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => match rt.block_on(CognitiveContextManager::new(mem_cfg)) {
+                            Ok(mgr) => {
+                                tracing::debug!("memory: CognitiveContextManager initialised");
+                                (Some(Arc::new(mgr)), None)
+                            }
+                            Err(err) => {
+                                let msg = format!("Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory.");
+                                tracing::error!("{msg}");
+                                (None, Some(msg))
+                            }
+                        },
+                        Err(e) => {
+                            let msg = format!("Memory system unavailable: failed to create runtime: {e}. Memory features will NOT work.");
+                            tracing::error!("{msg}");
+                            (None, Some(msg))
+                        }
+                    }
                 }
             }
         } else {
