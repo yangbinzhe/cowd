@@ -19,7 +19,7 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
-    PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
+    PermissionContext, PermissionOutcome, PermissionPolicy,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
@@ -931,307 +931,6 @@ self.record_turn_completed(&summary);
         }
     }
 
-    #[deprecated(since = "0.2.0", note = "use run_turn_async() for true event-by-event streaming")]
-    #[allow(clippy::too_many_lines)]
-    pub fn run_turn(
-        &mut self,
-        user_input: impl Into<String>,
-        mut prompter: Option<&mut dyn PermissionPrompter>,
-    ) -> Result<TurnSummary, RuntimeError> {
-        let user_input = user_input.into();
-
-        // ROADMAP #38: Session-health canary - probe if context was compacted
-        if self.session.read().unwrap_or_else(|e| e.into_inner()).compaction.is_some() {
-            if let Err(error) = self.run_session_health_probe() {
-                return Err(RuntimeError::new(format!(
-                    "Session health probe failed after compaction: {error}. \
-                     The session may be in an inconsistent state. \
-                     Consider starting a fresh session with /session new."
-                )));
-            }
-        }
-
-        self.record_turn_started(&user_input);
-        self.session.write().unwrap_or_else(|e| e.into_inner())
-            .push_user_text(user_input.clone())
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
-
-        // ── Memory: prepare context before the first model call ──────────────
-        // Build an effective system prompt that includes memory context.
-        // Falls back to the configured system_prompt when memory is disabled.
-        let effective_system_prompt = {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(self.prepare_memory_context(&user_input))
-        };
-
-        let mut assistant_messages = Vec::new();
-        let mut tool_results = Vec::new();
-        let mut prompt_cache_events = Vec::new();
-        let mut iterations = 0;
-
-        loop {
-            iterations += 1;
-            if iterations > self.max_iterations {
-                let error = RuntimeError::new(
-                    "conversation loop exceeded the maximum number of iterations",
-                );
-                self.record_turn_failed(iterations, &error);
-                return Err(error);
-            }
-
-            if self.auto_compaction_input_tokens_threshold > 0
-                && estimate_session_tokens(&*self.session.read().unwrap_or_else(|e| e.into_inner())) > self.auto_compaction_input_tokens_threshold as usize
-            {
-                let result = compact_session(&*self.session.read().unwrap_or_else(|e| e.into_inner()), CompactionConfig::default());
-                if result.removed_message_count > 0 {
-                    *self.session.write().unwrap_or_else(|e| e.into_inner()) = result.compacted_session;
-                }
-            }
-
-            let request = ApiRequest {
-                system_prompt: effective_system_prompt.clone(),
-                messages: self.session.read().unwrap_or_else(|e| e.into_inner()).messages.clone(),
-            };
-            let events = {
-                let handle = tokio::runtime::Handle::current();
-                let stream = self.api_client.stream(request);
-                let result = handle.block_on(async {
-                    use futures::StreamExt;
-                    let mut pinned = stream;
-                    let mut events = Vec::new();
-                    while let Some(event) = pinned.next().await {
-                        events.push(event?);
-                    }
-                    Ok(events)
-                });
-                let events = match result {
-                    Ok(events) => events,
-                    Err(error) => {
-                        self.record_turn_failed(iterations, &error);
-                        return Err(error);
-                    }
-                };
-                events
-            };
-            let (assistant_message, usage, turn_prompt_cache_events) =
-                match build_assistant_message(events) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        self.record_turn_failed(iterations, &error);
-                        return Err(error);
-                    }
-                };
-            if let Some(usage) = usage {
-                self.usage_tracker.record(usage);
-            }
-            prompt_cache_events.extend(turn_prompt_cache_events);
-            let pending_tool_uses = assistant_message
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolUse { id, name, input } => {
-                        Some((id.clone(), name.clone(), input.clone()))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            self.record_assistant_iteration(
-                iterations,
-                &assistant_message,
-                pending_tool_uses.len(),
-            );
-
-            self.session.write().unwrap_or_else(|e| e.into_inner())
-                .push_message(assistant_message.clone())
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            assistant_messages.push(assistant_message);
-
-            if pending_tool_uses.is_empty() {
-                break;
-            }
-
-            for (tool_use_id, tool_name, input) in pending_tool_uses {
-                let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
-                let effective_input = pre_hook_result
-                    .updated_input()
-                    .map_or_else(|| input.clone(), ToOwned::to_owned);
-                let permission_context = PermissionContext::new(
-                    pre_hook_result.permission_override(),
-                    pre_hook_result.permission_reason().map(ToOwned::to_owned),
-                );
-
-                let permission_outcome = if pre_hook_result.is_cancelled() {
-                    PermissionOutcome::Deny {
-                        reason: format_hook_message(
-                            &pre_hook_result,
-                            &format!("PreToolUse hook cancelled tool `{tool_name}`"),
-                        ),
-                    }
-                } else if pre_hook_result.is_failed() {
-                    PermissionOutcome::Deny {
-                        reason: format_hook_message(
-                            &pre_hook_result,
-                            &format!("PreToolUse hook failed for tool `{tool_name}`"),
-                        ),
-                    }
-                } else if pre_hook_result.is_denied() {
-                    PermissionOutcome::Deny {
-                        reason: format_hook_message(
-                            &pre_hook_result,
-                            &format!("PreToolUse hook denied tool `{tool_name}`"),
-                        ),
-                    }
-                } else if let Some(prompt) = prompter.as_mut() {
-                    self.permission_policy.authorize_with_context(
-                        &tool_name,
-                        &effective_input,
-                        &permission_context,
-                        Some(*prompt),
-                    )
-                } else {
-                    self.permission_policy.authorize_with_context(
-                        &tool_name,
-                        &effective_input,
-                        &permission_context,
-                        None,
-                    )
-                };
-
-                let result_message = match permission_outcome {
-                    PermissionOutcome::Allow => {
-                        // P0-1: Smart approval gate — check if command needs approval
-                        let mut gate_denied: Option<ConversationMessage> = None;
-                        if let Some(gate) = &self.approval_gate {
-                            let gate_result = match tokio::runtime::Handle::try_current() {
-                                Ok(handle) => handle.block_on(gate.evaluate(&tool_name, &effective_input)),
-                                Err(_) => {
-                                    // No async runtime available; auto-pass
-                                    crate::approval_gate::ApprovalGateResult::AutoPass {
-                                        reason: crate::permission_enforcer::AutoPassReason::NoPatternMatch,
-                                    }
-                                }
-                            };
-
-                            match gate_result {
-                                crate::approval_gate::ApprovalGateResult::Denied { reason } => {
-                                    gate_denied = Some(ConversationMessage::tool_result(
-                                        tool_use_id.clone(),
-                                        tool_name.clone(),
-                                        reason,
-                                        true,
-                                    ));
-                                }
-                                crate::approval_gate::ApprovalGateResult::TimedOut => {
-                                    gate_denied = Some(ConversationMessage::tool_result(
-                                        tool_use_id.clone(),
-                                        tool_name.clone(),
-                                        "Approval request timed out".to_string(),
-                                        true,
-                                    ));
-                                }
-                                crate::approval_gate::ApprovalGateResult::AutoPass { .. }
-                                | crate::approval_gate::ApprovalGateResult::Approved { .. } => {
-                                    // Continue to execution
-                                }
-                            }
-                        }
-
-                        if let Some(denied_msg) = gate_denied {
-                            self.session.write().unwrap_or_else(|e| e.into_inner())
-                                .push_message(denied_msg.clone())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            self.record_tool_finished(iterations, &denied_msg);
-                            tool_results.push(denied_msg);
-                            break; // skip remaining tools in this batch
-                        }
-
-                        self.record_tool_started(iterations, &tool_name);
-
-                        // P0-2: Notify tool callback that execution is starting
-                        if let Some(callback) = &self.tool_callback {
-                            let preview: String = effective_input.chars().take(200).collect();
-                            callback.on_tool_start(&tool_use_id, &tool_name, &preview);
-                        }
-
-                        let (mut output, mut is_error) =
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
-                                Ok(output) => (output, false),
-                                Err(error) => (error.to_string(), true),
-                            };
-                        output = merge_hook_feedback(pre_hook_result.messages(), output, false);
-
-                        // P0-2: Notify tool callback that execution is complete
-                        if let Some(callback) = &self.tool_callback {
-                            let summary: String = output.chars().take(500).collect();
-                            let exit_code = if is_error { Some(1) } else { Some(0) };
-                            callback.on_tool_complete(&tool_use_id, &tool_name, &summary, exit_code);
-                        }
-
-                        let post_hook_result = if is_error {
-                            self.run_post_tool_use_failure_hook(
-                                &tool_name,
-                                &effective_input,
-                                &output,
-                            )
-                        } else {
-                            self.run_post_tool_use_hook(
-                                &tool_name,
-                                &effective_input,
-                                &output,
-                                false,
-                            )
-                        };
-                        if post_hook_result.is_denied()
-                            || post_hook_result.is_failed()
-                            || post_hook_result.is_cancelled()
-                        {
-                            is_error = true;
-                        }
-                        output = merge_hook_feedback(
-                            post_hook_result.messages(),
-                            output,
-                            post_hook_result.is_denied()
-                                || post_hook_result.is_failed()
-                                || post_hook_result.is_cancelled(),
-                        );
-
-                        ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
-                    }
-                    PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
-                        tool_use_id,
-                        tool_name,
-                        merge_hook_feedback(pre_hook_result.messages(), reason, true),
-                        true,
-                    ),
-                };
-                self.session.write().unwrap_or_else(|e| e.into_inner())
-                    .push_message(result_message.clone())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.record_tool_finished(iterations, &result_message);
-                tool_results.push(result_message);
-            }
-        }
-
-        let auto_compaction = self.maybe_auto_compact();
-
-        // ── Memory: post-turn housekeeping ───────────────────────────────
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().handle().clone()
-        });
-        let _ = handle.block_on(self.run_memory_post_turn());
-
-        let summary = TurnSummary {
-            assistant_messages,
-            tool_results,
-            prompt_cache_events,
-            iterations,
-            usage: self.usage_tracker.cumulative_usage(),
-            auto_compaction,
-        };
-        self.record_turn_completed(&summary);
-
-        Ok(summary)
-    }
 
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
@@ -1908,7 +1607,7 @@ mod tests {
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-        PermissionRequest,
+        PermissionRequest, SharedPrompter,
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
@@ -1991,8 +1690,12 @@ mod tests {
             system_prompt,
         );
 
-        let summary = runtime
-            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+        let prompter = SharedPrompter::new(Box::new(PromptAllowOnce));
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Runtime::new().unwrap().handle().clone()
+        });
+        let summary = handle
+            .block_on(runtime.run_turn_async("what is 2 + 2?", &prompter))
             .expect("conversation loop should succeed");
 
         assert_eq!(summary.iterations, 2);
@@ -2028,8 +1731,12 @@ mod tests {
         )
         .with_session_tracer(tracer);
 
-        runtime
-            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+        let prompter = SharedPrompter::new(Box::new(PromptAllowOnce));
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Runtime::new().unwrap().handle().clone()
+        });
+        handle
+            .block_on(runtime.run_turn_async("what is 2 + 2?", &prompter))
             .expect("conversation loop should succeed");
 
         let events = sink.events();
@@ -2091,8 +1798,12 @@ mod tests {
             vec!["system".to_string()],
         );
 
-        let summary = runtime
-            .run_turn("use the tool", Some(&mut RejectPrompter))
+        let prompter = SharedPrompter::new(Box::new(RejectPrompter));
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Runtime::new().unwrap().handle().clone()
+        });
+        let summary = handle
+            .block_on(runtime.run_turn_async("use the tool", &prompter))
             .expect("conversation should continue after denied tool");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -2143,8 +1854,12 @@ mod tests {
             )),
         );
 
-        let summary = runtime
-            .run_turn("use the tool", None)
+        let prompter = SharedPrompter::none();
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Runtime::new().unwrap().handle().clone()
+        });
+        let summary = handle
+            .block_on(runtime.run_turn_async("use the tool", &prompter))
             .expect("conversation should continue after hook denial");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -2207,8 +1922,12 @@ mod tests {
         );
 
         // when
-        let summary = runtime
-            .run_turn("use the tool", None)
+        let prompter = SharedPrompter::none();
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Runtime::new().unwrap().handle().clone()
+        });
+        let summary = handle
+            .block_on(runtime.run_turn_async("use the tool", &prompter))
             .expect("conversation should continue after hook failure");
 
         // then
@@ -2275,8 +1994,12 @@ mod tests {
             )),
         );
 
-        let summary = runtime
-            .run_turn("use add", None)
+        let prompter = SharedPrompter::none();
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Runtime::new().unwrap().handle().clone()
+        });
+        let summary = handle
+            .block_on(runtime.run_turn_async("use add", &prompter))
             .expect("tool loop succeeds");
 
         assert_eq!(summary.tool_results.len(), 1);
@@ -2353,8 +2076,12 @@ mod tests {
         );
 
         // when
-        let summary = runtime
-            .run_turn("use fail", None)
+        let prompter = SharedPrompter::none();
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Runtime::new().unwrap().handle().clone()
+        });
+        let summary = handle
+            .block_on(runtime.run_turn_async("use fail", &prompter))
             .expect("tool loop succeeds");
 
         // then
@@ -2447,9 +2174,13 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         );
-        runtime.run_turn("a", None).expect("turn a");
-        runtime.run_turn("b", None).expect("turn b");
-        runtime.run_turn("c", None).expect("turn c");
+        let prompter = SharedPrompter::none();
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Runtime::new().unwrap().handle().clone()
+        });
+        handle.block_on(runtime.run_turn_async("a", &prompter)).expect("turn a");
+        handle.block_on(runtime.run_turn_async("b", &prompter)).expect("turn b");
+        handle.block_on(runtime.run_turn_async("c", &prompter)).expect("turn c");
 
         let result = runtime.compact(CompactionConfig {
             preserve_recent_messages: 2,
@@ -2492,8 +2223,12 @@ mod tests {
             vec!["system".to_string()],
         );
 
-        runtime
-            .run_turn("persist this turn", None)
+        let prompter = SharedPrompter::none();
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Runtime::new().unwrap().handle().clone()
+        });
+        handle
+            .block_on(runtime.run_turn_async("persist this turn", &prompter))
             .expect("turn should succeed");
 
         drop(runtime);

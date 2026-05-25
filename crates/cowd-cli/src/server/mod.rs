@@ -3314,7 +3314,7 @@ fn server_execute_turn(input: &str) -> Result<String, Box<dyn std::error::Error 
     let mut runtime = crate::build_runtime(
         session, &session_id, "claude-sonnet-4-6".to_string(), system_prompt,
         true, false, None,
-        runtime::PermissionMode::DangerFullAccess, None, None, None,
+        runtime::PermissionMode::DangerFullAccess, None, None,
     ).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
     let prompter = runtime::permissions::SharedPrompter::new(Box::new(
         crate::CliPermissionPrompter::new(runtime::PermissionMode::DangerFullAccess)
