@@ -1112,7 +1112,7 @@ impl CognitiveContextManager {
         {
             let tick = self.cross_store_verify_counter.fetch_add(1, Ordering::Relaxed) + 1;
             if tick % 50 == 0 {
-                let warnings = self.cross_store_verify();
+                let warnings = self.cross_store_verify().await;
                 for w in &warnings {
                     tracing::warn!("cross-store-verify: {w}");
                 }
@@ -1841,7 +1841,7 @@ impl CognitiveContextManager {
     ///
     /// Samples 10 random entries from each store and checks for referential
     /// integrity. Returns a list of warning strings. Kept lightweight (<10ms).
-    fn cross_store_verify(&self) -> Vec<String> {
+    async fn cross_store_verify(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
         // 1. KG entities → MemoryStore: check a random sample of KG entities
@@ -1864,9 +1864,7 @@ impl CognitiveContextManager {
                     }
                     checked += 1;
                     // Check if entity name appears in store via FTS
-                    let found = tokio::runtime::Handle::current().block_on(async {
-                        store.search_fts(&entity.name, 1).await
-                    });
+                    let found = store.search_fts(&entity.name, 1).await;
                     match found {
                         Ok(results) if results.is_empty() => {
                             warnings.push(format!(
@@ -1910,9 +1908,7 @@ impl CognitiveContextManager {
                             Ok(id) => id,
                             Err(_) => continue,
                         };
-                        let found = tokio::runtime::Handle::current().block_on(async {
-                            store.get(&uuid).await
-                        });
+                        let found = store.get(&uuid).await;
                         match found {
                             Ok(None) => {
                                 warnings.push(format!(
@@ -1935,9 +1931,7 @@ impl CognitiveContextManager {
         //    verbatim counterparts exist (reverse check since we can't list verbatim).
         {
             let store = self.orchestrator.store();
-            let all_entries = tokio::runtime::Handle::current().block_on(async {
-                store.list_all().await
-            });
+            let all_entries = store.list_all().await;
             match all_entries {
                 Ok(entries) if !entries.is_empty() => {
                     let sample_size = 10usize.min(entries.len());
@@ -1948,9 +1942,7 @@ impl CognitiveContextManager {
                             continue;
                         }
                         checked += 1;
-                        let verbatim = tokio::runtime::Handle::current().block_on(async {
-                            store.load_verbatim_by_id(&entry.id.to_string()).await
-                        });
+                        let verbatim = store.load_verbatim_by_id(&entry.id.to_string()).await;
                         match verbatim {
                             Ok(None) => {
                                 warnings.push(format!(
@@ -1993,9 +1985,7 @@ impl CognitiveContextManager {
                         continue;
                     }
                     checked += 1;
-                    let results = tokio::runtime::Handle::current().block_on(async {
-                        store.search_fts(&entity.name, 3).await
-                    });
+                    let results = store.search_fts(&entity.name, 3).await;
                     match results {
                         Ok(entries) => {
                             let has_relevant = entries.iter().any(|e| {

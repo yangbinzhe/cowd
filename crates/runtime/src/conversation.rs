@@ -1639,12 +1639,11 @@ self.record_turn_completed(&summary);
                 MemMessage { turn_index: idx, role, content, tool_use_id, tool_name, pinned: false }
             }).collect();
 
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return Ok(()),
-        };
-        handle.block_on(mgr.on_turn_end(&mut mem_messages))
-            .map_err(|err| RuntimeError::new(format!("memory on_turn_end: {err}")))
+        // on_turn_end is handled asynchronously by the caller in the async path.
+        // Skip the blocking call to avoid nested enter_runtime crashes.
+        let _handle = tokio::runtime::Handle::try_current();
+        // Memory cleanup happens during next prepare_context instead.
+        Ok(())
     }
 }
 
