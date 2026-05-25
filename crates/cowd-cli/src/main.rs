@@ -2708,7 +2708,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     // "Loading..." → "Finishing..." → Done (min 3s display).
     let startup_ready = true;
 
-    let mut turn_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut turn_handle: Option<std::thread::JoinHandle<()>> = None;
     let mut abort_monitor: Option<HookAbortMonitor> = None;
     let mut abort_signal_for_turn: Option<runtime::HookAbortSignal> = None;
 
@@ -2825,22 +2825,24 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                 abort_signal_for_turn = Some(abort_signal);
 
                                 let tx = tui_tx.clone();
-                                turn_handle = Some(SHARED_RT.spawn_blocking(move || {
+                                turn_handle = Some(std::thread::spawn(move || {
                                     let _ = tx.send(tui::TuiEvent::TurnStarted);
-                                    SHARED_RT.block_on(async move {
-                                        match prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await {
-                                            Ok(summary) => {
-                                                let final_text = final_assistant_text(&summary);
-                                                let _ = tx.send(tui::TuiEvent::TurnComplete {
-                                                    assistant_text: final_text.clone(),
-                                                    iterations: summary.iterations as u32,
-                                                });
-                                            }
-                                            Err(e) => {
-                                                let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
-                                            }
-                                        }
+                                    let rt = tokio::runtime::Runtime::new().expect("turn runtime");
+                                    let result = rt.block_on(async {
+                                        prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await
                                     });
+                                    match result {
+                                        Ok(summary) => {
+                                            let final_text = final_assistant_text(&summary);
+                                            let _ = tx.send(tui::TuiEvent::TurnComplete {
+                                                assistant_text: final_text.clone(),
+                                                iterations: summary.iterations as u32,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
+                                        }
+                                    }
                                 }));
                             }
                             ProcessedKey::Exit => break,
@@ -2853,7 +2855,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                     state.add_message("system", "Interrupted");
                                 }
                                 if let Some(handle) = turn_handle.take() {
-                                    handle.abort();
+                                    drop(handle); // detach — runtime-level abort signal already sent above
                                 }
                             }
                             ProcessedKey::Nothing => {}
