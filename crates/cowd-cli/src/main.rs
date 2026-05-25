@@ -6531,7 +6531,8 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
-    let model_ctx = api::model_context_window(&model);
+    let overrides = feature_config.model_context_windows();
+    let model_ctx = api::model_context_window_with_overrides(&model, Some(&overrides));
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(

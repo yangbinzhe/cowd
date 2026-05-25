@@ -35,6 +35,7 @@ pub struct RuntimeFeatureConfig {
     oauth: Option<OAuthConfig>,
     model: Option<String>,
     aliases: BTreeMap<String, String>,
+    model_context_windows: BTreeMap<String, u32>,
     permission_mode: Option<ResolvedPermissionMode>,
     permission_rules: RuntimePermissionRuleConfig,
     approval: ApprovalConfig,
@@ -379,6 +380,7 @@ impl ConfigLoader {
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
             aliases: parse_optional_aliases(&merged_value)?,
+            model_context_windows: parse_optional_model_context_windows(&merged_value)?,
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             approval: parse_optional_approval_config(&merged_value)?,
@@ -462,6 +464,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn aliases(&self) -> &BTreeMap<String, String> {
         &self.feature_config.aliases
+    }
+
+    #[must_use]
+    pub fn model_context_windows(&self) -> &BTreeMap<String, u32> {
+        &self.feature_config.model_context_windows
     }
 
     #[must_use]
@@ -556,6 +563,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn aliases(&self) -> &BTreeMap<String, String> {
         &self.aliases
+    }
+
+    #[must_use]
+    pub fn model_context_windows(&self) -> &BTreeMap<String, u32> {
+        &self.model_context_windows
     }
 
     #[must_use]
@@ -881,6 +893,29 @@ fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, 
         return Ok(BTreeMap::new());
     };
     Ok(optional_string_map(object, "aliases", "merged settings")?.unwrap_or_default())
+}
+
+fn parse_optional_model_context_windows(root: &JsonValue) -> Result<BTreeMap<String, u32>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(val) = object.get("model_context_windows") else {
+        return Ok(BTreeMap::new());
+    };
+    let map = val.as_object().ok_or_else(|| {
+        ConfigError::Parse("merged settings: field model_context_windows must be an object".to_string())
+    })?;
+    let mut result = BTreeMap::new();
+    for (k, v) in map {
+        let num: i64 = v.as_i64().ok_or_else(|| ConfigError::Parse(format!(
+            "merged settings: field model_context_windows.{k} must be a number"
+        )))?;
+        let n: u32 = num.try_into().map_err(|_| ConfigError::Parse(format!(
+            "merged settings: field model_context_windows.{k} value out of u32 range"
+        )))?;
+        result.insert(k.clone(), n);
+    }
+    Ok(result)
 }
 
 fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, ConfigError> {

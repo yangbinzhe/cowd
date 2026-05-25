@@ -442,7 +442,7 @@ pub fn model_context_window(model: &str) -> u32 {
 #[must_use]
 pub fn model_context_window_with_overrides(
     model: &str,
-    overrides: Option<&std::collections::HashMap<String, u32>>,
+    overrides: Option<&std::collections::BTreeMap<String, u32>>,
 ) -> u32 {
     let canonical = resolve_model_alias(model);
     if let Some(overrides) = overrides {
