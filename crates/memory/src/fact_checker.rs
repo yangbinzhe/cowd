@@ -13,10 +13,12 @@
 //! 3. **Temporal check** — the triple's validity window does not overlap with
 //!    an invalidated triple of the same (subject, predicate, object).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::resolution::{ConflictInfo, ConflictResolver, CorrectionReport, Verdict};
 use crate::temporal_graph::{EntityFacts, EntityType, KnowledgeGraph, Triple};
 
 // ─── Result types ──────────────────────────────────────────────────────────────
@@ -170,6 +172,126 @@ impl FactChecker {
             0.95
         } else {
             triple.confidence
+        }
+    }
+
+    /// Count how many distinct agents have registered the same (subject, predicate, object).
+    fn count_agents_for(&self, subject: &str, predicate: &str, object: &str) -> usize {
+        self.triples
+            .iter()
+            .filter(|t| {
+                t.subject == subject
+                    && t.predicate == predicate
+                    && t.object == object
+                    && t.valid_until.is_none()
+            })
+            .filter_map(|t| t.source_agent.as_deref())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Auto-correct: scan all stored triples for conflicts, resolve each via
+    /// [`ConflictResolver`], and apply verdicts (invalidate old entries for
+    /// `ReplaceWithNew`, boost confidence for `PromoteConsensus`, prune for
+    /// `KeepExisting`, log for `FlagForReview`).
+    ///
+    /// Returns a [`CorrectionReport`] summarising what was done.
+    pub fn auto_correct(&mut self) -> CorrectionReport {
+        let resolver = ConflictResolver::default();
+        let mut corrected = 0usize;
+        let mut pruned = 0usize;
+        let mut flagged = 0usize;
+
+        let mut conflict_infos: Vec<ConflictInfo> = Vec::new();
+        let mut processed_pairs: HashSet<(usize, usize)> = HashSet::new();
+
+        let n = self.triples.len();
+        for i in 0..n {
+            let t_a = &self.triples[i];
+            if t_a.valid_until.is_some() {
+                continue;
+            }
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let pair = (i.min(j), i.max(j));
+                if processed_pairs.contains(&pair) {
+                    continue;
+                }
+                let t_b = &self.triples[j];
+                if t_b.subject == t_a.subject
+                    && t_b.predicate == t_a.predicate
+                    && t_b.object != t_a.object
+                    && t_b.source_agent != t_a.source_agent
+                    && t_b.valid_until.is_none()
+                {
+                    processed_pairs.insert(pair);
+
+                    let consensus_count =
+                        self.count_agents_for(&t_a.subject, &t_a.predicate, &t_a.object);
+
+                    conflict_infos.push(ConflictInfo {
+                        existing_id: t_b.id.clone(),
+                        new_id: t_a.id.clone(),
+                        subject: t_a.subject.clone(),
+                        predicate: t_a.predicate.clone(),
+                        existing_object: t_b.object.clone(),
+                        new_object: t_a.object.clone(),
+                        existing_confidence: t_b.confidence,
+                        new_confidence: t_a.confidence,
+                        new_agent: t_a
+                            .source_agent
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        consensus_count,
+                        conflict_score: 0.5,
+                    });
+                }
+            }
+        }
+
+        'conflict_loop: for info in &conflict_infos {
+            match resolver.resolve(info) {
+                Verdict::ReplaceWithNew(_) => {
+                    for t in self.triples.iter_mut() {
+                        if t.id == info.existing_id {
+                            t.valid_until = Some(Utc::now());
+                            continue 'conflict_loop;
+                        }
+                    }
+                    corrected += 1;
+                    pruned += 1;
+                }
+                Verdict::PromoteConsensus(ref id) => {
+                    for t in self.triples.iter_mut() {
+                        if t.id == *id {
+                            t.confidence = 0.95;
+                            break;
+                        }
+                    }
+                    corrected += 1;
+                }
+                Verdict::KeepExisting(_) => {
+                    for t in self.triples.iter_mut() {
+                        if t.id == info.new_id {
+                            t.valid_until = Some(Utc::now());
+                            break;
+                        }
+                    }
+                    corrected += 1;
+                    pruned += 1;
+                }
+                Verdict::FlagForReview(_) => {
+                    flagged += 1;
+                }
+            }
+        }
+
+        CorrectionReport {
+            corrected,
+            pruned,
+            flagged,
         }
     }
 
@@ -411,6 +533,94 @@ mod tests {
         let result = checker.check_triple(&triple);
         assert!(!result.is_consistent);
         assert!(result.contradiction.unwrap().contains("not valid for entity type"));
+    }
+
+    // ── auto_correct tests ──────────────────────────────────────────
+
+    fn make_triple(
+        id: &str,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        confidence: f32,
+        agent: &str,
+    ) -> Triple {
+        Triple {
+            id: id.to_string(),
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            valid_from: None,
+            valid_until: None,
+            confidence,
+            source_memory_id: None,
+            source_file: None,
+            source_agent: Some(agent.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_auto_correct_replace() {
+        let mut checker = FactChecker::new();
+        checker.register_triple(make_triple("t1", "Alice", "partner_of", "Bob", 0.3, "unknown"));
+        checker.register_triple(make_triple(
+            "t2", "Alice", "partner_of", "Charlie", 0.9, "Orchestrator",
+        ));
+
+        let report = checker.auto_correct();
+        assert!(report.corrected >= 1, "should have at least one correction");
+        assert!(report.pruned >= 1, "existing triple should be pruned");
+
+        let t1 = checker.triples.iter().find(|t| t.id == "t1").unwrap();
+        assert!(
+            t1.valid_until.is_some(),
+            "existing triple should be invalidated"
+        );
+    }
+
+    #[test]
+    fn test_auto_correct_consensus() {
+        let mut checker = FactChecker::new();
+        checker.register_triple(make_triple(
+            "t1", "Bob", "works_for", "Acme", 0.7, "Orchestrator",
+        ));
+        checker.register_triple(make_triple(
+            "t2", "Bob", "works_for", "Acme", 0.7, "Reviewer",
+        ));
+        checker.register_triple(make_triple(
+            "t3", "Bob", "works_for", "Acme", 0.7, "Executor",
+        ));
+        checker.register_triple(make_triple(
+            "t4", "Bob", "works_for", "Globex", 0.7, "unknown",
+        ));
+
+        let report = checker.auto_correct();
+
+        let consensus_triple = checker
+            .triples
+            .iter()
+            .find(|t| t.subject == "Bob" && t.object == "Acme" && t.confidence >= 0.95);
+        assert!(
+            consensus_triple.is_some(),
+            "consensus triple should have confidence boosted to 0.95"
+        );
+        assert!(report.corrected > 0, "should have corrections");
+    }
+
+    #[test]
+    fn test_auto_correct_noop() {
+        let mut checker = FactChecker::new();
+        checker.register_triple(make_triple(
+            "t1", "Carol", "child_of", "Dave", 0.8, "Orchestrator",
+        ));
+        checker.register_triple(make_triple(
+            "t2", "Eve", "works_for", "Inc", 0.7, "Reviewer",
+        ));
+
+        let report = checker.auto_correct();
+        assert_eq!(report.corrected, 0, "no conflicts → nothing corrected");
+        assert_eq!(report.pruned, 0, "no conflicts → nothing pruned");
+        assert_eq!(report.flagged, 0, "no conflicts → nothing flagged");
     }
 
     #[test]
