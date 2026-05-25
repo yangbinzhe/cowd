@@ -2828,19 +2828,26 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                 turn_handle = Some(std::thread::spawn(move || {
                                     let _ = tx.send(tui::TuiEvent::TurnStarted);
                                     let rt = tokio::runtime::Runtime::new().expect("turn runtime");
-                                    let result = rt.block_on(async {
-                                        prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await
-                                    });
+                                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        rt.block_on(async {
+                                            prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await
+                                        })
+                                    }));
                                     match result {
-                                        Ok(summary) => {
+                                        Ok(Ok(summary)) => {
                                             let final_text = final_assistant_text(&summary);
                                             let _ = tx.send(tui::TuiEvent::TurnComplete {
                                                 assistant_text: final_text.clone(),
                                                 iterations: summary.iterations as u32,
                                             });
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
                                             let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
+                                        }
+                                        Err(_) => {
+                                            let _ = tx.send(tui::TuiEvent::TurnError {
+                                                error: "turn panicked".to_string(),
+                                            });
                                         }
                                     }
                                 }));
