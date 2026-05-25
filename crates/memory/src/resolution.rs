@@ -303,12 +303,10 @@ mod tests {
 
     #[test]
     fn test_resolve_all_mixed_batch() {
-        let resolver = ConflictResolver::new();
-        let mut resolver_weighted = ConflictResolver::new();
-        resolver_weighted
+        let mut resolver = ConflictResolver::new();
+        resolver
             .agent_weights
             .insert("TrustedAgent".to_string(), 0.9);
-        let resolver_default = ConflictResolver::new();
 
         let conflicts = vec![
             // 1. Consensus (3 agents agree on new) → PromoteConsensus
@@ -332,10 +330,6 @@ mod tests {
             // 4. Too close → FlagForReview
             conflict_info(0.45, 0.4, "unknown", 0),
         ];
-
-        let resolver = resolver_default; // use default, but need TrustedAgent weight
-        let mut resolver = ConflictResolver::new();
-        resolver.agent_weights.insert("TrustedAgent".to_string(), 0.9);
 
         let (verdicts, report) = resolver.resolve_all(&conflicts);
 
