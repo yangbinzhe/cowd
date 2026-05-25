@@ -3592,7 +3592,9 @@ impl LiveCli {
         let prompter = runtime::permissions::SharedPrompter::new(Box::new(
             CliPermissionPrompter::new(self.permission_mode),
         ));
-        let result = tokio::runtime::Handle::current()
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| TOKIO_RT.handle().clone());
+        let result = handle
             .block_on(runtime.run_turn_async(input, &prompter));
         hook_abort_monitor.stop();
         match result {
@@ -3643,7 +3645,9 @@ impl LiveCli {
         let prompter = runtime::permissions::SharedPrompter::new(Box::new(
             CliPermissionPrompter::new(self.permission_mode),
         ));
-        let result = tokio::runtime::Handle::current()
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| TOKIO_RT.handle().clone());
+        let result = handle
             .block_on(runtime.run_turn_async(input, &prompter));
         hook_abort_monitor.stop();
         let summary = result?;
@@ -3659,7 +3663,9 @@ impl LiveCli {
         let prompter = runtime::permissions::SharedPrompter::new(Box::new(
             CliPermissionPrompter::new(self.permission_mode),
         ));
-        let result = tokio::runtime::Handle::current()
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| TOKIO_RT.handle().clone());
+        let result = handle
             .block_on(runtime.run_turn_async(input, &prompter));
         hook_abort_monitor.stop();
         let summary = result?;
@@ -4524,7 +4530,9 @@ impl LiveCli {
         let prompter = runtime::permissions::SharedPrompter::new(Box::new(
             CliPermissionPrompter::new(self.permission_mode),
         ));
-        let summary = tokio::runtime::Handle::current()
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| TOKIO_RT.handle().clone());
+        let summary = handle
             .block_on(runtime.run_turn_async(prompt, &prompter))?;
         let text = final_assistant_text(&summary).trim().to_string();
         runtime.shutdown_plugins()?;
