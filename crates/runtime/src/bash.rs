@@ -98,7 +98,12 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         });
     }
 
-    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let runtime = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            return handle.block_on(execute_bash_async(input, sandbox_status, cwd));
+        }
+        Err(_) => Builder::new_current_thread().enable_all().build()?,
+    };
     runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
 }
 

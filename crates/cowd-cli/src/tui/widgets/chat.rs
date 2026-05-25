@@ -82,7 +82,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn rebuild_streaming_tail(app: &mut App) {
     let n = app.timeline_len();
-    if n == 0 { return; }
+    if n == 0 || n > app.timeline_len() { return; }
 
     let prefix_count: usize = app.entry_line_counts.iter()
         .take(n.saturating_sub(1))

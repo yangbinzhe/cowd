@@ -143,6 +143,9 @@ impl ChatView {
         if self.timeline.is_empty() {
             return false;
         }
+        if self.timeline_cursor >= self.timeline.len() {
+            self.timeline_cursor = self.timeline.len().saturating_sub(1);
+        }
         let mut idx = self.timeline_cursor;
         loop {
             if idx == 0 {
@@ -451,7 +454,7 @@ impl ChatView {
     /// Rebuild only the last entry (being streamed) in-place.
     fn rebuild_streaming_tail(&mut self) {
         let n = self.timeline.len();
-        if n == 0 {
+        if n == 0 || n > self.timeline.len() {
             return;
         }
 

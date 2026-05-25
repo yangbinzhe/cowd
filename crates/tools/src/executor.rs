@@ -3118,7 +3118,13 @@ impl ProviderRuntimeClient {
             }
         }
         Ok(Self {
-            runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
+            runtime: match tokio::runtime::Handle::try_current() {
+                Ok(_) => tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?,
+                Err(_) => tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
+            },
             chain,
             allowed_tools,
         })
