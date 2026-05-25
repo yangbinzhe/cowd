@@ -315,18 +315,118 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     match canonical.as_str() {
         "claude-opus-4-6" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
-            context_window_tokens: 200_000,
+            context_window_tokens: 1_000_000,
         }),
-        "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
+        "claude-sonnet-4-6" => Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 200_000,
+        }),
+        "grok-4" | "grok-4.1" | "grok-4.20" => Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 2_000_000,
         }),
         "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "grok-2" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 128_000,
+        }),
+        "deepseek-chat" | "deepseek-v4-pro" | "deepseek-v4" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "deepseek-v4-flash" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "deepseek-reasoner" | "deepseek-r1" | "deepseek-r1-0528" => Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 128_000,
+        }),
+        "qwen-long" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 10_000_000,
+        }),
+        "qwen3.5-plus" | "qwen3-coder-plus" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "qwen-max" | "qwen3-max" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 262_144,
+        }),
+        "qwen-plus" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
             context_window_tokens: 131_072,
         }),
-        "kimi-latest" => Some(ModelTokenLimit {
+        "qwen-turbo" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
+            context_window_tokens: 128_000,
+        }),
+        "kimi-latest" | "kimi-k2.6" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 262_144,
+        }),
+        "kimi-k2" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 131_072,
+        }),
+        "glm-4" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 128_000,
+        }),
+        "yi" | "yi-lightning" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 128_000,
+        }),
+        "minimax" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 128_000,
+        }),
+        "mimo" | "mimo-v2.5" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "gpt-5" | "gpt-5.5" | "gpt-5.4" => Some(ModelTokenLimit {
+            max_output_tokens: 128_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "gpt-4o" | "gpt-4o-mini" => Some(ModelTokenLimit {
+            max_output_tokens: 16_000,
+            context_window_tokens: 128_000,
+        }),
+        "o3" | "o3-mini" | "o4-mini" => Some(ModelTokenLimit {
+            max_output_tokens: 32_000,
+            context_window_tokens: 128_000,
+        }),
+        "gemini-3.1-pro" | "gemini-3.1-flash" => Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 2_000_000,
+        }),
+        "gemini-2.5-pro" | "gemini-2.5-flash" => Some(ModelTokenLimit {
+            max_output_tokens: 64_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "llama-4-maverick" => Some(ModelTokenLimit {
+            max_output_tokens: 16_000,
+            context_window_tokens: 1_000_000,
+        }),
+        "llama-4-scout" => Some(ModelTokenLimit {
+            max_output_tokens: 16_000,
+            context_window_tokens: 10_000_000,
+        }),
+        "mistral-large" => Some(ModelTokenLimit {
+            max_output_tokens: 16_000,
             context_window_tokens: 128_000,
         }),
         _ => None,
@@ -335,7 +435,22 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
 
 #[must_use]
 pub fn model_context_window(model: &str) -> u32 {
-    model_token_limit(model).map_or(200_000, |l| l.context_window_tokens)
+    model_token_limit(model).map_or(128_000, |l| l.context_window_tokens)
+}
+
+/// Like model_context_window() but checks a config override map first.
+#[must_use]
+pub fn model_context_window_with_overrides(
+    model: &str,
+    overrides: Option<&std::collections::HashMap<String, u32>>,
+) -> u32 {
+    let canonical = resolve_model_alias(model);
+    if let Some(overrides) = overrides {
+        if let Some(&ctx) = overrides.get(&canonical) {
+            return ctx;
+        }
+    }
+    model_context_window(&canonical)
 }
 
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
@@ -540,8 +655,8 @@ mod tests {
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
         load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_token_limit, parse_dotenv, preflight_message_request, resolve_model_alias,
-        ProviderKind,
+        model_context_window, model_token_limit, parse_dotenv, preflight_message_request,
+        resolve_model_alias, ProviderKind,
     };
 
     #[test]
@@ -674,20 +789,20 @@ mod tests {
             model_token_limit("claude-sonnet-4-6")
                 .expect("claude-sonnet-4-6 should be registered")
                 .context_window_tokens,
-            200_000
+            1_000_000
         );
         assert_eq!(
             model_token_limit("grok-mini")
                 .expect("grok-mini should resolve to a registered model")
                 .context_window_tokens,
-            131_072
+            1_000_000
         );
     }
 
     #[test]
     fn preflight_blocks_requests_that_exceed_the_model_context_window() {
         let request = MessageRequest {
-            model: "claude-sonnet-4-6".to_string(),
+            model: "claude-haiku-4-5-20251213".to_string(),
             max_tokens: 64_000,
             messages: vec![InputMessage {
                 role: "user".to_string(),
@@ -720,7 +835,7 @@ mod tests {
                 estimated_total_tokens,
                 context_window_tokens,
             } => {
-                assert_eq!(model, "claude-sonnet-4-6");
+                assert_eq!(model, "claude-haiku-4-5-20251213");
                 assert!(estimated_input_tokens > 136_000);
                 assert_eq!(requested_output_tokens, 64_000);
                 assert!(estimated_total_tokens > context_window_tokens);
@@ -1080,4 +1195,29 @@ NO_EQUALS_LINE
     // (env_lock only protects within a single binary). The detection logic
     // is covered: OPENAI_BASE_URL alone routes to OpenAi as a last-resort
     // fallback in detect_provider_kind().
+
+    #[test]
+    fn model_context_window_updated_values() {
+        assert_eq!(model_context_window("claude-opus-4-6"), 1_000_000);
+        assert_eq!(model_context_window("claude-sonnet-4-6"), 1_000_000);
+        assert_eq!(model_context_window("claude-haiku-4-5-20251213"), 200_000);
+        assert_eq!(model_context_window("grok-3"), 1_000_000);
+        assert_eq!(model_context_window("kimi-latest"), 262_144);
+    }
+
+    #[test]
+    fn model_context_window_chinese_models() {
+        assert_eq!(model_context_window("deepseek-chat"), 1_000_000);
+        assert_eq!(model_context_window("deepseek-v4-pro"), 1_000_000);
+        assert_eq!(model_context_window("deepseek-r1"), 128_000);
+        assert_eq!(model_context_window("qwen-max"), 262_144);
+        assert_eq!(model_context_window("qwen-plus"), 131_072);
+        assert_eq!(model_context_window("glm-4"), 128_000);
+        assert_eq!(model_context_window("yi-lightning"), 128_000);
+    }
+
+    #[test]
+    fn model_context_window_fallback_is_128k_not_200k() {
+        assert_eq!(model_context_window("unknown-model-xyz"), 128_000);
+    }
 }

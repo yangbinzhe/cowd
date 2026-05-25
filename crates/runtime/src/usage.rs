@@ -310,4 +310,12 @@ mod tests {
         assert_eq!(tracker.turns(), 1);
         assert_eq!(tracker.cumulative_usage().total_tokens(), 8);
     }
+
+    #[test]
+    fn pricing_for_model_still_works() {
+        // Verify money code is not broken by our changes
+        assert!(pricing_for_model("claude-sonnet-4-6-20250514").is_some());
+        assert!(pricing_for_model("claude-opus-4-6").is_some());
+        assert!(pricing_for_model("claude-haiku-4-5-20251213").is_some());
+    }
 }

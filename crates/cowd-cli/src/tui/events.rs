@@ -108,4 +108,27 @@ mod tests {
             let _ = format!("{event:?}");
         }
     }
+
+    #[test]
+    fn context_window_event_updates_app() {
+        use crate::tui::app::App;
+        let mut app = App::new("test", "test-session");
+        assert_eq!(app.context_window, 0);
+        app.apply_event(TuiEvent::ContextWindow(200_000));
+        assert_eq!(app.context_window, 200_000);
+    }
+
+    #[test]
+    fn token_usage_event_updates_all_counters() {
+        use crate::tui::app::App;
+        let mut app = App::new("test", "test-session");
+        app.apply_event(TuiEvent::TurnStarted);
+        app.apply_event(TuiEvent::TokenUsage {
+            input: 100, output: 50, cache_create: 10, cache_read: 5,
+        });
+        assert_eq!(app.input_tokens, 100);
+        assert_eq!(app.output_tokens, 50);
+        assert_eq!(app.token_count, 165);
+        assert_eq!(app.turn_input_tokens, 100);
+    }
 }

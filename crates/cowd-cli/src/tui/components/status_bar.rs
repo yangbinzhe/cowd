@@ -772,4 +772,22 @@ mod tests {
         // Notification text should be visible
         terminal.assert_line_contains("NOTICE");
     }
+
+    #[test]
+    fn token_bar_returns_some_when_window_nonzero() {
+        use crate::tui::app::App;
+        let mut app = App::new("test", "test-session");
+        app.context_window = 200_000;
+        app.token_count = 50_000;
+        let bar = token_bar(&app);
+        assert!(bar.is_some(), "token_bar should return Some when context_window > 0");
+        assert!(bar.unwrap().contains("25%"), "should show 25% usage");
+    }
+
+    #[test]
+    fn token_bar_returns_none_when_window_zero() {
+        use crate::tui::app::App;
+        let app = App::new("test", "test-session");
+        assert!(token_bar(&app).is_none(), "token_bar should return None when context_window == 0");
+    }
 }
