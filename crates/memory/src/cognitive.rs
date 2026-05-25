@@ -370,7 +370,7 @@ impl CognitiveContextManager {
     /// Set the active agent for source_agent tagging and peer context discovery.
     pub fn set_active_agent(&self, agent_id: String) {
         self.orchestrator.set_active_agent(agent_id.clone());
-        *self.current_agent.lock().unwrap() = Some(agent_id);
+        *self.current_agent.lock().unwrap_or_else(|e| e.into_inner()) = Some(agent_id);
     }
 
     /// Set the active session ID for auto-filling new entries and intra-turn
@@ -414,7 +414,7 @@ impl CognitiveContextManager {
             .map_err(|_| MemoryError::Other("kg lock poisoned".into()))?;
         *guard = kg;
         // Track path for auto-rebuild on staleness
-        *self.project_kg_path.lock().unwrap() = Some(project_path.clone());
+        *self.project_kg_path.lock().unwrap_or_else(|e| e.into_inner()) = Some(project_path.clone());
         tracing::info!(
             entity_count,
             path = %project_path.display(),
@@ -585,7 +585,7 @@ impl CognitiveContextManager {
         }
 
         // ── Step 2c: Peer context perception from L4 ────────────────────────
-        let current_agent = self.current_agent.lock().unwrap().clone();
+        let current_agent = self.current_agent.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(ref agent) = current_agent {
             let peer_entries = self
                 .orchestrator
@@ -980,7 +980,7 @@ impl CognitiveContextManager {
             }
 
             // ── 0b. Index large tool outputs into sandbox ───────────────────
-            let mut sandbox = self.tool_sandbox.lock().unwrap();
+            let mut sandbox = self.tool_sandbox.lock().unwrap_or_else(|e| e.into_inner());
             for msg in messages.iter().filter(|m| matches!(m.role, MessageRole::Tool)) {
                 let call_id = msg.tool_use_id.as_deref().unwrap_or("unknown");
                 let tool_name = msg.tool_name.as_deref().unwrap_or("unknown_tool");
@@ -1077,7 +1077,7 @@ impl CognitiveContextManager {
 
         // ── 5a. Check project KG staleness and auto-rebuild if needed ───────
         if let Some(ref mgr) = self.project_scope_mgr {
-            if let Some(proj_path) = self.project_kg_path.lock().unwrap().as_ref() {
+            if let Some(proj_path) = self.project_kg_path.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                 let pid = crate::project_scope::hash_path(proj_path);
                 if mgr.is_kg_stale(&pid).unwrap_or(false) {
                     tracing::info!("project KG is stale, auto-rebuilding...");
@@ -1093,7 +1093,7 @@ impl CognitiveContextManager {
         {
             let tick = self.kg_rebuild_tick_counter.fetch_add(1, Ordering::Relaxed) + 1;
             if tick % 100 == 0 {
-                if let Some(proj_path) = self.project_kg_path.lock().unwrap().as_ref() {
+                if let Some(proj_path) = self.project_kg_path.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                     tracing::info!(
                         tick,
                         path = %proj_path.display(),
@@ -1134,7 +1134,7 @@ impl CognitiveContextManager {
         }
 
         // ── 6. Persist vector index ─────────────────────────────────────────
-        if let Err(e) = self.vector_index.lock().unwrap().persist() {
+        if let Err(e) = self.vector_index.lock().unwrap_or_else(|e| e.into_inner()).persist() {
             tracing::warn!("failed to persist vector index: {}", e);
         }
 
@@ -1184,7 +1184,7 @@ impl CognitiveContextManager {
                         if let Err(e) = self.sqlite_store.save_closet(&json) {
                             tracing::warn!("failed to save closet: {}", e);
                         } else {
-                            let mut closet_guard = self.closet.lock().unwrap();
+                            let mut closet_guard = self.closet.lock().unwrap_or_else(|e| e.into_inner());
                             *closet_guard = Some(manager.closet().clone());
                         }
                     }
@@ -1231,7 +1231,7 @@ impl CognitiveContextManager {
                                 "batch embedded {} entries",
                                 embeddings.len()
                             );
-                            let mut vi = self.vector_index.lock().unwrap();
+                            let mut vi = self.vector_index.lock().unwrap_or_else(|e| e.into_inner());
                             for ((id, _), embedding) in
                                 pending_embeddings.iter().zip(embeddings.into_iter())
                             {
@@ -1478,14 +1478,14 @@ impl CognitiveContextManager {
     /// Get the number of vectors currently indexed.
     #[must_use]
     pub fn vector_index_count(&self) -> usize {
-        self.vector_index.lock().unwrap().count()
+        self.vector_index.lock().unwrap_or_else(|e| e.into_inner()).count()
     }
 
     /// Get vector index statistics.
     #[must_use]
     pub fn vector_index_stats(&self) -> VectorIndexStats {
         VectorIndexStats {
-            count: self.vector_index.lock().unwrap().count(),
+            count: self.vector_index.lock().unwrap_or_else(|e| e.into_inner()).count(),
         }
     }
 
@@ -1889,7 +1889,7 @@ impl CognitiveContextManager {
         // 2. Closet pointers → MemoryStore: check a random sample of drawer_ids
         //    exist in MemoryStore.
         {
-            let closet_guard = self.closet.lock().unwrap();
+            let closet_guard = self.closet.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref closet) = *closet_guard {
                 let all_ids: Vec<&str> = closet
                     .pointers

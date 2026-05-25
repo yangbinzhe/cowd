@@ -205,11 +205,11 @@ impl CompressionPipeline {
     #[must_use]
     pub fn should_session_compact(&self, messages: &[Message]) -> bool {
         // Anti-thrashing: skip if too many recent compressions were ineffective
-        if *self.ineffective_compression_count.lock().unwrap() >= 2 {
+        if *self.ineffective_compression_count.lock().unwrap_or_else(|e| e.into_inner()) >= 2 {
             return false;
         }
         // Cooldown: skip if LLM summarizer recently failed
-        if let Some(cooldown) = *self.summary_cooldown_until.lock().unwrap() {
+        if let Some(cooldown) = *self.summary_cooldown_until.lock().unwrap_or_else(|e| e.into_inner()) {
             if std::time::Instant::now() < cooldown {
                 return false;
             }
@@ -232,7 +232,7 @@ impl CompressionPipeline {
         orchestrator: &MemoryOrchestrator,
     ) -> Result<CompactionResult> {
         let _scope = self.guard.enter()?;
-        let prev = self.previous_summary.lock().unwrap().clone();
+        let prev = self.previous_summary.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let result = self
             .session
             .compact(messages, orchestrator, prev.as_deref())
@@ -242,7 +242,7 @@ impl CompressionPipeline {
         // The first message after compaction is the pinned summary message.
         if let Some(summary_msg) = messages.first() {
             if summary_msg.pinned {
-                *self.previous_summary.lock().unwrap() = Some(summary_msg.content.clone());
+                *self.previous_summary.lock().unwrap_or_else(|e| e.into_inner()) = Some(summary_msg.content.clone());
             }
         }
 

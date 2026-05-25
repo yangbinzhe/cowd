@@ -2712,7 +2712,7 @@ mod tests {
     #[test]
     fn max_output_tokens_reads_from_environment_variable() {
         // given — set environment variable
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvVarGuard::set("COWD_MAX_OUTPUT_TOKENS", Some("4096"));
 
         // when
@@ -2725,7 +2725,7 @@ mod tests {
     #[test]
     fn max_output_tokens_falls_back_to_none_when_env_var_is_unset() {
         // given — ensure env var is unset
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvVarGuard::set("COWD_MAX_OUTPUT_TOKENS", None);
 
         // when
@@ -2738,7 +2738,7 @@ mod tests {
     #[test]
     fn max_output_tokens_falls_back_to_none_when_env_var_is_invalid() {
         // given — set invalid environment variable
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvVarGuard::set("COWD_MAX_OUTPUT_TOKENS", Some("not-a-number"));
 
         // when

@@ -84,12 +84,12 @@ impl UnifiedSessionStore {
     /// Uses `INSERT OR IGNORE` so calling this for an already-existing session
     /// is a harmless no-op.
     pub fn create_session(&self, session: &SessionRecord) -> Result<()> {
-        self.inner.lock().unwrap().create_session(session)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).create_session(session)
     }
 
     /// Retrieve a session record by its ID, or `None` if not found.
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
-        self.inner.lock().unwrap().get_session(session_id)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).get_session(session_id)
     }
 
     /// Overwrite all mutable fields of an existing session record.
@@ -97,7 +97,7 @@ impl UnifiedSessionStore {
     /// `session_id` is used as the lookup key; the row is silently unchanged
     /// if it does not exist.
     pub fn update_session(&self, session: &SessionRecord) -> Result<()> {
-        self.inner.lock().unwrap().update_session(session)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).update_session(session)
     }
 
     /// Upsert a session record (insert or replace all fields).
@@ -105,22 +105,22 @@ impl UnifiedSessionStore {
     /// Equivalent to calling [`create_session`] then [`update_session`].  Use
     /// this when you don't know whether the row already exists.
     pub fn upsert_session(&self, session: &SessionRecord) -> Result<()> {
-        self.inner.lock().unwrap().upsert_session(session)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).upsert_session(session)
     }
 
     /// Permanently remove a session and all its memory associations.
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
-        self.inner.lock().unwrap().delete_session(session_id)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).delete_session(session_id)
     }
 
     /// List all session records ordered by `last_activity DESC`.
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
-        self.inner.lock().unwrap().list_sessions()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).list_sessions()
     }
 
     /// List all sessions for a given platform, ordered by `last_activity DESC`.
     pub fn list_sessions_by_platform(&self, platform: &str) -> Result<Vec<SessionRecord>> {
-        self.inner.lock().unwrap().list_sessions_by_platform(platform)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).list_sessions_by_platform(platform)
     }
 
     /// Search sessions using FTS5 full-text search.
@@ -128,7 +128,7 @@ impl UnifiedSessionStore {
     /// Searches across platform, chat_id, user_id, and metadata_json.
     /// Returns results with highlighted snippets from metadata.
     pub fn search_sessions(&self, query: &str, limit: usize) -> Result<Vec<SessionSearchResult>> {
-        self.inner.lock().unwrap().search_sessions(query, limit)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).search_sessions(query, limit)
     }
 
     /// Search sessions with platform filter.
@@ -138,7 +138,7 @@ impl UnifiedSessionStore {
         platform: &str,
         limit: usize,
     ) -> Result<Vec<SessionSearchResult>> {
-        self.inner.lock().unwrap().search_sessions_by_platform(query, platform, limit)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).search_sessions_by_platform(query, platform, limit)
     }
 
     // -----------------------------------------------------------------------
@@ -149,17 +149,17 @@ impl UnifiedSessionStore {
     ///
     /// `INSERT OR IGNORE` makes this idempotent.
     pub fn associate_memory(&self, session_id: &str, memory_id: &str) -> Result<()> {
-        self.inner.lock().unwrap().associate_memory(session_id, memory_id)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).associate_memory(session_id, memory_id)
     }
 
     /// Return all memory IDs associated with `session_id`.
     pub fn get_session_memories(&self, session_id: &str) -> Result<Vec<String>> {
-        self.inner.lock().unwrap().get_session_memories(session_id)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).get_session_memories(session_id)
     }
 
     /// Remove the association between a session and a memory.
     pub fn disassociate_memory(&self, session_id: &str, memory_id: &str) -> Result<()> {
-        self.inner.lock().unwrap().disassociate_memory(session_id, memory_id)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).disassociate_memory(session_id, memory_id)
     }
 
     // -----------------------------------------------------------------------
@@ -170,6 +170,6 @@ impl UnifiedSessionStore {
     ///
     /// Returns the number of sessions that were removed.
     pub fn prune_before(&self, cutoff_iso8601: &str) -> Result<usize> {
-        self.inner.lock().unwrap().prune_before(cutoff_iso8601)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).prune_before(cutoff_iso8601)
     }
 }

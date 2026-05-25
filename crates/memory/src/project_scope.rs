@@ -186,7 +186,7 @@ impl ProjectScopeManager {
     where
         F: Fn(&PathBuf) + Send + Sync + 'static,
     {
-        self.inner.lock().unwrap().on_project_registered = Some(Box::new(callback));
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).on_project_registered = Some(Box::new(callback));
         self
     }
 
@@ -201,13 +201,13 @@ impl ProjectScopeManager {
         })?;
         let project_id = hash_path(&canonical);
         let db_filename = format!("memory_{}.db", &project_id[..12.min(project_id.len())]);
-        let db_path = if let Some(parent) = self.inner.lock().unwrap().global_path.parent() {
+        let db_path = if let Some(parent) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).global_path.parent() {
             parent.join(&db_filename)
         } else {
             PathBuf::from(&db_filename)
         };
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // Idempotent: return existing ID if already registered.
         if let Some(existing) = inner.projects.values().find(|m| m.path == canonical) {
@@ -240,7 +240,7 @@ impl ProjectScopeManager {
         // Auto-build project knowledge graph on registration
         let (_kg, file_mtimes) = build_project_kg(&canonical_clone);
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(manifest) = inner.projects.get_mut(&project_id) {
                 manifest.indexed_file_mtimes = file_mtimes;
             }
@@ -281,7 +281,7 @@ impl ProjectScopeManager {
         }
 
         if project_registered_cb.is_some() {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref cb) = inner.on_project_registered {
                 cb(&canonical_clone);
             }
@@ -295,7 +295,7 @@ impl ProjectScopeManager {
     /// Returns the [`SqliteStore`] for that project so callers can start
     /// reading/writing immediately.
     pub fn switch_project(&self, project_id: &str) -> Result<SqliteStore, MemoryError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         let store = inner
             .project_stores
@@ -315,7 +315,7 @@ impl ProjectScopeManager {
 
     /// Return the manifest of the currently active project, if any.
     pub fn current_project(&self) -> Option<ProjectManifest> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .active_project
             .as_ref()
@@ -327,7 +327,7 @@ impl ProjectScopeManager {
     ///
     /// The global store is always available and never destroyed.
     pub fn global_store(&self) -> SqliteStore {
-        self.inner.lock().unwrap().global_store.clone()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).global_store.clone()
     }
 
     /// Check whether the indexed files for a registered project have changed
@@ -338,7 +338,7 @@ impl ProjectScopeManager {
     /// any file has a different mtime (or was deleted), meaning the KG is
     /// stale and should be rebuilt.
     pub fn is_kg_stale(&self, project_id: &str) -> Result<bool, MemoryError> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let manifest = inner
             .projects
             .get(project_id)

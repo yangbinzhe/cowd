@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(idx1, idx2, "cache should return identical result");
 
         // Verify cache actually stored the mapping
-        let guard = cache().lock().unwrap();
+        let guard = cache().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             guard.get(&(123, 45, 67)),
             Some(&idx1),
