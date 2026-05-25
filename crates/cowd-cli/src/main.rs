@@ -2845,7 +2845,8 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                 let tx = tui_tx.clone();
                                 turn_handle = Some(std::thread::spawn(move || {
                                     let _ = tx.send(tui::TuiEvent::TurnStarted);
-                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                    let rt = tokio::runtime::Builder::new_multi_thread()
+                                        .worker_threads(1)
                                         .enable_all()
                                         .build()
                                         .expect("build tokio rt for turn");

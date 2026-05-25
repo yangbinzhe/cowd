@@ -91,10 +91,7 @@ pub trait ApiClient {
     /// Convenience: collect all events synchronously (backward compat).
     fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let stream = self.stream(request);
-        let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| {
-                tokio::runtime::Runtime::new().expect("tokio runtime").handle().clone()
-            });
+        let handle = tokio::runtime::Handle::current();
         handle.block_on(async {
             use futures::StreamExt;
             let mut events = Vec::new();
@@ -963,8 +960,7 @@ self.record_turn_completed(&summary);
         // Build an effective system prompt that includes memory context.
         // Falls back to the configured system_prompt when memory is disabled.
         let effective_system_prompt = {
-            let handle = tokio::runtime::Handle::try_current()
-                .unwrap_or_else(|_| tokio::runtime::Runtime::new().expect("tokio runtime fallback").handle().clone());
+            let handle = tokio::runtime::Handle::current();
             handle.block_on(self.prepare_memory_context(&user_input))
         };
 
