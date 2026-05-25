@@ -894,11 +894,14 @@ impl CognitiveContextManager {
         // ── Delegation observation ────────────────────────────────────────────
         // Write child agent results to L4 with parent_session_id.
         {
-            let mut delegation_queue = self
-                .delegation_results
-                .lock()
-                .map_err(|_| MemoryError::Other("delegation_results lock poisoned".into()))?;
-            for d in delegation_queue.drain(..) {
+            let drained: Vec<_> = {
+                let mut delegation_queue = self
+                    .delegation_results
+                    .lock()
+                    .map_err(|_| MemoryError::Other("delegation_results lock poisoned".into()))?;
+                delegation_queue.drain(..).collect()
+            }; // guard dropped before any .await
+            for d in drained {
                 let title = format!("delegation:{}:{}", d.agent_role, &d.task[..d.task.len().min(40)]);
                 let content = format!(
                     "Agent: {}\nTask: {}\nResult: {}",
@@ -1140,9 +1143,12 @@ impl CognitiveContextManager {
 
         // ── 7. Persist knowledge graph (every 10 ticks) ──────────────────────
         {
-            let kg = self.kg.lock().map_err(|_| MemoryError::Other("kg lock poisoned".into()))?;
-            let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
-            let triples: Vec<_> = kg.list_triples().into_iter().cloned().collect();
+            let (entities, triples): (Vec<_>, Vec<_>) = {
+                let kg = self.kg.lock().map_err(|_| MemoryError::Other("kg lock poisoned".into()))?;
+                let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
+                let triples: Vec<_> = kg.list_triples().into_iter().cloned().collect();
+                (entities, triples)
+            }; // kg dropped before any .await
             if !entities.is_empty() || !triples.is_empty() {
                 if let Err(e) = self.orchestrator.store().save_entities(&entities).await {
                     tracing::warn!("failed to persist KG entities: {}", e);
@@ -1847,11 +1853,13 @@ impl CognitiveContextManager {
         // 1. KG entities → MemoryStore: check a random sample of KG entities
         //    have corresponding MemoryStore entries.
         {
-            let kg = match self.kg.lock() {
-                Ok(g) => g,
-                Err(_) => return vec!["kg lock poisoned".into()],
-            };
-            let entities: Vec<_> = kg.list_entities().into_iter().collect();
+            let entities: Vec<_> = {
+                let kg = match self.kg.lock() {
+                    Ok(g) => g,
+                    Err(_) => return vec!["kg lock poisoned".into()],
+                };
+                kg.list_entities().into_iter().cloned().collect()
+            }; // kg dropped before any .await
             let sample_size = 10usize.min(entities.len());
             if sample_size > 0 {
                 let store = self.orchestrator.store();
@@ -1887,41 +1895,54 @@ impl CognitiveContextManager {
         // 2. Closet pointers → MemoryStore: check a random sample of drawer_ids
         //    exist in MemoryStore.
         {
-            let closet_guard = self.closet.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(ref closet) = *closet_guard {
-                let all_ids: Vec<&str> = closet
-                    .pointers
-                    .iter()
-                    .flat_map(|p| p.drawer_ids.iter().map(String::as_str))
-                    .collect();
-                let sample_size = 10usize.min(all_ids.len());
-                if sample_size > 0 {
-                    let step = (all_ids.len() / sample_size).max(1);
-                    let store = self.orchestrator.store();
-                    let mut checked = 0usize;
-                    for (i, drawer_id) in all_ids.iter().enumerate() {
-                        if i % step != 0 || checked >= sample_size {
-                            continue;
-                        }
-                        checked += 1;
-                        let uuid = match uuid::Uuid::parse_str(drawer_id) {
-                            Ok(id) => id,
-                            Err(_) => continue,
-                        };
-                        let found = store.get(&uuid).await;
-                        match found {
-                            Ok(None) => {
-                                warnings.push(format!(
-                                    "closet-orphan: drawer_id '{drawer_id}' not found in MemoryStore"
-                                ));
+            let sampled_ids: Vec<String> = {
+                let closet_guard = self.closet.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ref closet) = *closet_guard {
+                    let all_ids: Vec<&str> = closet
+                        .pointers
+                        .iter()
+                        .flat_map(|p| p.drawer_ids.iter().map(String::as_str))
+                        .collect();
+                    let sample_size = 10usize.min(all_ids.len());
+                    if sample_size > 0 {
+                        let step = (all_ids.len() / sample_size).max(1);
+                        let mut result = Vec::new();
+                        let mut checked = 0usize;
+                        for (i, drawer_id) in all_ids.iter().enumerate() {
+                            if i % step != 0 || checked >= sample_size {
+                                continue;
                             }
-                            Err(e) => {
-                                warnings.push(format!(
-                                    "closet-orphan-check: drawer_id '{drawer_id}' get failed: {e}"
-                                ));
-                            }
-                            _ => {} // OK
+                            checked += 1;
+                            result.push(drawer_id.to_string());
                         }
+                        result
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            }; // closet_guard dropped before any .await
+            if !sampled_ids.is_empty() {
+                let store = self.orchestrator.store();
+                for drawer_id in &sampled_ids {
+                    let uuid = match uuid::Uuid::parse_str(drawer_id) {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    };
+                    let found = store.get(&uuid).await;
+                    match found {
+                        Ok(None) => {
+                            warnings.push(format!(
+                                "closet-orphan: drawer_id '{drawer_id}' not found in MemoryStore"
+                            ));
+                        }
+                        Err(e) => {
+                            warnings.push(format!(
+                                "closet-orphan-check: drawer_id '{drawer_id}' get failed: {e}"
+                            ));
+                        }
+                        _ => {} // OK
                     }
                 }
             }
@@ -1970,11 +1991,13 @@ impl CognitiveContextManager {
         // 4. Coherence check: verify KG entity names appear in at least one
         //    MemoryStore entry with a minimum Jaccard similarity.
         {
-            let kg = match self.kg.lock() {
-                Ok(g) => g,
-                Err(_) => return warnings,
-            };
-            let entities: Vec<_> = kg.list_entities().into_iter().collect();
+            let entities: Vec<_> = {
+                let kg = match self.kg.lock() {
+                    Ok(g) => g,
+                    Err(_) => return warnings,
+                };
+                kg.list_entities().into_iter().cloned().collect()
+            }; // kg dropped before any .await
             if !entities.is_empty() {
                 let sample_size = 5usize.min(entities.len());
                 let step = (entities.len() / sample_size).max(1);

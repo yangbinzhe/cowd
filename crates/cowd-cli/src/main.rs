@@ -2708,7 +2708,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     // "Loading..." → "Finishing..." → Done (min 3s display).
     let startup_ready = true;
 
-    let mut turn_handle: Option<std::thread::JoinHandle<()>> = None;
+    let mut turn_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut abort_monitor: Option<HookAbortMonitor> = None;
     let mut abort_signal_for_turn: Option<runtime::HookAbortSignal> = None;
 
@@ -2726,10 +2726,6 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
             if turn_handle.as_ref().is_some_and(|h| h.is_finished()) {
                 turn_handle = None;
                 state.is_loading = false;
-                cli.persist_session()?;
-                refresh_panels(&mut state, &workspace, &cli.runtime);
-                abort_monitor = None;
-                abort_signal_for_turn = None;
             }
 
             // ── Render using FrameTimer for skip optimization ──
@@ -2825,32 +2821,22 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                 abort_signal_for_turn = Some(abort_signal);
 
                                 let tx = tui_tx.clone();
-                                turn_handle = Some(std::thread::spawn(move || {
+                                let task = SHARED_RT.spawn(async move {
                                     let _ = tx.send(tui::TuiEvent::TurnStarted);
-                                    let rt = tokio::runtime::Runtime::new().expect("turn runtime");
-                                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        rt.block_on(async {
-                                            prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await
-                                        })
-                                    }));
-                                    match result {
-                                        Ok(Ok(summary)) => {
+                                    match prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await {
+                                        Ok(summary) => {
                                             let final_text = final_assistant_text(&summary);
                                             let _ = tx.send(tui::TuiEvent::TurnComplete {
                                                 assistant_text: final_text.clone(),
                                                 iterations: summary.iterations as u32,
                                             });
                                         }
-                                        Ok(Err(e)) => {
+                                        Err(e) => {
                                             let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
                                         }
-                                        Err(_) => {
-                                            let _ = tx.send(tui::TuiEvent::TurnError {
-                                                error: "turn panicked".to_string(),
-                                            });
-                                        }
                                     }
-                                }));
+                                });
+                                turn_handle = Some(task);
                             }
                             ProcessedKey::Exit => break,
                             ProcessedKey::Cancel => {
@@ -2862,7 +2848,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                     state.add_message("system", "Interrupted");
                                 }
                                 if let Some(handle) = turn_handle.take() {
-                                    drop(handle); // detach — runtime-level abort signal already sent above
+                                    handle.abort();
                                 }
                             }
                             ProcessedKey::Nothing => {}
