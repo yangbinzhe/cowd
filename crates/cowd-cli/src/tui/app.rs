@@ -329,7 +329,7 @@ impl App {
 
             help_visible: false,
 
-            available_models: Vec::new(),
+            available_models: vec![model.to_string()],
             model_dirty: false,
 
             notification: None,

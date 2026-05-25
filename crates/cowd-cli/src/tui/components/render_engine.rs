@@ -83,7 +83,7 @@ fn render_node(node: &mut LayoutNode, frame: &mut Frame, area: Rect, theme: &Ski
     }
 }
 
-// ── Tests (disabled — import paths reference non-existent module structures; FIXME: re-enable after fixing) ──
+// ── Tests (active — verify render_tree and LayoutNode variants) ──
 /* */
 #[cfg(test)]
 mod tests {

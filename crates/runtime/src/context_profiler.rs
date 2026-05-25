@@ -54,14 +54,6 @@ impl ContextProfiler {
         p
     }
 
-    pub fn token_distribution(&self) -> String {
-        let profile = self.profile();
-        let mut parts: Vec<String> = profile.by_category.iter()
-            .map(|(cat, count)| format!("{}:{}", cat, count))
-            .collect();
-        parts.sort();
-        parts.join(" ")
-    }
 }
 
 fn hash_str(s: &str) -> u64 {

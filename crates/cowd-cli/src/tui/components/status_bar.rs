@@ -12,6 +12,8 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+use api;
+
 use crate::tui::app::{App, Panel};
 use crate::tui::components::{Component, EventResult, RenderContext};
 
@@ -282,7 +284,13 @@ impl StatusBar {
             section.content = match section.id.as_str() {
                 "brand" => Some("Cowd".to_string()),
                 "panel_model_status" => {
-                    Some(format!("{panel_label} │ {status} │ {}", app.model))
+                    let provider = api::detect_provider_kind(&app.model);
+                    let provider_label = match provider {
+                        api::ProviderKind::Anthropic => "Anthropic",
+                        api::ProviderKind::Xai => "Xai",
+                        api::ProviderKind::OpenAi => "OpenAI",
+                    };
+                    Some(format!("{provider_label} │ {panel_label} │ {status} │ {}", app.model))
                 }
                 "token_bar" => token_bar(app),
                 "token_count" => {
