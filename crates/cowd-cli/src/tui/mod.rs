@@ -8,6 +8,7 @@ pub mod skin;
 pub mod events;
 pub mod event;
 pub mod runner;
+pub mod scroll_state;
 pub mod callbacks;
 pub mod widgets;
 pub mod osc52;

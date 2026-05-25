@@ -416,6 +416,7 @@ fn collect_focusable(node: &LayoutNode, chain: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::components::{Component, EventResult, RenderContext};
     use crate::tui::test_utils::MockTerminal;
     use super::super::types::{Split, TabDef};
     use ratatui::layout::Rect as RtRect;

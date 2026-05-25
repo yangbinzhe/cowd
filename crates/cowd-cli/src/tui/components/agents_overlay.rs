@@ -238,6 +238,7 @@ impl Component for AgentsOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
     use crate::tui::test_utils::MockTerminal;
     use crate::tui::skin::SkinConfig;
 

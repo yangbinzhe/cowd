@@ -20,6 +20,7 @@ use ratatui::{
 use crate::tui::app::{Theme, TimelineEntry};
 use crate::tui::components::{Component, EventResult, RenderContext};
 use crate::tui::md_renderer;
+use crate::tui::scroll_state::ScrollState;
 
 // ── ChatView ──────────────────────────────────────────────────────
 
@@ -33,10 +34,8 @@ pub struct ChatView {
     pub timeline: Vec<TimelineEntry>,
     pub timeline_cursor: usize,
 
-    // ── Scrolling ──
-    pub scroll_offset: u16,
-    pub auto_scroll: bool,
-    pub viewport_height: u16,
+    // ── Scrolling (unified scroll state from ratatui-kit pattern) ──
+    pub scroll_state: ScrollState,
 
     // ── Turn state ──
     pub turn_active: bool,
@@ -75,9 +74,7 @@ impl ChatView {
         Self {
             timeline: Vec::new(),
             timeline_cursor: 0,
-            scroll_offset: 0,
-            auto_scroll: true,
-            viewport_height: 24,
+            scroll_state: ScrollState::new(),
             turn_active: false,
             spinner_idx: 0,
             pending_message_menu: false,
@@ -118,9 +115,9 @@ impl ChatView {
     pub fn sync_from_app(&mut self, app: &crate::tui::App) {
         self.timeline = app.timeline_clone_vec();
         self.timeline_cursor = app.timeline_cursor;
-        self.scroll_offset = app.scroll_offset;
-        self.auto_scroll = app.auto_scroll;
-        self.viewport_height = app.viewport_height;
+        self.scroll_state.offset = app.scroll_offset;
+        self.scroll_state.auto_scroll = app.auto_scroll;
+        self.scroll_state.viewport_height = app.viewport_height;
         self.turn_active = app.turn_active;
         self.spinner_idx = app.spinner_idx;
         self.theme = app.theme;
@@ -134,9 +131,9 @@ impl ChatView {
     /// Persist view-model back to the shared App state.
     /// Called after rendering to preserve cursor position and scroll offset.
     pub fn sync_to_app(&self, app: &mut crate::tui::App) {
-        app.scroll_offset = self.scroll_offset;
-        app.auto_scroll = self.auto_scroll;
-        app.viewport_height = self.viewport_height;
+        app.scroll_offset = self.scroll_state.offset;
+        app.auto_scroll = self.scroll_state.auto_scroll;
+        app.viewport_height = self.scroll_state.viewport_height;
     }
 
     // ── Navigation ────────────────────────────────────────────────
@@ -154,7 +151,7 @@ impl ChatView {
             idx -= 1;
             if self.timeline[idx].is_collapsible() {
                 self.timeline_cursor = idx;
-                self.auto_scroll = false;
+                self.scroll_state.auto_scroll = false;
                 return true;
             }
         }
@@ -171,7 +168,7 @@ impl ChatView {
             idx += 1;
             if self.timeline[idx].is_collapsible() {
                 self.timeline_cursor = idx;
-                self.auto_scroll = true;
+                self.scroll_state.auto_scroll = true;
                 return true;
             }
         }
@@ -188,19 +185,17 @@ impl ChatView {
 
     /// Scroll up by one viewport worth of lines.
     pub fn scroll_page_up(&mut self) {
-        let amount = self.viewport_height.max(1).saturating_sub(1);
-        self.scroll_offset = self.scroll_offset.saturating_sub(amount);
+        self.scroll_state.scroll_page_up();
     }
 
     /// Scroll down by one viewport worth of lines.
     pub fn scroll_page_down(&mut self) {
-        let amount = self.viewport_height.max(1).saturating_sub(1);
-        self.scroll_offset = self.scroll_offset.saturating_add(amount);
+        self.scroll_state.scroll_page_down();
     }
 
     /// Scroll so the entry at the given index is visible.
     pub fn scroll_to_entry(&mut self, entry_idx: usize) {
-        let vh = self.viewport_height.max(1) as usize;
+        let vh = self.scroll_state.viewport_height.max(1) as usize;
         let mut offset: usize = 0;
         for i in 0..entry_idx.min(self.entry_line_counts.len()) {
             offset += self.entry_line_counts[i] as usize + 1;
@@ -211,11 +206,11 @@ impl ChatView {
             .copied()
             .unwrap_or(1) as usize;
 
-        let scroll = self.scroll_offset as usize;
+        let scroll = self.scroll_state.offset as usize;
         if offset < scroll {
-            self.scroll_offset = offset as u16;
+            self.scroll_state.offset = offset as u16;
         } else if offset + entry_h > scroll + vh {
-            self.scroll_offset = offset.saturating_sub(vh.saturating_sub(entry_h)) as u16;
+            self.scroll_state.offset = offset.saturating_sub(vh.saturating_sub(entry_h)) as u16;
         }
     }
 
@@ -245,17 +240,21 @@ impl ChatView {
 impl Component for ChatView {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         let viewport_h = area.height as usize;
-        self.viewport_height = viewport_h as u16;
+        self.scroll_state.viewport_height = viewport_h as u16;
 
         // ── Compute total lines ──
         let total_lines = self.total_lines();
 
+        // ── Post-render size callback: sync actual content height ──
+        self.scroll_state.set_content_size(total_lines as u16);
+
         // ── Auto-scroll ──
-        if self.auto_scroll && total_lines > viewport_h {
-            self.scroll_offset = (total_lines.saturating_sub(viewport_h)) as u16;
+        if self.scroll_state.auto_scroll && total_lines > viewport_h {
+            self.scroll_state.offset = (total_lines.saturating_sub(viewport_h)) as u16;
         }
         let scroll_off = self
-            .scroll_offset
+            .scroll_state
+            .offset
             .min(total_lines.saturating_sub(1) as u16) as usize;
 
         // ── Build visible lines ──
@@ -332,12 +331,6 @@ impl Component for ChatView {
                 .viewport_content_length(viewport_h);
             frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scroll_state);
         }
-
-        // Clamp scroll_offset to prevent ghost scroll space
-        let max_scroll = total_lines.saturating_sub(viewport_h);
-        if self.scroll_offset > max_scroll as u16 {
-            self.scroll_offset = max_scroll as u16;
-        }
     }
 
     fn handle_event(&mut self, event: &Event) -> EventResult {
@@ -401,11 +394,12 @@ impl ChatView {
             }
             KeyCode::PageUp => {
                 self.scroll_page_up();
-                self.auto_scroll = false;
+                self.scroll_state.auto_scroll = false;
                 EventResult::Consumed
             }
             KeyCode::PageDown => {
                 self.scroll_page_down();
+                self.scroll_state.auto_scroll = false;
                 EventResult::Consumed
             }
             _ => EventResult::NotConsumed,
@@ -1280,7 +1274,7 @@ mod tests {
         // viewport = 10, threshold = 30, need >30 lines.
         // 20 messages → 20 * 2 = 40 lines (>30).
         let mut view = ChatView::new();
-        view.viewport_height = 10;
+        view.scroll_state.viewport_height = 10;
         view.timeline = (0..20)
             .map(|i| make_message("user", &format!("msg {i}")))
             .collect();
@@ -1371,13 +1365,13 @@ mod tests {
     #[test]
     fn scroll_to_entry() {
         let mut view = ChatView::new();
-        view.viewport_height = 5;
+        view.scroll_state.viewport_height = 5;
         // 10 entries, each 1 line + 1 separator = 2 lines → 20 total lines
         view.timeline = (0..10)
             .map(|i| make_message("user", &format!("msg {i}")))
             .collect();
         view.entry_line_counts = vec![1u16; 10];
-        view.scroll_offset = 0;
+        view.scroll_state.offset = 0;
 
         // Scroll to entry 8 (near the bottom)
         view.scroll_to_entry(8);
@@ -1387,14 +1381,14 @@ mod tests {
         // With entry_h=1: offset=16, need offset + 1 > scroll + 5 → 17 > scroll + 5 → scroll < 12
         // scroll_to_entry computes: offset.saturating_sub(5.saturating_sub(1)) = 16 - 4 = 12
         assert!(
-            view.scroll_offset >= 10,
+            view.scroll_state.offset >= 10,
             "scroll_offset={} should be large enough to show entry 8",
-            view.scroll_offset
+            view.scroll_state.offset
         );
 
         // Scroll to entry 0
         view.scroll_to_entry(0);
-        assert_eq!(view.scroll_offset, 0, "scroll_to_entry(0) should reset scroll");
+        assert_eq!(view.scroll_state.offset, 0, "scroll_to_entry(0) should reset scroll");
     }
 
     // ── Empty timeline ────────────────────────────────────────────
@@ -1466,12 +1460,12 @@ mod tests {
     #[test]
     fn handle_pageup_scrolls() {
         let mut view = ChatView::new();
-        view.viewport_height = 10;
-        view.scroll_offset = 30;
+        view.scroll_state.viewport_height = 10;
+        view.scroll_state.offset = 30;
 
         view.handle_event(&Event::Key(KeyEvent::from(KeyCode::PageUp)));
         assert!(
-            view.scroll_offset < 30,
+            view.scroll_state.offset < 30,
             "PageUp should reduce scroll offset"
         );
     }
@@ -1479,12 +1473,12 @@ mod tests {
     #[test]
     fn handle_pagedown_scrolls() {
         let mut view = ChatView::new();
-        view.viewport_height = 10;
-        view.scroll_offset = 5;
+        view.scroll_state.viewport_height = 10;
+        view.scroll_state.offset = 5;
 
         view.handle_event(&Event::Key(KeyEvent::from(KeyCode::PageDown)));
         assert!(
-            view.scroll_offset > 5,
+            view.scroll_state.offset > 5,
             "PageDown should increase scroll offset"
         );
     }
@@ -1566,8 +1560,8 @@ mod tests {
     fn default_chat_view_is_empty() {
         let view = ChatView::default();
         assert!(view.timeline.is_empty());
-        assert_eq!(view.scroll_offset, 0);
-        assert!(view.auto_scroll);
+        assert_eq!(view.scroll_state.offset, 0);
+        assert!(view.scroll_state.auto_scroll);
         assert_eq!(view.id(), "chat_view");
     }
 
@@ -1584,12 +1578,12 @@ mod tests {
         view.sync_from_app(&app);
 
         assert_eq!(view.timeline.len(), 5);
-        assert_eq!(view.scroll_offset, 10);
-        assert!(!view.auto_scroll);
+        assert_eq!(view.scroll_state.offset, 10);
+        assert!(!view.scroll_state.auto_scroll);
 
         // Modify view and sync back
-        view.scroll_offset = 42;
-        view.auto_scroll = true;
+        view.scroll_state.offset = 42;
+        view.scroll_state.auto_scroll = true;
         view.sync_to_app(&mut app);
 
         assert_eq!(app.scroll_offset, 42);

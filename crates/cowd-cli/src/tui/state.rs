@@ -485,8 +485,8 @@ impl TuiState {
             }
         }
         // Re-sync chat_view's scroll state from app after potential update
-        self.chat_view.scroll_offset = self.app.scroll_offset;
-        self.chat_view.auto_scroll = self.app.auto_scroll;
+        self.chat_view.scroll_state.offset = self.app.scroll_offset;
+        self.chat_view.scroll_state.auto_scroll = self.app.auto_scroll;
 
         // 2. Render status bar at bottom (reuses main_ctx)
         {
@@ -1500,6 +1500,7 @@ const STARTUP_MIN_DISPLAY_MS: u64 = 3000;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::layout::LayoutNode;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
 

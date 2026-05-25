@@ -90,7 +90,7 @@ mod tests {
     use super::*;
     use crate::tui::{
         components::{Component, EventResult, RenderContext},
-        layout::{PanelDef, Split, SplitDirection, TabDef, TabGroup},
+        layout::types::{PanelDef, Split, SplitDirection, TabDef, TabGroup},
         test_utils::MockTerminal,
     };
 
