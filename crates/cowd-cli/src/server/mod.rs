@@ -613,37 +613,7 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .route("/api/crons/:id/pause", post(pause_cron_handler))
         .route("/api/crons/:id/resume", post(resume_cron_handler));
 
-    let v1_routes = Router::new()
-        .route("/v1/chat/completions", post(chat_handler))
-        .route("/v1/models", get(models_handler))
-        .route("/v1/sessions", get(list_sessions_handler))
-        .route("/v1/sessions/:id", get(get_session_handler))
-        .route("/v1/sessions/:id", delete(delete_session_handler))
-        .route("/v1/sessions/:id/compact", post(compact_session_handler))
-        .route("/v1/memory/status", get(memory_status_handler))
-        .route("/v1/memory/search", get(memory_search_handler))
-        .route("/v1/memory/entries", get(list_memory_entries_handler))
-        .route("/v1/memory/entries", post(create_memory_entry_handler))
-        .route("/v1/memory/entries/:id", get(get_memory_entry_handler).delete(delete_memory_entry_handler))
-        .route("/v1/memory/handoff", post(create_handoff_handler))
-        .route("/v1/memory/handoff/restore", post(restore_handoff_handler))
-        .route("/v1/memory/layers", get(list_memory_layers_handler))
-        .route("/v1/memory/graph/entities", get(list_graph_entities_handler))
-        .route("/v1/memory/graph/relations", get(list_graph_relations_handler))
-        .route("/v1/memory/graph/query", post(query_graph_handler))
-        .route("/v1/skills", get(list_skills_handler))
-        .route("/v1/skills/install", post(install_skill_handler))
-        .route("/v1/skills/:name", get(view_skill_handler).delete(uninstall_skill_handler))
-        .route("/v1/skills/:name/invoke", post(invoke_skill_handler))
-        .route("/v1/skills/:name/toggle", post(toggle_skill_handler))
-        .route("/v1/workspaces", get(list_workspaces_handler))
-        .route("/v1/workspaces/:name", get(get_workspace_handler))
-        .route("/v1/workspaces/:name/preview", get(preview_workspace_handler))
-        .route("/v1/system/status", get(system_status_handler))
-        .route("/v1/platforms", get(list_platforms_handler))
-        .route("/v1/platforms/:name", get(get_platform_handler))
-        .route("/v1/platforms/:name/sessions", get(list_platform_sessions_handler))
-        .route("/v1/platforms/:name/sessions/:id", delete(delete_platform_session_handler));
+    
 
     let other_routes = Router::new()
         .route("/api/upload", post(upload_file_handler))
@@ -663,7 +633,6 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .merge(workspace_routes)
         .merge(approval_routes)
         .merge(cron_routes)
-        .merge(v1_routes)
         .merge(other_routes)
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
