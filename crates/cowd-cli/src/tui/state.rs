@@ -322,8 +322,35 @@ impl TuiState {
         self.context_panel.sync_from_app(&self.app);
         // File changes: populated by external load() from session diff
         // TodoPanel: extracts TodoWrite from timeline entries
-        self.file_changes_panel.load(vec![]);
-        self.todo_panel.load(vec![]);
+        // Extract file changes from timeline ToolCall outputs
+        let file_changes: Vec<crate::tui::components::file_changes_panel::FileChangeEntry> = {
+            let mut changes = Vec::new();
+            for entry in self.app.timeline_clone_vec() {
+                if let crate::tui::app::TimelineEntry::ToolCall { name, output, .. } = &entry {
+                    if name == "edit_file" || name == "write_file" || name == "patch_file" || name == "apply_diff" {
+                        // Extract filename and line counts from tool output
+                        let lines: Vec<&str> = output.lines().collect();
+                        let adds = lines.iter().filter(|l| l.starts_with('+')).count();
+                        let dels = lines.iter().filter(|l| l.starts_with('-')).count();
+                        for line in &lines {
+                            if let Some(path) = line.strip_prefix("Updated file: ").or_else(|| line.strip_prefix("File: ")).or_else(|| line.strip_prefix("### ")) {
+                                changes.push(crate::tui::components::file_changes_panel::FileChangeEntry {
+                                    path: path.trim().to_string(),
+                                    added: adds,
+                                    removed: dels,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            changes
+        };
+        if !file_changes.is_empty() {
+            self.file_changes_panel.load(file_changes);
+        }
+        self.todo_panel.extract_from_timeline(&self.app.timeline_clone_vec());
 
         // Sync file tree from App file_entries
         if !self.app.file_entries.is_empty() {
@@ -433,7 +460,26 @@ impl TuiState {
                 sidebar_area.width,
                 sidebar_area.height.saturating_sub(tab_height),
             );
-            match self.sidebar_active_tab {
+            // Sync diff_viewer before rendering
+        {
+            // Collect diff text from recent tool calls for diff viewer
+            let diffs: Vec<String> = self.app.timeline_clone_vec().iter()
+                .filter_map(|e| {
+                    if let crate::tui::app::TimelineEntry::ToolCall { name, output, .. } = e {
+                        if (name == "edit_file" || name == "patch_file" || name == "apply_diff") && !output.is_empty() {
+                            Some(output.clone())
+                        } else { None }
+                    } else { None }
+                })
+                .collect();
+            if !diffs.is_empty() {
+                let combined = diffs.join("
+---
+");
+                self.diff_viewer.load(&combined);
+            }
+        }
+        match self.sidebar_active_tab {
                 0 => {
                     let _ = error_recovery::catch_render_panic("context_panel", AssertUnwindSafe(|| {
                         self.context_panel.render(&mut main_ctx, panel_area);
