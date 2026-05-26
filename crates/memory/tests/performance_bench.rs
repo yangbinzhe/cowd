@@ -120,6 +120,10 @@ async fn bench_get_entry_latency() {
 /// Change `n` below to 10_000 or 20_000 when optimizing hot path.
 #[tokio::test]
 async fn stress_insert_1k_entries() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config = bench_config(&tmp.path().join("bench.db"));
+    let mgr = CognitiveContextManager::new(config).await.unwrap();
+
     let n = 1_000;
     let start = Instant::now();
 

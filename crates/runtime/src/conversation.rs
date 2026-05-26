@@ -90,7 +90,9 @@ pub trait ApiClient {
     /// Convenience: collect all events synchronously (backward compat).
     fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let stream = self.stream(request);
-        let handle = tokio::runtime::Handle::current();
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tokio::runtime::Builder::new_current_thread()
+                .enable_all().build().expect("stream_collect rt").handle().clone());
         handle.block_on(async {
             use futures::StreamExt;
             let mut events = Vec::new();

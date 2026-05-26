@@ -10782,7 +10782,7 @@ UU conflicted.rs",
         let runtime_config = loader.load().expect("runtime config should load");
         let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
             .expect("runtime plugin state should load");
-        let mut executor = CliToolExecutor::new(
+        let executor = CliToolExecutor::new(
             None,
             false,
             state.tool_registry.clone(),

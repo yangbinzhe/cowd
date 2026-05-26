@@ -4753,7 +4753,7 @@ mod tests {
     use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        LaneEventName, LaneFailureClass, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, TaskScope, ToolExecutor,
+        LaneEventName, LaneFailureClass, PermissionMode, PermissionPolicy, RuntimeError, Session, SharedPrompter, TaskPacket, TaskScope, ToolExecutor,
     };
     use serde_json::json;
 
@@ -6802,8 +6802,9 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
             vec![String::from("system prompt")],
         );
 
-        let summary = runtime
-            .run_turn("Inspect the delegated file", None)
+        let summary = tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(runtime.run_turn_async("Inspect the delegated file", &SharedPrompter::none()))
             .expect("subagent loop should succeed");
 
         assert_eq!(

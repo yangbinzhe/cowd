@@ -885,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_Y_yes() {
+    fn confirm_uppercase_y_yes() {
         let mut mgr = DialogManager::new();
         mgr.push(DialogState::new(DialogKind::Confirm {
             title: "Confirm".into(),
