@@ -124,6 +124,18 @@ pub trait ToolCallback: Send + Sync {
     fn on_usage(&self, _usage: &crate::usage::TokenUsage) {}
 }
 
+/// Memory lifecycle callback for real-time TUI visualization.
+/// Follows the same pattern as [`ToolCallback`] so the CLI crate can
+/// forward memory events to the TUI render loop.
+pub trait MemoryCallback: Send + Sync {
+    /// Called when memory context entries are prepared for injection into
+    /// the system prompt. Each tuple is `(layer, content, relevance)`.
+    fn on_memory_update(&self, entries: Vec<(String, String, f64)>, status: &str);
+    /// Called after post-turn memory housekeeping completes
+    /// (micro-compact, drift, seeds).
+    fn on_memory_stats(&self, total_entries: usize, vector_count: usize, layers: Vec<String>);
+}
+
 /// Error returned when a tool invocation fails locally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError {
@@ -224,6 +236,8 @@ bus: Option<crate::bus::EventBus>,
     memory_status: Option<String>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
+    /// Optional memory lifecycle callback for TUI memory events.
+    memory_callback: Option<Arc<dyn MemoryCallback>>,
     /// Optional smart approval gate for intelligent command approval (P0-1).
     approval_gate: Option<Arc<crate::approval_gate::SmartApprovalGate>>,
     /// P2-10: Optional EffectHandler for side-effect recording / mocking.
@@ -355,6 +369,7 @@ where
             memory_manager,
             memory_status,
             tool_callback: None,
+            memory_callback: None,
             approval_gate: None,
             effect_handler: None,
             project_phase: "Discovery".to_string(),
@@ -403,6 +418,16 @@ where
     pub fn with_tool_callback(mut self, callback: Arc<dyn ToolCallback>) -> Self {
         self.tool_callback = Some(callback);
         self
+    }
+
+    #[must_use]
+    pub fn with_memory_callback(mut self, callback: Arc<dyn MemoryCallback>) -> Self {
+        self.memory_callback = Some(callback);
+        self
+    }
+
+    pub fn set_memory_callback(&mut self, callback: Arc<dyn MemoryCallback>) {
+        self.memory_callback = Some(callback);
     }
 
     /// Set the smart approval gate for intelligent command approval (P0-1).
@@ -479,6 +504,14 @@ where
     pub fn without_memory(mut self) -> Self {
         self.memory_manager = None;
         self
+    }
+
+    /// Access the cognitive memory manager, if memory is enabled.
+    ///
+    /// Returns `None` when memory is disabled or failed to initialise.
+    #[must_use]
+    pub fn memory_manager(&self) -> Option<&Arc<CognitiveContextManager>> {
+        self.memory_manager.as_ref()
     }
 
     /// Create a cross-session handoff packet from the current memory state.
@@ -1214,6 +1247,9 @@ self.record_turn_completed(&summary);
         match mgr.prepare_context(user_input, &mem_messages).await {
             Ok(mut prepared) => {
                 if prepared.entries.is_empty() {
+                    if let Some(cb) = &self.memory_callback {
+                        cb.on_memory_update(Vec::new(), "no memories found");
+                    }
                     return self.system_prompt.clone();
                 }
 
@@ -1328,6 +1364,14 @@ self.record_turn_completed(&summary);
                     .filter(|e| matches!(e.layer, MemoryLayer::L0 | MemoryLayer::L1))
                     .count();
 
+                if let Some(cb) = &self.memory_callback {
+                    let entries: Vec<(String, String, f64)> = prepared.entries.iter()
+                        .map(|e| (format!("{:?}", e.layer), e.content.clone(), e.confidence as f64))
+                        .collect();
+                    let status = format!("{} memory entries loaded", entries.len());
+                    cb.on_memory_update(entries, &status);
+                }
+
                 let mut prompt = self.system_prompt.clone();
                 prompt.insert(0, context);
                 self.cached_prompt.rebuild(prompt.clone(), actual_memory_high);
@@ -1335,6 +1379,9 @@ self.record_turn_completed(&summary);
             }
             Err(err) => {
                 tracing::warn!(%err, "memory: prepare_context failed, using base system prompt");
+                if let Some(cb) = &self.memory_callback {
+                    cb.on_memory_update(Vec::new(), &format!("memory error: {err}"));
+                }
                 self.system_prompt.clone()
             }
         }
@@ -1386,6 +1433,19 @@ self.record_turn_completed(&summary);
             }).collect();
 
         let _ = mgr.on_turn_end(&mut mem_messages).await;
+
+        if let Some(cb) = &self.memory_callback {
+            let layers_data = mgr.list_layers().await;
+            let total_entries: usize = layers_data.iter()
+                .filter_map(|l| l.get("entry_count").and_then(|c| c.as_u64()).map(|c| c as usize))
+                .sum();
+            let layer_names: Vec<String> = layers_data.iter()
+                .filter_map(|l| l.get("layer").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                .collect();
+            let vector_count = mgr.vector_index_count();
+            cb.on_memory_stats(total_entries, vector_count, layer_names);
+        }
+
         Ok(())
     }
 }

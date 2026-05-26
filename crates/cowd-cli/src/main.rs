@@ -393,14 +393,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 approval_config: Some(approval_config),
                 session_reset: runtime_config.gateway().session_reset,
             };
-            let rt = match tokio::runtime::Handle::try_current() {
-                Ok(handle) => handle,
-                Err(_) => tokio::runtime::Runtime::new()
-                    .map_err(|e| e.to_string())?
-                    .handle()
-                    .clone(),
-            };
-            rt.block_on(async {
+            let rt = SHARED_RT.handle().clone();
+            let r2 = SHARED_RT.handle().clone();
+            r2.block_on(async {
                 server::start_http_server(config).await.map_err(|e| e.to_string())
             })?;
         }
@@ -2502,6 +2497,24 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
             });
         }
     }
+    // Session resume via BM25 – surfaces relevant prior-session entries
+    if let Some(mgr) = runtime.memory_manager() {
+        if let Some(resume) = mgr.session_resume() {
+            let session_id = runtime.session().session_id;
+            if let Ok(results) = SHARED_RT
+                .handle()
+                .block_on(resume.resume_recent(&session_id, None, 10))
+            {
+                for entry in results {
+                    app.memory_entries.push(tui::MemoryEntry {
+                        layer: "resume".to_string(),
+                        content: entry.content,
+                        priority: format!("{:.2}", entry.confidence),
+                    });
+                }
+            }
+        }
+    }
 
     // P1: Skills data pipeline
     app.skill_list.clear();
@@ -2678,6 +2691,9 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                         std::sync::Arc::new(tui::TuiToolCallback::new(tui_tx.clone()));
                                     let (mut prepared, monitor, abort_signal) =
                                         cli.prepare_turn_runtime(false, Some(callback), Some(tui_tx.clone()))?;
+                                    prepared.set_memory_callback(
+                                        std::sync::Arc::new(tui::TuiMemoryCallback::new(tui_tx.clone())),
+                                    );
                                     abort_monitor = Some(monitor);
                                     abort_signal_for_turn = Some(abort_signal);
 

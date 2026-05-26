@@ -235,26 +235,7 @@ fn draw_delegate_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
 }
 
 fn draw_memory_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let mut lines: Vec<Line> = Vec::new();
-    if app.memory_entries.is_empty() {
-        lines.push(Line::from(Span::styled("No memory entries loaded.", Style::default().fg(Color::DarkGray))));
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled("Memory system: 3-layer (L0 Identity / L1 Essential / L3 Deep Recall)", Style::default().fg(Color::DarkGray))));
-        lines.push(Line::from(Span::styled("Auto-extraction: background async, zero token cost", Style::default().fg(Color::DarkGray))));
-    } else {
-        for entry in &app.memory_entries {
-            let icon = match entry.priority.as_str() {
-                "high" => "🔴",
-                "medium" => "🟡",
-                _ => "⚪",
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{icon} [{}] ", entry.layer), Style::default().fg(Color::Cyan)),
-                Span::styled(&entry.content, Style::default().fg(Color::White)),
-            ]));
-        }
-    }
-    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+    super::components::memory_panel::MemoryPanel::draw(frame, area, app);
 }
 
 fn draw_skills_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {

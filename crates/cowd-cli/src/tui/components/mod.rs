@@ -18,6 +18,7 @@ pub mod render_engine;
 pub mod session_sidebar;
 pub mod status_bar;
 pub mod thinking_panel;
+pub mod memory_panel;
 pub mod question_form;
 pub mod toast;
 pub mod todo_panel;

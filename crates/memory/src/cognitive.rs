@@ -1507,6 +1507,14 @@ impl CognitiveContextManager {
         self.embedding_capability.search_mode_label()
     }
 
+    /// Access the pre-built BM25 session resume index, if available.
+    ///
+    /// The index is built at construction time from all persisted entries.
+    #[must_use]
+    pub fn session_resume(&self) -> Option<&SessionResume> {
+        self.session_resume.as_ref()
+    }
+
     // -----------------------------------------------------------------------
     // FTS5 Full-text search
     // -----------------------------------------------------------------------

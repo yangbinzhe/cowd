@@ -41,6 +41,14 @@ pub enum TuiEvent {
     // ── System ──
     /// Auto-compaction notification
     CompactionNotice { removed_count: usize },
+
+    // ── Memory events ──
+    /// New memory entry added (from cognitive context)
+    MemoryEntry { layer: String, content: String, relevance: f64 },
+    /// Batch memory update after context preparation
+    MemoryUpdate { entries: Vec<(String, String, f64)>, status: String },
+    /// Memory statistics after turn completion
+    MemoryStats { total_entries: usize, vector_count: usize, layers: Vec<String> },
 }
 
 /// Channel sender/receiver type aliases for the TUI event pipeline.

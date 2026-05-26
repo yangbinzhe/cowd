@@ -5,6 +5,7 @@
 
 use ratatui::layout::Rect;
 
+use crate::tui::components::memory_panel::MemoryPanel;
 use crate::tui::components::{Component, EventResult, RenderContext};
 use super::LayoutTree;
 use super::types::{LayoutNode, Split, SplitDirection, TabDef, TabGroup};
@@ -68,7 +69,7 @@ pub fn build_default_layout() -> LayoutTree {
             id: "memory".to_string(),
             label: "Memory".to_string(),
             icon: Some("🧠".to_string()),
-            content: Box::new(PlaceholderComponent { id: "memory" }),
+            content: Box::new(MemoryPanel::new()),
         },
         TabDef {
             id: "skills".to_string(),

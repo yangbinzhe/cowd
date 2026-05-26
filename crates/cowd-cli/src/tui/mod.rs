@@ -28,4 +28,4 @@ pub mod accessibility;
 
 pub use app::{App, FileEntry, DelegateTask, MemoryEntry, SkillSummary};
 pub use events::{TuiEvent, TuiEventReceiver, tui_event_channel};
-pub use callbacks::TuiToolCallback;
+pub use callbacks::{TuiMemoryCallback, TuiToolCallback};

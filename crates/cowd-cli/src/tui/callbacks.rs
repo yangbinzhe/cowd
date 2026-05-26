@@ -1,6 +1,6 @@
 use std::sync::mpsc;
 use crate::tui::TuiEvent;
-use runtime::ToolCallback;
+use runtime::{MemoryCallback, ToolCallback};
 
 pub struct TuiToolCallback {
     tx: mpsc::SyncSender<TuiEvent>,
@@ -44,6 +44,33 @@ impl ToolCallback for TuiToolCallback {
             output: usage.output_tokens as u64,
             cache_create: usage.cache_creation_input_tokens as u64,
             cache_read: usage.cache_read_input_tokens as u64,
+        });
+    }
+}
+
+pub struct TuiMemoryCallback {
+    tx: mpsc::SyncSender<TuiEvent>,
+}
+
+impl TuiMemoryCallback {
+    pub fn new(tx: mpsc::SyncSender<TuiEvent>) -> Self {
+        Self { tx }
+    }
+}
+
+impl MemoryCallback for TuiMemoryCallback {
+    fn on_memory_update(&self, entries: Vec<(String, String, f64)>, status: &str) {
+        let _ = self.tx.try_send(TuiEvent::MemoryUpdate {
+            entries,
+            status: status.to_string(),
+        });
+    }
+
+    fn on_memory_stats(&self, total_entries: usize, vector_count: usize, layers: Vec<String>) {
+        let _ = self.tx.try_send(TuiEvent::MemoryStats {
+            total_entries,
+            vector_count,
+            layers,
         });
     }
 }

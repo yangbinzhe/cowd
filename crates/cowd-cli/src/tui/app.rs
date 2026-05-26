@@ -924,6 +924,36 @@ impl App {
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
+
+            TuiEvent::MemoryEntry { layer, content, relevance } => {
+                self.timeline_push(TimelineEntry::Message {
+                    role: "system".into(),
+                    content: format!("[Memory:{layer}] (rel={relevance:.2}) {content}"),
+                    timestamp: App::format_timestamp(),
+                });
+                self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+
+            TuiEvent::MemoryUpdate { entries, status } => {
+                self.timeline_push(TimelineEntry::Message {
+                    role: "system".into(),
+                    content: format!("[Memory] {status}: {} entries updated", entries.len()),
+                    timestamp: App::format_timestamp(),
+                });
+                self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+
+            TuiEvent::MemoryStats { total_entries, vector_count, layers } => {
+                self.timeline_push(TimelineEntry::Message {
+                    role: "system".into(),
+                    content: format!("[Memory] total={total_entries}, vectors={vector_count}, layers={}", layers.join(", ")),
+                    timestamp: App::format_timestamp(),
+                });
+                self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
         }
     }
 }

@@ -98,7 +98,7 @@ pub use config_validate::{
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    build_cc_memory_config, ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor,
+    build_cc_memory_config, ConversationRuntime, MemoryCallback, PromptCacheEvent, RuntimeError, StaticToolExecutor,
     ToolCallback, ToolError, ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
