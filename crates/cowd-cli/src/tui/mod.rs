@@ -1,7 +1,6 @@
 pub mod app;
 pub mod layout;
 pub mod components;
-pub mod render;
 pub mod input;
 pub mod keybind;
 pub mod skin;
@@ -10,7 +9,6 @@ pub mod event;
 pub mod runner;
 pub mod scroll_state;
 pub mod callbacks;
-pub mod widgets;
 pub mod osc52;
 pub mod clipboard;
 pub mod md_renderer;
