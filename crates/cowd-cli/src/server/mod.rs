@@ -1085,10 +1085,10 @@ impl OpenAiApiClient {
                         }
                         // DeepSeek thinking mode: reasoning_content must be passed back
                         // in subsequent requests. Convert Thinking blocks to InputContentBlock.
-                        SessionContentBlock::Thinking { thinking } => {
+                        SessionContentBlock::Thinking { thinking, signature } => {
                             Some(InputContentBlock::Thinking {
                                 thinking: thinking.clone(),
-                                signature: None,
+                                signature: signature.clone(),
                             })
                         }
                         _ => None, // Skip tool use/result blocks for OpenAI API

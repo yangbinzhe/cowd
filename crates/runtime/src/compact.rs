@@ -321,7 +321,7 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
 fn summarize_block(block: &ContentBlock) -> String {
     let raw = match block {
         ContentBlock::Text { text } => text.clone(),
-        ContentBlock::Thinking { thinking } => format!("[thinking] {}", thinking),
+        ContentBlock::Thinking { thinking, .. } => format!("[thinking] {}", thinking),
         ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
         ContentBlock::ToolResult {
             tool_name,
@@ -453,7 +453,7 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } => text.len() / 4 + 1,
-            ContentBlock::Thinking { thinking } => thinking.len() / 4 + 1,
+            ContentBlock::Thinking { thinking, .. } => thinking.len() / 4 + 1,
             ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
             ContentBlock::ToolResult {
                 tool_name, output, ..

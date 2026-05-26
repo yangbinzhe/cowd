@@ -529,6 +529,15 @@ impl StreamState {
                 }));
             }
 
+            // DeepSeek/Anthropic thinking mode: signature must be
+            // preserved and passed back in subsequent requests.
+            if let Some(signature) = choice.delta.signature {
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::SignatureDelta { signature },
+                }));
+            }
+
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
                 // Close the reasoning block if it was started before the visible content.
                 if self.reasoning_started && !self.reasoning_finished {
@@ -745,6 +754,10 @@ struct ChatMessage {
     /// Must be passed back verbatim in subsequent requests.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Signature for thinking content (e.g., Anthropic). Must be
+    /// passed back verbatim in subsequent requests.
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -794,6 +807,10 @@ struct ChunkDelta {
     /// DeepSeek thinking-mode reasoning content (streaming).
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Signature for thinking content (streaming). Must be
+    /// passed back verbatim in subsequent requests.
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1169,7 +1186,7 @@ fn normalize_response(
     if let Some(reasoning) = choice.message.reasoning_content.filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Thinking {
             thinking: reasoning,
-            signature: None,
+            signature: choice.message.signature,
         });
     }
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {

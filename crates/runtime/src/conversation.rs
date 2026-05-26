@@ -39,6 +39,9 @@ pub enum AssistantEvent {
     TextDelta(String),
     /// P1-7: Extended thinking delta (reasoning model output)
     ThinkingDelta(String),
+    /// P1-7: Thinking signature that must be preserved and passed back
+    /// to the provider in subsequent requests.
+    SignatureDelta(String),
     ToolUse {
         id: String,
         name: String,
@@ -719,6 +722,7 @@ pub async fn run_turn_async(
             use futures::StreamExt;
             let mut current_text = String::new();
             let mut thinking_text = String::new();
+            let mut thinking_signature: Option<String> = None;
             let mut pending_tool_uses: Vec<(String, String, String)> = Vec::new();
             let mut turn_usage: Option<TokenUsage> = None;
             let mut stream_events: Vec<(String, String, String, u8)> = Vec::new();
@@ -734,6 +738,9 @@ pub async fn run_turn_async(
                         AssistantEvent::ThinkingDelta(thinking) => {
                             thinking_text.push_str(&thinking);
                             stream_events.push(("thinking".into(), "reasoning".into(), thinking[..thinking.len().min(80)].to_string(), 2));
+                        }
+                        AssistantEvent::SignatureDelta(signature) => {
+                            thinking_signature = Some(signature);
                         }
                         AssistantEvent::ToolUse { id, name, input } => { pending_tool_uses.push((id, name, input)); }
                         AssistantEvent::Usage(usage) => { turn_usage = Some(usage); }
@@ -768,7 +775,7 @@ pub async fn run_turn_async(
             // Build assistant message with text + tool_use blocks
             let mut blocks = Vec::new();
             if !thinking_text.is_empty() {
-                blocks.push(ContentBlock::Thinking { thinking: thinking_text });
+                blocks.push(ContentBlock::Thinking { thinking: thinking_text, signature: thinking_signature });
             }
             blocks.push(ContentBlock::Text { text: current_text });
             for (id, name, input) in &pending_tool_uses {
@@ -1559,6 +1566,7 @@ fn build_assistant_message(
 > {
     let mut text = String::new();
     let mut thinking = String::new();
+    let mut thinking_signature: Option<String> = None;
     let mut blocks = Vec::new();
     let mut prompt_cache_events = Vec::new();
     let mut finished = false;
@@ -1575,7 +1583,7 @@ fn build_assistant_message(
             }
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
-                flush_thinking_block(&mut thinking, &mut blocks);
+                flush_thinking_block(&mut thinking, thinking_signature.take(), &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
             }
             AssistantEvent::Usage(value) => usage = Some(value),
@@ -1588,11 +1596,14 @@ fn build_assistant_message(
             AssistantEvent::ToolStart { .. }
             | AssistantEvent::ToolProgress { .. }
             | AssistantEvent::ToolComplete { .. } => {}
+            AssistantEvent::SignatureDelta(signature) => {
+                thinking_signature = Some(signature);
+            }
         }
     }
 
     flush_text_block(&mut text, &mut blocks);
-    flush_thinking_block(&mut thinking, &mut blocks);
+    flush_thinking_block(&mut thinking, thinking_signature, &mut blocks);
 
     if !finished {
         return Err(RuntimeError::new(
@@ -1621,10 +1632,11 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
 
 /// P1-7: Flush accumulated thinking content into a Thinking content block.
 #[allow(dead_code)]
-fn flush_thinking_block(thinking: &mut String, blocks: &mut Vec<ContentBlock>) {
+fn flush_thinking_block(thinking: &mut String, signature: Option<String>, blocks: &mut Vec<ContentBlock>) {
     if !thinking.is_empty() {
         blocks.push(ContentBlock::Thinking {
             thinking: std::mem::take(thinking),
+            signature,
         });
     }
 }

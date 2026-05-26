@@ -3350,9 +3350,9 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
                     // Thinking blocks contain reasoning_content that must be passed back
                     // to providers like DeepSeek in subsequent requests.
-                    ContentBlock::Thinking { thinking } => InputContentBlock::Thinking {
+                    ContentBlock::Thinking { thinking, signature } => InputContentBlock::Thinking {
                         thinking: thinking.clone(),
-                        signature: None,
+                        signature: signature.clone(),
                     },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),

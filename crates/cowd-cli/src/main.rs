@@ -5609,7 +5609,7 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
-                ContentBlock::Thinking { thinking } => lines.push(format!("[thinking] {thinking}")),
+                ContentBlock::Thinking { thinking, .. } => lines.push(format!("[thinking] {thinking}")),
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -5796,7 +5796,7 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                         lines.push(String::new());
                     }
                 }
-                ContentBlock::Thinking { thinking } => {
+                ContentBlock::Thinking { thinking, .. } => {
                     lines.push(format!("> **Thinking:** {}", thinking.chars().take(200).collect::<String>()));
                     lines.push(String::new());
                 }
@@ -6448,7 +6448,9 @@ impl AnthropicRuntimeClient {
                             let _ = cb.try_send(crate::tui::TuiEvent::ThinkingDelta { thinking });
                         }
                     }
-                    ContentBlockDelta::SignatureDelta { .. } => {}
+                    ContentBlockDelta::SignatureDelta { signature } => {
+                        events.push(AssistantEvent::SignatureDelta(signature));
+                    }
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
@@ -6623,7 +6625,9 @@ async fn consume_stream_standalone(
                         let _ = cb.try_send(crate::tui::TuiEvent::ThinkingDelta { thinking });
                     }
                 }
-                ContentBlockDelta::SignatureDelta { .. } => {}
+                ContentBlockDelta::SignatureDelta { signature } => {
+                    events.push(AssistantEvent::SignatureDelta(signature));
+                }
             },
             ApiStreamEvent::ContentBlockStop(_) => {
                 block_has_thinking_summary = false;
@@ -7691,7 +7695,7 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::Thinking { thinking } => InputContentBlock::Thinking { thinking: thinking.clone(), signature: None },
+                    ContentBlock::Thinking { thinking, signature } => InputContentBlock::Thinking { thinking: thinking.clone(), signature: signature.clone() },
                     ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
