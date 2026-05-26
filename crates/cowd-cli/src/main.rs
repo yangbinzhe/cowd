@@ -2655,32 +2655,21 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     load_session_history(&mut state, &cli.runtime.session());
     refresh_panels(&mut state, &workspace, &cli.runtime);
 
-    // ── Initialize unified session manager ──
-    let session_mgr = memory::create_session_manager();
+    // ── Populate TUI session list from the unified SQLite store ──
     {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let meta = memory::UnifiedSessionMeta {
-            id: session_id.clone(),
-            session_type: memory::SessionType::Cli,
-            created_at: now,
-            last_activity: now,
-            workspace: Some(workspace.clone()),
-            platform_data: std::collections::HashMap::new(),
+        let sessions = match get_unified_store() {
+            Ok(store) => store.list_sessions().unwrap_or_default(),
+            Err(_) => Vec::new(),
         };
-        let _ = SHARED_RT.handle().block_on(session_mgr.register_session(meta));
+        let session_list: Vec<(String, String, String)> = sessions
+            .iter()
+            .map(|r| {
+                let name = format!("cli [{}]", &r.session_id[..r.session_id.len().min(8)]);
+                (r.session_id.clone(), name, r.created_at.clone())
+            })
+            .collect();
+        let _ = tui_tx.send(tui::TuiEvent::SessionList { sessions: session_list });
     }
-    let sessions = SHARED_RT.handle().block_on(session_mgr.list_sessions());
-    let session_list: Vec<(String, String, String)> = sessions
-        .iter()
-        .map(|s| {
-            let name = format!("{} [{}]", s.session_type, &s.id[..s.id.len().min(8)]);
-            (s.id.clone(), name, s.created_at.to_string())
-        })
-        .collect();
-    let _ = tui_tx.send(tui::TuiEvent::SessionList { sessions: session_list });
 
     // Startup phase: ready after init completes.
     // If init <500ms the overlay never shows. If init >500ms,
@@ -3788,6 +3777,26 @@ impl LiveCli {
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime.session().save_to_path(&self.session.path)?;
+        // Sync metadata to the unified SQLite store.
+        if let Ok(store) = get_unified_store() {
+            let session = self.runtime.session();
+            let record = memory::store::session::SessionRecord {
+                session_id: session.session_id.clone(),
+                platform: "cli".to_string(),
+                chat_id: self.session.id.clone(),
+                user_id: None,
+                model: Some(self.model.clone()),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_activity: chrono::Utc::now().to_rfc3339(),
+                message_count: session.messages.len() as i64,
+                reset_policy: "none".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+            };
+            let _ = store.upsert_session(&record);
+        }
         Ok(())
     }
 
@@ -4440,95 +4449,369 @@ impl LiveCli {
     }
 }
 
-fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(current_session_store()?.sessions_dir().to_path_buf())
+// ── Unified Session Store (replaces runtime::SessionStore) ────────────────────
+//
+// TUI sessions now use the same SQLite-backed `UnifiedSessionStore` as the
+// HTTP server.  Metadata lives at `~/.cowd/sessions.db`; JSONL content files
+// are stored flat under `~/.cowd/sessions/<id>.jsonl`.
+
+static UNIFIED_STORE: std::sync::OnceLock<memory::UnifiedSessionStore> =
+    std::sync::OnceLock::new();
+
+/// Return the global unified session store, lazily initialised on first call.
+fn get_unified_store() -> Result<&'static memory::UnifiedSessionStore, Box<dyn std::error::Error>> {
+    if let Some(store) = UNIFIED_STORE.get() {
+        return Ok(store);
+    }
+
+    let db_path = runtime::cowd_dirs::config_home_dir().join("sessions.db");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let store = memory::UnifiedSessionStore::open(&db_path).map_err(|e| {
+        let msg = format!("failed to open unified session store at {:?}: {e}", db_path);
+        Box::<dyn std::error::Error>::from(msg)
+    })?;
+
+    if let Err(e) = migrate_jsonl_sessions(&store) {
+        tracing::warn!("JSONL session migration error (non-fatal): {e}");
+    }
+
+    // set() fails if another thread already initialised — either way get() works.
+    UNIFIED_STORE.set(store).unwrap_or_else(|_| {});
+    Ok(UNIFIED_STORE.get().unwrap())
 }
 
-fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+/// Flat directory where JSONL session content files live.
+fn jsonl_sessions_dir() -> PathBuf {
+    runtime::cowd_dirs::config_home_dir().join("sessions")
+}
+
+/// Scan legacy `~/.cowd/sessions/projects/*/` and `global/` for `.jsonl`/`.json`
+/// files and import their metadata into the SQLite store.
+fn migrate_jsonl_sessions(
+    store: &memory::UnifiedSessionStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base = jsonl_sessions_dir();
+    let mut count: u64 = 0;
+
+    for sub in &["projects", "global"] {
+        let dir = base.join(sub);
+        if !dir.is_dir() {
+            continue;
+        }
+        let hash_dirs = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(Box::new(err)),
+        };
+        for entry in hash_dirs {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let hash_dir = entry.path();
+            if !hash_dir.is_dir() {
+                continue;
+            }
+            let files = match std::fs::read_dir(&hash_dir) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            for file in files {
+                let file = match file {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                let path = file.path();
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                if ext != "jsonl" && ext != "json" {
+                    continue;
+                }
+                let session = match Session::load_from_path(&path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let record = session_to_record(&session, &path);
+                if store.create_session(&record).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    if count > 0 {
+        tracing::info!("migrated {count} sessions from JSONL");
+    }
+    Ok(())
+}
+
+/// Build a [`memory::SessionRecord`] from a loaded `Session` + its file path.
+fn session_to_record(
+    session: &Session,
+    path: &Path,
+) -> memory::store::session::SessionRecord {
+    use memory::store::session::SessionRecord;
+
+    let id = session.session_id.clone();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let metadata = serde_json::json!({
+        "workspace_root": session.workspace_root().map(|p| p.display().to_string()),
+        "parent_session_id": session.fork.as_ref().map(|f| f.parent_session_id.clone()),
+        "branch_name": session.fork.as_ref().and_then(|f| f.branch_name.clone()),
+        "legacy_path": path.display().to_string(),
+    });
+
+    SessionRecord {
+        session_id: id,
+        platform: "cli".to_string(),
+        chat_id: path.display().to_string(),
+        user_id: None,
+        model: session.model.clone(),
+        created_at: now.clone(),
+        last_activity: now,
+        message_count: session.messages.len() as i64,
+        reset_policy: "none".to_string(),
+        metadata_json: Some(metadata.to_string()),
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0.0,
+    }
+}
+
+fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(jsonl_sessions_dir())
 }
 
 pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
     Ok(Session::new().with_workspace_root(env::current_dir()?))
 }
 
+/// Create a managed session handle and register its metadata in SQLite.
 fn create_managed_session_handle(
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?.create_handle(session_id);
+    let dir = jsonl_sessions_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{session_id}.jsonl"));
+
+    // Register metadata in SQLite (idempotent via INSERT OR IGNORE).
+    if let Ok(store) = get_unified_store() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = memory::store::session::SessionRecord {
+            session_id: session_id.to_string(),
+            platform: "cli".to_string(),
+            chat_id: session_id.to_string(),
+            user_id: None,
+            model: None,
+            created_at: now.clone(),
+            last_activity: now,
+            message_count: 0,
+            reset_policy: "none".to_string(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
+        };
+        let _ = store.create_session(&record);
+        // Also bump last_activity so it sorts near the top
+        let _ = store.upsert_session(&record);
+    }
+
     Ok(SessionHandle {
-        id: handle.id,
-        path: handle.path,
+        id: session_id.to_string(),
+        path,
     })
 }
 
-fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?
-        .resolve_reference(reference)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    Ok(SessionHandle {
-        id: handle.id,
-        path: handle.path,
-    })
+fn resolve_session_reference(
+    reference: &str,
+) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    // 1. Aliases ("latest", "last", "recent") → most-recent SQLite record.
+    if reference.eq_ignore_ascii_case("latest")
+        || reference.eq_ignore_ascii_case("last")
+        || reference.eq_ignore_ascii_case("recent")
+    {
+        let store = get_unified_store()?;
+        let records = store
+            .list_sessions()
+            .map_err(|e| -> Box<dyn std::error::Error> {
+                format!("failed to list sessions: {e}").into()
+            })?;
+        let record = records
+            .into_iter()
+            .next()
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                "no managed sessions found".into()
+            })?;
+        let path = jsonl_sessions_dir().join(format!("{}.jsonl", record.session_id));
+        return Ok(SessionHandle {
+            id: record.session_id,
+            path,
+        });
+    }
+
+    // 2. Path-based reference (backward-compat: absolute/relative paths).
+    let direct = PathBuf::from(reference);
+    let candidate = if direct.is_absolute() {
+        direct.clone()
+    } else {
+        env::current_dir()?.join(&direct)
+    };
+    let looks_like_path =
+        direct.extension().is_some() || direct.components().count() > 1;
+
+    if candidate.exists() {
+        let id = candidate
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(reference)
+            .to_string();
+        return Ok(SessionHandle { id, path: candidate });
+    }
+
+    if looks_like_path {
+        return Err(format!("session file not found: {reference}").into());
+    }
+
+    // 3. Session-ID → SQLite lookup, compute JSONL path.
+    let path = resolve_managed_session_path(reference)?;
+    let id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(reference)
+        .to_string();
+    Ok(SessionHandle { id, path })
 }
 
-fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    current_session_store()?
-        .resolve_managed_path(session_id)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+fn resolve_managed_session_path(
+    session_id: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = jsonl_sessions_dir();
+
+    // Check if the session is registered in SQLite.
+    if let Ok(store) = get_unified_store() {
+        if let Ok(Some(_record)) = store.get_session(session_id) {
+            // Try existing .jsonl / .json first.
+            for ext in &["jsonl", "json"] {
+                let path = dir.join(format!("{session_id}.{ext}"));
+                if path.exists() {
+                    return Ok(path);
+                }
+            }
+            // Session is registered but file hasn't been persisted yet.
+            return Ok(dir.join(format!("{session_id}.jsonl")));
+        }
+    }
+
+    // Fallback: check for orphan JSONL files (e.g. legacy paths).
+    for ext in &["jsonl", "json"] {
+        let path = dir.join(format!("{session_id}.{ext}"));
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    Err(format!("session not found: {session_id}").into())
 }
 
-fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
-    Ok(current_session_store()?
+fn list_managed_sessions(
+) -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
+    let store = get_unified_store()?;
+    let records = store
         .list_sessions()
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
-        .into_iter()
-        .map(|session| ManagedSessionSummary {
-            id: session.id,
-            path: session.path,
-            updated_at_ms: session.updated_at_ms,
-            modified_epoch_millis: session.modified_epoch_millis,
-            message_count: session.message_count,
-            parent_session_id: session.parent_session_id,
-            branch_name: session.branch_name,
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("failed to list sessions: {e}").into()
+        })?;
+    Ok(records.into_iter().map(record_to_summary).collect())
+}
+
+/// Convert a SQLite [`memory::SessionRecord`] into the TUI's summary struct.
+fn record_to_summary(
+    record: memory::store::session::SessionRecord,
+) -> ManagedSessionSummary {
+    let dir = jsonl_sessions_dir();
+    let path = dir.join(format!("{}.jsonl", record.session_id));
+
+    // Parse last_activity from ISO 8601 → epoch millis for sorting.
+    let last_activity_ms = chrono::DateTime::parse_from_rfc3339(&record.last_activity)
+        .ok()
+        .map(|dt| dt.timestamp_millis().max(0) as u64)
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(
+                &record.last_activity,
+                "%Y-%m-%dT%H:%M:%S%.fZ",
+            )
+            .ok()
+            .map(|dt| dt.and_utc().timestamp_millis().max(0) as u64)
         })
-        .collect())
+        .unwrap_or(0);
+
+    let file_mtime = path
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let (parent_session_id, branch_name) = record
+        .metadata_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .map(|v| {
+            (
+                v.get("parent_session_id")
+                    .and_then(|s| s.as_str())
+                    .map(String::from),
+                v.get("branch_name")
+                    .and_then(|s| s.as_str())
+                    .map(String::from),
+            )
+        })
+        .unwrap_or((None, None));
+
+    ManagedSessionSummary {
+        id: record.session_id,
+        path,
+        updated_at_ms: last_activity_ms,
+        modified_epoch_millis: file_mtime,
+        message_count: record.message_count.max(0) as usize,
+        parent_session_id,
+        branch_name,
+    }
 }
 
 fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error::Error>> {
-    let session = current_session_store()?
-        .latest_session()
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    Ok(ManagedSessionSummary {
-        id: session.id,
-        path: session.path,
-        updated_at_ms: session.updated_at_ms,
-        modified_epoch_millis: session.modified_epoch_millis,
-        message_count: session.message_count,
-        parent_session_id: session.parent_session_id,
-        branch_name: session.branch_name,
-    })
+    list_managed_sessions()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            "no managed sessions found".into()
+        })
 }
 
 fn load_session_reference(
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
-    let loaded = current_session_store()?
-        .load_session(reference)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    Ok((
-        SessionHandle {
-            id: loaded.handle.id,
-            path: loaded.handle.path,
-        },
-        loaded.session,
-    ))
+    let handle = resolve_session_reference(reference)?;
+    let session = Session::load_from_path(&handle.path)?;
+    Ok((handle, session))
 }
 
 fn delete_managed_session(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if !path.exists() {
         return Err(format!("session file does not exist: {}", path.display()).into());
+    }
+    // Remove from SQLite as well (extract session_id from filename stem).
+    if let Ok(store) = get_unified_store() {
+        if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+            let _ = store.delete_session(id);
+        }
     }
     fs::remove_file(path)?;
     Ok(())
