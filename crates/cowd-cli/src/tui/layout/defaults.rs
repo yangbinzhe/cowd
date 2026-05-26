@@ -1,3 +1,4 @@
+use crate::tui::components::chat_view::ChatView;
 // ── Default Layout & State Management ──────────────────────────────
 // build_default_layout(), LayoutState (toggle_sidebar, resize_sidebar),
 // and unit tests for the default split-view layout.
@@ -114,7 +115,7 @@ pub fn build_default_layout() -> LayoutTree {
         direction: SplitDirection::Horizontal,
         ratio: 0.7,
         children: vec![
-            LayoutNode::Leaf(Box::new(PlaceholderComponent { id: "chat_view" })),
+            LayoutNode::Leaf(Box::new(ChatView::new())),
             LayoutNode::TabGroup(TabGroup {
                 tabs: sidebar_tabs,
                 active: 0,
