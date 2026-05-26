@@ -191,12 +191,16 @@ pub struct App {
     pub notification: Option<String>,
     notification_ttl: u32,
 
+    pub sessions: Vec<(String, String, String)>,  // (id, name, created)
+    pub active_session_name: String,
+
     pub layout_tree: LayoutTree,
     pub layout_state: LayoutState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MemoryEntry {
+    pub id: Option<String>,
     pub layer: String,
     pub content: String,
     pub priority: String,
@@ -334,6 +338,9 @@ impl App {
 
             notification: None,
             notification_ttl: 0,
+
+            sessions: Vec::new(),
+            active_session_name: String::new(),
 
             layout_tree: build_default_layout(),
             layout_state: LayoutState::new(),
@@ -952,6 +959,26 @@ impl App {
                     timestamp: App::format_timestamp(),
                 });
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+
+            TuiEvent::SessionList { sessions } => {
+                self.sessions = sessions;
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+
+            TuiEvent::SessionCreated { id, name } => {
+                self.sessions.push((id, name, App::format_timestamp()));
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+
+            TuiEvent::SessionDeleted { id } => {
+                self.sessions.retain(|(sid, _, _)| sid != &id);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+
+            TuiEvent::SessionSwitched { id: _, name } => {
+                self.active_session_name = name;
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
         }

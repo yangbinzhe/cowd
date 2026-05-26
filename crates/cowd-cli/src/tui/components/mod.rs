@@ -22,6 +22,7 @@ pub mod memory_panel;
 pub mod question_form;
 pub mod toast;
 pub mod todo_panel;
+pub mod session_events;
 
 #[cfg(test)]
 mod base_test;

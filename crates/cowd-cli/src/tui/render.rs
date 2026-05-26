@@ -8,6 +8,8 @@ use ratatui::{
 };
 use super::app::{App, Panel};
 use super::widgets::{chat, status_bar};
+use crate::tui::components::file_tree::FileTree;
+use crate::tui::components::{Component, RenderContext};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -122,21 +124,12 @@ fn draw_gateway_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
 }
 
 fn draw_file_browser(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
-    let mut lines: Vec<Line> = Vec::new();
-    if app.file_entries.is_empty() {
-        lines.push(Line::from(Span::styled("No files loaded. Press 'r' to refresh.", Style::default().fg(Color::DarkGray))));
-    } else {
-        for f in &app.file_entries {
-            let icon = if f.is_dir { "📁" } else { "📄" };
-            let size = if f.size > 1024 { format!("{}KB", f.size/1024) } else { format!("{}B", f.size) };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{icon} "), Style::default()),
-                Span::styled(&f.name, Style::default().fg(Color::White)),
-                Span::styled(format!(" ({size})"), Style::default().fg(Color::DarkGray)),
-            ]));
-        }
+    let mut file_tree = FileTree::new();
+    if !app.file_entries.is_empty() {
+        file_tree.rebuild(&app.file_entries);
     }
-    frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
+    let mut ctx = RenderContext::new(frame, &app.skin);
+    file_tree.render(&mut ctx, area);
 }
 
 fn draw_help_modal(frame: &mut Frame, area: ratatui::layout::Rect) {

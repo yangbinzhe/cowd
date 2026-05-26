@@ -49,6 +49,16 @@ pub enum TuiEvent {
     MemoryUpdate { entries: Vec<(String, String, f64)>, status: String },
     /// Memory statistics after turn completion
     MemoryStats { total_entries: usize, vector_count: usize, layers: Vec<String> },
+
+    // ── Session events ──
+    /// Session list updated
+    SessionList { sessions: Vec<(String, String, String)> }, // (id, name, created_at)
+    /// Session created
+    SessionCreated { id: String, name: String },
+    /// Session deleted
+    SessionDeleted { id: String },
+    /// Session switched (active session changed)
+    SessionSwitched { id: String, name: String },
 }
 
 /// Channel sender/receiver type aliases for the TUI event pipeline.

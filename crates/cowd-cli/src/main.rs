@@ -2494,6 +2494,7 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
                 layer: "handoff".to_string(),
                 content: handoff.summary.clone(),
                 priority: "high".to_string(),
+                ..Default::default()
             });
         }
     }
@@ -2510,6 +2511,7 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
                         layer: "resume".to_string(),
                         content: entry.content,
                         priority: format!("{:.2}", entry.confidence),
+                        ..Default::default()
                     });
                 }
             }
@@ -2608,6 +2610,33 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     }
     load_session_history(&mut state, &cli.runtime.session());
     refresh_panels(&mut state, &workspace, &cli.runtime);
+
+    // ── Initialize unified session manager ──
+    let session_mgr = memory::create_session_manager();
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let meta = memory::UnifiedSessionMeta {
+            id: session_id.clone(),
+            session_type: memory::SessionType::Cli,
+            created_at: now,
+            last_activity: now,
+            workspace: Some(workspace.clone()),
+            platform_data: std::collections::HashMap::new(),
+        };
+        let _ = SHARED_RT.handle().block_on(session_mgr.register_session(meta));
+    }
+    let sessions = SHARED_RT.handle().block_on(session_mgr.list_sessions());
+    let session_list: Vec<(String, String, String)> = sessions
+        .iter()
+        .map(|s| {
+            let name = format!("{} [{}]", s.session_type, &s.id[..s.id.len().min(8)]);
+            (s.id.clone(), name, s.created_at.to_string())
+        })
+        .collect();
+    let _ = tui_tx.send(tui::TuiEvent::SessionList { sessions: session_list });
 
     // Startup phase: ready after init completes.
     // If init <500ms the overlay never shows. If init >500ms,

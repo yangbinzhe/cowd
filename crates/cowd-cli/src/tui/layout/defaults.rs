@@ -5,7 +5,12 @@
 
 use ratatui::layout::Rect;
 
+use crate::tui::components::agents_overlay::AgentsOverlay;
+use crate::tui::components::context_panel::ContextPanel;
+use crate::tui::components::file_changes_panel::FileChangesPanel;
+use crate::tui::components::file_tree::FileTree;
 use crate::tui::components::memory_panel::MemoryPanel;
+use crate::tui::components::todo_panel::TodoPanel;
 use crate::tui::components::{Component, EventResult, RenderContext};
 use super::LayoutTree;
 use super::types::{LayoutNode, Split, SplitDirection, TabDef, TabGroup};
@@ -63,7 +68,7 @@ pub fn build_default_layout() -> LayoutTree {
             id: "files".to_string(),
             label: "Files".to_string(),
             icon: Some("📁".to_string()),
-            content: Box::new(PlaceholderComponent { id: "files" }),
+            content: Box::new(FileTree::new()),
         },
         TabDef {
             id: "memory".to_string(),
@@ -81,25 +86,25 @@ pub fn build_default_layout() -> LayoutTree {
             id: "delegates".to_string(),
             label: "Delegates".to_string(),
             icon: Some("📋".to_string()),
-            content: Box::new(PlaceholderComponent { id: "delegates" }),
+            content: Box::new(AgentsOverlay::new()),
         },
         TabDef {
             id: "context".to_string(),
             label: "Context".to_string(),
             icon: Some("📊".to_string()),
-            content: Box::new(PlaceholderComponent { id: "context" }),
+            content: Box::new(ContextPanel::new()),
         },
         TabDef {
             id: "changes".to_string(),
             label: "Changes".to_string(),
             icon: Some("📄".to_string()),
-            content: Box::new(PlaceholderComponent { id: "changes" }),
+            content: Box::new(FileChangesPanel::new()),
         },
         TabDef {
             id: "todo".to_string(),
             label: "Todo".to_string(),
             icon: Some("☑".to_string()),
-            content: Box::new(PlaceholderComponent { id: "todo" }),
+            content: Box::new(TodoPanel::new()),
         },
     ];
 
