@@ -9,7 +9,9 @@ use crate::tui::components::agents_overlay::AgentsOverlay;
 use crate::tui::components::context_panel::ContextPanel;
 use crate::tui::components::file_changes_panel::FileChangesPanel;
 use crate::tui::components::file_tree::FileTree;
+use crate::tui::components::gateway_panel::GatewayPanel;
 use crate::tui::components::memory_panel::MemoryPanel;
+use crate::tui::components::skills_panel::SkillsPanel;
 use crate::tui::components::todo_panel::TodoPanel;
 use crate::tui::components::{Component, EventResult, RenderContext};
 use super::LayoutTree;
@@ -62,7 +64,7 @@ pub fn build_default_layout() -> LayoutTree {
             id: "gateway".to_string(),
             label: "Gateway".to_string(),
             icon: Some("🌐".to_string()),
-            content: Box::new(PlaceholderComponent { id: "gateway" }),
+            content: Box::new(GatewayPanel::new()),
         },
         TabDef {
             id: "files".to_string(),
@@ -80,7 +82,7 @@ pub fn build_default_layout() -> LayoutTree {
             id: "skills".to_string(),
             label: "Skills".to_string(),
             icon: Some("⚙️".to_string()),
-            content: Box::new(PlaceholderComponent { id: "skills" }),
+            content: Box::new(SkillsPanel::new()),
         },
         TabDef {
             id: "delegates".to_string(),

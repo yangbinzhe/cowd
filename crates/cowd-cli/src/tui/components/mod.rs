@@ -13,6 +13,7 @@ pub mod revert_dialog;
 pub mod export_dialog;
 pub mod file_changes_panel;
 pub mod file_tree;
+pub mod gateway_panel;
 pub mod prompt;
 pub mod render_engine;
 pub mod session_sidebar;
@@ -21,6 +22,7 @@ pub mod thinking_panel;
 pub mod memory_panel;
 pub mod question_form;
 pub mod toast;
+pub mod skills_panel;
 pub mod todo_panel;
 pub mod session_events;
 

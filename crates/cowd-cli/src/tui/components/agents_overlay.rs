@@ -182,7 +182,7 @@ impl Component for AgentsOverlay {
 
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "x: interrupt running agent",
+            "Keys: j↓ k↑  Enter:view-task  Tab:filter  Esc:close",
             Style::default().fg(Color::DarkGray),
         )));
 

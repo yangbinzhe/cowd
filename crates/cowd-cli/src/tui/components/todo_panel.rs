@@ -15,7 +15,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
-    text::{Line, Text},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
@@ -222,6 +222,12 @@ impl Component for TodoPanel {
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
             ));
         }
+
+        items.push(Line::raw(""));
+        items.push(Line::from(Span::styled(
+            "Keys: a:add  Enter:done  j↓ k↑  d:delete  p:priority",
+            Style::default().fg(Color::DarkGray),
+        )));
 
         let text = Text::from(items);
         let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });

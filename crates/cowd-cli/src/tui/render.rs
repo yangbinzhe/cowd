@@ -119,6 +119,11 @@ fn draw_gateway_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App)
             ]));
         }
     }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Keys: j↓ k↑  Enter:select  Tab:switch",
+        Style::default().fg(Color::DarkGray),
+    )));
     let block = Block::default().borders(Borders::ALL).title(" Gateway (Tab to switch) ").fg(Color::Cyan);
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), pa);
 }
@@ -223,6 +228,11 @@ fn draw_delegate_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App
             ]));
         }
     }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Keys: j↓ k↑  Enter:view  d:delete",
+        Style::default().fg(Color::DarkGray),
+    )));
     let block = Block::default().borders(Borders::ALL).title(" Delegate Dashboard (Tab to switch) ").fg(Color::Magenta);
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), pa);
 }
@@ -247,5 +257,10 @@ fn draw_skills_panel(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
             ]));
         }
     }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Keys: j↓ k↑  Enter:install  d:uninstall  r:refresh",
+        Style::default().fg(Color::DarkGray),
+    )));
     frame.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), area);
 }

@@ -641,6 +641,12 @@ impl FileTree {
             }
         }
 
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "Keys: j↓ k↑ Enter:open  h:toggle-hidden  r:refresh  o:collapse",
+            Style::default().fg(Color::DarkGray),
+        )));
+
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Files ")

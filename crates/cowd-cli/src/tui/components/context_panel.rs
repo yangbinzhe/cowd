@@ -160,6 +160,11 @@ impl Component for ContextPanel {
                 Style::default().fg(Color::Yellow),
             ),
         ]));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "Keys: t:token-detail  r:refresh",
+            Style::default().fg(Color::DarkGray),
+        )));
 
         let block = Block::default()
             .borders(Borders::ALL)

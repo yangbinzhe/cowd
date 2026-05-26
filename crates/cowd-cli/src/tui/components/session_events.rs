@@ -68,6 +68,12 @@ impl Component for SessionEvents {
             ]));
         }
 
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "Keys: j↓ k↑  Enter:switch-session  d:delete  r:refresh",
+            Style::default().fg(Color::DarkGray),
+        )));
+
         ctx.frame_mut().render_widget(Paragraph::new(lines), inner);
     }
 

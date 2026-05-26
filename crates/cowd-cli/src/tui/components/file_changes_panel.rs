@@ -9,7 +9,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
-    text::{Line, Text},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
@@ -247,6 +247,12 @@ impl Component for FileChangesPanel {
 
             items.push(Line::styled(label, style));
         }
+
+        items.push(Line::raw(""));
+        items.push(Line::from(Span::styled(
+            "Keys: j↓ k↑  Enter:diff  a:stage-all  s:stage-selected",
+            Style::default().fg(Color::DarkGray),
+        )));
 
         // Collapse indicator
         if self.collapsed && self.files.len() > self.collapse_limit {
