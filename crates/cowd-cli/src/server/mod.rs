@@ -769,6 +769,7 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
 
     let app = router.with_state(state);
 
+    tracing::info!(port = config.port, host = %config.host, "server started");
     println!("ClawServer HTTP listening on {} (PID: {})", addr, pid);
 
     axum::serve(listener, app)
@@ -776,6 +777,7 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
         .map_err(|e| ServerError(e.to_string()))?;
 
     // Clean up PID file
+    tracing::info!("server shutting down");
     fs::remove_file(pid_file()).ok();
 
     Ok(())

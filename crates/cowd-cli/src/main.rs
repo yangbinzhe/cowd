@@ -239,7 +239,49 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
+fn init_logging() {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    use tracing_appender::rolling;
+
+    let log_dir = runtime::cowd_dirs::config_home_dir().join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let file_appender = rolling::daily(&log_dir, "cowd");
+
+    // Level: debug builds = DEBUG, release = WARN
+    let default_level = if cfg!(debug_assertions) { "debug" } else { "warn" };
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_level));
+
+    // File layer: always on
+    let file_layer = fmt::layer()
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_writer(file_appender);
+
+    // Stderr layer: debug builds only
+    if cfg!(debug_assertions) {
+        let stderr_layer = fmt::layer()
+            .with_target(false)
+            .with_writer(std::io::stderr);
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .with(stderr_layer)
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .init();
+    }
+
+    tracing::info!("COWD v{} logging initialized", VERSION);
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+
     // 检查是否需要引导配置
     if bootstrap::needs_bootstrap() {
         bootstrap::run_bootstrap()?;
@@ -2471,6 +2513,7 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
 
     app.delegate_tasks.clear();
     if let Some(handoff) = runtime.create_memory_handoff() {
+        tracing::debug!(has_handoff = true, "memory handoff");
         for task in &handoff.task_states {
             app.delegate_tasks.push(tui::DelegateTask {
                 id: task.task_id.clone(),
@@ -2506,6 +2549,7 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
                 .handle()
                 .block_on(resume.resume_recent(&session_id, None, 10))
             {
+                tracing::info!(resumed = results.len(), "session resume");
                 for entry in results {
                     app.memory_entries.push(tui::MemoryEntry {
                         layer: "resume".to_string(),
@@ -2731,18 +2775,21 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                     let abort_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                                     abort_flag = Some(abort_signal.clone());
                                     let task = std::thread::spawn(move || {
+                                        tracing::debug!("TUI turn started");
                                         let _ = tx.send(tui::TuiEvent::TurnStarted);
                                         if abort_signal.load(std::sync::atomic::Ordering::Relaxed) { return; }
                                         rt_handle.block_on(async move {
                                             match prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await {
                                                 Ok(summary) => {
                                                     let final_text = final_assistant_text(&summary);
+                                                    tracing::info!(text_len = final_text.len(), iterations = summary.iterations, "TUI turn complete");
                                                     let _ = tx.send(tui::TuiEvent::TurnComplete {
                                                         assistant_text: final_text.clone(),
                                                         iterations: summary.iterations as u32,
                                                     });
                                                 }
                                                 Err(e) => {
+                                                    tracing::error!(error = %e, "TUI turn error");
                                                     let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
                                                 }
                                             }
@@ -6449,6 +6496,7 @@ impl AnthropicRuntimeClient {
                         }
                     }
                     ContentBlockDelta::SignatureDelta { signature } => {
+                        tracing::debug!("signature delta received");
                         events.push(AssistantEvent::SignatureDelta(signature));
                     }
                 },
@@ -6626,6 +6674,7 @@ async fn consume_stream_standalone(
                     }
                 }
                 ContentBlockDelta::SignatureDelta { signature } => {
+                    tracing::debug!("signature delta received");
                     events.push(AssistantEvent::SignatureDelta(signature));
                 }
             },

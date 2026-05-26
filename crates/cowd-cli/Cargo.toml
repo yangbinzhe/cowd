@@ -35,6 +35,8 @@ tokio-stream = "0.1"
 tools = { path = "../tools" }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 

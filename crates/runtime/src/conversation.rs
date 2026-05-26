@@ -668,6 +668,7 @@ pub async fn run_turn_async(
         prompter: &crate::permissions::SharedPrompter,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
+        tracing::info!(session_id = %self.session().session_id, "turn started");
 
         if self.session.read().unwrap_or_else(|e| e.into_inner()).compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
@@ -693,6 +694,7 @@ pub async fn run_turn_async(
             iterations += 1;
             if iterations > self.max_iterations {
                 let error = RuntimeError::new("max iterations exceeded");
+                tracing::error!(iterations, "turn failed: max iterations exceeded");
                 self.record_turn_failed(iterations, &error);
                 return Err(error);
             }
@@ -775,7 +777,8 @@ pub async fn run_turn_async(
             // Build assistant message with text + tool_use blocks
             let mut blocks = Vec::new();
             if !thinking_text.is_empty() {
-                blocks.push(ContentBlock::Thinking { thinking: thinking_text, signature: thinking_signature });
+                blocks.push(ContentBlock::Thinking { thinking: thinking_text.clone(), signature: thinking_signature.clone() });
+                tracing::debug!(thinking_len = thinking_text.len(), has_signature = thinking_signature.is_some(), "thinking block stored");
             }
             blocks.push(ContentBlock::Text { text: current_text });
             for (id, name, input) in &pending_tool_uses {
@@ -887,6 +890,7 @@ pub async fn run_turn_async(
             auto_compaction,
         };
 self.record_turn_completed(&summary);
+        tracing::info!(iterations = %summary.iterations, tokens = %summary.usage.total_tokens(), "turn completed");
         if let Some(ref bus) = self.bus {
             bus.emit(crate::bus::Event::TurnCompleted {
                 tokens: summary.usage.total_tokens(),
@@ -1065,6 +1069,7 @@ self.record_turn_completed(&summary);
             return None;
         }
 
+        tracing::info!(removed = result.removed_message_count, "compaction");
         *self.session.write().unwrap_or_else(|e| e.into_inner()) = result.compacted_session;
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
@@ -1259,6 +1264,7 @@ self.record_turn_completed(&summary);
         match mgr.prepare_context(user_input, &mem_messages).await {
             Ok(mut prepared) => {
                 if prepared.entries.is_empty() {
+                    tracing::debug!(entries = 0, "memory context prepared");
                     if let Some(cb) = &self.memory_callback {
                         cb.on_memory_update(Vec::new(), "no memories found");
                     }
@@ -1384,6 +1390,7 @@ self.record_turn_completed(&summary);
                     cb.on_memory_update(entries, &status);
                 }
 
+                tracing::debug!(entries = prepared.entries.len(), "memory context prepared");
                 let mut prompt = self.system_prompt.clone();
                 prompt.insert(0, context);
                 self.cached_prompt.rebuild(prompt.clone(), actual_memory_high);

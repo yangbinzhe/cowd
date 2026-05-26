@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tracing;
 
 use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
@@ -1306,7 +1307,10 @@ fn parse_sse_frame(
     }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
         .map(Some)
-        .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
+        .map_err(|error| {
+            tracing::warn!(error = %error, "stream chunk parse error");
+            ApiError::json_deserialize(provider, model, &payload, error)
+        })
 }
 
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
@@ -1357,6 +1361,8 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     let body = response.text().await.unwrap_or_default();
     let parsed_error = serde_json::from_str::<ErrorEnvelope>(&body).ok();
     let retryable = is_retryable_status(status);
+
+    tracing::error!(status = status.as_u16(), body = %body, retryable, "API request failed");
 
     Err(ApiError::Api {
         status,
