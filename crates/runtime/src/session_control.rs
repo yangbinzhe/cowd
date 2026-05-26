@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -5,6 +7,22 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::session::{Session, SessionError};
+
+// ── DEPRECATED ────────────────────────────────────────────────────────────
+// The SessionStore and all associated types/functions in this module have been
+// replaced by the unified session storage layer in `crates/runtime/src/storage/`.
+//
+// MIGRATION:
+//   - `SessionStore::from_cwd()`       → `UnifiedSessionStore::open_workspace_root()`
+//   - `SessionStore::from_data_dir()`  → `UnifiedSessionStore::open_data_dir()`
+//   - `SessionStore::from_project_dir()` → `UnifiedSessionStore::open_project_dir()`
+//   - `SessionStore::global()`         → `UnifiedSessionStore::open_global()`
+//   - Freestanding `*_for()` helpers   → Use `UnifiedSessionStore` methods directly
+//
+// This module is retained for backward compatibility until all callers are
+// migrated. The `workspace_sessions_dir()` convenience in `session.rs` is the
+// last remaining internal consumer.
+// ───────────────────────────────────────────────────────────────────────────
 
 /// Per-worktree session store that namespaces on-disk session files by
 /// workspace fingerprint so that parallel `cowd serve` instances never
@@ -19,6 +37,7 @@ use crate::session::{Session, SessionError};
 /// Use [`SessionStore::from_project_dir`] for the legacy project-local layout
 /// (`<project>/.cowd/sessions/<hash>/`) when project-scoped isolation is
 /// explicitly required.
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead. See migration notice at top of file."]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStore {
     /// Resolved root of the session namespace.
@@ -310,6 +329,7 @@ impl SessionStore {
 /// Uses FNV-1a (64-bit) to produce a 16-char hex string that partitions the
 /// on-disk session directory per workspace root.
 #[must_use]
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn workspace_fingerprint(workspace_root: &Path) -> String {
     let input = workspace_root.to_string_lossy();
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -320,18 +340,23 @@ pub fn workspace_fingerprint(workspace_root: &Path) -> String {
     format!("{hash:016x}")
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub const LEGACY_SESSION_EXTENSION: &str = "json";
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub const LATEST_SESSION_REFERENCE: &str = "latest";
 
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionHandle {
     pub id: String,
     pub path: PathBuf,
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedSessionSummary {
     pub id: String,
@@ -353,12 +378,14 @@ fn sort_managed_sessions(sessions: &mut [ManagedSessionSummary]) {
     });
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedManagedSession {
     pub handle: SessionHandle,
     pub session: Session,
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkedManagedSession {
     pub parent_session_id: String,
@@ -367,6 +394,7 @@ pub struct ForkedManagedSession {
     pub branch_name: Option<String>,
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 #[derive(Debug)]
 pub enum SessionControlError {
     Io(std::io::Error),
@@ -405,10 +433,12 @@ impl From<SessionError> for SessionControlError {
     }
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn sessions_dir() -> Result<PathBuf, SessionControlError> {
     managed_sessions_dir_for(env::current_dir()?)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn managed_sessions_dir_for(
     base_dir: impl AsRef<Path>,
 ) -> Result<PathBuf, SessionControlError> {
@@ -416,12 +446,14 @@ pub fn managed_sessions_dir_for(
     Ok(store.sessions_dir().to_path_buf())
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn create_managed_session_handle(
     session_id: &str,
 ) -> Result<SessionHandle, SessionControlError> {
     create_managed_session_handle_for(env::current_dir()?, session_id)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn create_managed_session_handle_for(
     base_dir: impl AsRef<Path>,
     session_id: &str,
@@ -430,10 +462,12 @@ pub fn create_managed_session_handle_for(
     Ok(store.create_handle(session_id))
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn resolve_session_reference(reference: &str) -> Result<SessionHandle, SessionControlError> {
     resolve_session_reference_for(env::current_dir()?, reference)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn resolve_session_reference_for(
     base_dir: impl AsRef<Path>,
     reference: &str,
@@ -442,10 +476,12 @@ pub fn resolve_session_reference_for(
     store.resolve_reference(reference)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, SessionControlError> {
     resolve_managed_session_path_for(env::current_dir()?, session_id)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn resolve_managed_session_path_for(
     base_dir: impl AsRef<Path>,
     session_id: &str,
@@ -454,6 +490,7 @@ pub fn resolve_managed_session_path_for(
     store.resolve_managed_path(session_id)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 #[must_use]
 pub fn is_managed_session_file(path: &Path) -> bool {
     path.extension()
@@ -463,10 +500,12 @@ pub fn is_managed_session_file(path: &Path) -> bool {
         })
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, SessionControlError> {
     list_managed_sessions_for(env::current_dir()?)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn list_managed_sessions_for(
     base_dir: impl AsRef<Path>,
 ) -> Result<Vec<ManagedSessionSummary>, SessionControlError> {
@@ -474,10 +513,12 @@ pub fn list_managed_sessions_for(
     store.list_sessions()
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn latest_managed_session() -> Result<ManagedSessionSummary, SessionControlError> {
     latest_managed_session_for(env::current_dir()?)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn latest_managed_session_for(
     base_dir: impl AsRef<Path>,
 ) -> Result<ManagedSessionSummary, SessionControlError> {
@@ -485,10 +526,12 @@ pub fn latest_managed_session_for(
     store.latest_session()
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn load_managed_session(reference: &str) -> Result<LoadedManagedSession, SessionControlError> {
     load_managed_session_for(env::current_dir()?, reference)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn load_managed_session_for(
     base_dir: impl AsRef<Path>,
     reference: &str,
@@ -497,6 +540,7 @@ pub fn load_managed_session_for(
     store.load_session(reference)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn fork_managed_session(
     session: &Session,
     branch_name: Option<String>,
@@ -504,6 +548,7 @@ pub fn fork_managed_session(
     fork_managed_session_for(env::current_dir()?, session, branch_name)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 pub fn fork_managed_session_for(
     base_dir: impl AsRef<Path>,
     session: &Session,
@@ -513,6 +558,7 @@ pub fn fork_managed_session_for(
     store.fork_session(session, branch_name)
 }
 
+#[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead."]
 #[must_use]
 pub fn is_session_reference_alias(reference: &str) -> bool {
     SESSION_REFERENCE_ALIASES

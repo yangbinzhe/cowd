@@ -1514,7 +1514,7 @@ mod tests {
 /// by the workspace fingerprint of the given working directory.
 /// This prevents parallel `opencode serve` instances from colliding.
 /// Called by external consumers (e.g. cowd-orchestrator) to enumerate sessions for a CWD.
-#[allow(dead_code)]
+#[allow(dead_code, deprecated)]
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
     let store = crate::session_control::SessionStore::from_cwd(cwd)
         .map_err(|e| SessionError::Io(std::io::Error::other(e.to_string())))?;

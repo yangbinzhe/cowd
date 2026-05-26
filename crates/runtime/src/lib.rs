@@ -56,7 +56,9 @@ mod remote;
 pub mod sandbox;
 mod session;
 pub use session::workspace_sessions_dir;
-pub mod session_control;
+#[allow(deprecated)]
+mod session_control;
+#[allow(deprecated)]
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;

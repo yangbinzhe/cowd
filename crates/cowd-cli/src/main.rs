@@ -12,6 +12,7 @@ mod mcp_serve;
 mod doctor;
 mod checks;
 mod render;
+mod gateway;
 mod server;
 mod suggestions;
 mod tui;
