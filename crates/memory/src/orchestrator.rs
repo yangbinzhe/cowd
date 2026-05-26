@@ -312,7 +312,8 @@ impl MemoryOrchestrator {
     /// Call periodically after significant memory insertions to keep
     /// the routing index fresh.
     pub async fn rebuild_closet(&self) -> Result<()> {
-        *self.closet.lock() = ClosetManager::build_from_orchestrator(self).await?;
+        let rebuilt = ClosetManager::build_from_orchestrator(self).await?;
+        *self.closet.lock() = rebuilt;
         Ok(())
     }
 

@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;

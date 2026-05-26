@@ -58,7 +58,6 @@ pub mod sandbox;
 mod session;
 pub use session::workspace_sessions_dir;
 pub mod session_control;
-pub mod session_manager;
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
@@ -67,8 +66,7 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
-#[cfg(test)]
-mod trust_resolver;
+pub mod trust_resolver;
 mod usage;
 pub mod worker_boot;
 pub mod tool_orchestrator;

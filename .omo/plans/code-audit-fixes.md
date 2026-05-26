@@ -63,11 +63,11 @@
 - `crates/config/Cargo.toml` + `crates/memory/Cargo.toml` — thiserror v1→v2
 
 ### Definition of Done
-- [ ] `cargo build --release` 零错误 + 零警告
-- [ ] `cargo test` 全部通过 (456 + 相关测试)
-- [ ] 所有 `Handle::current().block_on()` 在生产路径中已消除或安全
-- [ ] 所有 `.lock().unwrap()` 在生产代码中已转换为 `into_inner()` 模式
-- [ ] 版本号统一到 0.6.7
+- [x] `cargo build --release` 零错误 + 零警告
+- [x] `cargo test` 全部通过 (456 + 相关测试)
+- [x] 所有 `Handle::current().block_on()` 在生产路径中已消除或安全
+- [x] 所有 `.lock().unwrap()` 在生产代码中已转换为 `into_inner()` 模式
+- [x] 版本号统一到 0.6.7
 
 ### Must Have
 - 所有崩溃 Bug 修复
@@ -345,7 +345,7 @@ Critical Path: Task 1 → Task 5 → Task 6 → Task 7 → Task 16 → F1-F4
 
   **Commit**: Groups with T7
 
-- [ ] 7. **server/mod.rs:3322 — server_execute_turn 嵌套 enter_runtime 修复**
+- [x] 7. **server/mod.rs:3322 — server_execute_turn 嵌套 enter_runtime 修复**
 
   **What to do**:
   - 读取 `crates/cowd-cli/src/server/mod.rs:3318-3328`
@@ -379,7 +379,7 @@ Critical Path: Task 1 → Task 5 → Task 6 → Task 7 → Task 16 → F1-F4
 
   **Commit**: Groups with T6
 
-- [ ] 8. **orchestrator.rs:315 — MutexGuard 跨越 .await 修复**
+- [x] 8. **orchestrator.rs:315 — MutexGuard 跨越 .await 修复**
 
   **What to do**:
   - 读取 `crates/memory/src/orchestrator.rs:310-320`
@@ -412,7 +412,7 @@ Critical Path: Task 1 → Task 5 → Task 6 → Task 7 → Task 16 → F1-F4
   **Commit**: YES
   - Message: `fix: orchestrator rebuild_closet — drop MutexGuard before .await`
 
-- [ ] 9. **移除 #![allow(deprecated)] — conversation.rs**
+- [x] 9. **移除 #![allow(deprecated)] — conversation.rs**
 
   **What to do**:
   - 读取 `crates/runtime/src/conversation.rs:1` — 确认 `#![allow(deprecated)]` 存在
@@ -438,7 +438,7 @@ Critical Path: Task 1 → Task 5 → Task 6 → Task 7 → Task 16 → F1-F4
 
   **Commit**: Groups with T10, T11
 
-- [ ] 10. **移除 #![allow(deprecated)] — store/session.rs + session_store.rs**
+- [x] 10. **移除 #![allow(deprecated)] — store/session.rs + session_store.rs**
 
   **What to do**:
   - 读取 `crates/memory/src/store/session.rs:1` — 删除 `#![allow(deprecated)]`
@@ -462,7 +462,7 @@ Critical Path: Task 1 → Task 5 → Task 6 → Task 7 → Task 16 → F1-F4
 
   **Commit**: Groups with T9, T11
 
-- [ ] 11. **删除 runtime session_manager.rs 死代码**
+- [x] 11. **删除 runtime session_manager.rs 死代码**
 
   **What to do**:
   - 确认零外部引用: `grep -rn "InMemorySessionManager\|SessionManager" crates/cowd-cli/src/ crates/runtime/src/ --include="*.rs" | grep -v "session_manager.rs" | grep -v "test"`
@@ -486,7 +486,7 @@ Critical Path: Task 1 → Task 5 → Task 6 → Task 7 → Task 16 → F1-F4
 
   **Commit**: Groups with T9, T10
 
-- [ ] 12. **处理 ProviderChain 死代码**
+- [x] 12. **处理 ProviderChain 死代码**
 
   **What to do**:
   - 确认零外部调用: `grep -rn "ProviderChain" crates/ --include="*.rs" | grep -v "provider_chain.rs" | grep -v "lib.rs"`
@@ -512,7 +512,7 @@ Critical Path: Task 1 → Task 5 → Task 6 → Task 7 → Task 16 → F1-F4
   **Commit**: YES
   - Message: `cleanup: remove dead ProviderChain code (398 lines)`
 
-- [ ] 13. **处理 trust_resolver #[cfg(test)] 门控**
+- [x] 13. **处理 trust_resolver #[cfg(test)] 门控**
 
   **What to do**:
   - 读取 `crates/runtime/src/lib.rs:70-71,210-211`

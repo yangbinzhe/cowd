@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! SQLite-backed session store for Gateway [`SessionContext`] persistence.
 //!
 //! Follows the same design as [`super::sqlite`]: the database **path** is
