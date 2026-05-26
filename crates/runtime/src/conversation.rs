@@ -1037,6 +1037,7 @@ self.record_turn_completed(&summary);
         session_tracer.record("turn_started", attributes);
     }
 
+    #[allow(dead_code)]
     fn record_assistant_iteration(
         &self,
         iteration: usize,
@@ -1074,6 +1075,7 @@ self.record_turn_completed(&summary);
         session_tracer.record("tool_execution_started", attributes);
     }
 
+    #[allow(dead_code)]
     fn record_tool_finished(&self, iteration: usize, result_message: &ConversationMessage) {
         let Some(session_tracer) = &self.session_tracer else {
             return;
@@ -1477,6 +1479,7 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
+#[allow(dead_code)]
 fn build_assistant_message(
     events: Vec<AssistantEvent>,
 ) -> Result<
@@ -1540,6 +1543,7 @@ fn build_assistant_message(
     ))
 }
 
+#[allow(dead_code)]
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
@@ -1549,6 +1553,7 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
 }
 
 /// P1-7: Flush accumulated thinking content into a Thinking content block.
+#[allow(dead_code)]
 fn flush_thinking_block(thinking: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !thinking.is_empty() {
         blocks.push(ContentBlock::Thinking {
@@ -1557,6 +1562,7 @@ fn flush_thinking_block(thinking: &mut String, blocks: &mut Vec<ContentBlock>) {
     }
 }
 
+#[allow(dead_code)]
 fn format_hook_message(result: &HookRunResult, fallback: &str) -> String {
     if result.messages().is_empty() {
         fallback.to_string()
@@ -1565,6 +1571,7 @@ fn format_hook_message(result: &HookRunResult, fallback: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> String {
     if messages.is_empty() { return output; }
     let mut combined = output;
@@ -1620,7 +1627,6 @@ impl ToolExecutor for StaticToolExecutor {
 
 #[cfg(test)]
 mod tests {
-    #![allow(deprecated)]
 
     use super::{
         ApiClient, ApiRequest,

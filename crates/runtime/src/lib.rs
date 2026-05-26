@@ -47,7 +47,6 @@ pub mod provider_pool;
 pub mod effect;
 pub mod bus;
 pub mod context_profiler;
-pub mod subagent_executor;
 pub mod task_graph;
 pub mod platform;
 mod policy_engine;
@@ -205,7 +204,6 @@ pub use stale_branch::{
     StaleBranchPolicy,
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket};
-#[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,

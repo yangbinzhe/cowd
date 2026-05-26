@@ -537,7 +537,7 @@ Critical Path: Task 1 → Task 5 → Task 6 → Task 7 → Task 16 → F1-F4
 
   **Commit**: Groups with T14, T15
 
-- [ ] 14. **处理 SubAgentExecutor 命名冲突**
+- [x] 14. **处理 SubAgentExecutor 命名冲突**
 
   **What to do**:
   - 确认零外部调用: `grep -rn "subagent_executor::SubAgentExecutor" crates/ --include="*.rs"`
@@ -563,7 +563,7 @@ Critical Path: Task 1 → Task 5 → Task 6 → Task 7 → Task 16 → F1-F4
 
   **Commit**: Groups with T13, T15
 
-- [ ] 15. **清理 17 构建警告 + dead_code 审计**
+- [x] 15. **清理 17 构建警告 + dead_code 审计**
 
   **What to do**:
   - `cargo build 2>&1 | grep "warning:" | grep -v "imap-proto"` → 获取所有警告列表
@@ -590,7 +590,7 @@ Critical Path: Task 1 → Task 5 → Task 6 → Task 7 → Task 16 → F1-F4
 
   **Commit**: Groups with T13, T14
 
-- [ ] 16. **全量构建验证 + 测试 + 崩溃日志验证**
+- [x] 16. **全量构建验证 + 测试 + 崩溃日志验证**
 
   **What to do**:
   - `cargo build --release` → 零错误零警告（imap-proto 除外）
@@ -708,19 +708,19 @@ Critical Path: Task 1 → Task 5 → Task 6 → Task 7 → Task 16 → F1-F4
 
 ## Final Verification Wave (MANDATORY — after ALL implementation tasks)
 
-- [ ] F1. **Plan Compliance Audit** — `oracle`
+- [x] F1. **Plan Compliance Audit** — `oracle`
   Read the plan end-to-end. For each "Must Have": verify implementation exists. For each "Must NOT Have": search codebase. Check evidence files exist in .omo/evidence/.
   Output: `Must Have [N/N] | Must NOT Have [N/N] | Tasks [N/N] | VERDICT: APPROVE/REJECT`
 
-- [ ] F2. **Code Quality Review** — `unspecified-high`
+- [x] F2. **Code Quality Review** — `unspecified-high`
   Run `cargo build --release` + `cargo test`. Review all changed files for: `as any`/`@ts-ignore`, empty catches, console.log in prod, commented-out code, unused imports. Check AI slop.
   Output: `Build [PASS/FAIL] | Tests [N pass/N fail] | Warnings [N] | VERDICT`
 
-- [ ] F3. **Real Manual QA** — `unspecified-high`
+- [x] F3. **Real Manual QA** — `unspecified-high`
   Start from clean state. Run TUI with `--solo`. Send test message. Verify no crash.log entries. Run HTTP API if applicable.
   Output: `TUI [PASS/FAIL] | Crash log [0 new] | VERDICT`
 
-- [ ] F4. **Scope Fidelity Check** — `deep`
+- [x] F4. **Scope Fidelity Check** — `deep`
   For each task: read "What to do", read actual diff. Verify 1:1. Check "Must NOT do" compliance.
   Output: `Tasks [N/N compliant] | Contamination [CLEAN/N issues] | VERDICT`
 
@@ -745,7 +745,7 @@ grep -rn "\.lock()\.unwrap()" crates/memory/src/cognitive.rs  # Expected: 0 (not
 ```
 
 ### Final Checklist
-- [ ] All "Must Have" present
-- [ ] All "Must NOT Have" absent
-- [ ] All tests pass
-- [ ] Zero new crash.log entries
+- [x] All "Must Have" present
+- [x] All "Must NOT Have" absent
+- [x] All tests pass
+- [x] Zero new crash.log entries

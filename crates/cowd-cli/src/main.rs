@@ -19,16 +19,16 @@ mod tui;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::io::FromRawFd;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use api::{
     detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
@@ -49,8 +49,8 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, format_stale_base_warning, format_usd,
-    load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
+    check_base_commit, format_stale_base_warning,
+    load_system_prompt, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy,
     ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
@@ -62,7 +62,6 @@ use tools::{
     GlobalToolRegistry, RuntimeToolDefinition,
 };
 
-use crossterm::event::EventStream;
 use futures::StreamExt;
 
 pub(crate) const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -944,7 +943,7 @@ fn parse_direct_slash_cli_action(
     output_format: CliOutputFormat,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    compact: bool,
+    _compact: bool,
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
