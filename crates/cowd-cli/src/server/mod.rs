@@ -2298,9 +2298,20 @@ async fn handle_ws(mut socket: WebSocket, addr: std::net::SocketAddr, state: Htt
             // P0-1: Attach smart approval gate
             runtime = runtime.with_approval_gate(state.approval_gate.clone());
 
-            match tokio::runtime::Handle::current()
-                .block_on(runtime.run_turn_async(&user_input, &runtime::permissions::SharedPrompter::none())) {
-                Ok(summary) => Ok(summary
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ui = user_input;
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("ws turn rt");
+                let result = rt.block_on(
+                    runtime.run_turn_async(&ui, &runtime::permissions::SharedPrompter::none())
+                );
+                let _ = tx.send(result);
+            });
+            match rx.recv() {
+                Ok(Ok(summary)) => Ok(summary
                     .assistant_messages
                     .iter()
                     .flat_map(|msg| &msg.blocks)
@@ -2310,7 +2321,8 @@ async fn handle_ws(mut socket: WebSocket, addr: std::net::SocketAddr, state: Htt
                     })
                     .collect::<Vec<_>>()
                     .join("")),
-                Err(e) => Err(format!("Runtime error: {}", e)),
+                Ok(Err(e)) => Err(format!("Runtime error: {}", e)),
+                Err(_) => Err("Thread panicked".to_string()),
             }
         };
         // runtime dropped here
@@ -3291,7 +3303,10 @@ async fn send_message_handler(
         let mut mem_messages = vec![user_msg, assistant_msg];
         let mgr_arc = Arc::clone(mgr);
         let _ = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("memory rt");
             rt.block_on(async { mgr_arc.on_turn_end(&mut mem_messages).await })
         }).await;
     }
@@ -3319,7 +3334,11 @@ fn server_execute_turn(input: &str) -> Result<String, Box<dyn std::error::Error 
     let prompter = runtime::permissions::SharedPrompter::new(Box::new(
         crate::CliPermissionPrompter::new(runtime::PermissionMode::DangerFullAccess)
     ));
-    let summary = tokio::runtime::Handle::current()
+    let turn_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("server_execute_turn rt");
+    let summary = turn_rt
         .block_on(runtime.run_turn_async(input, &prompter))
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
     let text = summary.assistant_messages.last()

@@ -1,7 +1,9 @@
 {
-  "active_plan": "/media/yi/Datas/workspace/cowd/.omo/plans/v0.6.x-roadmap.md",
-  "started_at": "2026-05-25T16:02:23.317Z",
-  "session_ids": ["ses_1ac7fbf51ffeBq73jfxdTDwx4Q"],
-  "plan_name": "v0.6.x-roadmap",
+  "active_plan": "/media/yi/Datas/workspace/cowd/.omo/plans/code-audit-fixes.md",
+  "started_at": "2026-05-26T00:36:28.051Z",
+  "session_ids": [
+    "ses_1ac7fbf51ffeBq73jfxdTDwx4Q"
+  ],
+  "plan_name": "code-audit-fixes",
   "worktree_path": "/media/yi/Datas/workspace/cowd"
 }

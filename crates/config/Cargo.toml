@@ -9,7 +9,7 @@ publish.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
 
 [lints.rust]

@@ -1476,7 +1476,7 @@ impl CognitiveContextManager {
     pub fn persist_vector_index(&self) -> Result<()> {
         self.vector_index
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .persist()
             .map_err(|e| MemoryError::Store(format!("persist vector index: {e}")))
     }

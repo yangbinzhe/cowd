@@ -1,0 +1,17 @@
+# Task 2: Permissions Lock Poison Fix
+
+## Change
+- **File**: `crates/runtime/src/permissions.rs:116`
+- **Before**: `self.inner.lock().expect("SharedPrompter lock poisoned")`
+- **After**:  `self.inner.lock().unwrap_or_else(|e| e.into_inner())`
+
+## Verification
+- [x] `.lock().expect()` removed from permissions.rs (grep returns no matches)
+- [x] Build: `cargo check -p runtime` — 0 errors
+- [x] Permissions tests: 9/9 passed (`cargo test --lib -p runtime -- permissions`)
+- [x] Return type unchanged (`std::sync::MutexGuard<'_, Option<Box<dyn PermissionPrompter>>>`)
+- [x] No other lock() calls affected
+
+## Pre-existing test failures (unrelated)
+- `config_validate::tests::validates_nested_permissions_keys` — expects 1 diagnostic, gets 0 (config validation bug, not related to lock change)
+- Other config_validate and conversation tests also fail pre-existing

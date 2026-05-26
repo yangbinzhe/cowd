@@ -113,7 +113,7 @@ impl SharedPrompter {
 
     /// Lock the inner prompter and return a guard.
     pub fn lock(&self) -> std::sync::MutexGuard<'_, Option<Box<dyn PermissionPrompter>>> {
-        self.inner.lock().expect("SharedPrompter lock poisoned")
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

@@ -4,6 +4,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 use std::pin::Pin;
+use futures::stream;
 use futures::stream::Stream;
 use crate::conversation::{ApiClient, ApiRequest, AssistantEvent, RuntimeError};
 
@@ -43,6 +44,9 @@ impl ProviderPool {
 impl ApiClient for ProviderPool {
     fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
         let idx = self.current.load(Ordering::Relaxed) % self.clients.len().max(1);
+        if self.clients.is_empty() {
+            return Box::pin(stream::once(async { Err(RuntimeError::new("ProviderPool: no clients configured")) }));
+        }
         self.clients[idx].stream(request)
     }
 }
