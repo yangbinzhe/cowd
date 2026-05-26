@@ -3402,7 +3402,7 @@ impl LiveCli {
             |context| context.git_summary.headline(),
         );
         format!(
-            "\x1b[1;31m============================\n          COWD v{VERSION}\n============================\x1b[0m\n\
+            "============================\n\x1b[1;31m          COWD v{VERSION}\x1b[0m\n============================\n\
    \x1b[2mModel\x1b[0m       {}\n\
    \x1b[2mWorkspace\x1b[0m    {}\n\
    \x1b[2mBranch\x1b[0m       {}\n\

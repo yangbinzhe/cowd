@@ -718,6 +718,7 @@ pub async fn run_turn_async(
             // Use the new Stream-based API — consume events as they arrive
             use futures::StreamExt;
             let mut current_text = String::new();
+            let mut thinking_text = String::new();
             let mut pending_tool_uses: Vec<(String, String, String)> = Vec::new();
             let mut turn_usage: Option<TokenUsage> = None;
             let mut stream_events: Vec<(String, String, String, u8)> = Vec::new();
@@ -731,7 +732,7 @@ pub async fn run_turn_async(
                             stream_events.push(("text_delta".into(), "assistant".into(), text[..text.len().min(80)].to_string(), 3));
                         }
                         AssistantEvent::ThinkingDelta(thinking) => {
-                            current_text.push_str(&format!("\n[think]{}[/think]\n", thinking));
+                            thinking_text.push_str(&thinking);
                             stream_events.push(("thinking".into(), "reasoning".into(), thinking[..thinking.len().min(80)].to_string(), 2));
                         }
                         AssistantEvent::ToolUse { id, name, input } => { pending_tool_uses.push((id, name, input)); }
@@ -765,7 +766,11 @@ pub async fn run_turn_async(
             }
 
             // Build assistant message with text + tool_use blocks
-            let mut blocks = vec![ContentBlock::Text { text: current_text }];
+            let mut blocks = Vec::new();
+            if !thinking_text.is_empty() {
+                blocks.push(ContentBlock::Thinking { thinking: thinking_text });
+            }
+            blocks.push(ContentBlock::Text { text: current_text });
             for (id, name, input) in &pending_tool_uses {
                 blocks.push(ContentBlock::ToolUse {
                     id: id.clone(),
