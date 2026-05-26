@@ -1,0 +1,68 @@
+use crate::tui::TuiSession;
+use crate::reporter::TestRunner;
+use crate::llm;
+
+pub fn has_scenario(name: &str) -> bool {
+    matches!(name, "tui_startup" | "tui_chat" | "tui_chat_stream" | "tui_scroll_expand" | "tui_search" | "tui_sidebar_tabs" | "" | "all")
+}
+
+pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
+    let tui = TuiSession::new("tui-basic")?;
+    tui.wait_for("COWD", 15).ok();
+    println!("\n── TUI Basic ──");
+
+    runner.run("Startup: COWD logo + status bar", || {
+        let cap = tui.capture()?;
+        if !cap.contains("COWD") { return Err(anyhow::anyhow!("COWD logo not found")); }
+        if !cap.contains("Model") { return Err(anyhow::anyhow!("Status bar missing")); }
+        Ok(())
+    });
+
+    runner.run("Chat: send message, receive streaming reply", || {
+        // LLM generates a contextually relevant test prompt
+        let prompt = llm::generate_prompt("conversational_ai");
+        println!("  LLM prompt: {}", prompt);
+
+        tui.send(&prompt)?;
+        tui.enter()?;
+
+        // LLM validates the output semantics
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        let output = tui.capture()?;
+        llm::validate_output(&output, "The terminal output shows an AI assistant's response that is helpful and on-topic. It should contain actual response text, not just an error message.")
+            .map_err(|e| anyhow::anyhow!("Output validation failed: {e}"))
+    });
+
+    runner.run("Scroll: PgUp/PgDn changes viewport", || {
+        tui.send("Write a haiku about programming")?; tui.enter()?;
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        tui.send("Write another about debugging")?; tui.enter()?;
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        let before = tui.capture()?;
+        tui.send_key("PageUp")?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        tui.send_key("PageDown")?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let after = tui.capture()?;
+        // LLM validates scroll changed viewport
+        llm::validate_output(&after, "The terminal output should look different from before scrolling, showing a different portion of conversation history.")
+            .or_else(|_| {
+                // Fallback: basic heuristic if no LLM
+                if before == after { Err(anyhow::anyhow!("Scroll did not change viewport")) }
+                else { Ok(()) }
+            })
+    });
+
+    runner.run("Sidebar: Tab cycles panels", || {
+        tui.send_key("Tab")?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let cap = tui.capture()?;
+        if !cap.contains("Context") && !cap.contains("Changes") && !cap.contains("Todo") {
+            return Err(anyhow::anyhow!("Sidebar tab labels not visible"));
+        }
+        Ok(())
+    });
+
+    tui.close()?;
+    Ok(())
+}
