@@ -8,6 +8,8 @@
 mod api_routes;
 mod bootstrap;
 mod cli;
+mod daemon;
+mod event_bus;
 mod init;
 mod mcp_serve;
 mod doctor;
@@ -56,7 +58,7 @@ use runtime::{
     load_system_prompt, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage, TurnSummary,
+    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
     ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
@@ -344,106 +346,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Doctor { output_format } => doctor::run_doctor(output_format)?,
         CliAction::State { output_format } => mcp_serve::run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
-        CliAction::Serve { host, port, auth_enabled, cors_origins, output_format: _, solo_mode } => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-            // ── 加载统一配置 ──
-            let loader = runtime::ConfigLoader::default_for(&cwd);
-            let runtime_config = match loader.load() {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    eprintln!("warn: failed to load config, using defaults: {e}");
-                    runtime::RuntimeConfig::empty()
-                }
-            };
-
-            // ── 从统一配置提取各字段 ──
-
-            // 查找 gateway 中的 api_server 平台配置
-            let api_server_platform = runtime_config
-                .gateway()
-                .platforms
-                .iter()
-                .find(|p| p.platform_type == "api_server" && p.enabled);
-
-            // host/port: CLI 参数 > gateway 配置 > 硬编码默认值
-            let effective_host = if let Some(host_override) = host {
-                host_override
-            } else {
-                api_server_platform
-                    .and_then(|p| p.extra.get("host"))
-                    .and_then(|h| h.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| "127.0.0.1".to_string())
-            };
-            let effective_port = if let Some(port_override) = port {
-                port_override
-            } else {
-                api_server_platform
-                    .and_then(|p| p.extra.get("port"))
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n as u16)
-                    .unwrap_or(8642)
-            };
-            // auth: --no-auth 标志 > gateway 配置 > 默认启用
-            let effective_auth_enabled = if !auth_enabled {
-                false // --no-auth 明确禁用
-            } else {
-                api_server_platform
-                    .and_then(|p| p.extra.get("auth"))
-                    .and_then(|a| a.as_object())
-                    .and_then(|obj| obj.get("enabled"))
-                    .and_then(|e| e.as_bool())
-                    .unwrap_or(auth_enabled)
-            };
-            // auth token: 从 gateway.platforms[api_server].auth.token 提取
-            let auth_token = api_server_platform
-                .and_then(|p| p.extra.get("auth"))
-                .and_then(|a| a.as_object())
-                .and_then(|obj| obj.get("token"))
-                .and_then(|t| t.as_str())
-                .map(String::from)
-                .unwrap_or_default();
-
-            // session store path
-            let session_store_path = {
-                let store_dir = cwd.join(".cowd").join("sessions");
-                std::fs::create_dir_all(&store_dir).ok();
-                Some(store_dir.join("sessions.db"))
-            };
-
-            // memory config: runtime::config::MemoryConfig → memory::MemoryConfig
-            let memory_config = build_memory_config(runtime_config.memory(), &cwd);
-
-            // platform configs: runtime::config::PlatformConfig → runtime::platform::PlatformConfig
-            let platform_configs = build_platform_configs(runtime_config.gateway());
-
-            // approval config: 如果 --solo 启用，强制设置 solo_mode=true
-            let mut approval_config = runtime_config.approval().clone();
-            if solo_mode {
-                approval_config.solo_mode = true;
-                approval_config.solo_honor_critical = false;
-                eprintln!("🚀 SOLO mode enabled: all command approvals bypassed");
-            }
-
-            let config = server::HttpConfig {
-                host: effective_host,
-                port: effective_port,
-                auth_enabled: effective_auth_enabled,
-                auth_token,
-                with_webui: true,
-                memory_config,
-                session_store_path,
-                platform_configs,
-                cors_origins,
-                approval_config: Some(approval_config),
-                session_reset: runtime_config.gateway().session_reset,
-            };
-            let r2 = SHARED_RT.handle().clone();
-            r2.block_on(async {
-                server::start_http_server(config).await.map_err(|e| e.to_string())
-            })?;
-        }
         CliAction::Export {
             session_reference,
             output_path,
@@ -456,19 +358,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
-            compact,
-            prompt,
-        } => run_repl(
-            model,
-            allowed_tools,
-            permission_mode,
-            base_commit,
-            reasoning_effort,
-            allow_broad_cwd,
-            compact,
-            prompt,
-        )?,
-        CliAction::MigrateSessions { output_format } => run_migrate_sessions(output_format)?,
+        } => {
+            // Auto-start daemon if not already running
+            let sock = std::path::Path::new("/tmp/cowd.sock");
+            if !sock.exists() {
+                tracing::info!("daemon not running, auto-starting...");
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(&exe)
+                        .arg("gateway")
+                        .arg("run")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    // Wait for socket to appear (max 5 seconds)
+                    for _ in 0..50 {
+                        if sock.exists() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+            run_repl(model, allowed_tools, permission_mode, base_commit, reasoning_effort, allow_broad_cwd)?;
+        }
         CliAction::Gateway { action, output_format } => run_gateway_action(&action, output_format)?,
         CliAction::Install { systemd, path } => run_install(systemd, path.as_deref())?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
@@ -551,48 +464,36 @@ fn run_gateway_action(
                 .and_then(|p| p.extra.get("host"))
                 .and_then(|h| h.as_str())
                 .map(String::from)
-                .unwrap_or_else(|| "127.0.0.1".to_string());
+                .unwrap_or_else(|| "0.0.0.0".to_string());
             let effective_port = api_server_platform
                 .and_then(|p| p.extra.get("port"))
                 .and_then(|v| v.as_i64())
                 .map(|n| n as u16)
                 .unwrap_or(8642);
-            let effective_auth_enabled = api_server_platform
-                .and_then(|p| p.extra.get("auth"))
-                .and_then(|a| a.as_object())
-                .and_then(|obj| obj.get("enabled"))
-                .and_then(|e| e.as_bool())
-                .unwrap_or(true);
-            let auth_token = api_server_platform
-                .and_then(|p| p.extra.get("auth"))
-                .and_then(|a| a.as_object())
-                .and_then(|obj| obj.get("token"))
-                .and_then(|t| t.as_str())
-                .map(String::from)
-                .unwrap_or_default();
-            let session_store_path = {
-                let store_dir = cwd.join(".cowd").join("sessions");
-                std::fs::create_dir_all(&store_dir).ok();
-                Some(store_dir.join("sessions.db"))
-            };
             let memory_config = build_memory_config(runtime_config.memory(), &cwd);
             let platform_configs = build_platform_configs(runtime_config.gateway());
-            let config = server::HttpConfig {
-                host: effective_host,
-                port: effective_port,
-                auth_enabled: effective_auth_enabled,
-                auth_token,
-                with_webui: true,
+            let runtime_config_json = runtime_config
+                .as_json()
+                .as_object()
+                .map(|obj| serde_json::Value::Object(
+                    obj.iter().map(|(k, v)| (k.clone(), json_value_to_serde(v))).collect()
+                ));
+            let cors_origins: Vec<String> = api_server_platform
+                .and_then(|p| p.extra.get("cors_origins"))
+                .and_then(|c| c.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let daemon_config = daemon::DaemonConfig {
+                http_addr: format!("{effective_host}:{effective_port}"),
+                unix_sock_path: "/tmp/cowd.sock".to_string(),
                 memory_config,
-                session_store_path,
                 platform_configs,
-                cors_origins: Vec::new(),
-                approval_config: Some(runtime_config.approval().clone()),
-                session_reset: runtime_config.gateway().session_reset,
+                runtime_config: runtime_config_json,
+                cors_origins,
             };
             let r2 = SHARED_RT.handle().clone();
             r2.block_on(async {
-                server::start_http_server(config).await.map_err(|e| e.to_string())
+                daemon::run_daemon(daemon_config).await.map_err(|e| e.to_string())
             })?;
             Ok(())
         }
@@ -694,14 +595,6 @@ pub(crate) enum CliAction {
     Init {
         output_format: CliOutputFormat,
     },
-    Serve {
-        host: Option<String>,
-        port: Option<u16>,
-        auth_enabled: bool,
-        cors_origins: Vec<String>,
-        output_format: CliOutputFormat,
-        solo_mode: bool,
-    },
     Export {
         session_reference: String,
         output_path: Option<PathBuf>,
@@ -714,11 +607,6 @@ pub(crate) enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
-        compact: bool,
-        prompt: Option<String>,
-    },
-    MigrateSessions {
-        output_format: CliOutputFormat,
     },
     Gateway {
         action: GatewayAction,
@@ -768,11 +656,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut wants_help = false;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
-    let mut compact = false;
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
-    let mut global_solo_mode = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -844,11 +730,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--dangerously-skip-permissions" | "--solo" => {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
-                global_solo_mode = true;
-                index += 1;
-            }
-            "--compact" => {
-                compact = true;
                 index += 1;
             }
             "--base-commit" => {
@@ -962,8 +843,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
-            compact,
-            prompt: None,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -1001,8 +880,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
-                    compact,
-                    prompt: Some(_prompt),
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -1013,31 +890,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
-        "serve" => {
-            let mut host: Option<String> = None;
-            let mut port: Option<u16> = None;
-            let mut auth_enabled = true;
-            let mut cors_origins: Vec<String> = Vec::new();
-            let mut solo_mode = false;
-            let mut i = 1;
-            while i < rest.len() {
-                match rest[i].as_str() {
-                    "--host" if i + 1 < rest.len() => { host = Some(rest[i + 1].clone()); i += 2; }
-                    "--port" if i + 1 < rest.len() => { port = Some(rest[i + 1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?); i += 2; }
-                    "--no-auth" => { auth_enabled = false; i += 1; }
-                    "--solo" => { solo_mode = true; i += 1; }
-                    "--cors-origins" if i + 1 < rest.len() => {
-                        cors_origins = rest[i + 1].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                        i += 2;
-                    }
-                    other => return Err(format!("unknown serve flag: {other}")),
-                }
-            }
-            Ok(CliAction::Serve { host, port, auth_enabled, cors_origins, output_format, solo_mode: solo_mode || global_solo_mode })
-        }
         "export" => parse_export_args(&rest[1..], output_format),
         "install" => parse_install_args(&rest[1..], output_format),
-        "migrate-sessions" => Ok(CliAction::MigrateSessions { output_format }),
         "gateway" => parse_gateway_args(&rest[1..], output_format),
 
         other if other.starts_with('/') => parse_direct_slash_cli_action(
@@ -1046,7 +900,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
-            compact,
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
@@ -1058,8 +911,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
-            compact,
-            prompt: Some(rest.join(" ")),
         }),
     }
 }
@@ -1172,7 +1023,6 @@ fn parse_direct_slash_cli_action(
     output_format: CliOutputFormat,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    _compact: bool,
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
@@ -1202,8 +1052,6 @@ fn parse_direct_slash_cli_action(
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
-                    compact: false,
-                    prompt: Some(_prompt),
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -1387,7 +1235,7 @@ fn parse_system_prompt_args(
     })
 }
 
-fn parse_install_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+fn parse_install_args(args: &[String], _output_format: CliOutputFormat) -> Result<CliAction, String> {
     let mut systemd = false;
     let mut path = None;
     let mut i = 0;
@@ -2648,8 +2496,6 @@ fn run_repl(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
-    compact: bool,
-    prompt: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
@@ -2657,51 +2503,8 @@ fn run_repl(
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
 
-    if compact || prompt.is_some() {
-        let prompt = prompt.ok_or_else(|| "compact mode requires a prompt argument".to_string())?;
-        if prompt.is_empty() {
-            return Err("compact mode requires a non-empty prompt argument".into());
-        }
-        let (mut runtime, hook_abort_monitor, _) = cli.prepare_turn_runtime(false, None, None)?;
-        let prompter = runtime::permissions::SharedPrompter::new(Box::new(
-            CliPermissionPrompter::new(cli.permission_mode),
-        ));
-        let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| SHARED_RT.handle().clone());
-        let result = handle.block_on(runtime.run_turn_async(&prompt, &prompter));
-        hook_abort_monitor.stop();
-        match result {
-            Ok(summary) => {
-                cli.replace_runtime(runtime)?;
-                let text = extract_compact_output(&summary);
-                cli.persist_session()?;
-                println!("{}", text);
-                Ok(())
-            }
-            Err(error) => {
-                runtime.shutdown_plugins()?;
-                Err(Box::new(error))
-            }
-        }
-    } else {
-        let workspace = std::env::current_dir().unwrap_or_default();
-        run_tui_repl(cli, workspace)
-    }
-}
-
-fn extract_compact_output(summary: &TurnSummary) -> String {
-    summary
-        .assistant_messages
-        .iter()
-        .filter(|msg| msg.role == MessageRole::Assistant)
-        .flat_map(|msg| {
-            msg.blocks.iter().filter_map(|block| match block {
-                ContentBlock::Text { text } if !text.is_empty() => Some(text.as_str()),
-                _ => None,
-            })
-        })
-        .collect::<Vec<_>>()
-        .join("")
+    let workspace = std::env::current_dir().unwrap_or_default();
+    run_tui_repl(cli, workspace)
 }
 
 fn list_workspace_files(workspace: &PathBuf) -> Vec<tui::FileEntry> {
@@ -5010,96 +4813,6 @@ fn migrate_jsonl_sessions(
 /// Scans legacy `~/.cowd/sessions/projects/*/` and `global/` directories for
 /// .jsonl / .json files and imports them into the UnifiedSessionStore SQLite
 /// database.  Sessions that already exist in the store are counted as skipped.
-fn run_migrate_sessions(
-    output_format: CliOutputFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Force the unified store to open — this also triggers the auto-migration
-    // on first access.  We then do our own scanning for accurate stats.
-    let _store = get_unified_store()?;
-
-    let base = jsonl_sessions_dir();
-    let mut migrated: u64 = 0;
-    let mut skipped: u64 = 0;
-
-    for sub in &["projects", "global"] {
-        let dir = base.join(sub);
-        if !dir.is_dir() {
-            continue;
-        }
-        let hash_dirs = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(Box::new(err)),
-        };
-        for entry in hash_dirs {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let hash_dir = entry.path();
-            if !hash_dir.is_dir() {
-                continue;
-            }
-            let files = match std::fs::read_dir(&hash_dir) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            for file in files {
-                let file = match file {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                let path = file.path();
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                if ext != "jsonl" && ext != "json" {
-                    continue;
-                }
-                let session = match Session::load_from_path(&path) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let record = session_to_record(&session, &path);
-                let exists = _store
-                    .get_session(&record.session_id)
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if exists {
-                    skipped += 1;
-                } else {
-                    if _store.create_session(&record).is_ok() {
-                        migrated += 1;
-                        tracing::info!("migrated session {}", record.session_id);
-                    } else {
-                        skipped += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    match output_format {
-        CliOutputFormat::Text => {
-            println!("Migrated {migrated} sessions, {skipped} skipped");
-        }
-        CliOutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "kind": "migrate-sessions",
-                    "migrated": migrated,
-                    "skipped": skipped,
-                })
-            );
-        }
-    }
-    tracing::info!("cli migrate-sessions: migrated {migrated}, skipped {skipped}");
-    Ok(())
-}
-
 /// Build a [`memory::SessionRecord`] from a loaded `Session` + its file path.
 fn session_to_record(
     session: &Session,
@@ -9308,8 +9021,6 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
-                compact: false,
-                prompt: None,
             }
         );
     }
@@ -9585,8 +9296,6 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
-                compact: false,
-                prompt: None,
             }
         );
     }
@@ -9609,13 +9318,10 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
-                compact: false,
-                prompt: None,
             }
         );
     }
 
-    #[test]
     #[test]
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
         let _guard = env_lock();
@@ -9640,8 +9346,6 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
-                compact: false,
-                prompt: None,
             }
         );
     }
@@ -9741,12 +9445,10 @@ mod tests {
                     allowed_tools: None,
                     permission_mode: crate::default_permission_mode(),
                     base_commit: None,
-                    reasoning_effort: None,
-                    allow_broad_cwd: false,
-                    compact: false,
-                    prompt: Some("$help overview".to_string()),
-                }
-            );
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+            }
+        );
             assert_eq!(
                 parse_args(&["agents".to_string(), "--help".to_string()])
                     .expect("agents help should parse"),
@@ -10200,8 +9902,6 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
-                compact: false,
-                prompt: Some("$help overview".to_string()),
             }
         );
         assert_eq!(
@@ -10226,8 +9926,6 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
-                compact: false,
-                prompt: Some("$test".to_string()),
             }
         );
         let error = parse_args(&["/status".to_string()])
