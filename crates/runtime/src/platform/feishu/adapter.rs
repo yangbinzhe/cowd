@@ -724,8 +724,7 @@ impl PlatformAdapter for FeishuAdapter {
     }
 
     fn is_connected(&self) -> bool {
-        let connected = self.connected.blocking_read();
-        *connected
+        self.connected.try_read().map(|g| *g).unwrap_or(false)
     }
 
     async fn receive(&mut self) -> PlatformResult<Option<InboundMessage>> {
