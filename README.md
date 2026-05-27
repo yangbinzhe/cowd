@@ -10,7 +10,7 @@
 
 | Crate | 文件 | 行数 | 职责 |
 |-------|------|------|------|
-| `cowd-cli` | 68 | 50,749 | 主程序：CLI / TUI / Server 入口 |
+| `cowd-cli` | 70 | ~47K | 主程序：CLI / TUI / Server / Gateway 入口（新增 gateway.rs 101行, api_routes.rs 230行） |
 | `runtime` | 81 | 45,131 | 运行时核心：会话、工具、权限、MCP、Gates |
 | `memory` | 61 | 32,411 | 36模块内存系统 + 代码图谱 + 知识图谱 |
 | `tools` | 8 | 10,633 | 50+ 内置工具规范 |
@@ -19,7 +19,7 @@
 | `plugins` | 3 | 4,288 | 插件注册与生命周期 |
 | `config` | 2 | 2,162 | 统一配置管理 |
 | 其他 | 5 | 1,814 | 遥测、兼容测试、Mock 服务 |
-| **总计** | **273** | **173,053** | |
+| **总计** | **274** | **~172K** | |
 
 ---
 
@@ -184,7 +184,7 @@ Wave + SubAgent 的组合让 cowd 可以处理复杂的多步骤任务，同时�
 
 cowd 不只是一个 TUI 工具。它可以嵌入到：
 
-- **API Server**：REST API，支持认证和 CORS，WebUI 捆绑
+- **API Server**：REST API，支持认证和 CORS，WebUI 捆绑，ActiveSessions 多会话并发，API 完全对等（记忆/工具/配置）
 - **飞书机器人**：接收飞书消息，返回智能体回答，支持富文本和交互卡片
 - **企微机器人**：企业微信适配
 - **邮件**：邮件收发，自动推理和回复
@@ -238,13 +238,13 @@ v0.7.0 后，TUI 和 API Server 统一为**单一网关守护进程**，共享�
 
 | 领域 | 完成度 | 关键指标 |
 |------|--------|----------|
-| 内存系统 36 模块 | 100% | 524 测试，全生命周期闭环 |
+| 内存系统 36 模块 | 100% | 456 测试，全生命周期闭环 |
 | 3D 记忆架构 | 100% | Scope×Layer×State，14+语言扫描 |
 | tree-sitter 代码索引 | 100% | 5 语言 AST，增量索引，关系图谱 |
 | 会话运行时 | 95% | ConversationRuntime，自动压缩，续接 |
 | Gate 流水线 | 90% | 5 种 Gate，PolicyEngine 协同 |
-| Wave 编排 | 85% | 依赖图引擎，并行执行 |
-| SubAgent | 85% | 受限执行，WriteGuard，Token 预算 |
+| Wave 编排 | 85% | TaskGraph 依赖图引擎，并行执行（TaskGraph 已存在，尚未完全接入运行时） |
+| SubAgent | 85% | trait 已定义，受限执行/WriteGuard/Token 预算，生产级实现仍为 stub |
 | MCP 工具协议 | 90% | Stdio/SSE/Remote，生命周期管理 |
 | 权限系统 | 90% | 3 种模式，Gate 集成 |
 | 平台适配 | 85% | API 完全对等 (记忆/工具/配置)，Gateway 守护进程 |
@@ -262,6 +262,8 @@ v0.7.0 后，TUI 和 API Server 统一为**单一网关守护进程**，共享�
 4. **平台适配器是单向的**。飞书/企微可以接收消息并回复，但不能将外部事件（如代码仓库 webhook）触发到 cowd 的主动推理循环。
 
 5. **性能基线没有 CI 护栏**。1K 测试是手动运行的，没有自动化的性能回归门禁。10K/20K 是优化参考，但缺少持续监控。
+
+6. **Gateway 守护进程需进一步增强**。当前 `cowd gateway start` 使用子进程方式启动，非真正的 daemonize。API 端点虽然连接了实际后端，但内存搜索、工具执行等高级功能尚未通过 API 完整暴露。
 
 ---
 
@@ -327,7 +329,7 @@ v0.7.0 后，TUI 和 API Server 统一为**单一网关守护进程**，共享�
 ```
   ┌──────────────────────────────────────────────────────────────────┐
   │                       接入层 (Platform)                          │
-  │   CLI        TUI        API Server    飞书/企微/邮件   WebUI     │
+  │   CLI    TUI(控制台,10/10面板)    API Server    Gateway    飞书/企微/邮件   WebUI  │
   └──────────┬──────────┬──────────────────────┬────────────────────┘
              │          │                      │
              ▼          ▼                      ▼
@@ -373,7 +375,7 @@ v0.7.0 后，TUI 和 API Server 统一为**单一网关守护进程**，共享�
 cargo build --release
 
 # TUI 终端模式（默认，全功能控制台）
-cowd --solo
+cowd --solo                 # --solo 为 TUI 模式的显式别名，等同无参数运行
 
 # API 网关服务（前台运行）
 cowd gateway run
@@ -399,9 +401,10 @@ cowd --resume latest    # 续接最近会话
 ## 开发
 
 ```bash
+cargo clean && cargo build --release  # clean rebuild (~1m)
 cargo test -p cowd-memory  # 456 tests
 cargo test --workspace     # 1000+ tests
-cargo build --release      # → target/release/cowd (~32MB)
+cargo build --release      # → target/release/cowd (~28MB)
 ```
 
 ## 日志
