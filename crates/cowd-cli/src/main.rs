@@ -5,6 +5,7 @@
     dead_code
 )]
 #![deny(deprecated)]
+mod api_routes;
 mod bootstrap;
 mod cli;
 mod init;
@@ -462,10 +463,172 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
         )?,
+        CliAction::MigrateSessions { output_format } => run_migrate_sessions(output_format)?,
+        CliAction::Gateway { action, output_format } => run_gateway_action(&action, output_format)?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
     Ok(())
+}
+
+fn run_gateway_action(
+    action: &GatewayAction,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        GatewayAction::Start => {
+            let status = server::get_server_status().map_err(|e| e.to_string())?;
+            if status.is_some() {
+                tracing::info!("gateway start: already running");
+                println!("Gateway is already running");
+                return Ok(());
+            }
+            let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
+            tracing::info!(binary = %exe.display(), "gateway start: spawning daemon");
+            let child = std::process::Command::new(&exe)
+                .arg("gateway")
+                .arg("run")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| format!("failed to start gateway daemon: {e}"))?;
+            println!("Gateway started (pid: {})", child.id());
+            tracing::info!(pid = child.id(), "gateway daemon spawned");
+            Ok(())
+        }
+        GatewayAction::Stop => {
+            server::stop_server().map_err(|e| e.to_string())?;
+            println!("Gateway stopped");
+            tracing::info!("gateway stopped");
+            Ok(())
+        }
+        GatewayAction::Status => {
+            let status = server::get_server_status().map_err(|e| e.to_string())?;
+            match output_format {
+                CliOutputFormat::Text => {
+                    match status {
+                        Some(info) => println!("Gateway is running (pid: {}, address: {})", info.pid, info.address),
+                        None => println!("Gateway is not running"),
+                    }
+                }
+                CliOutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "kind": "gateway-status",
+                            "running": status.is_some(),
+                            "pid": status.as_ref().map(|s| s.pid),
+                            "address": status.as_ref().map(|s| &s.address),
+                        })
+                    );
+                }
+            }
+            Ok(())
+        }
+        GatewayAction::Run => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let loader = runtime::ConfigLoader::default_for(&cwd);
+            let runtime_config = match loader.load() {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!("failed to load config, using defaults: {e}");
+                    runtime::RuntimeConfig::empty()
+                }
+            };
+            let api_server_platform = runtime_config
+                .gateway()
+                .platforms
+                .iter()
+                .find(|p| p.platform_type == "api_server" && p.enabled);
+            let effective_host = api_server_platform
+                .and_then(|p| p.extra.get("host"))
+                .and_then(|h| h.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let effective_port = api_server_platform
+                .and_then(|p| p.extra.get("port"))
+                .and_then(|v| v.as_i64())
+                .map(|n| n as u16)
+                .unwrap_or(8642);
+            let effective_auth_enabled = api_server_platform
+                .and_then(|p| p.extra.get("auth"))
+                .and_then(|a| a.as_object())
+                .and_then(|obj| obj.get("enabled"))
+                .and_then(|e| e.as_bool())
+                .unwrap_or(true);
+            let auth_token = api_server_platform
+                .and_then(|p| p.extra.get("auth"))
+                .and_then(|a| a.as_object())
+                .and_then(|obj| obj.get("token"))
+                .and_then(|t| t.as_str())
+                .map(String::from)
+                .unwrap_or_default();
+            let session_store_path = {
+                let store_dir = cwd.join(".cowd").join("sessions");
+                std::fs::create_dir_all(&store_dir).ok();
+                Some(store_dir.join("sessions.db"))
+            };
+            let memory_config = build_memory_config(runtime_config.memory(), &cwd);
+            let platform_configs = build_platform_configs(runtime_config.gateway());
+            let config = server::HttpConfig {
+                host: effective_host,
+                port: effective_port,
+                auth_enabled: effective_auth_enabled,
+                auth_token,
+                with_webui: true,
+                memory_config,
+                session_store_path,
+                platform_configs,
+                cors_origins: Vec::new(),
+                approval_config: Some(runtime_config.approval().clone()),
+                session_reset: runtime_config.gateway().session_reset,
+            };
+            let r2 = SHARED_RT.handle().clone();
+            r2.block_on(async {
+                server::start_http_server(config).await.map_err(|e| e.to_string())
+            })?;
+            Ok(())
+        }
+        GatewayAction::Restart => {
+            server::stop_server().map_err(|e| e.to_string())?;
+            tracing::info!("gateway restart: stopped, re-spawning");
+            let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
+            let child = std::process::Command::new(&exe)
+                .arg("gateway")
+                .arg("run")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| format!("failed to start gateway daemon: {e}"))?;
+            println!("Gateway restarted (pid: {})", child.id());
+            tracing::info!(pid = child.id(), "gateway restarted");
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GatewayAction {
+    Start,
+    Stop,
+    Status,
+    Run,
+    Restart,
+}
+
+impl GatewayAction {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "start" => Some(Self::Start),
+            "stop" => Some(Self::Stop),
+            "status" => Some(Self::Status),
+            "run" => Some(Self::Run),
+            "restart" => Some(Self::Restart),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -545,6 +708,13 @@ pub(crate) enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
+    },
+    MigrateSessions {
+        output_format: CliOutputFormat,
+    },
+    Gateway {
+        action: GatewayAction,
+        output_format: CliOutputFormat,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -850,6 +1020,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             Ok(CliAction::Serve { host, port, auth_enabled, cors_origins, output_format, solo_mode: solo_mode || global_solo_mode })
         }
         "export" => parse_export_args(&rest[1..], output_format),
+        "migrate-sessions" => Ok(CliAction::MigrateSessions { output_format }),
+        "gateway" => parse_gateway_args(&rest[1..], output_format),
 
         other if other.starts_with('/') => parse_direct_slash_cli_action(
             &rest,
@@ -1244,6 +1416,21 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
         output_path,
         output_format,
     })
+}
+
+fn parse_gateway_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let action_str = args.first().ok_or_else(|| {
+        "gateway requires a subcommand: start, stop, status, run, or restart".to_string()
+    })?;
+    let action = GatewayAction::from_str(action_str).ok_or_else(|| {
+        format!(
+            "unknown gateway subcommand: {action_str}. Expected start, stop, status, run, or restart"
+        )
+    })?;
+    Ok(CliAction::Gateway { action, output_format })
 }
 
 fn parse_dump_manifests_args(
@@ -2639,6 +2826,29 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     let session_id = cli.session.id.clone();
     let mut state = TuiState::new(&cli.model, &session_id);
 
+    // ── Wire TUI into ActiveSessions (T6) ──
+    use crate::gateway::ActiveSessions;
+    let active_sessions = Arc::new(ActiveSessions::new());
+    {
+        // Build a registry runtime from the cli session data
+        let session = cli.runtime.session();
+        let registry_runtime = build_runtime(
+            session,
+            &cli.session.id,
+            cli.model.clone(),
+            cli.system_prompt.clone(),
+            true,
+            true,
+            cli.allowed_tools.clone(),
+            cli.permission_mode,
+            None,
+            None,
+        )?;
+        active_sessions.register(cli.session.id.clone(), registry_runtime);
+    }
+    cli.set_active_sessions(active_sessions.clone());
+    state.set_active_sessions(active_sessions);
+
     // Enable accessibility mode if flag is set
     if accessibility_enabled {
         state.accessibility = tui::accessibility::AccessibilityMode::full();
@@ -2904,6 +3114,7 @@ pub(crate) struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    active_sessions: Option<Arc<crate::gateway::ActiveSessions>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3417,6 +3628,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            active_sessions: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -3426,6 +3638,11 @@ impl LiveCli {
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(effort);
         }
+    }
+
+    /// Set the shared ActiveSessions registry for session tracking.
+    pub(crate) fn set_active_sessions(&mut self, active_sessions: Arc<crate::gateway::ActiveSessions>) {
+        self.active_sessions = Some(active_sessions);
     }
 
     fn startup_banner(&self) -> String {
@@ -3728,7 +3945,9 @@ impl LiveCli {
             }
             SlashCommand::Retry => { println!("Retry: resend last message."); false }
             SlashCommand::Undo => { println!("Undo: remove last exchange."); false }
-            SlashCommand::NewSession => { println!("New session started."); false }
+            SlashCommand::NewSession => {
+                self.handle_session_command(Some("new"), None)?
+            }
             SlashCommand::Title { name } => {
                 println!("Title: {}", name.unwrap_or_default());
                 false
@@ -4190,6 +4409,8 @@ impl LiveCli {
                 let (handle, session) = load_session_reference(target)?;
                 let message_count = session.messages.len();
                 let session_id = session.session_id.clone();
+                // Clone session for ActiveSessions registry (so both TUI and API can reference it)
+                let registry_session = session.clone();
                 let runtime = build_runtime(
                     session,
                     &handle.id,
@@ -4202,13 +4423,75 @@ impl LiveCli {
                     None,
                     None,
                 )?;
+                // Register a separate runtime in ActiveSessions for API access
+                if let Some(ref as2) = self.active_sessions {
+                    let registry_runtime = build_runtime(
+                        registry_session,
+                        &handle.id,
+                        self.model.clone(),
+                        self.system_prompt.clone(),
+                        true,
+                        true,
+                        self.allowed_tools.clone(),
+                        self.permission_mode,
+                        None,
+                        None,
+                    )?;
+                    as2.register(session_id.clone(), registry_runtime);
+                }
                 self.replace_runtime(runtime)?;
                 self.session = SessionHandle {
-                    id: session_id,
+                    id: session_id.clone(),
                     path: handle.path,
                 };
                 println!(
                     "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
+                    self.session.id,
+                    self.session.path.display(),
+                    message_count,
+                );
+                Ok(true)
+            }
+            Some("new") => {
+                // Create a fresh session
+                let new_session = new_cli_session()?;
+                let session_id = new_session.session_id.clone();
+                let handle = create_managed_session_handle(&session_id)?;
+                let message_count = new_session.messages.len();
+                let registry_session = new_session.clone();
+                let runtime = build_runtime(
+                    new_session,
+                    &handle.id,
+                    self.model.clone(),
+                    self.system_prompt.clone(),
+                    true,
+                    true,
+                    self.allowed_tools.clone(),
+                    self.permission_mode,
+                    None,
+                    None,
+                )?;
+                // Register in ActiveSessions for API access
+                if let Some(ref as2) = self.active_sessions {
+                    let registry_runtime = build_runtime(
+                        registry_session,
+                        &handle.id,
+                        self.model.clone(),
+                        self.system_prompt.clone(),
+                        true,
+                        true,
+                        self.allowed_tools.clone(),
+                        self.permission_mode,
+                        None,
+                        None,
+                    )?;
+                    as2.register(session_id.clone(), registry_runtime);
+                }
+                self.replace_runtime(runtime)?;
+                self.session = handle;
+                let _ = self.persist_session();
+                println!(
+                    "New session created\n  Active session   {}\n  File             {}\n  Messages         {}",
                     self.session.id,
                     self.session.path.display(),
                     message_count,
@@ -4547,6 +4830,101 @@ fn migrate_jsonl_sessions(
     if count > 0 {
         tracing::info!("migrated {count} sessions from JSONL");
     }
+    Ok(())
+}
+
+/// CLI handler for `cowd migrate-sessions`.
+///
+/// Scans legacy `~/.cowd/sessions/projects/*/` and `global/` directories for
+/// .jsonl / .json files and imports them into the UnifiedSessionStore SQLite
+/// database.  Sessions that already exist in the store are counted as skipped.
+fn run_migrate_sessions(
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Force the unified store to open — this also triggers the auto-migration
+    // on first access.  We then do our own scanning for accurate stats.
+    let _store = get_unified_store()?;
+
+    let base = jsonl_sessions_dir();
+    let mut migrated: u64 = 0;
+    let mut skipped: u64 = 0;
+
+    for sub in &["projects", "global"] {
+        let dir = base.join(sub);
+        if !dir.is_dir() {
+            continue;
+        }
+        let hash_dirs = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(Box::new(err)),
+        };
+        for entry in hash_dirs {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let hash_dir = entry.path();
+            if !hash_dir.is_dir() {
+                continue;
+            }
+            let files = match std::fs::read_dir(&hash_dir) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            for file in files {
+                let file = match file {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                let path = file.path();
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                if ext != "jsonl" && ext != "json" {
+                    continue;
+                }
+                let session = match Session::load_from_path(&path) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let record = session_to_record(&session, &path);
+                let exists = _store
+                    .get_session(&record.session_id)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if exists {
+                    skipped += 1;
+                } else {
+                    if _store.create_session(&record).is_ok() {
+                        migrated += 1;
+                        tracing::info!("migrated session {}", record.session_id);
+                    } else {
+                        skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    match output_format {
+        CliOutputFormat::Text => {
+            println!("Migrated {migrated} sessions, {skipped} skipped");
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "kind": "migrate-sessions",
+                    "migrated": migrated,
+                    "skipped": skipped,
+                })
+            );
+        }
+    }
+    tracing::info!("cli migrate-sessions: migrated {migrated}, skipped {skipped}");
     Ok(())
 }
 

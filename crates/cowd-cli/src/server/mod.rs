@@ -198,7 +198,7 @@ struct ModelUsageResponse {
 // ── Service Management ─────────────────────────────────────────────────────────
 
 // B8: PID file in user-local directory with restricted permissions
-fn pid_file() -> PathBuf {
+pub fn pid_file() -> PathBuf {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| format!("/tmp/cowd-{}", std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())));
     let dir = PathBuf::from(runtime_dir);

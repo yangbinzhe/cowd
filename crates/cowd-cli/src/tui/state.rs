@@ -163,6 +163,9 @@ pub struct TuiState {
     /// Accessibility settings (ARIA labels, high contrast, screen reader).
     pub accessibility: AccessibilityMode,
 
+    /// Shared registry of active session runtimes (TUI/API bridge).
+    pub active_sessions: Option<std::sync::Arc<crate::gateway::ActiveSessions>>,
+
     /// Startup phase for the loading overlay state machine.
     pub startup_phase: StartupPhase,
     /// Instant when TuiState was created (for show-delay calculation).
@@ -251,10 +254,16 @@ impl TuiState {
             session_sidebar,
             sidebar_active_tab: 0,
             accessibility,
+            active_sessions: None,
             startup_phase: StartupPhase::Hidden,
             startup_start: Instant::now(),
             startup_show_time: None,
         }
+    }
+
+    /// Set the shared ActiveSessions registry for the session sidebar.
+    pub fn set_active_sessions(&mut self, active_sessions: std::sync::Arc<crate::gateway::ActiveSessions>) {
+        self.active_sessions = Some(active_sessions);
     }
 
     // ── Event Bridging ──────────────────────────────────────────
