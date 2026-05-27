@@ -6,12 +6,14 @@
 pub mod adapter;
 pub mod auth;
 pub mod batch;
+pub mod card_handler;
 pub mod comment;
 pub mod doc;
 pub mod markdown;
 pub mod media;
 pub mod normalize;
 pub mod processing;
+pub mod proto;
 pub mod reactions;
 pub mod rules;
 pub mod types;
@@ -49,20 +51,12 @@ pub fn create_feishu_adapter(settings: &serde_json::Value) -> PlatformResult<Fei
 
     let mut config = FeishuConfig::new(app_id, app_secret);
 
-    if let Some(token) = settings.get("verify_token").and_then(|v| v.as_str()) {
-        config = config.with_verify_token(token);
+    if let Some(bot_open_id) = settings.get("bot_open_id").and_then(|v| v.as_str()) {
+        config = config.with_bot_open_id(bot_open_id);
     }
 
-    if let Some(key) = settings.get("encrypt_key").and_then(|v| v.as_str()) {
-        config = config.with_encrypt_key(key);
-    }
-
-    if let Some(timeout) = settings.get("long_polling_timeout").and_then(|v| v.as_u64()) {
-        config.long_polling_timeout = timeout;
-    }
-
-    if let Some(enable) = settings.get("enable_events").and_then(|v| v.as_bool()) {
-        config.enable_events = enable;
+    if let Some(bot_name) = settings.get("bot_name").and_then(|v| v.as_str()) {
+        config = config.with_bot_name(bot_name);
     }
 
     Ok(FeishuAdapter::new(config))
@@ -77,15 +71,6 @@ mod tests {
         let config = FeishuConfig::new("app_id_123", "app_secret_456");
         assert_eq!(config.app_id, "app_id_123");
         assert_eq!(config.app_secret, "app_secret_456");
-    }
-
-    #[test]
-    fn test_feishu_config_with_tokens() {
-        let config = FeishuConfig::new("app_id", "secret")
-            .with_verify_token("verify_token")
-            .with_encrypt_key("encrypt_key");
-        assert!(config.verify_token.is_some());
-        assert!(config.encrypt_key.is_some());
     }
 
     #[tokio::test]
