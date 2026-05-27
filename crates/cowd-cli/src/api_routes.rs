@@ -27,6 +27,9 @@ pub fn api_router(active_sessions: AppState) -> Router {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session).delete(delete_session))
         .route("/api/sessions/:id/messages", post(send_message))
+        .route("/api/memory", get(memory_handler))
+        .route("/api/tools", get(tools_handler))
+        .route("/api/config", get(config_handler))
         .with_state(active_sessions)
 }
 
@@ -159,4 +162,52 @@ async fn send_message(
         "status": "received",
         "message": "Message received (full processing pending)"
     })))
+}
+
+// ── Memory / Tools / Config (simple stubs) ──────────────────────
+
+async fn memory_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "enabled": true,
+        "store_path": "~/.cowd/memory",
+        "session_store": true,
+        "layers": {
+            "L0": "fixed identity",
+            "L1": "working memory",
+            "L2": "project context",
+            "L3": "deep memories",
+            "L4": "archived"
+        },
+        "features": {
+            "semantic_search": true,
+            "context_compression": true,
+            "drift_detection": true,
+            "session_handoff": true
+        }
+    }))
+}
+
+async fn tools_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "tools": [
+            {"name": "read", "description": "Read files from the local filesystem"},
+            {"name": "write", "description": "Write files to the local filesystem"},
+            {"name": "edit", "description": "Make targeted edits to files"},
+            {"name": "glob", "description": "Find files by glob pattern"},
+            {"name": "grep", "description": "Search file contents with regex"},
+            {"name": "bash", "description": "Execute shell commands"},
+            {"name": "web_search", "description": "Search the web"},
+            {"name": "web_fetch", "description": "Fetch content from a URL"}
+        ]
+    }))
+}
+
+async fn config_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "model": "claude-opus-4-6",
+        "provider": "anthropic",
+        "theme": "dark",
+        "language": "zh-CN",
+        "streaming": true
+    }))
 }

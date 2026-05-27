@@ -437,7 +437,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 approval_config: Some(approval_config),
                 session_reset: runtime_config.gateway().session_reset,
             };
-            let rt = SHARED_RT.handle().clone();
             let r2 = SHARED_RT.handle().clone();
             r2.block_on(async {
                 server::start_http_server(config).await.map_err(|e| e.to_string())
