@@ -129,6 +129,8 @@ pub struct SkillsPanel {
     status_ticks: u32,
     /// Whether to use built-in definitions (true when App.skill_list is empty).
     using_builtins: bool,
+    /// Optional reference to GlobalToolRegistry for real enable/disable.
+    pub registry: Option<std::sync::Arc<dyn crate::tui::app::ToolRegistry>>,
 }
 
 /// Unified display entry for a skill, regardless of source.
@@ -157,6 +159,7 @@ impl SkillsPanel {
             status_message: None,
             status_ticks: 0,
             using_builtins: true,
+            registry: None,
         }
     }
 
@@ -263,8 +266,16 @@ impl SkillsPanel {
                 // Toggle in-place in entries
                 if let Some(entry) = self.entries.iter_mut().find(|e| e.name == name) {
                     entry.enabled = !entry.enabled;
-                    let status = if entry.enabled { "enabled" } else { "disabled" };
+                    let new_enabled = entry.enabled;
+                    let status = if new_enabled { "enabled" } else { "disabled" };
                     self.set_status(&format!("{name}: {status}"));
+                    if let Some(ref registry) = self.registry {
+                        if new_enabled {
+                            registry.enable_tool(&name);
+                        } else {
+                            registry.disable_tool(&name);
+                        }
+                    }
                 }
             }
         }
@@ -289,6 +300,13 @@ impl SkillsPanel {
                     entry.enabled = value;
                     let status = if value { "enabled" } else { "disabled" };
                     self.set_status(&format!("{name}: {status}"));
+                    if let Some(ref registry) = self.registry {
+                        if value {
+                            registry.enable_tool(&name);
+                        } else {
+                            registry.disable_tool(&name);
+                        }
+                    }
                 }
             }
         }

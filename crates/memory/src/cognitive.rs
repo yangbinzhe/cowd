@@ -45,7 +45,6 @@ use crate::{ MemoryScope, SessionResume,
     handoff::HandoffManager,
     orchestrator::MemoryOrchestrator,
     project_scope::{build_project_kg, ProjectScopeManager},
-    relevance::DynamicLoader,
     search::HybridSearcher,
     seeds::{DecisionThreadStore, SeedRegistry},
     state_rebuilder::StateRebuilder,
@@ -107,13 +106,9 @@ pub struct CognitiveContextManager {
     orchestrator: MemoryOrchestrator,
     /// Three-stage compression pipeline.
     pipeline: CompressionPipeline,
-    /// Multi-signal relevance scorer + dynamic memory loader.
-    #[allow(dead_code)] // Design: reserved for future dynamic memory loading
-    loader: DynamicLoader,
     /// In-process vector index for semantic search.
     vector_index: Mutex<VectorIndex>,
     /// Hybrid (BM25+vector) searcher for re-ranking.
-    #[allow(dead_code)]
     hybrid_searcher: HybridSearcher,
     /// Real-time context window pressure monitor.
     monitor: ContextWindowMonitor,
@@ -317,7 +312,6 @@ impl CognitiveContextManager {
             config,
             orchestrator,
             pipeline,
-            loader: DynamicLoader::new(),
             vector_index,
             hybrid_searcher: HybridSearcher::new(),
             monitor,
@@ -719,13 +713,49 @@ impl CognitiveContextManager {
                 query,
                 query_embedding.as_deref(),
                 &already_surfaced,
-                memory_budget,
+                memory_budget * 2, // over-fetch for hybrid re-ranking
             )
             .await?;
-        for e in &deep_entries {
+
+        // ── Hybrid re-ranking: combine vector + BM25 scores ──
+        let re_ranked = if !deep_entries.is_empty() {
+            let vector_results: Vec<(String, String, f64)> = deep_entries
+                .iter()
+                .map(|e| (e.id.to_string(), e.content.clone(), e.confidence as f64))
+                .collect();
+            let all_docs: Vec<String> = deep_entries.iter().map(|e| e.content.clone()).collect();
+            let doc_ids: Vec<String> = deep_entries.iter().map(|e| e.id.to_string()).collect();
+            let hybrid_results = self.hybrid_searcher.search(
+                query,
+                vector_results,
+                &all_docs,
+                &doc_ids,
+                memory_budget as usize,
+            );
+            // Re-order deep_entries by hybrid score
+            let mut scored: Vec<(usize, f64)> = hybrid_results
+                .iter()
+                .filter_map(|r| {
+                    deep_entries
+                        .iter()
+                        .position(|e| e.id.to_string() == r.id)
+                        .map(|idx| (idx, r.hybrid_score))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored
+                .into_iter()
+                .take(memory_budget as usize)
+                .map(|(idx, _)| deep_entries[idx].clone())
+                .collect()
+        } else {
+            deep_entries
+        };
+
+        for e in &re_ranked {
             already_surfaced.insert(e.id);
         }
-        entries.extend(deep_entries);
+        entries.extend(re_ranked);
 
         // ── Step 4: check seed triggers ─────────────────────────────────────
         let query_words: Vec<String> = query

@@ -14,7 +14,7 @@ use ratatui::{
 
 use api;
 
-use crate::tui::app::{App, Panel};
+use crate::tui::app::App;
 use crate::tui::components::{Component, EventResult, RenderContext};
 
 // ── SectionWidth ─────────────────────────────────────────────────
@@ -266,14 +266,6 @@ impl StatusBar {
     /// Only sections with recognized built-in IDs are populated;
     /// custom sections are left unchanged.
     pub fn sync_from_app(&mut self, app: &App) {
-        let panel_label = match app.current_panel {
-            Panel::Chat => "Chat",
-            Panel::Gateway => "Gateway",
-            Panel::Files => "Files",
-            Panel::Memory => "Memory",
-            Panel::Skills => "Skills",
-            Panel::Delegate => "Delegates",
-        };
         let status = if app.turn_active {
             format!("{} Thinking", app.spinner_char())
         } else {
@@ -290,7 +282,7 @@ impl StatusBar {
                         api::ProviderKind::Xai => "Xai",
                         api::ProviderKind::OpenAi => "OpenAI",
                     };
-                    Some(format!("{provider_label} │ {panel_label} │ {status} │ {}", app.model))
+                    Some(format!("{provider_label} │ {status} │ {}", app.model))
                 }
                 "token_bar" => token_bar(app),
                 "token_count" => {
@@ -606,7 +598,6 @@ mod tests {
 
         let section = bar.section_mut("panel_model_status").unwrap();
         let content = section.content.as_deref().unwrap();
-        assert!(content.contains("Chat"));
         assert!(content.contains("✓ Ready"));
         assert!(content.contains("claude-sonnet-4"));
     }

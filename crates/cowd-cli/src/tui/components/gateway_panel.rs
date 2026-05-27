@@ -52,10 +52,18 @@ impl GatewayPanel {
 
     /// Sync panel state from the application model.
     ///
-    /// Currently independent of App; reserved for future integration
-    /// with server runtime state stored in App.
-    pub fn sync_from_app(&mut self, _app: &App) {
-        // Server status is independent of App for now
+    /// Copies server state from App into the panel fields for display.
+    /// Derives health_status from server_running: "Healthy" when running,
+    /// None when stopped.
+    pub fn sync_from_app(&mut self, app: &App) {
+        self.server_running = app.server_running;
+        self.uptime_secs = app.server_uptime_secs;
+        self.active_sessions = app.active_api_sessions;
+        if app.server_running {
+            self.health_status = Some("Healthy".to_string());
+        } else {
+            self.health_status = None;
+        }
     }
 
     /// Update the health status string and mark server as running.

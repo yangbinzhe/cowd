@@ -36,6 +36,7 @@ use crate::tui::components::file_changes_panel::FileChangesPanel;
 use crate::tui::components::file_tree::FileTree;
 use crate::tui::components::prompt::Prompt;
 use crate::tui::components::question_form::QuestionForm;
+use crate::tui::components::memory_panel::MemoryPanel;
 use crate::tui::components::session_sidebar::SessionSidebar;
 use crate::tui::components::status_bar::StatusBar;
 use crate::tui::components::revert_dialog::RevertDialog;
@@ -145,7 +146,10 @@ pub struct TuiState {
     /// Session list browser with rename/delete/switch/fork actions.
     pub session_sidebar: SessionSidebar,
 
-    /// Active tab index in the sidebar (0=Context, 1=Changes, 2=Todo, 3=Diff, 4=Files, 5=Sessions).
+    /// Memory browser panel with layer filter, search, detail view, delete.
+    pub memory_panel: MemoryPanel,
+
+    /// Active tab index in the sidebar (0=Context, 1=Changes, 2=Todo, 3=Diff, 4=Files, 5=Sessions, 6=Memory).
     pub sidebar_active_tab: usize,
 
     /// Status bar at the bottom showing model, tokens, and system info.
@@ -223,6 +227,7 @@ impl TuiState {
         let prompt = Prompt::new(cwd);
         let file_tree = FileTree::new();
         let session_sidebar = SessionSidebar::new(session_id);
+        let memory_panel = MemoryPanel::new();
 
         Self {
             app,
@@ -252,6 +257,7 @@ impl TuiState {
             prompt,
             file_tree,
             session_sidebar,
+            memory_panel,
             sidebar_active_tab: 0,
             accessibility,
             active_sessions: None,
@@ -351,6 +357,9 @@ impl TuiState {
         }
         self.session_sidebar.set_current_session(&self.app.session_id);
 
+        // Sync memory panel from App state
+        self.memory_panel.sync_from_app(&self.app);
+
         // BUG 1 FIX: No bidirectional sync — app.input is the single source of truth.
         // Prompt is used only for autocomplete suggestions (rendered as overlay dropdown).
 
@@ -435,7 +444,7 @@ impl TuiState {
 
             // Render sidebar: tab bar + active panel
             let tab_height = 1u16;
-            let tab_labels = ["Context", "Changes", "Todo", "Diff", "Files", "Sessions"];
+            let tab_labels = ["Context", "Changes", "Todo", "Diff", "Files", "Sessions", "Memory"];
             let tab_area = ratatui::layout::Rect::new(
                 sidebar_area.x, sidebar_area.y, sidebar_area.width, tab_height,
             );
@@ -499,6 +508,12 @@ impl TuiState {
                     let _guard = self.render_profiler.guard("session_sidebar");
                     let _ = error_recovery::catch_render_panic("session_sidebar", AssertUnwindSafe(|| {
                         self.session_sidebar.render(&mut main_ctx, panel_area);
+                    }));
+                }
+                6 => {
+                    let _guard = self.render_profiler.guard("memory_panel");
+                    let _ = error_recovery::catch_render_panic("memory_panel", AssertUnwindSafe(|| {
+                        self.memory_panel.render(&mut main_ctx, panel_area);
                     }));
                 }
                 _ => {}
@@ -919,8 +934,8 @@ impl TuiState {
         }
 
         // ── Sidebar tab switching ──
-        // Tab / Shift+Tab: cycle through sidebar tabs (Context / Changes / Todo / Diff / Files / Sessions)
-        const SIDEBAR_TAB_COUNT: usize = 6;
+        // Tab / Shift+Tab: cycle through sidebar tabs (Context / Changes / Todo / Diff / Files / Sessions / Memory)
+        const SIDEBAR_TAB_COUNT: usize = 7;
         if key.code == KeyCode::Tab {
             self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
             return ProcessedKey::Nothing;
@@ -1190,18 +1205,10 @@ impl TuiState {
                 self.app.should_quit = true;
             }
             Action::NextPanel => {
-                self.app.next_panel();
+                // Panel rotation removed — use sidebar navigation instead
             }
             Action::PrevPanel => {
-                use crate::tui::app::Panel;
-                self.app.current_panel = match self.app.current_panel {
-                    Panel::Chat => Panel::Delegate,
-                    Panel::Delegate => Panel::Skills,
-                    Panel::Skills => Panel::Memory,
-                    Panel::Memory => Panel::Files,
-                    Panel::Files => Panel::Gateway,
-                    Panel::Gateway => Panel::Chat,
-                };
+                // Panel rotation removed — use sidebar navigation instead
             }
             Action::ToggleCommandPalette => {
                 if self.command_palette.is_open() {
@@ -1767,17 +1774,6 @@ mod tests {
         let g2 = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
         assert!(state.handle_input(g2));
         assert!(state.keybind_engine.pending_chord().is_empty());
-    }
-
-    #[test]
-    fn handle_input_next_panel() {
-        let mut state = TuiState::new("m", "s");
-        use crate::tui::app::Panel;
-        assert_eq!(state.app.current_panel, Panel::Chat);
-
-        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-        state.handle_input(tab);
-        assert_eq!(state.app.current_panel, Panel::Gateway);
     }
 
     // ── dialog focus trap ───────────────────────────────────────

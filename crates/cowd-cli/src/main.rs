@@ -65,6 +65,7 @@ use tools::{
 };
 
 use futures::StreamExt;
+use tui::state::TuiState;
 
 pub(crate) const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -3050,6 +3051,8 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                     if state.turn_active {
                         state.tick();
                     }
+                    // ── T1 FIX: consume SessionSidebar pending actions ──
+                    consume_session_sidebar_actions(&mut state, &mut cli, &workspace);
                 }
             }
             terminal.draw(|f| state.render(f))?;
@@ -3075,6 +3078,92 @@ fn drain_tui_events_state(rx: &tui::TuiEventReceiver, state: &mut tui::state::Tu
         if count >= limit {
             break;
         }
+    }
+}
+
+/// Consume pending session sidebar actions (switch/delete/rename/new/fork/export).
+/// Called every 16ms tick in the TUI main loop.
+fn consume_session_sidebar_actions(
+    state: &mut TuiState,
+    cli: &mut LiveCli,
+    workspace: &PathBuf,
+) {
+    use crate::tui::app::SessionSummary;
+
+    // 1. Session switch
+    if let Some(idx) = state.session_sidebar.pending_switch_idx.take() {
+        let sessions: Vec<_> = state.session_sidebar.sessions().to_vec();
+        if let Some(target) = sessions.get(idx) {
+            let target_id = target.id.clone();
+            if target_id != state.session_id {
+                let _ = cli.persist_session();
+                state.session_sidebar.set_current_session(&target_id);
+                state.session_id = target_id.clone();
+                load_session_history(&mut state.app, &cli.runtime.session());
+                refresh_panels(&mut state.app, workspace, &cli.runtime);
+                state.add_message("system", &format!("Switched to session {}", &target_id[..8.min(target_id.len())]));
+            }
+        }
+    }
+
+    // 2. Session delete
+    if let Some(idx) = state.session_sidebar.pending_delete_idx.take() {
+        let sessions: Vec<_> = state.session_sidebar.sessions().to_vec();
+        if let Some(target) = sessions.get(idx) {
+            let target_id = target.id.clone();
+            if let Ok(store) = get_unified_store() {
+                let _ = store.delete_session(&target_id);
+                state.add_message("system", &format!("Deleted session {}", &target_id[..8.min(target_id.len())]));
+
+                if let Ok(records) = store.list_sessions() {
+                    let summaries: Vec<SessionSummary> = records.iter()
+                        .map(|r| SessionSummary {
+                            id: r.session_id.clone(),
+                            path: r.chat_id.clone(),
+                            updated_at_ms: 0,
+                            message_count: r.message_count as usize,
+                        })
+                        .collect();
+                    state.picker_sessions = summaries.clone();
+                    state.session_sidebar.load(summaries);
+                }
+            }
+        }
+    }
+
+    // 3. Session rename
+    if let Some((idx, new_name)) = state.session_sidebar.pending_rename.take() {
+        let sessions: Vec<_> = state.session_sidebar.sessions().to_vec();
+        if let Some(target) = sessions.get(idx) {
+            let target_id = target.id.clone();
+            if let Ok(store) = get_unified_store() {
+                if let Ok(Some(mut record)) = store.get_session(&target_id) {
+                    record.chat_id = new_name.clone();
+                    let _ = store.update_session(&record);
+                    state.add_message("system", &format!("Renamed to {}", new_name));
+                }
+            }
+        }
+    }
+
+    // 4. New session
+    if state.session_sidebar.pending_new_session {
+        state.session_sidebar.pending_new_session = false;
+        let _ = cli.persist_session();
+        state.add_message("system", "New session created");
+    }
+
+    // 5. Fork
+    if state.session_sidebar.pending_fork {
+        state.session_sidebar.pending_fork = false;
+        let fork_at = state.session_sidebar.pending_fork_at.take();
+        state.add_message("system", &format!("Fork requested at {:?}", fork_at));
+    }
+
+    // 6. Export
+    if state.session_sidebar.pending_export {
+        state.session_sidebar.pending_export = false;
+        state.export_dialog_active = true;
     }
 }
 

@@ -9,15 +9,17 @@
 //! Replace:
 //!
 //! ```rust,no_run
-//! use cowd_memory::SqliteSessionStore;
-//! let store = SqliteSessionStore::open(path)?;
+//! use cowd_memory::store::session::SqliteSessionStore;
+//! use std::path::Path;
+//! let store = SqliteSessionStore::open(Path::new("sessions.db")).unwrap();
 //! ```
-//!
+
 //! with:
-//!
+
 //! ```rust,no_run
 //! use cowd_memory::UnifiedSessionStore;
-//! let store = UnifiedSessionStore::open(path)?;
+//! use std::path::Path;
+//! let store = UnifiedSessionStore::open(Path::new("sessions.db")).unwrap();
 //! ```
 
 use std::path::Path;

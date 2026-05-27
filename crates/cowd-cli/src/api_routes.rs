@@ -144,24 +144,57 @@ async fn send_message(
     Path(id): Path<String>,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime = state.sessions.get(&id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        )
+    let runtime_arc = state.sessions.remove(&id).ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(ErrorResponse {
+            error: format!("session {id} not found"),
+        }))
     })?;
 
     tracing::info!(%id, content_len = body.content.len(), "API message received");
-    let _runtime = runtime;
-    let _content = body.content;
 
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "status": "received",
-        "message": "Message received (full processing pending)"
-    })))
+    let mut runtime = Arc::try_unwrap(runtime_arc).map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+            error: format!("session {id} runtime is still referenced"),
+        }))
+    })?;
+
+    let session_id = id.clone();
+    let sessions = Arc::clone(&state.sessions);
+
+    match runtime.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none()).await {
+        Ok(summary) => {
+            let final_text = summary.assistant_messages.last()
+                .map(|msg| {
+                    msg.blocks.iter()
+                        .filter_map(|block| match block {
+                            runtime::ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+
+            let response = serde_json::json!({
+                "session_id": &session_id,
+                "status": "complete",
+                "response": final_text,
+                "iterations": summary.iterations,
+            });
+
+            sessions.register(session_id, runtime);
+
+            Ok(Json(response))
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            sessions.register(session_id, runtime);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: error_msg }),
+            ))
+        }
+    }
 }
 
 // ── Memory / Tools / Config handlers ───────────────────────────
