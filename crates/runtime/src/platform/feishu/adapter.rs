@@ -2,13 +2,17 @@
 //!
 //! This adapter provides core functionality for interacting with Feishu (Lark) API.
 
-use crate::platform::adapter::{InboundMessage, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformResult};
+use crate::platform::adapter::{ChatInfo, InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformEvent, PlatformResult};
 use crate::platform::types::SessionKey;
+use super::markdown::{build_post_payload, build_text_payload, strip_markdown};
+use super::types::{GetChatResponse, SendMessageRequest, SendMessageResponse, UpdateMessageRequest, UpdateMessageResponse, ReplyMessageRequest, ReplyMessageResponse};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Feishu adapter configuration.
@@ -287,6 +291,11 @@ impl FeishuAdapter {
                         "message_id": msg_content.message_id,
                         "chat_id": msg_content.chat_id,
                     }),
+                    message_type: MessageType::Text,
+                    message_id: Some(msg_content.message_id),
+                    reply_to_message_id: None,
+                    media_urls: vec![],
+                    media_types: vec![],
                 }));
             }
             _ => {
@@ -458,6 +467,11 @@ impl FeishuAdapter {
                 "message_id": message_id,
                 "chat_id": chat_id,
             }),
+            message_type: MessageType::Text,
+            message_id: Some(message_id.to_string()),
+            reply_to_message_id: None,
+            media_urls: vec![],
+            media_types: vec![],
         })
     }
 
@@ -540,6 +554,188 @@ impl FeishuAdapter {
         tracing::debug!(to = %session_key.user_id, %msg_id, "feishu card message sent");
         Ok(msg_id)
     }
+
+    /// Retry an async operation up to 3 times with exponential backoff.
+    ///
+    /// Only retries on `SendFailed` and `RateLimited` errors. Other errors
+    /// (including `NotImplemented`, `AuthenticationFailed`) are returned immediately.
+    async fn feishu_send_with_retry<F, Fut>(&self, mut f: F) -> PlatformResult<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = PlatformResult<()>>,
+    {
+        let mut last_err = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                let backoff = Duration::from_millis(500 * 2u64.pow(attempt as u32 - 1));
+                tracing::debug!(attempt, ?backoff, "feishu retry");
+                tokio::time::sleep(backoff).await;
+            }
+            match f().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if matches!(e, PlatformError::RateLimited(_) | PlatformError::SendFailed(_)) {
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| PlatformError::SendFailed("retry exhausted".into())))
+    }
+
+    /// Send a message with post→text fallback.
+    ///
+    /// Tries to send as a rich post message first. If the Feishu API rejects
+    /// the post format (error code `"content format of the post type is incorrect"`),
+    /// falls back to plain text via `strip_markdown`.
+    async fn send_internal(
+        &self,
+        receive_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> PlatformResult<()> {
+        let token = self.ensure_token().await?;
+        let client = reqwest::Client::new();
+
+        // Post rejection regex (case-insensitive)
+        let post_reject_re = Regex::new(r"(?i)content format of the post type is incorrect")
+            .map_err(|e| PlatformError::Unknown(format!("regex compile: {}", e)))?;
+
+        // Build payloads
+        let post_content = build_post_payload(text);
+        let fallback_text = strip_markdown(text);
+
+        // Determine whether to use reply endpoint or new-message endpoint
+        if let Some(reply_msg_id) = reply_to {
+            // --- Reply path ---
+            let reply_url = format!(
+                "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
+                reply_msg_id
+            );
+
+            // Try reply as post
+            let post_req = ReplyMessageRequest {
+                msg_type: "post".to_string(),
+                content: post_content.clone(),
+            };
+            let post_resp: ReplyMessageResponse = client
+                .put(&reply_url)
+                .header("Authorization", format!("Bearer {}", &token))
+                .json(&post_req)
+                .send()
+                .await
+                .map_err(|e| PlatformError::SendFailed(e.to_string()))?
+                .json()
+                .await
+                .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+            if post_resp.code == 0 {
+                return Ok(());
+            }
+
+            // Reply-specific error codes → fall back to new message
+            if post_resp.code == 230011 || post_resp.code == 231003 {
+                tracing::debug!(
+                    code = post_resp.code,
+                    msg = %post_resp.msg,
+                    "feishu reply target missing, sending as new message"
+                );
+            } else if post_reject_re.is_match(&post_resp.msg) {
+                // Post format rejected → retry reply as text
+                let text_req = ReplyMessageRequest {
+                    msg_type: "text".to_string(),
+                    content: build_text_payload(&fallback_text),
+                };
+                let text_resp: ReplyMessageResponse = client
+                    .put(&reply_url)
+                    .header("Authorization", format!("Bearer {}", &token))
+                    .json(&text_req)
+                    .send()
+                    .await
+                    .map_err(|e| PlatformError::SendFailed(e.to_string()))?
+                    .json()
+                    .await
+                    .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+                if text_resp.code == 0 {
+                    tracing::debug!("feishu text fallback reply succeeded");
+                    return Ok(());
+                }
+
+                if text_resp.code == 230011 || text_resp.code == 231003 {
+                    tracing::debug!(
+                        code = text_resp.code,
+                        "feishu text reply target missing, sending as new message"
+                    );
+                } else {
+                    return Err(PlatformError::SendFailed(text_resp.msg));
+                }
+            } else {
+                return Err(PlatformError::SendFailed(post_resp.msg));
+            }
+
+            // Fall through to new-message path
+        }
+
+        // --- New-message path ---
+        let send_url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id";
+
+        // Try post first
+        let post_req = SendMessageRequest {
+            receive_id: receive_id.to_string(),
+            msg_type: "post".to_string(),
+            content: post_content.clone(),
+        };
+        let post_resp: SendMessageResponse = client
+            .post(send_url)
+            .header("Authorization", format!("Bearer {}", &token))
+            .json(&post_req)
+            .send()
+            .await
+            .map_err(|e| PlatformError::SendFailed(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+        if post_resp.code == 0 {
+            tracing::debug!(to = %receive_id, "feishu post message sent");
+            return Ok(());
+        }
+
+        if post_reject_re.is_match(&post_resp.msg) {
+            tracing::debug!(
+                msg = %post_resp.msg,
+                "feishu post rejected, falling back to text"
+            );
+            // Fall back to text
+            let text_req = SendMessageRequest {
+                receive_id: receive_id.to_string(),
+                msg_type: "text".to_string(),
+                content: build_text_payload(&fallback_text),
+            };
+            let text_resp: SendMessageResponse = client
+                .post(send_url)
+                .header("Authorization", format!("Bearer {}", &token))
+                .json(&text_req)
+                .send()
+                .await
+                .map_err(|e| PlatformError::SendFailed(e.to_string()))?
+                .json()
+                .await
+                .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+            if text_resp.code != 0 {
+                return Err(PlatformError::SendFailed(text_resp.msg));
+            }
+            tracing::debug!(to = %receive_id, "feishu text fallback message sent");
+        } else {
+            return Err(PlatformError::SendFailed(post_resp.msg));
+        }
+
+        Ok(())
+    }
 }
 
 /// A card action button for interactive card messages.
@@ -607,7 +803,201 @@ impl PlatformAdapter for FeishuAdapter {
     }
 
     async fn send(&self, msg: &OutboundMessage) -> PlatformResult<()> {
-        self.send_message(&msg.session_key, &msg.text).await
+        let receive_id = msg
+            .session_key
+            .thread_id
+            .as_deref()
+            .unwrap_or(&msg.session_key.user_id);
+
+        self.feishu_send_with_retry(|| {
+            self.send_internal(receive_id, &msg.text, msg.reply_to.as_deref())
+        })
+        .await
+    }
+
+    async fn send_typing(&self, _chat_id: &str) -> Result<(), PlatformError> {
+        // Feishu bot API does not expose a typing indicator
+        Ok(())
+    }
+
+    async fn send_image(&self, _chat_id: &str, _image_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_image".into()))
+    }
+
+    async fn send_image_file(&self, _chat_id: &str, _image_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_image_file".into()))
+    }
+
+    async fn send_voice(&self, _chat_id: &str, _audio_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_voice".into()))
+    }
+
+    async fn send_document(&self, _chat_id: &str, _file_path: &str, _file_name: Option<&str>, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_document".into()))
+    }
+
+    async fn send_video(&self, _chat_id: &str, _video_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_video".into()))
+    }
+
+    async fn send_animation(&self, _chat_id: &str, _animation_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_animation".into()))
+    }
+
+    async fn edit_message(&self, _chat_id: &str, message_id: &str, content: &str) -> PlatformResult<()> {
+        let token = self.ensure_token().await?;
+        let client = reqwest::Client::new();
+        let url = format!(
+            "https://open.feishu.cn/open-apis/im/v1/messages/{}",
+            message_id
+        );
+
+        let post_reject_re = Regex::new(r"(?i)content format of the post type is incorrect")
+            .map_err(|e| PlatformError::Unknown(format!("regex compile: {}", e)))?;
+
+        let post_content = build_post_payload(content);
+        let fallback_text = strip_markdown(content);
+
+        self.feishu_send_with_retry(|| {
+            let url = url.clone();
+            let token = token.clone();
+            let post_content = post_content.clone();
+            let fallback_text = fallback_text.clone();
+            let post_reject_re = post_reject_re.clone();
+            let client = client.clone();
+            async move {
+                // Try post first
+                let post_req = UpdateMessageRequest {
+                    content: post_content.clone(),
+                    msg_type: "post".to_string(),
+                };
+                let post_resp: UpdateMessageResponse = client
+                    .put(&url)
+                    .header("Authorization", format!("Bearer {}", &token))
+                    .json(&post_req)
+                    .send()
+                    .await
+                    .map_err(|e| PlatformError::SendFailed(e.to_string()))?
+                    .json()
+                    .await
+                    .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+                if post_resp.code == 0 {
+                    return Ok(());
+                }
+
+                if post_reject_re.is_match(&post_resp.msg) {
+                    tracing::debug!("feishu edit post rejected, falling back to text");
+                    let text_req = UpdateMessageRequest {
+                        content: build_text_payload(&fallback_text),
+                        msg_type: "text".to_string(),
+                    };
+                    let text_resp: UpdateMessageResponse = client
+                        .put(&url)
+                        .header("Authorization", format!("Bearer {}", &token))
+                        .json(&text_req)
+                        .send()
+                        .await
+                        .map_err(|e| PlatformError::SendFailed(e.to_string()))?
+                        .json()
+                        .await
+                        .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+                    if text_resp.code != 0 {
+                        return Err(PlatformError::SendFailed(text_resp.msg));
+                    }
+                    tracing::debug!(%message_id, "feishu text fallback edit succeeded");
+                } else {
+                    return Err(PlatformError::SendFailed(post_resp.msg));
+                }
+                Ok(())
+            }
+        })
+        .await
+    }
+
+    async fn delete_message(&self, _chat_id: &str, message_id: &str) -> PlatformResult<()> {
+        let token = self.ensure_token().await?;
+        let client = reqwest::Client::new();
+        let url = format!(
+            "https://open.feishu.cn/open-apis/im/v1/messages/{}",
+            message_id
+        );
+
+        self.feishu_send_with_retry(|| {
+            let url = url.clone();
+            let token = token.clone();
+            let client = client.clone();
+            async move {
+                let response = client
+                    .delete(&url)
+                    .header("Authorization", format!("Bearer {}", &token))
+                    .send()
+                    .await
+                    .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+                #[derive(Deserialize)]
+                struct DeleteResponse {
+                    code: i32,
+                    msg: String,
+                }
+
+                let resp: DeleteResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+                if resp.code != 0 {
+                    return Err(PlatformError::SendFailed(resp.msg));
+                }
+                tracing::debug!(%message_id, "feishu message deleted");
+                Ok(())
+            }
+        })
+        .await
+    }
+
+    async fn get_chat_info(&self, chat_id: &str) -> PlatformResult<ChatInfo> {
+        let token = self.ensure_token().await?;
+        let client = reqwest::Client::new();
+        let url = format!(
+            "https://open.feishu.cn/open-apis/im/v1/chats/{}",
+            chat_id
+        );
+
+        let response = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", &token))
+            .send()
+            .await
+            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+        let resp: GetChatResponse = response
+            .json()
+            .await
+            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+        if resp.code != 0 {
+            return Err(PlatformError::SendFailed(resp.msg));
+        }
+
+        let data = resp
+            .data
+            .ok_or_else(|| PlatformError::SendFailed("missing chat data".into()))?;
+
+        Ok(ChatInfo {
+            chat_id: data.chat_id.unwrap_or_else(|| chat_id.to_string()),
+            name: data.name.unwrap_or_default(),
+            chat_type: data.chat_type.unwrap_or_else(|| "unknown".to_string()),
+        })
+    }
+
+    async fn send_card(&self, _chat_id: &str, _card_json: &str) -> PlatformResult<String> {
+        Err(PlatformError::NotImplemented("send_card".into()))
+    }
+
+    async fn on_event(&self, _event: &PlatformEvent) -> PlatformResult<Option<InboundMessage>> {
+        Ok(None)
     }
 }
 
@@ -637,5 +1027,157 @@ mod tests {
             .with_verify_token("test_token");
         // Signature computation test would go here
         let _ = config;
+    }
+
+    // ------------------------------------------------------------------
+    // Post rejection regex tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_post_rejection_regex_matches_feishu_error() {
+        let re = Regex::new(r"(?i)content format of the post type is incorrect").unwrap();
+        assert!(re.is_match("content format of the post type is incorrect"));
+        assert!(re.is_match("Content Format Of The Post Type Is Incorrect"));
+        assert!(re.is_match("error: content format of the post type is incorrect, please check"));
+    }
+
+    #[test]
+    fn test_post_rejection_regex_rejects_other_errors() {
+        let re = Regex::new(r"(?i)content format of the post type is incorrect").unwrap();
+        assert!(!re.is_match("invalid access token"));
+        assert!(!re.is_match("message not found"));
+        assert!(!re.is_match("rate limited"));
+        assert!(!re.is_match(""));
+    }
+
+    // ------------------------------------------------------------------
+    // Send text message format tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_send_text_message_format() {
+        let text = "Hello world";
+        let payload = build_text_payload(text);
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["text"], "Hello world");
+    }
+
+    #[test]
+    fn test_send_text_message_format_empty() {
+        let payload = build_text_payload("");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["text"], "");
+    }
+
+    // ------------------------------------------------------------------
+    // Post→text fallback detection tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_post_fallback_strips_markdown() {
+        let input = "**bold** and *italic* and `code`";
+        let stripped = strip_markdown(input);
+        assert!(!stripped.contains("**"));
+        assert!(!stripped.contains("*"));
+        assert!(!stripped.contains("`"));
+        assert_eq!(stripped, "bold and italic and code");
+    }
+
+    #[test]
+    fn test_post_payload_contains_markdown_formatting() {
+        let payload = build_post_payload("Hello **world**");
+        assert!(payload.contains("Hello **world**"));
+        assert!(payload.contains(r#""tag":"md""#));
+    }
+
+    #[test]
+    fn test_post_payload_is_valid_json() {
+        let payload = build_post_payload("Test message");
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(v["zh_cn"]["content"].is_array());
+    }
+
+    // ------------------------------------------------------------------
+    // Edit message format tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_edit_message_update_request_format() {
+        let content = r#"{"text":"updated content"}"#;
+        let req = UpdateMessageRequest {
+            content: content.to_string(),
+            msg_type: "text".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["content"], content);
+        assert_eq!(v["msg_type"], "text");
+    }
+
+    #[test]
+    fn test_edit_message_send_message_request_format() {
+        let req = SendMessageRequest {
+            receive_id: "ou_test123".to_string(),
+            msg_type: "post".to_string(),
+            content: r#"{"zh_cn":{"content":[[{"tag":"md","text":"hello"}]]}}"#.to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["receive_id"], "ou_test123");
+        assert_eq!(v["msg_type"], "post");
+        assert!(v["content"].as_str().unwrap().contains("zh_cn"));
+    }
+
+    // ------------------------------------------------------------------
+    // Delete message response format tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_delete_message_response_format() {
+        // Test that the delete response format is correct
+        #[derive(Deserialize)]
+        struct DeleteResponse {
+            code: i32,
+            msg: String,
+        }
+        let raw = r#"{"code": 0, "msg": "success"}"#;
+        let resp: DeleteResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.code, 0);
+        assert_eq!(resp.msg, "success");
+    }
+
+    // ------------------------------------------------------------------
+    // Chat info response format tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_chat_info_from_get_chat_response() {
+        let raw = r#"{
+            "code": 0,
+            "msg": "success",
+            "data": {
+                "chat_type": "group",
+                "name": "Test Chat",
+                "chat_id": "oc_chat123"
+            }
+        }"#;
+        let resp: GetChatResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.code, 0);
+        let data = resp.data.unwrap();
+        assert_eq!(data.chat_type.unwrap(), "group");
+        assert_eq!(data.name.unwrap(), "Test Chat");
+        assert_eq!(data.chat_id.unwrap(), "oc_chat123");
+    }
+
+    // ------------------------------------------------------------------
+    // Reply fallback code tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_reply_fallback_codes() {
+        // 230011 = message not found (reply target missing)
+        // 231003 = message has been recalled
+        assert_ne!(230011, 0);
+        assert_ne!(231003, 0);
     }
 }

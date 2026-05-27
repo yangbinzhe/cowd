@@ -4,7 +4,7 @@
 //! supporting both sending and receiving messages through the WeCom API,
 //! with full AES-256-CBC message encryption/decryption and callback verification.
 
-use crate::platform::adapter::{InboundMessage, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformResult};
+use crate::platform::adapter::{ChatInfo, InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformEvent, PlatformResult};
 use crate::platform::types::SessionKey;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -460,6 +460,11 @@ impl WeComAdapter {
                     metadata: serde_json::json!({
                         "msg_id": msg_id,
                     }),
+                    message_type: MessageType::Text,
+                    message_id: msg_id.clone(),
+                    reply_to_message_id: None,
+                    media_urls: vec![],
+                    media_types: vec![],
                 }))
             }
             Some("event") => {
@@ -585,6 +590,54 @@ impl PlatformAdapter for WeComAdapter {
 
     async fn send(&self, msg: &OutboundMessage) -> PlatformResult<()> {
         self.send_message(&msg.session_key, &msg.text).await
+    }
+
+    async fn send_typing(&self, _chat_id: &str) -> Result<(), PlatformError> {
+        Err(PlatformError::NotImplemented("send_typing".into()))
+    }
+
+    async fn send_image(&self, _chat_id: &str, _image_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_image".into()))
+    }
+
+    async fn send_image_file(&self, _chat_id: &str, _image_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_image_file".into()))
+    }
+
+    async fn send_voice(&self, _chat_id: &str, _audio_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_voice".into()))
+    }
+
+    async fn send_document(&self, _chat_id: &str, _file_path: &str, _file_name: Option<&str>, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_document".into()))
+    }
+
+    async fn send_video(&self, _chat_id: &str, _video_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_video".into()))
+    }
+
+    async fn send_animation(&self, _chat_id: &str, _animation_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_animation".into()))
+    }
+
+    async fn edit_message(&self, _chat_id: &str, _message_id: &str, _content: &str) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("edit_message".into()))
+    }
+
+    async fn delete_message(&self, _chat_id: &str, _message_id: &str) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("delete_message".into()))
+    }
+
+    async fn get_chat_info(&self, _chat_id: &str) -> PlatformResult<ChatInfo> {
+        Err(PlatformError::NotImplemented("get_chat_info".into()))
+    }
+
+    async fn send_card(&self, _chat_id: &str, _card_json: &str) -> PlatformResult<String> {
+        Err(PlatformError::NotImplemented("send_card".into()))
+    }
+
+    async fn on_event(&self, _event: &PlatformEvent) -> PlatformResult<Option<InboundMessage>> {
+        Ok(None)
     }
 }
 

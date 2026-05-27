@@ -9,7 +9,7 @@
 
 use crate::platform::adapter::InboundMessage;
 #[cfg(test)]
-use crate::platform::adapter::Platform;
+use crate::platform::adapter::{MessageType, Platform};
 #[cfg(test)]
 use crate::platform::types::SessionKey;
 use chrono::{DateTime, Utc};
@@ -262,6 +262,11 @@ mod tests {
             sender_name: Some("Alice".to_string()),
             timestamp: Utc::now(),
             metadata: serde_json::json!({}),
+            message_type: MessageType::Text,
+            message_id: None,
+            reply_to_message_id: None,
+            media_urls: vec![],
+            media_types: vec![],
         };
 
         let results = mirror.mirror(&msg).await;
@@ -282,6 +287,11 @@ mod tests {
             sender_name: None,
             timestamp: Utc::now(),
             metadata: serde_json::json!({}),
+            message_type: MessageType::Text,
+            message_id: None,
+            reply_to_message_id: None,
+            media_urls: vec![],
+            media_types: vec![],
         };
 
         let results = mirror.mirror(&msg).await;
@@ -312,6 +322,11 @@ mod tests {
             sender_name: None,
             timestamp: Utc::now(),
             metadata: serde_json::json!({}),
+            message_type: MessageType::Text,
+            message_id: None,
+            reply_to_message_id: None,
+            media_urls: vec![],
+            media_types: vec![],
         };
 
         let results = mirror.mirror(&msg).await;
@@ -342,6 +357,11 @@ mod tests {
             sender_name: None,
             timestamp: Utc::now(),
             metadata: serde_json::json!({}),
+            message_type: MessageType::Text,
+            message_id: None,
+            reply_to_message_id: None,
+            media_urls: vec![],
+            media_types: vec![],
         };
 
         let results = mirror.mirror(&msg).await;
@@ -367,6 +387,11 @@ mod tests {
             sender_name: None,
             timestamp: Utc::now(),
             metadata: serde_json::json!({}),
+            message_type: MessageType::Text,
+            message_id: None,
+            reply_to_message_id: None,
+            media_urls: vec![],
+            media_types: vec![],
         };
         let results = mirror.mirror(&msg).await;
         assert_eq!(results.len(), 1);
@@ -382,6 +407,11 @@ mod tests {
             sender_name: None,
             timestamp: Utc::now(),
             metadata: serde_json::json!({}),
+            message_type: MessageType::Text,
+            message_id: None,
+            reply_to_message_id: None,
+            media_urls: vec![],
+            media_types: vec![],
         };
 
         let mirrored = MirroredMessage::from_inbound(&msg);

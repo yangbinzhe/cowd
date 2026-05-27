@@ -2,7 +2,7 @@
 //!
 //! Provides SMTP email sending and IMAP email receiving with attachment handling.
 
-use crate::platform::adapter::{InboundMessage, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformResult};
+use crate::platform::adapter::{InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformResult};
 use crate::platform::types::SessionKey;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -233,6 +233,11 @@ impl EmailAdapter {
                                     "uid": uid,
                                     "attachments": attachment_count,
                                 }),
+                                message_type: MessageType::Text,
+                                message_id: None,
+                                reply_to_message_id: None,
+                                media_urls: vec![],
+                                media_types: vec![],
                             });
                         }
                     }

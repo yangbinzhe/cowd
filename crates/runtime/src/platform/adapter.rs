@@ -2,8 +2,10 @@
 
 use crate::platform::types::SessionKey;
 use async_trait::async_trait;
-use std::fmt;
 use thiserror::Error;
+
+// Re-export types for backward compatibility.
+pub use crate::platform::types::{ChatInfo, MessageType, Platform, PlatformEvent, SendResult};
 
 /// Errors that can occur during platform operations.
 #[derive(Error, Debug)]
@@ -31,6 +33,9 @@ pub enum PlatformError {
 
     #[error("unknown platform error: {0}")]
     Unknown(String),
+
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
 }
 
 /// Inbound message from a platform.
@@ -48,6 +53,16 @@ pub struct InboundMessage {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     /// Additional metadata.
     pub metadata: serde_json::Value,
+    /// Message type classification.
+    pub message_type: MessageType,
+    /// Platform-specific message identifier.
+    pub message_id: Option<String>,
+    /// ID of the message this is replying to.
+    pub reply_to_message_id: Option<String>,
+    /// URLs of media attachments.
+    pub media_urls: Vec<String>,
+    /// MIME types of media attachments.
+    pub media_types: Vec<String>,
 }
 
 /// Outbound message to a platform.
@@ -61,45 +76,6 @@ pub struct OutboundMessage {
     pub reply_to: Option<String>,
     /// Additional metadata.
     pub metadata: serde_json::Value,
-}
-
-/// Platform type enumeration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Platform {
-    Feishu,
-    WeChat,
-    Email,
-    /// Custom platform identified by name.
-    Custom(&'static str),
-}
-
-impl Platform {
-    /// Get the platform name as a string.
-    pub fn name(&self) -> &str {
-        match self {
-            Platform::Feishu => "feishu",
-            Platform::WeChat => "wecom",
-            Platform::Email => "email",
-            Platform::Custom(name) => name,
-        }
-    }
-
-    /// Parse a platform from a string.
-    pub fn parse(s: &str) -> Self {
-        let lower = s.to_lowercase();
-        match lower.as_str() {
-            "feishu" | "lark" => Platform::Feishu,
-            "wecom" | "wechat" => Platform::WeChat,
-            "email" | "mail" => Platform::Email,
-            other => Platform::Custom(Box::leak(other.to_string().into_boxed_str())),
-        }
-    }
-}
-
-impl fmt::Display for Platform {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name())
-    }
 }
 
 /// Trait for platform adapters.
@@ -130,6 +106,78 @@ pub trait PlatformAdapter: Send + Sync {
 
     /// Send an outbound message.
     async fn send(&self, msg: &OutboundMessage) -> Result<(), PlatformError>;
+
+    /// Send a typing indicator to the chat.
+    #[allow(unused_variables)]
+    async fn send_typing(&self, chat_id: &str) -> Result<(), PlatformError> {
+        Err(PlatformError::NotImplemented("send_typing".into()))
+    }
+
+    /// Send an image from a URL.
+    #[allow(unused_variables)]
+    async fn send_image(&self, chat_id: &str, image_url: &str, caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_image".into()))
+    }
+
+    /// Send an image from a local file path.
+    #[allow(unused_variables)]
+    async fn send_image_file(&self, chat_id: &str, image_path: &str, caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_image_file".into()))
+    }
+
+    /// Send a voice message from an audio file.
+    #[allow(unused_variables)]
+    async fn send_voice(&self, chat_id: &str, audio_path: &str, caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_voice".into()))
+    }
+
+    /// Send a document/file.
+    #[allow(unused_variables)]
+    async fn send_document(&self, chat_id: &str, file_path: &str, file_name: Option<&str>, caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_document".into()))
+    }
+
+    /// Send a video message.
+    #[allow(unused_variables)]
+    async fn send_video(&self, chat_id: &str, video_path: &str, caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_video".into()))
+    }
+
+    /// Send an animation/GIF from a URL.
+    #[allow(unused_variables)]
+    async fn send_animation(&self, chat_id: &str, animation_url: &str, caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_animation".into()))
+    }
+
+    /// Edit an existing message.
+    #[allow(unused_variables)]
+    async fn edit_message(&self, chat_id: &str, message_id: &str, content: &str) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("edit_message".into()))
+    }
+
+    /// Delete an existing message.
+    #[allow(unused_variables)]
+    async fn delete_message(&self, chat_id: &str, message_id: &str) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("delete_message".into()))
+    }
+
+    /// Get information about a chat/group.
+    #[allow(unused_variables)]
+    async fn get_chat_info(&self, chat_id: &str) -> PlatformResult<ChatInfo> {
+        Err(PlatformError::NotImplemented("get_chat_info".into()))
+    }
+
+    /// Send an interactive card message. Returns the message ID.
+    #[allow(unused_variables)]
+    async fn send_card(&self, chat_id: &str, card_json: &str) -> PlatformResult<String> {
+        Err(PlatformError::NotImplemented("send_card".into()))
+    }
+
+    /// Handle an incoming platform event. Returns an optional InboundMessage.
+    #[allow(unused_variables)]
+    async fn on_event(&self, event: &PlatformEvent) -> PlatformResult<Option<InboundMessage>> {
+        Ok(None)
+    }
 }
 
 /// Result type alias for platform operations.
@@ -141,7 +189,7 @@ pub struct NullAdapter;
 #[async_trait]
 impl PlatformAdapter for NullAdapter {
     fn platform(&self) -> Platform {
-        Platform::Custom("null")
+        Platform::Custom("null".to_string())
     }
 
     fn platform_name(&self) -> &str {
@@ -166,5 +214,57 @@ impl PlatformAdapter for NullAdapter {
 
     async fn send(&self, _msg: &OutboundMessage) -> PlatformResult<()> {
         Ok(())
+    }
+
+    async fn send_typing(&self, _chat_id: &str) -> Result<(), PlatformError> {
+        Ok(())
+    }
+
+    async fn send_image(&self, _chat_id: &str, _image_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_image".into()))
+    }
+
+    async fn send_image_file(&self, _chat_id: &str, _image_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_image_file".into()))
+    }
+
+    async fn send_voice(&self, _chat_id: &str, _audio_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_voice".into()))
+    }
+
+    async fn send_document(&self, _chat_id: &str, _file_path: &str, _file_name: Option<&str>, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_document".into()))
+    }
+
+    async fn send_video(&self, _chat_id: &str, _video_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_video".into()))
+    }
+
+    async fn send_animation(&self, _chat_id: &str, _animation_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("send_animation".into()))
+    }
+
+    async fn edit_message(&self, _chat_id: &str, _message_id: &str, _content: &str) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("edit_message".into()))
+    }
+
+    async fn delete_message(&self, _chat_id: &str, _message_id: &str) -> PlatformResult<()> {
+        Err(PlatformError::NotImplemented("delete_message".into()))
+    }
+
+    async fn get_chat_info(&self, _chat_id: &str) -> PlatformResult<ChatInfo> {
+        Ok(ChatInfo {
+            chat_id: _chat_id.to_string(),
+            name: "Null Chat".into(),
+            chat_type: "null".into(),
+        })
+    }
+
+    async fn send_card(&self, _chat_id: &str, _card_json: &str) -> PlatformResult<String> {
+        Err(PlatformError::NotImplemented("send_card".into()))
+    }
+
+    async fn on_event(&self, _event: &PlatformEvent) -> PlatformResult<Option<InboundMessage>> {
+        Ok(None)
     }
 }

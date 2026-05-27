@@ -3,6 +3,90 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Platform type enumeration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Platform {
+    Feishu,
+    WeChat,
+    Email,
+    /// Custom platform identified by name.
+    Custom(String),
+}
+
+impl Platform {
+    /// Get the platform name as a string.
+    pub fn name(&self) -> &str {
+        match self {
+            Platform::Feishu => "feishu",
+            Platform::WeChat => "wecom",
+            Platform::Email => "email",
+            Platform::Custom(name) => name.as_str(),
+        }
+    }
+
+    /// Parse a platform from a string.
+    pub fn parse(s: &str) -> Self {
+        let lower = s.to_lowercase();
+        match lower.as_str() {
+            "feishu" | "lark" => Platform::Feishu,
+            "wecom" | "wechat" => Platform::WeChat,
+            "email" | "mail" => Platform::Email,
+            other => Platform::Custom(other.to_string()),
+        }
+    }
+}
+
+impl fmt::Display for Platform {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// Message type classification for inbound messages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MessageType {
+    Text,
+    Photo,
+    Video,
+    Audio,
+    Voice,
+    Document,
+    Sticker,
+    Command,
+    Location,
+}
+
+impl Default for MessageType {
+    fn default() -> Self {
+        MessageType::Text
+    }
+}
+
+/// Result of a message send operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendResult {
+    pub success: bool,
+    pub message_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Basic chat/group information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatInfo {
+    pub chat_id: String,
+    pub name: String,
+    pub chat_type: String,
+}
+
+/// Platform event received from an external platform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformEvent {
+    pub event_type: String,
+    pub platform: Platform,
+    pub data: serde_json::Value,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
 /// Unique identifier for a platform session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionKey {

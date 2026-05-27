@@ -3,6 +3,8 @@
 //! Provides rule-based message processing and routing for Feishu platform.
 
 use crate::platform::adapter::{InboundMessage, PlatformError, PlatformResult};
+#[cfg(test)]
+use crate::platform::adapter::MessageType;
 use crate::platform::feishu::FeishuAdapter;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -368,6 +370,11 @@ mod tests {
             sender_name: None,
             timestamp: chrono::Utc::now(),
             metadata: serde_json::json!({}),
+            message_type: MessageType::Text,
+            message_id: None,
+            reply_to_message_id: None,
+            media_urls: vec![],
+            media_types: vec![],
         }
     }
 
