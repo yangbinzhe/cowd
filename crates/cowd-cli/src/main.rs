@@ -55,7 +55,7 @@ use runtime::{
     load_system_prompt, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
+    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage, TurnSummary,
     ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
@@ -455,6 +455,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            compact,
+            prompt,
         } => run_repl(
             model,
             allowed_tools,
@@ -462,6 +464,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            compact,
+            prompt,
         )?,
         CliAction::MigrateSessions { output_format } => run_migrate_sessions(output_format)?,
         CliAction::Gateway { action, output_format } => run_gateway_action(&action, output_format)?,
@@ -709,6 +713,8 @@ pub(crate) enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
+        compact: bool,
+        prompt: Option<String>,
     },
     MigrateSessions {
         output_format: CliOutputFormat,
@@ -955,6 +961,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
+            compact,
+            prompt: None,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -992,6 +1000,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
+                    compact,
+                    prompt: Some(_prompt),
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -1047,6 +1057,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
+            compact,
+            prompt: Some(rest.join(" ")),
         }),
     }
 }
@@ -1189,6 +1201,8 @@ fn parse_direct_slash_cli_action(
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
+                    compact: false,
+                    prompt: Some(_prompt),
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -2636,14 +2650,60 @@ fn run_repl(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
+    compact: bool,
+    prompt: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
-    let workspace = std::env::current_dir().unwrap_or_default();
-    run_tui_repl(cli, workspace)
+
+    if compact {
+        let prompt = prompt.ok_or_else(|| "compact mode requires a prompt argument".to_string())?;
+        if prompt.is_empty() {
+            return Err("compact mode requires a non-empty prompt argument".into());
+        }
+        let (mut runtime, hook_abort_monitor, _) = cli.prepare_turn_runtime(false, None, None)?;
+        let prompter = runtime::permissions::SharedPrompter::new(Box::new(
+            CliPermissionPrompter::new(cli.permission_mode),
+        ));
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| SHARED_RT.handle().clone());
+        let result = handle.block_on(runtime.run_turn_async(&prompt, &prompter));
+        hook_abort_monitor.stop();
+        match result {
+            Ok(summary) => {
+                cli.replace_runtime(runtime)?;
+                let text = extract_compact_output(&summary);
+                cli.persist_session()?;
+                println!("{}", text);
+                Ok(())
+            }
+            Err(error) => {
+                runtime.shutdown_plugins()?;
+                Err(Box::new(error))
+            }
+        }
+    } else {
+        let workspace = std::env::current_dir().unwrap_or_default();
+        run_tui_repl(cli, workspace)
+    }
+}
+
+fn extract_compact_output(summary: &TurnSummary) -> String {
+    summary
+        .assistant_messages
+        .iter()
+        .filter(|msg| msg.role == MessageRole::Assistant)
+        .flat_map(|msg| {
+            msg.blocks.iter().filter_map(|block| match block {
+                ContentBlock::Text { text } if !text.is_empty() => Some(text.as_str()),
+                _ => None,
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn list_workspace_files(workspace: &PathBuf) -> Vec<tui::FileEntry> {
@@ -5293,6 +5353,19 @@ fn load_session_reference(
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
     let handle = resolve_session_reference(reference)?;
     let session = Session::load_from_path(&handle.path)?;
+
+    // Check workspace mismatch
+    if let Some(ref session_workspace) = session.workspace_root {
+        let current_dir = std::env::current_dir()?;
+        if *session_workspace != current_dir {
+            return Err(format!(
+                "session workspace mismatch: session was created in '{}' but current workspace is '{}'",
+                session_workspace.display(),
+                current_dir.display()
+            ).into());
+        }
+    }
+
     Ok((handle, session))
 }
 
@@ -7574,7 +7647,7 @@ fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
 
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
     if error.is_context_window_failure() {
-        error.to_string()
+        format_context_window_error(session_id, error)
     } else if error.is_generic_fatal_wrapper() {
         let mut qualifiers = vec![format!("session {session_id}")];
         if let Some(request_id) = error.request_id() {
@@ -7590,6 +7663,87 @@ fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> Str
         error.to_string()
     }
 }
+
+fn format_context_window_error(session_id: &str, error: &api::ApiError) -> String {
+    let mut lines: Vec<String> = vec!["context_window_blocked".to_string(), String::new()];
+
+    match error {
+        api::ApiError::ContextWindowExceeded {
+            model,
+            estimated_input_tokens,
+            requested_output_tokens: _,
+            estimated_total_tokens,
+            context_window_tokens: _,
+        } => {
+            lines.push(format!("Context window blocked for {model}"));
+            lines.push(String::new());
+            lines.push(format!("{:<17}{session_id}", "Session"));
+            lines.push(format!("{:<17}{model}", "Model"));
+            lines.push(format!(
+                "{:<17}~{estimated_input_tokens} tokens (heuristic)",
+                "Input estimate"
+            ));
+            lines.push(format!(
+                "{:<17}~{estimated_total_tokens} tokens (heuristic)",
+                "Total estimate"
+            ));
+            lines.push(String::new());
+            lines.push(format!("{:<17}/compact", "Compact"));
+            lines.push(format!(
+                "{:<17}cowd --resume {session_id} /compact",
+                "Resume compact"
+            ));
+            lines.push(format!("{:<17}/clear --confirm", "Fresh session"));
+            lines.push(format!(
+                "{:<17}reduce output tokens or break into smaller requests",
+                "Reduce scope"
+            ));
+            lines.push(format!("{:<17}rerun", "Retry"));
+        }
+        api::ApiError::Api {
+            message,
+            request_id,
+            ..
+        } => {
+            if let Some(ref rid) = request_id {
+                lines.push(format!("{:<17}{rid}", "Trace"));
+            }
+            if let Some(ref msg) = message {
+                lines.push(format!("{:<17}{msg}", "Detail"));
+            }
+            lines.push(String::new());
+            lines.push(format!("{:<17}/compact", "Compact"));
+            lines.push(format!("{:<17}/clear --confirm", "Fresh session"));
+        }
+        api::ApiError::RetriesExhausted { attempts, last_error } => {
+            lines.push("Context window blocked".to_string());
+            lines.push(format!("api failed after {attempts} attempts"));
+            lines.push(String::new());
+            if let Some(rid) = last_error.request_id() {
+                lines.push(format!("{:<17}{rid}", "Trace"));
+            }
+            if let api::ApiError::Api {
+                message: Some(ref msg),
+                ..
+            } = **last_error
+            {
+                lines.push(format!("{:<17}{msg}", "Detail"));
+            }
+            lines.push(String::new());
+            lines.push(format!("{:<17}/compact", "Compact"));
+            lines.push(format!(
+                "{:<17}cowd --resume {session_id} /compact",
+                "Resume compact"
+            ));
+        }
+        _ => {
+            lines.push(error.to_string());
+        }
+    }
+
+    lines.join("\n")
+}
+
 
 
 
@@ -9128,6 +9282,8 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                compact: false,
+                prompt: None,
             }
         );
     }
@@ -9401,6 +9557,8 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                compact: false,
+                prompt: None,
             }
         );
     }
@@ -9423,6 +9581,8 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                compact: false,
+                prompt: None,
             }
         );
     }
@@ -9452,6 +9612,8 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                compact: false,
+                prompt: None,
             }
         );
     }
@@ -9553,6 +9715,8 @@ mod tests {
                     base_commit: None,
                     reasoning_effort: None,
                     allow_broad_cwd: false,
+                    compact: false,
+                    prompt: Some("$help overview".to_string()),
                 }
             );
             assert_eq!(
@@ -10008,6 +10172,8 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                compact: false,
+                prompt: Some("$help overview".to_string()),
             }
         );
         assert_eq!(
@@ -10032,6 +10198,8 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                compact: false,
+                prompt: Some("$test".to_string()),
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -10899,7 +11067,9 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let config_home_original = std::env::var("COWD_CONFIG_HOME").ok();
+        std::env::remove_var("COWD_CONFIG_HOME");
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -10928,13 +11098,22 @@ UU conflicted.rs",
                 .expect("legacy path should exist")
         );
 
+        // Clean up created session files
+        let _ = std::fs::remove_file(&handle.path);
+        let _ = std::fs::remove_file(&legacy_path);
+
         std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        if let Some(v) = config_home_original {
+            std::env::set_var("COWD_CONFIG_HOME", v);
+        }
     }
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let config_home_original = std::env::var("COWD_CONFIG_HOME").ok();
+        std::env::remove_var("COWD_CONFIG_HOME");
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -10961,13 +11140,19 @@ UU conflicted.rs",
             newer.path.canonicalize().expect("newer path should exist")
         );
 
+        let _ = std::fs::remove_file(&older.path);
+        let _ = std::fs::remove_file(&newer.path);
+
         std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        if let Some(v) = config_home_original {
+            std::env::set_var("COWD_CONFIG_HOME", v);
+        }
     }
 
     #[test]
     fn load_session_reference_rejects_workspace_mismatch() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
         let workspace_a = temp_workspace("session-mismatch-a");
         let workspace_b = temp_workspace("session-mismatch-b");
         std::fs::create_dir_all(&workspace_a).expect("workspace a should create");
