@@ -10501,7 +10501,7 @@ mod tests {
             vec!["session-old".to_string()],
         );
 
-        assert!(completions.contains(&"/model claude-sonnet-4-6".to_string()));
+        assert!(completions.contains(&"/model sonnet".to_string()));
         assert!(completions.contains(&"/permissions workspace-write".to_string()));
         assert!(completions.contains(&"/session list".to_string()));
         assert!(completions.contains(&"/session switch session-current".to_string()));
@@ -10572,7 +10572,7 @@ mod tests {
         fs::create_dir_all(&config_home).expect("config home dir");
         std::env::set_var("COWD_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
-        std::env::set_var("ANTHROPIC_MODEL", "sonnet");
+        std::env::set_var("ANTHROPIC_MODEL", "claude-sonnet-4-6");
 
         let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 
