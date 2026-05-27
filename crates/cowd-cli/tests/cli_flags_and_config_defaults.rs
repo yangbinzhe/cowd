@@ -19,7 +19,7 @@ fn status_command_applies_model_and_permission_mode_flags() {
         .current_dir(&temp_dir)
         .args([
             "--model",
-            "sonnet",
+            "claude-sonnet-4-6",
             "--permission-mode",
             "read-only",
             "status",

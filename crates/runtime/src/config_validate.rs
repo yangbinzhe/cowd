@@ -93,6 +93,7 @@ enum FieldType {
     Object,
     StringArray,
     Number,
+    ObjectOrObjectArray,
 }
 
 impl FieldType {
@@ -103,6 +104,7 @@ impl FieldType {
             Self::Object => "an object",
             Self::StringArray => "an array of strings",
             Self::Number => "a number",
+            Self::ObjectOrObjectArray => "an object or an array of objects",
         }
     }
 
@@ -115,6 +117,12 @@ impl FieldType {
                 .as_array()
                 .is_some_and(|arr| arr.iter().all(|v| v.as_str().is_some())),
             Self::Number => value.as_i64().is_some(),
+            Self::ObjectOrObjectArray => {
+                value.as_object().is_some()
+                    || value
+                        .as_array()
+                        .is_some_and(|arr| arr.iter().all(|v| v.as_object().is_some()))
+            }
         }
     }
 }
@@ -191,7 +199,7 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "providerFallbacks",
-        expected: FieldType::Object,
+        expected: FieldType::ObjectOrObjectArray,
     },
     FieldSpec {
         name: "trustedRoots",

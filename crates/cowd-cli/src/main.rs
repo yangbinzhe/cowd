@@ -34,9 +34,10 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use api::{
     detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    CachedProviderClient, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -67,9 +68,9 @@ use tools::{
 use futures::StreamExt;
 use tui::state::TuiState;
 
-pub(crate) const DEFAULT_MODEL: &str = "claude-opus-4-6";
+pub(crate) const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
-    cli::max_tokens_for_model(model)
+    api::max_tokens_for_model(model)
 }
 static SHARED_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -1224,29 +1225,23 @@ fn parse_direct_slash_cli_action(
     }
 }
 
-fn resolve_model_alias(model: &str) -> &str {
-    cli::resolve_model_alias(model)
-}
-
-/// Resolve a model name through user-defined config aliases first, then fall
-/// back to the built-in alias table. This is the entry point used wherever a
-/// user-supplied model string is about to be dispatched to a provider.
 fn resolve_model_alias_with_config(model: &str) -> String {
     let trimmed = model.trim();
-    if let Some(resolved) = config_alias_for_current_dir(trimmed) {
-        return resolve_model_alias(&resolved).to_string();
-    }
-    resolve_model_alias(trimmed).to_string()
+    let config_aliases = config_aliases_for_current_dir();
+    let resolver = runtime::ModelResolver::new(config_aliases);
+    resolver.resolve(trimmed)
 }
 
-fn config_alias_for_current_dir(alias: &str) -> Option<String> {
-    if alias.is_empty() {
-        return None;
-    }
-    let cwd = env::current_dir().ok()?;
+fn config_aliases_for_current_dir() -> std::collections::HashMap<String, String> {
+    let cwd = match env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return std::collections::HashMap::new(),
+    };
     let loader = ConfigLoader::default_for(&cwd);
-    let config = loader.load().ok()?;
-    config.aliases().get(alias).cloned()
+    match loader.load() {
+        Ok(config) => config.aliases().clone().into_iter().collect(),
+        Err(_) => std::collections::HashMap::new(),
+    }
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
@@ -1321,15 +1316,18 @@ fn resolve_repl_model(cli_model: String) -> String {
     if cli_model != DEFAULT_MODEL {
         return cli_model;
     }
-    if let Some(env_model) = env::var("ANTHROPIC_MODEL")
+    // Config file takes priority over environment variables.
+    if let Some(config_model) = config_model_for_current_dir() {
+        return resolve_model_alias_with_config(&config_model);
+    }
+    // Environment variables serve as fallback: COWD_MODEL (new) or ANTHROPIC_MODEL (legacy).
+    if let Some(env_model) = env::var("COWD_MODEL")
         .ok()
+        .or_else(|| env::var("ANTHROPIC_MODEL").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
         return resolve_model_alias_with_config(&env_model);
-    }
-    if let Some(config_model) = config_model_for_current_dir() {
-        return resolve_model_alias_with_config(&config_model);
     }
     cli_model
 }
@@ -7084,6 +7082,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 // it. See ROADMAP #29 for the provider-dispatch routing fix.
 struct AnthropicRuntimeClient {
     client: ApiProviderClient,
+    cached_client: CachedProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -7123,7 +7122,7 @@ impl AnthropicRuntimeClient {
         // session-scoped prompt cache on the Anthropic path; the
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
-        let resolved_model = api::resolve_model_alias(&model);
+        let resolved_model = model.trim().to_string();
         apply_config_provider_overrides(&resolved_model);
         let client = match detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => {
@@ -7147,8 +7146,12 @@ impl AnthropicRuntimeClient {
                 ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
             }
         };
+        // Wrap in a CachedProviderClient so ALL providers (including
+        // OpenAI-compat) benefit from deterministic prompt caching.
+        let cached_client = CachedProviderClient::new(client.clone(), session_id);
         Ok(Self {
             client,
+            cached_client,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -7174,11 +7177,28 @@ fn apply_config_provider_overrides(model: &str) {
     let loader = ConfigLoader::default_for(&cwd);
     let Ok(config) = loader.load() else { return };
     if let Some((base_url, api_key)) = config.providers().resolve(model) {
-        let url = if base_url.ends_with("/v1") || base_url.ends_with("/v1/") { base_url.to_string() }
-                  else if base_url.ends_with('/') { format!("{base_url}v1") }
-                  else { format!("{base_url}/v1") };
-        std::env::set_var("OPENAI_BASE_URL", &url);
-        std::env::set_var("OPENAI_API_KEY", api_key);
+        // Config file providers take priority over environment variables.
+        // Only apply overrides when env vars are not already set — config first,
+        // environment variables serve as fallback.
+        match detect_provider_kind(model) {
+            ProviderKind::Anthropic => {
+                if std::env::var_os("ANTHROPIC_API_KEY").is_none() {
+                    std::env::set_var("ANTHROPIC_API_KEY", api_key);
+                }
+                if std::env::var_os("ANTHROPIC_BASE_URL").is_none() {
+                    std::env::set_var("ANTHROPIC_BASE_URL", base_url);
+                }
+            }
+            _ => {
+                if std::env::var_os("OPENAI_API_KEY").is_none() {
+                    let url = if base_url.ends_with("/v1") || base_url.ends_with("/v1/") { base_url.to_string() }
+                              else if base_url.ends_with('/') { format!("{base_url}v1") }
+                              else { format!("{base_url}/v1") };
+                    std::env::set_var("OPENAI_BASE_URL", &url);
+                    std::env::set_var("OPENAI_API_KEY", api_key);
+                }
+            }
+        }
     }
 }
 
@@ -7445,8 +7465,8 @@ impl AnthropicRuntimeClient {
             return Ok(events);
         }
 
-        let response = self
-            .client
+        let (response, cache_record) = self
+            .cached_client
             .send_message(&MessageRequest {
                 stream: false,
                 ..message_request.clone()
@@ -7456,6 +7476,12 @@ impl AnthropicRuntimeClient {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
             })?;
         let mut events = response_to_events(response, out)?;
+        // Forward cache-break record from CachedProviderClient if present.
+        if let Some(record) = cache_record {
+            if let Some(event) = prompt_cache_record_to_runtime_event(record) {
+                events.push(AssistantEvent::PromptCache(event));
+            }
+        }
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
     }
@@ -7997,7 +8023,7 @@ fn slash_command_completion_candidates_with_sessions(
     }
 
     if !model.trim().is_empty() {
-        completions.insert(format!("/model {}", resolve_model_alias(model)));
+        completions.insert(format!("/model {}", resolve_model_alias_with_config(model)));
         completions.insert(format!("/model {model}"));
     }
 
@@ -8940,7 +8966,7 @@ mod tests {
         parse_history_count, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
         render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        render_session_markdown, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
@@ -9476,11 +9502,13 @@ mod tests {
     }
 
     #[test]
-    fn resolves_known_model_aliases() {
-        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
-        assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
-        assert_eq!(resolve_model_alias("haiku"), "claude-haiku-4-5-20251213");
-        assert_eq!(resolve_model_alias("claude-opus"), "claude-opus");
+    fn builtin_aliases_fallback_main_and_fast() {
+        let resolver = runtime::ModelResolver::default();
+        assert_eq!(resolver.resolve("main"), "claude-sonnet-4-6");
+        assert_eq!(resolver.resolve("fast"), "claude-haiku-4-5-20251213");
+        // Unknown aliases pass through
+        assert_eq!(resolver.resolve("opus"), "opus");
+        assert_eq!(resolver.resolve("grok-3"), "grok-3");
     }
 
     #[test]
@@ -9522,10 +9550,10 @@ mod tests {
 
         // then
         assert_eq!(direct, "claude-haiku-4-5-20251213");
-        assert_eq!(chained, "claude-opus-4-6");
+        assert_eq!(chained, "opus");
         assert_eq!(cross_provider, "grok-3-mini");
         assert_eq!(unknown, "unknown-model");
-        assert_eq!(builtin, "claude-haiku-4-5-20251213");
+        assert_eq!(builtin, "haiku");
     }
 
     #[test]
@@ -10473,7 +10501,7 @@ mod tests {
             vec!["session-old".to_string()],
         );
 
-        assert!(completions.contains(&"/model claude-sonnet-4-6".to_string()));
+        assert!(completions.contains(&"/model sonnet".to_string()));
         assert!(completions.contains(&"/permissions workspace-write".to_string()));
         assert!(completions.contains(&"/session list".to_string()));
         assert!(completions.contains(&"/session switch session-current".to_string()));
@@ -10528,11 +10556,11 @@ mod tests {
 
     #[test]
     fn resolve_repl_model_returns_user_supplied_model_unchanged_when_explicit() {
-        let user_model = "claude-sonnet-4-6".to_string();
+        let user_model = "gpt-4o".to_string();
 
         let resolved = resolve_repl_model(user_model);
 
-        assert_eq!(resolved, "claude-sonnet-4-6");
+        assert_eq!(resolved, "gpt-4o");
     }
 
     #[test]
@@ -10544,7 +10572,7 @@ mod tests {
         fs::create_dir_all(&config_home).expect("config home dir");
         std::env::set_var("COWD_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_MODEL");
-        std::env::set_var("ANTHROPIC_MODEL", "sonnet");
+        std::env::set_var("ANTHROPIC_MODEL", "claude-sonnet-4-6");
 
         let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
 

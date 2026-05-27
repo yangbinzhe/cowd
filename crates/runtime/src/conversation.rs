@@ -15,7 +15,7 @@ use tracing;
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
-use crate::config::RuntimeFeatureConfig;
+use crate::config::{RuntimeFeatureConfig, ProviderFallbackConfig};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy,
@@ -31,6 +31,8 @@ const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "COWD_AUTO_COMPACT_INPUT_TOKENS"
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
+    /// Target model ID (used by provider fallback chain to switch models).
+    pub model: String,
 }
 
 /// Streamed events emitted while processing a single assistant turn.
@@ -249,6 +251,10 @@ bus: Option<crate::bus::EventBus>,
     project_phase: String,
     /// Optional commit quality gate evaluator (PreFlight, Revision, Escalation, Abort).
     gate_evaluator: Option<Arc<crate::gates::GateEvaluator>>,
+    /// Current model ID (used for provider fallback chain lookup).
+    model: Option<String>,
+    /// Provider fallback configuration for automatic retry on 429/5xx errors.
+    provider_fallbacks_config: ProviderFallbackConfig,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -377,6 +383,8 @@ where
             effect_handler: None,
             project_phase: "Discovery".to_string(),
             gate_evaluator: None,
+            model: feature_config.model().map(str::to_string),
+            provider_fallbacks_config: feature_config.provider_fallbacks().clone(),
         }
     }
 
@@ -718,7 +726,16 @@ pub async fn run_turn_async(
             let request = ApiRequest {
                 system_prompt: effective_system_prompt.clone(),
                 messages: self.session.read().unwrap_or_else(|e| e.into_inner()).messages.clone(),
+                model: String::new(), // filled by fallback loop below
             };
+
+            let fallback_chain = crate::fallback_chain::FallbackChain::from_config(
+                &self.provider_fallbacks_config,
+                self.model.as_deref().unwrap_or(""),
+            );
+            let model_list: Vec<String> = std::iter::once(fallback_chain.primary.clone())
+                .chain(fallback_chain.fallbacks.clone())
+                .collect();
 
             // Use the new Stream-based API — consume events as they arrive
             use futures::StreamExt;
@@ -729,38 +746,93 @@ pub async fn run_turn_async(
             let mut turn_usage: Option<TokenUsage> = None;
             let mut stream_events: Vec<(String, String, String, u8)> = Vec::new();
 
-            {
-                let mut stream = self.api_client.stream(request);
-                while let Some(event) = stream.next().await {
-                    match event? {
-                        AssistantEvent::TextDelta(text) => {
-                            current_text.push_str(&text);
-                            stream_events.push(("text_delta".into(), "assistant".into(), text[..text.len().min(80)].to_string(), 3));
-                        }
-                        AssistantEvent::ThinkingDelta(thinking) => {
-                            thinking_text.push_str(&thinking);
-                            stream_events.push(("thinking".into(), "reasoning".into(), thinking[..thinking.len().min(80)].to_string(), 2));
-                        }
-                        AssistantEvent::SignatureDelta(signature) => {
-                            thinking_signature = Some(signature);
-                        }
-                        AssistantEvent::ToolUse { id, name, input } => { pending_tool_uses.push((id, name, input)); }
-                        AssistantEvent::Usage(usage) => { turn_usage = Some(usage); }
-                        AssistantEvent::MessageStop => break,
-                        AssistantEvent::ToolStart { id, name, preview } => {
-                            if let Some(callback) = &self.tool_callback {
-                                callback.on_tool_start(&id, &name, &preview);
+            let mut stream_error: Option<RuntimeError> = None;
+            let stream_success = 'retry: {
+                for (model_idx, model) in model_list.iter().enumerate() {
+                    let max_retries: u32 = 8;
+                    for attempt in 0..max_retries {
+                        let mut req = request.clone();
+                        req.model = model.to_string();
+
+                        let mut stream = self.api_client.stream(req);
+                        let mut model_current_text = String::new();
+                        let mut model_thinking_text = String::new();
+                        let mut model_thinking_signature: Option<String> = None;
+                        let mut model_pending_tool_uses: Vec<(String, String, String)> = Vec::new();
+                        let mut model_turn_usage: Option<TokenUsage> = None;
+                        let mut model_stream_events: Vec<(String, String, String, u8)> = Vec::new();
+
+                        let mut failed = false;
+                        while let Some(event) = stream.next().await {
+                            match event {
+                                Ok(AssistantEvent::TextDelta(text)) => {
+                                    model_current_text.push_str(&text);
+                                    model_stream_events.push(("text_delta".into(), "assistant".into(), text[..text.len().min(80)].to_string(), 3));
+                                }
+                                Ok(AssistantEvent::ThinkingDelta(thinking)) => {
+                                    model_thinking_text.push_str(&thinking);
+                                    model_stream_events.push(("thinking".into(), "reasoning".into(), thinking[..thinking.len().min(80)].to_string(), 2));
+                                }
+                                Ok(AssistantEvent::SignatureDelta(signature)) => {
+                                    model_thinking_signature = Some(signature);
+                                }
+                                Ok(AssistantEvent::ToolUse { id, name, input }) => {
+                                    model_pending_tool_uses.push((id, name, input));
+                                }
+                                Ok(AssistantEvent::Usage(usage)) => {
+                                    model_turn_usage = Some(usage);
+                                }
+                                Ok(AssistantEvent::MessageStop) => break,
+                                Ok(AssistantEvent::ToolStart { id, name, preview }) => {
+                                    if let Some(callback) = &self.tool_callback {
+                                        callback.on_tool_start(&id, &name, &preview);
+                                    }
+                                }
+                                Ok(AssistantEvent::ToolComplete { id, name, result_summary, exit_code }) => {
+                                    if let Some(callback) = &self.tool_callback {
+                                        callback.on_tool_complete(&id, &name, &result_summary, exit_code);
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    let err_str = e.to_string();
+                                    if is_retryable_error(&err_str) {
+                                        tracing::warn!(model, attempt, model_idx, error = %err_str, "retryable stream error");
+                                        if attempt == max_retries - 1 {
+                                            tracing::warn!(model, "exhausted retries, switching fallback");
+                                        }
+                                        failed = true;
+                                        stream_error = Some(e);
+                                        break;
+                                    }
+                                    return Err(e);
+                                }
                             }
                         }
-                        AssistantEvent::ToolComplete { id, name, result_summary, exit_code } => {
-                            if let Some(callback) = &self.tool_callback {
-                                callback.on_tool_complete(&id, &name, &result_summary, exit_code);
+                        if !failed {
+                            current_text = model_current_text;
+                            thinking_text = model_thinking_text;
+                            thinking_signature = model_thinking_signature;
+                            pending_tool_uses = model_pending_tool_uses;
+                            turn_usage = model_turn_usage;
+                            stream_events = model_stream_events;
+                            if model_idx > 0 {
+                                tracing::warn!(
+                                    model,
+                                    fallback_model_idx = model_idx,
+                                    "provider fallback succeeded"
+                                );
                             }
+                            break 'retry true;
                         }
-                        _ => {}
                     }
                 }
-            } // stream dropped here, releasing &mut self.api_client
+                false
+            };
+
+            if !stream_success {
+                return Err(stream_error.unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")));
+            }
 
             // Flush buffered stream events into context profiler
             for (event_type, category, summary, priority) in stream_events {
@@ -1709,6 +1781,13 @@ impl ToolExecutor for StaticToolExecutor {
             .get(tool_name)
             .ok_or_else(|| ToolError::new(format!("unknown tool: {tool_name}")))?(input)
     }
+}
+
+/// Check whether an error string indicates a retryable HTTP status (429/5xx).
+#[inline]
+fn is_retryable_error(err_str: &str) -> bool {
+    const RETRYABLE: &[&str] = &["429", "500", "502", "503", "504"];
+    RETRYABLE.iter().any(|code| err_str.contains(code))
 }
 
 #[cfg(test)]

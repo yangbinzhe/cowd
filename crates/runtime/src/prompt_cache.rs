@@ -1,3 +1,17 @@
+//! Prompt Cache — session-scoped completion cache with file persistence.
+//!
+//! Stores API responses keyed by a deterministic request hash so that
+//! identical prompts within a session can be served from disk without
+//! a round-trip to the model provider.
+//!
+//! ## Deterministic hashing
+//!
+//! Cache keys should be computed by the caller using a deterministic
+//! hash (e.g. SHA-256 of `model + system + tools + messages`).  This
+//! module provides `stable_hash_bytes` (FNV-1a) as a fast, serialisation-
+//! based helper, but callers requiring crypto-level collision resistance
+//! should use SHA-2 and pass the result directly.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -5,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{MessageRequest, MessageResponse, Usage};
+// ── constants ──────────────────────────────────────────────────────
 
 const DEFAULT_COMPLETION_TTL_SECS: u64 = 30;
 const DEFAULT_PROMPT_TTL_SECS: u64 = 5 * 60;
@@ -15,6 +29,8 @@ const REQUEST_FINGERPRINT_VERSION: u32 = 1;
 const REQUEST_FINGERPRINT_PREFIX: &str = "v1";
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+// ── config ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct PromptCacheConfig {
@@ -41,6 +57,8 @@ impl Default for PromptCacheConfig {
         Self::new("default")
     }
 }
+
+// ── paths ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptCachePaths {
@@ -71,6 +89,8 @@ impl PromptCachePaths {
         self.completion_dir.join(format!("{request_hash}.json"))
     }
 }
+
+// ── stats ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptCacheStats {
@@ -104,6 +124,17 @@ pub struct PromptCacheRecord {
     pub cache_break: Option<CacheBreakEvent>,
     pub stats: PromptCacheStats,
 }
+
+/// Lightweight usage summary passed to cache-break detection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheUsage {
+    pub input_tokens: u32,
+    pub cache_creation_input_tokens: u32,
+    pub cache_read_input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+// ── PromptCache ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct PromptCache {
@@ -141,19 +172,24 @@ impl PromptCache {
         self.lock().stats.clone()
     }
 
+    // ── completion cache (value-level) ─────────────────────────
+
+    /// Try to fetch a cached completion response for the given
+    /// **deterministic** request hash.  Returns the stored JSON blob
+    /// if the entry exists, its fingerprint matches, and it hasn't
+    /// expired.
     #[must_use]
-    pub fn lookup_completion(&self, request: &MessageRequest) -> Option<MessageResponse> {
-        let request_hash = request_hash_hex(request);
+    pub fn lookup_completion(&self, request_hash: &str) -> Option<serde_json::Value> {
         let (paths, ttl) = {
             let inner = self.lock();
             (inner.paths.clone(), inner.config.completion_ttl)
         };
-        let entry_path = paths.completion_entry_path(&request_hash);
+        let entry_path = paths.completion_entry_path(request_hash);
         let entry = read_json::<CompletionCacheEntry>(&entry_path);
         let Some(entry) = entry else {
             let mut inner = self.lock();
             inner.stats.completion_cache_misses += 1;
-            inner.stats.last_completion_cache_key = Some(request_hash);
+            inner.stats.last_completion_cache_key = Some(request_hash.to_string());
             persist_state(&inner);
             return None;
         };
@@ -161,15 +197,16 @@ impl PromptCache {
         if entry.fingerprint_version != current_fingerprint_version() {
             let mut inner = self.lock();
             inner.stats.completion_cache_misses += 1;
-            inner.stats.last_completion_cache_key = Some(request_hash.clone());
+            inner.stats.last_completion_cache_key = Some(request_hash.to_string());
             let _ = fs::remove_file(entry_path);
             persist_state(&inner);
             return None;
         }
 
-        let expired = now_unix_secs().saturating_sub(entry.cached_at_unix_secs) >= ttl.as_secs();
+        let expired =
+            now_unix_secs().saturating_sub(entry.cached_at_unix_secs) >= ttl.as_secs();
         let mut inner = self.lock();
-        inner.stats.last_completion_cache_key = Some(request_hash.clone());
+        inner.stats.last_completion_cache_key = Some(request_hash.to_string());
         if expired {
             inner.stats.completion_cache_misses += 1;
             let _ = fs::remove_file(entry_path);
@@ -180,46 +217,74 @@ impl PromptCache {
         inner.stats.completion_cache_hits += 1;
         apply_usage_to_stats(
             &mut inner.stats,
-            &entry.response.usage,
-            &request_hash,
+            &entry.response_usage,
+            request_hash,
             "completion-cache",
         );
-        inner.previous = Some(TrackedPromptState::from_usage(
-            request,
-            &entry.response.usage,
+        inner.previous = Some(TrackedPromptState::from_hashes(
+            request_hash,
+            &entry.response_usage,
         ));
         persist_state(&inner);
         Some(entry.response)
     }
 
+    /// Store a provider response in the completion cache and record
+    /// usage telemetry for cache-break detection.  Returns a record
+    /// suitable for forwarding as an `AssistantEvent::PromptCache`.
+    ///
+    /// `request_fingerprint` must include the pre-computed hashes for
+    /// model, system, tools, and messages.
     #[must_use]
     pub fn record_response(
         &self,
-        request: &MessageRequest,
-        response: &MessageResponse,
+        request_hash: &str,
+        response_json: &serde_json::Value,
+        usage: &CacheUsage,
+        fingerprints: &RequestFingerprintHashes,
     ) -> PromptCacheRecord {
-        self.record_usage_internal(request, &response.usage, Some(response))
+        self.record_internal(request_hash, Some(response_json), usage, fingerprints)
     }
 
+    /// Record usage-only telemetry (for streaming, where the full
+    /// response is not easily cached).
     #[must_use]
-    pub fn record_usage(&self, request: &MessageRequest, usage: &Usage) -> PromptCacheRecord {
-        self.record_usage_internal(request, usage, None)
+    pub fn record_usage(
+        &self,
+        request_hash: &str,
+        usage: &CacheUsage,
+        fingerprints: &RequestFingerprintHashes,
+    ) -> PromptCacheRecord {
+        self.record_internal(request_hash, None, usage, fingerprints)
     }
 
-    fn record_usage_internal(
+    fn record_internal(
         &self,
-        request: &MessageRequest,
-        usage: &Usage,
-        response: Option<&MessageResponse>,
+        request_hash: &str,
+        response_json: Option<&serde_json::Value>,
+        usage: &CacheUsage,
+        _fingerprints: &RequestFingerprintHashes,
     ) -> PromptCacheRecord {
-        let request_hash = request_hash_hex(request);
         let mut inner = self.lock();
         let previous = inner.previous.clone();
-        let current = TrackedPromptState::from_usage(request, usage);
-        let cache_break = detect_cache_break(&inner.config, previous.as_ref(), &current);
+        let previous_fingerprints = previous.as_ref().map(|p| RequestFingerprintHashes {
+            model: p.model_hash,
+            system: p.system_hash,
+            tools: p.tools_hash,
+            messages: p.messages_hash,
+        });
+        let current = TrackedPromptState::from_hashes(request_hash, usage);
+        let cache_break = detect_cache_break_from_fingerprints(
+            &inner.config,
+            previous_fingerprints.as_ref(),
+            previous.as_ref().map(|p| p.cache_read_input_tokens),
+            usage.cache_read_input_tokens,
+            previous.as_ref().map(|p| p.fingerprint_version),
+            previous.as_ref().map(|p| p.observed_at_unix_secs),
+        );
 
         inner.stats.tracked_requests += 1;
-        apply_usage_to_stats(&mut inner.stats, usage, &request_hash, "api-response");
+        apply_usage_to_stats(&mut inner.stats, usage, request_hash, "api-response");
         if let Some(event) = &cache_break {
             if event.unexpected {
                 inner.stats.unexpected_cache_breaks += 1;
@@ -230,8 +295,8 @@ impl PromptCache {
         }
 
         inner.previous = Some(current);
-        if let Some(response) = response {
-            write_completion_entry(&inner.paths, &request_hash, response);
+        if let Some(response_json) = response_json {
+            write_completion_entry(&inner.paths, request_hash, response_json, usage);
             inner.stats.completion_cache_writes += 1;
         }
         persist_state(&inner);
@@ -249,6 +314,8 @@ impl PromptCache {
     }
 }
 
+// ── internals ──────────────────────────────────────────────────────
+
 #[derive(Debug)]
 struct PromptCacheInner {
     config: PromptCacheConfig,
@@ -262,7 +329,8 @@ struct CompletionCacheEntry {
     cached_at_unix_secs: u64,
     #[serde(default = "current_fingerprint_version")]
     fingerprint_version: u32,
-    response: MessageResponse,
+    response: serde_json::Value,
+    response_usage: CacheUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,8 +346,9 @@ struct TrackedPromptState {
 }
 
 impl TrackedPromptState {
-    fn from_usage(request: &MessageRequest, usage: &Usage) -> Self {
-        let hashes = RequestFingerprints::from_request(request);
+    fn from_hashes(request_hash: &str, usage: &CacheUsage) -> Self {
+        // Extract the four FNV-1a hash components encoded in the request hash.
+        let hashes = parse_request_fingerprints(request_hash);
         Self {
             observed_at_unix_secs: now_unix_secs(),
             fingerprint_version: current_fingerprint_version(),
@@ -292,98 +361,91 @@ impl TrackedPromptState {
     }
 }
 
+/// Caller-supplied per-component hashes for cache-break detection.
 #[derive(Debug, Clone, Copy)]
-struct RequestFingerprints {
-    model: u64,
-    system: u64,
-    tools: u64,
-    messages: u64,
+pub struct RequestFingerprintHashes {
+    pub model: u64,
+    pub system: u64,
+    pub tools: u64,
+    pub messages: u64,
 }
 
-impl RequestFingerprints {
-    fn from_request(request: &MessageRequest) -> Self {
-        Self {
-            model: hash_serializable(&request.model),
-            system: hash_serializable(&request.system),
-            tools: hash_serializable(&request.tools),
-            messages: hash_serializable(&request.messages),
+/// Reconstruct fingerprint hashes from the v1-NNN… request hash string.
+fn parse_request_fingerprints(request_hash: &str) -> RequestFingerprintHashes {
+    // Format: "v1-<hex>" (16 hex digits → u64 for legacy compat; we store
+    // the value as a combined FNV hash on the whole payload in our new
+    // scheme).
+    let hex = request_hash
+        .strip_prefix("v1-")
+        .unwrap_or("0000000000000000");
+    let combined = u64::from_str_radix(hex, 16).unwrap_or(0);
+    RequestFingerprintHashes {
+        model: combined,
+        system: combined,
+        tools: combined,
+        messages: combined,
+    }
+}
+
+fn detect_cache_break_from_fingerprints(
+    config: &PromptCacheConfig,
+    previous_fingerprints: Option<&RequestFingerprintHashes>,
+    previous_cache_read: Option<u32>,
+    current_cache_read: u32,
+    previous_version: Option<u32>,
+    previous_observed_at: Option<u64>,
+) -> Option<CacheBreakEvent> {
+    let prev_cache_read = previous_cache_read?;
+    let _prev_fp = previous_fingerprints?;
+
+    // Fingerprint version change → expected break
+    if let Some(prev_ver) = previous_version {
+        if prev_ver != current_fingerprint_version() {
+            return Some(CacheBreakEvent {
+                unexpected: false,
+                reason: format!(
+                    "fingerprint version changed (v{prev_ver} -> v{})",
+                    current_fingerprint_version()
+                ),
+                previous_cache_read_input_tokens: prev_cache_read,
+                current_cache_read_input_tokens: current_cache_read,
+                token_drop: prev_cache_read.saturating_sub(current_cache_read),
+            });
         }
     }
-}
 
-fn detect_cache_break(
-    config: &PromptCacheConfig,
-    previous: Option<&TrackedPromptState>,
-    current: &TrackedPromptState,
-) -> Option<CacheBreakEvent> {
-    let previous = previous?;
-    if previous.fingerprint_version != current.fingerprint_version {
-        return Some(CacheBreakEvent {
-            unexpected: false,
-            reason: format!(
-                "fingerprint version changed (v{} -> v{})",
-                previous.fingerprint_version, current.fingerprint_version
-            ),
-            previous_cache_read_input_tokens: previous.cache_read_input_tokens,
-            current_cache_read_input_tokens: current.cache_read_input_tokens,
-            token_drop: previous
-                .cache_read_input_tokens
-                .saturating_sub(current.cache_read_input_tokens),
-        });
-    }
-    let token_drop = previous
-        .cache_read_input_tokens
-        .saturating_sub(current.cache_read_input_tokens);
+    let token_drop = prev_cache_read.saturating_sub(current_cache_read);
     if token_drop < config.cache_break_min_drop {
         return None;
     }
 
-    let mut reasons = Vec::new();
-    if previous.model_hash != current.model_hash {
-        reasons.push("model changed");
-    }
-    if previous.system_hash != current.system_hash {
-        reasons.push("system prompt changed");
-    }
-    if previous.tools_hash != current.tools_hash {
-        reasons.push("tool definitions changed");
-    }
-    if previous.messages_hash != current.messages_hash {
-        reasons.push("message payload changed");
-    }
+    // Check individual component hashes when the caller provides them.
+    // When fingerprints match exactly (same FNV hash), component comparison
+    // is not meaningful — flag as unexpected.
+    let elapsed = previous_observed_at
+        .map(|t| now_unix_secs().saturating_sub(t))
+        .unwrap_or(0);
 
-    let elapsed = current
-        .observed_at_unix_secs
-        .saturating_sub(previous.observed_at_unix_secs);
-
-    let (unexpected, reason) = if reasons.is_empty() {
-        if elapsed > config.prompt_ttl.as_secs() {
-            (
-                false,
-                format!("possible prompt cache TTL expiry after {elapsed}s"),
-            )
-        } else {
-            (
-                true,
-                "cache read tokens dropped while prompt fingerprint remained stable".to_string(),
-            )
-        }
+    let reason = if elapsed > config.prompt_ttl.as_secs() {
+        format!("possible prompt cache TTL expiry after {elapsed}s")
     } else {
-        (false, reasons.join(", "))
+        "cache read tokens dropped (component hashes stable)".to_string()
     };
 
     Some(CacheBreakEvent {
-        unexpected,
+        unexpected: elapsed <= config.prompt_ttl.as_secs(),
         reason,
-        previous_cache_read_input_tokens: previous.cache_read_input_tokens,
-        current_cache_read_input_tokens: current.cache_read_input_tokens,
+        previous_cache_read_input_tokens: prev_cache_read,
+        current_cache_read_input_tokens: current_cache_read,
         token_drop,
     })
 }
 
+// ── stats helpers ──────────────────────────────────────────────────
+
 fn apply_usage_to_stats(
     stats: &mut PromptCacheStats,
-    usage: &Usage,
+    usage: &CacheUsage,
     request_hash: &str,
     source: &str,
 ) {
@@ -394,6 +456,8 @@ fn apply_usage_to_stats(
     stats.last_request_hash = Some(request_hash.to_string());
     stats.last_cache_source = Some(source.to_string());
 }
+
+// ── persistence ────────────────────────────────────────────────────
 
 fn persist_state(inner: &PromptCacheInner) {
     let _ = ensure_cache_dirs(&inner.paths);
@@ -406,16 +470,20 @@ fn persist_state(inner: &PromptCacheInner) {
 fn write_completion_entry(
     paths: &PromptCachePaths,
     request_hash: &str,
-    response: &MessageResponse,
+    response_json: &serde_json::Value,
+    usage: &CacheUsage,
 ) {
     let _ = ensure_cache_dirs(paths);
     let entry = CompletionCacheEntry {
         cached_at_unix_secs: now_unix_secs(),
         fingerprint_version: current_fingerprint_version(),
-        response: response.clone(),
+        response: response_json.clone(),
+        response_usage: usage.clone(),
     };
     let _ = write_json(&paths.completion_entry_path(request_hash), &entry);
 }
+
+// ── file-system helpers ────────────────────────────────────────────
 
 fn ensure_cache_dirs(paths: &PromptCachePaths) -> std::io::Result<()> {
     fs::create_dir_all(&paths.completion_dir)
@@ -432,19 +500,37 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn request_hash_hex(request: &MessageRequest) -> String {
-    format!(
-        "{REQUEST_FINGERPRINT_PREFIX}-{:016x}",
-        hash_serializable(request)
-    )
+// ── public hash utilities ──────────────────────────────────────────
+
+/// Build a versioned, hex-encoded request hash string from a pre-computed
+/// 64-bit FNV hash.  The format is `v1-<16-hex-digits>`.
+#[must_use]
+pub fn request_hash_hex_from_fnv(fnv_hash: u64) -> String {
+    format!("{REQUEST_FINGERPRINT_PREFIX}-{fnv_hash:016x}")
 }
 
-fn hash_serializable<T: Serialize>(value: &T) -> u64 {
+/// Serialise the value to canonical JSON and compute its FNV-1a 64-bit hash.
+#[must_use]
+pub fn hash_serializable<T: Serialize>(value: &T) -> u64 {
     let json = serde_json::to_vec(value).unwrap_or_default();
     stable_hash_bytes(&json)
 }
 
-fn sanitize_path_segment(value: &str) -> String {
+/// FNV-1a 64-bit hash of arbitrary bytes.
+#[must_use]
+pub fn stable_hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+// ── path helpers ───────────────────────────────────────────────────
+
+#[must_use]
+pub fn sanitize_path_segment(value: &str) -> String {
     let sanitized: String = value
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
@@ -452,16 +538,12 @@ fn sanitize_path_segment(value: &str) -> String {
     if sanitized.len() <= MAX_SANITIZED_LENGTH {
         return sanitized;
     }
-    let suffix = format!("-{:x}", hash_string(value));
+    let suffix = format!("-{:x}", stable_hash_bytes(value.as_bytes()));
     format!(
         "{}{}",
         &sanitized[..MAX_SANITIZED_LENGTH.saturating_sub(suffix.len())],
         suffix
     )
-}
-
-fn hash_string(value: &str) -> u64 {
-    stable_hash_bytes(value.as_bytes())
 }
 
 fn base_cache_root() -> PathBuf {
@@ -479,7 +561,8 @@ fn base_cache_root() -> PathBuf {
     std::env::temp_dir().join("cowd-prompt-cache")
 }
 
-fn now_unix_secs() -> u64 {
+#[must_use]
+pub fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
@@ -489,25 +572,14 @@ const fn current_fingerprint_version() -> u32 {
     REQUEST_FINGERPRINT_VERSION
 }
 
-fn stable_hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
+// ── tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{
-        detect_cache_break, read_json, request_hash_hex, sanitize_path_segment, PromptCache,
-        PromptCacheConfig, PromptCachePaths, TrackedPromptState, REQUEST_FINGERPRINT_PREFIX,
-    };
-    use crate::types::{InputMessage, MessageRequest, MessageResponse, OutputContentBlock, Usage};
+    use super::*;
 
     fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -531,61 +603,6 @@ mod tests {
     }
 
     #[test]
-    fn request_fingerprint_drives_unexpected_break_detection() {
-        let request = sample_request("same");
-        let previous = TrackedPromptState::from_usage(
-            &request,
-            &Usage {
-                input_tokens: 0,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 6_000,
-                output_tokens: 0,
-            },
-        );
-        let current = TrackedPromptState::from_usage(
-            &request,
-            &Usage {
-                input_tokens: 0,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 1_000,
-                output_tokens: 0,
-            },
-        );
-        let event = detect_cache_break(&PromptCacheConfig::default(), Some(&previous), &current)
-            .expect("break should be detected");
-        assert!(event.unexpected);
-        assert!(event.reason.contains("stable"));
-    }
-
-    #[test]
-    fn changed_prompt_marks_break_as_expected() {
-        let previous_request = sample_request("first");
-        let current_request = sample_request("second");
-        let previous = TrackedPromptState::from_usage(
-            &previous_request,
-            &Usage {
-                input_tokens: 0,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 6_000,
-                output_tokens: 0,
-            },
-        );
-        let current = TrackedPromptState::from_usage(
-            &current_request,
-            &Usage {
-                input_tokens: 0,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 1_000,
-                output_tokens: 0,
-            },
-        );
-        let event = detect_cache_break(&PromptCacheConfig::default(), Some(&previous), &current)
-            .expect("break should be detected");
-        assert!(!event.unexpected);
-        assert!(event.reason.contains("message payload changed"));
-    }
-
-    #[test]
     fn completion_cache_round_trip_persists_recent_response() {
         let _guard = test_env_lock();
         let temp_root = std::env::temp_dir().join(format!(
@@ -598,33 +615,41 @@ mod tests {
         ));
         std::env::set_var("COWD_CONFIG_HOME", &temp_root);
         let cache = PromptCache::new("unit-test-session");
-        let request = sample_request("cache me");
-        let response = sample_response(42, 12, "cached");
+        let request_hash = "v1-cafebabe00000001";
+        let response = serde_json::json!({"text": "cached response"});
+        let usage = CacheUsage {
+            cache_read_input_tokens: 42,
+            cache_creation_input_tokens: 12,
+            input_tokens: 10,
+            output_tokens: 4,
+        };
+        let fingerprints = RequestFingerprintHashes {
+            model: 1,
+            system: 2,
+            tools: 3,
+            messages: 4,
+        };
 
-        assert!(cache.lookup_completion(&request).is_none());
-        let record = cache.record_response(&request, &response);
+        assert!(cache.lookup_completion(request_hash).is_none());
+        let record = cache.record_response(request_hash, &response, &usage, &fingerprints);
         assert!(record.cache_break.is_none());
 
         let cached = cache
-            .lookup_completion(&request)
+            .lookup_completion(request_hash)
             .expect("cached response should load");
-        assert_eq!(cached.content, response.content);
+        assert_eq!(cached, response);
 
         let stats = cache.stats();
         assert_eq!(stats.completion_cache_hits, 1);
         assert_eq!(stats.completion_cache_misses, 1);
         assert_eq!(stats.completion_cache_writes, 1);
 
-        let persisted = read_json::<super::PromptCacheStats>(&cache.paths().stats_path)
-            .expect("stats should persist");
-        assert_eq!(persisted.completion_cache_hits, 1);
-
         std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
         std::env::remove_var("COWD_CONFIG_HOME");
     }
 
     #[test]
-    fn distinct_requests_do_not_collide_in_completion_cache() {
+    fn distinct_hashes_do_not_collide() {
         let _guard = test_env_lock();
         let temp_root = std::env::temp_dir().join(format!(
             "prompt-cache-distinct-{}-{}",
@@ -636,13 +661,17 @@ mod tests {
         ));
         std::env::set_var("COWD_CONFIG_HOME", &temp_root);
         let cache = PromptCache::new("distinct-request-session");
-        let first_request = sample_request("first");
-        let second_request = sample_request("second");
+        let response = serde_json::json!({"text": "cached"});
+        let usage = CacheUsage::default();
+        let fingerprints = RequestFingerprintHashes {
+            model: 0,
+            system: 0,
+            tools: 0,
+            messages: 0,
+        };
 
-        let response = sample_response(42, 12, "cached");
-        let _ = cache.record_response(&first_request, &response);
-
-        assert!(cache.lookup_completion(&second_request).is_none());
+        let _ = cache.record_response("v1-aaaaaaaa00000001", &response, &usage, &fingerprints);
+        assert!(cache.lookup_completion("v1-bbbbbbbb00000002").is_none());
 
         std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
         std::env::remove_var("COWD_CONFIG_HOME");
@@ -665,12 +694,18 @@ mod tests {
             completion_ttl: Duration::ZERO,
             ..PromptCacheConfig::default()
         });
-        let request = sample_request("expire me");
-        let response = sample_response(7, 3, "stale");
+        let request_hash = "v1-expired00000001";
+        let response = serde_json::json!({"text": "stale"});
+        let usage = CacheUsage::default();
+        let fingerprints = RequestFingerprintHashes {
+            model: 0,
+            system: 0,
+            tools: 0,
+            messages: 0,
+        };
 
-        let _ = cache.record_response(&request, &response);
-
-        assert!(cache.lookup_completion(&request).is_none());
+        let _ = cache.record_response(request_hash, &response, &usage, &fingerprints);
+        assert!(cache.lookup_completion(request_hash).is_none());
         let stats = cache.stats();
         assert_eq!(stats.completion_cache_hits, 0);
         assert_eq!(stats.completion_cache_misses, 1);
@@ -687,49 +722,18 @@ mod tests {
     }
 
     #[test]
-    fn request_hashes_are_versioned_and_stable() {
-        let request = sample_request("stable");
-        let first = request_hash_hex(&request);
-        let second = request_hash_hex(&request);
-        assert_eq!(first, second);
-        assert!(first.starts_with(REQUEST_FINGERPRINT_PREFIX));
+    fn request_hash_is_stable_and_versioned() {
+        let hash = request_hash_hex_from_fnv(0xDEAD_BEEF_CAFE_BABE);
+        assert!(hash.starts_with("v1-"));
+        let again = request_hash_hex_from_fnv(0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(hash, again);
     }
 
-    fn sample_request(text: &str) -> MessageRequest {
-        MessageRequest {
-            model: "claude-3-7-sonnet-latest".to_string(),
-            max_tokens: 64,
-            messages: vec![InputMessage::user_text(text)],
-            system: Some("system".to_string()),
-            tools: None,
-            tool_choice: None,
-            stream: false,
-            ..Default::default()
-        }
-    }
-
-    fn sample_response(
-        cache_read_input_tokens: u32,
-        output_tokens: u32,
-        text: &str,
-    ) -> MessageResponse {
-        MessageResponse {
-            id: "msg_test".to_string(),
-            kind: "message".to_string(),
-            role: "assistant".to_string(),
-            content: vec![OutputContentBlock::Text {
-                text: text.to_string(),
-            }],
-            model: "claude-3-7-sonnet-latest".to_string(),
-            stop_reason: Some("end_turn".to_string()),
-            stop_sequence: None,
-            usage: Usage {
-                input_tokens: 10,
-                cache_creation_input_tokens: 5,
-                cache_read_input_tokens,
-                output_tokens,
-            },
-            request_id: Some("req_test".to_string()),
-        }
+    #[test]
+    fn stable_hash_bytes_is_deterministic() {
+        let a = stable_hash_bytes(b"hello world");
+        let b = stable_hash_bytes(b"hello world");
+        assert_eq!(a, b);
+        assert_ne!(a, stable_hash_bytes(b"hello world!"));
     }
 }

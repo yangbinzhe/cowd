@@ -47,6 +47,7 @@ pub mod provider_pool;
 pub mod effect;
 pub mod bus;
 pub mod context_profiler;
+pub mod fallback_chain;
 
 pub mod platform;
 mod policy_engine;
@@ -57,7 +58,7 @@ pub mod sandbox;
 mod session;
 pub use session::workspace_sessions_dir;
 #[allow(deprecated)]
-mod session_control;
+pub mod session_control;
 #[allow(deprecated)]
 pub use session_control::SessionStore;
 mod sse;
@@ -76,6 +77,7 @@ pub mod agent;
 pub mod approval_gate;
 pub mod pairing;
 pub mod mirror;
+pub mod model_registry;
 pub mod profile;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
@@ -90,7 +92,7 @@ pub use config::{
     GatewayConfig, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
     McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig,
     McpTransport, McpWebSocketServerConfig, MemoryConfig, OAuthConfig, PlatformConfig as GatewayPlatformConfig,
-    ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
+    ProviderFallbackConfig, ProviderFallbackEntry, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
     SessionResetPolicy, COWD_SETTINGS_SCHEMA_NAME,
 };
@@ -207,6 +209,10 @@ pub use stale_branch::{
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket};
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
+pub use model_registry::{
+    global_registry, CircularAliasError, ModelInfo, ModelRegistry, ModelRegistryError,
+    ModelResolver, Pricing,
+};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };
@@ -218,9 +224,16 @@ pub use worker_boot::{
 
 pub mod cached_prompt;
 pub mod memory_provider;
+pub mod prompt_cache;
 
 pub use cached_prompt::CachedSystemPrompt;
 pub use memory_provider::{MemoryProvider, BuiltinMemoryProvider, MemoryProviderManager};
+pub use prompt_cache::{
+    CacheBreakEvent, CacheUsage, PromptCache, PromptCacheConfig, PromptCachePaths,
+    PromptCacheRecord, PromptCacheStats, RequestFingerprintHashes, hash_serializable,
+    now_unix_secs, request_hash_hex_from_fnv, sanitize_path_segment, stable_hash_bytes,
+};
+pub use fallback_chain::FallbackChain;
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

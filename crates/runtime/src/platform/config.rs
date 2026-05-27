@@ -42,9 +42,9 @@ impl PlatformConfig {
     }
 }
 
-// ── Re-export from unified config crate ─────────────────────────────
+// ── Re-export from runtime config ──────────────────────────────────
 
-pub use config::SessionResetPolicy;
+pub use crate::config::SessionResetPolicy;
 
 /// Runtime-wide platform configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]

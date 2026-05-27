@@ -1,9 +1,9 @@
 use crate::error::ApiError;
-use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
+use runtime::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
@@ -22,7 +22,7 @@ impl ProviderClient {
         model: &str,
         anthropic_auth: Option<AuthSource>,
     ) -> Result<Self, ApiError> {
-        let resolved_model = providers::resolve_model_alias(model);
+        let resolved_model = model.trim();
         match providers::detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
                 Some(auth) => AnthropicClient::from_auth(auth),
@@ -145,15 +145,8 @@ pub fn read_xai_base_url() -> String {
 #[cfg(test)]
 mod tests {
     use super::ProviderClient;
-    use crate::providers::{detect_provider_kind, resolve_model_alias, ProviderKind};
+    use crate::providers::{detect_provider_kind, ProviderKind};
     use crate::test_utils::{env_lock, EnvVarGuard};
-
-    #[test]
-    fn resolves_existing_and_grok_aliases() {
-        assert_eq!(resolve_model_alias("opus"), "claude-opus-4-6");
-        assert_eq!(resolve_model_alias("grok"), "grok-3");
-        assert_eq!(resolve_model_alias("grok-mini"), "grok-3-mini");
-    }
 
     #[test]
     fn provider_detection_prefers_model_family() {

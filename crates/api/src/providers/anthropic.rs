@@ -14,10 +14,10 @@ use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, Session
 
 use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
-use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
+use runtime::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{
-    anthropic_missing_credentials, model_token_limit, resolve_model_alias, Provider, ProviderFuture,
+    anthropic_missing_credentials, model_token_limit, Provider, ProviderFuture,
 };
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
@@ -290,8 +290,11 @@ impl AnthropicClient {
         };
 
         if let Some(prompt_cache) = &self.prompt_cache {
-            if let Some(response) = prompt_cache.lookup_completion(&request) {
-                return Ok(response);
+            let cache_key = crate::cached_client::CachedProviderClient::compute_cache_key(&request);
+            if let Some(cached_json) = prompt_cache.lookup_completion(&cache_key) {
+                if let Ok(response) = serde_json::from_value::<MessageResponse>(cached_json) {
+                    return Ok(response);
+                }
             }
         }
 
@@ -308,7 +311,26 @@ impl AnthropicClient {
         }
 
         if let Some(prompt_cache) = &self.prompt_cache {
-            let record = prompt_cache.record_response(&request, &response);
+            let cache_key = crate::cached_client::CachedProviderClient::compute_cache_key(&request);
+            let fingerprints = runtime::prompt_cache::RequestFingerprintHashes {
+                model: runtime::prompt_cache::hash_serializable(&request.model),
+                system: runtime::prompt_cache::hash_serializable(&request.system),
+                tools: runtime::prompt_cache::hash_serializable(&request.tools),
+                messages: runtime::prompt_cache::hash_serializable(&request.messages),
+            };
+            let cache_usage = runtime::prompt_cache::CacheUsage {
+                input_tokens: response.usage.input_tokens,
+                cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+                cache_read_input_tokens: response.usage.cache_read_input_tokens,
+                output_tokens: response.usage.output_tokens,
+            };
+            let response_json = serde_json::to_value(&response).unwrap_or_default();
+            let record = prompt_cache.record_response(
+                &cache_key,
+                &response_json,
+                &cache_usage,
+                &fingerprints,
+            );
             self.store_last_prompt_cache_record(record);
         }
         if let Some(session_tracer) = &self.session_tracer {
@@ -508,7 +530,7 @@ impl AnthropicClient {
         let estimated_total_tokens = counted_input_tokens.saturating_add(request.max_tokens);
         if estimated_total_tokens > limit.context_window_tokens {
             return Err(ApiError::ContextWindowExceeded {
-                model: resolve_model_alias(&request.model),
+                model: request.model.clone(),
                 estimated_input_tokens: counted_input_tokens,
                 requested_output_tokens: request.max_tokens,
                 estimated_total_tokens,
@@ -852,7 +874,20 @@ impl MessageStream {
                     if let (Some(prompt_cache), Some(usage)) =
                         (&self.prompt_cache, self.latest_usage.as_ref())
                     {
-                        let record = prompt_cache.record_usage(&self.request, usage);
+                        let cache_key = crate::cached_client::CachedProviderClient::compute_cache_key(&self.request);
+                        let fingerprints = runtime::prompt_cache::RequestFingerprintHashes {
+                            model: runtime::prompt_cache::hash_serializable(&self.request.model),
+                            system: runtime::prompt_cache::hash_serializable(&self.request.system),
+                            tools: runtime::prompt_cache::hash_serializable(&self.request.tools),
+                            messages: runtime::prompt_cache::hash_serializable(&self.request.messages),
+                        };
+                        let cache_usage = runtime::prompt_cache::CacheUsage {
+                            input_tokens: usage.input_tokens,
+                            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                            cache_read_input_tokens: usage.cache_read_input_tokens,
+                            output_tokens: usage.output_tokens,
+                        };
+                        let record = prompt_cache.record_usage(&cache_key, &cache_usage, &fingerprints);
                         *self
                             .last_prompt_cache_record
                             .lock()

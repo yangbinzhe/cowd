@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use api::{
-    max_tokens_for_model, resolve_model_alias, ApiError, ContentBlockDelta, InputContentBlock,
+    max_tokens_for_model, ApiError, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
@@ -2462,7 +2462,7 @@ fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
     None
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_AGENT_MODEL: &str = "claude-sonnet-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
@@ -3109,16 +3109,22 @@ impl ProviderRuntimeClient {
         allowed_tools: BTreeSet<String>,
         fallback_config: &ProviderFallbackConfig,
     ) -> Result<Self, String> {
-        let primary_model = fallback_config.primary().map_or(model, str::to_string);
+        let entry = fallback_config.find(&model);
+        let primary_model = entry
+            .map(|e| e.primary.as_str())
+            .unwrap_or(&model)
+            .to_string();
         let primary = build_provider_entry(&primary_model)?;
         let mut chain = vec![primary];
-        for fallback_model in fallback_config.fallbacks() {
-            match build_provider_entry(fallback_model) {
-                Ok(entry) => chain.push(entry),
-                Err(error) => {
-                    eprintln!(
-                        "warning: skipping unavailable fallback provider {fallback_model}: {error}"
-                    );
+        if let Some(entry) = entry {
+            for fallback_model in &entry.fallbacks {
+                match build_provider_entry(fallback_model) {
+                    Ok(entry) => chain.push(entry),
+                    Err(error) => {
+                        eprintln!(
+                            "warning: skipping unavailable fallback provider {fallback_model}: {error}"
+                        );
+                    }
                 }
             }
         }
@@ -3134,7 +3140,7 @@ impl ProviderRuntimeClient {
 }
 
 fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
-    let resolved = resolve_model_alias(model).clone();
+    let resolved = model.trim().to_string();
     let client = ProviderClient::from_model(&resolved).map_err(|error| error.to_string())?;
     Ok(ProviderEntry {
         model: resolved,

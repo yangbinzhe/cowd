@@ -2,15 +2,505 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
-// ── Re-export from unified config crate ──────────────────────────────
-pub use config::{ApprovalConfig, ResolvedPermissionMode, McpTransport, McpOAuthConfig, OAuthConfig};
-pub use config::{ConfigSource, ConfigEntry, ConfigError};
-pub use config::{ProviderFallbackConfig, RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig};
-pub use config::{CompressionConfig, VectorConfig, LayerConfig};
-pub use config::{MicroCompactConfig, SessionCompactConfig, DeepCompactConfig, CircuitBreakerConfig, SessionResetPolicy};
+// ── Config Error Types ─────────────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("YAML parse error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+    #[error("Parse error: {0}")]
+    Parse(String),
+    #[error("Missing required config: {0}")]
+    Missing(String),
+    #[error("Invalid value for {key}: {message}")]
+    Invalid { key: String, message: String },
+}
+
+// ── Config Source (Precedence) ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigSource {
+    User,
+    Project,
+    Local,
+    Environment,
+    Cli,
+}
+
+impl std::fmt::Display for ConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigSource::User => write!(f, "user"),
+            ConfigSource::Project => write!(f, "project"),
+            ConfigSource::Local => write!(f, "local"),
+            ConfigSource::Environment => write!(f, "environment"),
+            ConfigSource::Cli => write!(f, "cli"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigEntry {
+    pub source: ConfigSource,
+    pub path: PathBuf,
+    pub exists: bool,
+}
+
+// ── Approval & Permission Resolution ───────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalConfig {
+    #[serde(default)]
+    pub solo_mode: bool,
+    #[serde(default = "default_true_bool")]
+    pub solo_honor_critical: bool,
+    #[serde(default = "default_true_bool")]
+    pub auto_pass_read_only: bool,
+    #[serde(default = "default_true_bool")]
+    pub auto_pass_low_risk: bool,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self { solo_mode: false, solo_honor_critical: true, auto_pass_read_only: true, auto_pass_low_risk: true }
+    }
+}
+
+impl ApprovalConfig {
+    pub fn new() -> Self { Self::default() }
+    pub fn with_solo_mode(mut self, enabled: bool) -> Self { self.solo_mode = enabled; self }
+    pub fn with_solo_honor_critical(mut self, honor: bool) -> Self { self.solo_honor_critical = honor; self }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolvedPermissionMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+// ── MCP & OAuth Types ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    Stdio,
+    Sse,
+    Http,
+    Ws,
+    Sdk,
+    ManagedProxy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpOAuthConfig {
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub callback_port: Option<u16>,
+    #[serde(default)]
+    pub auth_server_metadata_url: Option<String>,
+    #[serde(default)]
+    pub xaa: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthConfig {
+    pub client_id: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    #[serde(default)]
+    pub callback_port: Option<u16>,
+    #[serde(default)]
+    pub manual_redirect_url: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+// ── Runtime Config Types ───────────────────────────────────────────────
+
+/// A single provider fallback chain entry.
+///
+/// Maps a primary model to its ordered list of fallback models.
+/// When the primary model returns a retryable error (429/500/502/503/504),
+/// the runtime automatically tries the fallbacks in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderFallbackEntry {
+    pub primary: String,
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
+}
+
+impl ProviderFallbackEntry {
+    #[must_use]
+    pub fn new(primary: String, fallbacks: Vec<String>) -> Self {
+        Self { primary, fallbacks }
+    }
+
+    /// Check whether this fallback entry matches the given model name.
+    #[must_use]
+    pub fn matches(&self, model: &str) -> bool {
+        self.primary == model
+    }
+}
+
+/// Collection of provider fallback chain entries.
+///
+/// Each entry defines a primary model and its ordered fallback models.
+/// The `providerFallbacks` config key accepts either:
+/// - An array of fallback entries (preferred):
+///   ```yaml
+///   providerFallbacks:
+///     - primary: "deepseek-v4-pro"
+///       fallbacks: ["deepseek-v4-flash", "qwen3.6-plus"]
+///   ```
+/// - A single fallback entry object (legacy):
+///   ```yaml
+///   providerFallbacks:
+///     primary: "claude-opus-4-6"
+///     fallbacks: ["grok-3", "grok-3-mini"]
+///   ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProviderFallbackConfig {
+    #[serde(default)]
+    pub entries: Vec<ProviderFallbackEntry>,
+}
+
+impl ProviderFallbackConfig {
+    #[must_use]
+    pub fn new(entries: Vec<ProviderFallbackEntry>) -> Self {
+        Self { entries }
+    }
+
+    /// Find the fallback chain entry that matches the given model name.
+    #[must_use]
+    pub fn find(&self, model: &str) -> Option<&ProviderFallbackEntry> {
+        self.entries.iter().find(|e| e.matches(model))
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns all fallback chain entries.
+    #[must_use]
+    pub fn entries(&self) -> &[ProviderFallbackEntry] {
+        &self.entries
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuntimeHookConfig {
+    #[serde(default)]
+    pub pre_tool_use: Vec<String>,
+    #[serde(default)]
+    pub post_tool_use: Vec<String>,
+    #[serde(default)]
+    pub post_tool_use_failure: Vec<String>,
+}
+
+impl RuntimeHookConfig {
+    #[must_use]
+    pub fn new(pre_tool_use: Vec<String>, post_tool_use: Vec<String>, post_tool_use_failure: Vec<String>) -> Self {
+        Self { pre_tool_use, post_tool_use, post_tool_use_failure }
+    }
+    #[must_use]
+    pub fn pre_tool_use(&self) -> &[String] { &self.pre_tool_use }
+    #[must_use]
+    pub fn post_tool_use(&self) -> &[String] { &self.post_tool_use }
+    #[must_use]
+    pub fn post_tool_use_failure(&self) -> &[String] { &self.post_tool_use_failure }
+    #[must_use]
+    pub fn merged(&self, other: &Self) -> Self {
+        let mut merged = self.clone();
+        merged.extend(other);
+        merged
+    }
+    pub fn extend(&mut self, other: &Self) {
+        let mut pre_set: std::collections::HashSet<String> = self.pre_tool_use.iter().cloned().collect();
+        for item in &other.pre_tool_use { if pre_set.insert(item.clone()) { self.pre_tool_use.push(item.clone()); } }
+        let mut post_set: std::collections::HashSet<String> = self.post_tool_use.iter().cloned().collect();
+        for item in &other.post_tool_use { if post_set.insert(item.clone()) { self.post_tool_use.push(item.clone()); } }
+        let mut fail_set: std::collections::HashSet<String> = self.post_tool_use_failure.iter().cloned().collect();
+        for item in &other.post_tool_use_failure { if fail_set.insert(item.clone()) { self.post_tool_use_failure.push(item.clone()); } }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuntimePermissionRuleConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+}
+
+impl RuntimePermissionRuleConfig {
+    #[must_use]
+    pub fn new(allow: Vec<String>, deny: Vec<String>, ask: Vec<String>) -> Self { Self { allow, deny, ask } }
+    #[must_use]
+    pub fn allow(&self) -> &[String] { &self.allow }
+    #[must_use]
+    pub fn deny(&self) -> &[String] { &self.deny }
+    #[must_use]
+    pub fn ask(&self) -> &[String] { &self.ask }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePluginConfig {
+    #[serde(default)]
+    pub enabled_plugins: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub external_directories: Vec<String>,
+    #[serde(default)]
+    pub install_root: Option<String>,
+    #[serde(default)]
+    pub registry_path: Option<String>,
+    #[serde(default)]
+    pub bundled_root: Option<String>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+}
+
+impl Default for RuntimePluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled_plugins: BTreeMap::default(),
+            external_directories: Vec::default(),
+            install_root: None,
+            registry_path: None,
+            bundled_root: None,
+            max_output_tokens: std::env::var("COWD_MAX_OUTPUT_TOKENS").ok().and_then(|v| v.parse().ok()),
+        }
+    }
+}
+
+impl RuntimePluginConfig {
+    #[must_use]
+    pub fn enabled_plugins(&self) -> &BTreeMap<String, bool> { &self.enabled_plugins }
+    #[must_use]
+    pub fn external_directories(&self) -> &[String] { &self.external_directories }
+    #[must_use]
+    pub fn install_root(&self) -> Option<&str> { self.install_root.as_deref() }
+    #[must_use]
+    pub fn registry_path(&self) -> Option<&str> { self.registry_path.as_deref() }
+    #[must_use]
+    pub fn bundled_root(&self) -> Option<&str> { self.bundled_root.as_deref() }
+    #[must_use]
+    pub fn max_output_tokens(&self) -> Option<u32> { self.max_output_tokens }
+    #[must_use]
+    pub fn state_for(&self, plugin_id: &str, default_enabled: bool) -> bool {
+        self.enabled_plugins.get(plugin_id).copied().unwrap_or(default_enabled)
+    }
+}
+
+// ── Session Reset Policy ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionResetPolicy {
+    Daily,
+    Idle,
+    Both,
+    Always,
+    #[default]
+    None,
+}
+
+// ── Layer Configuration ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerConfig {
+    #[serde(default = "default_true_bool")]
+    pub l0_enabled: bool,
+    #[serde(default = "default_l1_max_tokens")]
+    pub l1_max_tokens: u32,
+    #[serde(default = "default_l2_max_tokens")]
+    pub l2_max_tokens: u32,
+    #[serde(default = "default_l3_search_limit")]
+    pub l3_search_limit: u32,
+    #[serde(default)]
+    pub l4_enabled: bool,
+}
+
+fn default_l1_max_tokens() -> u32 { 2000 }
+fn default_l2_max_tokens() -> u32 { 3000 }
+fn default_l3_search_limit() -> u32 { 5 }
+
+impl Default for LayerConfig {
+    fn default() -> Self {
+        Self { l0_enabled: true, l1_max_tokens: 2000, l2_max_tokens: 3000, l3_search_limit: 5, l4_enabled: false }
+    }
+}
+
+// ── Vector Configuration ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub api_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub dimension: usize,
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+}
+
+fn default_timeout() -> u64 { 30 }
+fn default_batch_size() -> usize { 32 }
+
+impl Default for VectorConfig {
+    fn default() -> Self {
+        Self { enabled: false, model: String::new(), api_url: String::new(), api_key: String::new(),
+               dimension: 0, timeout_secs: 30, batch_size: 32 }
+    }
+}
+
+// ── Compression Sub-Configuration ──────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MicroCompactConfig {
+    #[serde(default = "default_true_bool")]
+    pub enabled: bool,
+    #[serde(default = "default_tool_result_max_chars")]
+    pub tool_result_max_chars: u32,
+    #[serde(default = "default_decay_factor")]
+    pub time_decay_factor: f32,
+}
+
+fn default_tool_result_max_chars() -> u32 { 4000 }
+fn default_decay_factor() -> f32 { 0.9 }
+
+impl Eq for MicroCompactConfig {}
+impl Default for MicroCompactConfig {
+    fn default() -> Self { Self { enabled: true, tool_result_max_chars: 4000, time_decay_factor: 0.9 } }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionCompactConfig {
+    #[serde(default = "default_session_threshold_tokens")]
+    pub threshold_tokens: u32,
+    #[serde(default = "default_preserve_recent")]
+    pub preserve_recent: u32,
+    #[serde(default = "default_summary_max")]
+    pub summary_max_tokens: u32,
+    #[serde(default = "default_buffer_tokens")]
+    pub buffer_tokens: u32,
+}
+
+fn default_session_threshold_tokens() -> u32 { 80000 }
+fn default_preserve_recent() -> u32 { 6 }
+fn default_summary_max() -> u32 { 2000 }
+fn default_buffer_tokens() -> u32 { 13000 }
+
+impl Default for SessionCompactConfig {
+    fn default() -> Self { Self { threshold_tokens: 80000, preserve_recent: 6, summary_max_tokens: 2000, buffer_tokens: 13000 } }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeepCompactConfig {
+    #[serde(default = "default_true_bool")]
+    pub enabled: bool,
+    #[serde(default = "default_true_bool")]
+    pub iterative_update: bool,
+}
+
+impl Default for DeepCompactConfig {
+    fn default() -> Self { Self { enabled: true, iterative_update: true } }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CircuitBreakerConfig {
+    #[serde(default = "default_max_retries_3")]
+    pub max_retries: u32,
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u32,
+}
+
+fn default_max_retries_3() -> u32 { 3 }
+fn default_cooldown_secs() -> u32 { 30 }
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self { Self { max_retries: 3, cooldown_secs: 30 } }
+}
+
+// ── Compression Config ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompressionConfig {
+    #[serde(default)]
+    pub micro: MicroCompactConfig,
+    #[serde(default)]
+    pub session: SessionCompactConfig,
+    #[serde(default)]
+    pub deep: DeepCompactConfig,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+    #[serde(default)]
+    pub llm: LlmSummarizerConfig,
+}
+
+fn default_true_bool() -> bool { true }
+
+impl Eq for CompressionConfig {}
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            micro: MicroCompactConfig::default(),
+            session: SessionCompactConfig::default(),
+            deep: DeepCompactConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            llm: LlmSummarizerConfig::default(),
+        }
+    }
+}
+
+// ── LLM Summarizer Config ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmSummarizerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+}
+
+impl LlmSummarizerConfig {
+    pub fn is_configured(&self) -> bool {
+        self.enabled && !self.api_url.is_empty() && !self.api_key.is_empty()
+    }
+}
+
+fn default_llm_model() -> String { "gpt-4o-mini".to_string() }
+
+impl Eq for LlmSummarizerConfig {}
+impl Default for LlmSummarizerConfig {
+    fn default() -> Self {
+        Self { enabled: false, api_url: String::new(), api_key: String::new(), model: "gpt-4o-mini".to_string() }
+    }
+}
 
 /// Prefix used for environment variable config overrides.
 const ENV_OVERRIDE_PREFIX: &str = "COWD_";
@@ -348,7 +838,13 @@ impl ConfigLoader {
                     &entry.path,
                 );
                 if !validation.is_ok() {
-                    all_warnings.extend(validation.errors);
+                    let errors = validation
+                        .errors
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(ConfigError::Parse(errors));
                 }
                 all_warnings.extend(validation.warnings);
                 validate_optional_hooks_config(&parsed.object, &entry.path)?;
@@ -1087,12 +1583,39 @@ fn parse_optional_provider_fallbacks(
     let Some(value) = object.get("providerFallbacks") else {
         return Ok(ProviderFallbackConfig::default());
     };
-    let entry = expect_object(value, "merged settings.providerFallbacks")?;
-    let primary =
-        optional_string(entry, "primary", "merged settings.providerFallbacks")?.map(str::to_string);
-    let fallbacks = optional_string_array(entry, "fallbacks", "merged settings.providerFallbacks")?
-        .unwrap_or_default();
-    Ok(ProviderFallbackConfig { primary, fallbacks })
+
+    match value {
+        // Array format (preferred): list of { primary, fallbacks } entries
+        JsonValue::Array(items) => {
+            let mut entries = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                let ctx = format!("merged settings.providerFallbacks[{i}]");
+                let entry = expect_object(item, &ctx)?;
+                let primary = expect_string(entry, "primary", &ctx)?.to_string();
+                let fallbacks = optional_string_array(entry, "fallbacks", &ctx)?
+                    .unwrap_or_default();
+                entries.push(ProviderFallbackEntry { primary, fallbacks });
+            }
+            Ok(ProviderFallbackConfig { entries })
+        }
+        // Legacy single-object format: { primary, fallbacks }
+        JsonValue::Object(entry) => {
+            let primary =
+                optional_string(entry, "primary", "merged settings.providerFallbacks")?
+                    .map(str::to_string);
+            let fallbacks =
+                optional_string_array(entry, "fallbacks", "merged settings.providerFallbacks")?
+                    .unwrap_or_default();
+            let entries = match primary {
+                Some(p) => vec![ProviderFallbackEntry { primary: p, fallbacks }],
+                None => Vec::new(),
+            };
+            Ok(ProviderFallbackConfig { entries })
+        }
+        _ => Err(ConfigError::Parse(
+            "merged settings.providerFallbacks: expected an object or array".to_string(),
+        )),
+    }
 }
 
 /// Parse the optional top-level `providers` mapping.
@@ -2007,7 +2530,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_provider_fallbacks_chain_with_primary_and_ordered_fallbacks() {
+    fn parses_provider_fallbacks_legacy_single_object_format() {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
@@ -2032,12 +2555,54 @@ mod tests {
 
         // then
         let chain = loaded.provider_fallbacks();
-        assert_eq!(chain.primary(), Some("claude-opus-4-6"));
-        assert_eq!(
-            chain.fallbacks(),
-            &["grok-3".to_string(), "grok-3-mini".to_string()]
-        );
         assert!(!chain.is_empty());
+        assert_eq!(chain.entries().len(), 1);
+        let entry = chain.find("claude-opus-4-6").expect("should find entry by primary");
+        assert_eq!(entry.primary, "claude-opus-4-6");
+        assert_eq!(entry.fallbacks, vec!["grok-3".to_string(), "grok-3-mini".to_string()]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_provider_fallbacks_array_format() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(cwd.join(".cowd")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"{
+              "providerFallbacks": [
+                {
+                  "primary": "deepseek-v4-pro",
+                  "fallbacks": ["deepseek-v4-flash", "qwen3.6-plus", "step-3.5-flash"]
+                },
+                {
+                  "primary": "claude-sonnet-4-6",
+                  "fallbacks": ["claude-haiku-4-6"]
+                }
+              ]
+            }"#,
+        )
+        .expect("write provider fallback settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let chain = loaded.provider_fallbacks();
+        assert!(!chain.is_empty());
+        assert_eq!(chain.entries().len(), 2);
+        let ds = chain.find("deepseek-v4-pro").expect("should find deepseek");
+        assert_eq!(ds.fallbacks, vec!["deepseek-v4-flash", "qwen3.6-plus", "step-3.5-flash"]);
+        let cs = chain.find("claude-sonnet-4-6").expect("should find claude");
+        assert_eq!(cs.fallbacks, vec!["claude-haiku-4-6"]);
+        assert!(chain.find("nonexistent").is_none());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -2059,9 +2624,8 @@ mod tests {
 
         // then
         let chain = loaded.provider_fallbacks();
-        assert_eq!(chain.primary(), None);
-        assert!(chain.fallbacks().is_empty());
         assert!(chain.is_empty());
+        assert_eq!(chain.entries().len(), 0);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

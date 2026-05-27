@@ -69,6 +69,7 @@ dependencies = [
  "runtime",
  "serde",
  "serde_json",
+ "sha2",
  "telemetry",
  "tokio",
  "tracing",
@@ -598,17 +599,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "config"
-version = "0.7.4"
-dependencies = [
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -676,7 +666,6 @@ version = "0.7.4"
 dependencies = [
  "async-trait",
  "chrono",
- "config",
  "parking_lot",
  "regex",
  "reqwest",
@@ -2738,7 +2727,6 @@ dependencies = [
  "base64 0.22.1",
  "cbc",
  "chrono",
- "config",
  "cowd-memory",
  "futures",
  "glob",

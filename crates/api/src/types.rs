@@ -302,7 +302,7 @@ mod tests {
             kind: "message".to_string(),
             role: "assistant".to_string(),
             content: Vec::new(),
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             stop_reason: Some("end_turn".to_string()),
             stop_sequence: None,
             usage: Usage {
@@ -315,7 +315,7 @@ mod tests {
         };
 
         let cost = response.usage.estimated_cost_usd(&response.model);
-        assert_eq!(format_usd(cost.total_cost_usd()), "$54.6750");
+        assert_eq!(format_usd(cost.total_cost_usd()), "$10.9350");
         assert_eq!(response.total_tokens(), 1_800_000);
     }
 

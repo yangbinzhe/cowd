@@ -49,99 +49,6 @@ pub struct ModelTokenLimit {
     pub context_window_tokens: u32,
 }
 
-const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
-    (
-        "opus",
-        ProviderMetadata {
-            provider: ProviderKind::Anthropic,
-            auth_env: "ANTHROPIC_API_KEY",
-            base_url_env: "ANTHROPIC_BASE_URL",
-            default_base_url: anthropic::DEFAULT_BASE_URL,
-        },
-    ),
-    (
-        "sonnet",
-        ProviderMetadata {
-            provider: ProviderKind::Anthropic,
-            auth_env: "ANTHROPIC_API_KEY",
-            base_url_env: "ANTHROPIC_BASE_URL",
-            default_base_url: anthropic::DEFAULT_BASE_URL,
-        },
-    ),
-    (
-        "haiku",
-        ProviderMetadata {
-            provider: ProviderKind::Anthropic,
-            auth_env: "ANTHROPIC_API_KEY",
-            base_url_env: "ANTHROPIC_BASE_URL",
-            default_base_url: anthropic::DEFAULT_BASE_URL,
-        },
-    ),
-    (
-        "grok",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-3",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-mini",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-3-mini",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "grok-2",
-        ProviderMetadata {
-            provider: ProviderKind::Xai,
-            auth_env: "XAI_API_KEY",
-            base_url_env: "XAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
-        },
-    ),
-    (
-        "kimi",
-        ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "MOONSHOT_API_KEY",
-            base_url_env: "MOONSHOT_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_MOONSHOT_BASE_URL,
-        },
-    ),
-    (
-        "kimi-latest",
-        ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "MOONSHOT_API_KEY",
-            base_url_env: "MOONSHOT_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_MOONSHOT_BASE_URL,
-        },
-    ),
-];
-
 /// Strip a known routing prefix (e.g. `"kimi:"`) from a model name so that
 /// `kimi:kimi-latest` resolves to the `kimi-latest` alias while still
 /// selecting the Moonshot provider via prefix routing.
@@ -156,38 +63,9 @@ pub fn strip_routing_prefix(model: &str) -> String {
 }
 
 #[must_use]
-pub fn resolve_model_alias(model: &str) -> String {
-    let stripped = strip_routing_prefix(model);
-    let trimmed = stripped.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    MODEL_REGISTRY
-        .iter()
-        .find_map(|(alias, metadata)| {
-            (*alias == lower).then_some(match metadata.provider {
-                ProviderKind::Anthropic => match *alias {
-                    "opus" => "claude-opus-4-6",
-                    "sonnet" => "claude-sonnet-4-6",
-                    "haiku" => "claude-haiku-4-5-20251213",
-                    _ => trimmed,
-                },
-                ProviderKind::Xai => match *alias {
-                    "grok" | "grok-3" => "grok-3",
-                    "grok-mini" | "grok-3-mini" => "grok-3-mini",
-                    "grok-2" => "grok-2",
-                    _ => trimmed,
-                },
-                ProviderKind::OpenAi => match *alias {
-                    "kimi" | "kimi-latest" => "kimi-latest",
-                    _ => trimmed,
-                },
-            })
-        })
-        .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
-}
-
-#[must_use]
 pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
-    let canonical = resolve_model_alias(model);
+    let canonical = strip_routing_prefix(model);
+    let canonical = canonical.trim();
     if canonical.starts_with("claude") {
         return Some(ProviderMetadata {
             provider: ProviderKind::Anthropic,
@@ -288,17 +166,8 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
-    model_token_limit(model).map_or_else(
-        || {
-            let canonical = resolve_model_alias(model);
-            if canonical.contains("opus") {
-                32_000
-            } else {
-                64_000
-            }
-        },
-        |limit| limit.max_output_tokens,
-    )
+    let registry = runtime::model_registry::global_registry();
+    registry.max_output_tokens_for(model)
 }
 
 /// Returns the effective max output tokens for a model, preferring a plugin
@@ -311,126 +180,12 @@ pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u
 
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
-    let canonical = resolve_model_alias(model);
-    match canonical.as_str() {
-        "claude-opus-4-6" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "claude-sonnet-4-6" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 200_000,
-        }),
-        "grok-4" | "grok-4.1" | "grok-4.20" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 2_000_000,
-        }),
-        "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "grok-2" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 128_000,
-        }),
-        "deepseek-chat" | "deepseek-v4-pro" | "deepseek-v4" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "deepseek-v4-flash" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "deepseek-reasoner" | "deepseek-r1" | "deepseek-r1-0528" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 128_000,
-        }),
-        "qwen-long" => Some(ModelTokenLimit {
-            max_output_tokens: 8_192,
-            context_window_tokens: 10_000_000,
-        }),
-        "qwen3.5-plus" | "qwen3-coder-plus" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "qwen-max" | "qwen3-max" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 262_144,
-        }),
-        "qwen-plus" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 131_072,
-        }),
-        "qwen-turbo" => Some(ModelTokenLimit {
-            max_output_tokens: 8_192,
-            context_window_tokens: 128_000,
-        }),
-        "kimi-latest" | "kimi-k2.6" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 262_144,
-        }),
-        "kimi-k2" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 131_072,
-        }),
-        "glm-4" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 128_000,
-        }),
-        "yi" | "yi-lightning" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 128_000,
-        }),
-        "minimax" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 128_000,
-        }),
-        "mimo" | "mimo-v2.5" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "gpt-5" | "gpt-5.5" | "gpt-5.4" => Some(ModelTokenLimit {
-            max_output_tokens: 128_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "gpt-4o" | "gpt-4o-mini" => Some(ModelTokenLimit {
-            max_output_tokens: 16_000,
-            context_window_tokens: 128_000,
-        }),
-        "o3" | "o3-mini" | "o4-mini" => Some(ModelTokenLimit {
-            max_output_tokens: 32_000,
-            context_window_tokens: 128_000,
-        }),
-        "gemini-3.1-pro" | "gemini-3.1-flash" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 2_000_000,
-        }),
-        "gemini-2.5-pro" | "gemini-2.5-flash" => Some(ModelTokenLimit {
-            max_output_tokens: 64_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "llama-4-maverick" => Some(ModelTokenLimit {
-            max_output_tokens: 16_000,
-            context_window_tokens: 1_000_000,
-        }),
-        "llama-4-scout" => Some(ModelTokenLimit {
-            max_output_tokens: 16_000,
-            context_window_tokens: 10_000_000,
-        }),
-        "mistral-large" => Some(ModelTokenLimit {
-            max_output_tokens: 16_000,
-            context_window_tokens: 128_000,
-        }),
-        _ => None,
-    }
+    let registry = runtime::model_registry::global_registry();
+    let info = registry.get(model)?;
+    Some(ModelTokenLimit {
+        max_output_tokens: info.max_output_tokens,
+        context_window_tokens: info.context_window,
+    })
 }
 
 #[must_use]
@@ -444,13 +199,12 @@ pub fn model_context_window_with_overrides(
     model: &str,
     overrides: Option<&std::collections::BTreeMap<String, u32>>,
 ) -> u32 {
-    let canonical = resolve_model_alias(model);
     if let Some(overrides) = overrides {
-        if let Some(&ctx) = overrides.get(&canonical) {
+        if let Some(&ctx) = overrides.get(model) {
             return ctx;
         }
     }
-    model_context_window(&canonical)
+    model_context_window(model)
 }
 
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
@@ -462,7 +216,7 @@ pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiErro
     let estimated_total_tokens = estimated_input_tokens.saturating_add(request.max_tokens);
     if estimated_total_tokens > limit.context_window_tokens {
         return Err(ApiError::ContextWindowExceeded {
-            model: resolve_model_alias(&request.model),
+            model: request.model.clone(),
             estimated_input_tokens,
             requested_output_tokens: request.max_tokens,
             estimated_total_tokens,
@@ -507,7 +261,7 @@ pub fn check_request_body_size(
     let size = estimate_request_body_size(request);
     if size > limit {
         return Err(ApiError::RequestBodyTooLarge {
-            model: resolve_model_alias(&request.model),
+            model: request.model.clone(),
             estimated_bytes: size,
             limit_bytes: limit,
         });
@@ -656,15 +410,8 @@ mod tests {
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
         load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
         model_context_window, model_token_limit, parse_dotenv, preflight_message_request,
-        resolve_model_alias, ProviderKind,
+        ProviderKind,
     };
-
-    #[test]
-    fn resolves_grok_aliases() {
-        assert_eq!(resolve_model_alias("grok"), "grok-3");
-        assert_eq!(resolve_model_alias("grok-mini"), "grok-3-mini");
-        assert_eq!(resolve_model_alias("grok-2"), "grok-2");
-    }
 
     #[test]
     fn detects_provider_from_model_name_first() {
@@ -728,9 +475,13 @@ mod tests {
     }
 
     #[test]
-    fn keeps_existing_max_token_heuristic() {
-        assert_eq!(max_tokens_for_model("opus"), 32_000);
+    fn max_tokens_from_registry() {
+        // claude-opus-4-6: 32K from models.yaml
+        assert_eq!(max_tokens_for_model("claude-opus-4-6"), 32_000);
+        // grok-3: 64K from models.yaml
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        // unknown model falls back to 64K
+        assert_eq!(max_tokens_for_model("unknown-model"), 64_000);
     }
 
     #[test]
@@ -792,8 +543,8 @@ mod tests {
             1_000_000
         );
         assert_eq!(
-            model_token_limit("grok-mini")
-                .expect("grok-mini should resolve to a registered model")
+            model_token_limit("grok-3-mini")
+                .expect("grok-3-mini should be registered")
                 .context_window_tokens,
             1_000_000
         );
