@@ -2657,7 +2657,7 @@ fn run_repl(
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
 
-    if compact {
+    if compact || prompt.is_some() {
         let prompt = prompt.ok_or_else(|| "compact mode requires a prompt argument".to_string())?;
         if prompt.is_empty() {
             return Err("compact mode requires a non-empty prompt argument".into());

@@ -198,36 +198,36 @@ cowd 不只是一个 TUI 工具。它可以嵌入到：
    CLI输入  ──→ EventBus ──→ ConversationRuntime ──→ LLM → TUI渲染
 ```
 
-### 6. 统一网关 (Gateway) — 单进程双前端
+### 6. 入口模式 (Entry Points) — 独立进程，共享后端
 
-v0.7.0 后，TUI 和 API Server 统一为**单一网关守护进程**，共享同一个 SHARED_RT runtime：
+TUI 模式和 Server 模式是两个独立进程入口，共享同一个 `runtime` crate 后端代码，但各自独立运行：
 
 ```
-┌─────────────────────────────────────────────────┐
-│           cowd gateway (单进程)                   │
-│                                                  │
-│  SHARED_RT (4 workers)                           │
-│  ┌────────────────────────────────────────────┐  │
-│  │           共享后端 (Arc 单例)                │  │
-│  │  ├ UnifiedSessionStore (SQLite)             │  │
-│  │  ├ ActiveSessions (多 Session 并发)         │  │
-│  │  ├ CognitiveContextManager (统一记忆)        │  │
-│  │  ├ GlobalToolRegistry (53+ 工具)            │  │
-│  │  └ RuntimeConfig (实时配置读写)              │  │
-│  └────────────────────────────────────────────┘  │
-│         │                         │               │
-│  ┌──────▼──────┐          ┌───────▼───────┐      │
-│  │  TUI 前端    │          │  HTTP API 前端  │      │
-│  │  (控制台)    │          │  (REST + WS)    │      │
-│  │  10/10 面板  │          │  完全能力对等    │      │
-│  └─────────────┘          └───────────────┘      │
-└─────────────────────────────────────────────────┘
+  cowd --solo (TUI 模式)              cowd serve (Server 模式)
+  ┌──────────────────────┐            ┌──────────────────────────┐
+  │  TUI 控制台           │            │  HTTP API + 飞书 WebSocket │
+  │  10/10 面板           │            │  + WebUI 捆绑             │
+  │                      │            │                          │
+  │  ┌────────────────┐  │            │  ┌──────────────────────┐ │
+  │  │ Conversation   │  │            │  │ Conversation         │ │
+  │  │ Runtime        │  │            │  │ Runtime              │ │
+  │  │ (独立实例)      │  │            │  │ (独立实例)            │ │
+  │  └────────────────┘  │            │  └──────────────────────┘ │
+  │        │              │            │        │                  │
+  │  ┌─────▼──────────┐  │            │  ┌─────▼──────────────┐  │
+  │  │ runtime crate  │  │            │  │ runtime crate      │  │
+  │  │ memory·tools·  │  │            │  │ memory·tools·      │  │
+  │  │ permissions·   │  │            │  │ permissions·       │  │
+  │  │ config         │  │            │  │ config             │  │
+  │  └────────────────┘  │            │  └────────────────────┘  │
+  └──────────────────────┘            └──────────────────────────┘
 ```
 
 关键特性：
-- **Session SQLite 统一**：TUI 和 API 共享同一个 `~/.cowd/sessions.db`
-- **API 完全对等**：`/api/memory` `/api/tools` `/api/config` 全部连接实际后端
-- **多 Session 并发**：ActiveSessions 管理多个独立 ConversationRuntime
+- **共享代码，独立进程**：TUI 和 Server 使用相同的 `runtime` crate（内存系统、工具注册、权限管控、配置管理），但运行在独立进程中，各有自己的 ConversationRuntime 实例
+- **Session SQLite 共享**：TUI 和 API 可以访问同一个 `~/.cowd/sessions.db`，但同一时间只有一个进程写入
+- **API 完全对等**：Server 模式的 `/api/memory` `/api/tools` `/api/config` 全部连接实际运行时后端
+- **多 Session 并发**：Server 模式下 ActiveSessions 管理多个独立 ConversationRuntime
 - **安装部署**：`cowd install` → `~/.cowd/bin/cowd` + systemd 服务注册
 
 ---
