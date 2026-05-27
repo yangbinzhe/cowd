@@ -33,7 +33,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// Feishu adapter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +84,7 @@ pub struct FeishuAdapter {
     pub reactions: ProcessingReactions,
     pub batch_manager: Option<TextBatchManager>,
     pub processing_queue: ChatProcessingQueue,
+    ws_events: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>>,
 }
 
 impl FeishuAdapter {
@@ -100,6 +101,7 @@ impl FeishuAdapter {
             reactions: ProcessingReactions::new(),
             batch_manager: None,
             processing_queue: ChatProcessingQueue::new(1000),
+            ws_events: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -711,11 +713,24 @@ impl PlatformAdapter for FeishuAdapter {
         let token = self.authenticate().await?;
         *self.access_token.write().await = Some(token);
         *self.connected.write().await = true;
+
+        let ws_client = super::ws::FeishuWsClient::new(&self.config.app_id, &self.config.app_secret);
+        match ws_client.connect().await {
+            Ok(rx) => {
+                *self.ws_events.lock().await = Some(rx);
+                tracing::info!("feishu adapter: WebSocket event channel active");
+            }
+            Err(e) => {
+                tracing::warn!("feishu adapter: WebSocket connect failed: {e}");
+            }
+        }
+
         tracing::info!("feishu adapter connected");
         Ok(())
     }
 
     async fn disconnect(&mut self) -> PlatformResult<()> {
+        *self.ws_events.lock().await = None;
         *self.connected.write().await = false;
         *self.access_token.write().await = None;
         *self.token_expires_at.write().await = None;
@@ -728,10 +743,22 @@ impl PlatformAdapter for FeishuAdapter {
     }
 
     async fn receive(&mut self) -> PlatformResult<Option<InboundMessage>> {
-        // WebSocket events are handled by the FeishuWsClient in ws.rs.
-        // This polling method returns None — use FeishuWsClient::connect()
-        // for real-time event reception.
-        Ok(None)
+        let mut guard = self.ws_events.lock().await;
+        let rx = match guard.as_mut() {
+            Some(rx) => rx,
+            None => return Ok(None),
+        };
+
+        match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+            Ok(Some(event)) => {
+                drop(guard);
+                let payload = serde_json::to_vec(&event)
+                    .map_err(|e| PlatformError::Unknown(format!("serialize event: {e}")))?;
+                self.process_webhook_event(&payload)
+            }
+            Ok(None) => Ok(None),
+            Err(_) => Ok(None),
+        }
     }
 
     async fn send(&self, msg: &OutboundMessage) -> PlatformResult<()> {
