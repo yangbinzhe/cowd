@@ -29,6 +29,6 @@ unused_variables = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
-pedantic = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -2 }
 unwrap_used = { level = "warn", priority = -1 }
 expect_used = { level = "warn", priority = -1 }

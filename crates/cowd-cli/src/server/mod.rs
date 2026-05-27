@@ -14,9 +14,10 @@ use serde::Serialize;
 use tokio::net::TcpListener as TokioTcpListener;
 use tower_http::cors::CorsLayer;
 
-use memory::MemoryConfig;
+use memory::{cognitive::CognitiveContextManager, MemoryConfig};
 use runtime::platform::PlatformConfig;
-use runtime::{ApprovalConfig, SessionResetPolicy};
+use runtime::{ApprovalConfig, ConfigLoader, SessionResetPolicy};
+use tools::GlobalToolRegistry;
 
 use crate::api_routes;
 use crate::gateway::ActiveSessions;
@@ -244,7 +245,31 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
 
     // ── Build router from api_routes ──
     let active_sessions = Arc::new(ActiveSessions::new());
-    let api_router = api_routes::api_router(active_sessions);
+    let tool_registry = Arc::new(GlobalToolRegistry::builtin());
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let runtime_config = ConfigLoader::default_for(&cwd)
+        .load()
+        .ok()
+        .map(|c| json_value_to_serde_json(&c.as_json()));
+
+    // Init memory manager if configured
+    let memory_manager = match &config.memory_config {
+        Some(mem_cfg) => CognitiveContextManager::new(mem_cfg.clone())
+            .await
+            .ok()
+            .map(Arc::new),
+        None => None,
+    };
+
+    let state = Arc::new(api_routes::AppState {
+        sessions: active_sessions,
+        memory_manager,
+        tool_registry,
+        config: runtime_config,
+    });
+
+    let api_router = api_routes::api_router(state.clone());
 
     // ── Public routes (no auth) ──
     let public_routes = Router::new()
@@ -387,4 +412,21 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
     fs::remove_file(pid_file()).ok();
 
     Ok(())
+}
+
+fn json_value_to_serde_json(v: &runtime::JsonValue) -> serde_json::Value {
+    match v {
+        runtime::JsonValue::Null => serde_json::Value::Null,
+        runtime::JsonValue::Bool(b) => serde_json::Value::Bool(*b),
+        runtime::JsonValue::Number(n) => serde_json::json!(*n),
+        runtime::JsonValue::String(s) => serde_json::Value::String(s.clone()),
+        runtime::JsonValue::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(json_value_to_serde_json).collect())
+        }
+        runtime::JsonValue::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_value_to_serde_json(v)))
+                .collect(),
+        ),
+    }
 }

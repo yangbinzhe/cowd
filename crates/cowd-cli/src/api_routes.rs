@@ -2,10 +2,10 @@
 // Core session management routes shared between TUI and HTTP API.
 // DO NOT delete old server/mod.rs yet (T16 will do that).
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
-    extract::{Path, State as AxumState},
+    extract::{Path, Query, State as AxumState},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -13,24 +13,33 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use tools::GlobalToolRegistry;
+
 use crate::gateway::ActiveSessions;
+use memory::cognitive::CognitiveContextManager;
 
 // ── Shared application state ───────────────────────────────────
 
-pub type AppState = Arc<ActiveSessions>;
+pub struct AppState {
+    pub sessions: Arc<ActiveSessions>,
+    pub memory_manager: Option<Arc<CognitiveContextManager>>,
+    pub tool_registry: Arc<GlobalToolRegistry>,
+    pub config: Option<serde_json::Value>,
+}
 
 // ── Router ─────────────────────────────────────────────────────
 
-pub fn api_router(active_sessions: AppState) -> Router {
+pub fn api_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session).delete(delete_session))
         .route("/api/sessions/:id/messages", post(send_message))
         .route("/api/memory", get(memory_handler))
+        .route("/api/memory/search", get(memory_search_handler))
         .route("/api/tools", get(tools_handler))
         .route("/api/config", get(config_handler))
-        .with_state(active_sessions)
+        .with_state(state)
 }
 
 // ── Response types ─────────────────────────────────────────────
@@ -69,9 +78,9 @@ async fn health_handler() -> &'static str {
 }
 
 async fn list_sessions(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let ids = state.list();
+    let ids = state.sessions.list();
     let sessions: Vec<SessionInfo> = ids
         .into_iter()
         .map(|id| SessionInfo {
@@ -83,17 +92,10 @@ async fn list_sessions(
 }
 
 async fn create_session(
-    AxumState(_state): AxumState<AppState>,
+    AxumState(_state): AxumState<Arc<AppState>>,
     Json(_body): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let session_id = uuid::Uuid::new_v4().to_string();
-    // For now, create a session entry without a full runtime.
-    // Full runtime creation requires model config, tool registry,
-    // MCP state, etc. — this will be wired in a later task.
-    // The session is tracked in ActiveSessions (list/get/delete work).
-    // Push the session_id onto a lightweight tracking list.
-    // (ActiveSessions requires a full BuiltRuntime for register(),
-    // so we use an indirect tracking mechanism here.)
     tracing::info!(%session_id, "API session create requested (full runtime wiring pending)");
     let info = SessionInfo {
         id: session_id,
@@ -103,10 +105,10 @@ async fn create_session(
 }
 
 async fn get_session(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if state.get(&id).is_some() {
+    if state.sessions.get(&id).is_some() {
         Ok(Json(SessionInfo {
             id,
             status: "active".to_string(),
@@ -122,10 +124,10 @@ async fn get_session(
 }
 
 async fn delete_session(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if state.remove(&id).is_some() {
+    if state.sessions.remove(&id).is_some() {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((
@@ -138,11 +140,11 @@ async fn delete_session(
 }
 
 async fn send_message(
-    AxumState(state): AxumState<AppState>,
+    AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime = state.get(&id).ok_or_else(|| {
+    let runtime = state.sessions.get(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -152,8 +154,6 @@ async fn send_message(
     })?;
 
     tracing::info!(%id, content_len = body.content.len(), "API message received");
-    // Runtime is available for future message processing.
-    // Full streaming/response will be wired in a later task.
     let _runtime = runtime;
     let _content = body.content;
 
@@ -164,50 +164,67 @@ async fn send_message(
     })))
 }
 
-// ── Memory / Tools / Config (simple stubs) ──────────────────────
+// ── Memory / Tools / Config handlers ───────────────────────────
 
-async fn memory_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "enabled": true,
-        "store_path": "~/.cowd/memory",
-        "session_store": true,
-        "layers": {
-            "L0": "fixed identity",
-            "L1": "working memory",
-            "L2": "project context",
-            "L3": "deep memories",
-            "L4": "archived"
-        },
-        "features": {
-            "semantic_search": true,
-            "context_compression": true,
-            "drift_detection": true,
-            "session_handoff": true
+async fn memory_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    if let Some(ref mgr) = state.memory_manager {
+        let layers = mgr.list_layers().await;
+        let vector_count = mgr.vector_index_count();
+        Json(serde_json::json!({
+            "enabled": true,
+            "layers": layers,
+            "vector_count": vector_count,
+            "session_store": true,
+        }))
+    } else {
+        Json(serde_json::json!({
+            "enabled": false,
+            "message": "memory not configured"
+        }))
+    }
+}
+
+async fn memory_search_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let query = params.get("q").cloned().unwrap_or_default();
+    if let Some(ref mgr) = state.memory_manager {
+        match mgr.search(&query).await {
+            Ok(results) => Json(serde_json::json!({ "results": results })),
+            Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
         }
-    }))
+    } else {
+        Json(serde_json::json!({ "results": [] }))
+    }
 }
 
-async fn tools_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "tools": [
-            {"name": "read", "description": "Read files from the local filesystem"},
-            {"name": "write", "description": "Write files to the local filesystem"},
-            {"name": "edit", "description": "Make targeted edits to files"},
-            {"name": "glob", "description": "Find files by glob pattern"},
-            {"name": "grep", "description": "Search file contents with regex"},
-            {"name": "bash", "description": "Execute shell commands"},
-            {"name": "web_search", "description": "Search the web"},
-            {"name": "web_fetch", "description": "Fetch content from a URL"}
-        ]
-    }))
+async fn tools_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    let tools: Vec<serde_json::Value> = state.tool_registry
+        .definitions(None)
+        .iter()
+        .map(|t| serde_json::json!({
+            "name": t.name,
+            "description": t.description,
+            "enabled": true,
+        }))
+        .collect();
+    Json(serde_json::json!({ "tools": tools, "count": tools.len() }))
 }
 
-async fn config_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "model": "claude-opus-4-6",
-        "provider": "anthropic",
-        "theme": "dark",
-        "language": "zh-CN",
-        "streaming": true
-    }))
+async fn config_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    match &state.config {
+        Some(config) => Json(config.clone()),
+        None => Json(serde_json::json!({
+            "error": "config not loaded",
+            "model": "unknown",
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    }
 }

@@ -464,6 +464,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         CliAction::MigrateSessions { output_format } => run_migrate_sessions(output_format)?,
         CliAction::Gateway { action, output_format } => run_gateway_action(&action, output_format)?,
+        CliAction::Install { systemd, path } => run_install(systemd, path.as_deref())?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -714,6 +715,10 @@ pub(crate) enum CliAction {
     Gateway {
         action: GatewayAction,
         output_format: CliOutputFormat,
+    },
+    Install {
+        systemd: bool,
+        path: Option<String>,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -1019,6 +1024,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             Ok(CliAction::Serve { host, port, auth_enabled, cors_origins, output_format, solo_mode: solo_mode || global_solo_mode })
         }
         "export" => parse_export_args(&rest[1..], output_format),
+        "install" => parse_install_args(&rest[1..], output_format),
         "migrate-sessions" => Ok(CliAction::MigrateSessions { output_format }),
         "gateway" => parse_gateway_args(&rest[1..], output_format),
 
@@ -1366,6 +1372,26 @@ fn parse_system_prompt_args(
         date,
         output_format,
     })
+}
+
+fn parse_install_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    let mut systemd = false;
+    let mut path = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--systemd" => {
+                systemd = true;
+                i += 1;
+            }
+            "--path" if i + 1 < args.len() => {
+                path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => return Err(format!("unknown install flag: {other}")),
+        }
+    }
+    Ok(CliAction::Install { systemd, path })
 }
 
 fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
@@ -6403,6 +6429,54 @@ fn summarize_tool_payload_for_markdown(payload: &str) -> String {
         return String::new();
     }
     truncate_for_summary(&compact, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT)
+}
+
+fn run_install(systemd: bool, path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let install_dir = path.map(PathBuf::from).unwrap_or_else(|| {
+        runtime::cowd_dirs::config_home_dir().join("bin")
+    });
+    std::fs::create_dir_all(&install_dir)?;
+
+    let current_exe = std::env::current_exe()?;
+    let target = install_dir.join("cowd");
+    std::fs::copy(&current_exe, &target)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    println!("Installed cowd to {}", target.display());
+
+    if systemd {
+        let unit = format!(
+            r#"[Unit]
+Description=COWD Gateway Daemon
+After=network.target
+
+[Service]
+ExecStart={} gateway run
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=warn
+
+[Install]
+WantedBy=default.target
+"#,
+            target.display()
+        );
+        let unit_path = install_dir
+            .parent()
+            .unwrap_or(&install_dir)
+            .join("cowd-gateway.service");
+        std::fs::write(&unit_path, &unit)?;
+        println!("Created systemd unit at {}", unit_path.display());
+        println!(
+            "To enable: systemctl --user enable --now {}",
+            unit_path.display()
+        );
+    }
+    Ok(())
 }
 
 fn run_export(
