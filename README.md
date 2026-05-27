@@ -1,6 +1,6 @@
 # COWD — AI 编程智能体框架
 
-> **Rust 原生多智能体编程框架** | 当前版本 v0.7.4
+> **Rust 原生多智能体编程框架** | 当前版本 v0.7.6
 > 统一网关 · 全功能 TUI · API 完全对等 · Session SQLite 存储
 > 内存系统 · 代码智能 · 权限管控 · MCP 协议 · 多平台接入
 
@@ -10,16 +10,15 @@
 
 | Crate | 文件 | 行数 | 职责 |
 |-------|------|------|------|
-| `cowd-cli` | 70 | ~47K | 主程序：CLI / TUI / Server / Gateway 入口（新增 gateway.rs 101行, api_routes.rs 230行） |
-| `runtime` | 81 | 45,131 | 运行时核心：会话、工具、权限、MCP、Gates |
-| `memory` | 61 | 32,411 | 36模块内存系统 + 代码图谱 + 知识图谱 |
-| `tools` | 8 | 10,633 | 50+ 内置工具规范 |
-| `commands` | 7 | 8,926 | 100+ 斜杠命令 + 技能系统 |
-| `api` | 13 | 7,939 | 多 Provider 模型适配层 |
-| `plugins` | 3 | 4,288 | 插件注册与生命周期 |
-| `config` | 2 | 2,162 | 统一配置管理 |
-| 其他 | 5 | 1,814 | 遥测、兼容测试、Mock 服务 |
-| **总计** | **274** | **~172K** | |
+| `cowd-cli` | 70 | ~47K | 主程序：CLI / TUI / Server / Gateway 入口 |
+| `runtime` | 83 | ~47K | 运行时核心：会话、工具、权限、MCP、Gates、模型注册表、故障转移、缓存 |
+| `memory` | 61 | ~32K | 36模块内存系统 + 代码图谱 + 知识图谱 |
+| `tools` | 8 | ~10K | 50+ 内置工具规范 |
+| `commands` | 7 | ~9K | 100+ 斜杠命令 + 技能系统 |
+| `api` | 13 | ~8K | 多 Provider 模型适配层 + CachedProviderClient |
+| `plugins` | 3 | ~4K | 插件注册与生命周期 |
+| 其他 | 3 | ~2K | 遥测、兼容测试、Mock 服务 |
+| **总计** | **~250** | **~160K** | (config crate 已合并到 runtime) |
 
 ---
 
@@ -185,8 +184,8 @@ Wave + SubAgent 的组合让 cowd 可以处理复杂的多步骤任务，同时�
 cowd 不只是一个 TUI 工具。它可以嵌入到：
 
 - **API Server**：REST API，支持认证和 CORS，WebUI 捆绑，ActiveSessions 多会话并发，API 完全对等（记忆/工具/配置）
-- **飞书机器人**：接收飞书消息，返回智能体回答，支持富文本和交互卡片
-- **企微机器人**：企业微信适配
+- **飞书机器人**：接收飞书消息，返回智能体回答，支持富文本和交互卡片（WebSocket 长连接）
+- **微信个人机器人**：iLink Bot API 适配，个人微信接入
 - **邮件**：邮件收发，自动推理和回复
 - **CLI**：`cowd prompt "xxx"` 单次问答，`cowd --resume` 续接会话
 
@@ -394,6 +393,15 @@ cowd install --systemd
 # Session 管理
 cowd migrate-sessions   # JSONL → SQLite 迁移
 cowd --resume latest    # 续接最近会话
+
+# 模型管理
+cowd --model sonnet prompt "hello"   # 指定模型
+cowd --model main                    # 使用配置别名
+cowd models list                     # 列出已注册模型
+cowd models update                   # 在线更新模型注册表
+
+# 飞书适配器
+cowd serve --port 8642               # 启动 API + 飞书 WebSocket
 ```
 
 ---
@@ -416,6 +424,150 @@ RUST_LOG=debug cowd --solo
 # 日志文件位置
 tail -f ~/.cowd/logs/cowd.$(date +%Y-%m-%d)
 ```
+
+---
+
+## 完整使用指南
+
+### 快速开始
+
+```bash
+# 1. 安装
+cargo build --release && cp target/release/cowd /usr/local/bin/
+
+# 2. 配置 API key (~/.cowd/config.yaml)
+echo 'providers:
+  anthropic:
+    api_key: "sk-ant-xxx"
+aliases:
+  main: "claude-sonnet-4-6"
+  fast: "claude-haiku-4-5-20251213"' > ~/.cowd/config.yaml
+
+# 3. 启动 TUI
+cowd --solo
+```
+
+### TUI 模式
+
+```
+cowd --solo              # 进入全功能 TUI
+```
+
+**快捷键**：
+- `Tab` / `Shift+Tab` — 切换侧边栏面板（Context/Changes/Todo/Diff/Files/Sessions/Memory）
+- `Ctrl+P` — 命令面板
+- `Space` — WhichKey 快捷键引导
+- `Ctrl+O` — 消息操作菜单
+- `Esc` — 中断当前 LLM 调用
+- `/model sonnet` — 切换模型
+- `/new` — 新建会话
+
+### Server 模式
+
+```bash
+cowd serve --port 8642    # 启动 API 服务器
+```
+
+**API 端点**：
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/sessions` | GET | 列出会话 |
+| `/api/sessions/:id` | DELETE | 删除会话 |
+| `/api/sessions/:id/message` | POST | 发送消息 |
+| `/api/memory` | GET | 查看记忆层 |
+| `/api/memory/search?q=` | GET | 搜索记忆 |
+| `/api/tools` | GET | 列出工具 |
+| `/api/config` | GET/PUT | 查看/修改配置 |
+| `/health` | GET | 健康检查 |
+
+### 单次问答
+
+```bash
+cowd prompt "解释 Rust 的 ownership"           # 单次问答
+cowd --compact "summarize Cargo.toml"         # 只输出最终回复
+cowd --model deepseek-v4-pro prompt "hello"   # 指定模型
+cowd --resume latest                          # 续接最近会话
+```
+
+### 模型管理
+
+```bash
+cowd models list          # 列出 ~/.cowd/models.yaml 中 40+ 已注册模型
+cowd models update        # 从远程更新模型注册表（含定价/token限制/能力）
+```
+
+**配置别名** (在 `~/.cowd/config.yaml` 中)：
+```yaml
+aliases:
+  main: "claude-sonnet-4-6"
+  fast: "claude-haiku-4-5-20251213"
+  deep: "deepseek-v4-pro"
+  qwen: "qwen-max"
+```
+
+**Provider 故障转移**：
+```yaml
+providerFallbacks:
+  - primary: "deepseek-v4-pro"
+    fallbacks:
+      - "deepseek-v4-flash"
+      - "qwen3.6-plus"
+```
+
+### 飞书机器人
+
+```bash
+# 1. 在飞书开放平台创建应用，获取 App ID 和 Secret
+# 2. 配置 ~/.cowd/config.yaml:
+platforms:
+  - platformType: feishu
+    enabled: true
+    app_id: "cli_xxx"
+    app_secret: "xxx"
+    bot_name: "Cowd"
+
+# 3. 启动服务
+cowd serve --port 8642
+# 飞书 WebSocket 自动连接，发送消息到机器人即可交互
+```
+
+### 微信个人机器人
+
+```bash
+# 配置 ~/.cowd/config.yaml:
+platforms:
+  - platformType: wechat_ilink
+    enabled: true
+    bot_id: "xxx"
+    bot_secret: "xxx"
+
+# 启动服务
+cowd serve --port 8642
+```
+
+### Prompt 缓存
+
+所有模型的 Prompt 缓存自动生效（SHA-256 确定性 hash，无随机缓存头）。
+缓存文件存储在 `~/.cowd/prompt-cache/{session_id}/`。
+
+### 权限模式
+
+```bash
+cowd --permission-mode read-only        # 只读模式
+cowd --permission-mode workspace-write  # 工作区可写（默认）
+cowd --solo                             # 完全访问
+```
+
+### 日志
+
+```bash
+RUST_LOG=debug cowd --solo
+tail -f ~/.cowd/logs/cowd.$(date +%Y-%m-%d)
+```
+
+### 架构文档
+
+完整架构设计见 README 前半部分。模块详细文档在 `crates/*/README.md`。
 
 ---
 
