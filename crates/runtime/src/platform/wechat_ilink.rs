@@ -596,8 +596,99 @@ impl PlatformAdapter for WeChatLinkAdapter {
     // Unimplemented methods (same pattern as FeishuAdapter)
     // ------------------------------------------------------------------
 
-    async fn send_image(&self, _chat_id: &str, _image_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
-        Err(PlatformError::NotImplemented("send_image".into()))
+    async fn send_image(&self, chat_id: &str, image_url: &str, caption: Option<&str>) -> PlatformResult<()> {
+        let token = self.ensure_token().await?;
+        let client = reqwest::Client::new();
+
+        // 1. Download the image
+        let image_bytes = client
+            .get(image_url)
+            .send()
+            .await
+            .map_err(|e| PlatformError::SendFailed(format!("download image: {e}")))?
+            .bytes()
+            .await
+            .map_err(|e| PlatformError::SendFailed(format!("read image bytes: {e}")))?;
+
+        // 2. Get upload URL from iLink and upload the image
+        let upload_url = self.get_upload_url("image").await?;
+
+        let upload_resp = client
+            .post(&upload_url)
+            .body(image_bytes.to_vec())
+            .send()
+            .await
+            .map_err(|e| PlatformError::SendFailed(format!("upload image: {e}")))?;
+
+        let upload_json: serde_json::Value = upload_resp
+            .json()
+            .await
+            .map_err(|e| PlatformError::SendFailed(format!("parse upload response: {e}")))?;
+
+        let image_key = upload_json["image_key"]
+            .as_str()
+            .or_else(|| upload_json["media_id"].as_str())
+            .ok_or_else(|| PlatformError::SendFailed("no image_key in upload response".into()))?;
+
+        // 3. Send image message via iLink
+        let url = format!("{}/ilink/bot/sendmessage", self.config.base_url);
+
+        let mut payload = serde_json::json!({
+            "token": token,
+            "touser": chat_id,
+            "msgtype": "image",
+            "image": {
+                "media_id": image_key,
+            },
+        });
+
+        if let Some(cap) = caption {
+            payload["image"]["caption"] = serde_json::Value::String(cap.to_string());
+        }
+
+        let response = client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| PlatformError::SendFailed(format!("send image: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(PlatformError::SendFailed(format!(
+                "send_image failed {}: {}",
+                status, body
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct SendResponse {
+            #[serde(default)]
+            code: i32,
+            #[serde(default)]
+            msg: String,
+            message_id: Option<String>,
+        }
+
+        let send_resp: SendResponse = response
+            .json()
+            .await
+            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+
+        if send_resp.code != 0 {
+            return Err(PlatformError::SendFailed(format!(
+                "send_image failed (code={}): {}",
+                send_resp.code, send_resp.msg
+            )));
+        }
+
+        tracing::debug!(
+            to = %chat_id,
+            msg_id = %send_resp.message_id.unwrap_or_default(),
+            "ilink image message sent"
+        );
+        Ok(())
     }
 
     async fn send_image_file(&self, _chat_id: &str, _image_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
@@ -971,7 +1062,6 @@ mod tests {
             .unwrap();
 
         rt.block_on(async {
-            assert!(adapter.send_image("c", "u", None).await.is_err());
             assert!(adapter.send_image_file("c", "p", None).await.is_err());
             assert!(adapter.send_voice("c", "p", None).await.is_err());
             assert!(adapter.send_document("c", "f", None, None).await.is_err());
