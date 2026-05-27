@@ -578,4 +578,76 @@ mod tests {
             assert!(seen.insert(a), "action '{}' appeared more than once", a);
         }
     }
+
+    // ------------------------------------------------------------------
+    // TDD tests (from spec)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_approval_card_build_has_correct_structure() {
+        let card = ApprovalCard::new(1, "rm -rf /");
+        let json = card.build();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["config"]["wide_screen_mode"], true);
+        assert_eq!(
+            v["header"]["title"]["content"],
+            "⚠️ Command Approval Required"
+        );
+        assert_eq!(v["header"]["template"], "orange");
+        let actions = &v["elements"][1]["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 4);
+        assert_eq!(actions[0]["text"]["content"], "✅ Allow Once");
+        assert_eq!(actions[0]["type"], "primary");
+        assert_eq!(actions[3]["text"]["content"], "❌ Deny");
+        assert_eq!(actions[3]["type"], "danger");
+    }
+
+    #[test]
+    fn test_approval_card_resolved_approved() {
+        let json = ApprovalCard::build_resolved("approve_once", "testuser");
+        assert!(json.contains("✅"));
+        assert!(json.contains("testuser"));
+        assert!(json.contains("Approved"));
+    }
+
+    #[test]
+    fn test_approval_card_resolved_denied() {
+        let json = ApprovalCard::build_resolved("deny", "testuser");
+        assert!(json.contains("❌"));
+        assert!(json.contains("Denied"));
+    }
+
+    // ------------------------------------------------------------------
+    // Card callback parsing tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_card_action_callback_parsing() {
+        let callback = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {"hermes_action": "approve_once", "approval_id": 42}
+            }
+        });
+
+        let action = callback.get("action").unwrap();
+        let value = action.get("value").unwrap();
+        assert_eq!(value["hermes_action"], "approve_once");
+        assert_eq!(value["approval_id"], 42);
+    }
+
+    #[test]
+    fn test_parse_hermes_action_deny() {
+        let callback = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {"hermes_action": "deny", "approval_id": 99}
+            }
+        });
+
+        let action = callback.get("action").unwrap();
+        let value = action.get("value").unwrap();
+        assert_eq!(value["hermes_action"], "deny");
+        assert_eq!(value["approval_id"], 99);
+    }
 }

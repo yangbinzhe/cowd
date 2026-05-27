@@ -78,25 +78,55 @@ impl CardActionHandler {
 
         let session_key = SessionKey::with_thread("feishu", operator_open_id, chat_id);
 
+        let mut metadata = serde_json::json!({
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "operator_open_id": operator_open_id,
+            "action_tag": tag,
+            "action_value": value,
+        });
+        if let Some(ha) = value.get("hermes_action").and_then(|v| v.as_str()) {
+            metadata["hermes_action"] = serde_json::Value::String(ha.to_string());
+        }
+        if let Some(aid) = value.get("approval_id") {
+            metadata["approval_id"] = aid.clone();
+        }
+
         Some(InboundMessage {
             platform: Platform::Feishu,
             session_key,
             text,
             sender_name: None,
             timestamp: Utc::now(),
-            metadata: serde_json::json!({
-                "message_id": message_id,
-                "chat_id": chat_id,
-                "operator_open_id": operator_open_id,
-                "action_tag": tag,
-                "action_value": value,
-            }),
+            metadata,
             message_type: MessageType::Command,
             message_id: Some(message_id.to_string()),
             reply_to_message_id: None,
             media_urls: vec![],
             media_types: vec![],
         })
+    }
+
+    pub fn extract_hermes_action(event: &serde_json::Value) -> Option<String> {
+        event
+            .get("action")
+            .and_then(|a| a.get("value"))
+            .and_then(|v| v.get("hermes_action"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    pub fn extract_approval_id(event: &serde_json::Value) -> Option<u64> {
+        event
+            .get("action")
+            .and_then(|a| a.get("value"))
+            .and_then(|v| v.get("approval_id"))
+            .and_then(|v| v.as_u64())
+    }
+
+    pub fn is_approval_card_action(event: &serde_json::Value) -> bool {
+        Self::extract_hermes_action(event).is_some()
+            && Self::extract_approval_id(event).is_some()
     }
 
     /// Check whether a card action token is a duplicate.
@@ -324,5 +354,88 @@ mod tests {
         );
         assert!(!map.contains_key("exp_a"), "expired token should be pruned");
         assert!(!map.contains_key("exp_b"), "expired token should be pruned");
+    }
+
+    // ------------------------------------------------------------------
+    // Approval card action extraction tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_hermes_action_approve_once() {
+        let event = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {"hermes_action": "approve_once", "approval_id": 42}
+            }
+        });
+        assert_eq!(
+            CardActionHandler::extract_hermes_action(&event),
+            Some("approve_once".to_string())
+        );
+        assert_eq!(CardActionHandler::extract_approval_id(&event), Some(42));
+        assert!(CardActionHandler::is_approval_card_action(&event));
+    }
+
+    #[test]
+    fn test_extract_hermes_action_deny() {
+        let event = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {"hermes_action": "deny", "approval_id": 99}
+            }
+        });
+        assert_eq!(
+            CardActionHandler::extract_hermes_action(&event),
+            Some("deny".to_string())
+        );
+        assert_eq!(CardActionHandler::extract_approval_id(&event), Some(99));
+        assert!(CardActionHandler::is_approval_card_action(&event));
+    }
+
+    #[test]
+    fn test_extract_hermes_action_non_approval_card() {
+        let event = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {"action": "other"}
+            }
+        });
+        assert_eq!(CardActionHandler::extract_hermes_action(&event), None);
+        assert_eq!(CardActionHandler::extract_approval_id(&event), None);
+        assert!(!CardActionHandler::is_approval_card_action(&event));
+    }
+
+    #[test]
+    fn test_extract_hermes_action_missing_fields() {
+        let event = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {"hermes_action": "approve_once"}
+            }
+        });
+        assert!(CardActionHandler::extract_hermes_action(&event).is_some());
+        assert_eq!(CardActionHandler::extract_approval_id(&event), None);
+        assert!(!CardActionHandler::is_approval_card_action(&event));
+    }
+
+    #[test]
+    fn test_handle_card_action_includes_hermes_metadata() {
+        let event = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {"hermes_action": "approve_always", "approval_id": 7}
+            },
+            "open_id": "ou_user",
+            "open_message_id": "om_msg",
+            "open_chat_id": "oc_chat"
+        });
+
+        let msg = CardActionHandler::handle_card_action(
+            &event, "om_msg", "oc_chat", "ou_user",
+        )
+        .unwrap();
+
+        assert_eq!(msg.metadata["hermes_action"], "approve_always");
+        assert_eq!(msg.metadata["approval_id"], 7);
     }
 }

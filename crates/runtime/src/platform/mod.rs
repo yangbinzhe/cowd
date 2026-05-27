@@ -32,7 +32,6 @@ pub mod config;
 pub mod dedup;
 pub mod feishu;
 pub mod email;
-pub mod wecom;
 pub mod wechat_ilink;
 pub mod runtime;
 pub mod types;
@@ -45,5 +44,4 @@ pub use types::{SessionKey, PlatformSession};
 
 pub use feishu::FeishuAdapter;
 pub use email::EmailAdapter;
-pub use wecom::WeComAdapter;
 pub use wechat_ilink::{WeChatLinkAdapter, WeChatLinkConfig};

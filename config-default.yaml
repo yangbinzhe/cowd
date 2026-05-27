@@ -362,15 +362,6 @@ gateway:
     #   bot_secret: ""                      # Bot Secret
     #   base_url: "https://ilinkai.weixin.qq.com"  # iLink API 基础 URL
 
-    # ── 企业微信机器人（WeCom）─────────────────────────────────────────────
-    # - platformType: wecom
-    #   enabled: false
-    #   corp_id: ""                          # 企业微信 Corp ID
-    #   corp_secret: ""                      # Corp Secret
-    #   agent_id: ""                         # Agent ID
-    #   token: ""                            # 回调验证 Token
-    #   encoding_aes_key: ""                 # 回调加密 AES Key
-
     # 邮箱
     # - platformType: email
     #   enabled: false

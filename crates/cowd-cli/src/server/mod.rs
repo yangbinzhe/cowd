@@ -432,26 +432,6 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
                     }
                 }
             }
-            "wecom" | "wechat_work" => {
-                match runtime::platform::wecom::create_wecom_adapter(&settings_json) {
-                    Ok(mut adapter) => {
-                        tracing::info!(
-                            "wecom adapter created for corp_id={}",
-                            pc.settings
-                                .get("corp_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?")
-                        );
-                        match adapter.connect().await {
-                            Ok(()) => tracing::info!("wecom adapter connected"),
-                            Err(e) => tracing::error!("wecom adapter connect failed: {e}"),
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("failed to create wecom adapter: {e}");
-                    }
-                }
-            }
             "wechat_ilink" | "wechat" => {
                 match runtime::platform::wechat_ilink::create_wechat_ilink_adapter(&settings_json) {
                     Ok(mut adapter) => {
