@@ -25,24 +25,6 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
     Ok(buffer[..bytes_read].contains(&0))
 }
 
-/// Validate that a resolved path stays within the given workspace root.
-/// Returns the canonical path on success, or an error if the path escapes
-/// the workspace boundary (e.g. via `../` traversal or symlink).
-#[allow(dead_code)]
-fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
-    if !resolved.starts_with(workspace_root) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "path {} escapes workspace boundary {}",
-                resolved.display(),
-                workspace_root.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Text payload returned by file-reading operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TextFilePayload {
@@ -575,67 +557,13 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     Ok(candidate)
 }
 
-/// Read a file with workspace boundary enforcement.
-#[allow(dead_code)]
-pub fn read_file_in_workspace(
-    path: &str,
-    offset: Option<usize>,
-    limit: Option<usize>,
-    workspace_root: &Path,
-) -> io::Result<ReadFileOutput> {
-    let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    read_file(path, offset, limit)
-}
 
-/// Write a file with workspace boundary enforcement.
-#[allow(dead_code)]
-pub fn write_file_in_workspace(
-    path: &str,
-    content: &str,
-    workspace_root: &Path,
-) -> io::Result<WriteFileOutput> {
-    let absolute_path = normalize_path_allow_missing(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    write_file(path, content)
-}
 
-/// Edit a file with workspace boundary enforcement.
-#[allow(dead_code)]
-pub fn edit_file_in_workspace(
-    path: &str,
-    old_string: &str,
-    new_string: &str,
-    replace_all: bool,
-    workspace_root: &Path,
-) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    edit_file(path, old_string, new_string, replace_all)
-}
 
-/// Check whether a path is a symlink that resolves outside the workspace.
-#[allow(dead_code)]
-pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_symlink() {
-        return Ok(false);
-    }
-    let resolved = path.canonicalize()?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    Ok(!resolved.starts_with(&canonical_root))
-}
+
+
+
+
 
 /// Expand shell-style brace groups in a glob pattern.
 ///
@@ -664,8 +592,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        edit_file, expand_braces, glob_search, grep_search, is_symlink_escape, read_file,
-        read_file_in_workspace, write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        edit_file, expand_braces, glob_search, grep_search, read_file,
+        write_file, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -718,51 +646,6 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("too large"));
-    }
-
-    #[test]
-    fn enforces_workspace_boundary() {
-        let workspace = temp_path("workspace-boundary");
-        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
-        let inside = workspace.join("inside.txt");
-        write_file(inside.to_string_lossy().as_ref(), "safe content")
-            .expect("write inside workspace should succeed");
-
-        // Reading inside workspace should succeed
-        let result =
-            read_file_in_workspace(inside.to_string_lossy().as_ref(), None, None, &workspace);
-        assert!(result.is_ok());
-
-        // Reading outside workspace should fail
-        let outside = temp_path("outside-boundary.txt");
-        write_file(outside.to_string_lossy().as_ref(), "unsafe content")
-            .expect("write outside should succeed");
-        let result =
-            read_file_in_workspace(outside.to_string_lossy().as_ref(), None, None, &workspace);
-        assert!(result.is_err());
-        let error = result.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("escapes workspace"));
-    }
-
-    #[test]
-    fn detects_symlink_escape() {
-        let workspace = temp_path("symlink-workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
-        let outside = temp_path("symlink-target.txt");
-        std::fs::write(&outside, "target content").expect("target should write");
-
-        let link_path = workspace.join("escape-link.txt");
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&outside, &link_path).expect("symlink should create");
-            assert!(is_symlink_escape(&link_path, &workspace).expect("check should succeed"));
-        }
-
-        // Non-symlink file should not be an escape
-        let normal = workspace.join("normal.txt");
-        std::fs::write(&normal, "normal content").expect("normal file should write");
-        assert!(!is_symlink_escape(&normal, &workspace).expect("check should succeed"));
     }
 
     #[test]

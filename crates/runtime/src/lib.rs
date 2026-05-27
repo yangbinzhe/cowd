@@ -58,7 +58,7 @@ pub mod sandbox;
 mod session;
 pub use session::workspace_sessions_dir;
 #[allow(deprecated)]
-mod session_control;
+pub mod session_control;
 #[allow(deprecated)]
 pub use session_control::SessionStore;
 mod sse;
