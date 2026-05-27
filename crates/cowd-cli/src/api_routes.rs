@@ -2,19 +2,24 @@
 // Core session management routes shared between TUI and HTTP API.
 // DO NOT delete old server/mod.rs yet (T16 will do that).
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, convert::Infallible, sync::Arc};
 
 use axum::{
     extract::{Path, Query, State as AxumState},
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, sse::{Event, KeepAlive, Sse}},
     routing::{get, post},
     Router,
 };
+use futures::stream::Stream;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use tools::GlobalToolRegistry;
 
+use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use memory::cognitive::CognitiveContextManager;
 
@@ -25,6 +30,7 @@ pub struct AppState {
     pub memory_manager: Option<Arc<CognitiveContextManager>>,
     pub tool_registry: Arc<GlobalToolRegistry>,
     pub config: Option<serde_json::Value>,
+    pub event_bus: Arc<SessionEventBus>,
 }
 
 // ── Router ─────────────────────────────────────────────────────
@@ -35,6 +41,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session).delete(delete_session))
         .route("/api/sessions/:id/messages", post(send_message))
+        .route("/api/sessions/:id/stream", get(sse_stream_handler))
         .route("/api/memory", get(memory_handler))
         .route("/api/memory/search", get(memory_search_handler))
         .route("/api/tools", get(tools_handler))
@@ -260,4 +267,20 @@ async fn config_handler(
             "version": env!("CARGO_PKG_VERSION"),
         })),
     }
+}
+
+// ── SSE stream handler ──────────────────────────────────────────
+
+async fn sse_stream_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    state.event_bus.subscribe(&session_id, tx).await;
+    let stream = UnboundedReceiverStream::new(rx).map(|s| Ok(Event::default().data(s)));
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
