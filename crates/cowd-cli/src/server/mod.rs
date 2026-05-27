@@ -404,27 +404,84 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
     tracing::info!(port = config.port, host = %config.host, "server started");
     println!("Cowd gateway HTTP listening on {} (PID: {})", addr, pid);
 
-    // Create and connect Feishu adapters from platform configs
+    // Create and connect platform adapters
     for pc in &config.platform_configs {
-        if pc.platform_type == "feishu" && pc.enabled {
-            let settings_json = serde_json::to_value(&pc.settings).unwrap_or_default();
-            match runtime::platform::feishu::create_feishu_adapter(&settings_json) {
-                Ok(mut adapter) => {
-                    tracing::info!(
-                        "feishu adapter created for app_id={}",
-                        pc.settings
-                            .get("app_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?")
-                    );
-                    match adapter.connect().await {
-                        Ok(()) => tracing::info!("feishu adapter connected"),
-                        Err(e) => tracing::error!("feishu adapter connect failed: {e}"),
+        if !pc.enabled {
+            continue;
+        }
+        let settings_json = serde_json::to_value(&pc.settings).unwrap_or_default();
+
+        match pc.platform_type.as_str() {
+            "feishu" | "lark" => {
+                match runtime::platform::feishu::create_feishu_adapter(&settings_json) {
+                    Ok(mut adapter) => {
+                        tracing::info!(
+                            "feishu adapter created for app_id={}",
+                            pc.settings
+                                .get("app_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                        );
+                        match adapter.connect().await {
+                            Ok(()) => tracing::info!("feishu adapter connected"),
+                            Err(e) => tracing::error!("feishu adapter connect failed: {e}"),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to create feishu adapter: {e}");
                     }
                 }
-                Err(e) => {
-                    tracing::error!("failed to create feishu adapter: {e}");
+            }
+            "wecom" | "wechat_work" => {
+                match runtime::platform::wecom::create_wecom_adapter(&settings_json) {
+                    Ok(mut adapter) => {
+                        tracing::info!(
+                            "wecom adapter created for corp_id={}",
+                            pc.settings
+                                .get("corp_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                        );
+                        match adapter.connect().await {
+                            Ok(()) => tracing::info!("wecom adapter connected"),
+                            Err(e) => tracing::error!("wecom adapter connect failed: {e}"),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to create wecom adapter: {e}");
+                    }
                 }
+            }
+            "wechat_ilink" | "wechat" => {
+                match runtime::platform::wechat_ilink::create_wechat_ilink_adapter(&settings_json) {
+                    Ok(mut adapter) => {
+                        tracing::info!("wechat_ilink adapter created");
+                        match adapter.connect().await {
+                            Ok(()) => tracing::info!("wechat_ilink adapter connected"),
+                            Err(e) => tracing::error!("wechat_ilink adapter connect failed: {e}"),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to create wechat_ilink adapter: {e}");
+                    }
+                }
+            }
+            "email" | "mail" => {
+                match runtime::platform::email::create_email_adapter(&settings_json) {
+                    Ok(mut adapter) => {
+                        tracing::info!("email adapter created");
+                        match adapter.connect().await {
+                            Ok(()) => tracing::info!("email adapter connected"),
+                            Err(e) => tracing::error!("email adapter connect failed: {e}"),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to create email adapter: {e}");
+                    }
+                }
+            }
+            other => {
+                tracing::warn!("unknown platform type: {other}");
             }
         }
     }

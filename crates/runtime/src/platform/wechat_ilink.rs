@@ -736,6 +736,27 @@ impl PlatformAdapter for WeChatLinkAdapter {
     }
 }
 
+/// Create a WeChat iLink adapter from config settings.
+pub fn create_wechat_ilink_adapter(settings: &serde_json::Value) -> PlatformResult<WeChatLinkAdapter> {
+    let bot_id = settings
+        .get("bot_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PlatformError::ConfigError("missing bot_id".to_string()))?;
+
+    let bot_secret = settings
+        .get("bot_secret")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PlatformError::ConfigError("missing bot_secret".to_string()))?;
+
+    let base_url = settings
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or(ILINK_BASE_URL);
+
+    let config = WeChatLinkConfig::new(bot_id, bot_secret).with_base_url(base_url);
+    Ok(WeChatLinkAdapter::new(config))
+}
+
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------

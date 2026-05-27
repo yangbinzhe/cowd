@@ -24,7 +24,6 @@ pub mod question_form;
 pub mod toast;
 pub mod skills_panel;
 pub mod todo_panel;
-pub mod session_events;
 
 #[cfg(test)]
 mod base_test;
