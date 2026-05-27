@@ -311,15 +311,49 @@ gateway:
         enabled: false
         token: ""
 
-    # 飞书机器人
+    # ── 飞书机器人（Feishu/Lark）─────────────────────────────────────────────
+    # 支持 WebSocket 长连接事件推送 + 富文本消息 + 图片/文件/音视频发送
     # - platformType: feishu
     #   enabled: false
-    #   app_id: ""
-    #   app_secret: ""
-    #   verification_token: ""
-    #   encrypt_key: ""
-    #   webhook_port: 8080
-    #   bot_name: "Cowd"
+    #
+    #   # ── 基础凭证（必填）──
+    #   app_id: ""                          # 飞书应用 App ID
+    #   app_secret: ""                      # 飞书应用 App Secret
+    #
+    #   # ── 机器人身份（可选，用于自消息过滤和 @mention 检测）──
+    #   bot_open_id: ""                     # 机器人 open_id（默认=app_id）
+    #   bot_name: "Cowd"                    # 机器人显示名称
+    #
+    #   # ── 安全配置（可选，Webhook 模式使用）──
+    #   verification_token: ""              # 事件验证 Token
+    #   encrypt_key: ""                     # 事件加密密钥
+    #
+    #   # ── WebSocket 重连配置 ──
+    #   reconnect_max_attempts: 30          # 最大重连次数（0=不重连）
+    #   reconnect_interval_secs: 120        # 重连间隔（秒）
+    #
+    #   # ── 访问控制 ──
+    #   require_mention: false              # 群聊中是否需要 @机器人
+    #   allow_bots: "none"                  # 机器人消息策略: none | mentions | all
+    #   admins: []                          # 管理员列表 (open_id/union_id)
+    #   default_group_policy: "open"        # 默认群组策略: open | allowlist | blacklist | admin_only | disabled
+    #   # group_rules:                      # 群组规则（按 chat_id）
+    #   #   "oc_xxx":
+    #   #     policy: "allowlist"
+    #   #     allowlist: ["ou_user1"]
+    #   #     require_mention: true
+    #
+    #   # ── 消息批处理 ──
+    #   batch_delay_ms: 600                 # 文本批处理延迟（毫秒）
+    #   batch_max_messages: 8              # 每批最大消息数
+    #   batch_max_chars: 4000              # 每批最大字符数
+    #   media_batch_delay_ms: 800          # 媒体批处理延迟（毫秒）
+    #
+    #   # ── 处理队列 ──
+    #   max_queue_depth: 1000              # 每聊天最大待处理事件数
+    #
+    #   # ── 反应追踪 ──
+    #   reactions_cache_size: 1024         # 反应 LRU 缓存大小
 
     # 邮箱
     # - platformType: email

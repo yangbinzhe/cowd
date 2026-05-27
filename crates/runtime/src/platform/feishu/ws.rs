@@ -446,7 +446,9 @@ async fn ws_read_loop(
                 tracing::debug!("Feishu WS: received unexpected WebSocket ping");
                 continue;
             }
-            Some(Ok(Message::Pong(_))) => continue,
+            Some(Ok(Message::Pong(_))) => {
+                continue;
+            }
             // ── Connection close ────────────────────────────────────
             Some(Ok(Message::Close(_))) | None => {
                 tracing::info!("Feishu WS: connection closed by server");

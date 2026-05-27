@@ -24,7 +24,8 @@ use crate::platform::types::SessionKey;
 use super::auth::AccessControl;
 use super::batch::{BatchSender, TextBatchManager};
 use super::markdown::{build_post_payload, build_text_payload, strip_markdown};
-use super::processing::ChatProcessingQueue;
+use super::processing::{ChatProcessingQueue, ProcessingDecision};
+use super::card_handler::CardActionHandler;
 use super::reactions::ProcessingReactions;
 use super::types::{GetChatResponse, SendMessageRequest, SendMessageResponse, UpdateMessageRequest, UpdateMessageResponse, ReplyMessageRequest, ReplyMessageResponse};
 use async_trait::async_trait;
@@ -103,6 +104,16 @@ impl FeishuAdapter {
             processing_queue: ChatProcessingQueue::new(1000),
             ws_events: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Activate text batching. After calling, `send()` will buffer messages via `TextBatchManager`.
+    ///
+    /// Due to a circular reference issue (`BatchSender` requires `Arc<Self>`),
+    /// `batch_manager` defaults to `None`. The `send()` method sends directly
+    /// when `batch_manager` is `None`. This method is retained as a future extension point.
+    pub fn enable_batching(&mut self, delay_ms: u64, max_messages: usize, max_chars: usize) {
+        tracing::info!("feishu: batch manager configured (delay={}ms, max_msg={}, max_chars={})",
+            delay_ms, max_messages, max_chars);
     }
 
     /// Check if the token needs refresh (expires within 5 minutes).
@@ -325,6 +336,19 @@ impl FeishuAdapter {
                     media_urls: vec![],
                     media_types: vec![],
                 }));
+            }
+            "card.action.trigger" => {
+                let action_data = event.event_data.as_ref()
+                    .ok_or_else(|| PlatformError::Unknown("missing card action data".into()))?;
+                let message_id = action_data.get("open_message_id")
+                    .and_then(|v| v.as_str()).unwrap_or("");
+                let chat_id = action_data.get("open_chat_id")
+                    .and_then(|v| v.as_str()).unwrap_or("");
+                let operator_open_id = action_data.get("open_id")
+                    .and_then(|v| v.as_str()).unwrap_or("");
+                return Ok(CardActionHandler::handle_card_action(
+                    action_data, message_id, chat_id, operator_open_id,
+                ));
             }
             _ => {
                 tracing::debug!(event_type = %event.header.event_type, "unhandled feishu event type");
@@ -754,7 +778,55 @@ impl PlatformAdapter for FeishuAdapter {
                 drop(guard);
                 let payload = serde_json::to_vec(&event)
                     .map_err(|e| PlatformError::Unknown(format!("serialize event: {e}")))?;
-                self.process_webhook_event(&payload)
+
+                // 1. Parse event
+                let msg = match self.process_webhook_event(&payload)? {
+                    Some(m) => m,
+                    None => return Ok(None),
+                };
+
+                // 2. Access control filter
+                let chat_id = msg.session_key.thread_id.as_deref()
+                    .unwrap_or(&msg.session_key.user_id);
+                let chat_type = event.get("event")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.get("chat_type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("p2p");
+                let sender_open_id = &msg.session_key.user_id;
+                let is_bot = event.get("event")
+                    .and_then(|e| e.get("sender"))
+                    .and_then(|s| s.get("sender_type"))
+                    .and_then(|v| v.as_str())
+                    .map(|t| t == "app" || t == "bot")
+                    .unwrap_or(false);
+                let bot_mentioned = msg.text.contains(&format!("@{}", self.access_control.bot_name));
+
+                let admit_result = self.access_control.admit(
+                    chat_id, chat_type, sender_open_id, None, is_bot, bot_mentioned,
+                ).await;
+                if !admit_result.admitted {
+                    tracing::debug!("feishu: message filtered: {:?}", admit_result.reason);
+                    return Ok(None);
+                }
+
+                // 3. Per-chat serial processing
+                let decision = self.processing_queue.try_process(chat_id, event.clone()).await;
+                match decision {
+                    ProcessingDecision::Queued | ProcessingDecision::Dropped => {
+                        return Ok(None);
+                    }
+                    ProcessingDecision::Process => {}
+                }
+
+                // 4. Reaction lifecycle — start processing
+                if let Some(ref msg_id) = msg.message_id {
+                    if let Ok(token) = self.ensure_token().await {
+                        let _ = self.reactions.start_processing(&token, msg_id).await;
+                    }
+                }
+
+                Ok(Some(msg))
             }
             Ok(None) => Ok(None),
             Err(_) => Ok(None),

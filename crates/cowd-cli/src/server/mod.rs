@@ -15,6 +15,7 @@ use tokio::net::TcpListener as TokioTcpListener;
 use tower_http::cors::CorsLayer;
 
 use memory::{cognitive::CognitiveContextManager, MemoryConfig};
+use runtime::platform::PlatformAdapter;
 use runtime::platform::PlatformConfig;
 use runtime::{ApprovalConfig, ConfigLoader, SessionResetPolicy};
 use tools::GlobalToolRegistry;
@@ -402,6 +403,31 @@ pub async fn start_http_server(config: HttpConfig) -> Result<(), Box<dyn std::er
 
     tracing::info!(port = config.port, host = %config.host, "server started");
     println!("Cowd gateway HTTP listening on {} (PID: {})", addr, pid);
+
+    // Create and connect Feishu adapters from platform configs
+    for pc in &config.platform_configs {
+        if pc.platform_type == "feishu" && pc.enabled {
+            let settings_json = serde_json::to_value(&pc.settings).unwrap_or_default();
+            match runtime::platform::feishu::create_feishu_adapter(&settings_json) {
+                Ok(mut adapter) => {
+                    tracing::info!(
+                        "feishu adapter created for app_id={}",
+                        pc.settings
+                            .get("app_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                    );
+                    match adapter.connect().await {
+                        Ok(()) => tracing::info!("feishu adapter connected"),
+                        Err(e) => tracing::error!("feishu adapter connect failed: {e}"),
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("failed to create feishu adapter: {e}");
+                }
+            }
+        }
+    }
 
     axum::serve(listener, app)
         .await

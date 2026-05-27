@@ -59,7 +59,67 @@ pub fn create_feishu_adapter(settings: &serde_json::Value) -> PlatformResult<Fei
         config = config.with_bot_name(bot_name);
     }
 
-    Ok(FeishuAdapter::new(config))
+    let mut adapter = FeishuAdapter::new(config);
+
+    // ── Access control ──────────────────────────────────────────
+
+    let require_mention = settings
+        .get("require_mention")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let allow_bots = settings
+        .get("allow_bots")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none");
+
+    let admins: std::collections::HashSet<String> = settings
+        .get("admins")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let default_group_policy = settings
+        .get("default_group_policy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("open");
+
+    adapter.access_control.require_mention = require_mention;
+    adapter.access_control.allow_bots = match allow_bots {
+        "mentions" => AllowBots::Mentions,
+        "all" => AllowBots::All,
+        _ => AllowBots::None,
+    };
+    adapter.access_control.admins = admins;
+    adapter.access_control.default_group_policy = match default_group_policy {
+        "allowlist" => Policy::Allowlist,
+        "blacklist" => Policy::Blacklist,
+        "admin_only" => Policy::AdminOnly,
+        "disabled" => Policy::Disabled,
+        _ => Policy::Open,
+    };
+
+    // ── Processing queue ────────────────────────────────────────
+
+    let max_queue_depth = settings
+        .get("max_queue_depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1000) as usize;
+
+    adapter.processing_queue = ChatProcessingQueue::new(max_queue_depth);
+
+    // ── Reactions cache (ProcessingReactions::new() uses default 1024; custom cache_size NYI) ──
+
+    let _reactions_cache_size = settings
+        .get("reactions_cache_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1024) as usize;
+
+    Ok(adapter)
 }
 
 #[cfg(test)]
