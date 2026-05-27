@@ -1,6 +1,7 @@
 # COWD — AI 编程智能体框架
 
-> **Rust 原生多智能体编程框架** | 273 源文件 · 173K 行 · 524 测试
+> **Rust 原生多智能体编程框架** | 当前版本 v0.7.4
+> 统一网关 · 全功能 TUI · API 完全对等 · Session SQLite 存储
 > 内存系统 · 代码智能 · 权限管控 · MCP 协议 · 多平台接入
 
 ---
@@ -194,8 +195,40 @@ cowd 不只是一个 TUI 工具。它可以嵌入到：
 ```
   飞书消息 ──→ EventBus ──→ ConversationRuntime ──→ LLM → 回复飞书
   API请求  ──→ EventBus ──→ ConversationRuntime ──→ LLM → 回传API
-  CLI输入  ──→ EventBus ──→ ConversationRuntime ──→ LLM → TUI渲染
+   CLI输入  ──→ EventBus ──→ ConversationRuntime ──→ LLM → TUI渲染
 ```
+
+### 6. 统一网关 (Gateway) — 单进程双前端
+
+v0.7.0 后，TUI 和 API Server 统一为**单一网关守护进程**，共享同一个 SHARED_RT runtime：
+
+```
+┌─────────────────────────────────────────────────┐
+│           cowd gateway (单进程)                   │
+│                                                  │
+│  SHARED_RT (4 workers)                           │
+│  ┌────────────────────────────────────────────┐  │
+│  │           共享后端 (Arc 单例)                │  │
+│  │  ├ UnifiedSessionStore (SQLite)             │  │
+│  │  ├ ActiveSessions (多 Session 并发)         │  │
+│  │  ├ CognitiveContextManager (统一记忆)        │  │
+│  │  ├ GlobalToolRegistry (53+ 工具)            │  │
+│  │  └ RuntimeConfig (实时配置读写)              │  │
+│  └────────────────────────────────────────────┘  │
+│         │                         │               │
+│  ┌──────▼──────┐          ┌───────▼───────┐      │
+│  │  TUI 前端    │          │  HTTP API 前端  │      │
+│  │  (控制台)    │          │  (REST + WS)    │      │
+│  │  10/10 面板  │          │  完全能力对等    │      │
+│  └─────────────┘          └───────────────┘      │
+└─────────────────────────────────────────────────┘
+```
+
+关键特性：
+- **Session SQLite 统一**：TUI 和 API 共享同一个 `~/.cowd/sessions.db`
+- **API 完全对等**：`/api/memory` `/api/tools` `/api/config` 全部连接实际后端
+- **多 Session 并发**：ActiveSessions 管理多个独立 ConversationRuntime
+- **安装部署**：`cowd install` → `~/.cowd/bin/cowd` + systemd 服务注册
 
 ---
 
@@ -214,8 +247,8 @@ cowd 不只是一个 TUI 工具。它可以嵌入到：
 | SubAgent | 85% | 受限执行，WriteGuard，Token 预算 |
 | MCP 工具协议 | 90% | Stdio/SSE/Remote，生命周期管理 |
 | 权限系统 | 90% | 3 种模式，Gate 集成 |
-| 平台适配 | 70% | API Server 完善，飞书/企微/邮件可用 |
-| TUI | 85% | 19 组件，主题引擎，无障碍 |
+| 平台适配 | 85% | API 完全对等 (记忆/工具/配置)，Gateway 守护进程 |
+| TUI | 95% | 10/10 侧边栏面板全功能，ChatView 对话渲染，快捷键提示 |
 | 性能 | 80% | OnceLock 加速，1K/10K/20K 基准测试 |
 
 ### 存在的薄弱环节
@@ -339,20 +372,26 @@ cowd 不只是一个 TUI 工具。它可以嵌入到：
 # 编译
 cargo build --release
 
-# TUI 终端模式（默认）
-cowd
+# TUI 终端模式（默认，全功能控制台）
+cowd --solo
 
-# 单次问答
-cowd prompt "解释这个项目"
+# API 网关服务（前台运行）
+cowd gateway run
 
-# 指定模型
-cowd --model deepseek-v4-pro "写一个排序函数"
+# 网关后台管理
+cowd gateway start     # 后台启动
+cowd gateway stop      # 停止
+cowd gateway status    # 查看状态
 
-# 启动 Web 服务
-cowd serve --port 8080
+# 单次 API 服务
+cowd serve --port 8080 --no-auth
 
-# 续接会话
-cowd --resume latest
+# 安装到 ~/.cowd/bin/ + systemd 注册
+cowd install --systemd
+
+# Session 管理
+cowd migrate-sessions   # JSONL → SQLite 迁移
+cowd --resume latest    # 续接最近会话
 ```
 
 ---
@@ -360,9 +399,19 @@ cowd --resume latest
 ## 开发
 
 ```bash
-cargo test -p cowd-memory  # 524 tests
+cargo test -p cowd-memory  # 456 tests
 cargo test --workspace     # 1000+ tests
-cargo build --release      # → target/release/cowd (~28MB)
+cargo build --release      # → target/release/cowd (~32MB)
+```
+
+## 日志
+
+```bash
+# 调试模式（完整日志到终端 + 文件）
+RUST_LOG=debug cowd --solo
+
+# 日志文件位置
+tail -f ~/.cowd/logs/cowd.$(date +%Y-%m-%d)
 ```
 
 ---
