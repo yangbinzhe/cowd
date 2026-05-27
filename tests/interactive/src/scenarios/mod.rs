@@ -5,6 +5,8 @@ mod tui_memory;
 mod tui_skills;
 mod server_core;
 mod server_mgmt;
+mod server_gateway_api;
+mod server_gateway_cmd;
 mod cross_cut;
 
 use crate::reporter::TestRunner;
@@ -32,6 +34,13 @@ pub fn list() {
         ("server_memory", "Memory search + config read"),
         ("server_workspace", "Workspace files + command execute"),
         ("server_platform", "Platform list + approval config"),
+        ("server_gateway_api", "Gateway API: memory, tools, config endpoints"),
+        ("server_gateway_memory", "Gateway API: /api/memory enabled + layers"),
+        ("server_gateway_tools", "Gateway API: /api/tools count + definitions"),
+        ("server_gateway_config", "Gateway API: /api/config response size"),
+        ("server_gateway_start", "Gateway CLI: start command"),
+        ("server_gateway_status", "Gateway CLI: status command"),
+        ("server_gateway_stop", "Gateway CLI: stop command"),
         ("cross_session_api", "TUI send → API read session"),
         ("cross_memory", "TUI trigger memory → API search"),
         ("cross_approval", "TUI approval → API pending"),
@@ -56,6 +65,8 @@ pub fn run_all(runner: &mut TestRunner, filter: Option<String>) -> anyhow::Resul
     run_mod!(tui_skills);
     run_mod!(server_core);
     run_mod!(server_mgmt);
+    run_mod!(server_gateway_api);
+    run_mod!(server_gateway_cmd);
     run_mod!(cross_cut);
     Ok(())
 }
