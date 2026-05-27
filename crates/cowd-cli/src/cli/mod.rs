@@ -14,15 +14,6 @@ pub fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     }
 }
 
-pub fn resolve_model_alias(model: &str) -> &str {
-    match model {
-        "opus" => "claude-opus-4-6",
-        "sonnet" => "claude-sonnet-4-6",
-        "haiku" => "claude-haiku-4-5-20251213",
-        _ => model,
-    }
-}
-
 pub fn permission_mode_from_label(mode: &str) -> runtime::PermissionMode {
     match mode {
         "read-only" => runtime::PermissionMode::ReadOnly,
@@ -37,14 +28,6 @@ pub fn permission_mode_from_resolved(mode: runtime::ResolvedPermissionMode) -> r
         runtime::ResolvedPermissionMode::ReadOnly => runtime::PermissionMode::ReadOnly,
         runtime::ResolvedPermissionMode::WorkspaceWrite => runtime::PermissionMode::WorkspaceWrite,
         runtime::ResolvedPermissionMode::DangerFullAccess => runtime::PermissionMode::DangerFullAccess,
-    }
-}
-
-pub fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
     }
 }
 
@@ -75,31 +58,11 @@ mod tests {
     }
 
     #[test]
-    fn model_alias_sonnet() {
-        assert_eq!(resolve_model_alias("sonnet"), "claude-sonnet-4-6");
-    }
-
-    #[test]
-    fn model_alias_unknown_passthrough() {
-        assert_eq!(resolve_model_alias("qwen-turbo"), "qwen-turbo");
-    }
-
-    #[test]
     fn permission_mode_label_read_only() {
         use runtime::PermissionMode;
         assert_eq!(
             permission_mode_from_label("read-only"),
             PermissionMode::ReadOnly
         );
-    }
-
-    #[test]
-    fn max_tokens_opus() {
-        assert_eq!(max_tokens_for_model("claude-opus-4-6"), 32_000);
-    }
-
-    #[test]
-    fn max_tokens_other() {
-        assert_eq!(max_tokens_for_model("claude-sonnet-4-6"), 64_000);
     }
 }

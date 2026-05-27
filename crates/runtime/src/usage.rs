@@ -55,8 +55,21 @@ impl UsageCostEstimate {
 }
 
 /// Returns pricing metadata for a known model alias or family.
+///
+/// Delegates to the global [`ModelRegistry`] loaded from `~/.cowd/models.yaml`.
+/// Falls back to heuristic matching for Claude models when the registry is
+/// unavailable or the model is not found.
 #[must_use]
 pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
+    // First, try the global model registry.
+    if let Some(pricing) = crate::model_registry::global_registry()
+        .pricing_for(model)
+        .map(|p| p.to_model_pricing())
+    {
+        return Some(pricing);
+    }
+
+    // Fallback: heuristic matching for Claude family (legacy).
     let normalized = model.to_ascii_lowercase();
     if normalized.contains("haiku") {
         return Some(ModelPricing {
@@ -255,10 +268,10 @@ mod tests {
         let cost = usage.estimate_cost_usd();
         assert_eq!(format_usd(cost.input_cost_usd), "$15.0000");
         assert_eq!(format_usd(cost.output_cost_usd), "$37.5000");
-        let lines = usage.summary_lines_for_model("usage", Some("claude-sonnet-4-20250514"));
-        assert!(lines[0].contains("estimated_cost=$54.6750"));
-        assert!(lines[0].contains("model=claude-sonnet-4-20250514"));
-        assert!(lines[1].contains("cache_read=$0.3000"));
+        let lines = usage.summary_lines_for_model("usage", Some("claude-sonnet-4-6"));
+        assert!(lines[0].contains("estimated_cost=$10.9350"));
+        assert!(lines[0].contains("model=claude-sonnet-4-6"));
+        assert!(lines[1].contains("cache_read=$0.0600"));
     }
 
     #[test]

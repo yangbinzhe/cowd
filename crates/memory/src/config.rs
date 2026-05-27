@@ -1,19 +1,274 @@
 //! Configuration structures for the memory system.
 //!
-//! Types migrated to the unified `config` crate (single source of truth):
-//!   BudgetConfig, DriftConfig, PerfBudget, ModelProfile, LlmSummarizerConfig
-//!
-//! Remaining memory-specific types (pending migration due to field differences):
-//!   MemoryConfig, StoreConfig, VectorConfig, CompressionConfig, ExtractorConfig
+//! All config types are now self-contained — the unified `config` crate
+//! has been removed and its types were inlined into their respective
+//! consumer crates.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-// ── Re-export from unified config crate ─────────────────────────────────
+// ── Inlined from former config crate ─────────────────────────────────────
 
-pub use config::{BudgetConfig, DriftConfig, PerfBudget, ModelProfile, LlmSummarizerConfig};
+/// Token budget configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    /// Total context window size
+    #[serde(default = "default_context_window")]
+    pub context_window: u64,
+    /// Reserved for system prompt
+    #[serde(default = "default_reserved_system")]
+    pub reserved_system: u64,
+    /// Reserved for response
+    #[serde(default = "default_reserved_response")]
+    pub reserved_response: u64,
+    /// Warning threshold (0.0-1.0)
+    #[serde(default = "default_warning_threshold")]
+    pub warning_threshold: f32,
+    /// Critical threshold (0.0-1.0)
+    #[serde(default = "default_critical_threshold")]
+    pub critical_threshold: f32,
+}
 
-// ── Memory-specific types (not yet migrated) ────────────────────────────
+fn default_context_window() -> u64 { 200_000 }
+fn default_reserved_system() -> u64 { 10_000 }
+fn default_reserved_response() -> u64 { 8_000 }
+fn default_warning_threshold() -> f32 { 0.70 }
+fn default_critical_threshold() -> f32 { 0.90 }
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            context_window: 200_000,
+            reserved_system: 10_000,
+            reserved_response: 8_000,
+            warning_threshold: 0.70,
+            critical_threshold: 0.90,
+        }
+    }
+}
+
+impl BudgetConfig {
+    /// Calculate the actual available tokens for user content and memory.
+    pub fn available_tokens(&self) -> u64 {
+        self.context_window
+            .saturating_sub(self.reserved_system)
+            .saturating_sub(self.reserved_response)
+    }
+
+    /// Get the warning threshold in actual token count.
+    pub fn warning_tokens(&self) -> u64 {
+        (self.context_window as f64 * self.warning_threshold as f64) as u64
+    }
+
+    /// Get the critical threshold in actual token count.
+    pub fn critical_tokens(&self) -> u64 {
+        (self.context_window as f64 * self.critical_threshold as f64) as u64
+    }
+
+    /// Create a budget optimized for a specific context window size.
+    pub fn for_context_window(context_window: u64) -> Self {
+        let reserved_system = ((context_window as f64 * 0.05).min(20_000.0)) as u64;
+        let reserved_response = ((context_window as f64 * 0.04).min(16_000.0)) as u64;
+        Self {
+            context_window,
+            reserved_system,
+            reserved_response,
+            warning_threshold: 0.70,
+            critical_threshold: 0.90,
+        }
+    }
+}
+
+/// Memory drift detection configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriftConfig {
+    /// Staleness decay factor applied per day of inactivity.
+    #[serde(default = "default_decay")]
+    pub staleness_decay_per_day: f32,
+    /// Staleness score above which an entry is flagged for review.
+    #[serde(default = "default_review_threshold")]
+    pub review_threshold: f32,
+    /// Staleness score above which an entry is automatically pruned.
+    #[serde(default = "default_prune_threshold")]
+    pub prune_threshold: f32,
+    /// Jaccard similarity threshold for contradiction detection.
+    #[serde(default = "default_jaccard_threshold")]
+    pub contradiction_jaccard_threshold: f32,
+}
+
+fn default_decay() -> f32 { 0.02 }
+fn default_review_threshold() -> f32 { 0.7 }
+fn default_prune_threshold() -> f32 { 0.95 }
+fn default_jaccard_threshold() -> f32 { 0.6 }
+
+impl Default for DriftConfig {
+    fn default() -> Self {
+        Self {
+            staleness_decay_per_day: 0.02,
+            review_threshold: 0.7,
+            prune_threshold: 0.95,
+            contradiction_jaccard_threshold: 0.6,
+        }
+    }
+}
+
+/// Performance budget for memory operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfBudget {
+    #[serde(default = "default_hook_max_ms")]
+    pub hook_max_ms: u64,
+    #[serde(default = "default_inject_max_ms")]
+    pub inject_max_ms: u64,
+    #[serde(default = "default_warn_threshold_pct")]
+    pub warn_threshold_pct: f64,
+}
+
+fn default_hook_max_ms() -> u64 { 500 }
+fn default_inject_max_ms() -> u64 { 100 }
+fn default_warn_threshold_pct() -> f64 { 0.8 }
+
+impl Default for PerfBudget {
+    fn default() -> Self {
+        Self { hook_max_ms: 500, inject_max_ms: 100, warn_threshold_pct: 0.8 }
+    }
+}
+
+/// Model-specific profile for adaptive compression thresholds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfile {
+    pub model_name: String,
+    pub context_window: u64,
+    pub memory_budget_ratio: f32,
+    pub warning_threshold: f32,
+    pub critical_threshold: f32,
+    pub micro_threshold: usize,
+    pub session_threshold: usize,
+    pub compression_aggressiveness: f32,
+}
+
+impl Default for ModelProfile {
+    fn default() -> Self {
+        Self {
+            model_name: "default".to_string(),
+            context_window: 200_000,
+            memory_budget_ratio: 0.30,
+            warning_threshold: 0.70,
+            critical_threshold: 0.90,
+            micro_threshold: 50,
+            session_threshold: 10,
+            compression_aggressiveness: 0.5,
+        }
+    }
+}
+
+impl ModelProfile {
+    /// Find or create a profile for a given model name.
+    pub fn for_model(model_name: &str) -> Self {
+        let name_lower = model_name.to_lowercase();
+        if name_lower.contains("haiku") || name_lower.contains("flash")
+            || name_lower.contains("04-mini") || name_lower.contains("gpt-3.5-turbo")
+        {
+            if name_lower.contains("gpt-3.5-turbo") {
+                Self {
+                    model_name: model_name.to_string(), context_window: 16_385,
+                    memory_budget_ratio: 0.15, warning_threshold: 0.50,
+                    critical_threshold: 0.75, micro_threshold: 20,
+                    session_threshold: 4, compression_aggressiveness: 0.75,
+                }
+            } else {
+                Self {
+                    model_name: model_name.to_string(), context_window: 8_192,
+                    memory_budget_ratio: 0.10, warning_threshold: 0.40,
+                    critical_threshold: 0.65, micro_threshold: 10,
+                    session_threshold: 2, compression_aggressiveness: 0.85,
+                }
+            }
+        } else if name_lower.contains("claude-3-5-sonnet") || name_lower.contains("claude-3.5") {
+            Self {
+                model_name: model_name.to_string(), context_window: 200_000,
+                memory_budget_ratio: 0.35, warning_threshold: 0.70,
+                critical_threshold: 0.90, micro_threshold: 50,
+                session_threshold: 10, compression_aggressiveness: 0.5,
+            }
+        } else if name_lower.contains("claude-3-opus") {
+            Self {
+                model_name: model_name.to_string(), context_window: 200_000,
+                memory_budget_ratio: 0.35, warning_threshold: 0.70,
+                critical_threshold: 0.90, micro_threshold: 50,
+                session_threshold: 10, compression_aggressiveness: 0.5,
+            }
+        } else if name_lower.contains("claude") {
+            Self {
+                model_name: model_name.to_string(), context_window: 200_000,
+                memory_budget_ratio: 0.35, warning_threshold: 0.70,
+                critical_threshold: 0.90, micro_threshold: 50,
+                session_threshold: 10, compression_aggressiveness: 0.5,
+            }
+        } else if name_lower.contains("gpt-4o") {
+            Self {
+                model_name: model_name.to_string(), context_window: 128_000,
+                memory_budget_ratio: 0.30, warning_threshold: 0.70,
+                critical_threshold: 0.88, micro_threshold: 45,
+                session_threshold: 9, compression_aggressiveness: 0.55,
+            }
+        } else if name_lower.contains("o1-preview") || name_lower.contains("o1-mini") {
+            Self {
+                model_name: model_name.to_string(), context_window: 128_000,
+                memory_budget_ratio: 0.20, warning_threshold: 0.60,
+                critical_threshold: 0.80, micro_threshold: 30,
+                session_threshold: 6, compression_aggressiveness: 0.7,
+            }
+        } else if name_lower.contains("gpt-4") {
+            Self {
+                model_name: model_name.to_string(), context_window: 128_000,
+                memory_budget_ratio: 0.25, warning_threshold: 0.65,
+                critical_threshold: 0.85, micro_threshold: 40,
+                session_threshold: 8, compression_aggressiveness: 0.6,
+            }
+        } else {
+            let mut profile = Self::default();
+            profile.model_name = model_name.to_string();
+            profile
+        }
+    }
+}
+
+/// LLM summarization configuration for compression pipeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmSummarizerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+}
+
+impl LlmSummarizerConfig {
+    /// Check if LLM summarization is properly configured.
+    pub fn is_configured(&self) -> bool {
+        self.enabled && !self.api_url.is_empty() && !self.api_key.is_empty()
+    }
+}
+
+fn default_llm_model() -> String { "gpt-4o-mini".to_string() }
+
+impl Eq for LlmSummarizerConfig {}
+
+impl Default for LlmSummarizerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: String::new(),
+            api_key: String::new(),
+            model: "gpt-4o-mini".to_string(),
+        }
+    }
+}
+
+// ── Memory-specific types ────────────────────────────────────────────────
 
 /// Top-level memory system configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
