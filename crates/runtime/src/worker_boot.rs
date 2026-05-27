@@ -779,7 +779,11 @@ struct StateSnapshot<'a> {
 
 fn emit_state_file(worker: &Worker) {
     let state_path = crate::cowd_dirs::worker_state_path();
-    let state_dir = state_path.parent().unwrap();
+    let state_dir = state_path.parent()
+        .unwrap_or_else(|| {
+            tracing::error!("state path has no parent directory: {}", state_path.display());
+            std::process::exit(1);
+        });
     if std::fs::create_dir_all(state_dir).is_err() {
         return;
     }

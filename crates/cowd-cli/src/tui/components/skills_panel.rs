@@ -129,6 +129,10 @@ pub struct SkillsPanel {
     status_ticks: u32,
     /// Whether to use built-in definitions (true when App.skill_list is empty).
     using_builtins: bool,
+    /// Whether category cycling has started (avoids wrapping from None back to 0).
+    category_cycle_started: bool,
+    /// Optional reference to GlobalToolRegistry for real enable/disable.
+    pub registry: Option<std::sync::Arc<dyn crate::tui::app::ToolRegistry>>,
 }
 
 /// Unified display entry for a skill, regardless of source.
@@ -157,6 +161,8 @@ impl SkillsPanel {
             status_message: None,
             status_ticks: 0,
             using_builtins: true,
+            category_cycle_started: false,
+            registry: None,
         }
     }
 
@@ -232,7 +238,11 @@ impl SkillsPanel {
             return;
         }
         self.active_category = match self.active_category {
-            None => Some(0),
+            None if !self.category_cycle_started => {
+                self.category_cycle_started = true;
+                Some(0)
+            }
+            None => None,
             Some(i) if i + 1 < self.categories.len() => Some(i + 1),
             Some(_) => None,
         };
@@ -246,7 +256,11 @@ impl SkillsPanel {
             return;
         }
         self.active_category = match self.active_category {
-            None => Some(self.categories.len() - 1),
+            None if !self.category_cycle_started => {
+                self.category_cycle_started = true;
+                Some(self.categories.len() - 1)
+            }
+            None => None,
             Some(0) => None,
             Some(i) => Some(i - 1),
         };
@@ -263,8 +277,16 @@ impl SkillsPanel {
                 // Toggle in-place in entries
                 if let Some(entry) = self.entries.iter_mut().find(|e| e.name == name) {
                     entry.enabled = !entry.enabled;
-                    let status = if entry.enabled { "enabled" } else { "disabled" };
+                    let new_enabled = entry.enabled;
+                    let status = if new_enabled { "enabled" } else { "disabled" };
                     self.set_status(&format!("{name}: {status}"));
+                    if let Some(ref registry) = self.registry {
+                        if new_enabled {
+                            registry.enable_tool(&name);
+                        } else {
+                            registry.disable_tool(&name);
+                        }
+                    }
                 }
             }
         }
@@ -289,6 +311,13 @@ impl SkillsPanel {
                     entry.enabled = value;
                     let status = if value { "enabled" } else { "disabled" };
                     self.set_status(&format!("{name}: {status}"));
+                    if let Some(ref registry) = self.registry {
+                        if value {
+                            registry.enable_tool(&name);
+                        } else {
+                            registry.disable_tool(&name);
+                        }
+                    }
                 }
             }
         }

@@ -33,8 +33,11 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
+
+use super::approval::ApprovalCard;
 
 /// Feishu adapter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +89,7 @@ pub struct FeishuAdapter {
     pub batch_manager: Option<TextBatchManager>,
     pub processing_queue: ChatProcessingQueue,
     ws_events: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>>>>,
+    approval_id_counter: Arc<AtomicU64>,
 }
 
 impl FeishuAdapter {
@@ -103,6 +107,7 @@ impl FeishuAdapter {
             batch_manager: None,
             processing_queue: ChatProcessingQueue::new(1000),
             ws_events: Arc::new(Mutex::new(None)),
+            approval_id_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -707,6 +712,58 @@ impl CardAction {
         self
     }
 
+}
+
+impl FeishuAdapter {
+    pub fn next_approval_id(&self) -> u64 {
+        self.approval_id_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub async fn send_exec_approval(
+        &self,
+        chat_id: &str,
+        command: &str,
+        description: &str,
+    ) -> PlatformResult<String> {
+        let approval_id = self.next_approval_id();
+        let mut card = ApprovalCard::new(approval_id, command);
+        if !description.is_empty() {
+            card = card.with_description(description);
+        }
+        let card_json = card.build();
+        self.send_card(chat_id, &card_json).await
+    }
+
+    pub async fn update_approval_card(
+        &self,
+        message_id: &str,
+        choice: &str,
+        user_name: &str,
+    ) -> PlatformResult<()> {
+        let resolved_json = ApprovalCard::build_resolved(choice, user_name);
+        let token = self.ensure_token().await?;
+        let client = reqwest::Client::new();
+        let url = format!("{}/im/v1/messages/{}", self.api_base_url(), message_id);
+        let request = super::types::UpdateMessageRequest {
+            content: resolved_json,
+            msg_type: "interactive".to_string(),
+        };
+        let response = client
+            .put(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+        let resp: super::types::UpdateMessageResponse = response
+            .json()
+            .await
+            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+        if resp.code != 0 {
+            return Err(PlatformError::SendFailed(resp.msg));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -1428,5 +1485,85 @@ mod tests {
         let adapter = FeishuAdapter::new(config);
         assert_eq!(adapter.access_control.bot_open_id, "bot_ou_custom");
         assert_eq!(adapter.access_control.bot_name, "CustomBot");
+    }
+
+    // ------------------------------------------------------------------
+    // Approval card tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_next_approval_id_is_monotonic() {
+        let config = FeishuConfig::new("app_id", "app_secret");
+        let adapter = FeishuAdapter::new(config);
+        let id1 = adapter.next_approval_id();
+        let id2 = adapter.next_approval_id();
+        let id3 = adapter.next_approval_id();
+        assert_eq!(id1, 0);
+        assert_eq!(id2, 1);
+        assert_eq!(id3, 2);
+    }
+
+    #[test]
+    fn test_send_exec_approval_card_structure() {
+        // Build a card the same way send_exec_approval does
+        let approval_id = 42u64;
+        let card = ApprovalCard::new(approval_id, "rm -rf /tmp/test");
+        let card_json = card.build();
+        let v: serde_json::Value = serde_json::from_str(&card_json).unwrap();
+
+        assert_eq!(v["config"]["wide_screen_mode"], true);
+        assert_eq!(v["header"]["template"], "orange");
+        assert_eq!(
+            v["header"]["title"]["content"],
+            "⚠️ Command Approval Required"
+        );
+
+        let actions = v["elements"][1]["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 4);
+
+        // Verify hermes_action and approval_id in button values
+        assert_eq!(actions[0]["value"]["hermes_action"], "approve_once");
+        assert_eq!(actions[0]["value"]["approval_id"], 42);
+        assert_eq!(actions[1]["value"]["hermes_action"], "approve_session");
+        assert_eq!(actions[3]["value"]["hermes_action"], "deny");
+    }
+
+    #[test]
+    fn test_send_exec_approval_with_description() {
+        let card = ApprovalCard::new(1, "cargo build --release")
+            .with_description("Build the project in release mode");
+        let card_json = card.build();
+        let v: serde_json::Value = serde_json::from_str(&card_json).unwrap();
+
+        let md_content = v["elements"][0]["content"].as_str().unwrap();
+        assert!(md_content.contains("Build the project in release mode"));
+        assert!(md_content.contains("cargo build --release"));
+    }
+
+    #[test]
+    fn test_update_approval_card_resolved_content() {
+        let json = ApprovalCard::build_resolved("approve_once", "Alice");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["header"]["template"], "green");
+        assert!(v["header"]["title"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Alice"));
+    }
+
+    #[test]
+    fn test_card_action_callback_parses_hermes_action() {
+        let callback = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {"hermes_action": "approve_once", "approval_id": 42}
+            }
+        });
+
+        let action = callback.get("action").unwrap();
+        let value = action.get("value").unwrap();
+        assert_eq!(value["hermes_action"], "approve_once");
+        assert_eq!(value["approval_id"], 42);
     }
 }

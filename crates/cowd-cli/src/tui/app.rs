@@ -116,9 +116,6 @@ pub struct SessionSummary {
     pub message_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Panel { Chat, Gateway, Files, Delegate, Memory, Skills }
-
 pub struct App {
     pub model: String,
     pub session_id: String,
@@ -140,7 +137,6 @@ pub struct App {
     pub picker_idx: usize,
     pub theme: Theme,
     pub approval: Option<ApprovalRequest>,
-    pub current_panel: Panel,
     pub gateway_sessions: Vec<GatewaySession>,
     pub gateway_platform: String,
     pub file_entries: Vec<FileEntry>,
@@ -149,6 +145,13 @@ pub struct App {
     pub skill_list: Vec<SkillSummary>,
     pub skin: crate::tui::skin::SkinConfig,
     pub memory_status: Option<String>,
+
+    /// Whether the API server is currently running.
+    pub server_running: bool,
+    /// Server uptime in seconds.
+    pub server_uptime_secs: Option<u64>,
+    /// Number of active API sessions.
+    pub active_api_sessions: usize,
 
     pub scroll_offset: u16,
     pub auto_scroll: bool,
@@ -288,7 +291,6 @@ impl App {
             picker_idx: 0,
             theme: Theme::Dark,
             approval: None,
-            current_panel: Panel::Chat,
             gateway_sessions: Vec::new(),
             gateway_platform: String::new(),
             file_entries: Vec::new(),
@@ -297,6 +299,10 @@ impl App {
             skill_list: Vec::new(),
             skin: crate::tui::skin::SkinConfig::default(),
             memory_status: None,
+
+            server_running: false,
+            server_uptime_secs: None,
+            active_api_sessions: 0,
 
             scroll_offset: 0,
             auto_scroll: true,
@@ -486,17 +492,6 @@ impl App {
                 next_start += page.entries.len();
             }
         }
-    }
-
-    pub fn next_panel(&mut self) {
-        self.current_panel = match self.current_panel {
-            Panel::Chat => Panel::Gateway,
-            Panel::Gateway => Panel::Files,
-            Panel::Files => Panel::Memory,
-            Panel::Memory => Panel::Skills,
-            Panel::Skills => Panel::Delegate,
-            Panel::Delegate => Panel::Chat,
-        };
     }
 
     pub fn spinner_char(&self) -> &'static str {
@@ -1105,4 +1100,10 @@ mod tests {
         assert!(moved);
         assert!(app.timeline_cursor < 599);
     }
+}
+
+/// Trait for tool registry integration with SkillsPanel.
+pub trait ToolRegistry: Send + Sync {
+    fn enable_tool(&self, name: &str);
+    fn disable_tool(&self, name: &str);
 }

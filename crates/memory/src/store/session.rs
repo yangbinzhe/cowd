@@ -201,7 +201,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
 /// connection, in-memory databases are **not** shared between calls – use a
 /// file path for anything beyond isolated unit tests.
 #[derive(Debug, Clone)]
-pub(crate) struct SqliteSessionStore {
+pub struct SqliteSessionStore {
     db_path: String,
 }
 

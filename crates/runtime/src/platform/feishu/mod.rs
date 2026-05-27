@@ -4,6 +4,7 @@
 //! supporting both sending and receiving messages through the Feishu Open API.
 
 pub mod adapter;
+pub mod approval;
 pub mod auth;
 pub mod batch;
 pub mod card_handler;
@@ -21,6 +22,7 @@ pub mod ws;
 
 // Re-export types from sibling modules
 pub use adapter::{FeishuAdapter, FeishuConfig, CardAction};
+pub use approval::{ApprovalCard, CardActionDedup, CARD_ACTION_DEDUP_TTL_SECONDS, APPROVAL_HEADER_TEXT, LABEL_ALLOW_ONCE, LABEL_APPROVE_SESSION, LABEL_APPROVE_ALWAYS, LABEL_DENY, HERMES_ACTION_APPROVE_ONCE, HERMES_ACTION_APPROVE_SESSION, HERMES_ACTION_APPROVE_ALWAYS, HERMES_ACTION_DENY};
 pub use auth::*;
 pub use batch::*;
 pub use comment::{CommentHandler, CommentStatus, FeishuComment, CreateCommentRequest, ReplyCommentRequest, UpdateCommentRequest, CommentFilter};

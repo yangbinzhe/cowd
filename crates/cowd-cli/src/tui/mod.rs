@@ -1,7 +1,6 @@
 pub mod app;
 pub mod layout;
 pub mod components;
-pub mod input;
 pub mod keybind;
 pub mod skin;
 pub mod events;
