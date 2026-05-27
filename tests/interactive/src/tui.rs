@@ -58,3 +58,11 @@ impl TuiSession {
         Ok(())
     }
 }
+
+impl Drop for TuiSession {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", &self.session])
+            .status();
+    }
+}

@@ -42,6 +42,13 @@ impl ServerProcess {
 
 impl Drop for ServerProcess {
     fn drop(&mut self) {
-        let _ = self.close();
+        if let Some(mut child) = self.proc.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Also kill gateway if running
+        let _ = Command::new("pkill")
+            .args(["-f", "cowd.*gateway"])
+            .status();
     }
 }

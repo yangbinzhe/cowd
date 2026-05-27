@@ -1,5 +1,8 @@
 mod tui_basic;
+mod tui_gateway;
 mod tui_interact;
+mod tui_memory;
+mod tui_skills;
 mod server_core;
 mod server_mgmt;
 mod cross_cut;
@@ -20,6 +23,11 @@ pub fn list() {
         ("tui_toast", "Trigger toast notification"),
         ("tui_fork_export", "Session fork + export dialog"),
         ("tui_multi_input", "Shift+Enter multi-line + Ctrl+T theme"),
+        ("tui_gateway_panel", "Gateway panel: server status + API endpoints"),
+        ("tui_memory_panel", "Memory panel: entries + keyboard hints"),
+        ("tui_memory_slash", "/memory slash command response"),
+        ("tui_skills_panel", "Skills panel: categories + built-in skills"),
+        ("tui_skills_hints", "Skills panel: keyboard hints present"),
         ("server_health", "GET /health + session CRUD"),
         ("server_memory", "Memory search + config read"),
         ("server_workspace", "Workspace files + command execute"),
@@ -42,7 +50,10 @@ pub fn run_all(runner: &mut TestRunner, filter: Option<String>) -> anyhow::Resul
         };
     }
     run_mod!(tui_basic);
+    run_mod!(tui_gateway);
     run_mod!(tui_interact);
+    run_mod!(tui_memory);
+    run_mod!(tui_skills);
     run_mod!(server_core);
     run_mod!(server_mgmt);
     run_mod!(cross_cut);
