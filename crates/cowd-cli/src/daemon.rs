@@ -10,6 +10,7 @@ use std::sync::Arc;
 use axum::http::{header, HeaderValue};
 use tokio::net::{TcpListener, UnixListener};
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 
 use crate::api_routes;
 use crate::event_bus::SessionEventBus;
@@ -91,7 +92,10 @@ pub async fn run_daemon(
             ])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
-        api_routes::api_router(app_state).layer(cors)
+        let webui_dir = std::env::current_dir().unwrap().join("webui");
+        api_routes::api_router(app_state)
+            .fallback_service(ServeDir::new(webui_dir))
+            .layer(cors)
     };
 
     // 3. HTTP listener

@@ -365,8 +365,9 @@ window.Panels = (()=>{
       for(const l of (layers.layers||layers||[])){
         tree.innerHTML+='&nbsp;&nbsp;<b>ROOM:</b> '+UI.esc(l.name||'layer'+l.index)+'<br>';
         try{
-          const entries=await Api.listMemoryEntries(l.name||l);
-          if(entries&&entries.length){
+          const data=await Api.getMemoryLayer(l.name||l);
+          const entries=data.entries||data||[];
+          if(entries.length){
             entries.slice(0,8).forEach(e=>{
               const title=UI.esc((e.title||e.content||'').substring(0,60));
               tree.innerHTML+='&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--text3)">DRAWER:</span> '+title+'<br>';

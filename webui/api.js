@@ -51,7 +51,7 @@ window.Api = (()=>{
     async compactSession(id){return req('POST','/api/sessions/'+(id||sid)+'/compact')},
     async getMessages(id){return req('GET','/api/sessions/'+(id||sid)+'/messages')},
     async sendMessage(text,id){return req('POST','/api/sessions/'+(id||sid)+'/messages',{content:text,role:'user'})},
-    getStreamUrl(id){return BASE+'/api/sessions/'+(id||sid)+'/messages/stream'},
+    getStreamUrl(id){return BASE+'/api/sessions/'+(id||sid)+'/stream'},
 
     // ── Auth ──
     async login(token){
@@ -129,6 +129,9 @@ window.Api = (()=>{
 
     // ── Usage ──
     async getUsage(){return req('GET','/api/usage')},
+
+    // ── Progress ──
+    async getProgress(){return {progress: 0}},
   };
 })();
 

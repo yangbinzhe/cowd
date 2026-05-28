@@ -4,34 +4,13 @@ window.Messages = (()=>{
   let streamBuffer='';
   let activeToolId=null;
   let activeStreamEl=null;
-  let ws=null;
-
-  function connectWs(){
-    if(!Api.sid)return;
-    const proto=location.protocol==='https:'?'wss':'ws';
-    const tokenParam = Api.token ? '?token=' + encodeURIComponent(Api.token) : '';
-    try{
-      ws=new WebSocket(proto+'://'+location.host+'/ws'+tokenParam);
-      ws.onmessage=(evt)=>{ try{ const d=JSON.parse(evt.data); dispatch(d); }catch(e){} };
-      ws.onclose=()=>{ ws=null; };
-    }catch(e){}
-  }
-
-  function wsSend(action,data){
-    if(ws&&ws.readyState===WebSocket.OPEN){
-      ws.send(JSON.stringify({action,...data}));
-    }
-  }
-
   function approve(id,approved){
-    wsSend('approve',{id,approved});
     Api.respondApproval(id,approved).catch(()=>{});
   }
 
   function connect(){
     if(!Api.sid)return;
     disconnect();
-    connectWs();
     abortController=new AbortController();
     try{
       const headers = Api.token ? {'Content-Type':'application/json', 'Authorization':'Bearer '+Api.token} : {'Content-Type':'application/json'};
@@ -263,5 +242,5 @@ window.Messages = (()=>{
 
   function on(event,fn){callbacks[event]=fn}
 
-  return{connect,disconnect,send,addUserMessage,addSystemMessage,on,wsSend,approve};
+  return{connect,disconnect,send,addUserMessage,addSystemMessage,on,approve};
 })();

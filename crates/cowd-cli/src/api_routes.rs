@@ -68,20 +68,24 @@ async fn auth_middleware(
 // ── Router ─────────────────────────────────────────────────────
 
 pub fn api_router(state: Arc<AppState>) -> Router {
-    let health_route = Router::new().route("/health", get(health_handler));
+    let public_routes = Router::new()
+        .route("/health", get(health_handler))
+        .route("/api/auth/login", post(login_handler))
+        .route("/api/auth/verify", get(verify_handler));
 
     let protected_routes = Router::new()
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session).delete(delete_session))
-        .route("/api/sessions/:id/messages", post(send_message))
+        .route("/api/sessions/:id/messages", get(get_session_messages).post(send_message))
         .route("/api/sessions/:id/stream", get(sse_stream_handler))
+        .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/memory", get(memory_handler))
         .route("/api/memory/search", get(memory_search_handler))
         .route("/api/tools", get(tools_handler))
         .route("/api/config", get(config_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
-    health_route.merge(protected_routes).with_state(state)
+    public_routes.merge(protected_routes).with_state(state)
 }
 
 // ── Response types ─────────────────────────────────────────────
@@ -111,6 +115,11 @@ struct CreateSessionRequest {
 #[derive(Deserialize)]
 struct SendMessageRequest {
     content: String,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    token: String,
 }
 
 // ── Handlers ───────────────────────────────────────────────────
@@ -335,6 +344,166 @@ async fn config_handler(
             "model": "unknown",
             "version": env!("CARGO_PKG_VERSION"),
         })),
+    }
+}
+
+// ── Session messages handler ────────────────────────────────────
+
+async fn get_session_messages(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_entry = state.sessions.get(&id).ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(ErrorResponse {
+            error: format!("session {id} not found"),
+        }))
+    })?;
+
+    let runtime_guard = runtime_entry.lock().await;
+    let session = runtime_guard.session();
+
+    let messages: Vec<serde_json::Value> = session
+        .messages
+        .iter()
+        .map(|msg| {
+            let role = match msg.role {
+                runtime::MessageRole::System => "system",
+                runtime::MessageRole::User => "user",
+                runtime::MessageRole::Assistant => "assistant",
+                runtime::MessageRole::Tool => "tool",
+            };
+            let blocks: Vec<serde_json::Value> = msg
+                .blocks
+                .iter()
+                .map(|block| match block {
+                    runtime::ContentBlock::Text { text } => {
+                        serde_json::json!({"type": "text", "text": text})
+                    }
+                    runtime::ContentBlock::Thinking { thinking, signature } => {
+                        let mut val = serde_json::json!({"type": "thinking", "thinking": thinking});
+                        if let Some(sig) = signature {
+                            val["signature"] = serde_json::Value::String(sig.clone());
+                        }
+                        val
+                    }
+                    runtime::ContentBlock::ToolUse { id, name, input } => {
+                        serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
+                    }
+                    runtime::ContentBlock::ToolResult { tool_use_id, tool_name, output, is_error } => {
+                        serde_json::json!({"type": "tool_result", "tool_use_id": tool_use_id, "tool_name": tool_name, "output": output, "is_error": is_error})
+                    }
+                })
+                .collect();
+
+            let mut val = serde_json::json!({"role": role, "blocks": blocks});
+            if let Some(usage) = &msg.usage {
+                val["usage"] = serde_json::json!({
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens,
+                });
+            }
+            val
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "session_id": id,
+        "message_count": messages.len(),
+        "messages": messages,
+    })))
+}
+
+// ── Session compaction handler ──────────────────────────────────
+
+async fn compact_session_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_entry = state.sessions.get(&id).ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(ErrorResponse {
+            error: format!("session {id} not found"),
+        }))
+    })?;
+
+    let mut runtime_guard = runtime_entry.lock().await;
+    let result = runtime_guard.compact(runtime::CompactionConfig::default());
+
+    // Apply the compacted session back if compaction actually happened
+    if result.removed_message_count > 0 {
+        *runtime_guard.session_mut() = result.compacted_session.clone();
+    }
+
+    tracing::info!(%id, removed = result.removed_message_count, "API session compacted");
+
+    Ok(Json(serde_json::json!({
+        "session_id": id,
+        "compacted": result.removed_message_count > 0,
+        "removed_message_count": result.removed_message_count,
+        "summary": result.formatted_summary,
+    })))
+}
+
+// ── Auth handlers (public) ──────────────────────────────────────
+
+async fn login_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<LoginRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    match &state.auth_token {
+        None => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "auth not configured".to_string(),
+            }),
+        )),
+        Some(expected) if expected == &body.token => {
+            tracing::info!("API login successful");
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "token": body.token,
+            })))
+        }
+        Some(_) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid token".to_string(),
+            }),
+        )),
+    }
+}
+
+async fn verify_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let auth_token = match &state.auth_token {
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "auth not configured".to_string(),
+                }),
+            ));
+        }
+        Some(token) => token,
+    };
+
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(h) if h == format!("Bearer {auth_token}") => {
+            Ok(Json(serde_json::json!({ "valid": true })))
+        }
+        _ => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid or missing token".to_string(),
+            }),
+        )),
     }
 }
 
