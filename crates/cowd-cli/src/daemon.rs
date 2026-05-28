@@ -188,6 +188,12 @@ pub async fn run_daemon(
                     Err(e) => tracing::error!("failed to create email adapter: {e}"),
                 }
             }
+            "wecom" => {
+                match runtime::platform::wecom::create_wecom_adapter(&settings_json) {
+                    Ok(adapter) => { let _ = platform_runtime.register_adapter(Box::new(adapter)).await; }
+                    Err(e) => { tracing::warn!("wecom adapter init failed: {e}"); }
+                }
+            }
             other => {
                 tracing::warn!("unknown platform type: {other}");
             }
@@ -223,10 +229,24 @@ pub async fn run_daemon(
 
     // 7. HTTP server with graceful shutdown on SIGINT/SIGTERM
     let shutdown_signal = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install ctrl_c handler");
-        tracing::info!("shutdown signal received, beginning graceful shutdown");
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate()
+            ).expect("failed to install SIGTERM handler");
+            let mut sigint = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::interrupt()
+            ).expect("failed to install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
+                _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.expect("failed to install ctrl_c handler");
+            tracing::info!("shutdown signal received");
+        }
     };
 
     axum::serve(listener, app)

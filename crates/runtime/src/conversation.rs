@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// T35: Lightweight cancellation token (tokio-util not available in dep tree).
 #[derive(Clone, Default)]
@@ -1152,6 +1152,7 @@ self.record_turn_completed(&summary);
                     if r.success { Some(r.data) } else { None }
                 });
 
+                let start = Instant::now();
                 let (output, mut is_error) = if let Some(mock_output) = effect_mock {
                     (mock_output, false)
                 } else {
@@ -1180,6 +1181,11 @@ self.record_turn_completed(&summary);
                 };
                 if post_hook_result.is_denied() || post_hook_result.is_failed() || post_hook_result.is_cancelled() {
                     is_error = true;
+                }
+
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                if let Some(ref bus) = self.bus {
+                    bus.emit(crate::bus::Event::ToolExecuted { name: tool_name.to_string(), duration_ms: elapsed_ms });
                 }
 
                 // T36: Truncate oversized tool results before storing.
@@ -1456,6 +1462,7 @@ self.record_turn_completed(&summary);
             .collect();
 
         let session_id = self.session().session_id;
+        mgr.set_active_session(session_id.clone());
         match mgr.prepare_context(user_input, &mem_messages, Some(&session_id)).await {
             Ok(mut prepared) => {
                 if prepared.entries.is_empty() {
@@ -1490,29 +1497,8 @@ self.record_turn_completed(&summary);
                 let max_entries = prepared.entries.len().min(20);
                 prepared.entries.truncate(max_entries);
 
-                // P0: AAAK symbolic index mode (dual-layer injection)
-                let mut context = if self.use_aaak_index && !prepared.entries.is_empty() {
-                    let index = memory::aaak_index::AaakIndex::from_entries(&prepared.entries, budget.min(600));
-                    let mut ctx = index.to_xml();
-                    // Layer 2: inject L0/L1 top entries in full
-                    let top: Vec<_> = prepared.entries.iter()
-                        .filter(|e| matches!(e.layer, MemoryLayer::L0 | MemoryLayer::L1))
-                        .take(3).collect();
-                    if !top.is_empty() {
-                        ctx.push_str("\n<memory_top>\n");
-                        for e in top {
-                            ctx.push_str(&format!("  <full id=\"L{}\">{}</full>\n", e.layer as u8, e.content));
-                        }
-                        ctx.push_str("</memory_top>\n");
-                    }
-                    ctx
-                } else {
-                    // Full injection mode (existing behavior)
-                    String::from("<memory_context>\n")
-                };
-                if !self.use_aaak_index {
-                    // M2: Structured XML-style injection with budget caps
-                    for entry in &prepared.entries {
+                let mut context = String::from("<memory_context>\n");
+                for entry in &prepared.entries {
                     if used >= budget { break; }
                     let tokens = (entry.title.len() + entry.content.len()) as u64 / 4;
                     used += tokens;
@@ -1527,7 +1513,6 @@ self.record_turn_completed(&summary);
                     ));
                 }
                 context.push_str("</memory_context>");
-                }
 
                 // M2-L1-3: entity/triple relations as knowledge graph
                 let mut rel_count = 0;

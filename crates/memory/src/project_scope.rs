@@ -17,7 +17,6 @@ use crate::config::StoreConfig;
 use crate::entity::{Entity, EntityType, KnowledgeGraph};
 use crate::entity_registry::EntityRegistry;
 use crate::error::MemoryError;
-use crate::miner::{MemoryMiner, MiningMode};
 use crate::store::sqlite::SqliteStore;
 
 /// Module-level entity registry for dedup during KG building.
@@ -243,40 +242,6 @@ impl ProjectScopeManager {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(manifest) = inner.projects.get_mut(&project_id) {
                 manifest.indexed_file_mtimes = file_mtimes;
-            }
-        }
-
-        // Seed initial knowledge via MemoryMiner (fire-and-forget)
-        {
-            let project_path = canonical_clone.clone();
-            match tokio::runtime::Handle::try_current() {
-                Ok(_handle) => {
-                    tokio::spawn(async move {
-                        let miner = MemoryMiner::new(MiningMode::Project);
-                        match miner.mine_project(&project_path).await {
-                            Ok(entries) => {
-                                tracing::info!(
-                                    count = entries.len(),
-                                    path = %project_path.display(),
-                                    "miner: seeded {} entries from project structure",
-                                    entries.len()
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    path = %project_path.display(),
-                                    "miner: project mining failed (non-fatal)"
-                                );
-                            }
-                        }
-                    });
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        "miner: no tokio runtime available, skipping project mining"
-                    );
-                }
             }
         }
 
