@@ -341,10 +341,10 @@ impl StatusBar {
                     app.history_idx.map(|hidx| format!("hist:{}", hidx + 1))
                 }
                 "mcp_status" => {
-                    Some("● MCP:3".to_string())
+                    Some(format!("● MCP:{}", app.mcp_count))
                 }
                 "lsp_status" => {
-                    Some("● LSP:2".to_string())
+                    Some(format!("● LSP:{}", app.lsp_available))
                 }
                 "permission_status" => {
                     Some("△ 2".to_string())
