@@ -190,8 +190,14 @@ pub async fn run_daemon(
             }
             "wecom" => {
                 match runtime::platform::wecom::create_wecom_adapter(&settings_json) {
-                    Ok(adapter) => { let _ = platform_runtime.register_adapter(Box::new(adapter)).await; }
-                    Err(e) => { tracing::warn!("wecom adapter init failed: {e}"); }
+                    Ok(adapter) => {
+                        if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
+                            tracing::error!("failed to register wecom adapter: {e}");
+                        } else {
+                            tracing::info!("wecom adapter created and registered");
+                        }
+                    }
+                    Err(e) => { tracing::error!("wecom adapter init failed: {e}"); }
                 }
             }
             other => {
