@@ -34,12 +34,14 @@ use crate::tui::components::diff_viewer::DiffViewer;
 use crate::tui::components::export_dialog::ExportDialog;
 use crate::tui::components::file_changes_panel::FileChangesPanel;
 use crate::tui::components::file_tree::FileTree;
+use crate::tui::components::gateway_panel::GatewayPanel;
 use crate::tui::components::prompt::Prompt;
 use crate::tui::components::question_form::QuestionForm;
 use crate::tui::components::memory_panel::MemoryPanel;
 use crate::tui::components::session_sidebar::SessionSidebar;
 use crate::tui::components::status_bar::StatusBar;
 use crate::tui::components::revert_dialog::RevertDialog;
+use crate::tui::components::skills_panel::SkillsPanel;
 use crate::tui::components::thinking_panel::ThinkingPanel;
 use crate::tui::components::toast::{ToastManager, ToastVariant};
 use crate::tui::components::todo_panel::TodoPanel;
@@ -149,7 +151,13 @@ pub struct TuiState {
     /// Memory browser panel with layer filter, search, detail view, delete.
     pub memory_panel: MemoryPanel,
 
-    /// Active tab index in the sidebar (0=Context, 1=Changes, 2=Todo, 3=Diff, 4=Files, 5=Sessions, 6=Memory).
+    /// Skills panel showing categorized skill/plugin browsing.
+    pub skills_panel: SkillsPanel,
+
+    /// Gateway panel showing backend daemon/API gateway status.
+    pub gateway_panel: GatewayPanel,
+
+    /// Active tab index in the sidebar (0=Context, 1=Changes, 2=Todo, 3=Diff, 4=Files, 5=Sessions, 6=Memory, 7=Skills, 8=Gateway).
     pub sidebar_active_tab: usize,
 
     /// Status bar at the bottom showing model, tokens, and system info.
@@ -228,6 +236,8 @@ impl TuiState {
         let file_tree = FileTree::new();
         let session_sidebar = SessionSidebar::new(session_id);
         let memory_panel = MemoryPanel::new();
+        let skills_panel = SkillsPanel::new();
+        let gateway_panel = GatewayPanel::new();
 
         Self {
             app,
@@ -258,6 +268,8 @@ impl TuiState {
             file_tree,
             session_sidebar,
             memory_panel,
+            skills_panel,
+            gateway_panel,
             sidebar_active_tab: 0,
             accessibility,
             active_sessions: None,
@@ -360,6 +372,12 @@ impl TuiState {
         // Sync memory panel from App state
         self.memory_panel.sync_from_app(&self.app);
 
+        // Sync skills panel from App state
+        self.skills_panel.sync_from_app(&self.app);
+
+        // Sync gateway panel from App state
+        self.gateway_panel.sync_from_app(&self.app);
+
         // BUG 1 FIX: No bidirectional sync — app.input is the single source of truth.
         // Prompt is used only for autocomplete suggestions (rendered as overlay dropdown).
 
@@ -444,7 +462,7 @@ impl TuiState {
 
             // Render sidebar: tab bar + active panel
             let tab_height = 1u16;
-            let tab_labels = ["Context", "Changes", "Todo", "Diff", "Files", "Sessions", "Memory"];
+            let tab_labels = ["Context", "Changes", "Todo", "Diff", "Files", "Sessions", "Memory", "Skills", "Gateway"];
             let tab_area = ratatui::layout::Rect::new(
                 sidebar_area.x, sidebar_area.y, sidebar_area.width, tab_height,
             );
@@ -514,6 +532,16 @@ impl TuiState {
                     let _guard = self.render_profiler.guard("memory_panel");
                     let _ = error_recovery::catch_render_panic("memory_panel", AssertUnwindSafe(|| {
                         self.memory_panel.render(&mut main_ctx, panel_area);
+                    }));
+                }
+                7 => {
+                    let _ = error_recovery::catch_render_panic("skills_panel", AssertUnwindSafe(|| {
+                        self.skills_panel.render(&mut main_ctx, panel_area);
+                    }));
+                }
+                8 => {
+                    let _ = error_recovery::catch_render_panic("gateway_panel", AssertUnwindSafe(|| {
+                        self.gateway_panel.render(&mut main_ctx, panel_area);
                     }));
                 }
                 _ => {}
@@ -934,8 +962,8 @@ impl TuiState {
         }
 
         // ── Sidebar tab switching ──
-        // Tab / Shift+Tab: cycle through sidebar tabs (Context / Changes / Todo / Diff / Files / Sessions / Memory)
-        const SIDEBAR_TAB_COUNT: usize = 7;
+        // Tab / Shift+Tab: cycle through sidebar tabs (Context / Changes / Todo / Diff / Files / Sessions / Memory / Skills / Gateway)
+        const SIDEBAR_TAB_COUNT: usize = 9;
         if key.code == KeyCode::Tab {
             self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
             return ProcessedKey::Nothing;

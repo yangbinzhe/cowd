@@ -6,7 +6,7 @@ fn call_llm(prompt: &str) -> Option<String> {
     // Try Claude API
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         let payload = serde_json::json!({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-6",
             "max_tokens": 256,
             "messages": [{"role": "user", "content": prompt}]
         });

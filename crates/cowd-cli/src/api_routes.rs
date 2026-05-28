@@ -99,14 +99,39 @@ async fn list_sessions(
 }
 
 async fn create_session(
-    AxumState(_state): AxumState<Arc<AppState>>,
-    Json(_body): Json<CreateSessionRequest>,
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<CreateSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let session_id = uuid::Uuid::new_v4().to_string();
-    tracing::info!(%session_id, "API session create requested (full runtime wiring pending)");
+    tracing::info!(%session_id, "API session create requested");
+
+    let session = runtime::Session::new();
+    let runtime = crate::build_runtime(
+        session,
+        &session_id,
+        body.model.unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
+        vec![],
+        true,
+        true,
+        None,
+        runtime::PermissionMode::WorkspaceWrite,
+        None,
+        None,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("failed to build runtime: {e}"),
+            }),
+        )
+    })?;
+
+    state.sessions.register(session_id.clone(), runtime);
+
     let info = SessionInfo {
         id: session_id,
-        status: "pending".to_string(),
+        status: "active".to_string(),
     };
     Ok((StatusCode::CREATED, Json(info)))
 }
@@ -151,7 +176,7 @@ async fn send_message(
     Path(id): Path<String>,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_arc = state.sessions.remove(&id).ok_or_else(|| {
+    let runtime_entry = state.sessions.get(&id).ok_or_else(|| {
         (StatusCode::NOT_FOUND, Json(ErrorResponse {
             error: format!("session {id} not found"),
         }))
@@ -159,16 +184,12 @@ async fn send_message(
 
     tracing::info!(%id, content_len = body.content.len(), "API message received");
 
-    let mut runtime = Arc::try_unwrap(runtime_arc).map_err(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            error: format!("session {id} runtime is still referenced"),
-        }))
-    })?;
-
     let session_id = id.clone();
-    let sessions = Arc::clone(&state.sessions);
+    let event_bus = Arc::clone(&state.event_bus);
 
-    match runtime.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none()).await {
+    let mut runtime_guard = runtime_entry.lock().await;
+
+    match runtime_guard.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none()).await {
         Ok(summary) => {
             let final_text = summary.assistant_messages.last()
                 .map(|msg| {
@@ -189,13 +210,26 @@ async fn send_message(
                 "iterations": summary.iterations,
             });
 
-            sessions.register(session_id, runtime);
+            let sse_data = serde_json::json!({
+                "type": "TurnComplete",
+                "session_id": &session_id,
+                "response": final_text,
+                "iterations": summary.iterations,
+            });
+            event_bus.broadcast(&session_id, &sse_data.to_string()).await;
 
             Ok(Json(response))
         }
         Err(e) => {
             let error_msg = e.to_string();
-            sessions.register(session_id, runtime);
+
+            let sse_data = serde_json::json!({
+                "type": "TurnError",
+                "session_id": &session_id,
+                "error": error_msg,
+            });
+            event_bus.broadcast(&session_id, &sse_data.to_string()).await;
+
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse { error: error_msg }),

@@ -1694,21 +1694,23 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     let layers = if let Some(layers_val) = mem.get("layers") {
         let l = expect_object(layers_val, "merged settings.memory.layers")?;
         LayerConfig {
-            l0_enabled: optional_bool(l, "l0Enabled", "merged settings.memory.layers")?.
-                unwrap_or(LayerConfig::default().l0_enabled),
-            l1_max_tokens: optional_u32(l, "l1MaxTokens", "merged settings.memory.layers")?
+            l0_enabled: optional_bool_dual(l, "l0_enabled", "merged settings.memory.layers")?
+                .unwrap_or(LayerConfig::default().l0_enabled),
+            l1_max_tokens: optional_u32_dual(l, "l1_max_tokens", "merged settings.memory.layers")?
                 .unwrap_or(LayerConfig::default().l1_max_tokens),
-            l2_max_tokens: optional_u32(l, "l2MaxTokens", "merged settings.memory.layers")?
+            l2_max_tokens: optional_u32_dual(l, "l2_max_tokens", "merged settings.memory.layers")?
                 .unwrap_or(LayerConfig::default().l2_max_tokens),
-            l3_search_limit: optional_u32(l, "l3SearchLimit", "merged settings.memory.layers")?
+            l3_search_limit: optional_u32_dual(l, "l3_search_limit", "merged settings.memory.layers")?
                 .unwrap_or(LayerConfig::default().l3_search_limit),
-            l4_enabled: optional_bool(l, "l4Enabled", "merged settings.memory.layers")?
+            l4_enabled: optional_bool_dual(l, "l4_enabled", "merged settings.memory.layers")?
                 .unwrap_or(LayerConfig::default().l4_enabled),
         }
     } else {
         LayerConfig::default()
     };
-    let extraction = if let Some(ext_val) = mem.get("extraction") {
+    let extraction = if let Some(ext_val) = mem.get("extraction")
+        .or_else(|| mem.get("extractor"))
+    {
         let e = expect_object(ext_val, "merged settings.memory.extraction")?;
         ExtractionConfig {
             auto_extract: optional_bool(e, "autoExtract", "merged settings.memory.extraction")?
@@ -2314,6 +2316,44 @@ fn optional_string_dual<'a>(
         return optional_string(object, &camel_key, ctx);
     }
 
+    Ok(None)
+}
+
+/// Look up a boolean config value, supporting both snake_case (preferred) and camelCase (deprecated).
+fn optional_bool_dual(
+    object: &BTreeMap<String, JsonValue>,
+    snake_key: &str,
+    ctx: &str,
+) -> Result<Option<bool>, ConfigError> {
+    if object.contains_key(snake_key) {
+        return optional_bool(object, snake_key, ctx);
+    }
+    let camel_key = to_camel_case(snake_key);
+    if object.contains_key(&camel_key) {
+        tracing::warn!(
+            "config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
+        return optional_bool(object, &camel_key, ctx);
+    }
+    Ok(None)
+}
+
+/// Look up a u32 config value, supporting both snake_case (preferred) and camelCase (deprecated).
+fn optional_u32_dual(
+    object: &BTreeMap<String, JsonValue>,
+    snake_key: &str,
+    ctx: &str,
+) -> Result<Option<u32>, ConfigError> {
+    if object.contains_key(snake_key) {
+        return optional_u32(object, snake_key, ctx);
+    }
+    let camel_key = to_camel_case(snake_key);
+    if object.contains_key(&camel_key) {
+        tracing::warn!(
+            "config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
+        return optional_u32(object, &camel_key, ctx);
+    }
     Ok(None)
 }
 
