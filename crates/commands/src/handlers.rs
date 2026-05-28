@@ -6,6 +6,15 @@ use crate::specs::SlashCommand;
 use crate::parser::{
     render_slash_command_help, SlashCommandResult,
 };
+/// Return a result that redirects the command to the agent alias system.
+/// The CLI picks up the message and sends it as an agent prompt.
+fn agent_alias(prompt_template: &str, _args: &str, session: &Session) -> Option<SlashCommandResult> {
+    Some(SlashCommandResult {
+        message: format!("Delegate to agent: {}", prompt_template),
+        session: session.clone(),
+    })
+}
+
 #[must_use]
 pub fn handle_slash_command(
     input: &str,
@@ -43,6 +52,26 @@ pub fn handle_slash_command(
             message: render_slash_command_help(),
             session: session.clone(),
         }),
+        // Agent alias commands (redirect to agent instead of returning None)
+        SlashCommand::Summary => agent_alias("/summary", "", session),
+        SlashCommand::Review { scope } => {
+            agent_alias("/review", &scope.unwrap_or_default(), session)
+        }
+        SlashCommand::Context { action } => {
+            agent_alias("/context", &action.unwrap_or_default(), session)
+        }
+        SlashCommand::Branch { name } => {
+            agent_alias("/branch", &name.unwrap_or_default(), session)
+        }
+        SlashCommand::Unknown(name)
+            if matches!(
+                name.as_str(),
+                "git" | "test" | "build" | "run" | "search" | "explain" | "fix" | "refactor"
+                    | "docs" | "web" | "perf" | "format" | "lint" | "blame" | "log" | "stash"
+            ) =>
+        {
+            agent_alias(&name, "", session)
+        }
         SlashCommand::Status
         | SlashCommand::Bughunter { .. }
         | SlashCommand::Commit
@@ -79,7 +108,6 @@ pub fn handle_slash_command(
         | SlashCommand::Files
         | SlashCommand::Fast
         | SlashCommand::Exit
-        | SlashCommand::Summary
         | SlashCommand::Desktop
         | SlashCommand::Brief
         | SlashCommand::Advisor
@@ -91,7 +119,6 @@ pub fn handle_slash_command(
         | SlashCommand::Keybindings
         | SlashCommand::PrivacySettings
         | SlashCommand::Plan { .. }
-        | SlashCommand::Review { .. }
         | SlashCommand::Tasks { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
@@ -99,10 +126,8 @@ pub fn handle_slash_command(
         | SlashCommand::Rename { .. }
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }
-        | SlashCommand::Context { .. }
         | SlashCommand::Color { .. }
         | SlashCommand::Effort { .. }
-        | SlashCommand::Branch { .. }
         | SlashCommand::Rewind { .. }
         | SlashCommand::Ide { .. }
         | SlashCommand::Tag { .. }

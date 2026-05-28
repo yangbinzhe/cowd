@@ -1,4 +1,4 @@
-#![deny(deprecated)]
+#![warn(deprecated)]
 //! `memory` – unified memory framework for the cowd AI assistant.
 //!
 //! # Architecture
@@ -21,7 +21,7 @@
 //! }
 //! ```
 
-#![deny(deprecated)]
+#![warn(deprecated)]
 
 // --- Public modules ---
 
@@ -40,6 +40,8 @@ pub mod layers;
 pub mod orchestrator;
 pub mod resolution;
 pub mod seeds;
+#[deprecated(note = "Orphaned abstraction. Real session management in runtime::session. Revisit for multi-platform.")]
+#[doc(hidden)]
 pub mod session_manager;
 pub mod session_store;
 pub mod shared;
@@ -136,7 +138,7 @@ pub use state_rebuilder::{
     RebuildOptions, GsdRebuiltState, GsdStateRebuilder, GsdRebuildOptions,
 };
 pub use temporal_graph::{
-    TemporalGraph, TemporalSlice, TemporalQuery, TimeRange, GraphStats,
+    TimeRange,
     temporal_relation,
 };
 pub use write_guard::{

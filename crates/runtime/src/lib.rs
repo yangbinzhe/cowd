@@ -10,7 +10,6 @@
 
 pub mod cowd_dirs;
 pub mod error;
-pub mod event_bus;
 pub mod storage;
 mod bash;
 pub mod bash_validation;

@@ -615,51 +615,6 @@ impl TimeRange {
     }
 }
 
-/// Graph statistics placeholder.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphStats {
-    pub total_entries: usize,
-    pub total_relations: usize,
-    pub temporal_relations: usize,
-    pub causal_chains: usize,
-}
-
-/// A temporal slice of the knowledge graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TemporalSlice {
-    pub entries: Vec<MemoryEntry>,
-    pub relations: Vec<Relation>,
-    pub time_range: TimeRange,
-    pub stats: GraphStats,
-}
-
-/// Query options for temporal graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TemporalQuery {
-    pub time_range: Option<TimeRange>,
-    pub max_depth: u32,
-}
-
-impl Default for TemporalQuery {
-    fn default() -> Self {
-        Self {
-            time_range: None,
-            max_depth: 3,
-        }
-    }
-}
-
-/// Temporal graph placeholder.
-pub struct TemporalGraph {
-    _store: Arc<dyn MemoryStore>,
-}
-
-impl TemporalGraph {
-    pub fn new(store: Arc<dyn MemoryStore>) -> Self {
-        Self { _store: store }
-    }
-}
-
 /// Helper to create a temporal relation.
 pub fn temporal_relation(
     target_id: MemoryId,
