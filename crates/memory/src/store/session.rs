@@ -38,6 +38,14 @@ fn sql_err(e: rusqlite::Error) -> MemoryError {
     MemoryError::Store(e.to_string())
 }
 
+/// Configure per-connection pragmas (foreign keys, busy timeout).
+fn set_conn_pragmas(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(sql_err)?;
+    conn.query_row("PRAGMA busy_timeout=5000", [], |_| Ok(()))
+        .map_err(sql_err)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Schema DDL
 // ---------------------------------------------------------------------------
@@ -235,7 +243,7 @@ impl SqliteSessionStore {
 
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(sql_err)?;
+        set_conn_pragmas(&conn)?;
         Ok(conn)
     }
 
@@ -694,6 +702,20 @@ mod tests {
         let mems = store.get_session_memories("s-mem").unwrap();
         assert_eq!(mems.len(), 1);
         assert_eq!(mems[0], "mem-2");
+    }
+
+    #[test]
+    fn conn_sets_busy_timeout() {
+        let store = SqliteSessionStore::open_in_memory().unwrap();
+        let conn = store.conn().unwrap();
+        let timeout: i32 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert!(
+            timeout > 0,
+            "busy_timeout should be > 0, got {}",
+            timeout
+        );
     }
 
     #[test]

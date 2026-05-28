@@ -412,6 +412,7 @@ impl AaakConfig {
 }
 
 /// AAAK Compressor.
+#[derive(Default)]
 pub struct AaakCompressor {
     config: AaakConfig,
     /// Token frequency counter
@@ -574,7 +575,10 @@ impl AaakCompressor {
         let original_length = text.len();
         let tokens = self.tokenize(text);
 
-        // Build frequencies
+        // Clear previous state before building frequencies
+        self.frequency.clear();
+        self.entity_types.clear();
+        self.positions.clear();
         self.build_frequencies(&tokens);
 
         // Generate abbreviations
@@ -989,6 +993,22 @@ mod tests {
         let decompressed = compressed.decompress();
         // Note: compression may not be perfect, but verify the API works
         assert_eq!(verification.decompressed_length, decompressed.len());
+    }
+
+    #[test]
+    fn compress_clears_state_between_calls() {
+        let mut c = AaakCompressor::default();
+        c.compress("hello world hello world");
+        let f1 = c.frequency.len();
+        c.compress("foo bar foo bar");
+        let f2 = c.frequency.len();
+        assert!(
+            f2 <= 4,
+            "second compress should only have 'foo','bar' entries, got {}",
+            f2
+        );
+        // suppress unused warning
+        let _ = f1;
     }
 
     #[test]

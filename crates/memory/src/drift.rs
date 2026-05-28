@@ -4,6 +4,8 @@
 //! entries that have become stale or contradictory relative to newer
 //! observations.
 
+use chrono::Utc;
+
 use crate::{
     config::DriftConfig,
     error::MemoryError,
@@ -23,6 +25,16 @@ pub enum DriftVerdict {
     FlagForReview { reason: String },
     /// Entry should be automatically pruned.
     Prune { reason: String },
+}
+
+/// Compute the decay delta for an entry based on elapsed wall-clock time.
+fn compute_decay_delta(
+    created_at: &chrono::DateTime<chrono::Utc>,
+    decay_per_day: f32,
+) -> f32 {
+    let elapsed = Utc::now() - *created_at;
+    let days = elapsed.num_hours() as f32 / 24.0;
+    decay_per_day * days.max(0.0)
 }
 
 /// Detects staleness and contradiction in memory entries.
@@ -58,10 +70,10 @@ impl DriftDetector {
         }
     }
 
-    /// Apply daily staleness decay to a mutable entry.
+    /// Apply daily staleness decay proportional to wall-clock time elapsed since creation.
     pub fn decay(&self, entry: &mut MemoryEntry) {
-        entry.staleness =
-            (entry.staleness + self.config.staleness_decay_per_day).clamp(0.0, 1.0);
+        let delta = compute_decay_delta(&entry.created_at, self.config.staleness_decay_per_day);
+        entry.staleness = (entry.staleness + delta).clamp(0.0, 1.0);
     }
 
     /// IDs of entries that should be pruned from `entries`.
@@ -128,6 +140,15 @@ mod tests {
     use uuid::Uuid;
 
     fn make_entry(content: &str, layer: MemoryLayer, staleness: f32) -> MemoryEntry {
+        make_entry_aged(content, layer, staleness, Utc::now())
+    }
+
+    fn make_entry_aged(
+        content: &str,
+        layer: MemoryLayer,
+        staleness: f32,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> MemoryEntry {
         MemoryEntry {
             id: Uuid::new_v4(),
             title: content.chars().take(30).collect(),
@@ -135,8 +156,8 @@ mod tests {
             layer,
             confidence: 0.8,
             staleness,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at,
+            updated_at: created_at,
             last_accessed_at: None,
             source: MemorySource::AutoExtracted,
             category: MemoryCategory::Reference,
@@ -205,9 +226,28 @@ mod tests {
             contradiction_jaccard_threshold: 0.3,
         };
         let detector = DriftDetector::new(cfg);
-        let mut entry = make_entry("test", MemoryLayer::L2, 0.0);
+        let mut entry = make_entry_aged("test", MemoryLayer::L2, 0.0, Utc::now() - chrono::Duration::days(1));
         detector.decay(&mut entry);
         assert!((entry.staleness - 0.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn decay_uses_wall_clock_time() {
+        let config = DriftConfig {
+            staleness_decay_per_day: 0.1,
+            ..Default::default()
+        };
+        let detector = DriftDetector::new(config);
+        let mut entry =
+            make_entry_aged("test", MemoryLayer::L2, 0.0, Utc::now() - chrono::Duration::days(3));
+        let old = entry.staleness;
+        detector.decay(&mut entry);
+        let delta = entry.staleness - old;
+        assert!(
+            (delta - 0.3).abs() < 0.05,
+            "3 days should add ~0.3 staleness, got {}",
+            delta
+        );
     }
 
     #[test]
