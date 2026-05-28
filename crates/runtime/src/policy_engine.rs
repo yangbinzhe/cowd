@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::green_contract::GreenLevel;
+use crate::stale_branch::BranchFreshness;
 
 const STALE_BRANCH_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 
@@ -59,7 +60,14 @@ impl PolicyCondition {
                 .iter()
                 .any(|condition| condition.matches(context)),
             Self::GreenAt { level } => context.green_level >= *level,
-            Self::StaleBranch => context.branch_freshness >= STALE_BRANCH_THRESHOLD,
+            Self::StaleBranch => {
+                // Prefer git-aware check if available, fall back to Duration proxy
+                if let Some(ref fresh) = context.stale_branch {
+                    !matches!(fresh, BranchFreshness::Fresh)
+                } else {
+                    context.branch_freshness >= STALE_BRANCH_THRESHOLD
+                }
+            }
             Self::StartupBlocked => context.blocker == LaneBlocker::Startup,
             Self::LaneCompleted => context.completed,
             Self::LaneReconciled => context.reconciled,
@@ -135,6 +143,7 @@ pub struct LaneContext {
     pub lane_id: String,
     pub green_level: GreenLevel,
     pub branch_freshness: Duration,
+    pub stale_branch: Option<BranchFreshness>,
     pub blocker: LaneBlocker,
     pub review_status: ReviewStatus,
     pub diff_scope: DiffScope,
@@ -157,6 +166,7 @@ impl LaneContext {
             lane_id: lane_id.into(),
             green_level,
             branch_freshness,
+            stale_branch: None,
             blocker,
             review_status,
             diff_scope,
@@ -172,6 +182,7 @@ impl LaneContext {
             lane_id: lane_id.into(),
             green_level: GreenLevel::TargetedTests,
             branch_freshness: Duration::from_secs(0),
+            stale_branch: None,
             blocker: LaneBlocker::None,
             review_status: ReviewStatus::Pending,
             diff_scope: DiffScope::Full,

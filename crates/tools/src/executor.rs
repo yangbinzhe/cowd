@@ -942,6 +942,7 @@ fn workspace_test_branch_preflight(
     let freshness = check_freshness(&branch, &main_ref);
     // Also populate lane context for policy evaluation
     if let Some(ref mut ctx) = lane_ctx {
+        ctx.stale_branch = Some(freshness.clone());
         ctx.branch_freshness = match &freshness {
             BranchFreshness::Stale{..} | BranchFreshness::Diverged{..} => Duration::from_secs(999999),
             BranchFreshness::Fresh => Duration::from_secs(0),
