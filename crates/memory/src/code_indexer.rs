@@ -345,6 +345,76 @@ impl CodeIndexer {
         Ok((symbols, edges))
     }
 
+    /// Scan the project root directory for all indexable source files and
+    /// index them in a single pass.
+    ///
+    /// When a [`MemoryStore`] is attached (via [`with_store`](Self::with_store)),
+    /// extracted symbols and edges are automatically persisted to the store.
+    pub async fn scan(&mut self) -> Result<IndexStats, MemoryError> {
+        let mut stats = IndexStats::default();
+
+        for entry in walkdir::WalkDir::new(&self.project_root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let path = entry.path();
+            if !IndexLanguage::is_indexable(path) {
+                continue;
+            }
+
+            stats.files_processed += 1;
+
+            match self.index_file(path) {
+                Ok((symbols, edges)) => {
+                    stats.symbols_found += symbols.len();
+                    stats.edges_found += edges.len();
+
+                    // Auto-persist to SQLite if store is available
+                    if let Some(ref store) = self.store {
+                        for sym in &symbols {
+                            if let Err(e) = store.insert_symbol(sym).await {
+                                tracing::warn!(
+                                    "code_indexer: failed to persist symbol {}: {}",
+                                    sym.name,
+                                    e
+                                );
+                            }
+                        }
+                        for edge in &edges {
+                            if let Err(e) = store.insert_edge(edge).await {
+                                tracing::warn!(
+                                    "code_indexer: failed to persist edge {:?}: {}",
+                                    edge.edge_type,
+                                    e
+                                );
+                            }
+                        }
+                    }
+
+                    // Update fingerprint after successful indexing
+                    if let Ok(fp) = Self::compute_fingerprint(path) {
+                        self.fingerprints.insert(path.to_path_buf(), fp);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("code_indexer: failed to index {:?}: {}", path, e);
+                }
+            }
+        }
+
+        if self.store.is_some() {
+            tracing::info!(
+                files = stats.files_processed,
+                symbols = stats.symbols_found,
+                edges = stats.edges_found,
+                "code_indexer: scan complete, persisted to SQLite"
+            );
+        }
+
+        Ok(stats)
+    }
+
     // -----------------------------------------------------------------------
     // Incremental indexing
     // -----------------------------------------------------------------------

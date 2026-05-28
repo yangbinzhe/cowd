@@ -33,7 +33,7 @@ use crate::{ MemoryScope, SessionResume,
         monitor::ContextWindowMonitor,
         CompressionPipeline,
     },
-    config::MemoryConfig,
+    config::{BudgetCalculator, MemoryConfig},
     context_rot::{ContextRotMonitor, RotAlert, RotMetrics},
     drift::DriftDetector,
     embedding::EmbeddingCapability,
@@ -802,14 +802,10 @@ impl CognitiveContextManager {
             }
         }
 
-        // ── Session isolation filter ──────────────────────────────────────────
+        // ── Session isolation filter (via ContextFence) ──
         if let Some(sid) = session_id {
-            entries = entries.into_iter().filter(|e| {
-                match &e.session_id {
-                    Some(entry_sid) => entry_sid == sid,
-                    None => true, // cross-session entries always visible
-                }
-            }).collect();
+            let fence = crate::context_fence::fence_from_session(sid, None, None);
+            entries = crate::context_fence::filter_through_fence(&entries, &fence).into_iter().cloned().collect();
         }
 
         // ── Step 4: check seed triggers and inject as high-priority L1 entries ──
@@ -960,6 +956,36 @@ impl CognitiveContextManager {
                         visibility: crate::types::AgentVisibility::default(),
                     });
                 }
+            }
+        }
+
+        // ── Step 7c: Hot code symbol injection ──
+        {
+            let hot_symbols = self.orchestrator.get_hot_symbols();
+            if !hot_symbols.is_empty() {
+                let entries_str: Vec<String> = hot_symbols.iter()
+                    .take(5)
+                    .map(|s| format!("{} (freq={:.1})", s.name, s.frequency))
+                    .collect();
+                entries.push(MemoryEntry {
+                    id: uuid::Uuid::new_v4(),
+                    layer: MemoryLayer::L1,
+                    category: MemoryCategory::Reference,
+                    priority: Priority::Normal,
+                    source: MemorySource::AutoExtracted,
+                    title: "Hot Code Symbols".into(),
+                    content: format!("Frequently accessed symbols: {}", entries_str.join(", ")),
+                    embedding: None,
+                    tags: vec!["hot_symbols".into(), "code".into()],
+                    relations: vec![],
+                    confidence: 0.9,
+                    access_count: 0, staleness: 0.0,
+                    created_at: Utc::now(), updated_at: Utc::now(),
+                    last_accessed_at: None,
+                    scope: MemoryScope::default(),
+                    session_id: None, source_agent: None,
+                    visibility: crate::types::AgentVisibility::default(),
+                });
             }
         }
 
@@ -2034,31 +2060,7 @@ impl CognitiveContextManager {
             .ok()
             .and_then(|g| g.clone())
             .unwrap_or_else(|| "Orchestrator".to_string());
-        self.compute_role_budget(&role)
-    }
-
-    /// Build a [`TokenBudget`] with a specific agent role multiplier.
-    fn compute_role_budget(&self, role: &str) -> TokenBudget {
-        let c = &self.config.budget;
-        let available = c
-            .context_window
-            .saturating_sub(c.reserved_system)
-            .saturating_sub(c.reserved_response);
-        let role_multiplier = match role {
-            "Planner" => 0.40,
-            "Executor" => 0.25,
-            "Reviewer" => 0.15,
-            "Orchestrator" | _ => 0.50,
-        };
-        let role_available = ((available as f32) * role_multiplier) as u64;
-        TokenBudget {
-            total: c.context_window,
-            reserved_system: c.reserved_system,
-            reserved_response: c.reserved_response,
-            allocated_memory: 0,
-            allocated_conversation: 0,
-            available: role_available,
-        }
+        BudgetCalculator::new(self.config.budget.clone()).make_role_budget(&role)
     }
 
     /// Verify cross-store consistency: KG ↔ MemoryStore ↔ Verbatim ↔ Closet.

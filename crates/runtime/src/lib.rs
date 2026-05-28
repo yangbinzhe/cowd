@@ -226,11 +226,9 @@ pub use worker_boot::{
 };
 
 pub mod cached_prompt;
-pub mod memory_provider;
 pub mod prompt_cache;
 
 pub use cached_prompt::CachedSystemPrompt;
-pub use memory_provider::{MemoryProvider, BuiltinMemoryProvider, MemoryProviderManager};
 pub use prompt_cache::{
     CacheBreakEvent, CacheUsage, PromptCache, PromptCacheConfig, PromptCachePaths,
     PromptCacheRecord, PromptCacheStats, RequestFingerprintHashes, hash_serializable,

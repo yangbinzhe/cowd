@@ -24,7 +24,7 @@ pub fn get_fact_checker() -> &'static parking_lot::Mutex<FactChecker> {
 }
 
 use crate::{
-    config::MemoryConfig,
+    config::{BudgetCalculator, MemoryConfig},
     context_fence::FenceRegistry,
     context_sync::ContextSync,
     closet::{ClosetManager, Closet},
@@ -189,6 +189,12 @@ impl MemoryOrchestrator {
         limit: usize,
     ) -> Vec<crate::code_indexer::CodeSymbol> {
         self.l2.find_relevant_symbols(query, limit).await
+    }
+
+    /// Return currently tracked hot code symbols, sorted by access frequency.
+    #[must_use]
+    pub fn get_hot_symbols(&self) -> Vec<crate::layers::essential::HotSymbol> {
+        self.l1.get_hot_symbols()
     }
 
     /// Record that source files were accessed by a tool.
@@ -803,19 +809,7 @@ impl MemoryOrchestrator {
     // -----------------------------------------------------------------------
 
     fn make_budget(&self) -> TokenBudget {
-        let c = &self.config.budget;
-        let available = c
-            .context_window
-            .saturating_sub(c.reserved_system)
-            .saturating_sub(c.reserved_response);
-        TokenBudget {
-            total: c.context_window,
-            reserved_system: c.reserved_system,
-            reserved_response: c.reserved_response,
-            allocated_memory: 0,
-            allocated_conversation: 0,
-            available,
-        }
+        BudgetCalculator::new(self.config.budget.clone()).make_budget()
     }
 }
 

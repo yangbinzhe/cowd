@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::types::TokenBudget;
+
 // ── Inlined from former config crate ─────────────────────────────────────
 
 /// Token budget configuration.
@@ -411,6 +413,65 @@ impl Default for ExtractorConfig {
             batch_size: 20,
             min_confidence: 0.6,
         }
+    }
+}
+
+// ── BudgetCalculator ────────────────────────────────────────────────────
+
+/// 统一的Token预算计算器, 消除分散在3处的计算逻辑
+#[derive(Debug, Clone)]
+pub struct BudgetCalculator {
+    config: BudgetConfig,
+}
+
+impl BudgetCalculator {
+    pub fn new(config: BudgetConfig) -> Self { Self { config } }
+
+    pub fn base_available(&self) -> u64 {
+        self.config.context_window
+            .saturating_sub(self.config.reserved_system)
+            .saturating_sub(self.config.reserved_response)
+    }
+
+    pub fn make_budget(&self) -> TokenBudget {
+        TokenBudget {
+            total: self.config.context_window,
+            reserved_system: self.config.reserved_system,
+            reserved_response: self.config.reserved_response,
+            allocated_memory: 0,
+            allocated_conversation: 0,
+            available: self.base_available(),
+        }
+    }
+
+    pub fn make_role_budget(&self, role: &str) -> TokenBudget {
+        let multiplier = Self::role_multiplier(role);
+        let role_available = (self.base_available() as f64 * multiplier) as u64;
+        TokenBudget {
+            total: self.config.context_window,
+            reserved_system: self.config.reserved_system,
+            reserved_response: self.config.reserved_response,
+            allocated_memory: 0,
+            allocated_conversation: 0,
+            available: role_available,
+        }
+    }
+
+    pub fn role_multiplier(role: &str) -> f64 {
+        match role {
+            "Planner" => 0.40,
+            "Executor" => 0.25,
+            "Reviewer" => 0.15,
+            _ => 0.50,
+        }
+    }
+
+    pub fn warning_tokens(&self) -> u64 {
+        (self.base_available() as f64 * self.config.warning_threshold as f64) as u64
+    }
+
+    pub fn critical_tokens(&self) -> u64 {
+        (self.base_available() as f64 * self.config.critical_threshold as f64) as u64
     }
 }
 
