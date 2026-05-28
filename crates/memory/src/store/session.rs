@@ -38,9 +38,10 @@ fn sql_err(e: rusqlite::Error) -> MemoryError {
     MemoryError::Store(e.to_string())
 }
 
-/// Configure per-connection pragmas (foreign keys, busy timeout).
+/// Configure per-connection pragmas (WAL mode, foreign keys, busy timeout).
 fn set_conn_pragmas(conn: &Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(sql_err)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        .map_err(sql_err)?;
     conn.query_row("PRAGMA busy_timeout=5000", [], |_| Ok(()))
         .map_err(sql_err)?;
     Ok(())

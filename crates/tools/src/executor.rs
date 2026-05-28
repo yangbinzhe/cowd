@@ -21,7 +21,7 @@ use runtime::{
     worker_boot::{Worker, WorkerReadySnapshot, WorkerStatus, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
+    GrepSearchInput, LaneCommitProvenance, LaneContext, LaneEvent, LaneEventBlocker, LaneEventName,
     LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
     PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, SharedPrompter, TaskPacket, ToolError, ToolExecutor,
 };
@@ -922,14 +922,17 @@ fn has_dangerous_paths(command: &str) -> bool {
 }
 
 fn run_bash(input: BashCommandInput) -> Result<String, String> {
-    if let Some(output) = workspace_test_branch_preflight(&input.command) {
+    if let Some(output) = workspace_test_branch_preflight(&input.command, None) {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
     }
     serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())
 }
 
-fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
+fn workspace_test_branch_preflight(
+    command: &str,
+    mut lane_ctx: Option<&mut LaneContext>,
+) -> Option<BashCommandOutput> {
     if !is_workspace_test_command(command) {
         return None;
     }
@@ -937,6 +940,13 @@ fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
     let branch = git_stdout(&["branch", "--show-current"])?;
     let main_ref = resolve_main_ref(&branch)?;
     let freshness = check_freshness(&branch, &main_ref);
+    // Also populate lane context for policy evaluation
+    if let Some(ref mut ctx) = lane_ctx {
+        ctx.branch_freshness = match &freshness {
+            BranchFreshness::Stale{..} | BranchFreshness::Diverged{..} => Duration::from_secs(999999),
+            BranchFreshness::Fresh => Duration::from_secs(0),
+        };
+    }
     match freshness {
         BranchFreshness::Fresh => None,
         BranchFreshness::Stale {
@@ -4569,7 +4579,7 @@ fn iso8601_timestamp() -> String {
 #[allow(clippy::needless_pass_by_value)]
 fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
     let _ = &input.description;
-    if let Some(output) = workspace_test_branch_preflight(&input.command) {
+    if let Some(output) = workspace_test_branch_preflight(&input.command, None) {
         return Ok(output);
     }
     let shell = detect_powershell_shell()?;

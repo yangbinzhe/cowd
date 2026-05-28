@@ -11,6 +11,7 @@ pub enum Event {
     ToolExecuted { name: String, duration_ms: u64 },
     MemoryExtracted { count: usize },
     ApprovalRequested { tool: String },
+    TextDelta { content: String },
 }
 
 #[derive(Clone)]

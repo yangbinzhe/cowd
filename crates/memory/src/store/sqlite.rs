@@ -43,10 +43,14 @@ const IN_MEMORY_PATH: &str = ":memory:";
 
 fn new_pool(db_path: &str, max_size: u32) -> Result<Pool<SqliteConnectionManager>> {
     let manager = SqliteConnectionManager::file(db_path);
-    Pool::builder()
+    let pool = Pool::builder()
         .max_size(max_size)
         .build(manager)
-        .map_err(|e| MemoryError::Store(e.to_string()))
+        .map_err(|e| MemoryError::Store(e.to_string()))?;
+    let conn = pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+        .map_err(sql_err)?;
+    Ok(pool)
 }
 
 fn sql_err(e: rusqlite::Error) -> MemoryError {
@@ -540,11 +544,9 @@ impl SqliteStore {
         Ok(store)
     }
 
-    /// Get a connection from the pool with `PRAGMA foreign_keys=ON`.
+    /// Get a connection from the pool.
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
-        let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(sql_err)?;
-        Ok(conn)
+        self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))
     }
 
     // -----------------------------------------------------------------------

@@ -11,6 +11,7 @@ use crate::parser::{
 fn agent_alias(prompt_template: &str, _args: &str, session: &Session) -> Option<SlashCommandResult> {
     Some(SlashCommandResult {
         message: format!("Delegate to agent: {}", prompt_template),
+        error: None,
         session: session.clone(),
     })
 }
@@ -27,6 +28,7 @@ pub fn handle_slash_command(
         Err(error) => {
             return Some(SlashCommandResult {
                 message: error.to_string(),
+                error: None,
                 session: session.clone(),
             });
         }
@@ -45,11 +47,13 @@ pub fn handle_slash_command(
             };
             Some(SlashCommandResult {
                 message,
+                error: None,
                 session: result.compacted_session,
             })
         }
         SlashCommand::Help => Some(SlashCommandResult {
             message: render_slash_command_help(),
+            error: None,
             session: session.clone(),
         }),
         // Agent alias commands (redirect to agent instead of returning None)
@@ -72,80 +76,13 @@ pub fn handle_slash_command(
         {
             agent_alias(&name, "", session)
         }
-        SlashCommand::Status
-        | SlashCommand::Bughunter { .. }
-        | SlashCommand::Commit
-        | SlashCommand::Pr { .. }
-        | SlashCommand::Issue { .. }
-        | SlashCommand::Ultraplan { .. }
-        | SlashCommand::Teleport { .. }
-        | SlashCommand::DebugToolCall
-        | SlashCommand::Sandbox
-        | SlashCommand::Model { .. }
-        | SlashCommand::Permissions { .. }
-        | SlashCommand::Clear { .. }
-        | SlashCommand::Cost
-        | SlashCommand::Resume { .. }
-        | SlashCommand::Config { .. }
-        | SlashCommand::Mcp { .. }
-        | SlashCommand::Memory
-        | SlashCommand::Init
-        | SlashCommand::Diff
-        | SlashCommand::Version
-        | SlashCommand::Export { .. }
-        | SlashCommand::Session { .. }
-        | SlashCommand::Plugins { .. }
-        | SlashCommand::Agents { .. }
-        | SlashCommand::Skills { .. }
-        | SlashCommand::Doctor
-        | SlashCommand::Login
-        | SlashCommand::Logout
-        | SlashCommand::Vim
-        | SlashCommand::Upgrade
-        | SlashCommand::Stats
-        | SlashCommand::Share
-        | SlashCommand::Feedback
-        | SlashCommand::Files
-        | SlashCommand::Fast
-        | SlashCommand::Exit
-        | SlashCommand::Desktop
-        | SlashCommand::Brief
-        | SlashCommand::Advisor
-        | SlashCommand::Stickers
-        | SlashCommand::Insights
-        | SlashCommand::Thinkback
-        | SlashCommand::ReleaseNotes
-        | SlashCommand::SecurityReview
-        | SlashCommand::Keybindings
-        | SlashCommand::PrivacySettings
-        | SlashCommand::Plan { .. }
-        | SlashCommand::Tasks { .. }
-        | SlashCommand::Theme { .. }
-        | SlashCommand::Voice { .. }
-        | SlashCommand::Usage { .. }
-        | SlashCommand::Rename { .. }
-        | SlashCommand::Copy { .. }
-        | SlashCommand::Hooks { .. }
-        | SlashCommand::Color { .. }
-        | SlashCommand::Effort { .. }
-        | SlashCommand::Rewind { .. }
-        | SlashCommand::Ide { .. }
-        | SlashCommand::Tag { .. }
-        | SlashCommand::OutputStyle { .. }
-        | SlashCommand::AddDir { .. }
-        | SlashCommand::History { .. }
-        | SlashCommand::Handoff { .. }
-        | SlashCommand::Closet { .. }
-        | SlashCommand::SandboxSearch { .. }
-        | SlashCommand::Retry
-        | SlashCommand::Undo
-        | SlashCommand::NewSession
-        | SlashCommand::Title { .. }
-        | SlashCommand::Compress
-        | SlashCommand::State
-        | SlashCommand::SubAgent { .. }
-        | SlashCommand::Pipeline { .. }
-        | SlashCommand::Unknown(_) => None,
+        _ => {
+            Some(SlashCommandResult {
+                message: format!("Command not yet implemented: {}", command.slash_name()),
+                error: Some("not_implemented".into()),
+                session: session.clone(),
+            })
+        }
     }
 }
 

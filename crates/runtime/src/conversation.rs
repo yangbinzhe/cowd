@@ -851,6 +851,9 @@ pub async fn run_turn_async(
                             match next_event {
                                 Ok(AssistantEvent::TextDelta(text)) => {
                                     model_current_text.push_str(&text);
+                                    if let Some(ref bus) = self.bus {
+                                        bus.emit(crate::bus::Event::TextDelta { content: text.clone() });
+                                    }
                                     model_stream_events.push(("text_delta".into(), "assistant".into(), text[..text.len().min(80)].to_string(), 3));
                                 }
                                 Ok(AssistantEvent::ThinkingDelta(thinking)) => {

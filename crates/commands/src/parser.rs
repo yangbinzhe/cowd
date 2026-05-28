@@ -915,6 +915,7 @@ pub fn render_slash_command_help() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommandResult {
     pub message: String,
+    pub error: Option<String>,
     pub session: Session,
 }
 
