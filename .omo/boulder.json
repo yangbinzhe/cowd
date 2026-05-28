@@ -29,9 +29,9 @@
       "work_id": "memory-phase2-refactor-5af22f7f",
       "active_plan": "/media/yi/Datas/workspace/cowd/.omo/plans/memory-phase2-refactor.md",
       "plan_name": "memory-phase2-refactor",
-      "status": "active",
+      "status": "completed",
       "started_at": "2026-05-28T16:35:53.867Z",
-      "updated_at": "2026-05-28T16:35:53.867Z",
+      "updated_at": "2026-05-28T16:51:10.132Z",
       "session_ids": [
         "ses_191265f12ffeSPAQCReg3dNMGG"
       ],
@@ -39,11 +39,15 @@
         "ses_191265f12ffeSPAQCReg3dNMGG": "direct"
       },
       "agent": "atlas",
-      "task_sessions": {}
+      "task_sessions": {},
+      "ended_at": "2026-05-28T16:51:10.132Z",
+      "elapsed_ms": 916265
     }
   },
   "active_work_id": "memory-phase2-refactor-5af22f7f",
-  "status": "active",
-  "updated_at": "2026-05-28T16:35:53.867Z",
-  "agent": "atlas"
+  "status": "completed",
+  "updated_at": "2026-05-28T16:51:10.132Z",
+  "agent": "atlas",
+  "ended_at": "2026-05-28T16:51:10.132Z",
+  "elapsed_ms": 916265
 }

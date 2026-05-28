@@ -46,6 +46,21 @@ Wave FINAL (全部实现完成后):
 
 ---
 
+## TODOs
+
+- [x] 1. F6 — 清理双轨接口: 删除 memory_provider.rs
+- [x] 2. F9 — 代码符号SQLite持久化: scan() + auto-persist
+- [x] 3. F7 — 统一Token预算: BudgetCalculator
+- [x] 4. F8 — 统一Session隔离: ContextFence
+- [x] 5. F10 — 热符号注入: get_hot_symbols
+
+## Final Verification Wave
+
+- [x] F1. 全量回归测试 — 330+935 pass, build pass
+- [x] F2. Oracle合规审计 — 5/5 targets met
+
+---
+
 ## Task 1: F6 — 清理双轨接口
 
 **工期**: 15min | **风险**: 零 | **涉及文件**: 3个
@@ -562,11 +577,11 @@ cargo test -p runtime
 
 ### F2: Oracle 合规审计
 
-- [ ] `grep -r "memory_provider" crates/ --include="*.rs"` 输出为空
-- [ ] `grep "make_budget\|compute_budget\|compute_role_budget" crates/memory/src/` 确认只有 BudgetCalculator 路径
-- [ ] `grep "entry.session_id == sid" crates/memory/src/cognitive.rs` 输出为空
-- [ ] `sqlite3 memory.db ".tables"` 包含 code_symbols, code_edges, symbol_memory_links
-- [ ] `grep "get_hot_symbols" crates/memory/src/cognitive.rs` 有匹配
+- [x] `grep -r "memory_provider" crates/ --include="*.rs"` 输出为空
+- [x] `grep "make_budget\|compute_budget\|compute_role_budget" crates/memory/src/` 确认只有 BudgetCalculator 路径
+- [x] `grep "entry.session_id == sid" crates/memory/src/cognitive.rs` 输出为空
+- [x] `sqlite3 memory.db ".tables"` 包含 code_symbols, code_edges, symbol_memory_links
+- [x] `grep "get_hot_symbols" crates/memory/src/cognitive.rs` 有匹配
 
 ---
 
