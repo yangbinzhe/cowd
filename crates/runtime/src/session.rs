@@ -94,6 +94,85 @@ pub struct SessionPromptEntry {
     pub text: String,
 }
 
+/// Mutations that can be applied to the message list of a session.
+///
+/// These are recorded in a [`SessionEventLog`] so the full message state
+/// can be reconstructed by replaying events, and so the state at any
+/// given point in time can be retrieved via [`SessionEventLog::messages_at`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageEvent {
+    MessageAppended {
+        message: ConversationMessage,
+    },
+    MessageEdited {
+        sequence: usize,
+        message: ConversationMessage,
+    },
+    MessagesTruncated {
+        sequence: usize,
+    },
+    SessionCompacted {
+        compaction: SessionCompaction,
+    },
+    SessionForked {
+        fork: SessionFork,
+    },
+}
+
+/// Append-only event log that tracks all mutations to a session's messages,
+/// enabling time-travel debugging and fast rebuild from event snapshots.
+#[derive(Debug, Clone, Default)]
+pub struct SessionEventLog {
+    events: Vec<MessageEvent>,
+}
+
+impl SessionEventLog {
+    pub fn new() -> Self {
+        Self { events: Vec::new() }
+    }
+
+    pub fn push(&mut self, event: MessageEvent) {
+        self.events.push(event);
+    }
+
+    /// Replay all events to produce the final message list.
+    pub fn rebuild_messages(&self) -> Vec<ConversationMessage> {
+        self.replay_events(self.events.len())
+    }
+
+    /// Replay events up to (but not including) `event_index` to produce
+    /// the message list as it existed at that point in time.
+    ///
+    /// `event_index` is clamped to `events.len()`.
+    pub fn messages_at(&self, event_index: usize) -> Vec<ConversationMessage> {
+        let idx = event_index.min(self.events.len());
+        self.replay_events(idx)
+    }
+
+    fn replay_events(&self, count: usize) -> Vec<ConversationMessage> {
+        let mut messages: Vec<ConversationMessage> = Vec::new();
+        for event in self.events.iter().take(count) {
+            match event {
+                MessageEvent::MessageAppended { message } => {
+                    messages.push(message.clone());
+                }
+                MessageEvent::MessageEdited { sequence, message } => {
+                    if *sequence < messages.len() {
+                        messages[*sequence] = message.clone();
+                    }
+                }
+                MessageEvent::MessagesTruncated { sequence } => {
+                    messages.truncate(*sequence);
+                }
+                MessageEvent::SessionCompacted { .. } | MessageEvent::SessionForked { .. } => {
+                    // metadata-only events do not alter the message list
+                }
+            }
+        }
+        messages
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionPersistence {
     path: PathBuf,

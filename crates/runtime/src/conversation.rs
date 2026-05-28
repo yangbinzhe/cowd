@@ -43,7 +43,9 @@ use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRun
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy,
 };
-use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::session::{
+    ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog,
+};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
 
@@ -267,6 +269,8 @@ bus: Option<crate::bus::EventBus>,
     tool_callback: Option<Arc<dyn ToolCallback>>,
     /// Optional session store for message dual-write (JSONL + SQLite).
     session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
+    /// Optional event log for time-travel debugging and session rebuild.
+    event_log: Option<std::sync::Mutex<SessionEventLog>>,
     /// Optional SSE callback for real-time streaming events to WebUI.
     /// Receives pre-formatted JSON event strings.
     sse_callback: Option<Arc<dyn Fn(String) + Send + Sync>>,
@@ -424,6 +428,7 @@ where
             memory_status,
             tool_callback: None,
             session_store: None,
+            event_log: None,
             sse_callback: None,
             memory_callback: None,
             approval_gate: None,
@@ -534,6 +539,13 @@ where
     #[must_use]
     pub fn with_session_store(mut self, store: Arc<memory::session_store::UnifiedSessionStore>) -> Self {
         self.session_store = Some(store);
+        self
+    }
+
+    /// Attach a [`SessionEventLog`] for time-travel debugging and session rebuild.
+    #[must_use]
+    pub fn with_event_log(mut self, log: SessionEventLog) -> Self {
+        self.event_log = Some(std::sync::Mutex::new(log));
         self
     }
 
@@ -859,7 +871,16 @@ pub async fn run_turn_async(
             {
                 let result = compact_session(&*self.session.read().await, CompactionConfig::default());
                 if result.removed_message_count > 0 {
+                    let compacted_len = result.compacted_session.messages.len();
                     *self.session.write().await = result.compacted_session;
+                    // Record compaction as a MessagesTruncated event for event log.
+                    if let Some(ref log) = self.event_log {
+                        if let Ok(mut guard) = log.lock() {
+                            guard.push(MessageEvent::MessagesTruncated {
+                                sequence: compacted_len,
+                            });
+                        }
+                    }
                     effective_system_prompt = self.prepare_memory_context(&user_input).await;
                 }
             }
@@ -1518,7 +1539,16 @@ self.record_turn_completed(&summary);
         }
 
         tracing::info!(removed = result.removed_message_count, "compaction");
+        let compacted_len = result.compacted_session.messages.len();
         *self.session.blocking_write() = result.compacted_session;
+        // Record compaction as a MessagesTruncated event for event log.
+        if let Some(ref log) = self.event_log {
+            if let Ok(mut guard) = log.lock() {
+                guard.push(MessageEvent::MessagesTruncated {
+                    sequence: compacted_len,
+                });
+            }
+        }
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
@@ -1901,6 +1931,14 @@ self.record_turn_completed(&summary);
     /// Write a message to the SQLite session store via a spawned background task.
     /// JSONL is the canonical source; SQLite failure is logged and retried once.
     fn dual_write_message(&self, msg: &crate::session::ConversationMessage, sequence: usize) {
+        // Record the message in the event log for time-travel debugging.
+        if let Some(ref log) = self.event_log {
+            if let Ok(mut guard) = log.lock() {
+                guard.push(MessageEvent::MessageAppended {
+                    message: msg.clone(),
+                });
+            }
+        }
         if let Some(ref store) = self.session_store {
             let session_id = self.session().session_id;
             let record = msg.to_session_message(&session_id, sequence);

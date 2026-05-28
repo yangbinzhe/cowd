@@ -6,6 +6,7 @@
 // Shared state: ActiveSessions, CognitiveContextManager, GlobalToolRegistry, SessionEventBus
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::{header, HeaderValue};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -18,6 +19,7 @@ use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
+use memory::{StorageTier, TieredSessionStore};
 use runtime::platform::{PlatformConfig, PlatformRuntime};
 use runtime::platform::config::PlatformRuntimeConfig;
 use runtime::mirror::MessageMirror;
@@ -251,6 +253,16 @@ pub async fn run_daemon(
         });
     }
 
+    // 6.5 Spawn tiered maintenance background task (non-blocking)
+    if let Some(store) = unified_store.as_ref() {
+        let tiered = Arc::new(TieredSessionStore::new(
+            (**store).clone(),
+            Default::default(),
+        ));
+        spawn_tiered_maintenance_task(tiered, Duration::from_secs(3600));
+        tracing::info!("tiered maintenance task spawned (interval=3600s)");
+    }
+
     // 7. HTTP server with graceful shutdown on SIGINT/SIGTERM
     let shutdown_signal = async {
         #[cfg(unix)]
@@ -292,6 +304,36 @@ pub async fn run_daemon(
     // PID file is cleaned up by PidFileGuard drop
     tracing::info!("daemon shutdown complete");
     Ok(())
+}
+
+// ── Tiered maintenance background task ──────────────────────────
+
+/// Periodically check sessions for cold-tier eligibility and archive them.
+fn spawn_tiered_maintenance_task(
+    tiered: Arc<TieredSessionStore>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let sessions = tiered.inner().list_sessions().await.unwrap_or_default();
+            for session in sessions {
+                if tiered
+                    .determine_tier(&session.session_id)
+                    .await
+                    .unwrap_or(StorageTier::Hot)
+                    == StorageTier::Cold
+                {
+                    if let Err(e) = tiered.archive_session(&session.session_id).await {
+                        tracing::warn!(session_id=%session.session_id, error=%e, "tiered: archive failed");
+                    } else {
+                        tracing::info!(session_id=%session.session_id, "tiered: archived to cold storage");
+                    }
+                }
+            }
+        }
+    })
 }
 
 // ── Unix client handler ─────────────────────────────────────────

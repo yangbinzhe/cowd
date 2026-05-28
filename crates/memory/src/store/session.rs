@@ -122,6 +122,31 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content=messages,
     content_rowid=id
 );
+
+CREATE TABLE IF NOT EXISTS session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_json TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, sequence);
+
+CREATE TABLE IF NOT EXISTS session_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    event_idx INTEGER NOT NULL,
+    messages_json TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_snapshots_session ON session_snapshots(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_snapshots_latest ON session_snapshots(session_id, event_idx DESC);
 ";
 
 /// FTS5 search result for sessions.
@@ -276,6 +301,55 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
         tool_name: row.get(6)?,
         token_usage_json: row.get(7)?,
         created_at_ms: row.get::<_, i64>(8)? as u64,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// SessionEvent / SessionSnapshot
+// ---------------------------------------------------------------------------
+
+/// A recorded mutation event for a session, enabling event-sourced
+/// reconstruction and time-travel debugging.
+///
+/// Each event is associated with a monotonically-increasing `sequence`
+/// that orders it within the session's event log.
+#[derive(Debug, Clone)]
+pub struct SessionEvent {
+    pub session_id: String,
+    pub event_type: String,
+    pub event_json: String,
+    pub sequence: usize,
+    pub created_at_ms: u64,
+}
+
+/// A full-message-list snapshot taken at a specific event index, used
+/// as a basis for fast replay from that point forward.
+#[derive(Debug, Clone)]
+pub struct SessionSnapshot {
+    pub session_id: String,
+    /// Event sequence index this snapshot corresponds to.
+    pub event_idx: usize,
+    /// Full JSON array of all messages at that point in time.
+    pub messages_json: String,
+    pub created_at_ms: u64,
+}
+
+fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
+    Ok(SessionEvent {
+        session_id: row.get(1)?,
+        event_type: row.get(2)?,
+        event_json: row.get(3)?,
+        sequence: row.get::<_, i64>(4)? as usize,
+        created_at_ms: row.get::<_, i64>(5)? as u64,
+    })
+}
+
+fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSnapshot> {
+    Ok(SessionSnapshot {
+        session_id: row.get(1)?,
+        event_idx: row.get::<_, i64>(2)? as usize,
+        messages_json: row.get(3)?,
+        created_at_ms: row.get::<_, i64>(4)? as u64,
     })
 }
 
@@ -854,6 +928,92 @@ impl SqliteSessionStore {
             }
             Ok(msgs)
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Event log
+    // -----------------------------------------------------------------------
+
+    /// Append a mutation event to the session's event log.
+    pub fn append_event(&self, event: &SessionEvent) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            r"INSERT INTO session_events
+               (session_id, event_type, event_json, sequence, created_at_ms)
+              VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                event.session_id,
+                event.event_type,
+                event.event_json,
+                event.sequence as i64,
+                event.created_at_ms as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Retrieve events for a session starting from `from_seq` (inclusive).
+    /// Ordered by sequence ascending.
+    pub fn get_events(
+        &self,
+        session_id: &str,
+        from_seq: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+                 FROM session_events
+                 WHERE session_id = ?1 AND sequence >= ?2
+                 ORDER BY sequence ASC",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![session_id, from_seq as i64], row_to_event)
+            .map_err(sql_err)?;
+        let mut events = Vec::new();
+        for r in rows {
+            events.push(r.map_err(sql_err)?);
+        }
+        Ok(events)
+    }
+
+    /// Save a full-message-list snapshot at a given event index.
+    pub fn save_snapshot(&self, snapshot: &SessionSnapshot) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            r"INSERT INTO session_snapshots
+               (session_id, event_idx, messages_json, created_at_ms)
+              VALUES (?1, ?2, ?3, ?4)",
+            params![
+                snapshot.session_id,
+                snapshot.event_idx as i64,
+                snapshot.messages_json,
+                snapshot.created_at_ms as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Return the most recent snapshot for a session, or `None`.
+    pub fn get_latest_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionSnapshot>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT id, session_id, event_idx, messages_json, created_at_ms
+             FROM session_snapshots
+             WHERE session_id = ?1
+             ORDER BY event_idx DESC
+             LIMIT 1",
+            params![session_id],
+            row_to_snapshot,
+        )
+        .optional()
+        .map_err(sql_err)
     }
 
     // -----------------------------------------------------------------------

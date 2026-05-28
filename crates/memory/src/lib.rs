@@ -64,6 +64,7 @@ pub mod code_indexer;
 pub mod session_resume;
 pub mod project_scope;
 pub mod tool_sandbox;
+pub mod tiered_store;
 
 // --- Convenience re-exports ---
 
@@ -73,7 +74,7 @@ pub use fresh_context::{
     FreshContextManager, FreshEntry, SessionTokenBudget, SessionBudgetStatus,
 };
 pub use session_store::UnifiedSessionStore;
-pub use store::session::{SessionRecord, SessionSearchResult};
+pub use store::session::{SessionEvent, SessionRecord, SessionSearchResult, SessionSnapshot};
 pub use store::verbatim::{VerbatimEntry, VerbatimSink};
 pub use embedding::{EmbeddingClient, EmbeddingCapability};
 pub use error::MemoryError;
@@ -146,6 +147,10 @@ pub use write_guard::{
     AuditOperation, IntegrityChecker, Anomaly, AnomalyReport,
 };
 pub use tool_sandbox::{ToolOutputSandbox, ToolOutputSummary};
+pub use tiered_store::{
+    TieredSessionStore, TieredSessionStoreConfig,
+    StorageTier, CompressionAlgo,
+};
 pub use closet::{Closet, ClosetPointer, ClosetEntry, ClosetManager, RANK_BOOSTS, CHAR_LIMIT, PointerKind, CodeSymbolId};
 pub use session_resume::SessionResume;
 pub use context_rot::{ContextRotMonitor, RotMetrics, RotAlert};

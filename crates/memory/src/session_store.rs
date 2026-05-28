@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::store::session::{SessionMessage, SessionRecord, SessionSearchResult, SqliteSessionStore};
+use crate::store::session::{SessionEvent, SessionMessage, SessionRecord, SessionSearchResult, SessionSnapshot, SqliteSessionStore};
 use crate::store::Result;
 
 // ---------------------------------------------------------------------------
@@ -170,6 +170,37 @@ impl UnifiedSessionStore {
     /// Remove the association between a session and a memory.
     pub async fn disassociate_memory(&self, session_id: &str, memory_id: &str) -> Result<()> {
         self.inner.lock().await.disassociate_memory(session_id, memory_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Event log
+    // -----------------------------------------------------------------------
+
+    /// Append a mutation event to the session's event log.
+    pub async fn append_event(&self, event: &SessionEvent) -> Result<()> {
+        self.inner.lock().await.append_event(event)
+    }
+
+    /// Retrieve events for a session starting from `from_seq` (inclusive).
+    pub async fn get_events(
+        &self,
+        session_id: &str,
+        from_seq: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        self.inner.lock().await.get_events(session_id, from_seq)
+    }
+
+    /// Save a full-message-list snapshot at a given event index.
+    pub async fn save_snapshot(&self, snapshot: &SessionSnapshot) -> Result<()> {
+        self.inner.lock().await.save_snapshot(snapshot)
+    }
+
+    /// Return the most recent snapshot for a session, or `None`.
+    pub async fn get_latest_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionSnapshot>> {
+        self.inner.lock().await.get_latest_snapshot(session_id)
     }
 
     // -----------------------------------------------------------------------
