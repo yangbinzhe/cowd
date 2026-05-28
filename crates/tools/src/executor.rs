@@ -4832,7 +4832,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -4849,7 +4849,7 @@ use std::path::{Component, Path, PathBuf};
     };
     use crate::{mvp_tool_specs, permission_mode_from_plugin, GlobalToolRegistry};
     use api::OutputContentBlock;
-    use runtime::ProviderFallbackConfig;
+    use runtime::{ProviderFallbackConfig, ProviderFallbackEntry};
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
         LaneEventName, LaneFailureClass, PermissionMode, PermissionPolicy, RuntimeError, Session, SharedPrompter, TaskPacket, TaskScope, ToolExecutor,
@@ -7909,10 +7909,12 @@ printf 'pwsh:%s' "$1"
         let original_xai = std::env::var_os("XAI_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
         std::env::set_var("XAI_API_KEY", "xai-test-key");
-        let fallback_config = ProviderFallbackConfig::new(
-            None,
-            vec!["grok-3".to_string(), "grok-3-mini".to_string()],
-        );
+        let fallback_config = ProviderFallbackConfig::new(vec![
+            ProviderFallbackEntry::new(
+                "claude-sonnet-4-6".to_string(),
+                vec!["grok-3".to_string(), "grok-3-mini".to_string()],
+            ),
+        ]);
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
@@ -7939,7 +7941,7 @@ printf 'pwsh:%s' "$1"
     }
 
     #[test]
-    fn provider_runtime_client_chain_primary_override_replaces_constructor_model() {
+    fn provider_runtime_client_chain_matches_entry_by_constructor_model() {
         // given
         let _guard = env_lock()
             .lock()
@@ -7948,18 +7950,20 @@ printf 'pwsh:%s' "$1"
         let original_xai = std::env::var_os("XAI_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
         std::env::set_var("XAI_API_KEY", "xai-test-key");
-        let fallback_config = ProviderFallbackConfig::new(
-            Some("grok-3".to_string()),
-            vec!["claude-sonnet-4-6".to_string()],
-        );
+        let fallback_config = ProviderFallbackConfig::new(vec![
+            ProviderFallbackEntry::new(
+                "grok-3".to_string(),
+                vec!["claude-sonnet-4-6".to_string()],
+            ),
+        ]);
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
-            "claude-haiku-4-5-20251213".to_string(),
+            "grok-3".to_string(),
             BTreeSet::new(),
             &fallback_config,
         )
-        .expect("chain with primary override should construct");
+        .expect("chain with matching entry should construct");
 
         // then
         assert_eq!(client.chain.len(), 2);
@@ -7986,13 +7990,15 @@ printf 'pwsh:%s' "$1"
         let original_xai = std::env::var_os("XAI_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
         std::env::remove_var("XAI_API_KEY");
-        let fallback_config = ProviderFallbackConfig::new(
-            None,
-            vec![
-                "grok-3".to_string(),
-                "claude-haiku-4-5-20251213".to_string(),
-            ],
-        );
+        let fallback_config = ProviderFallbackConfig::new(vec![
+            ProviderFallbackEntry::new(
+                "claude-sonnet-4-6".to_string(),
+                vec![
+                    "grok-3".to_string(),
+                    "claude-haiku-4-5-20251213".to_string(),
+                ],
+            ),
+        ]);
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(

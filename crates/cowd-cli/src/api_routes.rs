@@ -743,6 +743,7 @@ mod tests {
         let state = Arc::new(AppState {
             sessions,
             memory_manager: None,
+            unified_store: None,
             tool_registry: tools,
             config: None,
             event_bus,
@@ -770,6 +771,7 @@ mod tests {
         let state = Arc::new(AppState {
             sessions,
             memory_manager: None,
+            unified_store: None,
             tool_registry: tools,
             config: None,
             event_bus,

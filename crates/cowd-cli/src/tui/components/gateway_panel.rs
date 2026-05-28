@@ -278,6 +278,7 @@ impl Component for GatewayPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
 
     #[test]
     fn gateway_panel_defaults_stopped() {
