@@ -82,6 +82,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/:id/messages", get(get_session_messages).post(send_message))
         .route("/api/sessions/:id/stream", get(sse_stream_handler))
         .route("/api/sessions/:id/compact", post(compact_session_handler))
+        .route("/api/sessions/:id/export", get(export_session))
+        .route("/api/sessions/import", post(import_session))
         .route("/api/memory", get(memory_handler))
         .route("/api/memory/search", get(memory_search_handler))
         .route("/api/tools", get(tools_handler))
@@ -123,6 +125,45 @@ struct SendMessageRequest {
 #[derive(Deserialize)]
 struct LoginRequest {
     token: String,
+}
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    #[serde(default = "default_export_format")]
+    format: String,
+}
+
+fn default_export_format() -> String {
+    "jsonl".to_string()
+}
+
+#[derive(Deserialize)]
+struct ImportRequest {
+    format: String,
+    data: serde_json::Value,
+}
+
+// ── JSON value conversion helper ─────────────────────────────────
+
+/// Convert `serde_json::Value` → `runtime::JsonValue` so import payloads
+/// parsed with serde can be fed to `ConversationMessage::from_json()`.
+fn serde_value_to_json_value(v: &serde_json::Value) -> runtime::JsonValue {
+    match v {
+        serde_json::Value::Null => runtime::JsonValue::Null,
+        serde_json::Value::Bool(b) => runtime::JsonValue::Bool(*b),
+        serde_json::Value::Number(n) => {
+            runtime::JsonValue::Number(n.as_i64().unwrap_or(0))
+        }
+        serde_json::Value::String(s) => runtime::JsonValue::String(s.clone()),
+        serde_json::Value::Array(arr) => runtime::JsonValue::Array(
+            arr.iter().map(serde_value_to_json_value).collect(),
+        ),
+        serde_json::Value::Object(map) => runtime::JsonValue::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), serde_value_to_json_value(v)))
+                .collect(),
+        ),
+    }
 }
 
 // ── Handlers ───────────────────────────────────────────────────
@@ -520,6 +561,274 @@ async fn compact_session_handler(
         "removed_message_count": result.removed_message_count,
         "summary": result.formatted_summary,
     })))
+}
+
+// ── Session export handler ─────────────────────────────────────
+
+async fn export_session(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ExportQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime_entry = state.sessions.get(&id).ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(ErrorResponse {
+            error: format!("session {id} not found"),
+        }))
+    })?;
+
+    let runtime_guard = runtime_entry.lock().await;
+    let session = runtime_guard.session();
+
+    let jsonl = session.export_jsonl().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("export failed: {e}"),
+            }),
+        )
+    })?;
+
+    match query.format.as_str() {
+        "jsonl" => Ok((
+            StatusCode::OK,
+            [("content-type", "application/x-jsonlines")],
+            jsonl,
+        )
+            .into_response()),
+        "json" => {
+            let messages: Vec<serde_json::Value> = jsonl
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        return None;
+                    }
+                    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                    v.get("message").cloned()
+                })
+                .collect();
+            Ok(Json(serde_json::json!({
+                "session_id": id,
+                "format": "json",
+                "message_count": messages.len(),
+                "messages": messages,
+            }))
+                .into_response())
+        }
+        "markdown" => {
+            let md = convert_jsonl_to_markdown(&jsonl);
+            Ok(Json(serde_json::json!({
+                "session_id": id,
+                "format": "markdown",
+                "message_count": md.lines().filter(|l| l.starts_with("## ")).count(),
+                "markdown": md,
+            }))
+                .into_response())
+        }
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("unsupported format: {other}. Use jsonl, json, or markdown"),
+            }),
+        )),
+    }
+}
+
+/// Render exported JSONL lines as a human-readable Markdown transcript.
+fn convert_jsonl_to_markdown(jsonl: &str) -> String {
+    let mut out = String::new();
+    for line in jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(msg) = v.get("message") else {
+            continue;
+        };
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("unknown");
+        let role_heading = match role {
+            "user" => "## User",
+            "assistant" => "## Assistant",
+            "system" => "## System",
+            "tool" => "## Tool",
+            _ => "## Unknown",
+        };
+        out.push_str(role_heading);
+        out.push('\n');
+
+        if let Some(blocks) = msg.get("blocks").and_then(|b| b.as_array()) {
+            for block in blocks {
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                    }
+                    Some("thinking") => {
+                        if let Some(thinking) = block.get("thinking").and_then(|t| t.as_str()) {
+                            out.push_str("> ");
+                            out.push_str(thinking);
+                            out.push('\n');
+                        }
+                    }
+                    Some("tool_use") => {
+                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                        let input = block.get("input").and_then(|i| i.as_str()).unwrap_or("");
+                        out.push_str(&format!("```tool_use\n{name}\n{input}\n```\n"));
+                    }
+                    Some("tool_result") => {
+                        let tool_name = block.get("tool_name").and_then(|n| n.as_str()).unwrap_or("?");
+                        let output = block.get("output").and_then(|o| o.as_str()).unwrap_or("");
+                        let is_error = block.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+                        let prefix = if is_error { "Error" } else { "Result" };
+                        out.push_str(&format!("```tool_result [{prefix} – {tool_name}]\n{output}\n```\n"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+// ── Session import handler ─────────────────────────────────────
+
+async fn import_session(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<ImportRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    let messages: Vec<runtime::ConversationMessage> = match body.format.as_str() {
+        "jsonl" => {
+            let jsonl_str = body.data.as_str().ok_or_else(|| {
+                (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+                    error: "data field must be a string for jsonl format".to_string(),
+                }))
+            })?;
+            parse_jsonl_to_messages(jsonl_str)?
+        }
+        "json" => {
+            let arr = body.data.as_array().ok_or_else(|| {
+                (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+                    error: "data field must be an array for json format".to_string(),
+                }))
+            })?;
+            arr.iter()
+                .map(|v| {
+                    let jv = serde_value_to_json_value(v);
+                    runtime::ConversationMessage::from_json(&jv).map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse {
+                                error: format!("invalid message: {e}"),
+                            }),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("unsupported format: {other}. Use jsonl or json"),
+                }),
+            ));
+        }
+    };
+
+    let imported_count = messages.len();
+
+    if let Some(ref store) = state.unified_store {
+        let now = chrono::Utc::now().to_rfc3339();
+        let record = memory::SessionRecord {
+            session_id: session_id.clone(),
+            platform: "api".to_string(),
+            chat_id: "import".to_string(),
+            user_id: None,
+            model: None,
+            created_at: now.clone(),
+            last_activity: now.clone(),
+            message_count: imported_count as i64,
+            reset_policy: "preserve".to_string(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
+        };
+        store.upsert_session(&record).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to create session record: {e}"),
+                }),
+            )
+        })?;
+
+        let session_msgs: Vec<memory::store::session::SessionMessage> = messages
+            .iter()
+            .enumerate()
+            .map(|(seq, msg)| msg.to_session_message(&session_id, seq))
+            .collect();
+
+        store.insert_messages_batch(&session_msgs).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to insert messages: {e}"),
+                }),
+            )
+        })?;
+
+        tracing::info!(%session_id, count = imported_count, "API session imported");
+    }
+
+    Ok(Json(serde_json::json!({
+        "session_id": session_id,
+        "imported_count": imported_count,
+    })))
+}
+
+/// Parse a JSONL string, extracting only message records and converting them
+/// to [`ConversationMessage`] values.
+fn parse_jsonl_to_messages(
+    jsonl_str: &str,
+) -> Result<Vec<runtime::ConversationMessage>, (StatusCode, Json<ErrorResponse>)> {
+    let mut messages = Vec::new();
+    for (line_num, raw_line) in jsonl_str.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid JSONL at line {}: {e}", line_num + 1),
+                }),
+            )
+        })?;
+        let Some(msg_val) = v.get("message") else {
+            continue;
+        };
+        let jv = serde_value_to_json_value(msg_val);
+        let msg = runtime::ConversationMessage::from_json(&jv).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid message at line {}: {e}", line_num + 1),
+                }),
+            )
+        })?;
+        messages.push(msg);
+    }
+    Ok(messages)
 }
 
 // ── Auth handlers (public) ──────────────────────────────────────

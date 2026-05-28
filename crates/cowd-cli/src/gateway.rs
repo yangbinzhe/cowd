@@ -5,6 +5,15 @@ use tokio::sync::Mutex;
 
 use crate::BuiltRuntime;
 
+/// Callback trait for session lifecycle events.
+///
+/// Implementors receive notifications when sessions are registered or
+/// removed from the `ActiveSessions` registry.
+pub trait SessionLifecycle: Send + Sync {
+    fn register(&self, id: &str);
+    fn unregister(&self, id: &str);
+}
+
 /// Default maximum number of concurrent sessions.
 const DEFAULT_MAX_SESSIONS: usize = 100;
 
@@ -19,6 +28,7 @@ type SessionEntry = Arc<Mutex<BuiltRuntime>>;
 pub struct ActiveSessions {
     sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
     max_sessions: usize,
+    lifecycle: Option<Arc<dyn SessionLifecycle>>,
 }
 
 impl ActiveSessions {
@@ -27,6 +37,7 @@ impl ActiveSessions {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             max_sessions: DEFAULT_MAX_SESSIONS,
+            lifecycle: None,
         }
     }
 
@@ -36,7 +47,15 @@ impl ActiveSessions {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             max_sessions: max,
+            lifecycle: None,
         }
+    }
+
+    /// Attach a [`SessionLifecycle`] observer.
+    #[must_use]
+    pub fn with_lifecycle(mut self, lifecycle: Arc<dyn SessionLifecycle>) -> Self {
+        self.lifecycle = Some(lifecycle);
+        self
     }
 
     /// Look up a session by its ID. Returns `None` if the session is not registered.
@@ -73,6 +92,9 @@ impl ActiveSessions {
                 self.max_sessions
             ));
         }
+        if let Some(ref lifecycle) = self.lifecycle {
+            lifecycle.register(&id);
+        }
         Ok(map.insert(id, Arc::new(Mutex::new(runtime))))
     }
 
@@ -92,6 +114,9 @@ impl ActiveSessions {
 
     /// Remove and drop a session by ID. Returns the removed runtime, if any.
     pub fn remove(&self, id: &str) -> Option<SessionEntry> {
+        if let Some(ref lifecycle) = self.lifecycle {
+            lifecycle.unregister(id);
+        }
         self.sessions
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

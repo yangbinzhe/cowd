@@ -884,6 +884,43 @@ impl SqliteSessionStore {
         Ok(removed)
     }
 
+    /// Delete sessions whose `last_activity` is older than `cutoff_iso8601`,
+    /// cleaning up both the SQLite records and any corresponding JSONL/JSON
+    /// files on disk under `sessions_dir`.
+    ///
+    /// Returns the number of sessions that were removed.
+    pub fn prune_with_files(&self, cutoff_iso8601: &str, sessions_dir: &Path) -> Result<usize> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare("SELECT session_id FROM sessions WHERE last_activity < ?1")
+            .map_err(sql_err)?;
+        let ids: Vec<String> = stmt
+            .query_map(params![cutoff_iso8601], |row| row.get::<_, String>(0))
+            .map_err(sql_err)?
+            .filter_map(|r| r.ok())
+            .collect();
+        let count = ids.len();
+        for id in &ids {
+            self.delete_session(id)?;
+            for ext in &["jsonl", "json"] {
+                let path = sessions_dir.join(format!("{id}.{ext}"));
+                let _ = std::fs::remove_file(&path);
+                if *ext == "jsonl" {
+                    if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name();
+                            let name_str = name.to_string_lossy();
+                            if name_str.starts_with(&format!("{id}.rot-")) && name_str.ends_with(".jsonl") {
+                                let _ = std::fs::remove_file(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
     /// Mark a session as closed.
     ///
     /// Updates the session's status to `'closed'` and refreshes
