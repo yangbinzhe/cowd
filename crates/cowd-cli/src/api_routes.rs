@@ -244,27 +244,43 @@ async fn send_message(
     let session_id = id.clone();
     let event_bus = Arc::clone(&state.event_bus);
 
-    let mut runtime_guard = runtime_entry.lock().await;
-
-    // Subscribe runtime EventBus → forward TextDelta to SessionEventBus
-    if let Some(bus) = runtime_guard.bus() {
-        let mut rx = bus.subscribe();
-        let eb = event_bus.clone();
-        let sid = session_id.clone();
-        tokio::spawn(async move {
-            while let Ok(event) = rx.recv().await {
-                if let runtime::bus::Event::TextDelta { content } = event {
-                    let sse = serde_json::json!({"type":"TextDelta","content":content});
-                    let _ = eb.broadcast(&sid, &sse.to_string()).await;
+    // Phase 1: Subscribe runtime EventBus → forward TextDelta to SessionEventBus
+    // This phase is Send — it only spawns a background task and drops the guard.
+    {
+        let runtime_guard = runtime_entry.lock().await;
+        if let Some(bus) = runtime_guard.bus() {
+            let mut rx = bus.subscribe();
+            let eb = event_bus.clone();
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                while let Ok(event) = rx.recv().await {
+                    if let runtime::bus::Event::TextDelta { content } = event {
+                        let sse = serde_json::json!({"type":"TextDelta","content":content});
+                        let _ = eb.broadcast(&sid, &sse.to_string()).await;
+                    }
                 }
-            }
-        });
-    }
+            });
+        }
+    } // runtime_guard dropped — no MutexGuard held across the .await below
 
     const TURN_TIMEOUT: Duration = Duration::from_secs(300);
 
-    match timeout(TURN_TIMEOUT, runtime_guard.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none())).await {
-        Ok(Ok(summary)) => {
+    // Phase 2: Run turn in spawn_blocking — ConversationRuntime::run_turn_async
+    // internally holds std::sync::MutexGuard across .await, making its future !Send.
+    // spawn_blocking runs this on a dedicated thread so the axum handler future stays Send.
+    let content = body.content;
+    let rt_entry = runtime_entry.clone();
+    let turn_result = tokio::task::spawn_blocking(move || {
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(async move {
+            let mut runtime_guard = rt_entry.lock().await;
+            timeout(TURN_TIMEOUT, runtime_guard.run_turn_async(&content, &runtime::permissions::SharedPrompter::none())).await
+        })
+    }).await;
+
+    // Phase 3: Process result — all work here is Send (tokio::sync channels, serde, Json)
+    match turn_result {
+        Ok(Ok(Ok(summary))) => {
             let final_text = summary.assistant_messages.last()
                 .map(|msg| {
                     msg.blocks.iter()
@@ -294,7 +310,7 @@ async fn send_message(
 
             Ok(Json(response))
         }
-        Ok(Err(e)) => {
+        Ok(Ok(Err(e))) => {
             let error_msg = e.to_string();
 
             let sse_data = serde_json::json!({
@@ -309,7 +325,7 @@ async fn send_message(
                 Json(ErrorResponse { error: error_msg }),
             ))
         }
-        Err(_elapsed) => {
+        Ok(Err(_elapsed)) => {
             let error_msg = format!("turn timed out after {}s", TURN_TIMEOUT.as_secs());
 
             let sse_data = serde_json::json!({
@@ -324,6 +340,10 @@ async fn send_message(
                 Json(ErrorResponse { error: error_msg }),
             ))
         }
+        Err(join_err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: format!("task join error: {join_err}") }),
+        )),
     }
 }
 

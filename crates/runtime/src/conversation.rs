@@ -265,6 +265,9 @@ bus: Option<crate::bus::EventBus>,
     memory_status: Option<String>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
+    /// Optional SSE callback for real-time streaming events to WebUI.
+    /// Receives pre-formatted JSON event strings.
+    sse_callback: Option<Arc<dyn Fn(String) + Send + Sync>>,
     /// Optional memory lifecycle callback for TUI memory events.
     memory_callback: Option<Arc<dyn MemoryCallback>>,
     /// Optional smart approval gate for intelligent command approval (P0-1).
@@ -291,6 +294,8 @@ bus: Option<crate::bus::EventBus>,
     destructive_semaphore: Arc<Semaphore>,
     /// T4: Semaphore for default/ReadOnly tool concurrency (permits: 8).
     default_semaphore: Arc<Semaphore>,
+    /// Maximum duration for a single tool execution. `None` means no timeout.
+    tool_timeout: Option<Duration>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -416,6 +421,7 @@ where
             memory_manager,
             memory_status,
             tool_callback: None,
+            sse_callback: None,
             memory_callback: None,
             approval_gate: None,
             effect_handler: None,
@@ -435,6 +441,7 @@ where
                 crate::tool_orchestrator::ToolSafetyCategory::Destructive.max_concurrency(),
             )),
             default_semaphore: Arc::new(Semaphore::new(8)),
+            tool_timeout: Some(Duration::from_secs(120)),
         }
     }
 
@@ -442,6 +449,19 @@ where
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
         self
+    }
+
+    #[must_use]
+    pub fn with_tool_timeout(mut self, timeout: Duration) -> Self {
+        self.tool_timeout = Some(timeout);
+        self
+    }
+
+    /// Return a new subscriber for runtime bus events.
+    /// Returns `None` if no bus has been wired.
+    #[must_use]
+    pub fn subscribe_to_bus(&self) -> Option<tokio::sync::broadcast::Receiver<crate::bus::Event>> {
+        self.bus.as_ref().map(|bus| bus.subscribe())
     }
 
     /// Return a human-readable description of memory subsystem health.
@@ -485,6 +505,22 @@ where
     pub fn with_tool_callback(mut self, callback: Arc<dyn ToolCallback>) -> Self {
         self.tool_callback = Some(callback);
         self
+    }
+
+    /// # Safety
+    /// The callback MUST NOT capture an `Arc` to the `ConversationRuntime`
+    /// itself, as this would create a reference cycle and leak memory.
+    /// The runtime uses `Arc` ownership; callbacks should use `Weak` if
+    /// they need to reference the runtime.
+    #[must_use]
+    pub fn with_sse_callback(mut self, callback: Arc<dyn Fn(String) + Send + Sync>) -> Self {
+        self.sse_callback = Some(callback);
+        self
+    }
+
+    /// Set the SSE callback on an already-constructed runtime instance.
+    pub fn set_sse_callback(&mut self, callback: Arc<dyn Fn(String) + Send + Sync>) {
+        self.sse_callback = Some(callback);
     }
 
     /// # Safety
