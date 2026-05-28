@@ -18,8 +18,14 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     runner.run("TUI→API: send /status, verify API sees session", || {
         tui.send("/status")?;
         tui.enter()?;
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        let body = api.get("/api/sessions")?;
+        // Wait for session list via API polling (max 10s)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut body = String::new();
+        while std::time::Instant::now() < deadline {
+            body = api.get("/api/sessions")?;
+            if body.contains("sessions") && body.contains("id") { break; }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
         // LLM validates session data
         llm::validate_output(&body, "The API response should be valid JSON containing a 'sessions' array with at least one session entry. Each session should have an 'id' field.")
             .or_else(|_| {
@@ -37,8 +43,14 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         tui.send(&prompt)?;
         tui.enter()?;
 
-        std::thread::sleep(std::time::Duration::from_secs(30));
-        let tui_output = tui.capture()?;
+        // Wait for completion via TUI capture polling (max 35s)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+        let mut tui_output = String::new();
+        while std::time::Instant::now() < deadline {
+            tui_output = tui.capture()?;
+            if tui_output.len() > 200 { break; }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
         tui.screenshot("e2e_output.txt")?;
 
         // LLM validates TUI output

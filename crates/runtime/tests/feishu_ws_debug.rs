@@ -8,8 +8,8 @@ use reqwest;
 #[tokio::test]
 #[ignore]
 async fn test_ws_raw_dump() {
-    let app_id = "cli_a90340506db89cd9";
-    let app_secret = "jalBb4gBs41U9IEAULXTCdiG4QaMrDJd";
+    let app_id = std::env::var("FEISHU_APP_ID").expect("FEISHU_APP_ID must be set");
+    let app_secret = std::env::var("FEISHU_APP_SECRET").expect("FEISHU_APP_SECRET must be set");
 
     // 1. Get WS URL from Feishu (correct endpoint)
     println!("\n=== Step 1: Get WebSocket URL ===");

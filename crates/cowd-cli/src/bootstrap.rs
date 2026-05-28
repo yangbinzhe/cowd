@@ -72,10 +72,17 @@ pub fn run_bootstrap() -> Result<(), Box<dyn std::error::Error>> {
     // 生成配置
     let config_content = generate_config(&api_key, gateway_enabled, gateway_port, &gateway_token);
     
-    // 写入配置文件
+    // 写入配置文件 (0o600 — only owner can read the API key)
     fs::write(&config_file, config_content)?;
-    
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_file, std::fs::Permissions::from_mode(0o600)).ok();
+    }
+
     println!("\n✓ 配置文件已创建: {}", config_file.display());
+    println!("⚠️  WARNING: API keys are stored in plaintext in this file.");
+    println!("   Ensure the file is protected (0o600 permissions set) and");
     println!("\n下一步:");
     println!("  1. 编辑配置文件添加更多 Provider 配置");
     println!("  2. 运行 'cowd --help' 查看使用说明");

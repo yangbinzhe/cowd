@@ -18,9 +18,9 @@
 //  13. Input history navigation
 // -------------------------------------------------------------------
 
-use crate::tui::app::{App, Panel};
+use crate::tui::app::App;
 use crate::tui::state::{ProcessedKey, TuiState};
-use crate::tui::test_utils::{MockTerminal, MockEventSender, app_with_messages, app_streaming};
+use crate::tui::test_utils::{MockTerminal, app_with_messages};
 use crate::tui::TuiEvent;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -83,25 +83,27 @@ fn integration_render_chat_view_visible() {
 #[test]
 fn integration_panel_switch() {
     let mut state = TuiState::new("test-model", "test-session");
-    assert_eq!(state.current_panel, Panel::Chat);
+    // Default tab is Chat (index 0)
+    assert_eq!(state.sidebar_active_tab, 0);
+
+    // Tab cycles through panels: 0→1→2→3→4→5→0
+    state.handle_input(key(KeyCode::Tab));
+    assert_eq!(state.sidebar_active_tab, 1);
 
     state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.current_panel, Panel::Gateway);
+    assert_eq!(state.sidebar_active_tab, 2);
 
     state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.current_panel, Panel::Files);
+    assert_eq!(state.sidebar_active_tab, 3);
 
     state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.current_panel, Panel::Memory);
+    assert_eq!(state.sidebar_active_tab, 4);
 
     state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.current_panel, Panel::Skills);
+    assert_eq!(state.sidebar_active_tab, 5);
 
     state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.current_panel, Panel::Delegate);
-
-    state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.current_panel, Panel::Chat);
+    assert_eq!(state.sidebar_active_tab, 0);
 }
 
 #[test]

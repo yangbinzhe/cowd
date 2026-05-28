@@ -31,7 +31,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
 
     runner.run("Input history Alt+Up", || {
         tui.send("test history")?; tui.enter()?;
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        tui.wait_for("history", 3).ok();
         tui.send_alt("Up")?; std::thread::sleep(std::time::Duration::from_millis(300));
         Ok(())
     });

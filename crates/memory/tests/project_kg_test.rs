@@ -118,8 +118,9 @@ fn extracts_rust_impl_blocks() {
         tmp.path(),
         "src/lib.rs",
         r#"
+struct MyStruct;
 impl MyStruct {
-    fn new() -> Self { todo!() }
+    fn new() -> Self { Self }
 }
 impl SomeTrait for MyStruct {
     fn do_thing() {}

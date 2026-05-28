@@ -47,4 +47,5 @@ unsafe_code = "allow"
 mock-anthropic-service = { path = "../mock-anthropic-service" }
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
 

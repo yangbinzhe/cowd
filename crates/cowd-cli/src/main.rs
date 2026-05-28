@@ -28,7 +28,7 @@ use std::os::unix::io::FromRawFd;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
@@ -87,6 +87,46 @@ pub(crate) const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
     api::max_tokens_for_model(model)
 }
+/// Global list of daemon child processes that must be reaped.
+/// Children are adopted (stored here) instead of dropping the handle,
+/// which prevents zombie processes when the daemon exits.
+static DAEMON_CHILDREN: LazyLock<Mutex<Vec<Child>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Adopt a daemon child process — store it so the handle is not dropped.
+/// Returns the child's PID.
+fn adopt_daemon_child(child: Child) -> u32 {
+    let pid = child.id();
+    if let Ok(mut children) = DAEMON_CHILDREN.lock() {
+        children.push(child);
+    }
+    pid
+}
+
+/// Set up SIGCHLD handler to auto-reap child processes (prevent zombies).
+#[cfg(unix)]
+fn setup_sigchld_handler() {
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+    }
+}
+
+/// Try to reap any exited daemon children. Called periodically.
+fn reap_daemon_children() {
+    if let Ok(mut children) = DAEMON_CHILDREN.lock() {
+        children.retain_mut(|child| match child.try_wait() {
+            Ok(Some(status)) => {
+                tracing::debug!(pid = child.id(), code = status.code(), "daemon child reaped");
+                false
+            }
+            Ok(None) => true,  // still running
+            Err(e) => {
+                tracing::warn!(pid = child.id(), error = %e, "failed to wait on daemon child");
+                false
+            }
+        });
+    }
+}
+
 static SHARED_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -301,6 +341,9 @@ fn init_logging() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
 
+    // Set up SIGCHLD handler to auto-reap daemon child processes
+    setup_sigchld_handler();
+
     // 检查是否需要引导配置
     if bootstrap::needs_bootstrap() {
         bootstrap::run_bootstrap()?;
@@ -376,14 +419,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let sock = std::path::Path::new("/tmp/cowd.sock");
             if !sock.exists() {
                 tracing::info!("daemon not running, auto-starting...");
+                setup_sigchld_handler();
                 if let Ok(exe) = std::env::current_exe() {
-                    let _ = std::process::Command::new(&exe)
+                    match std::process::Command::new(&exe)
                         .arg("gateway")
                         .arg("run")
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
-                        .spawn();
+                        .spawn()
+                    {
+                        Ok(child) => {
+                            let pid = adopt_daemon_child(child);
+                            tracing::info!(pid, "daemon auto-started for REPL");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to auto-start daemon");
+                        }
+                    }
                     // Wait for socket to appear (max 5 seconds)
                     for _ in 0..50 {
                         if sock.exists() {
@@ -397,6 +450,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         CliAction::Gateway { action, output_format } => run_gateway_action(&action, output_format)?,
         CliAction::Install { systemd, path } => run_install(systemd, path.as_deref())?,
+        CliAction::Prompt {
+            text,
+            model,
+            allowed_tools,
+            permission_mode,
+            base_commit,
+            reasoning_effort,
+            allow_broad_cwd,
+            compact,
+            output_format,
+        } => run_prompt(
+            &text,
+            model,
+            allowed_tools,
+            permission_mode,
+            base_commit,
+            reasoning_effort,
+            allow_broad_cwd,
+            compact,
+            output_format,
+        )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -415,6 +489,7 @@ fn run_gateway_action(
                 println!("Gateway is already running");
                 return Ok(());
             }
+            setup_sigchld_handler();
             let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
             tracing::info!(binary = %exe.display(), "gateway start: spawning daemon");
             let child = std::process::Command::new(&exe)
@@ -425,8 +500,9 @@ fn run_gateway_action(
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .map_err(|e| format!("failed to start gateway daemon: {e}"))?;
-            println!("Gateway started (pid: {})", child.id());
-            tracing::info!(pid = child.id(), "gateway daemon spawned");
+            let pid = adopt_daemon_child(child);
+            println!("Gateway started (pid: {pid})");
+            tracing::info!(pid, "gateway daemon spawned");
             Ok(())
         }
         GatewayAction::Stop => {
@@ -516,6 +592,7 @@ fn run_gateway_action(
             Ok(())
         }
         GatewayAction::Restart => {
+            setup_sigchld_handler();
             server::stop_server().map_err(|e| e.to_string())?;
             tracing::info!("gateway restart: stopped, re-spawning");
             let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
@@ -527,8 +604,9 @@ fn run_gateway_action(
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .map_err(|e| format!("failed to start gateway daemon: {e}"))?;
-            println!("Gateway restarted (pid: {})", child.id());
-            tracing::info!(pid = child.id(), "gateway restarted");
+            let pid = adopt_daemon_child(child);
+            println!("Gateway restarted (pid: {pid})");
+            tracing::info!(pid, "gateway restarted");
             Ok(())
         }
     }
@@ -634,6 +712,17 @@ pub(crate) enum CliAction {
         systemd: bool,
         path: Option<String>,
     },
+    Prompt {
+        text: String,
+        model: String,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        base_commit: Option<String>,
+        reasoning_effort: Option<String>,
+        allow_broad_cwd: bool,
+        compact: bool,
+        output_format: CliOutputFormat,
+    },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
@@ -677,6 +766,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
+    let mut compact = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -785,6 +875,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--allow-broad-cwd" => {
                 allow_broad_cwd = true;
+                index += 1;
+            }
+            "--compact" => {
+                compact = true;
                 index += 1;
             }
             "--tui" => {
@@ -911,6 +1005,23 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "export" => parse_export_args(&rest[1..], output_format),
         "install" => parse_install_args(&rest[1..], output_format),
         "gateway" => parse_gateway_args(&rest[1..], output_format),
+        "prompt" => {
+            let text = rest[1..].join(" ");
+            if text.trim().is_empty() {
+                return Err("missing prompt text. Usage: cowd prompt \"your text\"".to_string());
+            }
+            Ok(CliAction::Prompt {
+                text,
+                model,
+                allowed_tools,
+                permission_mode,
+                base_commit,
+                reasoning_effort: reasoning_effort.clone(),
+                allow_broad_cwd,
+                compact,
+                output_format,
+            })
+        }
 
         other if other.starts_with('/') => parse_direct_slash_cli_action(
             &rest,
@@ -1159,7 +1270,7 @@ fn default_permission_mode() -> PermissionMode {
         .and_then(normalize_permission_mode)
         .map(permission_mode_from_label)
         .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::DangerFullAccess)
+        .unwrap_or(PermissionMode::WorkspaceWrite)
 }
 
 fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
@@ -2763,7 +2874,9 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
             None,
             None,
         )?;
-        active_sessions.register(cli.session.id.clone(), registry_runtime);
+        if let Err(e) = active_sessions.register(cli.session.id.clone(), registry_runtime) {
+            tracing::warn!("failed to register TUI session: {e}");
+        }
     }
     cli.set_active_sessions(active_sessions.clone());
     state.set_active_sessions(active_sessions);
@@ -4498,7 +4611,9 @@ impl LiveCli {
                         None,
                         None,
                     )?;
-                    as2.register(session_id.clone(), registry_runtime);
+                    if let Err(e) = as2.register(session_id.clone(), registry_runtime) {
+                        tracing::warn!("failed to register resumed session in ActiveSessions: {e}");
+                    }
                 }
                 self.replace_runtime(runtime)?;
                 self.session = SessionHandle {
@@ -4546,7 +4661,9 @@ impl LiveCli {
                         None,
                         None,
                     )?;
-                    as2.register(session_id.clone(), registry_runtime);
+                    if let Err(e) = as2.register(session_id.clone(), registry_runtime) {
+                        tracing::warn!("failed to register new session in ActiveSessions: {e}");
+                    }
                 }
                 self.replace_runtime(runtime)?;
                 self.session = handle;
@@ -6390,6 +6507,69 @@ fn summarize_tool_payload_for_markdown(payload: &str) -> String {
     truncate_for_summary(&compact, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT)
 }
 
+fn run_prompt(
+    text: &str,
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    base_commit: Option<String>,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
+    compact: bool,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
+    run_stale_base_preflight(base_commit.as_deref());
+    let resolved_model = resolve_repl_model(model);
+    let system_prompt = build_system_prompt()?;
+    let session_state = new_cli_session()?;
+    let session = create_managed_session_handle(&session_state.session_id)?;
+    let mut runtime = build_runtime(
+        session_state.with_persistence_path(session.path.clone()),
+        &session.id,
+        resolved_model,
+        system_prompt,
+        true,
+        false,
+        allowed_tools,
+        permission_mode,
+        None,
+        None,
+    )?;
+    if let Some(effort) = reasoning_effort {
+        if let Some(rt) = runtime.runtime.as_mut() {
+            rt.api_client_mut().set_reasoning_effort(Some(effort));
+        }
+    }
+    let prompter = runtime::permissions::SharedPrompter::new(Box::new(
+        CliPermissionPrompter::new(permission_mode),
+    ));
+    let handle = tokio::runtime::Handle::try_current()
+        .unwrap_or_else(|_| SHARED_RT.handle().clone());
+    let summary = handle.block_on(runtime.run_turn_async(text, &prompter))?;
+    runtime.shutdown_plugins()?;
+    let final_text = final_assistant_text(&summary).trim().to_string();
+    match output_format {
+        CliOutputFormat::Text => {
+            if compact {
+                // --compact: print only the final assistant text
+                println!("{final_text}");
+            } else {
+                // Full output: print text (includes any thinking blocks)
+                println!("{final_text}");
+            }
+        }
+        CliOutputFormat::Json => {
+            let response = serde_json::json!({
+                "text": final_text,
+                "compact": compact,
+            });
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+    }
+    Ok(())
+}
+
 fn run_install(systemd: bool, path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let install_dir = path.map(PathBuf::from).unwrap_or_else(|| {
         runtime::cowd_dirs::config_home_dir().join("bin")
@@ -6424,10 +6604,15 @@ WantedBy=default.target
 "#,
             target.display()
         );
-        let unit_path = install_dir
-            .parent()
-            .unwrap_or(&install_dir)
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+        let unit_path = PathBuf::from(&home_dir)
+            .join(".config")
+            .join("systemd")
+            .join("user")
             .join("cowd-gateway.service");
+        if let Some(parent) = unit_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(&unit_path, &unit)?;
         println!("Created systemd unit at {}", unit_path.display());
         println!(

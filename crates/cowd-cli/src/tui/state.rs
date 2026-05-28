@@ -284,6 +284,21 @@ impl TuiState {
         }
     }
 
+    /// Build a `TuiState` from an existing `App`, preserving all app state.
+    /// The app is moved in; call `into_app()` to extract it back after rendering.
+    #[must_use]
+    pub fn from_app(app: App) -> Self {
+        let mut state = Self::new(&app.model, &app.session_id);
+        state.app = app;
+        state
+    }
+
+    /// Extract the inner `App`, consuming this `TuiState`.
+    #[must_use]
+    pub fn into_app(self) -> App {
+        self.app
+    }
+
     /// Set the shared ActiveSessions registry for the session sidebar.
     pub fn set_active_sessions(&mut self, active_sessions: std::sync::Arc<crate::gateway::ActiveSessions>) {
         self.active_sessions = Some(active_sessions);

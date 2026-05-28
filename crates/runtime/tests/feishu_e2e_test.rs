@@ -4,13 +4,17 @@
 use runtime::platform::adapter::{OutboundMessage, PlatformAdapter};
 use runtime::platform::feishu::{FeishuAdapter, FeishuConfig};
 
-const APP_ID: &str = "cli_a90340506db89cd9";
-const APP_SECRET: &str = "jalBb4gBs41U9IEAULXTCdiG4QaMrDJd";
+fn app_id() -> String {
+    std::env::var("FEISHU_APP_ID").expect("FEISHU_APP_ID must be set")
+}
+fn app_secret() -> String {
+    std::env::var("FEISHU_APP_SECRET").expect("FEISHU_APP_SECRET must be set")
+}
 
 #[tokio::test]
 #[ignore = "需要飞书凭证"]
 async fn test_feishu_e2e_send_receive() {
-    let config = FeishuConfig::new(APP_ID, APP_SECRET);
+    let config = FeishuConfig::new(app_id(), app_secret());
     let mut adapter = FeishuAdapter::new(config);
 
     // 1. 连接

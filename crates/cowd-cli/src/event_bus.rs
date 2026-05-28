@@ -32,9 +32,11 @@ impl SessionEventBus {
     }
 
     /// Remove a specific sender from the session's subscriber list.
+    /// Uses channel identity (same_channel) to match senders, since the
+    /// sender passed to `subscribe` is moved into the subscriber list.
     pub async fn unsubscribe(&self, session_id: &str, tx: &EventSender) {
         if let Some(txs) = self.listeners.write().await.get_mut(session_id) {
-            txs.retain(|t| !std::ptr::eq(t, tx));
+            txs.retain(|t| !t.same_channel(tx));
             if txs.is_empty() {
                 self.listeners.write().await.remove(session_id);
             }

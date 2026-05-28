@@ -15,9 +15,13 @@ use runtime::platform::adapter::{OutboundMessage, PlatformAdapter};
 use runtime::platform::feishu::{register_pin, FeishuAdapter, FeishuConfig, FeishuWsClient};
 use runtime::platform::types::SessionKey;
 
-/// Hermes test credentials (from ~/.hermes/.env).
-const APP_ID: &str = "cli_a90340506db89cd9";
-const APP_SECRET: &str = "jalBb4gBs41U9IEAULXTCdiG4QaMrDJd";
+/// Loaded from FEISHU_APP_ID / FEISHU_APP_SECRET env vars.
+fn app_id() -> String {
+    std::env::var("FEISHU_APP_ID").expect("FEISHU_APP_ID must be set")
+}
+fn app_secret() -> String {
+    std::env::var("FEISHU_APP_SECRET").expect("FEISHU_APP_SECRET must be set")
+}
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -59,15 +63,15 @@ fn parse_feishu_code(body: &str) -> (i64, String) {
 #[ignore = "requires live Feishu credentials"]
 async fn test_feishu_e2e_full_flow() {
     section("Cowd Feishu Adapter — Live End-to-End Test");
-    println!("   APP_ID: {}", APP_ID);
-    println!("   APP_SECRET: {}...", &APP_SECRET[..8]);
+    println!("   APP_ID: {}", app_id());
+    println!("   APP_SECRET: {}...", &app_secret()[..8]);
 
     // ────────────────────────────────────────────────────────────
     // STEP 1: Create adapter + connect
     // ────────────────────────────────────────────────────────────
     section("STEP 1: Create adapter & connect");
 
-    let config = FeishuConfig::new(APP_ID, APP_SECRET);
+    let config = FeishuConfig::new(&app_id(), &app_secret());
     let mut adapter = FeishuAdapter::new(config);
 
     match adapter.connect().await {
@@ -275,9 +279,9 @@ async fn test_feishu_e2e_full_flow() {
 #[ignore = "requires live Feishu credentials and a human to send a message"]
 async fn test_feishu_ws_receive_and_reply() {
     section("Cowd Feishu Adapter — WebSocket Receive & Reply Test");
-    println!("   APP_ID: {}", APP_ID);
+    println!("   APP_ID: {}", app_id());
 
-    let config = FeishuConfig::new(APP_ID, APP_SECRET);
+    let config = FeishuConfig::new(&app_id(), &app_secret());
     let mut adapter = FeishuAdapter::new(config);
 
     match adapter.connect().await {
@@ -357,7 +361,7 @@ async fn test_feishu_ws_receive_and_reply() {
                 "event_type": "im.message.receive_v1",
                 "create_time": "1700000000000",
                 "token": "v",
-                "app_id": APP_ID,
+                "app_id": app_id(),
                 "tenant_key": "t_test"
             },
             "event": null,
@@ -405,9 +409,9 @@ async fn test_feishu_ws_receive_and_reply() {
 #[ignore = "requires live Feishu credentials"]
 async fn test_feishu_ws_register_pin_live() {
     section("Cowd Feishu — register_pin Live Test");
-    println!("   APP_ID: {}", APP_ID);
+    println!("   APP_ID: {}", app_id());
 
-    match register_pin(APP_ID, APP_SECRET).await {
+    match register_pin(&app_id(), &app_secret()).await {
         Ok(result) => {
             ok("register_pin", &format!("WS URL: {}", result.ws_url));
             println!("   ping_interval:     {:?}", result.ping_interval);
@@ -429,9 +433,9 @@ async fn test_feishu_ws_register_pin_live() {
 #[ignore = "requires live Feishu credentials"]
 async fn test_feishu_ws_connect_real() {
     section("Cowd Feishu — Full WebSocket Connect Live Test");
-    println!("   APP_ID: {}", APP_ID);
+    println!("   APP_ID: {}", app_id());
 
-    let client = FeishuWsClient::new(APP_ID, APP_SECRET)
+    let client = FeishuWsClient::new(&app_id(), &app_secret())
         .with_reconnect(0, 0); // No reconnect for test
 
     match client.connect().await {

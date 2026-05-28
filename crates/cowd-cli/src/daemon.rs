@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use axum::http::{header, HeaderValue};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
@@ -33,13 +34,41 @@ pub struct DaemonConfig {
     pub auth_token: Option<String>,
 }
 
+// ── PID file guard ──────────────────────────────────────────────
+
+struct PidFileGuard;
+
+impl PidFileGuard {
+    fn new() -> Result<Self, String> {
+        let pid_path = crate::server::pid_file();
+        let pid = std::process::id();
+        std::fs::write(&pid_path, pid.to_string())
+            .map_err(|e| format!("failed to write PID file {:?}: {e}", pid_path))?;
+        tracing::info!(pid, path = %pid_path.display(), "PID file written");
+        Ok(Self)
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        let pid_path = crate::server::pid_file();
+        if pid_path.exists() {
+            std::fs::remove_file(&pid_path).ok();
+            tracing::info!(path = %pid_path.display(), "PID file removed");
+        }
+    }
+}
+
 // ── Daemon entry point ─────────────────────────────────────────
 
 pub async fn run_daemon(
     config: DaemonConfig,
 ) -> Result<(), String> {
+    // 0. Write PID file (removed on drop via guard)
+    let _pid_guard = PidFileGuard::new()?;
+
     // 1. Initialise shared state
-    let sessions = Arc::new(ActiveSessions::new());
+    let sessions = Arc::new(ActiveSessions::default());
     let tools = Arc::new(GlobalToolRegistry::builtin());
 
     let cognitive: Option<Arc<CognitiveContextManager>> = match config.memory_config {
@@ -93,7 +122,7 @@ pub async fn run_daemon(
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
         let webui_dir = std::env::current_dir().unwrap().join("webui");
-        api_routes::api_router(app_state)
+        api_routes::api_router(app_state.clone())
             .fallback_service(ServeDir::new(webui_dir))
             .layer(cors)
     };
@@ -171,21 +200,300 @@ pub async fn run_daemon(
     }
 
     // 6. Unix socket accept loop (background)
-    tokio::spawn(async move {
-        loop {
-            match unix_listener.accept().await {
-                Ok((stream, _)) => {
-                    drop(stream); // TODO: handle TUI client connection over Unix socket
-                }
-                Err(e) => {
-                    tracing::warn!("unix socket accept error: {e}");
+    {
+        let sessions = sessions.clone();
+        let event_bus = event_bus.clone();
+        tokio::spawn(async move {
+            loop {
+                match unix_listener.accept().await {
+                    Ok((stream, _addr)) => {
+                        let sessions = sessions.clone();
+                        let event_bus = event_bus.clone();
+                        tokio::spawn(async move {
+                            handle_unix_client(stream, sessions, event_bus).await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("unix socket accept error: {e}");
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
-    // 7. HTTP server (blocking main loop)
+    // 7. HTTP server with graceful shutdown on SIGINT/SIGTERM
+    let shutdown_signal = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install ctrl_c handler");
+        tracing::info!("shutdown signal received, beginning graceful shutdown");
+    };
+
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
         .await
-        .map_err(|e| format!("HTTP server error: {e}"))
+        .map_err(|e| format!("HTTP server error: {e}"))?;
+
+    // ── Cleanup after shutdown ──
+    tracing::info!("cleaning up daemon resources...");
+
+    // Remove unix socket
+    let _ = std::fs::remove_file(&config.unix_sock_path);
+    tracing::info!("unix socket removed");
+
+    // Shutdown platform adapters
+    let _ = platform_runtime.shutdown().await;
+    tracing::info!("platform runtime shut down");
+
+    // PID file is cleaned up by PidFileGuard drop
+    tracing::info!("daemon shutdown complete");
+    Ok(())
+}
+
+// ── Unix client handler ─────────────────────────────────────────
+
+/// Handle a single Unix socket client connection.
+/// Reads newline-delimited JSON commands and writes JSON responses.
+/// Supported commands:
+///   {"cmd":"create_session","model":"..."}
+///   {"cmd":"chat","session_id":"...","content":"..."}
+///   {"cmd":"list_sessions"}
+async fn handle_unix_client(
+    stream: UnixStream,
+    sessions: Arc<ActiveSessions>,
+    event_bus: Arc<SessionEventBus>,
+) {
+    let (reader, mut writer) = stream.into_split();
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match buf_reader.read_line(&mut line).await {
+            Ok(0) => {
+                // EOF
+                break;
+            }
+            Ok(_n) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let response = match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(cmd) => {
+                        match cmd.get("cmd").and_then(|c| c.as_str()) {
+                            Some("create_session") => {
+                                let model = cmd
+                                    .get("model")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("claude-sonnet-4-6");
+                                let session_id = uuid::Uuid::new_v4().to_string();
+                                let session = runtime::Session::new();
+                                match crate::build_runtime(
+                                    session,
+                                    &session_id,
+                                    model.to_string(),
+                                    vec![],
+                                    true,
+                                    true,
+                                    None,
+                                    runtime::PermissionMode::WorkspaceWrite,
+                                    None,
+                                    None,
+                                ) {
+                                    Ok(runtime) => {
+                                        let _ = sessions.register(session_id.clone(), runtime);
+                                        serde_json::json!({
+                                            "ok": true,
+                                            "session_id": session_id,
+                                        })
+                                    }
+                                    Err(e) => {
+                                        serde_json::json!({
+                                            "ok": false,
+                                            "error": format!("failed to build runtime: {e}"),
+                                        })
+                                    }
+                                }
+                            }
+                            Some("chat") => {
+                                let session_id = cmd
+                                    .get("session_id")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or_default();
+                                let content = cmd
+                                    .get("content")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or_default();
+
+                                if session_id.is_empty() || content.is_empty() {
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "error": "session_id and content are required",
+                                    })
+                                } else {
+                                    match sessions.get(session_id) {
+                                        Some(entry) => {
+                                            let mut guard = entry.lock().await;
+                                            match guard
+                                                .run_turn_async(content, &runtime::permissions::SharedPrompter::none())
+                                                .await
+                                            {
+                                                Ok(summary) => {
+                                                    let final_text = summary
+                                                        .assistant_messages
+                                                        .last()
+                                                        .map(|msg| {
+                                                            msg.blocks
+                                                                .iter()
+                                                                .filter_map(|block| match block {
+                                                                    runtime::ContentBlock::Text { text } => {
+                                                                        Some(text.as_str())
+                                                                    }
+                                                                    _ => None,
+                                                                })
+                                                                .collect::<Vec<_>>()
+                                                                .join("")
+                                                        })
+                                                        .unwrap_or_default();
+
+                                                    let sse_data = serde_json::json!({
+                                                        "type": "TurnComplete",
+                                                        "session_id": session_id,
+                                                        "response": final_text,
+                                                        "iterations": summary.iterations,
+                                                    });
+                                                    event_bus
+                                                        .broadcast(session_id, &sse_data.to_string())
+                                                        .await;
+
+                                                    serde_json::json!({
+                                                        "ok": true,
+                                                        "response": final_text,
+                                                        "iterations": summary.iterations,
+                                                    })
+                                                }
+                                                Err(e) => {
+                                                    let err_msg = e.to_string();
+                                                    let sse_data = serde_json::json!({
+                                                        "type": "TurnError",
+                                                        "session_id": session_id,
+                                                        "error": err_msg,
+                                                    });
+                                                    event_bus
+                                                        .broadcast(session_id, &sse_data.to_string())
+                                                        .await;
+                                                    serde_json::json!({
+                                                        "ok": false,
+                                                        "error": err_msg,
+                                                    })
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            serde_json::json!({
+                                                "ok": false,
+                                                "error": format!("session {session_id} not found"),
+                                            })
+                                        }
+                                    }
+                                }
+                            }
+                            Some("list_sessions") => {
+                                let ids = sessions.list();
+                                serde_json::json!({ "ok": true, "sessions": ids })
+                            }
+                            Some(other) => {
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error": format!("unknown command: {other}"),
+                                })
+                            }
+                            None => {
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error": "missing 'cmd' field",
+                                })
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("invalid JSON: {e}"),
+                        })
+                    }
+                };
+
+                let mut resp_bytes = serde_json::to_vec(&response).unwrap_or_default();
+                resp_bytes.push(b'\n');
+                if let Err(e) = writer.write_all(&resp_bytes).await {
+                    tracing::warn!("unix socket write error: {e}");
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("unix socket read error: {e}");
+                break;
+            }
+        }
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memory::MemoryConfig;
+
+    #[test]
+    fn daemon_config_defaults() {
+        let config = DaemonConfig {
+            http_addr: "0.0.0.0:8642".into(),
+            unix_sock_path: "/tmp/cowd.sock".into(),
+            memory_config: None,
+            platform_configs: vec![],
+            runtime_config: None,
+            cors_origins: vec![],
+            auth_token: None,
+        };
+        assert_eq!(config.http_addr, "0.0.0.0:8642");
+        assert_eq!(config.unix_sock_path, "/tmp/cowd.sock");
+        assert!(config.memory_config.is_none());
+        assert!(config.platform_configs.is_empty());
+        assert!(config.auth_token.is_none());
+    }
+
+    #[test]
+    fn daemon_config_with_auth() {
+        let config = DaemonConfig {
+            http_addr: "127.0.0.1:9000".into(),
+            unix_sock_path: "/tmp/test.sock".into(),
+            memory_config: None,
+            platform_configs: vec![],
+            runtime_config: None,
+            cors_origins: vec!["http://localhost:3000".into()],
+            auth_token: Some("secret-token".into()),
+        };
+        assert_eq!(config.http_addr, "127.0.0.1:9000");
+        assert_eq!(config.auth_token.as_deref(), Some("secret-token"));
+        assert_eq!(config.cors_origins, vec!["http://localhost:3000"]);
+    }
+
+    #[test]
+    fn daemon_config_with_memory() {
+        let mem_cfg = MemoryConfig::default();
+        let config = DaemonConfig {
+            http_addr: "0.0.0.0:8642".into(),
+            unix_sock_path: "/tmp/cowd.sock".into(),
+            memory_config: Some(mem_cfg),
+            platform_configs: vec![],
+            runtime_config: None,
+            cors_origins: vec![],
+            auth_token: None,
+        };
+        assert!(config.memory_config.is_some());
+    }
 }

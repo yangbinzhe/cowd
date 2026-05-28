@@ -19,10 +19,11 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     runner.run("Send message", || {
         tui.send("Write a one-line shell command to list files")?;
         tui.enter()?;
-        std::thread::sleep(std::time::Duration::from_secs(20));
-        let cap = tui.capture()?;
-        if cap.len() < 200 { Err(anyhow::anyhow!("Response too short")) }
-        else { Ok(()) }
+        tui.wait_for("$", 25).or_else(|_| {
+            let cap = tui.capture()?;
+            if cap.len() < 200 { Err(anyhow::anyhow!("Response too short ({} chars)", cap.len())) }
+            else { Ok(()) }
+        })
     });
 
     runner.run("Which-Key overlay", || {
@@ -35,10 +36,11 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     if crate::tui::session_alive(tui.cmd()) {
         runner.run("Sidebar tab", || {
             tui.send_key("Tab")?;
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let cap = tui.capture()?;
-            if cap.contains("Context") || cap.contains("Changes") { Ok(()) }
-            else { Err(anyhow::anyhow!("Sidebar not visible")) }
+            tui.wait_for("Context", 5).or_else(|_| {
+                let cap = tui.capture()?;
+                if cap.contains("Changes") { Ok(()) }
+                else { Err(anyhow::anyhow!("Sidebar not visible after Tab")) }
+            })
         });
     } else {
         println!("  ⬜ Sidebar tab skipped (session dead)");
@@ -80,9 +82,9 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     println!("\n── Cross Test ──");
     runner.run("TUI→API session verify", || {
         let t = TuiSession::new("cross")?;
-        std::thread::sleep(std::time::Duration::from_secs(6));
+        t.wait_for("COWD", 10).ok();
         t.send("/status")?; t.enter()?;
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        t.wait_for("Model", 8).ok();
         t.close();
 
         let mut srv = ServerProcess::start()?;

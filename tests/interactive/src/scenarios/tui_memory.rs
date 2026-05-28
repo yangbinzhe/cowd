@@ -42,9 +42,14 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         tui.send("/memory")?;
         std::thread::sleep(std::time::Duration::from_millis(200));
         tui.enter()?;
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        let cap = tui.capture()?;
-        // Expect some response referencing memory or showing memory info
+        // Wait for memory-related output (max 10s)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut cap = String::new();
+        while std::time::Instant::now() < deadline {
+            cap = tui.capture()?;
+            if cap.contains("memory") || cap.contains("Memory") || cap.contains("entry") { break; }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
         if !cap.contains("memory") && !cap.contains("Memory") && !cap.contains("entry") {
             return Err(anyhow::anyhow!("/memory slash command did not produce expected response"));
         }

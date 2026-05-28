@@ -17,6 +17,7 @@ use futures::stream::Stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use tools::GlobalToolRegistry;
@@ -171,7 +172,14 @@ async fn create_session(
         )
     })?;
 
-    state.sessions.register(session_id.clone(), runtime);
+    if let Err(e) = state.sessions.register(session_id.clone(), runtime) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("failed to register session: {e}"),
+            }),
+        ));
+    }
 
     let info = SessionInfo {
         id: session_id,
@@ -233,8 +241,10 @@ async fn send_message(
 
     let mut runtime_guard = runtime_entry.lock().await;
 
-    match runtime_guard.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none()).await {
-        Ok(summary) => {
+    const TURN_TIMEOUT: Duration = Duration::from_secs(300);
+
+    match timeout(TURN_TIMEOUT, runtime_guard.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none())).await {
+        Ok(Ok(summary)) => {
             let final_text = summary.assistant_messages.last()
                 .map(|msg| {
                     msg.blocks.iter()
@@ -264,7 +274,7 @@ async fn send_message(
 
             Ok(Json(response))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let error_msg = e.to_string();
 
             let sse_data = serde_json::json!({
@@ -276,6 +286,21 @@ async fn send_message(
 
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: error_msg }),
+            ))
+        }
+        Err(_elapsed) => {
+            let error_msg = format!("turn timed out after {}s", TURN_TIMEOUT.as_secs());
+
+            let sse_data = serde_json::json!({
+                "type": "TurnError",
+                "session_id": &session_id,
+                "error": error_msg,
+            });
+            event_bus.broadcast(&session_id, &sse_data.to_string()).await;
+
+            Err((
+                StatusCode::REQUEST_TIMEOUT,
                 Json(ErrorResponse { error: error_msg }),
             ))
         }
@@ -507,6 +532,45 @@ async fn verify_handler(
     }
 }
 
+// ── SSE drop guard ───────────────────────────────────────────────
+
+/// Wraps an `UnboundedReceiverStream` and unsubscribes from the event bus
+/// when the stream is dropped (client disconnects), preventing sender leaks.
+struct SseStream {
+    rx: UnboundedReceiverStream<String>,
+    session_id: String,
+    event_bus: Arc<SessionEventBus>,
+    tx: mpsc::UnboundedSender<String>,
+}
+
+impl Stream for SseStream {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.rx.poll_next_unpin(cx) {
+            std::task::Poll::Ready(Some(data)) => {
+                std::task::Poll::Ready(Some(Ok(Event::default().data(data))))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for SseStream {
+    fn drop(&mut self) {
+        let event_bus = self.event_bus.clone();
+        let session_id = self.session_id.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            event_bus.unsubscribe(&session_id, &tx).await;
+        });
+    }
+}
+
 // ── SSE stream handler ──────────────────────────────────────────
 
 async fn sse_stream_handler(
@@ -514,11 +578,178 @@ async fn sse_stream_handler(
     Path(session_id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::unbounded_channel();
-    state.event_bus.subscribe(&session_id, tx).await;
-    let stream = UnboundedReceiverStream::new(rx).map(|s| Ok(Event::default().data(s)));
+    // Clone tx before subscribing — one copy moves into the event bus,
+    // the other stays with SseStream for cleanup on drop.
+    let bus_tx = tx.clone();
+    state.event_bus.subscribe(&session_id, bus_tx).await;
+
+    let stream = SseStream {
+        rx: UnboundedReceiverStream::new(rx),
+        session_id,
+        event_bus: state.event_bus.clone(),
+        tx,
+    };
+
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("keep-alive"),
     )
+}
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn test_state() -> Arc<AppState> {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new(); // returns Arc<Self>
+        Arc::new(AppState {
+            sessions,
+            memory_manager: None,
+            tool_registry: tools,
+            config: None,
+            event_bus,
+            auth_token: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn health_returns_ok() {
+        let state = test_state();
+        let app = api_router(state);
+        let response = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_returns_empty() {
+        let state = test_state();
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tools_returns_list() {
+        let state = test_state();
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn memory_without_config_returns_disabled() {
+        let state = test_state();
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn config_returns_version() {
+        let state = test_state();
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_required_when_token_set() {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        let state = Arc::new(AppState {
+            sessions,
+            memory_manager: None,
+            tool_registry: tools,
+            config: None,
+            event_bus,
+            auth_token: Some("test-token".into()),
+        });
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_passes_with_valid_token() {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        let state = Arc::new(AppState {
+            sessions,
+            memory_manager: None,
+            tool_registry: tools,
+            config: None,
+            event_bus,
+            auth_token: Some("test-token".into()),
+        });
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

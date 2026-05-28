@@ -7,13 +7,17 @@ use runtime::platform::feishu::FeishuConfig;
 use runtime::platform::adapter::PlatformAdapter;
 use tokio::time::{timeout, Duration};
 
-const APP_ID: &str = "cli_a90340506db89cd9";
-const APP_SECRET: &str = "jalBb4gBs41U9IEAULXTCdiG4QaMrDJd";
+fn app_id() -> String {
+    std::env::var("FEISHU_APP_ID").expect("FEISHU_APP_ID must be set")
+}
+fn app_secret() -> String {
+    std::env::var("FEISHU_APP_SECRET").expect("FEISHU_APP_SECRET must be set")
+}
 
 #[tokio::test]
 #[ignore = "runs indefinitely"]
 async fn test_gateway_loop() {
-    let config = FeishuConfig::new(APP_ID, APP_SECRET);
+    let config = FeishuConfig::new(app_id(), app_secret());
     let mut adapter = FeishuAdapter::new(config);
 
     println!("\n╔══════════════════════════════════╗");

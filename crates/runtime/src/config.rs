@@ -1430,9 +1430,11 @@ fn parse_optional_hooks_config_object(
     };
     let hooks = expect_object(hooks_value, context)?;
     Ok(RuntimeHookConfig {
-        pre_tool_use: optional_string_array(hooks, "PreToolUse", context)?.unwrap_or_default(),
-        post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
-        post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
+        pre_tool_use: optional_string_array_dual(hooks, "pre_tool_use", context)?
+            .unwrap_or_default(),
+        post_tool_use: optional_string_array_dual(hooks, "post_tool_use", context)?
+            .unwrap_or_default(),
+        post_tool_use_failure: optional_string_array_dual(hooks, "post_tool_use_failure", context)?
             .unwrap_or_default(),
     })
 }
@@ -1580,7 +1582,7 @@ fn parse_optional_provider_fallbacks(
     let Some(object) = root.as_object() else {
         return Ok(ProviderFallbackConfig::default());
     };
-    let Some(value) = object.get("providerFallbacks") else {
+    let Some(value) = find_key_dual(object, "provider_fallbacks", "merged settings") else {
         return Ok(ProviderFallbackConfig::default());
     };
 
@@ -1675,7 +1677,7 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
         return Ok(Vec::new());
     };
     Ok(
-        optional_string_array(object, "trustedRoots", "merged settings.trustedRoots")?
+        optional_string_array_dual(object, "trusted_roots", "merged settings")?
             .unwrap_or_default(),
     )
 }
@@ -2334,6 +2336,76 @@ fn optional_bool_dual(
             "config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
         );
         return optional_bool(object, &camel_key, ctx);
+    }
+    Ok(None)
+}
+
+/// Look up any config value by key, supporting snake_case (preferred), camelCase,
+/// and PascalCase (deprecated). Emits a deprecation warning when a non-snake_case
+/// key is used.
+fn find_key_dual<'a>(
+    object: &'a BTreeMap<String, JsonValue>,
+    snake_key: &str,
+    ctx: &str,
+) -> Option<&'a JsonValue> {
+    // Try snake_case first.
+    if let Some(value) = object.get(snake_key) {
+        return Some(value);
+    }
+    // Try camelCase (lowercase first letter).
+    let camel_key = to_camel_case(snake_key);
+    if let Some(value) = object.get(&camel_key) {
+        tracing::warn!(
+            "config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
+        return Some(value);
+    }
+    // Try PascalCase (uppercase first letter).
+    let pascal_key = {
+        let mut chars = camel_key.chars();
+        match chars.next() {
+            Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
+            None => return None,
+        }
+    };
+    if let Some(value) = object.get(&pascal_key) {
+        tracing::warn!(
+            "config key '{pascal_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
+        return Some(value);
+    }
+    None
+}
+
+/// Look up a string array config value, supporting both snake_case (preferred)
+/// and camelCase/PascalCase (deprecated).
+fn optional_string_array_dual(
+    object: &BTreeMap<String, JsonValue>,
+    snake_key: &str,
+    ctx: &str,
+) -> Result<Option<Vec<String>>, ConfigError> {
+    if object.contains_key(snake_key) {
+        return optional_string_array(object, snake_key, ctx);
+    }
+    let camel_key = to_camel_case(snake_key);
+    if object.contains_key(&camel_key) {
+        tracing::warn!(
+            "config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
+        return optional_string_array(object, &camel_key, ctx);
+    }
+    let pascal_key = {
+        let mut chars = camel_key.chars();
+        match chars.next() {
+            Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
+            None => return Ok(None),
+        }
+    };
+    if object.contains_key(&pascal_key) {
+        tracing::warn!(
+            "config key '{pascal_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
+        return optional_string_array(object, &pascal_key, ctx);
     }
     Ok(None)
 }

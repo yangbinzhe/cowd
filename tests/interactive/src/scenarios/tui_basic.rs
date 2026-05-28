@@ -26,18 +26,24 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         tui.send(&prompt)?;
         tui.enter()?;
 
+        // Use wait_for with timeout (max 20s) instead of fixed sleep
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut output = String::new();
+        while std::time::Instant::now() < deadline {
+            output = tui.capture()?;
+            if output.len() > 100 { break; }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
         // LLM validates the output semantics
-        std::thread::sleep(std::time::Duration::from_secs(15));
-        let output = tui.capture()?;
         llm::validate_output(&output, "The terminal output shows an AI assistant's response that is helpful and on-topic. It should contain actual response text, not just an error message.")
             .map_err(|e| anyhow::anyhow!("Output validation failed: {e}"))
     });
 
     runner.run("Scroll: PgUp/PgDn changes viewport", || {
         tui.send("Write a haiku about programming")?; tui.enter()?;
-        std::thread::sleep(std::time::Duration::from_secs(10));
+        tui.wait_for("haiku", 15).ok();
         tui.send("Write another about debugging")?; tui.enter()?;
-        std::thread::sleep(std::time::Duration::from_secs(10));
+        tui.wait_for("debugging", 15).ok();
         let before = tui.capture()?;
         tui.send_key("PageUp")?;
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -55,12 +61,11 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
 
     runner.run("Sidebar: Tab cycles panels", || {
         tui.send_key("Tab")?;
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let cap = tui.capture()?;
-        if !cap.contains("Context") && !cap.contains("Changes") && !cap.contains("Todo") {
-            return Err(anyhow::anyhow!("Sidebar tab labels not visible"));
-        }
-        Ok(())
+        tui.wait_for("Context", 5).or_else(|_| {
+            let cap = tui.capture()?;
+            if cap.contains("Changes") || cap.contains("Todo") { Ok(()) }
+            else { Err(anyhow::anyhow!("Sidebar tab labels not visible")) }
+        })
     });
 
     tui.close()?;

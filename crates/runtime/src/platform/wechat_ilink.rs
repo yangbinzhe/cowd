@@ -18,11 +18,11 @@ use crate::platform::adapter::{
     ChatInfo, InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter,
     PlatformError, PlatformEvent, PlatformResult,
 };
+use crate::platform::dedup::DedupStore;
 use crate::platform::types::SessionKey;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -73,9 +73,10 @@ pub struct WeChatLinkAdapter {
     token: Arc<RwLock<Option<String>>>,
     /// Latest context_token from getupdates response, echoed back in the next call.
     context_token: Arc<RwLock<String>>,
-    /// Dedup map: message_id → timestamp (millis). Used to avoid
+    /// Dedup store: message_id → timestamp. Used to avoid
     /// processing the same message twice in long-poll cycles.
-    seen_ids: Arc<RwLock<HashMap<String, i64>>>,
+    /// Uses LRU eviction with TTL expiry.
+    seen_ids: DedupStore,
 }
 
 impl WeChatLinkAdapter {
@@ -86,7 +87,7 @@ impl WeChatLinkAdapter {
             connected: Arc::new(RwLock::new(false)),
             token: Arc::new(RwLock::new(None)),
             context_token: Arc::new(RwLock::new(String::new())),
-            seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            seen_ids: DedupStore::new(10_000, 3600),
         }
     }
 
@@ -498,16 +499,10 @@ impl WeChatLinkAdapter {
             .ok_or_else(|| PlatformError::SendFailed("no upload_url in response".to_string()))
     }
 
-    /// Check if a message ID has already been seen.
+    /// Check if a message ID has already been seen (within TTL).
+    /// Automatically marks the ID as seen if not already present.
     async fn is_duplicate(&self, message_id: &str) -> bool {
-        let seen = self.seen_ids.read().await;
-        seen.contains_key(message_id)
-    }
-
-    /// Mark a message ID as seen with its timestamp.
-    async fn mark_seen(&self, message_id: &str, timestamp_ms: i64) {
-        let mut seen = self.seen_ids.write().await;
-        seen.insert(message_id.to_string(), timestamp_ms);
+        self.seen_ids.is_duplicate(message_id).await
     }
 }
 
@@ -567,11 +562,6 @@ impl PlatformAdapter for WeChatLinkAdapter {
                     tracing::debug!(%mid, "ilink skipping duplicate message");
                     continue;
                 }
-                let ts = msg
-                    .get("timestamp")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                self.mark_seen(mid, ts).await;
             }
 
             if let Some(inbound) = self.parse_ilink_message(&msg) {
@@ -1026,7 +1016,7 @@ mod tests {
 
     #[test]
     fn test_dedup_seen_ids() {
-        // This test verifies the dedup HashMap behavior directly
+        // This test verifies the DedupStore behavior directly
         let config = WeChatLinkConfig::new("bot", "secret");
         let adapter = WeChatLinkAdapter::new(config);
 
@@ -1036,10 +1026,12 @@ mod tests {
             .unwrap();
 
         rt.block_on(async {
+            // First sighting — not a duplicate (auto-marks as seen)
             assert!(!adapter.is_duplicate("msg_new").await);
-
-            adapter.mark_seen("msg_new", 1700000000000).await;
+            // Second sighting — duplicate within TTL
             assert!(adapter.is_duplicate("msg_new").await);
+
+            // Different message — not a duplicate
             assert!(!adapter.is_duplicate("msg_other").await);
         });
     }
