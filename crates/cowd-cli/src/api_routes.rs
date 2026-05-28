@@ -244,8 +244,30 @@ async fn send_message(
     let session_id = id.clone();
     let event_bus = Arc::clone(&state.event_bus);
 
+    // Subscribe to the runtime's internal EventBus so we can forward
+    // real-time TextDelta events to the SessionEventBus for SSE subscribers.
+    let rx = {
+        let runtime_guard = runtime_entry.lock().await;
+        runtime_guard.subscribe_to_bus()
+    };
+
+    // Spawn a background task that bridges runtime::bus::Event → SessionEventBus.
+    if let Some(mut rx) = rx {
+        let sse_bus = Arc::clone(&event_bus);
+        let sid = session_id.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = rx.recv().await {
+                if let runtime::bus::Event::TextDelta { content } = event {
+                    let sse = serde_json::json!({"type":"TextDelta","content":content});
+                    let _ = sse_bus.broadcast(&sid, &sse.to_string()).await;
+                }
+            }
+        });
+    }
+
     let mut runtime_guard = runtime_entry.lock().await;
 
+<<<<<<< Updated upstream
     // Subscribe runtime EventBus → forward TextDelta to SessionEventBus
     if let Some(bus) = runtime_guard.bus() {
         let mut rx = bus.subscribe();
@@ -265,6 +287,21 @@ async fn send_message(
 
     match timeout(TURN_TIMEOUT, runtime_guard.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none())).await {
         Ok(Ok(summary)) => {
+=======
+    let sse_cb_event_bus = Arc::clone(&event_bus);
+    let sse_cb_session_id = session_id.clone();
+    let sse_cb: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |sse_data: String| {
+        let bus = Arc::clone(&sse_cb_event_bus);
+        let sid = sse_cb_session_id.clone();
+        tokio::spawn(async move {
+            bus.broadcast(&sid, &sse_data).await;
+        });
+    });
+    runtime_guard.set_sse_callback(sse_cb);
+
+    match runtime_guard.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none()).await {
+        Ok(summary) => {
+>>>>>>> Stashed changes
             let final_text = summary.assistant_messages.last()
                 .map(|msg| {
                     msg.blocks.iter()

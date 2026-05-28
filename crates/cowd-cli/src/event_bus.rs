@@ -75,4 +75,64 @@ impl SessionEventBus {
             }
         }
     }
+
+    // ── Convenience methods for real-time SSE streaming events ─────
+
+    /// Broadcast a text delta event to all SSE subscribers for the given session.
+    pub async fn text_delta(&self, session_id: &str, content: &str) {
+        let json = serde_json::json!({
+            "type": "TextDelta",
+            "content": content,
+        });
+        self.broadcast(session_id, &json.to_string()).await;
+    }
+
+    /// Broadcast a thinking delta event to all SSE subscribers for the given session.
+    pub async fn thinking_delta(&self, session_id: &str, content: &str) {
+        let json = serde_json::json!({
+            "type": "ThinkingDelta",
+            "content": content,
+        });
+        self.broadcast(session_id, &json.to_string()).await;
+    }
+
+    /// Broadcast a tool start event to all SSE subscribers for the given session.
+    pub async fn tool_start(&self, session_id: &str, id: &str, name: &str) {
+        let json = serde_json::json!({
+            "type": "ToolStart",
+            "id": id,
+            "name": name,
+        });
+        self.broadcast(session_id, &json.to_string()).await;
+    }
+
+    /// Broadcast a tool progress event to all SSE subscribers for the given session.
+    pub async fn tool_progress(&self, session_id: &str, id: &str, name: &str, progress: &str) {
+        let json = serde_json::json!({
+            "type": "ToolProgress",
+            "id": id,
+            "name": name,
+            "progress": progress,
+        });
+        self.broadcast(session_id, &json.to_string()).await;
+    }
+
+    /// Broadcast a tool complete event to all SSE subscribers for the given session.
+    pub async fn tool_complete(
+        &self,
+        session_id: &str,
+        id: &str,
+        name: &str,
+        result_summary: &str,
+        exit_code: Option<i32>,
+    ) {
+        let json = serde_json::json!({
+            "type": "ToolComplete",
+            "id": id,
+            "name": name,
+            "summary": result_summary,
+            "exit_code": exit_code,
+        });
+        self.broadcast(session_id, &json.to_string()).await;
+    }
 }

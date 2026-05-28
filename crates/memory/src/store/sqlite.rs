@@ -54,7 +54,13 @@ fn new_pool(db_path: &str, max_size: u32) -> Result<Pool<SqliteConnectionManager
 }
 
 fn sql_err(e: rusqlite::Error) -> MemoryError {
-    MemoryError::Store(e.to_string())
+    if crate::error::is_disk_full_error(&e) {
+        MemoryError::DiskFull {
+            details: e.to_string(),
+        }
+    } else {
+        MemoryError::Store(e.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------

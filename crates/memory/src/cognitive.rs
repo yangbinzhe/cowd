@@ -368,7 +368,11 @@ impl CognitiveContextManager {
     // -----------------------------------------------------------------------
 
     /// Set the write guard for controlling write access.
+    ///
+    /// Propagates the guard to the underlying [`MemoryOrchestrator`] so that
+    /// [`MemoryOrchestrator::remember`] also enforces layer permissions.
     pub fn with_write_guard(mut self, guard: MemoryWriteGuard) -> Self {
+        self.orchestrator = self.orchestrator.with_write_guard(Arc::new(guard.clone()));
         self.write_guard = Some(guard);
         self
     }
@@ -397,6 +401,7 @@ impl CognitiveContextManager {
         self.orchestrator.set_active_session(session_id);
     }
 
+<<<<<<< Updated upstream
     /// Recover entries from a previous session's handoff file.
     ///
     /// Loads work items and decisions from the latest handoff, converts them
@@ -413,6 +418,11 @@ impl CognitiveContextManager {
             "recover_handoff: recovered entries persisted"
         );
         Ok(entries)
+=======
+    /// Get the current active session ID (if set).
+    pub fn active_session_id(&self) -> Option<String> {
+        self.orchestrator.active_session_id()
+>>>>>>> Stashed changes
     }
 
     /// Attach a [`ProjectScopeManager`] for KG staleness detection on turn end.

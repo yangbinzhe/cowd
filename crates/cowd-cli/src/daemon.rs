@@ -205,6 +205,7 @@ pub async fn run_daemon(
             }
             "wecom" => {
                 match runtime::platform::wecom::create_wecom_adapter(&settings_json) {
+<<<<<<< Updated upstream
                     Ok(adapter) => {
                         if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
                             tracing::error!("failed to register wecom adapter: {e}");
@@ -213,6 +214,16 @@ pub async fn run_daemon(
                         }
                     }
                     Err(e) => { tracing::error!("wecom adapter init failed: {e}"); }
+=======
+                    Ok(mut adapter) => {
+                        tracing::info!("wecom adapter created");
+                        match adapter.connect().await {
+                            Ok(()) => tracing::info!("wecom adapter connected"),
+                            Err(e) => tracing::error!("wecom adapter connect failed: {e}"),
+                        }
+                    }
+                    Err(e) => tracing::error!("failed to create wecom adapter: {e}"),
+>>>>>>> Stashed changes
                 }
             }
             other => {

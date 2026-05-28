@@ -6978,6 +6978,8 @@ fn build_runtime_with_plugin_state(
     if let Some(callback) = tool_callback {
         runtime = runtime.with_tool_callback(callback);
     }
+    let bus = runtime::bus::EventBus::new(256);
+    runtime = runtime.with_event_bus(bus);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }

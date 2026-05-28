@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+<<<<<<< Updated upstream
 use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
@@ -24,6 +25,9 @@ impl CancellationToken {
         self.0.store(true, Ordering::SeqCst);
     }
 }
+=======
+use std::time::Duration;
+>>>>>>> Stashed changes
 
 use futures::stream::Stream;
 use memory::cognitive::CognitiveContextManager;
@@ -265,6 +269,9 @@ bus: Option<crate::bus::EventBus>,
     memory_status: Option<String>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
+    /// Optional SSE callback for real-time streaming events to WebUI.
+    /// Receives pre-formatted JSON event strings.
+    sse_callback: Option<Arc<dyn Fn(String) + Send + Sync>>,
     /// Optional memory lifecycle callback for TUI memory events.
     memory_callback: Option<Arc<dyn MemoryCallback>>,
     /// Optional smart approval gate for intelligent command approval (P0-1).
@@ -279,6 +286,7 @@ bus: Option<crate::bus::EventBus>,
     model: Option<String>,
     /// Provider fallback configuration for automatic retry on 429/5xx errors.
     provider_fallbacks_config: ProviderFallbackConfig,
+<<<<<<< Updated upstream
     /// T35: Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
     /// T36: Tool orchestrator for result budgeting and truncation.
@@ -291,6 +299,10 @@ bus: Option<crate::bus::EventBus>,
     destructive_semaphore: Arc<Semaphore>,
     /// T4: Semaphore for default/ReadOnly tool concurrency (permits: 8).
     default_semaphore: Arc<Semaphore>,
+=======
+    /// Maximum duration for a single tool execution. `None` means no timeout.
+    tool_timeout: Option<Duration>,
+>>>>>>> Stashed changes
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -414,6 +426,7 @@ where
             memory_manager,
             memory_status,
             tool_callback: None,
+            sse_callback: None,
             memory_callback: None,
             approval_gate: None,
             effect_handler: None,
@@ -421,6 +434,7 @@ where
             gate_evaluator: Some(Arc::new(crate::gates::GateEvaluator::new().with_default_gates())),
             model: feature_config.model().map(str::to_string),
             provider_fallbacks_config: feature_config.provider_fallbacks().clone(),
+<<<<<<< Updated upstream
             cancellation_token: CancellationToken::new(),
             tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
             write_semaphore: Arc::new(Semaphore::new(
@@ -433,6 +447,9 @@ where
                 crate::tool_orchestrator::ToolSafetyCategory::Destructive.max_concurrency(),
             )),
             default_semaphore: Arc::new(Semaphore::new(8)),
+=======
+            tool_timeout: Some(Duration::from_secs(120)),
+>>>>>>> Stashed changes
         }
     }
 
@@ -440,6 +457,27 @@ where
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
         self
+    }
+
+    #[must_use]
+    pub fn with_tool_timeout(mut self, timeout: Duration) -> Self {
+        self.tool_timeout = Some(timeout);
+        self
+    }
+
+    /// Wire an EventBus so that external subscribers can receive
+    /// runtime events (TextDelta, TurnCompleted, etc.) in real time.
+    #[must_use]
+    pub fn with_event_bus(mut self, bus: crate::bus::EventBus) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    /// Return a new subscriber for runtime bus events.
+    /// Returns `None` if no bus has been wired.
+    #[must_use]
+    pub fn subscribe_to_bus(&self) -> Option<tokio::sync::broadcast::Receiver<crate::bus::Event>> {
+        self.bus.as_ref().map(|bus| bus.subscribe())
     }
 
     /// Return a human-readable description of memory subsystem health.
@@ -490,6 +528,22 @@ where
     /// itself, as this would create a reference cycle and leak memory.
     /// The runtime uses `Arc` ownership; callbacks should use `Weak` if
     /// they need to reference the runtime.
+    #[must_use]
+    pub fn with_sse_callback(mut self, callback: Arc<dyn Fn(String) + Send + Sync>) -> Self {
+        self.sse_callback = Some(callback);
+        self
+    }
+
+    /// Set the SSE callback on an already-constructed runtime instance.
+    pub fn set_sse_callback(&mut self, callback: Arc<dyn Fn(String) + Send + Sync>) {
+        self.sse_callback = Some(callback);
+    }
+
+    /// Clear the SSE callback from this runtime instance.
+    pub fn clear_sse_callback(&mut self) {
+        self.sse_callback = None;
+    }
+
     #[must_use]
     pub fn with_memory_callback(mut self, callback: Arc<dyn MemoryCallback>) -> Self {
         self.memory_callback = Some(callback);
@@ -884,10 +938,29 @@ pub async fn run_turn_async(
                                         bus.emit(crate::bus::Event::TextDelta { content: text.clone() });
                                     }
                                     model_stream_events.push(("text_delta".into(), "assistant".into(), text[..text.len().min(80)].to_string(), 3));
+                                    if let Some(ref cb) = self.sse_callback {
+                                        let json = serde_json::json!({
+                                            "type": "TextDelta",
+                                            "content": &text,
+                                        });
+                                        cb(json.to_string());
+                                    }
+                                    if let Some(ref bus) = self.bus {
+                                        bus.emit(crate::bus::Event::TextDelta {
+                                            content: text.clone(),
+                                        });
+                                    }
                                 }
                                 Ok(AssistantEvent::ThinkingDelta(thinking)) => {
                                     model_thinking_text.push_str(&thinking);
                                     model_stream_events.push(("thinking".into(), "reasoning".into(), thinking[..thinking.len().min(80)].to_string(), 2));
+                                    if let Some(ref cb) = self.sse_callback {
+                                        let json = serde_json::json!({
+                                            "type": "ThinkingDelta",
+                                            "content": &thinking,
+                                        });
+                                        cb(json.to_string());
+                                    }
                                 }
                                 Ok(AssistantEvent::SignatureDelta(signature)) => {
                                     model_thinking_signature = Some(signature);
@@ -903,10 +976,43 @@ pub async fn run_turn_async(
                                     if let Some(callback) = &self.tool_callback {
                                         callback.on_tool_start(&id, &name, &preview);
                                     }
+                                    if let Some(ref cb) = self.sse_callback {
+                                        let json = serde_json::json!({
+                                            "type": "ToolStart",
+                                            "id": &id,
+                                            "name": &name,
+                                            "preview": &preview,
+                                        });
+                                        cb(json.to_string());
+                                    }
+                                }
+                                Ok(AssistantEvent::ToolProgress { id, name, progress }) => {
+                                    if let Some(callback) = &self.tool_callback {
+                                        callback.on_tool_progress(&id, &name, &progress);
+                                    }
+                                    if let Some(ref cb) = self.sse_callback {
+                                        let json = serde_json::json!({
+                                            "type": "ToolProgress",
+                                            "id": &id,
+                                            "name": &name,
+                                            "progress": &progress,
+                                        });
+                                        cb(json.to_string());
+                                    }
                                 }
                                 Ok(AssistantEvent::ToolComplete { id, name, result_summary, exit_code }) => {
                                     if let Some(callback) = &self.tool_callback {
                                         callback.on_tool_complete(&id, &name, &result_summary, exit_code);
+                                    }
+                                    if let Some(ref cb) = self.sse_callback {
+                                        let json = serde_json::json!({
+                                            "type": "ToolComplete",
+                                            "id": &id,
+                                            "name": &name,
+                                            "summary": &result_summary,
+                                            "exit_code": exit_code,
+                                        });
+                                        cb(json.to_string());
                                     }
                                 }
                                 Ok(_) => {}
@@ -1255,6 +1361,7 @@ self.record_turn_completed(&summary);
                     callback.on_tool_start(tool_use_id, tool_name, &preview);
                 }
 
+<<<<<<< Updated upstream
                 // P2-10: EffectHandler interceptor — use mock result if available
                 let effect_mock = self.effect_handler.as_ref().and_then(|handler| {
                     let r = handler.handle(
@@ -1267,17 +1374,26 @@ self.record_turn_completed(&summary);
                 let (output, mut is_error) = if let Some(mock_output) = effect_mock {
                     (mock_output, false)
                 } else {
+=======
+                let start = std::time::Instant::now();
+                let (output, mut is_error) = {
+>>>>>>> Stashed changes
                     let tool_exec = Arc::clone(&self.tool_executor);
                     let tname = tool_name.to_string();
+                    let tname_for_err = tname.clone();
                     let tinput = effective_input.clone();
-                    match tokio::task::spawn_blocking(move || {
+                    let tool_timeout = self.tool_timeout.unwrap_or(Duration::from_secs(120));
+                    match tokio::time::timeout(tool_timeout, tokio::task::spawn_blocking(move || {
                         tool_exec.execute(&tname, &tinput)
-                    }).await {
-                        Ok(Ok(output)) => (output, false),
-                        Ok(Err(error)) => (error.to_string(), true),
-                        Err(join_error) => (format!("tool execution panicked: {join_error}"), true),
+                    })).await {
+                        Ok(Ok(Ok(output))) => (output, false),
+                        Ok(Ok(Err(error))) => (error.to_string(), true),
+                        Ok(Err(join_error)) => (format!("tool execution panicked: {join_error}"), true),
+                        Err(_elapsed) => (format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"), true),
                     }
                 };
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                self.hook_runner.fire_post_tool(tool_name, &output, is_error, elapsed_ms);
 
                 if let Some(callback) = &self.tool_callback {
                     let summary: String = output.chars().take(500).collect();
@@ -1592,7 +1708,12 @@ self.record_turn_completed(&summary);
 
         let session_id = self.session().session_id;
         mgr.set_active_session(session_id.clone());
+<<<<<<< Updated upstream
         match mgr.prepare_context(user_input, &mem_messages, Some(&session_id)).await {
+=======
+
+        match mgr.prepare_context(user_input, &mem_messages).await {
+>>>>>>> Stashed changes
             Ok(mut prepared) => {
                 if prepared.entries.is_empty() {
                     tracing::debug!(entries = 0, "memory context prepared");
@@ -1722,6 +1843,8 @@ self.record_turn_completed(&summary);
         let Some(mgr) = self.memory_manager.as_ref() else {
             return Ok(());
         };
+        let session_id = self.session().session_id;
+        mgr.set_active_session(session_id.clone());
         let mgr = Arc::clone(mgr);
 
         // Convert session messages to memory's Message type for post-turn extraction.
@@ -2186,8 +2309,8 @@ mod tests {
 
     use super::{
         ApiClient, ApiRequest,
-        AssistantEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor,
+        AssistantEvent, CognitiveContextManager, ConversationRuntime, PromptCacheEvent,
+        RuntimeError, StaticToolExecutor,
     };
     use std::pin::Pin;
     use futures::stream::Stream;
@@ -2988,6 +3111,57 @@ mod tests {
         if let Some(h) = handoff {
             rt.restore_memory_handoff(h);
         }
+    }
+
+    // ── T2: active session tracking ────────────────────────────
+
+    /// Integration test: verify that `prepare_memory_context` and
+    /// `run_memory_post_turn` both call `set_active_session` on the
+    /// memory manager before operating.
+    ///
+    /// Requires tempfile + memory DB, so marked `#[ignore]` for CI.
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_memory_context_sets_active_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let blob_dir = tmp.path().join("blobs");
+        std::fs::create_dir_all(&blob_dir).unwrap();
+
+        let store = memory::config::StoreConfig {
+            sqlite_path: db_path,
+            blob_dir,
+            enable_vector_index: false,
+            ..Default::default()
+        };
+        let mem_cfg = memory::config::MemoryConfig {
+            store,
+            ..Default::default()
+        };
+
+        let mgr = Arc::new(CognitiveContextManager::new(mem_cfg).await.unwrap());
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_memory_manager(mgr.clone());
+
+        // Act — prepare_memory_context should set the active session
+        let _ = rt.prepare_memory_context("test query").await;
+
+        // Assert — verify the memory manager recorded the session
+        let active = mgr.active_session_id();
+        assert_eq!(
+            active,
+            Some(session_id),
+            "active_session should be set after prepare_memory_context"
+        );
     }
 
 }

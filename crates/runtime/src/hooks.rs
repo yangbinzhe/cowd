@@ -326,6 +326,12 @@ impl HookRunner {
         )
     }
 
+    /// Fire post-tool lifecycle notification with execution duration.
+    /// This is a non-blocking notification (does not run script hooks).
+    pub fn fire_post_tool(&self, name: &str, _result: &str, is_error: bool, duration_ms: u64) {
+        tracing::debug!(tool = name, duration_ms, is_error, "tool execution completed");
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_commands(
         event: HookEvent,

@@ -37,6 +37,7 @@ use crate::{
         MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta, MemorySource,
         PreparedContext, Priority, TokenBudget,
     },
+    write_guard::MemoryWriteGuard,
 };
 
 /// Result alias.
@@ -77,6 +78,8 @@ pub struct MemoryOrchestrator {
     closet_rebuild_counter: AtomicU32,
     /// Cross-session context synchronisation store.
     context_sync: Mutex<ContextSync>,
+    /// Write guard for anti-corruption control (optional).
+    write_guard: Option<Arc<MemoryWriteGuard>>,
 }
 
 impl MemoryOrchestrator {
@@ -152,6 +155,7 @@ impl MemoryOrchestrator {
             active_session: Mutex::new(None),
             closet_rebuild_counter: AtomicU32::new(0),
             context_sync: Mutex::new(ContextSync::new()),
+            write_guard: None,
         })
     }
 
@@ -444,6 +448,16 @@ impl MemoryOrchestrator {
     /// and contradictory statements cause the entry's confidence to be
     /// downgraded.
     pub async fn remember(&self, mut entry: MemoryEntry) -> Result<MemoryId> {
+        // Enforce WriteGuard before allowing any write
+        if let Some(ref guard) = self.write_guard {
+            if !guard.is_write_allowed(entry.layer) {
+                return Err(MemoryError::WriteDenied {
+                    layer: format!("{:?}", entry.layer),
+                    write_source: format!("{:?}", guard.source()),
+                });
+            }
+        }
+
         // Auto-fill scope from the active scope
         entry.scope = self.active_scope.lock().clone();
 
@@ -795,6 +809,12 @@ impl MemoryOrchestrator {
     /// Set (create or update) the primary identity entry.
     pub async fn set_identity(&self, title: &str, content: &str) -> Result<MemoryId> {
         self.l0.set(title, content).await
+    }
+
+    /// Attach a write guard for anti-corruption control.
+    pub fn with_write_guard(mut self, guard: Arc<MemoryWriteGuard>) -> Self {
+        self.write_guard = Some(guard);
+        self
     }
 
     /// Configure a fact checker for contradiction detection.
