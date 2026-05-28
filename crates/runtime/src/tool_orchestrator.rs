@@ -36,14 +36,16 @@ impl ToolSafetyCategory {
     /// Classify a tool by name using a built-in mapping.
     pub fn from_tool_name(name: &str) -> Self {
         match name {
-            // Read-only tools
-            "read" | "grep" | "glob" | "file_search" | "list_directory"
+            "read" | "read_file" | "cat" | "head" | "tail"
+            | "grep" | "grep_search" | "rg"
+            | "glob" | "glob_search" | "find" | "ls" | "list_directory"
+            | "file_search"
             | "git_status" | "git_log" | "git_diff" | "git_show"
             | "memory_search" | "memory_list" | "memory_get" | "session_list"
             | "session_get" | "skill_list" | "skill_view" => Self::ReadOnly,
 
-            // Local write tools
-            "write" | "edit" | "bash" | "create_file" | "delete_file"
+            "write" | "write_file" | "edit" | "edit_file"
+            | "bash" | "create_file" | "delete_file"
             | "memory_create" | "memory_delete" | "session_create" => Self::WriteLocal,
 
             // Network tools
@@ -258,13 +260,19 @@ mod tests {
     #[test]
     fn classifies_read_tools() {
         assert_eq!(ToolSafetyCategory::from_tool_name("read"), ToolSafetyCategory::ReadOnly);
+        assert_eq!(ToolSafetyCategory::from_tool_name("read_file"), ToolSafetyCategory::ReadOnly);
         assert_eq!(ToolSafetyCategory::from_tool_name("grep"), ToolSafetyCategory::ReadOnly);
+        assert_eq!(ToolSafetyCategory::from_tool_name("grep_search"), ToolSafetyCategory::ReadOnly);
         assert_eq!(ToolSafetyCategory::from_tool_name("glob"), ToolSafetyCategory::ReadOnly);
+        assert_eq!(ToolSafetyCategory::from_tool_name("glob_search"), ToolSafetyCategory::ReadOnly);
     }
 
     #[test]
     fn classifies_write_tools() {
         assert_eq!(ToolSafetyCategory::from_tool_name("write"), ToolSafetyCategory::WriteLocal);
+        assert_eq!(ToolSafetyCategory::from_tool_name("write_file"), ToolSafetyCategory::WriteLocal);
+        assert_eq!(ToolSafetyCategory::from_tool_name("edit"), ToolSafetyCategory::WriteLocal);
+        assert_eq!(ToolSafetyCategory::from_tool_name("edit_file"), ToolSafetyCategory::WriteLocal);
         assert_eq!(ToolSafetyCategory::from_tool_name("bash"), ToolSafetyCategory::WriteLocal);
     }
 
@@ -287,7 +295,9 @@ mod tests {
     fn read_only_concurrent() {
         let orch = ToolOrchestrator::new();
         assert!(orch.can_run_concurrently("read", "grep"));
+        assert!(orch.can_run_concurrently("read_file", "grep_search"));
         assert!(orch.can_run_concurrently("glob", "file_search"));
+        assert!(orch.can_run_concurrently("glob_search", "grep_search"));
     }
 
     #[test]
