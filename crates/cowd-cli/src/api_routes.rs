@@ -215,7 +215,7 @@ async fn delete_session(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if state.sessions.remove(&id).is_some() {
         if let Some(ref store) = state.unified_store {
-            let _ = store.delete_session(&id);
+            let _ = store.delete_session(&id).await;
         }
         Ok(StatusCode::NO_CONTENT)
     } else {

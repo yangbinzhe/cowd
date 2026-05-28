@@ -2909,7 +2909,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     // ── Populate TUI session list from the unified SQLite store ──
     {
         let sessions = match get_unified_store() {
-            Ok(store) => store.list_sessions().unwrap_or_default(),
+            Ok(store) => SHARED_RT.block_on(store.list_sessions()).unwrap_or_default(),
             Err(_) => Vec::new(),
         };
         let session_list: Vec<(String, String, String)> = sessions
@@ -3126,10 +3126,10 @@ fn consume_session_sidebar_actions(
         if let Some(target) = sessions.get(idx) {
             let target_id = target.id.clone();
             if let Ok(store) = get_unified_store() {
-                let _ = store.delete_session(&target_id);
+                let _ = SHARED_RT.block_on(store.delete_session(&target_id));
                 state.add_message("system", &format!("Deleted session {}", &target_id[..8.min(target_id.len())]));
 
-                if let Ok(records) = store.list_sessions() {
+                if let Ok(records) = SHARED_RT.block_on(store.list_sessions()) {
                     let summaries: Vec<SessionSummary> = records.iter()
                         .map(|r| SessionSummary {
                             id: r.session_id.clone(),
@@ -3151,9 +3151,9 @@ fn consume_session_sidebar_actions(
         if let Some(target) = sessions.get(idx) {
             let target_id = target.id.clone();
             if let Ok(store) = get_unified_store() {
-                if let Ok(Some(mut record)) = store.get_session(&target_id) {
+                if let Ok(Some(mut record)) = SHARED_RT.block_on(store.get_session(&target_id)) {
                     record.chat_id = new_name.clone();
-                    let _ = store.update_session(&record);
+                    let _ = SHARED_RT.block_on(store.update_session(&record));
                     state.add_message("system", &format!("Renamed to {}", new_name));
                 }
             }
@@ -4197,7 +4197,7 @@ impl LiveCli {
                 output_tokens: 0,
                 estimated_cost_usd: 0.0,
             };
-            let _ = store.upsert_session(&record);
+            let _ = SHARED_RT.block_on(store.upsert_session(&record));
         }
         Ok(())
     }
@@ -5006,7 +5006,7 @@ fn migrate_jsonl_sessions(
                     Err(_) => continue,
                 };
                 let record = session_to_record(&session, &path);
-                if store.create_session(&record).is_ok() {
+                if SHARED_RT.block_on(store.create_session(&record)).is_ok() {
                     count += 1;
                 }
             }
@@ -5092,9 +5092,9 @@ fn create_managed_session_handle(
             output_tokens: 0,
             estimated_cost_usd: 0.0,
         };
-        let _ = store.create_session(&record);
+        let _ = SHARED_RT.block_on(store.create_session(&record));
         // Also bump last_activity so it sorts near the top
-        let _ = store.upsert_session(&record);
+        let _ = SHARED_RT.block_on(store.upsert_session(&record));
     }
 
     Ok(SessionHandle {
@@ -5112,8 +5112,7 @@ fn resolve_session_reference(
         || reference.eq_ignore_ascii_case("recent")
     {
         let store = get_unified_store()?;
-        let records = store
-            .list_sessions()
+        let records = SHARED_RT.block_on(store.list_sessions())
             .map_err(|e| -> Box<dyn std::error::Error> {
                 format!("failed to list sessions: {e}").into()
             })?;
@@ -5170,7 +5169,7 @@ fn resolve_managed_session_path(
 
     // Check if the session is registered in SQLite.
     if let Ok(store) = get_unified_store() {
-        if let Ok(Some(_record)) = store.get_session(session_id) {
+        if let Ok(Some(_record)) = SHARED_RT.block_on(store.get_session(session_id)) {
             // Try existing .jsonl / .json first.
             for ext in &["jsonl", "json"] {
                 let path = dir.join(format!("{session_id}.{ext}"));
@@ -5197,8 +5196,7 @@ fn resolve_managed_session_path(
 fn list_managed_sessions(
 ) -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
     let store = get_unified_store()?;
-    let records = store
-        .list_sessions()
+    let records = SHARED_RT.block_on(store.list_sessions())
         .map_err(|e| -> Box<dyn std::error::Error> {
             format!("failed to list sessions: {e}").into()
         })?;
@@ -5298,7 +5296,7 @@ fn delete_managed_session(path: &Path) -> Result<(), Box<dyn std::error::Error>>
     // Remove from SQLite as well (extract session_id from filename stem).
     if let Ok(store) = get_unified_store() {
         if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
-            let _ = store.delete_session(id);
+            let _ = SHARED_RT.block_on(store.delete_session(id));
         }
     }
     fs::remove_file(path)?;

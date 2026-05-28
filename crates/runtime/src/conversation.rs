@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 
 /// T35: Lightweight cancellation token (tokio-util not available in dep tree).
 #[derive(Clone, Default)]
@@ -240,7 +240,7 @@ impl TurnCallback {
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
 pub struct ConversationRuntime<C, T> {
-    session: Arc<RwLock<Session>>,
+    session: Arc<RwLock<Session>>, // tokio::sync::RwLock
     api_client: C,
     tool_executor: Arc<T>,
     permission_policy: PermissionPolicy,
@@ -785,7 +785,7 @@ where
     /// Returns Ok(()) if healthy, Err if the session appears broken.
     fn run_session_health_probe(&mut self) -> Result<(), String> {
         // Check if we have basic session integrity
-        if self.session.read().unwrap_or_else(|e| e.into_inner()).messages.is_empty() && self.session.read().unwrap_or_else(|e| e.into_inner()).compaction.is_some() {
+        if self.session.blocking_read().messages.is_empty() && self.session.blocking_read().compaction.is_some() {
             // Freshly compacted with no messages - this is normal
             return Ok(());
         }
@@ -808,7 +808,7 @@ pub async fn run_turn_async(
         let user_input = user_input.into();
         tracing::info!(session_id = %self.session().session_id, "turn started");
 
-        if self.session.read().unwrap_or_else(|e| e.into_inner()).compaction.is_some() {
+        if self.session.read().await.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
                 return Err(RuntimeError::new(format!("Session health probe failed: {error}")));
             }
@@ -817,7 +817,7 @@ pub async fn run_turn_async(
         self.record_turn_started(&user_input);
         self.record_context_event("user_input", "user",
             &user_input[..user_input.len().min(200)], 8);
-        self.session.write().unwrap_or_else(|e| e.into_inner())
+        self.session.write().await
             .push_user_text(user_input.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
 
@@ -838,16 +838,16 @@ pub async fn run_turn_async(
             }
 
             if self.auto_compaction_input_tokens_threshold > 0
-                && estimate_session_tokens(&*self.session.read().unwrap_or_else(|e| e.into_inner())) > self.auto_compaction_input_tokens_threshold as usize
+                && estimate_session_tokens(&*self.session.read().await) > self.auto_compaction_input_tokens_threshold as usize
             {
-                let result = compact_session(&*self.session.read().unwrap_or_else(|e| e.into_inner()), CompactionConfig::default());
+                let result = compact_session(&*self.session.read().await, CompactionConfig::default());
                 if result.removed_message_count > 0 {
-                    *self.session.write().unwrap_or_else(|e| e.into_inner()) = result.compacted_session;
+                    *self.session.write().await = result.compacted_session;
                     effective_system_prompt = self.prepare_memory_context(&user_input).await;
                 }
             }
             if self.model_context_window > 0 {
-                let used = estimate_session_tokens(&*self.session.read().unwrap_or_else(|e| e.into_inner()));
+                let used = estimate_session_tokens(&*self.session.read().await);
                 if used as f64 / self.model_context_window as f64 > 0.85 {
                     tracing::warn!(used, "context window pressure critical");
                 }
@@ -855,7 +855,7 @@ pub async fn run_turn_async(
 
             let request = ApiRequest {
                 system_prompt: effective_system_prompt.clone(),
-                messages: self.session.read().unwrap_or_else(|e| e.into_inner()).messages.clone(),
+                messages: self.session.read().await.messages.clone(),
                 model: String::new(), // filled by fallback loop below
             };
 
@@ -1066,7 +1066,7 @@ pub async fn run_turn_async(
             }
             let role = crate::session::MessageRole::Assistant;
             let assistant_msg = ConversationMessage { role, blocks, usage: turn_usage };
-            self.session.write().unwrap_or_else(|e| e.into_inner()).push_message(assistant_msg.clone())
+            self.session.write().await.push_message(assistant_msg.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             assistant_messages.push(assistant_msg);
 
@@ -1120,7 +1120,7 @@ pub async fn run_turn_async(
                             let msg = ConversationMessage::tool_result(
                                 tid.clone(), tool_name_str.clone(), output, is_error,
                             );
-                            self.session.write().unwrap_or_else(|e| e.into_inner())
+                            self.session.write().await
                                 .push_message(msg.clone())
                                 .map_err(|e| RuntimeError::new(e.to_string()))?;
                             let inject = self.turn_callback.as_ref().and_then(|cb| {
@@ -1207,7 +1207,7 @@ pub async fn run_turn_async(
                 }
             }
             if let Some(inject) = callback_inject {
-                self.session.write().unwrap_or_else(|e| e.into_inner()).push_user_text(inject).map_err(|e| RuntimeError::new(e.to_string()))?;
+                self.session.write().await.push_user_text(inject).map_err(|e| RuntimeError::new(e.to_string()))?;
                 continue; // continue loop with injected input
             }
         }
@@ -1283,7 +1283,7 @@ self.record_turn_completed(&summary);
                         let denied = ConversationMessage::tool_result(
                             tool_use_id.to_string(), tool_name.to_string(), reason, true,
                         );
-                        self.session.write().unwrap_or_else(|e| e.into_inner()).push_message(denied.clone())
+                        self.session.write().await.push_message(denied.clone())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                         return Ok(denied);
                     }
@@ -1325,7 +1325,7 @@ self.record_turn_completed(&summary);
                             format!("Gate check failed: {}", reasons.join("; ")),
                             true,
                         );
-                        self.session.write().unwrap_or_else(|e| e.into_inner()).push_message(denied.clone())
+                        self.session.write().await.push_message(denied.clone())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                         return Ok(denied);
                     }
@@ -1392,7 +1392,7 @@ self.record_turn_completed(&summary);
                 let result = ConversationMessage::tool_result(
                     tool_use_id.to_string(), tool_name.to_string(), truncated, is_error,
                 );
-                self.session.write().unwrap_or_else(|e| e.into_inner()).push_message(result.clone())
+                self.session.write().await.push_message(result.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 Ok(result)
             }
@@ -1400,7 +1400,7 @@ self.record_turn_completed(&summary);
                 let denied = ConversationMessage::tool_result(
                     tool_use_id.to_string(), tool_name.to_string(), reason, true,
                 );
-                self.session.write().unwrap_or_else(|e| e.into_inner()).push_message(denied.clone())
+                self.session.write().await.push_message(denied.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 Ok(denied)
             }
@@ -1428,12 +1428,12 @@ self.record_turn_completed(&summary);
 
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
-        compact_session(&*self.session.read().unwrap_or_else(|e| e.into_inner()), config)
+        compact_session(&*self.session.blocking_read(), config)
     }
 
     #[must_use]
     pub fn estimated_tokens(&self) -> usize {
-        estimate_session_tokens(&*self.session.read().unwrap_or_else(|e| e.into_inner()))
+        estimate_session_tokens(&*self.session.blocking_read())
     }
 
     #[must_use]
@@ -1443,39 +1443,45 @@ self.record_turn_completed(&summary);
 
     #[must_use]
     pub fn session(&self) -> Session {
-        self.session.read().unwrap_or_else(|e| e.into_inner()).clone()
+        tokio::task::block_in_place(|| {
+            self.session.blocking_read().clone()
+        })
     }
 
     pub fn api_client_mut(&mut self) -> &mut C {
         &mut self.api_client
     }
 
-    pub fn session_mut(&mut self) -> std::sync::RwLockWriteGuard<'_, Session> {
-        self.session.write().unwrap_or_else(|e| e.into_inner())
+    pub fn session_mut(&mut self) -> tokio::sync::RwLockWriteGuard<'_, Session> {
+        self.session.blocking_write()
+    }
+
+    pub async fn session_mut_async(&mut self) -> tokio::sync::RwLockWriteGuard<'_, Session> {
+        self.session.write().await
     }
 
     #[must_use]
     pub fn fork_session(&self, branch_name: Option<String>) -> Session {
-        self.session.read().unwrap_or_else(|e| e.into_inner()).fork(branch_name)
+        self.session.blocking_read().fork(branch_name)
     }
 
     #[must_use]
     pub fn into_session(self) -> Session {
-        Arc::try_unwrap(self.session).map(|lock| lock.into_inner().unwrap_or_else(|e| e.into_inner().clone())).unwrap_or_else(|arc| arc.read().unwrap_or_else(|e| e.into_inner()).clone())
+        Arc::try_unwrap(self.session).map(|lock| lock.into_inner()).unwrap_or_else(|arc| arc.blocking_read().clone())
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
         // Use the session's estimated token count directly, not the cumulative
         // usage tracker which spans across multiple sessions and doesn't
         // reflect the current conversation window pressure.
-        let session_tokens = estimate_session_tokens(&*self.session.read().unwrap_or_else(|e| e.into_inner()));
+        let session_tokens = estimate_session_tokens(&*self.session.blocking_read());
 
         if session_tokens < self.auto_compaction_input_tokens_threshold as usize {
             return None;
         }
 
         let result = compact_session(
-            &self.session.read().unwrap_or_else(|e| e.into_inner()),
+            &self.session.blocking_read(),
             CompactionConfig {
                 max_estimated_tokens: 0, priority_threshold: 3, keep_high_priority: true,
                 ..CompactionConfig::default()
@@ -1487,7 +1493,7 @@ self.record_turn_completed(&summary);
         }
 
         tracing::info!(removed = result.removed_message_count, "compaction");
-        *self.session.write().unwrap_or_else(|e| e.into_inner()) = result.compacted_session;
+        *self.session.blocking_write() = result.compacted_session;
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
@@ -1629,7 +1635,7 @@ self.record_turn_completed(&summary);
         // Tool execution results are machine-optimised data, not knowledge worth retaining
         // in long-term memory (they can be re-derived by re-running the tool).
         let mem_messages: Vec<MemMessage> = self
-            .session.read().unwrap_or_else(|e| e.into_inner())
+            .session.read().await
             .messages
             .iter()
             .enumerate()
@@ -1817,7 +1823,7 @@ self.record_turn_completed(&summary);
         // Convert session messages to memory's Message type for post-turn extraction.
         // DESIGN: Tool blocks are excluded (same rationale as prepare_memory_context).
         let mut mem_messages: Vec<MemMessage> = self
-            .session.read().unwrap_or_else(|e| e.into_inner())
+            .session.read().await
             .messages
             .iter()
             .enumerate()
