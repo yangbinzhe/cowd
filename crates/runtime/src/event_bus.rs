@@ -27,8 +27,8 @@ impl EventBus {
     }
 
     pub fn publish(&self, event: RuntimeEvent) -> Result<(), CowdError> {
-        self.tx.send(event).map_err(|e| {
-            CowdError::other(format!("event bus closed: {e}"))
+        self.tx.try_send(event).map_err(|e| {
+            CowdError::other(format!("event bus closed or full: {e}"))
         })
     }
 }

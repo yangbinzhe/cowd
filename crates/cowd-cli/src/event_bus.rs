@@ -31,12 +31,45 @@ impl SessionEventBus {
             .push(tx);
     }
 
+    /// Remove a specific sender from the session's subscriber list.
+    pub async fn unsubscribe(&self, session_id: &str, tx: &EventSender) {
+        if let Some(txs) = self.listeners.write().await.get_mut(session_id) {
+            txs.retain(|t| !std::ptr::eq(t, tx));
+            if txs.is_empty() {
+                self.listeners.write().await.remove(session_id);
+            }
+        }
+    }
+
     /// Send an SSE event string to all subscribers of the given session.
-    /// Dropped senders are silently ignored (the subscriber disconnected).
+    /// Dead (disconnected) senders are automatically cleaned up.
     pub async fn broadcast(&self, session_id: &str, sse_data: &str) {
-        if let Some(txs) = self.listeners.read().await.get(session_id) {
-            for tx in txs {
-                let _ = tx.send(sse_data.to_string());
+        let dead_indices: Vec<usize> = {
+            if let Some(txs) = self.listeners.read().await.get(session_id) {
+                txs.iter()
+                    .enumerate()
+                    .filter_map(|(i, tx)| {
+                        if tx.send(sse_data.to_string()).is_err() {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                return;
+            }
+        };
+
+        // Clean up dead connections
+        if !dead_indices.is_empty() {
+            if let Some(txs) = self.listeners.write().await.get_mut(session_id) {
+                for &i in dead_indices.iter().rev() {
+                    txs.remove(i);
+                }
+                if txs.is_empty() {
+                    self.listeners.write().await.remove(session_id);
+                }
             }
         }
     }
