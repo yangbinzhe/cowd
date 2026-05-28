@@ -10,9 +10,11 @@
 //! 7. Return top-n
 
 use crate::search::bm25::BM25Scorer;
+use parking_lot::Mutex;
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 /// Identifier for memory entries in search results.
 pub type MemoryId = String;
@@ -40,20 +42,23 @@ pub struct HybridSearcher {
     pub bm25_weight: f64,
     /// Over-fetch multiplier (default 3, borrowed from MemPalace).
     pub over_fetch_factor: usize,
+    /// Cached BM25 index + document hash, protected by interior mutability.
+    cache: Mutex<Option<(BM25Scorer, u64)>>,
 }
 
 impl Default for HybridSearcher {
     fn default() -> Self {
-        Self::new()
+        Self::new(0.6, 0.4)
     }
 }
 
 impl HybridSearcher {
-    pub fn new() -> Self {
+    pub fn new(vector_weight: f64, bm25_weight: f64) -> Self {
         Self {
-            vector_weight: 0.6,
-            bm25_weight: 0.4,
+            vector_weight,
+            bm25_weight,
             over_fetch_factor: 3,
+            cache: Mutex::new(None),
         }
     }
 
@@ -82,9 +87,25 @@ impl HybridSearcher {
         // Step 1: Vector candidates (take over_fetch from the provided results)
         let vector_candidates: Vec<_> = vector_results.into_iter().take(over_fetch).collect();
 
-        // Step 2: BM25 candidates
-        let bm25 = BM25Scorer::default_params(all_documents);
-        let bm25_rankings = bm25.rank(query);
+        // Step 2: BM25 candidates — use cached index when documents haven't changed
+        let doc_hash = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            all_documents.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        let bm25_rankings = {
+            let mut cache = self.cache.lock();
+            let rebuild = match cache.as_ref() {
+                Some((_, cached_hash)) if *cached_hash == doc_hash => false,
+                _ => true,
+            };
+            if rebuild {
+                let scorer = BM25Scorer::default_params(all_documents);
+                *cache = Some((scorer, doc_hash));
+            }
+            cache.as_ref().expect("BM25 index must be present after build/hit").0.rank(query)
+        };
         let bm25_candidates: Vec<_> = bm25_rankings.into_iter().take(over_fetch).collect();
 
         // Step 3: Merge candidate sets
@@ -287,7 +308,7 @@ mod tests {
             ("id_1".to_string(), "Python data science".to_string(), 0.3),
         ];
 
-        let searcher = HybridSearcher::new();
+        let searcher = HybridSearcher::new(0.6, 0.4);
         let results = searcher.search("Rust programming", vector_results, &docs, &doc_ids, 3);
 
         assert!(!results.is_empty());
@@ -301,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_hybrid_search_empty_docs() {
-        let searcher = HybridSearcher::new();
+        let searcher = HybridSearcher::new(0.6, 0.4);
         let results = searcher.search("test", vec![], &[], &[], 5);
         assert!(results.is_empty());
     }
@@ -335,7 +356,7 @@ mod tests {
             ("doc_a".to_string(), 0.50),
         ];
 
-        let searcher = HybridSearcher::new();
+        let searcher = HybridSearcher::new(0.6, 0.4);
         let results = searcher.search_rrf("test query", &porter, &trigram);
 
         assert_eq!(results.len(), 4, "should fuse to 4 unique documents");
@@ -363,7 +384,7 @@ mod tests {
             ("doc_b".to_string(), 0.80),
         ];
 
-        let searcher = HybridSearcher::new();
+        let searcher = HybridSearcher::new(0.6, 0.4);
         let results = searcher.search_rrf("test", &porter, &[]);
 
         assert_eq!(results.len(), 2);
@@ -381,7 +402,7 @@ mod tests {
     fn test_rrf_single_list_fallback_trigram() {
         let trigram = vec![("doc_x".to_string(), 0.88)];
 
-        let searcher = HybridSearcher::new();
+        let searcher = HybridSearcher::new(0.6, 0.4);
         let results = searcher.search_rrf("test", &[], &trigram);
 
         assert_eq!(results.len(), 1);
@@ -392,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_rrf_empty_input() {
-        let searcher = HybridSearcher::new();
+        let searcher = HybridSearcher::new(0.6, 0.4);
         let results = searcher.search_rrf("test", &[], &[]);
         assert!(results.is_empty());
     }
@@ -403,7 +424,7 @@ mod tests {
         let porter = vec![("doc_z".to_string(), 0.99)];
         let trigram = vec![("doc_z".to_string(), 0.99)];
 
-        let searcher = HybridSearcher::new();
+        let searcher = HybridSearcher::new(0.6, 0.4);
         let results = searcher.search_rrf("test", &porter, &trigram);
 
         assert_eq!(results.len(), 1);
@@ -412,5 +433,19 @@ mod tests {
         // RRF score: 1/(60+1) + 1/(60+1) = 2/61 ≈ 0.03279
         let expected = 1.0 / (60.0 + 1.0) + 1.0 / (60.0 + 1.0);
         assert!((results[0].hybrid_score - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn bm25_index_cached_across_searches() {
+        let searcher = HybridSearcher::new(0.5, 0.5);
+        let docs = vec!["hello world".to_string(), "foo bar".to_string()];
+        let doc_ids: Vec<MemoryId> = vec!["id_0".to_string(), "id_1".to_string()];
+
+        // First search builds BM25 index
+        searcher.search("hello", vec![], &docs, &doc_ids, 5);
+        // Second search with same docs should use cache (no rebuild)
+        searcher.search("bar", vec![], &docs, &doc_ids, 5);
+        // Verify cache exists
+        assert!(searcher.cache.lock().is_some(), "BM25 index should be cached after first search");
     }
 }

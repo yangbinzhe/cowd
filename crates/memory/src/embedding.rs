@@ -17,6 +17,7 @@
 //! - `CC_MEMORY_VECTOR_MODEL` – overrides [`VectorConfig::model`].
 //! - `CC_MEMORY_VECTOR_API_URL` – overrides [`VectorConfig::api_url`].
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -270,64 +271,113 @@ impl EmbeddingClient {
 
     /// Send one batch (≤ `batch_size` items) to the API and return
     /// `(original_index, embedding)` pairs in API response order.
+    ///
+    /// Retries up to [`EMBED_MAX_RETRIES`] times with exponential backoff on
+    /// transient HTTP failures.
     async fn embed_batch(
         &self,
         texts: &[&str],
     ) -> Result<Vec<(usize, Vec<f32>)>, MemoryError> {
-        let body = EmbedRequest {
-            model: &self.config.model,
-            input: texts,
-        };
+        let model = self.config.model.clone();
+        let api_url = self.config.api_url.clone();
+        let api_key = self.config.api_key.clone();
+        let http = self.http.clone();
 
-        let mut req = self
-            .http
-            .post(&self.config.api_url)
-            .header("Content-Type", "application/json");
+        retry_with_backoff(EMBED_MAX_RETRIES, EMBED_RETRY_BASE_DELAY_MS, move || {
+            let model = model.clone();
+            let api_url = api_url.clone();
+            let api_key = api_key.clone();
+            let http = http.clone();
+            let texts = texts.to_vec();
+            async move {
+                let body = EmbedRequest {
+                    model: &model,
+                    input: &texts,
+                };
 
-        // Attach the Bearer token when an API key is configured.
-        if !self.config.api_key.is_empty() {
-            req = req.header(
-                "Authorization",
-                format!("Bearer {}", self.config.api_key),
-            );
-        }
+                let mut req = http
+                    .post(&api_url)
+                    .header("Content-Type", "application/json");
 
-        let response = req.json(&body).send().await.map_err(|e| {
-            warn!(error = %e, url = %self.config.api_url, "embedding API request failed");
-            MemoryError::Store(format!("embedding API request failed: {e}"))
-        })?;
+                if !api_key.is_empty() {
+                    req = req.header(
+                        "Authorization",
+                        format!("Bearer {api_key}"),
+                    );
+                }
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body_text = response.text().await.unwrap_or_default();
-            warn!(
-                status = %status,
-                body = %body_text,
-                "embedding API returned non-2xx status"
-            );
-            return Err(MemoryError::Store(format!(
-                "embedding API error {status}: {body_text}"
-            )));
-        }
+                let response = req.json(&body).send().await.map_err(|e| {
+                    warn!(error = %e, url = %api_url, "embedding API request failed (will retry)");
+                    MemoryError::Store(format!("embedding API request failed: {e}"))
+                })?;
 
-        let embed_resp: EmbedResponse = response.json().await.map_err(|e| {
-            MemoryError::Store(format!("embedding API response parse error: {e}"))
-        })?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body_text = response.text().await.unwrap_or_default();
+                    warn!(
+                        status = %status,
+                        body = %body_text,
+                        "embedding API returned non-2xx status"
+                    );
+                    return Err(MemoryError::Store(format!(
+                        "embedding API error {status}: {body_text}"
+                    )));
+                }
 
-        if embed_resp.data.is_empty() {
-            return Err(MemoryError::Store(
-                "embedding API returned empty data array".into(),
-            ));
-        }
+                let embed_resp: EmbedResponse = response.json().await.map_err(|e| {
+                    MemoryError::Store(format!("embedding API response parse error: {e}"))
+                })?;
 
-        let pairs = embed_resp
-            .data
-            .into_iter()
-            .map(|item| (item.index, item.embedding))
-            .collect();
+                if embed_resp.data.is_empty() {
+                    return Err(MemoryError::Store(
+                        "embedding API returned empty data array".into(),
+                    ));
+                }
 
-        Ok(pairs)
+                Ok(embed_resp
+                    .data
+                    .into_iter()
+                    .map(|item| (item.index, item.embedding))
+                    .collect())
+            }
+        }).await
     }
+}
+
+// ─── Retry constants & utility ─────────────────────────────────────────────
+
+/// Number of retry attempts for transient embedding API failures.
+const EMBED_MAX_RETRIES: u32 = 3;
+/// Base delay in milliseconds for exponential backoff.
+const EMBED_RETRY_BASE_DELAY_MS: u64 = 500;
+
+/// Retry a fallible async operation with exponential backoff.
+///
+/// Calls `operation` up to `max_retries` times. Delays between retries follow
+/// `base_delay_ms * 2^attempt`.
+async fn retry_with_backoff<F, Fut, T>(
+    max_retries: u32,
+    base_delay_ms: u64,
+    operation: F,
+) -> Result<T, MemoryError>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, MemoryError>>,
+{
+    let mut last_error = None;
+    for attempt in 0..max_retries {
+        match operation().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                last_error = Some(e);
+                if attempt + 1 < max_retries {
+                    let delay = base_delay_ms * (1 << attempt);
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap())
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

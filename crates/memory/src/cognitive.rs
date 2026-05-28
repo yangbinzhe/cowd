@@ -313,7 +313,7 @@ impl CognitiveContextManager {
             orchestrator,
             pipeline,
             vector_index,
-            hybrid_searcher: HybridSearcher::new(),
+            hybrid_searcher: HybridSearcher::new(0.6, 0.4),
             monitor,
             handoff_mgr: HandoffManager::new(),
             seeds,

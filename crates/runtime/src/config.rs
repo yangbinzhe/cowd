@@ -1430,11 +1430,17 @@ fn parse_optional_hooks_config_object(
     };
     let hooks = expect_object(hooks_value, context)?;
     Ok(RuntimeHookConfig {
-        pre_tool_use: optional_string_array_dual(hooks, "pre_tool_use", context)?
+        pre_tool_use: find_key_dual(hooks, "pre_tool_use", context)
+            .map(|v| parse_json_string_array(v, "pre_tool_use", context))
+            .transpose()?
             .unwrap_or_default(),
-        post_tool_use: optional_string_array_dual(hooks, "post_tool_use", context)?
+        post_tool_use: find_key_dual(hooks, "post_tool_use", context)
+            .map(|v| parse_json_string_array(v, "post_tool_use", context))
+            .transpose()?
             .unwrap_or_default(),
-        post_tool_use_failure: optional_string_array_dual(hooks, "post_tool_use_failure", context)?
+        post_tool_use_failure: find_key_dual(hooks, "post_tool_use_failure", context)
+            .map(|v| parse_json_string_array(v, "post_tool_use_failure", context))
+            .transpose()?
             .unwrap_or_default(),
     })
 }
@@ -2224,30 +2230,35 @@ fn parse_bool_map(value: &JsonValue, context: &str) -> Result<BTreeMap<String, b
         .collect()
 }
 
+fn parse_json_string_array(
+    value: &JsonValue,
+    key: &str,
+    context: &str,
+) -> Result<Vec<String>, ConfigError> {
+    let Some(array) = value.as_array() else {
+        return Err(ConfigError::Parse(format!(
+            "{context}: field {key} must be an array"
+        )));
+    };
+    array
+        .iter()
+        .map(|item| {
+            item.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                ConfigError::Parse(format!(
+                    "{context}: field {key} must contain only strings"
+                ))
+            })
+        })
+        .collect()
+}
+
 fn optional_string_array(
     object: &BTreeMap<String, JsonValue>,
     key: &str,
     context: &str,
 ) -> Result<Option<Vec<String>>, ConfigError> {
     match object.get(key) {
-        Some(value) => {
-            let Some(array) = value.as_array() else {
-                return Err(ConfigError::Parse(format!(
-                    "{context}: field {key} must be an array"
-                )));
-            };
-            array
-                .iter()
-                .map(|item| {
-                    item.as_str().map(ToOwned::to_owned).ok_or_else(|| {
-                        ConfigError::Parse(format!(
-                            "{context}: field {key} must contain only strings"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map(Some)
-        }
+        Some(value) => parse_json_string_array(value, key, context).map(Some),
         None => Ok(None),
     }
 }
