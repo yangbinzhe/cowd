@@ -197,6 +197,21 @@ impl MemoryOrchestrator {
         self.l1.get_hot_symbols()
     }
 
+    /// Return a formatted context string of hot code symbols, or None if empty.
+    /// Matches the original Phase 2 design API.
+    #[must_use]
+    pub fn get_hot_symbols_context(&self) -> Option<String> {
+        let symbols = self.l1.get_hot_symbols();
+        if symbols.is_empty() {
+            return None;
+        }
+        let entries: Vec<String> = symbols.iter()
+            .take(5)
+            .map(|s| format!("{} (freq={:.1})", s.name, s.frequency))
+            .collect();
+        Some(format!("Hot Code Symbols: {}", entries.join(", ")))
+    }
+
     /// Record that source files were accessed by a tool.
     ///
     /// Automatically promotes relevant symbols to the hot-symbol cache

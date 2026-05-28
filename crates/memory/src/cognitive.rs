@@ -960,33 +960,33 @@ impl CognitiveContextManager {
         }
 
         // ── Step 7c: Hot code symbol injection ──
-        {
-            let hot_symbols = self.orchestrator.get_hot_symbols();
-            if !hot_symbols.is_empty() {
-                let entries_str: Vec<String> = hot_symbols.iter()
-                    .take(5)
-                    .map(|s| format!("{} (freq={:.1})", s.name, s.frequency))
-                    .collect();
-                entries.push(MemoryEntry {
-                    id: uuid::Uuid::new_v4(),
-                    layer: MemoryLayer::L1,
-                    category: MemoryCategory::Reference,
-                    priority: Priority::Normal,
-                    source: MemorySource::AutoExtracted,
-                    title: "Hot Code Symbols".into(),
-                    content: format!("Frequently accessed symbols: {}", entries_str.join(", ")),
-                    embedding: None,
-                    tags: vec!["hot_symbols".into(), "code".into()],
-                    relations: vec![],
-                    confidence: 0.9,
-                    access_count: 0, staleness: 0.0,
-                    created_at: Utc::now(), updated_at: Utc::now(),
-                    last_accessed_at: None,
-                    scope: MemoryScope::default(),
-                    session_id: None, source_agent: None,
-                    visibility: crate::types::AgentVisibility::default(),
-                });
-            }
+        if let Some(hot_ctx) = self.orchestrator.get_hot_symbols_context() {
+            entries.push(MemoryEntry {
+                id: uuid::Uuid::new_v4(),
+                layer: MemoryLayer::L1,
+                category: MemoryCategory::Reference,
+                priority: Priority::Normal,
+                source: MemorySource::AutoExtracted,
+                title: "Hot Code Symbols".into(),
+                content: hot_ctx,
+                embedding: None,
+                tags: vec!["hot_symbols".into(), "code".into()],
+                relations: vec![],
+                confidence: 0.9,
+                access_count: 0, staleness: 0.0,
+                created_at: Utc::now(), updated_at: Utc::now(),
+                last_accessed_at: None,
+                scope: MemoryScope::default(),
+                session_id: None, source_agent: None,
+                visibility: crate::types::AgentVisibility::default(),
+            });
+        }
+
+        // ── Step 7d: Symbol-memory linking ──
+        // Reserve for future: link code symbols referenced in context to memory entries.
+        // This is activated when code_context is populated by the code indexer.
+        if code_context.is_some() {
+            tracing::debug!("symbol-memory linking: code context present, linking reserved for Phase 4 get_callers/get_callees integration");
         }
 
         // ── Assemble PreparedContext ─────────────────────────────────────────

@@ -422,10 +422,14 @@ impl Default for ExtractorConfig {
 #[derive(Debug, Clone)]
 pub struct BudgetCalculator {
     config: BudgetConfig,
+    model_profile: ModelProfile,
 }
 
 impl BudgetCalculator {
-    pub fn new(config: BudgetConfig) -> Self { Self { config } }
+    pub fn new(config: BudgetConfig) -> Self {
+        let profile = ModelProfile::for_model(&config.context_window.to_string());
+        Self { config, model_profile: profile }
+    }
 
     pub fn base_available(&self) -> u64 {
         self.config.context_window
@@ -472,6 +476,24 @@ impl BudgetCalculator {
 
     pub fn critical_tokens(&self) -> u64 {
         (self.base_available() as f64 * self.config.critical_threshold as f64) as u64
+    }
+
+    /// 计算某层的token预算
+    pub fn layer_budget(&self, layer: crate::types::MemoryLayer, already_used: u64) -> u64 {
+        let ratio = Self::layer_allocation_ratio(layer);
+        let base = self.base_available().saturating_sub(already_used);
+        ((base as f64) * ratio) as u64
+    }
+
+    /// 层分配比例
+    pub fn layer_allocation_ratio(layer: crate::types::MemoryLayer) -> f64 {
+        match layer {
+            crate::types::MemoryLayer::L0 => 0.01,
+            crate::types::MemoryLayer::L1 => 0.15,
+            crate::types::MemoryLayer::L2 => 0.20,
+            crate::types::MemoryLayer::L3 => 0.40,
+            crate::types::MemoryLayer::L4 => 0.10,
+        }
     }
 }
 
