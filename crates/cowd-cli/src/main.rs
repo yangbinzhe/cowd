@@ -5009,6 +5009,10 @@ fn migrate_jsonl_sessions(
                 if SHARED_RT.block_on(store.create_session(&record)).is_ok() {
                     count += 1;
                 }
+                // Migrate messages from the JSONL file
+                if let Err(e) = migrate_session_messages(store, &record.session_id, &path) {
+                    tracing::warn!(%e, path=%path.display(), "failed to migrate messages, continuing");
+                }
             }
         }
     }
@@ -5017,6 +5021,66 @@ fn migrate_jsonl_sessions(
         tracing::info!("migrated {count} sessions from JSONL");
     }
     Ok(())
+}
+
+/// Stream JSONL session file line-by-line, converting each message to
+/// [`SessionMessage`] and batch-inserting into SQLite.
+/// Avoids loading the entire session into memory.
+fn migrate_session_messages(
+    store: &memory::UnifiedSessionStore,
+    session_id: &str,
+    jsonl_path: &Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use std::io::{BufRead, BufReader};
+    use memory::store::session::SessionMessage;
+
+    let file = std::fs::File::open(jsonl_path)?;
+    let reader = BufReader::new(file);
+    let mut batch = Vec::with_capacity(100);
+    let mut total = 0usize;
+    let mut sequence = 0usize;
+
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        // Skip metadata/compaction records (not message records)
+        if line.contains(r#""type":"session_meta""#)
+            || line.contains(r#""type":"compaction""#)
+        {
+            continue;
+        }
+
+        // Parse as JSONL message record {"type":"message","message":{...}}
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(message_val) = value.get("message") {
+                if let Ok(msg) =
+                    serde_json::from_value::<ConversationMessage>(message_val.clone())
+                {
+                    let record = msg.to_session_message(session_id, sequence);
+                    batch.push(record);
+                    sequence += 1;
+                    total += 1;
+                }
+            }
+        }
+
+        // Batch insert every 100 messages
+        if batch.len() >= 100 {
+            SHARED_RT.block_on(store.insert_messages_batch(&batch))?;
+            batch.clear();
+        }
+    }
+
+    // Final flush
+    if !batch.is_empty() {
+        SHARED_RT.block_on(store.insert_messages_batch(&batch))?;
+    }
+
+    tracing::info!(session_id, count = total, "migrated session messages to SQLite");
+    Ok(total)
 }
 
 /// CLI handler for `cowd migrate-sessions`.

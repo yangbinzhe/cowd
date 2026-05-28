@@ -265,6 +265,8 @@ bus: Option<crate::bus::EventBus>,
     memory_status: Option<String>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
+    /// Optional session store for message dual-write (JSONL + SQLite).
+    session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
     /// Optional SSE callback for real-time streaming events to WebUI.
     /// Receives pre-formatted JSON event strings.
     sse_callback: Option<Arc<dyn Fn(String) + Send + Sync>>,
@@ -421,6 +423,7 @@ where
             memory_manager,
             memory_status,
             tool_callback: None,
+            session_store: None,
             sse_callback: None,
             memory_callback: None,
             approval_gate: None,
@@ -526,6 +529,12 @@ where
     /// Clear the SSE callback from this runtime instance.
     pub fn clear_sse_callback(&mut self) {
         self.sse_callback = None;
+    }
+
+    #[must_use]
+    pub fn with_session_store(mut self, store: Arc<memory::session_store::UnifiedSessionStore>) -> Self {
+        self.session_store = Some(store);
+        self
     }
 
     /// # Safety
@@ -827,6 +836,7 @@ pub async fn run_turn_async(
         self.session.write().await
             .push_user_text(user_input.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        self.dual_write_message(&ConversationMessage::user_text(user_input.clone()), self.session().messages.len().wrapping_sub(1));
 
         let mut effective_system_prompt = self.prepare_memory_context(&user_input).await;
 
@@ -1075,6 +1085,7 @@ pub async fn run_turn_async(
             let assistant_msg = ConversationMessage { role, blocks, usage: turn_usage };
             self.session.write().await.push_message(assistant_msg.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
+            self.dual_write_message(&assistant_msg, self.session().messages.len().wrapping_sub(1));
             assistant_messages.push(assistant_msg);
 
             if pending_tool_uses.is_empty() {
@@ -1130,6 +1141,7 @@ pub async fn run_turn_async(
                             self.session.write().await
                                 .push_message(msg.clone())
                                 .map_err(|e| RuntimeError::new(e.to_string()))?;
+                            self.dual_write_message(&msg, self.session().messages.len().wrapping_sub(1));
                             let inject = self.turn_callback.as_ref().and_then(|cb| {
                                 let out = tres.output.as_deref().unwrap_or("");
                                 (cb.on_tool_result)(&tool_name_str, out)
@@ -1214,7 +1226,9 @@ pub async fn run_turn_async(
                 }
             }
             if let Some(inject) = callback_inject {
+                let inject_text = inject.clone();
                 self.session.write().await.push_user_text(inject).map_err(|e| RuntimeError::new(e.to_string()))?;
+                self.dual_write_message(&ConversationMessage::user_text(inject_text), self.session().messages.len().wrapping_sub(1));
                 continue; // continue loop with injected input
             }
         }
@@ -1292,6 +1306,7 @@ self.record_turn_completed(&summary);
                         );
                         self.session.write().await.push_message(denied.clone())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        self.dual_write_message(&denied, self.session().messages.len().wrapping_sub(1));
                         return Ok(denied);
                     }
                 }
@@ -1334,6 +1349,7 @@ self.record_turn_completed(&summary);
                         );
                         self.session.write().await.push_message(denied.clone())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        self.dual_write_message(&denied, self.session().messages.len().wrapping_sub(1));
                         return Ok(denied);
                     }
                 }
@@ -1401,6 +1417,7 @@ self.record_turn_completed(&summary);
                 );
                 self.session.write().await.push_message(result.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
+                self.dual_write_message(&result, self.session().messages.len().wrapping_sub(1));
                 Ok(result)
             }
             PermissionOutcome::Deny { reason } => {
@@ -1409,6 +1426,7 @@ self.record_turn_completed(&summary);
                 );
                 self.session.write().await.push_message(denied.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
+                self.dual_write_message(&denied, self.session().messages.len().wrapping_sub(1));
                 Ok(denied)
             }
         }
@@ -1878,6 +1896,22 @@ self.record_turn_completed(&summary);
         }
 
         Ok(())
+    }
+
+    /// Write a message to the SQLite session store via a spawned background task.
+    /// JSONL is the canonical source; SQLite failure is logged and retried once.
+    fn dual_write_message(&self, msg: &crate::session::ConversationMessage, sequence: usize) {
+        if let Some(ref store) = self.session_store {
+            let session_id = self.session().session_id;
+            let record = msg.to_session_message(&session_id, sequence);
+            let store = Arc::clone(store);
+            tokio::spawn(async move {
+                if let Err(e) = store.insert_message(&record).await {
+                    tracing::warn!(%e, session_id, sequence, "dual_write: SQLite insert failed, retrying");
+                    let _ = store.insert_message(&record).await;
+                }
+            });
+        }
     }
 }
 

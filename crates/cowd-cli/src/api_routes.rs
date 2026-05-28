@@ -18,7 +18,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use tools::GlobalToolRegistry;
 
@@ -586,13 +586,13 @@ async fn verify_handler(
 
 // ── SSE drop guard ───────────────────────────────────────────────
 
-/// Wraps an `UnboundedReceiverStream` and unsubscribes from the event bus
+/// Wraps a `ReceiverStream` and unsubscribes from the event bus
 /// when the stream is dropped (client disconnects), preventing sender leaks.
 struct SseStream {
-    rx: UnboundedReceiverStream<String>,
+    rx: ReceiverStream<String>,
     session_id: String,
     event_bus: Arc<SessionEventBus>,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
 }
 
 impl Stream for SseStream {
@@ -629,14 +629,14 @@ async fn sse_stream_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel::<String>(256);
     // Clone tx before subscribing — one copy moves into the event bus,
     // the other stays with SseStream for cleanup on drop.
     let bus_tx = tx.clone();
     state.event_bus.subscribe(&session_id, bus_tx).await;
 
     let stream = SseStream {
-        rx: UnboundedReceiverStream::new(rx),
+        rx: ReceiverStream::new(rx),
         session_id,
         event_bus: state.event_bus.clone(),
         tx,

@@ -7,7 +7,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
-pub(crate) type EventSender = mpsc::UnboundedSender<String>;
+pub(crate) type EventSender = mpsc::Sender<String>;
+
+const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
 pub struct SessionEventBus {
     listeners: RwLock<HashMap<String, Vec<EventSender>>>,
@@ -44,33 +46,35 @@ impl SessionEventBus {
     }
 
     /// Send an SSE event string to all subscribers of the given session.
+    /// Uses try_send to avoid blocking the producer — slow consumers are skipped.
     /// Dead (disconnected) senders are automatically cleaned up.
     pub async fn broadcast(&self, session_id: &str, sse_data: &str) {
-        let dead_indices: Vec<usize> = {
-            if let Some(txs) = self.listeners.read().await.get(session_id) {
-                txs.iter()
-                    .enumerate()
-                    .filter_map(|(i, tx)| {
-                        if tx.send(sse_data.to_string()).is_err() {
-                            Some(i)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            } else {
-                return;
-            }
-        };
-
-        // Clean up dead connections
-        if !dead_indices.is_empty() {
-            if let Some(txs) = self.listeners.write().await.get_mut(session_id) {
-                for &i in dead_indices.iter().rev() {
-                    txs.remove(i);
+        let listeners = self.listeners.read().await;
+        if let Some(txs) = listeners.get(session_id) {
+            let data = sse_data.to_string();
+            let mut dead_indices = Vec::new();
+            for (i, tx) in txs.iter().enumerate() {
+                match tx.try_send(data.clone()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Skip slow consumer — don't block the producer
+                        tracing::warn!(session_id, consumer_index = i, "SSE consumer slow, skipping event");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        dead_indices.push(i);
+                    }
                 }
-                if txs.is_empty() {
-                    self.listeners.write().await.remove(session_id);
+            }
+            // Clean up dead connections
+            if !dead_indices.is_empty() {
+                drop(listeners);
+                if let Some(txs) = self.listeners.write().await.get_mut(session_id) {
+                    for &i in dead_indices.iter().rev() {
+                        txs.remove(i);
+                    }
+                    if txs.is_empty() {
+                        self.listeners.write().await.remove(session_id);
+                    }
                 }
             }
         }
