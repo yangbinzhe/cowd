@@ -92,6 +92,8 @@ pub async fn run_daemon(
         .ok()
         .map(|s| Arc::new(s.clone()));
 
+    let unified_store_clone = unified_store.clone();
+
     let app_state = Arc::new(api_routes::AppState {
         sessions: sessions.clone(),
         memory_manager: cognitive.clone(),
@@ -254,9 +256,9 @@ pub async fn run_daemon(
     }
 
     // 6.5 Spawn tiered maintenance background task (non-blocking)
-    if let Some(store) = unified_store.as_ref() {
+    if let Some(store) = unified_store_clone {
         let tiered = Arc::new(TieredSessionStore::new(
-            (**store).clone(),
+            (*store).clone(),
             Default::default(),
         ));
         spawn_tiered_maintenance_task(tiered, Duration::from_secs(3600));
