@@ -267,27 +267,7 @@ async fn send_message(
 
     let mut runtime_guard = runtime_entry.lock().await;
 
-<<<<<<< Updated upstream
-    // Subscribe runtime EventBus → forward TextDelta to SessionEventBus
-    if let Some(bus) = runtime_guard.bus() {
-        let mut rx = bus.subscribe();
-        let eb = event_bus.clone();
-        let sid = session_id.clone();
-        tokio::spawn(async move {
-            while let Ok(event) = rx.recv().await {
-                if let runtime::bus::Event::TextDelta { content } = event {
-                    let sse = serde_json::json!({"type":"TextDelta","content":content});
-                    let _ = eb.broadcast(&sid, &sse.to_string()).await;
-                }
-            }
-        });
-    }
-
     const TURN_TIMEOUT: Duration = Duration::from_secs(300);
-
-    match timeout(TURN_TIMEOUT, runtime_guard.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none())).await {
-        Ok(Ok(summary)) => {
-=======
     let sse_cb_event_bus = Arc::clone(&event_bus);
     let sse_cb_session_id = session_id.clone();
     let sse_cb: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |sse_data: String| {
@@ -299,9 +279,8 @@ async fn send_message(
     });
     runtime_guard.set_sse_callback(sse_cb);
 
-    match runtime_guard.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none()).await {
-        Ok(summary) => {
->>>>>>> Stashed changes
+    match timeout(TURN_TIMEOUT, runtime_guard.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none())).await {
+        Ok(Ok(summary)) => {
             let final_text = summary.assistant_messages.last()
                 .map(|msg| {
                     msg.blocks.iter()

@@ -401,28 +401,9 @@ impl CognitiveContextManager {
         self.orchestrator.set_active_session(session_id);
     }
 
-<<<<<<< Updated upstream
-    /// Recover entries from a previous session's handoff file.
-    ///
-    /// Loads work items and decisions from the latest handoff, converts them
-    /// into memory entries, and persists them via the orchestrator so they
-    /// are available in future context preparations.
-    pub async fn recover_handoff_for_session(&self, session_id: &str) -> Result<Vec<MemoryEntry>> {
-        let entries = self.fresh_ctx.recover_from_handoff(session_id).await?;
-        if let Err(e) = self.orchestrator.remember_batch(entries.clone()).await {
-            tracing::warn!(error = %e, "recover_handoff: failed to persist entries");
-        }
-        tracing::info!(
-            count = entries.len(),
-            session_id = %session_id,
-            "recover_handoff: recovered entries persisted"
-        );
-        Ok(entries)
-=======
     /// Get the current active session ID (if set).
     pub fn active_session_id(&self) -> Option<String> {
         self.orchestrator.active_session_id()
->>>>>>> Stashed changes
     }
 
     /// Attach a [`ProjectScopeManager`] for KG staleness detection on turn end.

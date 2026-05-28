@@ -3,7 +3,6 @@ use std::fmt::{Display, Formatter};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-<<<<<<< Updated upstream
 use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
@@ -25,9 +24,6 @@ impl CancellationToken {
         self.0.store(true, Ordering::SeqCst);
     }
 }
-=======
-use std::time::Duration;
->>>>>>> Stashed changes
 
 use futures::stream::Stream;
 use memory::cognitive::CognitiveContextManager;
@@ -286,7 +282,6 @@ bus: Option<crate::bus::EventBus>,
     model: Option<String>,
     /// Provider fallback configuration for automatic retry on 429/5xx errors.
     provider_fallbacks_config: ProviderFallbackConfig,
-<<<<<<< Updated upstream
     /// T35: Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
     /// T36: Tool orchestrator for result budgeting and truncation.
@@ -299,10 +294,8 @@ bus: Option<crate::bus::EventBus>,
     destructive_semaphore: Arc<Semaphore>,
     /// T4: Semaphore for default/ReadOnly tool concurrency (permits: 8).
     default_semaphore: Arc<Semaphore>,
-=======
     /// Maximum duration for a single tool execution. `None` means no timeout.
     tool_timeout: Option<Duration>,
->>>>>>> Stashed changes
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -434,7 +427,6 @@ where
             gate_evaluator: Some(Arc::new(crate::gates::GateEvaluator::new().with_default_gates())),
             model: feature_config.model().map(str::to_string),
             provider_fallbacks_config: feature_config.provider_fallbacks().clone(),
-<<<<<<< Updated upstream
             cancellation_token: CancellationToken::new(),
             tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
             write_semaphore: Arc::new(Semaphore::new(
@@ -447,9 +439,7 @@ where
                 crate::tool_orchestrator::ToolSafetyCategory::Destructive.max_concurrency(),
             )),
             default_semaphore: Arc::new(Semaphore::new(8)),
-=======
             tool_timeout: Some(Duration::from_secs(120)),
->>>>>>> Stashed changes
         }
     }
 
@@ -945,11 +935,6 @@ pub async fn run_turn_async(
                                         });
                                         cb(json.to_string());
                                     }
-                                    if let Some(ref bus) = self.bus {
-                                        bus.emit(crate::bus::Event::TextDelta {
-                                            content: text.clone(),
-                                        });
-                                    }
                                 }
                                 Ok(AssistantEvent::ThinkingDelta(thinking)) => {
                                     model_thinking_text.push_str(&thinking);
@@ -1361,7 +1346,6 @@ self.record_turn_completed(&summary);
                     callback.on_tool_start(tool_use_id, tool_name, &preview);
                 }
 
-<<<<<<< Updated upstream
                 // P2-10: EffectHandler interceptor — use mock result if available
                 let effect_mock = self.effect_handler.as_ref().and_then(|handler| {
                     let r = handler.handle(
@@ -1374,10 +1358,6 @@ self.record_turn_completed(&summary);
                 let (output, mut is_error) = if let Some(mock_output) = effect_mock {
                     (mock_output, false)
                 } else {
-=======
-                let start = std::time::Instant::now();
-                let (output, mut is_error) = {
->>>>>>> Stashed changes
                     let tool_exec = Arc::clone(&self.tool_executor);
                     let tname = tool_name.to_string();
                     let tname_for_err = tname.clone();
@@ -1708,12 +1688,7 @@ self.record_turn_completed(&summary);
 
         let session_id = self.session().session_id;
         mgr.set_active_session(session_id.clone());
-<<<<<<< Updated upstream
         match mgr.prepare_context(user_input, &mem_messages, Some(&session_id)).await {
-=======
-
-        match mgr.prepare_context(user_input, &mem_messages).await {
->>>>>>> Stashed changes
             Ok(mut prepared) => {
                 if prepared.entries.is_empty() {
                     tracing::debug!(entries = 0, "memory context prepared");
