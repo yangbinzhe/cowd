@@ -576,6 +576,11 @@ fn run_gateway_action(
                 .and_then(|p| p.extra.get("auth_token"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            // Ensure the unified session store is initialised before the
+            // daemon starts so that the OnceLock is populated and the JSONL
+            // migration has already run.
+            let _ = get_unified_store();
+
             let daemon_config = daemon::DaemonConfig {
                 http_addr: format!("{effective_host}:{effective_port}"),
                 unix_sock_path: "/tmp/cowd.sock".to_string(),

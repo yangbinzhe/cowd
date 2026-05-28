@@ -84,9 +84,14 @@ pub async fn run_daemon(
 
     let event_bus = SessionEventBus::new();
 
+    let unified_store = crate::get_unified_store()
+        .ok()
+        .map(|s| Arc::new(s.clone()));
+
     let app_state = Arc::new(api_routes::AppState {
         sessions: sessions.clone(),
         memory_manager: cognitive.clone(),
+        unified_store,
         tool_registry: tools.clone(),
         config: config.runtime_config.clone(),
         event_bus: event_bus.clone(),

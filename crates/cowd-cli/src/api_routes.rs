@@ -25,12 +25,14 @@ use tools::GlobalToolRegistry;
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use memory::cognitive::CognitiveContextManager;
+use memory::session_store::UnifiedSessionStore;
 
 // ── Shared application state ───────────────────────────────────
 
 pub struct AppState {
     pub sessions: Arc<ActiveSessions>,
     pub memory_manager: Option<Arc<CognitiveContextManager>>,
+    pub unified_store: Option<Arc<UnifiedSessionStore>>,
     pub tool_registry: Arc<GlobalToolRegistry>,
     pub config: Option<serde_json::Value>,
     pub event_bus: Arc<SessionEventBus>,
@@ -212,6 +214,9 @@ async fn delete_session(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if state.sessions.remove(&id).is_some() {
+        if let Some(ref store) = state.unified_store {
+            let _ = store.delete_session(&id);
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((
@@ -616,6 +621,7 @@ mod tests {
         Arc::new(AppState {
             sessions,
             memory_manager: None,
+            unified_store: None,
             tool_registry: tools,
             config: None,
             event_bus,

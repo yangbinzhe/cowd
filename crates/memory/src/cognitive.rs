@@ -432,37 +432,20 @@ impl CognitiveContextManager {
         messages: &[Message],
         session_id: Option<&str>,
     ) -> Result<PreparedContext> {
-        // ── Step 1 & 2: fixed layers + project context ──────────────────────
         let mut entries: Vec<MemoryEntry> = Vec::new();
 
-        let fixed = self.orchestrator.load_fixed_layers().await?;
-        entries.extend(fixed);
+        // ═══════════════════════════════════════════════════════════════════
+        // Group 1: Base layers (L0+L1) and Project layer (L2) — independent
+        // ═══════════════════════════════════════════════════════════════════
+        let (l0l1_result, l2_result) = tokio::join!(
+            self.orchestrator.load_fixed_layers(),
+            self.orchestrator.load_project_context(),
+        );
+        entries.extend(l0l1_result?);
+        entries.extend(l2_result?);
 
-        let project = self.orchestrator.load_project_context().await?;
-        entries.extend(project);
-
-        // Track which IDs are already loaded so L3 can skip them.
+        // Track which IDs are already loaded so other layers can skip them.
         let mut already_surfaced: HashSet<MemoryId> = entries.iter().map(|e| e.id).collect();
-
-        // ── Step 2a: Session resume via BM25 ──────────────────────────────────
-        if let Some(ref resume) = self.session_resume {
-            let store: &dyn crate::store::MemoryStore = self.orchestrator.store().as_ref();
-            match resume.resume_recent("default", Some(store), 5).await {
-                Ok(resumed) => {
-                    for mut entry in resumed {
-                        if !already_surfaced.contains(&entry.id) {
-                            entry.content = format!("[SESSION RESUME] {}", entry.content);
-                            entry.tags.push("session_resume".into());
-                            already_surfaced.insert(entry.id);
-                            entries.push(entry);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "session resume failed, continuing without it");
-                }
-            }
-        }
 
         // ── Step 2a2: State rebuild from previous session state ──────────────
         if let Some(ref rebuilder) = self.state_rebuilder {
@@ -525,9 +508,6 @@ impl CognitiveContextManager {
         }
 
         // ── Step 2b: P1 project knowledge graph query ───────────────────────
-        // Tokenize the query and look up matching code-symbol entities from the
-        // project's knowledge graph. Matching entities are surfaced as L2-level
-        // ProjectKnowledge entries.
         {
             let kg = self
                 .kg
@@ -579,15 +559,71 @@ impl CognitiveContextManager {
             }
         }
 
-        // ── Step 2c: Peer context perception from L4 ────────────────────────
+        // ═══════════════════════════════════════════════════════════════════
+        // Group 2: Peer context + L4 recall + Query embedding — all independent
+        // ═══════════════════════════════════════════════════════════════════
         let current_agent = self.current_agent.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(ref agent) = current_agent {
-            let peer_entries = self
-                .orchestrator
-                .recall_peer_context(query, agent, 3, 5)
-                .await
-                .unwrap_or_default();
-            for entry in peer_entries {
+        let current_session = self.orchestrator.active_session_id();
+
+        let ((peers, realtime_peers), l4_project, l4_global, query_embedding) = tokio::join!(
+            // Peer context: regular + realtime
+            async {
+                if let Some(ref agent) = current_agent {
+                    let peers = self
+                        .orchestrator
+                        .recall_peer_context(query, agent, 3, 5)
+                        .await
+                        .unwrap_or_default();
+                    let realtime = if let Some(ref sid) = current_session {
+                        self.orchestrator
+                            .recall_peer_context_realtime(query, agent, sid, 2, 3)
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    (peers, realtime)
+                } else {
+                    (Vec::new(), Vec::new())
+                }
+            },
+            // L4 project-scoped recall
+            async { self.orchestrator.recall_l4_project(query, 5).await.unwrap_or_default() },
+            // L4 global-scoped recall
+            async { self.orchestrator.recall_l4_global(query, 5).await.unwrap_or_default() },
+            // Query embedding (needed by L3 in Group 3)
+            async {
+                if self.embedding_capability.supports_semantic() {
+                    match &self.embedding_capability {
+                        EmbeddingCapability::Remote { client } => {
+                            match client.embed_one(query).await {
+                                Ok(embed) => {
+                                    tracing::debug!(
+                                        dim = embed.len(),
+                                        "query embedding generated for hybrid search"
+                                    );
+                                    Some(embed)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "embedding failed, falling back to FTS5 search"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            },
+        );
+
+        // Process peer context results
+        if current_agent.is_some() {
+            for entry in peers {
                 let peer_id = entry.source_agent.as_deref().unwrap_or("unknown");
                 let prefixed_content = format!("[PEER: {peer_id}] {}", entry.content);
                 use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
@@ -614,59 +650,36 @@ impl CognitiveContextManager {
                     visibility: crate::types::AgentVisibility::default(),
                 });
             }
-
-            // ── Step 2c2: Intra-turn real-time peer perception (T3) ──────────
-            // Reads entries from L4 written by other agents in the SAME turn,
-            // without the 5-minute time cutoff. Uses session_id for filtering.
-            let current_session = self.orchestrator.active_session_id();
-            if let Some(ref session_id) = current_session {
-                let realtime_peers = self
-                    .orchestrator
-                    .recall_peer_context_realtime(query, agent, session_id, 2, 3)
-                    .await
-                    .unwrap_or_default();
-                for entry in realtime_peers {
-                    let peer_id = entry.source_agent.as_deref().unwrap_or("unknown");
-                    let prefixed_content = format!("[REALTIME PEER: {peer_id}] {}", entry.content);
-                    use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
-                    entries.push(MemoryEntry {
-                        id: uuid::Uuid::new_v4(),
-                        layer: MemoryLayer::L4,
-                        category: MemoryCategory::Shared,
-                        priority: Priority::High,
-                        source: MemorySource::Import,
-                        title: format!("Realtime peer context from {peer_id}"),
-                        content: prefixed_content,
-                        embedding: None,
-                        tags: vec!["peer".into(), "realtime".into(), "l4".into()],
-                        relations: vec![],
-                        confidence: 0.9,
-                        access_count: 0,
-                        staleness: 0.0,
-                        created_at: Utc::now(),
-                        updated_at: Utc::now(),
-                        last_accessed_at: None,
-                        scope: MemoryScope::default(),
-                        session_id: None,
-                        source_agent: None,
-                        visibility: crate::types::AgentVisibility::default(),
-                    });
-                }
+            for entry in realtime_peers {
+                let peer_id = entry.source_agent.as_deref().unwrap_or("unknown");
+                let prefixed_content = format!("[REALTIME PEER: {peer_id}] {}", entry.content);
+                use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
+                entries.push(MemoryEntry {
+                    id: uuid::Uuid::new_v4(),
+                    layer: MemoryLayer::L4,
+                    category: MemoryCategory::Shared,
+                    priority: Priority::High,
+                    source: MemorySource::Import,
+                    title: format!("Realtime peer context from {peer_id}"),
+                    content: prefixed_content,
+                    embedding: None,
+                    tags: vec!["peer".into(), "realtime".into(), "l4".into()],
+                    relations: vec![],
+                    confidence: 0.9,
+                    access_count: 0,
+                    staleness: 0.0,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    last_accessed_at: None,
+                    scope: MemoryScope::default(),
+                    session_id: None,
+                    source_agent: None,
+                    visibility: crate::types::AgentVisibility::default(),
+                });
             }
         }
 
-        // ── Step 2d: Dual-scope L4 recall (50/50 project/global) ─────────────
-        let l4_limit = 10;
-        let l4_project = self
-            .orchestrator
-            .recall_l4_project(query, l4_limit / 2)
-            .await
-            .unwrap_or_default();
-        let l4_global = self
-            .orchestrator
-            .recall_l4_global(query, l4_limit / 2)
-            .await
-            .unwrap_or_default();
+        // Process L4 recall results (filter against already-surfaced)
         for entry in l4_project.into_iter().chain(l4_global) {
             if !already_surfaced.contains(&entry.id) {
                 already_surfaced.insert(entry.id);
@@ -674,49 +687,34 @@ impl CognitiveContextManager {
             }
         }
 
-        // ── Step 3: dynamic deep memories (L3) ──────────────────────────────
+        // ═══════════════════════════════════════════════════════════════════
+        // Group 3: L3 recall + SessionResume — independent after base layers
+        // ═══════════════════════════════════════════════════════════════════
         let budget = self.compute_budget();
         let memory_budget = budget
             .available
             .saturating_sub(self.estimate_tokens_entries(&entries))
             .min(u64::from(u32::MAX)) as u32;
 
-        // Generate query embedding for hybrid search if available
-        let query_embedding = if self.embedding_capability.supports_semantic() {
-            match &self.embedding_capability {
-                EmbeddingCapability::Remote { client } => {
-                    match client.embed_one(query).await {
-                        Ok(embed) => {
-                            tracing::debug!(
-                                dim = embed.len(),
-                                "query embedding generated for hybrid search"
-                            );
-                            Some(embed)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "embedding failed, falling back to FTS5 search"
-                            );
-                            None
-                        }
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let deep_entries = self
-            .orchestrator
-            .recall_relevant(
+        let (l3_result, resume_result) = tokio::join!(
+            self.orchestrator.recall_relevant(
                 query,
                 query_embedding.as_deref(),
                 &already_surfaced,
                 memory_budget * 2, // over-fetch for hybrid re-ranking
-            )
-            .await?;
+            ),
+            async {
+                if let Some(ref resume) = self.session_resume {
+                    let store_arc = self.orchestrator.store();
+                    let store: &dyn crate::store::MemoryStore = store_arc.as_ref();
+                    resume.resume_recent("default", Some(store), 5).await
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+        );
+
+        let deep_entries = l3_result?;
 
         // ── Hybrid re-ranking: combine vector + BM25 scores ──
         let re_ranked = if !deep_entries.is_empty() {
@@ -757,6 +755,23 @@ impl CognitiveContextManager {
             already_surfaced.insert(e.id);
         }
         entries.extend(re_ranked);
+
+        // ── Process SessionResume results (after L3 to avoid &self conflict) ──
+        match resume_result {
+            Ok(resumed) => {
+                for mut entry in resumed {
+                    if !already_surfaced.contains(&entry.id) {
+                        entry.content = format!("[SESSION RESUME] {}", entry.content);
+                        entry.tags.push("session_resume".into());
+                        already_surfaced.insert(entry.id);
+                        entries.push(entry);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "session resume failed, continuing without it");
+            }
+        }
 
         // ── Session isolation filter ──────────────────────────────────────────
         if let Some(sid) = session_id {
