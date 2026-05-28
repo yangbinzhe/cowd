@@ -26,6 +26,18 @@ pub enum MessageRole {
     Tool,
 }
 
+impl MessageRole {
+    #[must_use]
+    pub fn role_str(&self) -> &'static str {
+        match self {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        }
+    }
+}
+
 /// Structured message content stored inside a [`Session`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentBlock {
@@ -766,6 +778,50 @@ impl ConversationMessage {
             blocks,
             usage,
         })
+    }
+
+    /// Convert to a database-persistable SessionMessage record.
+    /// All ContentBlocks are serialized as a JSON array in content_json.
+    pub fn to_session_message(
+        &self,
+        session_id: &str,
+        sequence: usize,
+    ) -> memory::store::session::SessionMessage {
+        let content_json = serde_json::to_string(
+            &self.blocks.iter().map(|b| b.to_json()).collect::<Vec<_>>(),
+        )
+        .unwrap_or_default();
+
+        let (tool_use_id, tool_name) = self
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    ..
+                } => Some((Some(tool_use_id.clone()), Some(tool_name.clone()))),
+                ContentBlock::ToolUse { id, name, .. } => {
+                    Some((Some(id.clone()), Some(name.clone())))
+                }
+                _ => None,
+            })
+            .unwrap_or((None, None));
+
+        memory::store::session::SessionMessage {
+            session_id: session_id.to_string(),
+            sequence,
+            role: self.role_str(),
+            content_json,
+            blocks_count: self.blocks.len(),
+            tool_use_id,
+            tool_name,
+            token_usage_json: self
+                .usage
+                .as_ref()
+                .map(|u| serde_json::to_string(u).unwrap_or_default()),
+            created_at_ms: crate::session::current_time_millis(),
+        }
     }
 }
 

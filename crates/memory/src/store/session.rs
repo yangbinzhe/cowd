@@ -39,11 +39,19 @@ fn sql_err(e: rusqlite::Error) -> MemoryError {
 }
 
 /// Configure per-connection pragmas (WAL mode, foreign keys, busy timeout).
+/// Execute a pragma that may return rows (rusqlite 0.31 treats this as an error).
+fn exec_pragma(conn: &Connection, sql: &str) -> Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::ExecuteReturnedResults) => Ok(()),
+        Err(e) => Err(sql_err(e)),
+    }
+}
+
 fn set_conn_pragmas(conn: &Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-        .map_err(sql_err)?;
-    conn.query_row("PRAGMA busy_timeout=5000", [], |_| Ok(()))
-        .map_err(sql_err)?;
+    exec_pragma(conn, "PRAGMA journal_mode=WAL")?;
+    exec_pragma(conn, "PRAGMA foreign_keys=ON")?;
+    exec_pragma(conn, "PRAGMA busy_timeout=5000")?;
     Ok(())
 }
 
@@ -87,6 +95,33 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
 
 CREATE INDEX IF NOT EXISTS idx_sessions_platform      ON sessions(platform);
 CREATE INDEX IF NOT EXISTS idx_sessions_last_activity ON sessions(last_activity);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL,
+    sequence        INTEGER NOT NULL,
+    role            TEXT NOT NULL,
+    content_json    TEXT NOT NULL,
+    blocks_count    INTEGER NOT NULL DEFAULT 1,
+    tool_use_id     TEXT,
+    tool_name       TEXT,
+    token_usage_json TEXT,
+    created_at_ms   INTEGER NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    UNIQUE(session_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, sequence);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    session_id UNINDEXED,
+    role,
+    content_text,
+    tool_name,
+    content=messages,
+    content_rowid=id
+);
 ";
 
 /// FTS5 search result for sessions.
@@ -101,6 +136,24 @@ pub struct SessionSearchResult {
     pub message_count: i64,
     /// Highlighted snippet from metadata_json
     pub snippet: Option<String>,
+}
+
+/// A single message within a conversation session.
+///
+/// Each message belongs to a session and is ordered by `sequence`.
+/// The `content_json` field stores the message blocks as a JSON array
+/// of `ContentBlock` objects (text, tool_use, tool_result, etc.).
+#[derive(Debug, Clone)]
+pub struct SessionMessage {
+    pub session_id: String,
+    pub sequence: usize,
+    pub role: String,
+    pub content_json: String,
+    pub blocks_count: usize,
+    pub tool_use_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub token_usage_json: Option<String>,
+    pub created_at_ms: u64,
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -125,6 +178,30 @@ fn init_schema(conn: &Connection) -> Result<()> {
         END",
     ];
     for trigger in triggers {
+        let _ = conn.execute_batch(trigger); // Ignore if already exists
+    }
+    // Create FTS5 triggers for messages (must be separate from batch)
+    let msg_triggers: &[&str] = &[
+        r"CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid, session_id, role, content_text, tool_name)
+            VALUES (new.id, new.session_id, new.role,
+                    (SELECT group_concat(json_extract(value,'$.text'),' ') FROM json_each(new.content_json) WHERE json_extract(value,'$.type')='text'),
+                    new.tool_name);
+        END",
+        r"CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content_text, tool_name)
+            VALUES ('delete', old.rowid, old.session_id, old.role, NULL, old.tool_name);
+        END",
+        r"CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content_text, tool_name)
+            VALUES ('delete', old.rowid, old.session_id, old.role, NULL, old.tool_name);
+            INSERT INTO messages_fts(rowid, session_id, role, content_text, tool_name)
+            VALUES (new.rowid, new.session_id, new.role,
+                    (SELECT group_concat(json_extract(value,'$.text'),' ') FROM json_each(new.content_json) WHERE json_extract(value,'$.type')='text'),
+                    new.tool_name);
+        END",
+    ];
+    for trigger in msg_triggers {
         let _ = conn.execute_batch(trigger); // Ignore if already exists
     }
     conn.execute_batch("COMMIT;").map_err(sql_err)?;
@@ -188,6 +265,20 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     })
 }
 
+fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
+    Ok(SessionMessage {
+        session_id: row.get(0)?,
+        sequence: row.get::<_, i64>(1)? as usize,
+        role: row.get(2)?,
+        content_json: row.get(3)?,
+        blocks_count: row.get::<_, i64>(4)? as usize,
+        tool_use_id: row.get(5)?,
+        tool_name: row.get(6)?,
+        token_usage_json: row.get(7)?,
+        created_at_ms: row.get::<_, i64>(8)? as u64,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // SqliteSessionStore
 // ---------------------------------------------------------------------------
@@ -244,7 +335,7 @@ impl SqliteSessionStore {
         Ok(store)
     }
 
-    fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+    pub fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
         set_conn_pragmas(&conn)?;
         Ok(conn)
@@ -562,6 +653,186 @@ impl SqliteSessionStore {
         )
         .map_err(sql_err)?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Message persistence
+    // -----------------------------------------------------------------------
+
+    /// Insert a single message (INSERT OR REPLACE on the (session_id, sequence)
+    /// unique constraint).
+    pub fn insert_message(&self, msg: &SessionMessage) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            r"INSERT OR REPLACE INTO messages
+                (session_id, sequence, role, content_json, blocks_count,
+                 tool_use_id, tool_name, token_usage_json, created_at_ms)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                msg.session_id,
+                msg.sequence as i64,
+                msg.role,
+                msg.content_json,
+                msg.blocks_count as i64,
+                msg.tool_use_id,
+                msg.tool_name,
+                msg.token_usage_json,
+                msg.created_at_ms as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Insert multiple messages in a single transaction.
+    pub fn insert_messages_batch(&self, messages: &[SessionMessage]) -> Result<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(sql_err)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    r"INSERT OR REPLACE INTO messages
+                       (session_id, sequence, role, content_json, blocks_count,
+                        tool_use_id, tool_name, token_usage_json, created_at_ms)
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .map_err(sql_err)?;
+            for msg in messages {
+                stmt.execute(params![
+                    msg.session_id,
+                    msg.sequence as i64,
+                    msg.role,
+                    msg.content_json,
+                    msg.blocks_count as i64,
+                    msg.tool_use_id,
+                    msg.tool_name,
+                    msg.token_usage_json,
+                    msg.created_at_ms as i64,
+                ])
+                .map_err(sql_err)?;
+            }
+        }
+        tx.commit().map_err(sql_err)?;
+        Ok(())
+    }
+
+    /// Retrieve messages for a session with pagination.
+    pub fn get_messages(
+        &self,
+        session_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                r"SELECT session_id, sequence, role, content_json,
+                          blocks_count, tool_use_id, tool_name,
+                          token_usage_json, created_at_ms
+                   FROM messages
+                  WHERE session_id = ?1
+                  ORDER BY sequence ASC
+                  LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(
+                params![session_id, limit as i64, offset as i64],
+                row_to_message,
+            )
+            .map_err(sql_err)?;
+        let mut msgs = Vec::new();
+        for r in rows {
+            msgs.push(r.map_err(sql_err)?);
+        }
+        Ok(msgs)
+    }
+
+    /// Count the number of messages in a session.
+    pub fn get_message_count(&self, session_id: &str) -> Result<usize> {
+        let conn = self.conn()?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        Ok(count as usize)
+    }
+
+    /// Delete all messages in a session starting from `from_sequence` (inclusive).
+    ///
+    /// Returns the number of rows deleted.
+    pub fn delete_messages_from(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        let removed = conn
+            .execute(
+                "DELETE FROM messages WHERE session_id = ?1 AND sequence >= ?2",
+                params![session_id, from_sequence as i64],
+            )
+            .map_err(sql_err)?;
+        Ok(removed)
+    }
+
+    /// Search messages using FTS5 full-text search.
+    ///
+    /// Optionally filter by `session_id`. Searches across role and
+    /// extracted text content from `content_json`.
+    pub fn search_messages(
+        &self,
+        query: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let conn = self.conn()?;
+        if let Some(sid) = session_id {
+            let mut stmt = conn
+                .prepare(
+                    r"SELECT m.session_id, m.sequence, m.role, m.content_json,
+                              m.blocks_count, m.tool_use_id, m.tool_name,
+                              m.token_usage_json, m.created_at_ms
+                       FROM messages m
+                       JOIN messages_fts fts ON m.id = fts.rowid
+                      WHERE messages_fts MATCH ?1 AND m.session_id = ?2
+                      ORDER BY rank
+                      LIMIT ?3",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![query, sid, limit as i64], row_to_message)
+                .map_err(sql_err)?;
+            let mut msgs = Vec::new();
+            for r in rows {
+                msgs.push(r.map_err(sql_err)?);
+            }
+            Ok(msgs)
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    r"SELECT m.session_id, m.sequence, m.role, m.content_json,
+                              m.blocks_count, m.tool_use_id, m.tool_name,
+                              m.token_usage_json, m.created_at_ms
+                       FROM messages m
+                       JOIN messages_fts fts ON m.id = fts.rowid
+                      WHERE messages_fts MATCH ?1
+                      ORDER BY rank
+                      LIMIT ?2",
+                )
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map(params![query, limit as i64], row_to_message)
+                .map_err(sql_err)?;
+            let mut msgs = Vec::new();
+            for r in rows {
+                msgs.push(r.map_err(sql_err)?);
+            }
+            Ok(msgs)
+        }
     }
 
     // -----------------------------------------------------------------------
