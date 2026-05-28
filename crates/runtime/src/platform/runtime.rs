@@ -3,6 +3,7 @@
 use crate::platform::adapter::{InboundMessage, OutboundMessage, PlatformAdapter, PlatformError};
 use crate::platform::config::{PlatformRuntimeConfig, RetryConfig, SessionResetPolicy};
 use crate::platform::types::{PlatformSession, SessionKey};
+use crate::mirror::MessageMirror;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -28,6 +29,8 @@ pub struct PlatformRuntime {
     shutdown_tx: RwLock<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Handles to running adapter loops for sending responses.
     adapter_handles: RwLock<HashMap<String, AdapterHandle>>,
+    /// Optional message mirror for cross-platform session synchronization.
+    message_mirror: RwLock<Option<Arc<MessageMirror>>>,
 }
 
 impl PlatformRuntime {
@@ -40,6 +43,7 @@ impl PlatformRuntime {
             message_rx: RwLock::new(None),
             shutdown_tx: RwLock::new(None),
             adapter_handles: RwLock::new(HashMap::new()),
+            message_mirror: RwLock::new(None),
         }
     }
 
@@ -49,6 +53,11 @@ impl PlatformRuntime {
         let mut adapters = self.adapters.write().await;
         adapters.insert(platform_name, adapter);
         Ok(())
+    }
+
+    /// Set the message mirror for cross-platform session synchronization.
+    pub async fn set_mirror(&self, mirror: Arc<MessageMirror>) {
+        *self.message_mirror.write().await = Some(mirror);
     }
 
     /// List all registered platform adapter names.
@@ -121,19 +130,35 @@ impl PlatformRuntime {
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
+        let mirror = self.message_mirror.read().await.clone();
+        let outbound_senders: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<OutboundMessage>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
         for (platform_name, adapter) in adapter_entries {
             let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(self.config.channel_capacity);
             self.adapter_handles.write().await.insert(
                 platform_name.clone(),
                 AdapterHandle { outbound_tx: outbound_tx.clone() },
             );
+            outbound_senders.lock().unwrap().insert(platform_name.clone(), outbound_tx);
 
             let inbound_tx_clone = inbound_tx.clone();
             let shutdown_rx = shutdown_tx.subscribe();
             let retry_config = self.config.retry.clone();
+            let mirror = mirror.clone();
+            let outbound_senders = outbound_senders.clone();
 
             tokio::spawn(async move {
-                run_adapter_loop(platform_name, adapter, inbound_tx_clone, outbound_rx, shutdown_rx, retry_config).await;
+                run_adapter_loop(
+                    platform_name,
+                    adapter,
+                    inbound_tx_clone,
+                    outbound_rx,
+                    shutdown_rx,
+                    retry_config,
+                    mirror,
+                    outbound_senders,
+                ).await;
             });
         }
 
@@ -237,6 +262,8 @@ async fn run_adapter_loop(
     mut outbound_rx: mpsc::Receiver<OutboundMessage>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     retry_config: RetryConfig,
+    mirror: Option<Arc<MessageMirror>>,
+    outbound_senders: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<OutboundMessage>>>>,
 ) {
     loop {
         tokio::select! {
@@ -247,6 +274,28 @@ async fn run_adapter_loop(
             result = adapter.receive() => {
                 match result {
                     Ok(Some(msg)) => {
+                        // Mirror the message to target sessions before forwarding
+                        if let Some(ref mirror) = mirror {
+                            let mirrored = mirror.mirror(&msg).await;
+                            for m in mirrored {
+                                if let Some(ref target_platform) = m.target_platform {
+                                    let sender = {
+                                        let senders = outbound_senders.lock().unwrap();
+                                        senders.get(target_platform.as_str()).cloned()
+                                    };
+                                    if let Some(tx) = sender {
+                                        let out_msg = OutboundMessage {
+                                            session_key: SessionKey::from(m.target_session.as_str()),
+                                            text: m.content.clone(),
+                                            reply_to: None,
+                                            metadata: serde_json::json!({"mirror": true}),
+                                        };
+                                        let _ = tx.send(out_msg).await;
+                                    }
+                                }
+                            }
+                        }
+
                         if inbound_tx.send(msg).await.is_err() {
                             warn!(platform = %platform_name, "inbound receiver dropped, stopping");
                             break;

@@ -18,7 +18,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
 };
 
@@ -58,7 +58,7 @@ use crate::{ MemoryScope, SessionResume,
         SearchMemoriesRequest, SearchMemoriesResult, SearchMode, SearchSnippet, Seed, TokenBudget,
         WorkItem, WorkItemStatus,
     },
-    write_guard::{AuditLog, AuditOperation, AuditEntry, MemoryWriteGuard, WriteSource},
+    write_guard::{AuditLog, AuditOperation, AuditEntry, IntegrityChecker, MemoryWriteGuard, WriteSource},
 };
 
 /// Result alias used throughout this module.
@@ -129,6 +129,10 @@ pub struct CognitiveContextManager {
     write_guard: Option<MemoryWriteGuard>,
     /// Audit log for tracking all write operations.
     audit_log: Option<AuditLog>,
+    /// Anomaly detector for write pattern irregularities.
+    integrity_checker: Option<Arc<IntegrityChecker>>,
+    /// Tick counter for periodic integrity checks (every 50 ticks).
+    integrity_check_counter: AtomicU64,
     /// Embedding capability level (Remote/Local/FTS5Only).
     embedding_capability: EmbeddingCapability,
     /// Heuristic memory extractor.
@@ -300,6 +304,17 @@ impl CognitiveContextManager {
             }
         };
 
+        let integrity_checker = {
+            let audit_path = config.store.blob_dir.join("audit.jsonl");
+            match AuditLog::open(audit_path) {
+                Ok(log) => Some(Arc::new(IntegrityChecker::new(log))),
+                Err(e) => {
+                    tracing::warn!("integrity checker: failed to open audit log: {e}");
+                    None
+                }
+            }
+        };
+
         Ok(Self {
             drift: DriftDetector::new(config.drift.clone()),
             fresh_ctx: FreshContextManager::new(config.budget.context_window),
@@ -329,6 +344,8 @@ impl CognitiveContextManager {
             sqlite_store,
             write_guard: None,
             audit_log: None,
+            integrity_checker,
+            integrity_check_counter: AtomicU64::new(0),
             embedding_capability,
             extractor,
             kg,
@@ -378,6 +395,26 @@ impl CognitiveContextManager {
     /// peer perception.
     pub fn set_active_session(&self, session_id: String) {
         self.orchestrator.set_active_session(session_id);
+    }
+
+    /// Recover entries from a previous session's handoff file.
+    ///
+    /// Loads work items and decisions from the latest handoff, converts them
+    /// into memory entries, and persists them via the orchestrator so they
+    /// are available in future context preparations.
+    pub async fn recover_handoff_for_session(&self, session_id: &str) -> Result<Vec<MemoryEntry>> {
+        let entries = self.fresh_ctx.recover_from_handoff(session_id).await?;
+        for entry in &entries {
+            if let Err(e) = self.orchestrator.remember(entry.clone()).await {
+                tracing::warn!(error = %e, "recover_handoff: failed to persist entry");
+            }
+        }
+        tracing::info!(
+            count = entries.len(),
+            session_id = %session_id,
+            "recover_handoff: recovered entries persisted"
+        );
+        Ok(entries)
     }
 
     /// Attach a [`ProjectScopeManager`] for KG staleness detection on turn end.
@@ -1188,6 +1225,35 @@ impl CognitiveContextManager {
                         "cross-store consistency check found {} issues",
                         warnings.len()
                     );
+                }
+            }
+        }
+
+        // ── 5a4. Integrity anomaly detection every 50 ticks (T9) ────────────
+        {
+            let tick = self.integrity_check_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if tick % 50 == 0 {
+                if let Some(ref checker) = self.integrity_checker {
+                    match checker.check_anomalies() {
+                        Ok(report) => {
+                            if !report.anomalies.is_empty() {
+                                for anomaly in &report.anomalies {
+                                    tracing::warn!(
+                                        "integrity anomaly detected: {:?}",
+                                        anomaly
+                                    );
+                                }
+                                tracing::warn!(
+                                    count = report.anomalies.len(),
+                                    "integrity check found {} anomaly(ies)",
+                                    report.anomalies.len()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("integrity check failed: {e}");
+                        }
+                    }
                 }
             }
         }

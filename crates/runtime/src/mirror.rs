@@ -56,6 +56,10 @@ pub struct MirrorRule {
 pub struct MirroredMessage {
     /// The mirrored text content, prefixed with source info.
     pub content: String,
+    /// The target session key where this message should be delivered.
+    pub target_session: String,
+    /// The target platform name (from the mirror rule), if known.
+    pub target_platform: Option<String>,
     /// The source platform name.
     pub mirror_source: String,
     /// The original session key.
@@ -71,6 +75,8 @@ impl MirroredMessage {
     pub fn from_inbound(msg: &InboundMessage) -> Self {
         Self {
             content: format!("[Mirror from {}] {}", msg.platform.name(), msg.text),
+            target_session: String::new(),
+            target_platform: None,
             mirror_source: msg.platform.name().to_string(),
             original_session: msg.session_key.as_str(),
             original_timestamp: msg.timestamp,
@@ -181,15 +187,43 @@ impl MessageMirror {
 
     /// Mirror an inbound message to all target sessions.
     ///
-    /// Returns a list of (target_session_key, MirroredMessage) pairs.
-    pub async fn mirror(&self, msg: &InboundMessage) -> Vec<(String, MirroredMessage)> {
-        let targets = self.find_targets(msg).await;
-        if targets.is_empty() {
-            return Vec::new();
+    /// Returns a list of MirroredMessage instances, each with its target
+    /// session and target platform populated from the matching rule.
+    pub async fn mirror(&self, msg: &InboundMessage) -> Vec<MirroredMessage> {
+        let rules = self.rules.read().await;
+        let source_platform = msg.platform.name();
+        let source_session = msg.session_key.as_str();
+
+        let mut results = Vec::new();
+        let base = MirroredMessage::from_inbound(msg);
+
+        for rule in rules.iter() {
+            if !rule.enabled {
+                continue;
+            }
+
+            let source_matches = rule.source_platform == source_platform
+                && (rule.source_session == "*" || rule.source_session == source_session);
+
+            if source_matches {
+                let mut mirrored = base.clone();
+                mirrored.target_session = rule.target_session.clone();
+                mirrored.target_platform = rule.target_platform.clone();
+                results.push(mirrored);
+            }
+
+            if rule.direction == MirrorDirection::Bidirectional {
+                let target_matches = rule.target_session == source_session;
+                if target_matches {
+                    let mut mirrored = base.clone();
+                    mirrored.target_session = rule.source_session.clone();
+                    mirrored.target_platform = Some(source_platform.to_string());
+                    results.push(mirrored);
+                }
+            }
         }
 
-        let mirrored = MirroredMessage::from_inbound(msg);
-        targets.into_iter().map(|t| (t, mirrored.clone())).collect()
+        results
     }
 
     /// Create a simple bidirectional mirror rule between two sessions.
@@ -271,9 +305,9 @@ mod tests {
 
         let results = mirror.mirror(&msg).await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "webui:session1");
-        assert!(results[0].1.content.contains("Mirror from feishu"));
-        assert!(results[0].1.mirror);
+        assert_eq!(results[0].target_session, "webui:session1");
+        assert!(results[0].content.contains("Mirror from feishu"));
+        assert!(results[0].mirror);
     }
 
     #[tokio::test]
@@ -395,7 +429,7 @@ mod tests {
         };
         let results = mirror.mirror(&msg).await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "webui:session1");
+        assert_eq!(results[0].target_session, "webui:session1");
     }
 
     #[test]

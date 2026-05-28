@@ -589,6 +589,7 @@ fn run_gateway_action(
                 runtime_config: runtime_config_json,
                 cors_origins,
                 auth_token,
+                message_mirror: None,
             };
             let r2 = SHARED_RT.handle().clone();
             r2.block_on(async {

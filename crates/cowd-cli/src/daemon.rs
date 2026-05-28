@@ -20,6 +20,7 @@ use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use runtime::platform::{PlatformConfig, PlatformRuntime};
 use runtime::platform::config::PlatformRuntimeConfig;
+use runtime::mirror::MessageMirror;
 use tools::GlobalToolRegistry;
 
 // ── Config ─────────────────────────────────────────────────────
@@ -32,6 +33,7 @@ pub struct DaemonConfig {
     pub runtime_config: Option<serde_json::Value>,
     pub cors_origins: Vec<String>,
     pub auth_token: Option<String>,
+    pub message_mirror: Option<Arc<MessageMirror>>,
 }
 
 // ── PID file guard ──────────────────────────────────────────────
@@ -146,6 +148,14 @@ pub async fn run_daemon(
 
     // 5. Platform adapters via PlatformRuntime
     let platform_runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
+
+    // Initialise the message mirror with default rules from daemon config
+    if let Some(mirror) = config.message_mirror {
+        platform_runtime.set_mirror(mirror).await;
+    } else {
+        let default_mirror = Arc::new(MessageMirror::new());
+        platform_runtime.set_mirror(default_mirror).await;
+    }
 
     for pc in &config.platform_configs {
         if !pc.enabled {
@@ -489,6 +499,7 @@ mod tests {
             runtime_config: None,
             cors_origins: vec![],
             auth_token: None,
+            message_mirror: None,
         };
         assert_eq!(config.http_addr, "0.0.0.0:8642");
         assert_eq!(config.unix_sock_path, "/tmp/cowd.sock");
@@ -507,6 +518,7 @@ mod tests {
             runtime_config: None,
             cors_origins: vec!["http://localhost:3000".into()],
             auth_token: Some("secret-token".into()),
+            message_mirror: None,
         };
         assert_eq!(config.http_addr, "127.0.0.1:9000");
         assert_eq!(config.auth_token.as_deref(), Some("secret-token"));
@@ -524,6 +536,7 @@ mod tests {
             runtime_config: None,
             cors_origins: vec![],
             auth_token: None,
+            message_mirror: None,
         };
         assert!(config.memory_config.is_some());
     }

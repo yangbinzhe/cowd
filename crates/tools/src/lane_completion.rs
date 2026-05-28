@@ -8,9 +8,12 @@
 //! - Tests passed (green status)
 //! - Code pushed (has output file)
 
+use std::process::Command;
+use std::time::Duration;
+
 use runtime::{
-    evaluate, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition, PolicyEngine,
-    PolicyRule, ReviewStatus,
+    check_freshness, evaluate, BranchFreshness, GreenLevel, LaneBlocker, LaneContext, PolicyAction,
+    PolicyCondition, PolicyEngine, PolicyRule, ReviewStatus,
 };
 
 use crate::AgentOutput;
@@ -65,9 +68,17 @@ pub(crate) fn detect_lane_completion(
     })
 }
 
-/// Evaluates policy actions for a completed lane.
+/// Evaluates policy actions for a completed lane, after checking branch freshness.
+///
+/// Stale/diverged branches are surfaced via policy rules that inspect
+/// `context.branch_freshness` against `STALE_BRANCH_THRESHOLD`.
 #[allow(dead_code)]
-pub(crate) fn evaluate_completed_lane(context: &LaneContext) -> Vec<PolicyAction> {
+pub(crate) fn evaluate_completed_lane(context: &mut LaneContext) -> Vec<PolicyAction> {
+    if let Some(branch) = current_git_branch() {
+        let freshness = check_freshness(&branch, "main");
+        context.branch_freshness = branch_freshness_to_duration(&freshness);
+    }
+
     let engine = PolicyEngine::new(vec![
         PolicyRule::new(
             "closeout-completed-lane",
@@ -87,6 +98,28 @@ pub(crate) fn evaluate_completed_lane(context: &LaneContext) -> Vec<PolicyAction
     ]);
 
     evaluate(&engine, context)
+}
+
+#[allow(dead_code)]
+fn current_git_branch() -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|b| !b.is_empty())
+}
+
+fn branch_freshness_to_duration(freshness: &BranchFreshness) -> Duration {
+    const STALE_BRANCH_THRESHOLD: Duration = Duration::from_secs(3600);
+    match freshness {
+        BranchFreshness::Fresh => Duration::ZERO,
+        BranchFreshness::Stale { .. } => STALE_BRANCH_THRESHOLD + Duration::from_secs(1),
+        BranchFreshness::Diverged { .. } => STALE_BRANCH_THRESHOLD * 2,
+    }
 }
 
 #[cfg(test)]
@@ -162,7 +195,7 @@ mod tests {
 
     #[test]
     fn evaluate_triggers_closeout_for_completed_lane() {
-        let context = LaneContext {
+        let mut context = LaneContext {
             lane_id: "completed-lane".to_string(),
             green_level: GreenLevel::Workspace,
             branch_freshness: std::time::Duration::from_secs(0),
@@ -173,7 +206,7 @@ mod tests {
             reconciled: false,
         };
 
-        let actions = evaluate_completed_lane(&context);
+        let actions = evaluate_completed_lane(&mut context);
 
         assert!(actions.contains(&PolicyAction::CloseoutLane));
         assert!(actions.contains(&PolicyAction::CleanupSession));
