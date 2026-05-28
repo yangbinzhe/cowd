@@ -146,6 +146,13 @@ pub struct App {
     pub skin: crate::tui::skin::SkinConfig,
     pub memory_status: Option<String>,
 
+    /// Number of MCP servers connected.
+    pub mcp_count: usize,
+    /// Number of LSP servers available.
+    pub lsp_available: usize,
+    /// Number of pending permission requests.
+    pub permission_count: usize,
+
     /// Whether the API server is currently running.
     pub server_running: bool,
     /// Server uptime in seconds.
@@ -299,6 +306,10 @@ impl App {
             skill_list: Vec::new(),
             skin: crate::tui::skin::SkinConfig::default(),
             memory_status: None,
+
+            mcp_count: 0,
+            lsp_available: 0,
+            permission_count: 0,
 
             server_running: false,
             server_uptime_secs: None,

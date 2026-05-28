@@ -922,30 +922,35 @@ impl WaveOrchestrator {
         max_retries: usize,
     ) -> Vec<TaskResult> {
         let mut retry_results = Vec::new();
+        // T32: Track still-failing tasks across attempts instead of re-using
+        // the immutable `failed_tasks` parameter on every iteration.
+        let mut still_failing: Vec<(TaskId, Option<String>)> = failed_tasks.to_vec();
 
         for attempt in 1..=max_retries {
-            if failed_tasks.is_empty() {
+            if still_failing.is_empty() {
                 break;
             }
 
             tracing::info!(
                 attempt = attempt,
-                failed_count = failed_tasks.len(),
+                failed_count = still_failing.len(),
                 "retrying failed tasks"
             );
 
-            let retry_ids: Vec<TaskId> = failed_tasks.iter().map(|(id, _)| id.clone()).collect();
+            let retry_ids: Vec<TaskId> =
+                still_failing.iter().map(|(id, _)| id.clone()).collect();
             let chunk_results = self
                 .execute_task_chunk(executor.clone(), &retry_ids, context, task_timeout)
                 .await;
 
-            let mut still_failing = Vec::new();
+            still_failing.clear();
             for result in chunk_results {
                 if result.success {
                     retry_results.push(result);
                 } else {
+                    // T32: Keep in still_failing for the next retry pass;
+                    // do NOT push to retry_results yet to avoid duplicates.
                     still_failing.push((result.task_id.clone(), result.error.clone()));
-                    retry_results.push(result);
                 }
             }
 
@@ -959,6 +964,16 @@ impl WaveOrchestrator {
                     failed_count = still_failing.len(),
                     "retry limit exhausted, some tasks remain failed"
                 );
+                // T32: Only now push final still-failing results (once, no duplicates).
+                for (id, error) in &still_failing {
+                    retry_results.push(TaskResult {
+                        task_id: id.clone(),
+                        success: false,
+                        output: None,
+                        error: error.clone(),
+                        duration_ms: 0,
+                    });
+                }
             }
         }
 

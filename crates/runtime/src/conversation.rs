@@ -1,7 +1,27 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+/// T35: Lightweight cancellation token (tokio-util not available in dep tree).
+#[derive(Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
 
 use futures::stream::Stream;
 use memory::cognitive::CognitiveContextManager;
@@ -256,6 +276,10 @@ bus: Option<crate::bus::EventBus>,
     model: Option<String>,
     /// Provider fallback configuration for automatic retry on 429/5xx errors.
     provider_fallbacks_config: ProviderFallbackConfig,
+    /// T35: Cancellation token for graceful shutdown.
+    cancellation_token: CancellationToken,
+    /// T36: Tool orchestrator for result budgeting and truncation.
+    tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -386,6 +410,8 @@ where
             gate_evaluator: Some(Arc::new(crate::gates::GateEvaluator::new().with_default_gates())),
             model: feature_config.model().map(str::to_string),
             provider_fallbacks_config: feature_config.provider_fallbacks().clone(),
+            cancellation_token: CancellationToken::new(),
+            tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
         }
     }
 
@@ -453,6 +479,23 @@ where
     #[must_use]
     pub fn with_effect_handler(mut self, handler: Arc<dyn crate::effect::EffectHandler>) -> Self {
         self.effect_handler = Some(handler);
+        self
+    }
+
+    /// T35: Set a cancellation token for graceful shutdown.
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = token;
+        self
+    }
+
+    /// T36: Set a custom tool orchestrator for result budgeting.
+    #[must_use]
+    pub fn with_tool_orchestrator(
+        mut self,
+        orchestrator: crate::tool_orchestrator::ToolOrchestrator,
+    ) -> Self {
+        self.tool_orchestrator = orchestrator;
         self
     }
 
@@ -764,8 +807,27 @@ pub async fn run_turn_async(
                         let mut model_stream_events: Vec<(String, String, String, u8)> = Vec::new();
 
                         let mut failed = false;
-                        while let Some(event) = stream.next().await {
-                            match event {
+                        loop {
+                            // T35: Check cancellation before each stream poll.
+                            if self.cancellation_token.is_cancelled() {
+                                return Err(RuntimeError::new("conversation cancelled"));
+                            }
+                            // T31: Enforce a 120-second timeout on each stream chunk.
+                            let next_event = match tokio::time::timeout(
+                                Duration::from_secs(120),
+                                stream.next(),
+                            )
+                            .await
+                            {
+                                Ok(Some(event)) => event,
+                                Ok(None) => break,
+                                Err(_) => {
+                                    return Err(RuntimeError::new(
+                                        "stream timed out after 120s",
+                                    ));
+                                }
+                            };
+                            match next_event {
                                 Ok(AssistantEvent::TextDelta(text)) => {
                                     model_current_text.push_str(&text);
                                     model_stream_events.push(("text_delta".into(), "assistant".into(), text[..text.len().min(80)].to_string(), 3));
@@ -799,6 +861,11 @@ pub async fn run_turn_async(
                                     let err_str = e.to_string();
                                     if is_retryable_error(&err_str) {
                                         tracing::warn!(model, attempt, model_idx, error = %err_str, "retryable stream error");
+                                        // T30: Exponential backoff before retry.
+                                        tokio::time::sleep(Duration::from_millis(
+                                            500 * 2u64.pow(attempt),
+                                        ))
+                                        .await;
                                         if attempt == max_retries - 1 {
                                             tracing::warn!(model, "exhausted retries, switching fallback");
                                         }
@@ -1115,8 +1182,10 @@ self.record_turn_completed(&summary);
                     is_error = true;
                 }
 
+                // T36: Truncate oversized tool results before storing.
+                let truncated = self.tool_orchestrator.truncate_result(&output);
                 let result = ConversationMessage::tool_result(
-                    tool_use_id.to_string(), tool_name.to_string(), output, is_error,
+                    tool_use_id.to_string(), tool_name.to_string(), truncated, is_error,
                 );
                 self.session.write().unwrap_or_else(|e| e.into_inner()).push_message(result.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;

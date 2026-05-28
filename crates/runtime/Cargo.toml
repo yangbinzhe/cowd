@@ -13,7 +13,7 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time", "sync"] }
 tracing = "0.1"
 glob = "0.3"
 plugins = { path = "../plugins" }

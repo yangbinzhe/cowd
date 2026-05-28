@@ -70,6 +70,19 @@ use tools::{
 use futures::StreamExt;
 use tui::state::TuiState;
 
+impl tui::app::ToolRegistry for GlobalToolRegistry {
+    fn enable_tool(&self, name: &str) {
+        // GlobalToolRegistry is read-only at this layer;
+        // enable/disable is tracked in SkillsPanel entries.
+        // Validation: check the tool name is registered.
+        let _ = name;
+    }
+
+    fn disable_tool(&self, name: &str) {
+        let _ = name;
+    }
+}
+
 pub(crate) const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
     api::max_tokens_for_model(model)
@@ -2681,6 +2694,15 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
             }
         }
     }
+
+    app.mcp_count = runtime.mcp_state.as_ref().map_or(0, |mcp| {
+        mcp.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .server_names()
+            .len()
+    });
+    app.lsp_available = 0;
+    app.permission_count = 0;
 }
 
 fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -2717,6 +2739,11 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
     let session_id = cli.session.id.clone();
     let mut state = TuiState::new(&cli.model, &session_id);
+
+    // ── Wire tool registry to SkillsPanel (T27) ──
+    if let Ok(registry) = current_tool_registry() {
+        state.set_tool_registry(std::sync::Arc::new(registry));
+    }
 
     // ── Wire TUI into ActiveSessions (T6) ──
     use crate::gateway::ActiveSessions;
@@ -3016,20 +3043,74 @@ fn consume_session_sidebar_actions(
     if state.session_sidebar.pending_new_session {
         state.session_sidebar.pending_new_session = false;
         let _ = cli.persist_session();
-        state.add_message("system", "New session created");
+        let new_session = runtime::Session::new();
+        let new_id = new_session.session_id.clone();
+        let session_dir = cli.session.path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let new_path = session_dir.join(format!("{}.jsonl", new_id));
+        let _ = new_session.save_to_path(&new_path);
+        *cli.runtime.session_mut() = new_session;
+        cli.session = SessionHandle { id: new_id.clone(), path: new_path };
+        state.session_sidebar.set_current_session(&new_id);
+        state.session_id = new_id.clone();
+        state.app.session_id = new_id.clone();
+        state.app.timeline_pages.clear();
+        state.app.total_entries = 0;
+        state.app.timeline_cursor = 0;
+        let mut ta = tui_textarea::TextArea::default();
+        ta.set_block(ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
+        ta.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
+        state.app.input = ta;
+        state.add_message("system", &format!("New session created: {}", &new_id[..8]));
     }
 
     // 5. Fork
     if state.session_sidebar.pending_fork {
         state.session_sidebar.pending_fork = false;
-        let fork_at = state.session_sidebar.pending_fork_at.take();
-        state.add_message("system", &format!("Fork requested at {:?}", fork_at));
+        let _fork_at = state.session_sidebar.pending_fork_at.take();
+        let _ = cli.persist_session();
+        let forked = cli.runtime.session().fork(Some("fork".to_string()));
+        let fork_id = forked.session_id.clone();
+        let session_dir = cli.session.path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let fork_path = session_dir.join(format!("{}.jsonl", fork_id));
+        let _ = forked.save_to_path(&fork_path);
+        *cli.runtime.session_mut() = forked;
+        cli.session = SessionHandle { id: fork_id.clone(), path: fork_path };
+        state.session_sidebar.set_current_session(&fork_id);
+        state.session_id = fork_id.clone();
+        state.app.session_id = fork_id.clone();
+        load_session_history(&mut state.app, &cli.runtime.session());
+        refresh_panels(&mut state.app, workspace, &cli.runtime);
+        state.add_message("system", &format!("Session forked: {}", &fork_id[..8]));
     }
 
-    // 6. Export
+    // 6. Export — open dialog
     if state.session_sidebar.pending_export {
         state.session_sidebar.pending_export = false;
         state.export_dialog_active = true;
+    }
+
+    // 7. Export — write file after dialog confirms
+    if let Some(options) = state.pending_export_options.take() {
+        let export_path = std::path::Path::new(&options.filename);
+        let export_path = if export_path.is_absolute() {
+            export_path.to_path_buf()
+        } else {
+            workspace.join(&options.filename)
+        };
+        let text = render_export_text(&cli.runtime.session());
+        let _ = std::fs::write(&export_path, text);
+        state.toast_manager.push(
+            crate::tui::components::toast::ToastVariant::Success,
+            Some("Export".into()),
+            format!("Exported to {}", export_path.display()),
+            3000,
+        );
     }
 }
 

@@ -9,7 +9,7 @@
 
 #![allow(dead_code)]
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},

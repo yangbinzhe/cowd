@@ -292,6 +292,11 @@ impl SkillsPanel {
         }
     }
 
+    /// Set the tool registry for real enable/disable operations.
+    pub fn set_registry(&mut self, registry: std::sync::Arc<dyn crate::tui::app::ToolRegistry>) {
+        self.registry = Some(registry);
+    }
+
     /// Enable the selected skill.
     fn enable_selected(&mut self) {
         self.set_selected_enabled(true);

@@ -80,6 +80,9 @@ pub mod mirror;
 pub mod model_registry;
 pub mod profile;
 
+pub use agent::{
+    SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback, SubAgentResult,
+};
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};

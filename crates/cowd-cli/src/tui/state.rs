@@ -123,6 +123,9 @@ pub struct TuiState {
     pub export_dialog: ExportDialog,
     /// Whether the export dialog is currently shown.
     pub export_dialog_active: bool,
+    /// Pending export options from a confirmed export dialog.
+    /// Consumed by `consume_session_sidebar_actions` in main.rs.
+    pub pending_export_options: Option<crate::tui::components::export_dialog::ExportOptions>,
 
     /// Revert dialog helper for per-message revert confirmation.
     pub revert_dialog: RevertDialog,
@@ -220,6 +223,7 @@ impl TuiState {
         let question_form = None;
         let export_dialog = ExportDialog::new();
         let export_dialog_active = false;
+        let pending_export_options = None;
         let revert_dialog = RevertDialog::new();
         let context_panel = ContextPanel::new();
         let file_changes_panel = FileChangesPanel::new();
@@ -255,6 +259,7 @@ impl TuiState {
             question_form,
             export_dialog,
             export_dialog_active,
+            pending_export_options,
             revert_dialog,
             context_panel,
             file_changes_panel,
@@ -282,6 +287,11 @@ impl TuiState {
     /// Set the shared ActiveSessions registry for the session sidebar.
     pub fn set_active_sessions(&mut self, active_sessions: std::sync::Arc<crate::gateway::ActiveSessions>) {
         self.active_sessions = Some(active_sessions);
+    }
+
+    /// Set the tool registry for the skills panel.
+    pub fn set_tool_registry(&mut self, registry: std::sync::Arc<dyn crate::tui::app::ToolRegistry>) {
+        self.skills_panel.set_registry(registry);
     }
 
     // ── Event Bridging ──────────────────────────────────────────
@@ -893,6 +903,7 @@ impl TuiState {
             let result = self.export_dialog.handle_event(&event);
             if result == crate::tui::components::EventResult::Consumed {
                 if let Some(ref result) = self.export_dialog.result {
+                    self.pending_export_options = self.export_dialog.result.clone();
                     self.toast_manager.push(
                         ToastVariant::Success,
                         Some("Export".into()),
