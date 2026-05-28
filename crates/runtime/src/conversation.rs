@@ -473,12 +473,23 @@ where
     }
 
     /// Set a tool callback for real-time execution visualization (P0-2).
+    ///
+    /// # Safety
+    /// The callback MUST NOT capture an `Arc` to the `ConversationRuntime`
+    /// itself, as this would create a reference cycle and leak memory.
+    /// The runtime uses `Arc` ownership; callbacks should use `Weak` if
+    /// they need to reference the runtime.
     #[must_use]
     pub fn with_tool_callback(mut self, callback: Arc<dyn ToolCallback>) -> Self {
         self.tool_callback = Some(callback);
         self
     }
 
+    /// # Safety
+    /// The callback MUST NOT capture an `Arc` to the `ConversationRuntime`
+    /// itself, as this would create a reference cycle and leak memory.
+    /// The runtime uses `Arc` ownership; callbacks should use `Weak` if
+    /// they need to reference the runtime.
     #[must_use]
     pub fn with_memory_callback(mut self, callback: Arc<dyn MemoryCallback>) -> Self {
         self.memory_callback = Some(callback);
@@ -497,6 +508,12 @@ where
     }
 
     /// P2-10: Register an EffectHandler for side-effect tracking.
+    ///
+    /// # Safety
+    /// The callback MUST NOT capture an `Arc` to the `ConversationRuntime`
+    /// itself, as this would create a reference cycle and leak memory.
+    /// The runtime uses `Arc` ownership; callbacks should use `Weak` if
+    /// they need to reference the runtime.
     #[must_use]
     pub fn with_effect_handler(mut self, handler: Arc<dyn crate::effect::EffectHandler>) -> Self {
         self.effect_handler = Some(handler);

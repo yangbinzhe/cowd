@@ -553,6 +553,15 @@ impl MemoryOrchestrator {
         Ok(id)
     }
 
+    /// Write multiple memory entries in a batch, returning their IDs.
+    pub async fn remember_batch(&self, entries: Vec<MemoryEntry>) -> Result<Vec<MemoryId>> {
+        let mut ids = Vec::with_capacity(entries.len());
+        for entry in entries {
+            ids.push(self.remember(entry).await?);
+        }
+        Ok(ids)
+    }
+
     /// Write a new memory entry to the specified layer.
     ///
     /// This is a convenience wrapper around `remember` that builds the entry

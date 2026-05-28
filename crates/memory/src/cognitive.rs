@@ -404,10 +404,8 @@ impl CognitiveContextManager {
     /// are available in future context preparations.
     pub async fn recover_handoff_for_session(&self, session_id: &str) -> Result<Vec<MemoryEntry>> {
         let entries = self.fresh_ctx.recover_from_handoff(session_id).await?;
-        for entry in &entries {
-            if let Err(e) = self.orchestrator.remember(entry.clone()).await {
-                tracing::warn!(error = %e, "recover_handoff: failed to persist entry");
-            }
+        if let Err(e) = self.orchestrator.remember_batch(entries.clone()).await {
+            tracing::warn!(error = %e, "recover_handoff: failed to persist entries");
         }
         tracing::info!(
             count = entries.len(),
@@ -479,11 +477,38 @@ impl CognitiveContextManager {
         let mut entries: Vec<MemoryEntry> = Vec::new();
 
         // ═══════════════════════════════════════════════════════════════════
-        // Group 1: Base layers (L0+L1) and Project layer (L2) — independent
+        // Group 1: Base layers (L0+L1) + Project layer (L2) + query embedding — independent
         // ═══════════════════════════════════════════════════════════════════
-        let (l0l1_result, l2_result) = tokio::join!(
+        let (l0l1_result, l2_result, query_embedding) = tokio::join!(
             self.orchestrator.load_fixed_layers(),
             self.orchestrator.load_project_context(),
+            async {
+                if self.embedding_capability.supports_semantic() {
+                    match &self.embedding_capability {
+                        EmbeddingCapability::Remote { client } => {
+                            match client.embed_one(query).await {
+                                Ok(embed) => {
+                                    tracing::debug!(
+                                        dim = embed.len(),
+                                        "query embedding generated for hybrid search"
+                                    );
+                                    Some(embed)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "embedding failed, falling back to FTS5 search"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            },
         );
         entries.extend(l0l1_result?);
         entries.extend(l2_result?);
@@ -603,13 +628,20 @@ impl CognitiveContextManager {
             }
         }
 
+        // Compute budget for L3 token-aware recall
+        let budget = self.compute_budget();
+        let memory_budget = budget
+            .available
+            .saturating_sub(self.estimate_tokens_entries(&entries))
+            .min(u64::from(u32::MAX)) as u32;
+
         // ═══════════════════════════════════════════════════════════════════
-        // Group 2: Peer context + L4 recall + Query embedding — all independent
+        // Group 2: Peer context + L4 recall + L3 recall + SessionResume — all independent
         // ═══════════════════════════════════════════════════════════════════
         let current_agent = self.current_agent.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let current_session = self.orchestrator.active_session_id();
 
-        let ((peers, realtime_peers), l4_project, l4_global, query_embedding) = tokio::join!(
+        let ((peers, realtime_peers), l4_project, l4_global, l3_result, resume_result) = tokio::join!(
             // Peer context: regular + realtime
             async {
                 if let Some(ref agent) = current_agent {
@@ -635,32 +667,24 @@ impl CognitiveContextManager {
             async { self.orchestrator.recall_l4_project(query, 5).await.unwrap_or_default() },
             // L4 global-scoped recall
             async { self.orchestrator.recall_l4_global(query, 5).await.unwrap_or_default() },
-            // Query embedding (needed by L3 in Group 3)
+            // L3 deep recall (hybrid semantic + BM25)
             async {
-                if self.embedding_capability.supports_semantic() {
-                    match &self.embedding_capability {
-                        EmbeddingCapability::Remote { client } => {
-                            match client.embed_one(query).await {
-                                Ok(embed) => {
-                                    tracing::debug!(
-                                        dim = embed.len(),
-                                        "query embedding generated for hybrid search"
-                                    );
-                                    Some(embed)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "embedding failed, falling back to FTS5 search"
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        _ => None,
-                    }
+                self.orchestrator.recall_relevant(
+                    query,
+                    query_embedding.as_deref(),
+                    &already_surfaced,
+                    memory_budget * 2, // over-fetch for hybrid re-ranking
+                )
+                .await
+            },
+            // Session resume from prior session context
+            async {
+                if let Some(ref resume) = self.session_resume {
+                    let store_arc = self.orchestrator.store();
+                    let store: &dyn crate::store::MemoryStore = store_arc.as_ref();
+                    resume.resume_recent(query, Some(store), 5).await
                 } else {
-                    None
+                    Ok(Vec::new())
                 }
             },
         );
@@ -731,33 +755,7 @@ impl CognitiveContextManager {
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        // Group 3: L3 recall + SessionResume — independent after base layers
-        // ═══════════════════════════════════════════════════════════════════
-        let budget = self.compute_budget();
-        let memory_budget = budget
-            .available
-            .saturating_sub(self.estimate_tokens_entries(&entries))
-            .min(u64::from(u32::MAX)) as u32;
-
-        let (l3_result, resume_result) = tokio::join!(
-            self.orchestrator.recall_relevant(
-                query,
-                query_embedding.as_deref(),
-                &already_surfaced,
-                memory_budget * 2, // over-fetch for hybrid re-ranking
-            ),
-            async {
-                if let Some(ref resume) = self.session_resume {
-                    let store_arc = self.orchestrator.store();
-                    let store: &dyn crate::store::MemoryStore = store_arc.as_ref();
-                    resume.resume_recent("default", Some(store), 5).await
-                } else {
-                    Ok(Vec::new())
-                }
-            },
-        );
-
+        // ── Process L3 results: hybrid re-ranking ──
         let deep_entries = l3_result?;
 
         // ── Hybrid re-ranking: combine vector + BM25 scores ──
@@ -1054,20 +1052,19 @@ impl CognitiveContextManager {
                         "on_turn_end: extracted {} memory entries",
                         entries.len()
                     );
-                    for entry in entries {
-                        let entry_id = entry.id;
-                        let entry_content = entry.content.clone();
-                        match self.orchestrator.remember(entry).await {
-                            Ok(_) => {
-                                tracing::debug!("on_turn_end: memory persisted successfully");
-                                pending_embeddings.push((entry_id, entry_content));
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    "on_turn_end: memory persistence failed"
-                                );
-                            }
+                    // Collect embedding pairs before consuming entries
+                    pending_embeddings = entries.iter()
+                        .map(|e| (e.id, e.content.clone()))
+                        .collect();
+                    match self.orchestrator.remember_batch(entries).await {
+                        Ok(_) => {
+                            tracing::debug!("on_turn_end: {} memories persisted successfully", pending_embeddings.len());
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "on_turn_end: memory persistence failed"
+                            );
                         }
                     }
                 }

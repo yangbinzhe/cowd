@@ -132,9 +132,9 @@ pub use hooks::{
     HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
 };
 pub use lane_events::{
-    dedupe_superseded_commit_events, dedupe_terminal_events, EventProvenance, LaneCommitProvenance,
-    LaneEvent, LaneEventBlocker, LaneEventBuilder, LaneEventMetadata, LaneEventName,
-    LaneEventStatus, LaneFailureClass, LaneOwnership, SessionIdentity, WatcherAction,
+    dedupe_superseded_commit_events, LaneCommitProvenance,
+    LaneEvent, LaneEventBlocker, LaneEventName,
+    LaneEventStatus, LaneFailureClass,
 };
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
