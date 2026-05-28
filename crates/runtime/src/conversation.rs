@@ -45,6 +45,7 @@ use crate::permissions::{
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
+use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "COWD_AUTO_COMPACT_INPUT_TOKENS";
@@ -965,13 +966,63 @@ pub async fn run_turn_async(
                 use crate::tool_dispatch::{ToolRequest, categorize};
 
                 let requests: Vec<ToolRequest> = pending_tool_uses.iter().map(|(id, name, input)| {
-                    ToolRequest { tool_use_id: id.clone(), tool_name: name.clone(), input: input.clone() }
+                    ToolRequest { tool_use_id: id.clone(), tool_name: name.clone(), input: input.clone(), depends_on: Vec::new() }
                 }).collect();
                 let ordered_ids: Vec<String> = requests.iter().map(|r| r.tool_use_id.clone()).collect();
                 let (read_indices, rest_indices) = categorize(&requests);
 
                 let mut result_map: std::collections::HashMap<String, (ConversationMessage, Option<String>)> =
                     std::collections::HashMap::new();
+
+                // T7: Wave-based execution for tools with dependency relationships
+                let wave_task_indices: Vec<usize> = requests.iter().enumerate()
+                    .filter(|(_, req)| !req.depends_on.is_empty())
+                    .map(|(i, _)| i)
+                    .collect();
+
+                let (read_indices, rest_indices) = if !wave_task_indices.is_empty() {
+                    let wave_set: std::collections::HashSet<usize> = wave_task_indices.iter().cloned().collect();
+                    let mut wave = crate::wave::WaveOrchestrator::new()
+                        .with_config(crate::wave::WaveConfig::default().with_max_parallel(8));
+
+                    for &idx in &wave_task_indices {
+                        let task = self.detect_wave_task(&requests[idx]).unwrap();
+                        wave.add_task(task);
+                    }
+                    wave.build_waves().map_err(|e: crate::wave::WaveError| RuntimeError::new(e.to_string()))?;
+
+                    let wave_exec = ToolWaveExecutor::new(Arc::clone(&self.tool_executor));
+                    let wave_results = wave.execute(wave_exec).await
+                        .map_err(|e: crate::wave::WaveError| RuntimeError::new(e.to_string()))?;
+
+                    for wresult in wave_results {
+                        for tres in wresult.task_results {
+                            let tid = tres.task_id.0.clone();
+                            let req = requests.iter().find(|r| r.tool_use_id == tid);
+                            let tool_name_str = req.map_or("unknown", |r| r.tool_name.as_str()).to_string();
+                            let output = tres.output.clone().unwrap_or_else(|| tres.error.clone().unwrap_or_default());
+                            let is_error = !tres.success;
+                            let msg = ConversationMessage::tool_result(
+                                tid.clone(), tool_name_str.clone(), output, is_error,
+                            );
+                            self.session.write().unwrap_or_else(|e| e.into_inner())
+                                .push_message(msg.clone())
+                                .map_err(|e| RuntimeError::new(e.to_string()))?;
+                            let inject = self.turn_callback.as_ref().and_then(|cb| {
+                                let out = tres.output.as_deref().unwrap_or("");
+                                (cb.on_tool_result)(&tool_name_str, out)
+                            });
+                            result_map.insert(tid, (msg, inject));
+                        }
+                    }
+
+                    // Filter wave tasks out of read/rest indices for remaining dispatch
+                    let read: Vec<usize> = read_indices.into_iter().filter(|i| !wave_set.contains(i)).collect();
+                    let rest: Vec<usize> = rest_indices.into_iter().filter(|i| !wave_set.contains(i)).collect();
+                    (read, rest)
+                } else {
+                    (read_indices, rest_indices)
+                };
 
                 if !read_indices.is_empty() {
                     let mut futs = FuturesUnordered::new();
@@ -1236,6 +1287,24 @@ self.record_turn_completed(&summary);
         }
     }
 
+    /// T7: Detect whether a [`ToolRequest`] should be executed via wave orchestration.
+    ///
+    /// Returns `Some(WaveTask)` when the request has dependency constraints,
+    /// converting the tool-use ID, tool name, and input into a wave-compatible payload.
+    fn detect_wave_task(&self, req: &crate::tool_dispatch::ToolRequest) -> Option<WaveTask> {
+        if req.depends_on.is_empty() {
+            return None;
+        }
+        let payload = serde_json::json!({
+            "tool_name": &req.tool_name,
+            "input": &req.input,
+        });
+        let mut task = WaveTask::new(&req.tool_use_id, &req.tool_name).with_payload(payload);
+        for dep in &req.depends_on {
+            task = task.with_dependency(TaskId::new(dep));
+        }
+        Some(task)
+    }
 
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
@@ -2004,6 +2073,72 @@ impl ToolExecutor for StaticToolExecutor {
         self.handlers
             .get(tool_name)
             .ok_or_else(|| ToolError::new(format!("unknown tool: {tool_name}")))?(input)
+    }
+}
+
+/// T7: Wave executor adapter that bridges WaveOrchestrator to ToolExecutor.
+///
+/// Each [`WaveTask`] payload is expected to contain `{"tool_name": "...", "input": "..."}`.
+struct ToolWaveExecutor<T: ToolExecutor> {
+    tool_exec: Arc<T>,
+}
+
+impl<T: ToolExecutor> ToolWaveExecutor<T> {
+    fn new(tool_exec: Arc<T>) -> Self {
+        Self { tool_exec }
+    }
+}
+
+impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
+    fn execute(
+        self: Arc<Self>,
+        task: WaveTask,
+        _context: crate::wave::TaskContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult, WaveError>> + Send>> {
+        let tool_exec = Arc::clone(&self.tool_exec);
+        let task_id = task.id.clone();
+        let tool_name = task
+            .payload
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&task.name)
+            .to_string();
+        let input = task
+            .payload
+            .get("input")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Box::pin(async move {
+            let start = std::time::Instant::now();
+            let raw = tokio::task::spawn_blocking(move || tool_exec.execute(&tool_name, &input))
+                .await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            match raw {
+                Ok(Ok(output)) => Ok(TaskResult {
+                    task_id,
+                    success: true,
+                    output: Some(output),
+                    error: None,
+                    duration_ms,
+                }),
+                Ok(Err(e)) => Ok(TaskResult {
+                    task_id,
+                    success: false,
+                    output: None,
+                    error: Some(e.to_string()),
+                    duration_ms,
+                }),
+                Err(e) => Ok(TaskResult {
+                    task_id,
+                    success: false,
+                    output: None,
+                    error: Some(format!("tool panicked: {e}")),
+                    duration_ms: 0,
+                }),
+            }
+        })
     }
 }
 

@@ -6,6 +6,8 @@ pub struct ToolRequest {
     pub tool_use_id: String,
     pub tool_name: String,
     pub input: String,
+    /// Tool IDs that must complete before this tool can execute (wave orchestration).
+    pub depends_on: Vec<String>,
 }
 
 pub struct ToolDispatchResult {

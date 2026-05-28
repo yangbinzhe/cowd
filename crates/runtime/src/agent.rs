@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
+use crate::subagent::DelegationRequest;
 use crate::tool_orchestrator::ToolResultBudget;
 
 pub trait SubAgentProgressCallback: Send + Sync {
@@ -40,6 +43,9 @@ pub struct SubAgentConfig {
     /// Optional timeout in seconds. None means no timeout.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Maximum number of sub-agent tasks to execute in parallel (default 4).
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel: usize,
 }
 
 fn default_write_source() -> String {
@@ -54,6 +60,10 @@ fn default_budget_tokens() -> usize {
     20_000
 }
 
+fn default_max_parallel() -> usize {
+    4
+}
+
 impl Default for SubAgentConfig {
     fn default() -> Self {
         Self {
@@ -63,6 +73,7 @@ impl Default for SubAgentConfig {
             max_turns: default_max_turns(),
             budget_tokens: default_budget_tokens(),
             timeout_secs: None,
+            max_parallel: default_max_parallel(),
         }
     }
 }
@@ -294,7 +305,19 @@ impl SubAgentRuntime {
     /// Requires an executor that can drive individual LLM turns. This method
     /// handles the loop control: budget checks, tool-result chaining, and
     /// stop-reason handling.
+    #[deprecated(note = "Use `run_loop_async` instead")]
     pub fn run_loop(
+        &mut self,
+        initial_prompt: &str,
+        executor: &mut dyn SubAgentExecutor,
+    ) -> SubAgentResult {
+        let prompt = initial_prompt.to_string();
+        futures::executor::block_on(self.run_loop_async(&prompt, executor))
+    }
+
+    /// Async version of `run_loop` using `tokio::task::JoinSet` for parallel
+    /// tool-call summary processing within each turn.
+    pub async fn run_loop_async(
         &mut self,
         initial_prompt: &str,
         executor: &mut dyn SubAgentExecutor,
@@ -357,21 +380,28 @@ impl SubAgentRuntime {
                 break;
             }
 
-            // Build next prompt from tool results if any
+            // Build next prompt from tool results — parallelize summaries via JoinSet
             if !turn.tool_calls.is_empty() {
-                let tool_summaries: Vec<String> = turn
-                    .tool_calls
-                    .iter()
-                    .map(|tc| {
+                let mut set = JoinSet::new();
+                for tc in &turn.tool_calls {
+                    let tool_name = tc.tool_name.clone();
+                    let tool_output = tc.tool_output.clone();
+                    set.spawn(async move {
                         format!(
                             "Tool {} returned: {}",
-                            tc.tool_name,
-                            truncate_str(&tc.tool_output, 500)
+                            tool_name,
+                            truncate_str(&tool_output, 500)
                         )
-                    })
-                    .collect();
+                    });
+                }
+                let mut summaries = Vec::with_capacity(turn.tool_calls.len());
+                while let Some(res) = set.join_next().await {
+                    if let Ok(s) = res {
+                        summaries.push(s);
+                    }
+                }
                 current_prompt =
-                    format!("Continue based on tool results:\n{}", tool_summaries.join("\n"));
+                    format!("Continue based on tool results:\n{}", summaries.join("\n"));
             } else {
                 break;
             }
@@ -385,6 +415,47 @@ impl SubAgentRuntime {
             memory_write_attempts,
             memory_writes_denied,
         }
+    }
+
+    /// Execute a single sub-agent request to completion.
+    pub async fn execute_single(
+        config: SubAgentConfig,
+        req: DelegationRequest,
+        executor: &mut dyn SubAgentExecutor,
+    ) -> SubAgentResult {
+        let prompt = format!(
+            "Task: {}\nContext: {}\nExpected output: {}",
+            req.task, req.context, req.expected_output
+        );
+        let mut runtime = SubAgentRuntime::new(config);
+        runtime.run_loop_async(&prompt, executor).await
+    }
+
+    /// Execute multiple sub-agent requests in parallel using `tokio::task::JoinSet`.
+    ///
+    /// Concurrency is capped by `config.max_parallel`.
+    pub async fn execute_parallel(
+        config: SubAgentConfig,
+        requests: Vec<DelegationRequest>,
+        executor_factory: impl Fn() -> Box<dyn SubAgentExecutor>,
+    ) -> Vec<SubAgentResult> {
+        let mut set = JoinSet::new();
+        let semaphore = Arc::new(Semaphore::new(config.max_parallel));
+        for req in requests {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let cfg = config.clone();
+            let mut executor = executor_factory();
+            set.spawn(async move {
+                let result = SubAgentRuntime::execute_single(cfg, req, executor.as_mut()).await;
+                drop(permit);
+                result
+            });
+        }
+        let mut results = Vec::with_capacity(set.len());
+        while let Some(result) = set.join_next().await {
+            results.push(result.unwrap_or_default());
+        }
+        results
     }
 }
 
@@ -548,8 +619,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn run_loop_completes_on_end_turn() {
+    #[tokio::test]
+    async fn run_loop_completes_on_end_turn() {
         let mut executor = StubExecutor::new(vec![TurnOutput {
             text: "task done".to_string(),
             tool_calls: vec![],
@@ -563,14 +634,14 @@ mod tests {
             ..SubAgentConfig::default()
         };
         let mut runtime = SubAgentRuntime::new(config);
-        let result = runtime.run_loop("do something", &mut executor);
+        let result = runtime.run_loop_async("do something", &mut executor).await;
         assert!(result.completed_normally);
         assert_eq!(result.output, "task done");
         assert_eq!(result.tool_call_count, 0);
     }
 
-    #[test]
-    fn run_loop_chains_tool_calls() {
+    #[tokio::test]
+    async fn run_loop_chains_tool_calls() {
         let mut executor = StubExecutor::new(vec![
             TurnOutput {
                 text: "using tool".to_string(),
@@ -597,15 +668,15 @@ mod tests {
             ..SubAgentConfig::default()
         };
         let mut runtime = SubAgentRuntime::new(config);
-        let result = runtime.run_loop("read a file", &mut executor);
+        let result = runtime.run_loop_async("read a file", &mut executor).await;
         assert!(result.completed_normally);
         assert_eq!(result.tool_call_count, 1);
         assert!(result.output.contains("using tool"));
         assert!(result.output.contains("final answer"));
     }
 
-    #[test]
-    fn run_loop_stops_on_budget_exhaustion() {
+    #[tokio::test]
+    async fn run_loop_stops_on_budget_exhaustion() {
         let mut executor = StubExecutor::new(vec![
             TurnOutput {
                 text: "turn 1".to_string(),
@@ -636,19 +707,19 @@ mod tests {
             ..SubAgentConfig::default()
         };
         let mut runtime = SubAgentRuntime::new(config);
-        let result = runtime.run_loop("expensive task", &mut executor);
+        let result = runtime.run_loop_async("expensive task", &mut executor).await;
         // After turn 2: tokens_consumed = 26000 > budget_tokens = 20000
         assert!(!result.completed_normally);
     }
 
-    #[test]
-    fn subagent_timeout_stops_execution() {
+    #[tokio::test]
+    async fn subagent_timeout_stops_execution() {
         let mut config = SubAgentConfig::default();
         config.timeout_secs = Some(0);
         config.budget_tokens = 100_000;
         let mut runtime = SubAgentRuntime::new(config);
         let mut executor = StubExecutor::new(vec![]);
-        let result = runtime.run_loop("test", &mut executor);
+        let result = runtime.run_loop_async("test", &mut executor).await;
         assert!(!result.completed_normally);
     }
 }
