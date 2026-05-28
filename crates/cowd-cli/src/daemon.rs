@@ -1,7 +1,7 @@
 // ── Unified Gateway Daemon ────────────────────────────────────
 // `cowd gateway run` = single daemon process providing:
 //   - HTTP API (0.0.0.0:8642) + SSE streaming
-//   - Unix socket (/tmp/cowd.sock) for TUI attach
+//   - Unix socket (/tmp/cowd.sock) for TUI connection
 //   - Platform adapters (feishu, wechat_ilink, email)
 // Shared state: ActiveSessions, CognitiveContextManager, GlobalToolRegistry, SessionEventBus
 

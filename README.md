@@ -374,26 +374,24 @@ TUI 模式和 Server 模式是两个独立进程入口，共享同一个 `runtim
 # 编译
 cargo build --release
 
-# TUI 终端模式（默认，全功能控制台）
-cowd --solo                 # --solo 为 TUI 模式的显式别名，等同无参数运行
+# TUI 终端模式（默认，自动启动 daemon）
+cowd                     # 新建会话，全功能 TUI 控制台
+cowd --solo              # 等同无参数运行（显式别名）
+cowd --resume latest     # 续接最近会话
+cowd --resume <id>       # 续接指定会话
 
-# API 网关服务（前台运行）
-cowd gateway run
+# API 网关服务
+cowd gateway run         # 前台运行 daemon (HTTP:8642 + Unix Socket + 飞书)
+cowd gateway start       # systemd 后台启动
+cowd gateway stop        # 停止
+cowd gateway status      # 查看状态
 
-# 网关后台管理
-cowd gateway start     # 后台启动
-cowd gateway stop      # 停止
-cowd gateway status    # 查看状态
+# 安装部署
+cowd install --systemd   # 安装到 ~/.cowd/bin/ + systemd 注册
 
-# 单次 API 服务
-cowd serve --port 8080 --no-auth
-
-# 安装到 ~/.cowd/bin/ + systemd 注册
-cowd install --systemd
-
-# Session 管理
-cowd migrate-sessions   # JSONL → SQLite 迁移
-cowd --resume latest    # 续接最近会话
+# 信息
+cowd version             # 版本
+cowd help                # 帮助
 ```
 
 ---
