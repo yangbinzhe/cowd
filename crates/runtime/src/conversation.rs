@@ -455,14 +455,6 @@ where
         self
     }
 
-    /// Wire an EventBus so that external subscribers can receive
-    /// runtime events (TextDelta, TurnCompleted, etc.) in real time.
-    #[must_use]
-    pub fn with_event_bus(mut self, bus: crate::bus::EventBus) -> Self {
-        self.bus = Some(bus);
-        self
-    }
-
     /// Return a new subscriber for runtime bus events.
     /// Returns `None` if no bus has been wired.
     #[must_use]
