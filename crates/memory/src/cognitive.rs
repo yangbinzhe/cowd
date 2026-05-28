@@ -53,9 +53,10 @@ use crate::{ MemoryScope, SessionResume,
     store::vector::VectorIndex,
     tool_sandbox::ToolOutputSandbox,
     types::{
-        DecisionEntry, HandoffData, MatchedKeyword, MemoryEntry, MemoryId, MemoryLayer,
-        MemoryCategory, MemorySource, Message, MessageRole, PreparedContext, Priority,
+        Blocker, Decision, DecisionEntry, HandoffData, MatchedKeyword, MemoryEntry, MemoryId,
+        MemoryLayer, MemoryCategory, MemorySource, Message, MessageRole, PreparedContext, Priority,
         SearchMemoriesRequest, SearchMemoriesResult, SearchMode, SearchSnippet, Seed, TokenBudget,
+        WorkItem, WorkItemStatus,
     },
     write_guard::{AuditLog, AuditOperation, AuditEntry, MemoryWriteGuard, WriteSource},
 };
@@ -158,6 +159,10 @@ pub struct CognitiveContextManager {
     fact_checker: Mutex<FactChecker>,
     /// State rebuilder for session restoration from previous session data.
     state_rebuilder: Option<StateRebuilder>,
+    /// Blockers preventing forward progress, collected during session.
+    blockers: Mutex<Vec<String>>,
+    /// Last action performed by the agent, used for handoff context.
+    last_action: Mutex<Option<String>>,
 }
 
 impl CognitiveContextManager {
@@ -309,6 +314,8 @@ impl CognitiveContextManager {
             tool_sandbox,
             fact_checker: Mutex::new(FactChecker::new()),
             state_rebuilder,
+            blockers: Mutex::new(Vec::new()),
+            last_action: Mutex::new(None),
             config,
             orchestrator,
             pipeline,
@@ -783,23 +790,19 @@ impl CognitiveContextManager {
             }).collect();
         }
 
-        // ── Step 4: check seed triggers ─────────────────────────────────────
+        // ── Step 4: check seed triggers and inject as high-priority L1 entries ──
         let query_words: Vec<String> = query
             .split_whitespace()
             .map(str::to_lowercase)
             .collect();
-        let seed_entries: Vec<String> = {
+        let triggered = {
             let mut reg = self
                 .seeds
                 .lock()
                 .map_err(|_| MemoryError::Other("seeds lock poisoned".into()))?;
             reg.check_triggers("default", &query_words, Utc::now())
-                .into_iter()
-                .map(|s| s.content)
-                .collect()
         };
-        // Seeds are folded into entries as L1-priority synthetic entries.
-        for (i, content) in seed_entries.into_iter().enumerate() {
+        for seed in triggered {
             use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
             entries.push(MemoryEntry {
                 id: uuid::Uuid::new_v4(),
@@ -807,8 +810,8 @@ impl CognitiveContextManager {
                 category: MemoryCategory::Reference,
                 priority: Priority::High,
                 source: MemorySource::Import,
-                title: format!("Seed context #{i}"),
-                content,
+                title: format!("Seed: {}", seed.name),
+                content: seed.content,
                 embedding: None,
                 tags: vec!["seed".into()],
                 relations: vec![],
@@ -823,6 +826,7 @@ impl CognitiveContextManager {
                 source_agent: None,
                 visibility: crate::types::AgentVisibility::default(),
             });
+            tracing::debug!(seed_id = %seed.id, "injected seed into context");
         }
 
         // ── Step 5: sample context window pressure ───────────────────────────
@@ -1696,17 +1700,87 @@ impl CognitiveContextManager {
 
     /// Serialise the current session state into a [`HandoffData`] packet ready
     /// for cross-session resumption.
-    pub fn create_handoff(&self) -> Result<HandoffData> {
+    pub async fn create_handoff(&self) -> Result<HandoffData> {
         let session_id = uuid::Uuid::new_v4().to_string();
+
+        // Gather recent work items from L1 memories
+        let recent = self
+            .orchestrator
+            .list_layer(MemoryLayer::L1)
+            .await
+            .unwrap_or_default();
+        let work_items: Vec<WorkItem> = recent
+            .iter()
+            .map(|e| WorkItem {
+                id: e.id.to_string(),
+                title: e.title.clone(),
+                description: e.title.clone(),
+                status: WorkItemStatus::Pending,
+                priority: e.priority,
+            })
+            .take(10)
+            .collect();
+
+        // Gather decisions from the decision thread store
+        let decisions: Vec<Decision> = {
+            let store = self.decisions.lock().unwrap_or_else(|e| e.into_inner());
+            let topics: Vec<String> = store
+                .list_threads()
+                .into_iter()
+                .map(|s| s.to_owned())
+                .collect();
+            let mut result = Vec::new();
+            for topic in &topics {
+                if let Some(thread) = store.get_thread(topic) {
+                    for entry in &thread.entries {
+                        result.push(Decision {
+                            id: entry.id.clone(),
+                            summary: entry.summary.clone(),
+                            rationale: entry.rationale.clone(),
+                            status: entry.status,
+                            made_at: entry.made_at,
+                        });
+                    }
+                }
+            }
+            result
+        };
+
+        // Gather blockers from the tracked list
+        let blockers: Vec<Blocker> = {
+            let list = self.blockers.lock().unwrap_or_else(|e| e.into_inner());
+            list.iter()
+                .enumerate()
+                .map(|(i, desc)| Blocker {
+                    id: format!("blocker-{i}"),
+                    description: desc.clone(),
+                    resolution_hint: None,
+                })
+                .collect()
+        };
+
+        // Build summary from last_action
+        let last_action = self
+            .last_action
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let context_notes = format!(
+            "Last action: {}. Session has {} memories and {} decisions logged.",
+            last_action.as_deref().unwrap_or("none"),
+            recent.len(),
+            decisions.len(),
+        );
+
         let handoff = self.handoff_mgr.create_handoff(
             &session_id,
-            None,  // no current task snapshot
-            vec![], // no completed items
-            vec![], // no remaining items
-            vec![], // no recorded decisions
-            vec![], // no blockers
-            "",    // next action to be filled by caller
-            "",    // context notes
+            None, // current_task — not tracked yet
+            work_items,
+            vec![],      // remaining items
+            decisions,
+            blockers,
+            last_action.as_deref().unwrap_or(""),
+            &context_notes,
         )?;
         self.handoff_mgr.save(&handoff)?;
         Ok(handoff)

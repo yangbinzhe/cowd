@@ -2721,7 +2721,8 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
     app.file_entries = list_workspace_files(workspace);
 
     app.delegate_tasks.clear();
-    if let Some(handoff) = runtime.create_memory_handoff() {
+    let handoff = SHARED_RT.block_on(runtime.create_memory_handoff());
+    if let Some(handoff) = handoff {
         tracing::debug!(has_handoff = true, "memory handoff");
         for task in &handoff.task_states {
             app.delegate_tasks.push(tui::DelegateTask {
@@ -2740,7 +2741,8 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
     }
 
     app.memory_entries.clear();
-    if let Some(handoff) = runtime.create_memory_handoff() {
+    let handoff = SHARED_RT.block_on(runtime.create_memory_handoff());
+    if let Some(handoff) = handoff {
         if !handoff.summary.is_empty() {
             app.memory_entries.push(tui::MemoryEntry {
                 layer: "handoff".to_string(),

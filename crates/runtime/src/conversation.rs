@@ -572,9 +572,9 @@ where
     /// Create a cross-session handoff packet from the current memory state.
     ///
     /// Returns `None` if the memory subsystem is disabled.
-    pub fn create_memory_handoff(&self) -> Option<memory::types::HandoffData> {
+    pub async fn create_memory_handoff(&self) -> Option<memory::types::HandoffData> {
         let mgr = self.memory_manager.as_ref()?;
-        match mgr.create_handoff() {
+        match mgr.create_handoff().await {
             Ok(data) => Some(data),
             Err(err) => {
                 tracing::warn!(%err, "memory: failed to create handoff packet");
@@ -2776,8 +2776,8 @@ mod tests {
         assert!(rank(MemoryLayer::L3) > rank(MemoryLayer::L4));
     }
 
-    #[test]
-    fn m2_l2_handoff_roundtrip_preserves_data() {
+    #[tokio::test]
+    async fn m2_l2_handoff_roundtrip_preserves_data() {
         // M2-L2-1: cross-session handoff creates/restores handoff data
         let session = Session::new();
         let rt = ConversationRuntime::new(session, MockApi,
@@ -2785,7 +2785,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()]);
         // Handoff should succeed even without memory manager (returns None)
-        let handoff = rt.create_memory_handoff();
+        let handoff = rt.create_memory_handoff().await;
         // Without memory manager, this is None — which is correct behavior
         assert!(handoff.is_none() || handoff.is_some(),
             "handoff API should be callable without crashing");
