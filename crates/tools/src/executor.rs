@@ -14,6 +14,7 @@ use reqwest::blocking::Client;
 use runtime::{
     check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
     grep_search, load_system_prompt,
+    gates::{GateContext, GateEvaluator},
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file,
     summary_compression::compress_summary_text,
@@ -46,14 +47,56 @@ pub fn enforce_permission_check(
 }
 
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
-    execute_tool_with_enforcer(None, name, input)
+    execute_tool_with_enforcer(None, None, name, input)
 }
 
+/// Execute a tool with optional permission enforcer and gate evaluator checks.
+///
+/// The gate evaluator is checked FIRST — before the permission enforcer —
+/// so that gate failures short-circuit before any enforcement logic runs.
 pub(crate) fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
+    gate_evaluator: Option<&GateEvaluator>,
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    // Gate evaluator check — runs before permission enforcer to short-circuit
+    // on gate failures (e.g., diff size, sensitive data patterns).
+    if let Some(ge) = gate_evaluator {
+        let input_str = serde_json::to_string(input).unwrap_or_default();
+        let context = GateContext {
+            repo_path: std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            branch: String::new(),
+            commit_message: name.to_string(),
+            changed_files: Vec::new(),
+            diff: input_str,
+            author: String::new(),
+            author_email: String::new(),
+            violations: Vec::new(),
+        };
+        let (all_passed, results) = ge.evaluate_all(&context);
+        if !all_passed {
+            let reasons: Vec<String> = results
+                .iter()
+                .filter(|r| !r.passed)
+                .map(|r| {
+                    let mut msg = format!("[{}] {}", r.gate_name, r.message);
+                    if !r.suggestions.is_empty() {
+                        msg.push_str(&format!(" Suggestions: {}", r.suggestions.join(", ")));
+                    }
+                    msg
+                })
+                .collect();
+            return Err(format!(
+                "Gate check failed for tool `{name}`: {}",
+                reasons.join("; ")
+            ));
+        }
+    }
+
     match name {
         "bash" => {
             // Parse input to get the command for permission classification
@@ -3368,7 +3411,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
+        execute_tool_with_enforcer(self.enforcer.as_ref(), None, tool_name, &value)
             .map_err(ToolError::new)
     }
 }

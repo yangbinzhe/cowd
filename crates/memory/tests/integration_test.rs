@@ -101,7 +101,7 @@ async fn test_integration_code_context_injection_on_code_query() {
     let mgr = CognitiveContextManager::new(cfg).await.unwrap();
 
     let query = "fix bug in authenticate_user function";
-    let ctx = mgr.prepare_context(query, &[]).await.unwrap();
+    let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
 
     // code_context may be None (no code indexer in bare config) but pipeline works
     let _ = ctx.code_context;
@@ -116,7 +116,7 @@ async fn test_integration_no_injection_on_non_code_query() {
     let mgr = CognitiveContextManager::new(cfg).await.unwrap();
 
     let query = "tell me about the weather";
-    let ctx = mgr.prepare_context(query, &[]).await.unwrap();
+    let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
 
     assert!(ctx.code_context.is_none(), "non-code query should not inject symbols");
 }
@@ -193,7 +193,7 @@ async fn test_integration_prepared_context_has_code_field() {
 
     let cfg = test_config(&db_path);
     let mgr = CognitiveContextManager::new(cfg).await.unwrap();
-    let ctx = mgr.prepare_context("fix the authenticate function bug", &[]).await.unwrap();
+    let ctx = mgr.prepare_context("fix the authenticate function bug", &[], None).await.unwrap();
 
     let _has_field = ctx.code_context;
 }

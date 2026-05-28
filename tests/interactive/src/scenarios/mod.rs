@@ -1,13 +1,20 @@
 mod tui_basic;
 mod tui_gateway;
+mod tui_gateway_live;
 mod tui_interact;
 mod tui_memory;
 mod tui_skills;
+mod tui_skills_registry;
+mod tui_session_sidebar;
 mod server_core;
 mod server_mgmt;
 mod server_gateway_api;
 mod server_gateway_cmd;
+mod server_send_message;
+mod server_feishu;
 mod cross_cut;
+mod cross_active;
+mod tui_all_panels;
 
 use crate::reporter::TestRunner;
 use anyhow::Result;
@@ -45,6 +52,20 @@ pub fn list() {
         ("cross_memory", "TUI trigger memory → API search"),
         ("cross_approval", "TUI approval → API pending"),
         ("cross_e2e", "Full end-to-end conversation test"),
+        ("cross_active_session", "Active session visible in API sessions list"),
+        ("cross_active_sync", "Active session sync verification"),
+        ("tui_session_sidebar", "Session: /session list shows current session"),
+        ("tui_session_switch", "Session: /status shows health"),
+        ("server_send_message", "API: create session + verify sessions list"),
+        ("server_send_chat", "API: send message returns response"),
+        ("tui_skills_registry", "SkillsPanel: shows tools from GlobalToolRegistry"),
+        ("tui_skills_tools", "SkillsPanel: tool names visible"),
+        ("tui_gateway_live", "GatewayPanel: live server status indicator"),
+        ("tui_gateway_status", "GatewayPanel: API endpoints visible"),
+        ("server_feishu_status", "Feishu: adapter module exists"),
+        ("server_feishu_config", "Feishu: config present"),
+        ("tui_all_panels", "Verify all panels accessible and show content"),
+        ("tui_panel_keybinds", "Keyboard hints visible across all panels"),
     ] {
         println!("  {:<20} {}", name, desc);
     }
@@ -60,13 +81,20 @@ pub fn run_all(runner: &mut TestRunner, filter: Option<String>) -> anyhow::Resul
     }
     run_mod!(tui_basic);
     run_mod!(tui_gateway);
+    run_mod!(tui_gateway_live);
     run_mod!(tui_interact);
     run_mod!(tui_memory);
     run_mod!(tui_skills);
+    run_mod!(tui_skills_registry);
+    run_mod!(tui_session_sidebar);
     run_mod!(server_core);
     run_mod!(server_mgmt);
     run_mod!(server_gateway_api);
     run_mod!(server_gateway_cmd);
+    run_mod!(server_send_message);
+    run_mod!(server_feishu);
     run_mod!(cross_cut);
+    run_mod!(cross_active);
+    run_mod!(tui_all_panels);
     Ok(())
 }

@@ -1067,6 +1067,9 @@ impl CognitiveContextManager {
         // ── 1. Micro compact ────────────────────────────────────────────────
         self.pipeline.micro_compact(messages);
 
+        // ── 1b. AAAK compact (entity-aware compression for code-heavy content) ─
+        self.pipeline.aaak_compact(messages);
+
         // ── 2. Session compact if threshold exceeded ─────────────────────────
         if self.pipeline.should_session_compact(messages) {
             self.pipeline

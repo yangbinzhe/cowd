@@ -19,6 +19,7 @@ impl AgentRole {
     }
 }
 
+#[deprecated(note = "Use crate::agent::SubAgentConfig instead")]
 #[derive(Debug, Clone)]
 pub struct SubAgentConfig {
     pub role: AgentRole,
@@ -47,6 +48,7 @@ pub struct DelegationRequest {
     pub parent_session_id: String,
 }
 
+#[deprecated(note = "Use crate::agent::SubAgentResult instead")]
 #[derive(Debug, Clone)]
 pub struct SubAgentResult {
     pub role: AgentRole,

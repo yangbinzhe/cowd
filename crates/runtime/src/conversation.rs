@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 use tracing;
 
+use crate::agent::{SubAgentError, SubAgentExecutor, ToolCallRecord, TurnOutput};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
@@ -382,7 +383,7 @@ where
             approval_gate: None,
             effect_handler: None,
             project_phase: "Discovery".to_string(),
-            gate_evaluator: None,
+            gate_evaluator: Some(Arc::new(crate::gates::GateEvaluator::new().with_default_gates())),
             model: feature_config.model().map(str::to_string),
             provider_fallbacks_config: feature_config.provider_fallbacks().clone(),
         }
@@ -1027,6 +1028,48 @@ self.record_turn_completed(&summary);
                     }
                 }
 
+                // Gate evaluator check — runs commit quality gates (PreFlight,
+                // Abort, Revision, Escalation) against the tool input before
+                // allowing execution.
+                if let Some(gate_evaluator) = &self.gate_evaluator {
+                    let context = crate::gates::GateContext {
+                        repo_path: std::env::current_dir()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                        branch: String::new(),
+                        commit_message: tool_name.to_string(),
+                        changed_files: Vec::new(),
+                        diff: effective_input.clone(),
+                        author: String::new(),
+                        author_email: String::new(),
+                        violations: Vec::new(),
+                    };
+                    let (all_passed, results) = gate_evaluator.evaluate_all(&context);
+                    if !all_passed {
+                        let reasons: Vec<String> = results
+                            .iter()
+                            .filter(|r| !r.passed)
+                            .map(|r| {
+                                let mut msg = format!("[{}] {}", r.gate_name, r.message);
+                                if !r.suggestions.is_empty() {
+                                    msg.push_str(&format!(" Suggestions: {}", r.suggestions.join(", ")));
+                                }
+                                msg
+                            })
+                            .collect();
+                        let denied = ConversationMessage::tool_result(
+                            tool_use_id.to_string(),
+                            tool_name.to_string(),
+                            format!("Gate check failed: {}", reasons.join("; ")),
+                            true,
+                        );
+                        self.session.write().unwrap_or_else(|e| e.into_inner()).push_message(denied.clone())
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        return Ok(denied);
+                    }
+                }
+
                 self.record_tool_started(iterations, tool_name);
 
                 if let Some(callback) = &self.tool_callback {
@@ -1034,7 +1077,17 @@ self.record_turn_completed(&summary);
                     callback.on_tool_start(tool_use_id, tool_name, &preview);
                 }
 
-                let (output, mut is_error) = {
+                // P2-10: EffectHandler interceptor — use mock result if available
+                let effect_mock = self.effect_handler.as_ref().and_then(|handler| {
+                    let r = handler.handle(
+                        crate::effect::Effect::ExecuteTool(tool_name.to_string(), effective_input.clone())
+                    );
+                    if r.success { Some(r.data) } else { None }
+                });
+
+                let (output, mut is_error) = if let Some(mock_output) = effect_mock {
+                    (mock_output, false)
+                } else {
                     let tool_exec = Arc::clone(&self.tool_executor);
                     let tname = tool_name.to_string();
                     let tinput = effective_input.clone();
@@ -1539,6 +1592,94 @@ self.record_turn_completed(&summary);
         }
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SubAgentExecutor impl (T13)
+// ---------------------------------------------------------------------------
+
+impl<C, T> SubAgentExecutor for ConversationRuntime<C, T>
+where
+    C: ApiClient + Send + Sync,
+    T: ToolExecutor,
+{
+    fn execute_turn(
+        &mut self,
+        prompt: &str,
+        _allowed_tools: &[String],
+        system_prompt: Option<&str>,
+    ) -> Result<TurnOutput, SubAgentError> {
+        let user_input = if let Some(sp) = system_prompt {
+            format!("{}\n\n{}", sp, prompt)
+        } else {
+            prompt.to_string()
+        };
+
+        let prompter = crate::permissions::SharedPrompter::none();
+        let handle = tokio::runtime::Handle::try_current().map_err(|e| {
+            SubAgentError::ExecutionError(format!("no tokio runtime: {}", e))
+        })?;
+
+        let summary = handle
+            .block_on(self.run_turn_async(user_input, &prompter))
+            .map_err(|e| SubAgentError::ExecutionError(e.to_string()))?;
+
+        let text: String = summary
+            .assistant_messages
+            .iter()
+            .flat_map(|msg| &msg.blocks)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let tool_calls: Vec<ToolCallRecord> = summary
+            .assistant_messages
+            .iter()
+            .flat_map(|msg| &msg.blocks)
+            .filter_map(|block| {
+                if let ContentBlock::ToolUse { id, name, input } = block {
+                    let output = summary
+                        .tool_results
+                        .iter()
+                        .find_map(|tr| {
+                            tr.blocks.iter().find_map(|b| {
+                                if let ContentBlock::ToolResult {
+                                    tool_use_id, output, ..
+                                } = b
+                                {
+                                    if tool_use_id == id {
+                                        Some(output.clone())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .unwrap_or_default();
+                    Some(ToolCallRecord {
+                        tool_name: name.clone(),
+                        tool_input: input.clone(),
+                        tool_output: output,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(TurnOutput {
+            text,
+            tool_calls,
+            input_tokens: summary.usage.input_tokens as usize,
+            output_tokens: summary.usage.output_tokens as usize,
+            stop_reason: "end_turn".to_string(),
+        })
     }
 }
 

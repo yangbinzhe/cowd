@@ -333,7 +333,7 @@ impl GlobalToolRegistry {
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
+            return execute_tool_with_enforcer(self.enforcer.as_ref(), None, name, input);
         }
         self.plugin_tools
             .iter()

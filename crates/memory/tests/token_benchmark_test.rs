@@ -47,7 +47,7 @@ async fn test_benchmark_no_injection_on_non_code_query() {
     ];
 
     for query in &queries {
-        let ctx = mgr.prepare_context(query, &[]).await.unwrap();
+        let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
         assert!(ctx.code_context.is_none(), "query '{}' should not inject code", query);
     }
 }
@@ -70,7 +70,7 @@ async fn test_benchmark_code_queries_run_injection_check() {
     ];
 
     for query in &queries {
-        let ctx = mgr.prepare_context(query, &[]).await.unwrap();
+        let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
         // code_context should be attempted (may be None if no code indexer)
         let _ = ctx.code_context;
     }
@@ -92,7 +92,7 @@ async fn test_benchmark_token_budget_not_exceeded() {
     ];
 
     for query in &queries {
-        let ctx = mgr.prepare_context(query, &[]).await.unwrap();
+        let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
         // Total tokens should never exceed budget total
         assert!(ctx.total_tokens <= ctx.budget.total,
             "token count {} exceeds budget {}", ctx.total_tokens, ctx.budget.total);

@@ -134,7 +134,7 @@ pub enum SubAgentError {
 pub trait SubAgentExecutor: Send + Sync {
     /// Execute one turn of the sub-agent loop.
     fn execute_turn(
-        &self,
+        &mut self,
         prompt: &str,
         allowed_tools: &[String],
         system_prompt: Option<&str>,
@@ -297,21 +297,24 @@ impl SubAgentRuntime {
     pub fn run_loop(
         &mut self,
         initial_prompt: &str,
-        executor: &dyn SubAgentExecutor,
+        executor: &mut dyn SubAgentExecutor,
     ) -> SubAgentResult {
         let mut output_parts: Vec<String> = Vec::new();
         let mut tool_call_count: usize = 0;
         let memory_write_attempts: usize = 0;
         let memory_writes_denied: usize = 0;
         let mut current_prompt = initial_prompt.to_string();
+        let mut completed_normally = true;
 
         loop {
             if let Err(e) = self.check_budget() {
                 tracing::warn!("SubAgent budget exhausted: {}", e);
+                completed_normally = false;
                 break;
             }
             if let Err(e) = self.check_timeout() {
                 tracing::warn!("SubAgent timed out: {}", e);
+                completed_normally = false;
                 break;
             }
 
@@ -327,6 +330,7 @@ impl SubAgentRuntime {
                 }
                 Err(e) => {
                     tracing::error!("SubAgent turn failed: {}", e);
+                    completed_normally = false;
                     break;
                 }
             };
@@ -377,8 +381,7 @@ impl SubAgentRuntime {
             output: output_parts.join("\n"),
             tool_call_count,
             tokens_used: self.tokens_consumed,
-            completed_normally: self.turns_executed <= self.config.max_turns
-                && self.tokens_consumed <= self.config.budget_tokens,
+            completed_normally,
             memory_write_attempts,
             memory_writes_denied,
         }
@@ -532,7 +535,7 @@ mod tests {
 
     impl SubAgentExecutor for StubExecutor {
         fn execute_turn(
-            &self,
+            &mut self,
             _prompt: &str,
             _allowed_tools: &[String],
             _system_prompt: Option<&str>,
@@ -547,7 +550,7 @@ mod tests {
 
     #[test]
     fn run_loop_completes_on_end_turn() {
-        let executor = StubExecutor::new(vec![TurnOutput {
+        let mut executor = StubExecutor::new(vec![TurnOutput {
             text: "task done".to_string(),
             tool_calls: vec![],
             input_tokens: 50,
@@ -560,7 +563,7 @@ mod tests {
             ..SubAgentConfig::default()
         };
         let mut runtime = SubAgentRuntime::new(config);
-        let result = runtime.run_loop("do something", &executor);
+        let result = runtime.run_loop("do something", &mut executor);
         assert!(result.completed_normally);
         assert_eq!(result.output, "task done");
         assert_eq!(result.tool_call_count, 0);
@@ -568,7 +571,7 @@ mod tests {
 
     #[test]
     fn run_loop_chains_tool_calls() {
-        let executor = StubExecutor::new(vec![
+        let mut executor = StubExecutor::new(vec![
             TurnOutput {
                 text: "using tool".to_string(),
                 tool_calls: vec![ToolCallRecord {
@@ -594,7 +597,7 @@ mod tests {
             ..SubAgentConfig::default()
         };
         let mut runtime = SubAgentRuntime::new(config);
-        let result = runtime.run_loop("read a file", &executor);
+        let result = runtime.run_loop("read a file", &mut executor);
         assert!(result.completed_normally);
         assert_eq!(result.tool_call_count, 1);
         assert!(result.output.contains("using tool"));
@@ -603,7 +606,7 @@ mod tests {
 
     #[test]
     fn run_loop_stops_on_budget_exhaustion() {
-        let executor = StubExecutor::new(vec![
+        let mut executor = StubExecutor::new(vec![
             TurnOutput {
                 text: "turn 1".to_string(),
                 tool_calls: vec![ToolCallRecord {
@@ -633,7 +636,7 @@ mod tests {
             ..SubAgentConfig::default()
         };
         let mut runtime = SubAgentRuntime::new(config);
-        let result = runtime.run_loop("expensive task", &executor);
+        let result = runtime.run_loop("expensive task", &mut executor);
         // After turn 2: tokens_consumed = 26000 > budget_tokens = 20000
         assert!(!result.completed_normally);
     }
@@ -644,8 +647,8 @@ mod tests {
         config.timeout_secs = Some(0);
         config.budget_tokens = 100_000;
         let mut runtime = SubAgentRuntime::new(config);
-        let executor = StubExecutor::new(vec![]);
-        let result = runtime.run_loop("test", &executor);
+        let mut executor = StubExecutor::new(vec![]);
+        let result = runtime.run_loop("test", &mut executor);
         assert!(!result.completed_normally);
     }
 }

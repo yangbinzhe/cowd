@@ -33,6 +33,7 @@ pub mod dedup;
 pub mod feishu;
 pub mod email;
 pub mod wechat_ilink;
+pub mod wecom;
 pub mod runtime;
 pub mod types;
 

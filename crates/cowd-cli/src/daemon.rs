@@ -16,7 +16,8 @@ use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
-use runtime::platform::{PlatformAdapter, PlatformConfig};
+use runtime::platform::{PlatformConfig, PlatformRuntime};
+use runtime::platform::config::PlatformRuntimeConfig;
 use tools::GlobalToolRegistry;
 
 // ── Config ─────────────────────────────────────────────────────
@@ -105,7 +106,9 @@ pub async fn run_daemon(
         .map_err(|e| format!("failed to bind unix socket {}: {}", config.unix_sock_path, e))?;
     tracing::info!("Unix socket on {}", config.unix_sock_path);
 
-    // 5. Platform adapters
+    // 5. Platform adapters via PlatformRuntime
+    let platform_runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
+
     for pc in &config.platform_configs {
         if !pc.enabled {
             continue;
@@ -114,16 +117,15 @@ pub async fn run_daemon(
         match pc.platform_type.as_str() {
             "feishu" | "lark" => {
                 match runtime::platform::feishu::create_feishu_adapter(&settings_json) {
-                    Ok(mut adapter) => {
+                    Ok(adapter) => {
                         let app_id = pc
                             .settings
                             .get("app_id")
                             .and_then(|v| v.as_str())
                             .unwrap_or("?");
                         tracing::info!("feishu adapter created for app_id={app_id}");
-                        match adapter.connect().await {
-                            Ok(()) => tracing::info!("feishu adapter connected"),
-                            Err(e) => tracing::error!("feishu adapter connect failed: {e}"),
+                        if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
+                            tracing::error!("failed to register feishu adapter: {e}");
                         }
                     }
                     Err(e) => tracing::error!("failed to create feishu adapter: {e}"),
@@ -133,11 +135,10 @@ pub async fn run_daemon(
                 match runtime::platform::wechat_ilink::create_wechat_ilink_adapter(
                     &settings_json,
                 ) {
-                    Ok(mut adapter) => {
+                    Ok(adapter) => {
                         tracing::info!("wechat_ilink adapter created");
-                        match adapter.connect().await {
-                            Ok(()) => tracing::info!("wechat_ilink adapter connected"),
-                            Err(e) => tracing::error!("wechat_ilink adapter connect failed: {e}"),
+                        if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
+                            tracing::error!("failed to register wechat_ilink adapter: {e}");
                         }
                     }
                     Err(e) => tracing::error!("failed to create wechat_ilink adapter: {e}"),
@@ -145,11 +146,10 @@ pub async fn run_daemon(
             }
             "email" | "mail" => {
                 match runtime::platform::email::create_email_adapter(&settings_json) {
-                    Ok(mut adapter) => {
+                    Ok(adapter) => {
                         tracing::info!("email adapter created");
-                        match adapter.connect().await {
-                            Ok(()) => tracing::info!("email adapter connected"),
-                            Err(e) => tracing::error!("email adapter connect failed: {e}"),
+                        if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
+                            tracing::error!("failed to register email adapter: {e}");
                         }
                     }
                     Err(e) => tracing::error!("failed to create email adapter: {e}"),
@@ -159,6 +159,11 @@ pub async fn run_daemon(
                 tracing::warn!("unknown platform type: {other}");
             }
         }
+    }
+
+    // Start the platform runtime (connects all registered adapters and spawns loops)
+    if let Err(e) = platform_runtime.start().await {
+        tracing::error!("failed to start platform runtime: {e}");
     }
 
     // 6. Unix socket accept loop (background)
