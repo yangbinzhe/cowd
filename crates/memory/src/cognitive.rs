@@ -39,7 +39,6 @@ use crate::{ MemoryScope, SessionResume,
     embedding::EmbeddingCapability,
     entity::KnowledgeGraph,
     error::MemoryError,
-    fact_checker::FactChecker,
     extractor::MemoryExtractor,
     fresh_context::FreshContextManager,
     handoff::HandoffManager,
@@ -49,7 +48,6 @@ use crate::{ MemoryScope, SessionResume,
     seeds::{DecisionThreadStore, SeedRegistry},
     state_rebuilder::StateRebuilder,
     store::{FtsSearchOptions, FtsSearchResult},
-    store::sqlite::SqliteStore,
     store::vector::VectorIndex,
     tool_sandbox::ToolOutputSandbox,
     types::{
@@ -121,8 +119,6 @@ pub struct CognitiveContextManager {
     decisions: Mutex<DecisionThreadStore>,
     /// Persisted Closet index, loaded from SQLite on startup.
     closet: Mutex<Option<Closet>>,
-    /// SQLite store handle for Closet/Seeds persistence.
-    sqlite_store: SqliteStore,
     /// Staleness and contradiction detector.
     drift: DriftDetector,
     /// Write guard for anti-corruption control.
@@ -159,8 +155,6 @@ pub struct CognitiveContextManager {
     cross_store_verify_counter: AtomicU64,
     /// In-memory FTS5 sandbox for indexing large tool outputs.
     tool_sandbox: Mutex<ToolOutputSandbox>,
-    /// Knowledge-graph fact checker for cross-agent conflict detection and auto-correction.
-    fact_checker: Mutex<FactChecker>,
     /// State rebuilder for session restoration from previous session data.
     state_rebuilder: Option<StateRebuilder>,
     /// Blockers preventing forward progress, collected during session.
@@ -252,13 +246,9 @@ impl CognitiveContextManager {
             Mutex::new(graph)
         };
 
-        // Build the SQLite store for Closet / Seeds persistence.
-        let sqlite_store = SqliteStore::open(&config.store)?;
-
-        // Restore Closet from SQLite and re-inject into orchestrator.
-        let closet: Option<Closet> = sqlite_store
-            .load_closet()
-            .unwrap_or(None)
+        // Restore Closet from KV store and re-inject into orchestrator.
+        let closet_json = orchestrator.store().kv_get("closet").await.unwrap_or(None);
+        let closet: Option<Closet> = closet_json
             .and_then(|json| {
                 serde_json::from_str::<Vec<crate::closet::ClosetPointer>>(&json)
                     .ok()
@@ -278,10 +268,9 @@ impl CognitiveContextManager {
             }
         };
 
-        // Restore Seeds from SQLite.
-        let saved_seeds: Vec<Seed> = sqlite_store
-            .load_seeds()
-            .unwrap_or(None)
+        // Restore Seeds from KV store.
+        let seeds_json = orchestrator.store().kv_get("seeds").await.unwrap_or(None);
+        let saved_seeds: Vec<Seed> = seeds_json
             .and_then(|json| serde_json::from_str::<Vec<Seed>>(&json).ok())
             .unwrap_or_default();
         let seeds = {
@@ -327,7 +316,6 @@ impl CognitiveContextManager {
             kg_rebuild_tick_counter: AtomicU64::new(0),
             cross_store_verify_counter: AtomicU64::new(0),
             tool_sandbox,
-            fact_checker: Mutex::new(FactChecker::new()),
             state_rebuilder,
             blockers: Mutex::new(Vec::new()),
             last_action: Mutex::new(None),
@@ -341,7 +329,6 @@ impl CognitiveContextManager {
             seeds,
             decisions: Mutex::new(DecisionThreadStore::new()),
             closet: Mutex::new(closet),
-            sqlite_store,
             write_guard: None,
             audit_log: None,
             integrity_checker,
@@ -943,6 +930,39 @@ impl CognitiveContextManager {
             None
         };
 
+        // ── Step 7b: Tool output sandbox injection ──
+        {
+            let sandbox = self.tool_sandbox.lock().unwrap_or_else(|e| e.into_inner());
+            let count = sandbox.entry_count();
+            if count > 0 {
+                let snippets = sandbox.search_all(query, 3);
+                for snip in snippets {
+                    entries.push(MemoryEntry {
+                        id: uuid::Uuid::new_v4(),
+                        layer: MemoryLayer::L3,
+                        category: MemoryCategory::Reference,
+                        priority: Priority::Normal,
+                        source: MemorySource::AutoExtracted,
+                        title: format!("[SANDBOX] tool output L{}-L{}", snip.line_start, snip.line_end),
+                        content: format!("[TOOL OUTPUT] {}", snip.content),
+                        embedding: None,
+                        tags: vec!["sandbox".into(), "tool_output".into()],
+                        relations: vec![],
+                        confidence: 0.7,
+                        access_count: 0,
+                        staleness: 0.0,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        last_accessed_at: None,
+                        scope: MemoryScope::default(),
+                        session_id: None,
+                        source_agent: None,
+                        visibility: crate::types::AgentVisibility::default(),
+                    });
+                }
+            }
+        }
+
         // ── Assemble PreparedContext ─────────────────────────────────────────
         let total_tokens = self.estimate_tokens_entries(&entries);
         let depth_scale = if total_tokens > budget.available {
@@ -1100,21 +1120,15 @@ impl CognitiveContextManager {
         }
 
         // ── 0c. Auto-correct contradictions via fact checker ──────────────
-        match self.fact_checker.lock() {
-            Ok(mut fc) => {
-                let report = fc.auto_correct();
-                if report.corrected > 0 || report.pruned > 0 {
-                    tracing::info!(
-                        corrected = report.corrected,
-                        pruned = report.pruned,
-                        flagged = report.flagged,
-                        "auto-correction applied"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!("fact_checker lock poisoned: {}", e);
-            }
+        let mut fc = crate::orchestrator::get_fact_checker().lock();
+        let report = fc.auto_correct();
+        if report.corrected > 0 || report.pruned > 0 {
+            tracing::info!(
+                corrected = report.corrected,
+                pruned = report.pruned,
+                flagged = report.flagged,
+                "auto-correction applied"
+            );
         }
 
         // ── 1. Micro compact ────────────────────────────────────────────────
@@ -1307,13 +1321,13 @@ impl CognitiveContextManager {
             }
         }
 
-        // ── 9. Save Closet to SQLite ────────────────────────────────────────
+        // ── 9. Save Closet to KV store ────────────────────────────────────────
         match ClosetManager::build_from_orchestrator(&self.orchestrator).await {
             Ok(manager) => {
                 let pointers = &manager.closet().pointers;
                 match serde_json::to_string(pointers) {
                     Ok(json) => {
-                        if let Err(e) = self.sqlite_store.save_closet(&json) {
+                        if let Err(e) = self.orchestrator.store().kv_put("closet", &json).await {
                             tracing::warn!("failed to save closet: {}", e);
                         } else {
                             let mut closet_guard = self.closet.lock().unwrap_or_else(|e| e.into_inner());
@@ -1330,7 +1344,7 @@ impl CognitiveContextManager {
             }
         }
 
-        // ── 10. Save Seeds to SQLite ────────────────────────────────────────
+        // ── 10. Save Seeds to KV store ──────────────────────────────────────
         {
             let reg = self
                 .seeds
@@ -1338,7 +1352,7 @@ impl CognitiveContextManager {
                 .map_err(|_| MemoryError::Other("seeds lock poisoned".into()))?;
             match serde_json::to_string(reg.all_seeds()) {
                 Ok(json) => {
-                    if let Err(e) = self.sqlite_store.save_seeds(&json) {
+                    if let Err(e) = self.orchestrator.store().kv_put("seeds", &json).await {
                         tracing::warn!("failed to save seeds: {}", e);
                     }
                 }

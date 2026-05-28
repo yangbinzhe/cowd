@@ -163,6 +163,44 @@ impl ToolOutputSandbox {
         }
     }
 
+    /// Search across ALL indexed tool outputs (not restricted to a specific call_id).
+    /// Returns matching snippets ordered by FTS5 relevance.
+    #[must_use]
+    pub fn search_all(&self, query: &str, limit: usize) -> Vec<SearchSnippet> {
+        let sql = "SELECT line_range, content FROM tool_output_fts \
+                   WHERE content MATCH ?1 \
+                   LIMIT ?2";
+        let mut stmt = match self.conn.prepare(sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(params![query, limit as i64], |row| {
+            let line_range: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let parts: Vec<&str> = line_range.trim_start_matches('L').split("-L").collect();
+            let start: usize = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let end: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(start);
+            Ok(SearchSnippet {
+                line_start: start,
+                line_end: end,
+                content,
+            })
+        });
+        match rows {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    /// Return total count of indexed tool output entries.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.conn
+            .query_row("SELECT count(*) FROM tool_output_fts", [], |row| row.get::<_, i64>(0))
+            .map(|n| n as usize)
+            .unwrap_or(0)
+    }
+
     /// Remove all indexed entries for the given tool call ID.
     pub fn clear(&self, tool_call_id: &str) {
         let _ = self.conn.execute(

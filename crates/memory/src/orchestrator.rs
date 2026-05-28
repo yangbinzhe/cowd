@@ -15,6 +15,14 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use std::sync::OnceLock;
 
+/// Global FactChecker singleton — replacing the dual-instance pattern.
+static GLOBAL_FACT_CHECKER: OnceLock<parking_lot::Mutex<FactChecker>> = OnceLock::new();
+
+/// Get the global FactChecker instance.
+pub fn get_fact_checker() -> &'static parking_lot::Mutex<FactChecker> {
+    GLOBAL_FACT_CHECKER.get_or_init(|| parking_lot::Mutex::new(FactChecker::new()))
+}
+
 use crate::{
     config::MemoryConfig,
     context_fence::FenceRegistry,
@@ -65,8 +73,6 @@ pub struct MemoryOrchestrator {
     closet: parking_lot::Mutex<ClosetManager>,
     /// Fence registry for context isolation.
     fence_registry: FenceRegistry,
-    /// Fact checker for detecting factual contradictions.
-    fact_checker: Mutex<Option<FactChecker>>,
     /// Active memory scope for auto-filling new entries.
     active_scope: Mutex<MemoryScope>,
     /// Active agent ID for auto-filling new entries' source_agent.
@@ -146,7 +152,6 @@ impl MemoryOrchestrator {
             l4,
             closet,
             fence_registry: FenceRegistry::new(),
-            fact_checker: Mutex::new(Some(FactChecker::new())),
             active_scope: Mutex::new(MemoryScope::default()),
             active_agent: Mutex::new(None),
             active_session: Mutex::new(None),
@@ -463,17 +468,14 @@ impl MemoryOrchestrator {
 
         // Apply fact checking if configured
         let check_result: Option<FactCheckResult> = {
-            let guard = self.fact_checker.lock();
-            if let Some(ref checker) = *guard {
-                let source_agent = entry.source_agent.as_deref();
-                let triple = extract_triple_from_content(&entry.content, source_agent);
-                if let Some(ref t) = triple {
-                    let result = checker.check_triple(t);
-                    if !result.is_consistent {
-                        Some(result)
-                    } else {
-                        None
-                    }
+            let guard = get_fact_checker().lock();
+            let checker = &*guard;
+            let source_agent = entry.source_agent.as_deref();
+            let triple = extract_triple_from_content(&entry.content, source_agent);
+            if let Some(ref t) = triple {
+                let result = checker.check_triple(t);
+                if !result.is_consistent {
+                    Some(result)
                 } else {
                     None
                 }
@@ -495,30 +497,29 @@ impl MemoryOrchestrator {
         // Register new facts from content for future checks
         // Also perform cross-agent conflict detection
         {
-            let mut guard = self.fact_checker.lock();
-            if let Some(ref mut checker) = *guard {
-                let source_agent = entry.source_agent.as_deref();
-                register_facts_from_content(checker, &entry.content, source_agent);
+            let mut guard = get_fact_checker().lock();
+            let checker = &mut *guard;
+            let source_agent = entry.source_agent.as_deref();
+            register_facts_from_content(checker, &entry.content, source_agent);
 
-                // Cross-agent conflict detection
-                if let Some(triple) = extract_triple_from_content(&entry.content, source_agent) {
-                    let conflict_info = checker.detect_conflict(&triple);
-                    if let Some((conflicting, score)) = conflict_info {
-                        let loser_confidence = score.clamp(0.1, 0.9);
-                        entry.confidence = (entry.confidence * loser_confidence).min(0.5);
-                        tracing::warn!(
-                            subject = %conflicting.subject,
-                            predicate = %conflicting.predicate,
-                            existing_object = %conflicting.object,
-                            conflict_score = score,
-                            entry_id = %entry.id,
-                            "cross-agent conflict: confidence downgraded"
-                        );
-                        // Also register this triple with downgraded confidence
-                        let mut downgraded = triple;
-                        downgraded.confidence = entry.confidence;
-                        checker.register_triple(downgraded);
-                    }
+            // Cross-agent conflict detection
+            if let Some(triple) = extract_triple_from_content(&entry.content, source_agent) {
+                let conflict_info = checker.detect_conflict(&triple);
+                if let Some((conflicting, score)) = conflict_info {
+                    let loser_confidence = score.clamp(0.1, 0.9);
+                    entry.confidence = (entry.confidence * loser_confidence).min(0.5);
+                    tracing::warn!(
+                        subject = %conflicting.subject,
+                        predicate = %conflicting.predicate,
+                        existing_object = %conflicting.object,
+                        conflict_score = score,
+                        entry_id = %entry.id,
+                        "cross-agent conflict: confidence downgraded"
+                    );
+                    // Also register this triple with downgraded confidence
+                    let mut downgraded = triple;
+                    downgraded.confidence = entry.confidence;
+                    checker.register_triple(downgraded);
                 }
             }
         }
@@ -795,26 +796,6 @@ impl MemoryOrchestrator {
     /// Set (create or update) the primary identity entry.
     pub async fn set_identity(&self, title: &str, content: &str) -> Result<MemoryId> {
         self.l0.set(title, content).await
-    }
-
-    /// Configure a fact checker for contradiction detection.
-    pub fn with_fact_checker(self, checker: FactChecker) -> Self {
-        *self.fact_checker.lock() = Some(checker);
-        self
-    }
-
-    /// Access the fact checker for configuration.
-    pub fn with_fact_checker_mut<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut FactChecker) -> R,
-    {
-        let mut guard = self.fact_checker.lock();
-        if let Some(ref mut checker) = *guard {
-            f(checker)
-        } else {
-            *guard = Some(FactChecker::new());
-            f(guard.as_mut().unwrap())
-        }
     }
 
     // -----------------------------------------------------------------------

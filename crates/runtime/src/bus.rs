@@ -7,11 +7,16 @@ use tokio::sync::broadcast;
 pub enum Event {
     SessionCreated { id: String },
     SessionDeleted { id: String },
+    TextDelta { content: String },
+    ThinkingDelta { content: String },
+    ToolStart { id: String, name: String, preview: String },
+    ToolProgress { id: String, name: String, progress: String },
+    ToolComplete { id: String, name: String, summary: String, exit_code: Option<i32> },
+    SignatureDelta { signature: String },
     TurnCompleted { tokens: u32, model: String },
     ToolExecuted { name: String, duration_ms: u64 },
     MemoryExtracted { count: usize },
     ApprovalRequested { tool: String },
-    TextDelta { content: String },
 }
 
 #[derive(Clone)]

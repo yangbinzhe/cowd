@@ -344,7 +344,8 @@ where
                     });
                     match handle.join().expect("memory init thread panicked") {
                         Ok(mgr) => {
-                            tracing::debug!("memory: CognitiveContextManager initialised");
+                            mgr.set_active_agent("primary".to_string());
+                            tracing::debug!("memory: CognitiveContextManager initialised, active_agent=primary");
                             (Some(Arc::new(mgr)), None)
                         }
                         Err(err) => {
@@ -361,7 +362,8 @@ where
                     {
                         Ok(rt) => match rt.block_on(CognitiveContextManager::new(mem_cfg)) {
                             Ok(mgr) => {
-                                tracing::debug!("memory: CognitiveContextManager initialised");
+                                mgr.set_active_agent("primary".to_string());
+                                tracing::debug!("memory: CognitiveContextManager initialised, active_agent=primary");
                                 (Some(Arc::new(mgr)), None)
                             }
                             Err(err) => {
@@ -1926,7 +1928,7 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
         compression: CompressionConfig {
             micro_threshold: 50,
             session_threshold: 10,
-            enable_deep_compression: false,
+            enable_deep_compression: feature_config.compression().deep.enabled,
             aggressiveness: 0.5,
             llm: Default::default(),
         },
