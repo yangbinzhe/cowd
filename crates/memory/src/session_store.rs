@@ -115,6 +115,14 @@ impl UnifiedSessionStore {
         self.inner.lock().await.delete_session(session_id)
     }
 
+    /// Mark a session as closed.
+    ///
+    /// Updates the session's status to `'closed'` and refreshes
+    /// `last_activity`.  Messages are preserved for auditing.
+    pub async fn mark_session_closed(&self, session_id: &str) -> Result<()> {
+        self.inner.lock().await.mark_session_closed(session_id)
+    }
+
     /// List all session records ordered by `last_activity DESC`.
     pub async fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         self.inner.lock().await.list_sessions()
@@ -197,6 +205,11 @@ impl UnifiedSessionStore {
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
         self.inner.lock().await.get_messages(session_id, offset, limit)
+    }
+
+    /// Retrieve ALL messages for a session (unbounded, no pagination).
+    pub async fn get_all_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
+        self.inner.lock().await.get_all_messages(session_id)
     }
 
     /// Get the total number of messages in a session.

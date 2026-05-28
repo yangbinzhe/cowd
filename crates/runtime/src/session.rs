@@ -126,6 +126,7 @@ pub struct Session {
     persistence: Option<SessionPersistence>,
     #[doc(hidden)]
     pub appended_since_snapshot: Arc<AtomicUsize>,
+    pub closed: bool,
 }
 
 impl PartialEq for Session {
@@ -195,6 +196,7 @@ impl Session {
             model: None,
             persistence: None,
             appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
+            closed: false,
         }
     }
 
@@ -324,6 +326,7 @@ impl Session {
             model: self.model.clone(),
             persistence: None,
             appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
+            closed: false,
         }
     }
 
@@ -449,6 +452,7 @@ impl Session {
             model,
             persistence: None,
             appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
+            closed: false,
         })
     }
 
@@ -551,6 +555,7 @@ impl Session {
             model,
             persistence: None,
             appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
+            closed: false,
         })
     }
 
@@ -666,6 +671,38 @@ impl Session {
     fn touch(&mut self) {
         self.updated_at_ms = current_time_millis();
     }
+
+    /// Export the session as a JSONL string.
+    pub fn export_jsonl(&self) -> Result<String, SessionError> {
+        self.render_jsonl_snapshot()
+    }
+
+    /// Returns `true` if this session has been explicitly closed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Close the session and force-save to its persistence path.
+    pub fn close(&mut self) -> Result<(), SessionError> {
+        self.touch();
+        self.closed = true;
+        if let Some(path) = self.persistence_path().map(|p| p.to_path_buf()) {
+            self.force_save_to_path(&path)?;
+        }
+        Ok(())
+    }
+
+    fn force_save_to_path(&self, path: &Path) -> Result<(), SessionError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock_file = OpenOptions::new().create(true).append(true).open(path)?;
+        lock_file.lock_exclusive()?;
+        let snapshot = self.render_jsonl_snapshot()?;
+        write_atomic(path, &snapshot)?;
+        Ok(())
+    }
 }
 
 impl Default for Session {
@@ -746,7 +783,7 @@ impl ConversationMessage {
         JsonValue::Object(object)
     }
 
-    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+    pub fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
         let object = value
             .as_object()
             .ok_or_else(|| SessionError::Format("message must be an object".to_string()))?;
@@ -787,10 +824,10 @@ impl ConversationMessage {
         session_id: &str,
         sequence: usize,
     ) -> memory::store::session::SessionMessage {
-        let content_json = serde_json::to_string(
-            &self.blocks.iter().map(|b| b.to_json()).collect::<Vec<_>>(),
+        let content_json = JsonValue::Array(
+            self.blocks.iter().map(|b| b.to_json()).collect(),
         )
-        .unwrap_or_default();
+        .render();
 
         let (tool_use_id, tool_name) = self
             .blocks
@@ -811,7 +848,7 @@ impl ConversationMessage {
         memory::store::session::SessionMessage {
             session_id: session_id.to_string(),
             sequence,
-            role: self.role_str(),
+            role: self.role.role_str().to_string(),
             content_json,
             blocks_count: self.blocks.len(),
             tool_use_id,
@@ -819,7 +856,7 @@ impl ConversationMessage {
             token_usage_json: self
                 .usage
                 .as_ref()
-                .map(|u| serde_json::to_string(u).unwrap_or_default()),
+                .map(|u| usage_to_json(u.clone()).render()),
             created_at_ms: crate::session::current_time_millis(),
         }
     }

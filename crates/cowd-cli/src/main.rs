@@ -57,7 +57,7 @@ use runtime::{
     check_base_commit, format_stale_base_warning,
     load_system_prompt, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy,
+    ContentBlock, ConversationMessage, ConversationRuntime, JsonValue, McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy,
     ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
     ToolError, ToolExecutor, UsageTracker,
 };
@@ -5054,11 +5054,9 @@ fn migrate_session_messages(
         }
 
         // Parse as JSONL message record {"type":"message","message":{...}}
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-            if let Some(message_val) = value.get("message") {
-                if let Ok(msg) =
-                    serde_json::from_value::<ConversationMessage>(message_val.clone())
-                {
+        if let Ok(value) = JsonValue::parse(&line) {
+            if let Some(message_val) = value.as_object().and_then(|obj| obj.get("message")) {
+                if let Ok(msg) = ConversationMessage::from_json(message_val) {
                     let record = msg.to_session_message(session_id, sequence);
                     batch.push(record);
                     sequence += 1;

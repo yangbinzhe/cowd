@@ -748,6 +748,27 @@ impl SqliteSessionStore {
         Ok(msgs)
     }
 
+    /// Retrieve ALL messages for a session (unbounded, no pagination).
+    pub fn get_all_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, sequence, role, content_json, blocks_count,
+                        tool_use_id, tool_name, token_usage_json, created_at_ms
+                 FROM messages WHERE session_id = ?1 ORDER BY sequence ASC",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt.query_map(params![session_id], row_to_message).map_err(sql_err)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row.map_err(sql_err)?);
+        }
+        if messages.len() > 1000 {
+            tracing::warn!(session_id, count = messages.len(), "get_all_messages: large session, consider pagination");
+        }
+        Ok(messages)
+    }
+
     /// Count the number of messages in a session.
     pub fn get_message_count(&self, session_id: &str) -> Result<usize> {
         let conn = self.conn()?;
@@ -861,6 +882,20 @@ impl SqliteSessionStore {
             .map_err(sql_err)?;
         tx.commit().map_err(sql_err)?;
         Ok(removed)
+    }
+
+    /// Mark a session as closed.
+    ///
+    /// Updates the session's status to `'closed'` and refreshes
+    /// `last_activity`.  Messages are preserved for auditing.
+    pub fn mark_session_closed(&self, session_id: &str) -> Result<()> {
+        let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
+        conn.execute(
+            "UPDATE sessions SET status = 'closed', last_activity = ?1 WHERE session_id = ?2",
+            params![chrono::Utc::now().to_rfc3339(), session_id],
+        )
+        .map_err(sql_err)?;
+        Ok(())
     }
 }
 
