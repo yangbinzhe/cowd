@@ -246,6 +246,21 @@ async fn send_message(
 
     let mut runtime_guard = runtime_entry.lock().await;
 
+    // Subscribe runtime EventBus → forward TextDelta to SessionEventBus
+    if let Some(bus) = runtime_guard.bus() {
+        let mut rx = bus.subscribe();
+        let eb = event_bus.clone();
+        let sid = session_id.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = rx.recv().await {
+                if let runtime::bus::Event::TextDelta { content } = event {
+                    let sse = serde_json::json!({"type":"TextDelta","content":content});
+                    let _ = eb.broadcast(&sid, &sse.to_string()).await;
+                }
+            }
+        });
+    }
+
     const TURN_TIMEOUT: Duration = Duration::from_secs(300);
 
     match timeout(TURN_TIMEOUT, runtime_guard.run_turn_async(&body.content, &runtime::permissions::SharedPrompter::none())).await {

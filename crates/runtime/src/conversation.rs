@@ -510,6 +510,18 @@ where
         self
     }
 
+    /// M9: Attach an EventBus for publish/subscribe module communication.
+    #[must_use]
+    pub fn with_event_bus(mut self, bus: crate::bus::EventBus) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    /// M9: Get a reference to the attached EventBus, if any.
+    pub fn bus(&self) -> Option<&crate::bus::EventBus> {
+        self.bus.as_ref()
+    }
+
     /// T36: Set a custom tool orchestrator for result budgeting.
     #[must_use]
     pub fn with_tool_orchestrator(

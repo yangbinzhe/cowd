@@ -6981,6 +6981,7 @@ fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
+    runtime = runtime.with_event_bus(runtime::bus::EventBus::new(256));
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
 
