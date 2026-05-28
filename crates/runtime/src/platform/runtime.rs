@@ -113,20 +113,40 @@ impl PlatformRuntime {
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(self.config.channel_capacity);
         *self.message_rx.write().await = Some(inbound_rx);
 
-        // Connect all adapters
+        // Connect all adapters in parallel
         let mut adapters = self.adapters.write().await;
-        for (name, adapter) in adapters.iter_mut() {
-            info!(platform = %name, "connecting platform adapter");
-            if let Err(e) = adapter.connect().await {
-                error!(platform = %name, error = %e, "failed to connect platform adapter");
-                return Err(e);
-            }
-            debug!(platform = %name, "platform adapter connected");
-        }
-
-        // Take adapters out and spawn a loop task for each one.
         let adapter_entries: Vec<(String, Box<dyn PlatformAdapter>)> = adapters.drain().collect();
         drop(adapters); // release the write lock
+
+        let connect_handles: Vec<_> = adapter_entries
+            .into_iter()
+            .map(|(name, mut adapter)| {
+                tokio::spawn(async move {
+                    info!(platform = %name, "connecting platform adapter");
+                    let result = adapter.connect().await;
+                    (name, adapter, result)
+                })
+            })
+            .collect();
+
+        let connect_results = futures::future::join_all(connect_handles).await;
+
+        // Process results — log errors and continue with remaining adapters
+        let mut connected_adapters = Vec::new();
+        for result in connect_results {
+            match result {
+                Ok((name, adapter, Ok(()))) => {
+                    debug!(platform = %name, "platform adapter connected");
+                    connected_adapters.push((name, adapter));
+                }
+                Ok((name, _adapter, Err(e))) => {
+                    error!(platform = %name, error = %e, "failed to connect platform adapter");
+                }
+                Err(e) => {
+                    error!(error = %e, "task join error");
+                }
+            }
+        }
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
@@ -134,7 +154,7 @@ impl PlatformRuntime {
         let outbound_senders: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<OutboundMessage>>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        for (platform_name, adapter) in adapter_entries {
+        for (platform_name, adapter) in connected_adapters {
             let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(self.config.channel_capacity);
             self.adapter_handles.write().await.insert(
                 platform_name.clone(),

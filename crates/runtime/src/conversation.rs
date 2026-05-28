@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use tokio::sync::Semaphore;
+
 /// T35: Lightweight cancellation token (tokio-util not available in dep tree).
 #[derive(Clone, Default)]
 pub struct CancellationToken(Arc<AtomicBool>);
@@ -280,6 +282,14 @@ bus: Option<crate::bus::EventBus>,
     cancellation_token: CancellationToken,
     /// T36: Tool orchestrator for result budgeting and truncation.
     tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator,
+    /// T4: Semaphore for WriteLocal tool concurrency (permits: 4).
+    write_semaphore: Arc<Semaphore>,
+    /// T4: Semaphore for Network tool concurrency (permits: 3).
+    network_semaphore: Arc<Semaphore>,
+    /// T4: Semaphore for Destructive tool concurrency (permits: 1).
+    destructive_semaphore: Arc<Semaphore>,
+    /// T4: Semaphore for default/ReadOnly tool concurrency (permits: 8).
+    default_semaphore: Arc<Semaphore>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -412,6 +422,16 @@ where
             provider_fallbacks_config: feature_config.provider_fallbacks().clone(),
             cancellation_token: CancellationToken::new(),
             tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
+            write_semaphore: Arc::new(Semaphore::new(
+                crate::tool_orchestrator::ToolSafetyCategory::WriteLocal.max_concurrency(),
+            )),
+            network_semaphore: Arc::new(Semaphore::new(
+                crate::tool_orchestrator::ToolSafetyCategory::Network.max_concurrency(),
+            )),
+            destructive_semaphore: Arc::new(Semaphore::new(
+                crate::tool_orchestrator::ToolSafetyCategory::Destructive.max_concurrency(),
+            )),
+            default_semaphore: Arc::new(Semaphore::new(8)),
         }
     }
 
@@ -980,10 +1000,18 @@ pub async fn run_turn_async(
 
                 for &idx in &rest_indices {
                     let (ref tool_use_id, ref tool_name, ref input) = pending_tool_uses[idx];
+                    let sem = match self.tool_orchestrator.classify(tool_name) {
+                        crate::tool_orchestrator::ToolSafetyCategory::WriteLocal => &self.write_semaphore,
+                        crate::tool_orchestrator::ToolSafetyCategory::Network => &self.network_semaphore,
+                        crate::tool_orchestrator::ToolSafetyCategory::Destructive => &self.destructive_semaphore,
+                        _ => &self.default_semaphore,
+                    };
+                    let _permit = sem.acquire().await.unwrap();
                     let result_msg = self.execute_single_tool(
                         tool_use_id, tool_name, input,
                         prompter, iterations,
                     ).await?;
+                    drop(_permit);
                     let inject = if let Some(ref cb) = self.turn_callback {
                         let output = result_msg.blocks.first().and_then(|b| match b {
                             ContentBlock::ToolResult { output, .. } => Some(output.as_str()),

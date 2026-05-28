@@ -39,6 +39,7 @@ futures = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 prost = "0.13"
+lru = "0.12"
 
 [dev-dependencies]
 httpmock = "0.7"

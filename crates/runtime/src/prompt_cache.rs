@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use lru::LruCache;
+use std::num::NonZeroUsize;
+
 use serde::{Deserialize, Serialize};
 
 // ── constants ──────────────────────────────────────────────────────
@@ -38,6 +41,7 @@ pub struct PromptCacheConfig {
     pub completion_ttl: Duration,
     pub prompt_ttl: Duration,
     pub cache_break_min_drop: u32,
+    pub memory_capacity: usize,
 }
 
 impl PromptCacheConfig {
@@ -48,6 +52,7 @@ impl PromptCacheConfig {
             completion_ttl: Duration::from_secs(DEFAULT_COMPLETION_TTL_SECS),
             prompt_ttl: Duration::from_secs(DEFAULT_PROMPT_TTL_SECS),
             cache_break_min_drop: DEFAULT_BREAK_MIN_DROP,
+            memory_capacity: 200,
         }
     }
 }
@@ -152,12 +157,16 @@ impl PromptCache {
         let paths = PromptCachePaths::for_session(&config.session_id);
         let stats = read_json::<PromptCacheStats>(&paths.stats_path).unwrap_or_default();
         let previous = read_json::<TrackedPromptState>(&paths.session_state_path);
+        let memory_capacity = config.memory_capacity;
         Self {
             inner: Arc::new(Mutex::new(PromptCacheInner {
                 config,
                 paths,
                 stats,
                 previous,
+                memory_cache: LruCache::new(
+                    NonZeroUsize::new(memory_capacity).unwrap_or(NonZeroUsize::MIN),
+                ),
             })),
         }
     }
@@ -180,10 +189,55 @@ impl PromptCache {
     /// expired.
     #[must_use]
     pub fn lookup_completion(&self, request_hash: &str) -> Option<serde_json::Value> {
-        let (paths, ttl) = {
-            let inner = self.lock();
-            (inner.paths.clone(), inner.config.completion_ttl)
-        };
+        let ttl;
+        let paths;
+        // Fast path: check in-memory LRU cache first.
+        {
+            let mut inner = self.lock();
+            ttl = inner.config.completion_ttl;
+            paths = inner.paths.clone();
+
+            if let Some(entry) = inner.memory_cache.get(request_hash) {
+                // Copy/clone all needed data upfront to release the borrow on inner.
+                let fingerprint_version = entry.fingerprint_version;
+                let cached_at_unix_secs = entry.cached_at_unix_secs;
+                let response_usage = entry.response_usage.clone();
+                let response = entry.response.clone();
+                // entry no longer used — NLL releases the mutable borrow
+
+                if fingerprint_version != current_fingerprint_version() {
+                    inner.memory_cache.pop(request_hash);
+                    inner.stats.completion_cache_misses += 1;
+                    inner.stats.last_completion_cache_key = Some(request_hash.to_string());
+                    persist_state(&inner);
+                    return None;
+                }
+                let expired =
+                    now_unix_secs().saturating_sub(cached_at_unix_secs) >= ttl.as_secs();
+                if expired {
+                    inner.memory_cache.pop(request_hash);
+                    inner.stats.completion_cache_misses += 1;
+                    inner.stats.last_completion_cache_key = Some(request_hash.to_string());
+                    persist_state(&inner);
+                    return None;
+                }
+                inner.stats.completion_cache_hits += 1;
+                apply_usage_to_stats(
+                    &mut inner.stats,
+                    &response_usage,
+                    request_hash,
+                    "completion-cache",
+                );
+                inner.previous = Some(TrackedPromptState::from_hashes(
+                    request_hash,
+                    &response_usage,
+                ));
+                persist_state(&inner);
+                return Some(response);
+            }
+        } // lock dropped before disk I/O
+
+        // Slow path: disk lookup
         let entry_path = paths.completion_entry_path(request_hash);
         let entry = read_json::<CompletionCacheEntry>(&entry_path);
         let Some(entry) = entry else {
@@ -198,7 +252,7 @@ impl PromptCache {
             let mut inner = self.lock();
             inner.stats.completion_cache_misses += 1;
             inner.stats.last_completion_cache_key = Some(request_hash.to_string());
-            let _ = fs::remove_file(entry_path);
+            let _ = fs::remove_file(&entry_path);
             persist_state(&inner);
             return None;
         }
@@ -209,7 +263,7 @@ impl PromptCache {
         inner.stats.last_completion_cache_key = Some(request_hash.to_string());
         if expired {
             inner.stats.completion_cache_misses += 1;
-            let _ = fs::remove_file(entry_path);
+            let _ = fs::remove_file(&entry_path);
             persist_state(&inner);
             return None;
         }
@@ -225,8 +279,11 @@ impl PromptCache {
             request_hash,
             &entry.response_usage,
         ));
+        // Populate memory cache on disk hit
+        let response = entry.response.clone();
+        inner.memory_cache.put(request_hash.to_string(), entry);
         persist_state(&inner);
-        Some(entry.response)
+        Some(response)
     }
 
     /// Store a provider response in the completion cache and record
@@ -298,6 +355,13 @@ impl PromptCache {
         if let Some(response_json) = response_json {
             write_completion_entry(&inner.paths, request_hash, response_json, usage);
             inner.stats.completion_cache_writes += 1;
+            let entry = CompletionCacheEntry {
+                cached_at_unix_secs: now_unix_secs(),
+                fingerprint_version: current_fingerprint_version(),
+                response: response_json.clone(),
+                response_usage: usage.clone(),
+            };
+            inner.memory_cache.put(request_hash.to_string(), entry);
         }
         persist_state(&inner);
 
@@ -322,6 +386,7 @@ struct PromptCacheInner {
     paths: PromptCachePaths,
     stats: PromptCacheStats,
     previous: Option<TrackedPromptState>,
+    memory_cache: LruCache<String, CompletionCacheEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

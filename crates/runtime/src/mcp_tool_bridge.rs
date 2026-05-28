@@ -12,7 +12,7 @@
 //! connect to MCP servers and invoke their capabilities.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::mcp::mcp_tool_name;
 use crate::mcp_stdio::McpServerManager;
@@ -72,7 +72,7 @@ pub struct McpServerState {
 #[derive(Debug, Clone, Default)]
 pub struct McpToolRegistry {
     inner: Arc<RwLock<HashMap<String, McpServerState>>>,
-    manager: Arc<OnceLock<Arc<RwLock<McpServerManager>>>>,
+    managers: Arc<RwLock<HashMap<String, Arc<Mutex<McpServerManager>>>>>,
 }
 
 impl McpToolRegistry {
@@ -81,11 +81,16 @@ impl McpToolRegistry {
         Self::default()
     }
 
-    pub fn set_manager(
-        &self,
-        manager: Arc<RwLock<McpServerManager>>,
-    ) -> Result<(), Arc<RwLock<McpServerManager>>> {
-        self.manager.set(manager)
+    /// Register a server-specific manager instance.
+    ///
+    /// Each MCP server gets its own `McpServerManager` with its own lock,
+    /// allowing different servers to execute tool calls in parallel.
+    pub fn set_server_manager(&self, server_name: &str, manager: McpServerManager) {
+        let mut managers = self.managers.write().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge managers lock poisoned; recovering");
+            poisoned.into_inner()
+        });
+        managers.insert(server_name.to_owned(), Arc::new(Mutex::new(manager)));
     }
 
     pub fn register_server(
@@ -192,7 +197,7 @@ impl McpToolRegistry {
     }
 
     fn spawn_tool_call(
-        manager: Arc<RwLock<McpServerManager>>,
+        manager: Arc<Mutex<McpServerManager>>,
         qualified_tool_name: String,
         arguments: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
@@ -207,7 +212,7 @@ impl McpToolRegistry {
                 runtime.block_on(async move {
                     let response = {
                         let mut manager = manager
-                            .write()
+                            .lock()
                             .map_err(|_| "mcp server manager lock poisoned".to_string())?;
                         manager
                             .discover_tools()
@@ -284,11 +289,14 @@ impl McpToolRegistry {
 
         drop(inner);
 
-        let manager = self
-            .manager
-            .get()
+        let managers = self.managers.read().unwrap_or_else(|poisoned| {
+            tracing::warn!("mcp tool bridge managers lock poisoned; recovering");
+            poisoned.into_inner()
+        });
+        let manager = managers
+            .get(server_name)
             .cloned()
-            .ok_or_else(|| "MCP server manager is not configured".to_string())?;
+            .ok_or_else(|| format!("MCP server '{}' manager is not configured", server_name))?;
 
         Self::spawn_tool_call(
             manager,
@@ -592,7 +600,7 @@ mod tests {
         let error = registry
             .call_tool("srv", "greet", &serde_json::json!({"name": "world"}))
             .expect_err("should require a configured manager");
-        assert!(error.contains("MCP server manager is not configured"));
+        assert!(error.contains("manager is not configured"));
 
         // Unknown tool should fail
         assert!(registry
@@ -609,7 +617,7 @@ mod tests {
             "alpha".to_string(),
             manager_server_config(&script_path, "alpha", &log_path),
         )]);
-        let manager = Arc::new(RwLock::new(McpServerManager::from_servers(&servers)));
+        let manager = McpServerManager::from_servers(&servers);
 
         let registry = McpToolRegistry::new();
         registry.register_server(
@@ -627,9 +635,7 @@ mod tests {
             vec![],
             Some("bridge test server".into()),
         );
-        registry
-            .set_manager(Arc::clone(&manager))
-            .expect("manager should only be set once");
+        registry.set_server_manager("alpha", manager);
 
         let result = registry
             .call_tool("alpha", "echo", &serde_json::json!({"text": "hello"}))
@@ -869,11 +875,7 @@ mod tests {
             vec![],
             None,
         );
-        registry
-            .set_manager(Arc::new(RwLock::new(McpServerManager::from_servers(
-                &servers,
-            ))))
-            .expect("manager should only be set once");
+        registry.set_server_manager("srv", McpServerManager::from_servers(&servers));
 
         let result = registry
             .call_tool("srv", "echo", &arguments)

@@ -208,6 +208,11 @@ impl ToolOrchestrator {
             .unwrap_or_else(|| ToolSafetyCategory::from_tool_name(tool_name))
     }
 
+    /// Alias for `category_for` — used by concurrency semaphore dispatch.
+    pub fn classify(&self, tool_name: &str) -> ToolSafetyCategory {
+        self.category_for(tool_name)
+    }
+
     /// Check if a tool can be executed concurrently with another.
     pub fn can_run_concurrently(&self, tool_a: &str, tool_b: &str) -> bool {
         let cat_a = self.category_for(tool_a);

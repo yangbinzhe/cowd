@@ -103,6 +103,7 @@ pub struct SessionSearchResult {
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;").map_err(sql_err)?;
     conn.execute_batch(SCHEMA_SQL).map_err(sql_err)?;
 
     // Create FTS5 triggers for sessions (must be separate from batch)
@@ -125,6 +126,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     for trigger in triggers {
         let _ = conn.execute_batch(trigger); // Ignore if already exists
     }
+    conn.execute_batch("COMMIT;").map_err(sql_err)?;
     Ok(())
 }
 

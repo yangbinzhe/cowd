@@ -317,6 +317,8 @@ fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryMeta> {
 // ---------------------------------------------------------------------------
 
 fn init_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;").map_err(sql_err)?;
+
     // Execute each DDL statement individually to avoid rusqlite's execute_batch
     // returning "Execute returned results" errors when FTS5 virtual tables or
     // triggers are involved in a multi-statement batch.
@@ -482,6 +484,8 @@ END",
     // Phase 1 migration: add source_agent and visibility columns.
     let _ = conn.execute_batch("ALTER TABLE memories ADD COLUMN source_agent TEXT");
     let _ = conn.execute_batch("ALTER TABLE memories ADD COLUMN visibility TEXT");
+
+    conn.execute_batch("COMMIT;").map_err(sql_err)?;
     Ok(())
 }
 

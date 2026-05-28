@@ -2807,6 +2807,7 @@ dependencies = [
  "httpmock",
  "imap",
  "lettre",
+ "lru",
  "mail-parser",
  "native-tls",
  "plugins",
