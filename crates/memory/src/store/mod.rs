@@ -196,4 +196,19 @@ pub trait MemoryStore: Send + Sync {
     async fn find_memories_by_symbol(&self, _symbol_name: &str) -> Result<Vec<MemoryId>> {
         Err(MemoryError::Store("symbol↔memory lookup not supported by this backend".into()))
     }
+
+    // -----------------------------------------------------------------------
+    // Key-value store (for Closet, Seeds, and auxiliary persistence)
+    // -----------------------------------------------------------------------
+
+    /// Store a key-value pair. Replaces existing value if key exists.
+    /// Used by Closet index, Seed registry, and other auxiliary data.
+    async fn kv_put(&self, _key: &str, _value: &str) -> Result<()> {
+        Err(MemoryError::Store("kv store not supported by this backend".into()))
+    }
+
+    /// Retrieve a value by key. Returns None if key does not exist.
+    async fn kv_get(&self, _key: &str) -> Result<Option<String>> {
+        Err(MemoryError::Store("kv store not supported by this backend".into()))
+    }
 }

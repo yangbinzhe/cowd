@@ -227,24 +227,27 @@ pub async fn run_daemon(
     }
 
     // 6. Unix socket accept loop (background)
+    // Use spawn_blocking — handle_unix_client internally calls run_turn_async
+    // which holds std::sync::MutexGuard across .await, making its future !Send.
     {
         let sessions = sessions.clone();
         let event_bus = event_bus.clone();
-        tokio::spawn(async move {
-            loop {
-                match unix_listener.accept().await {
-                    Ok((stream, _addr)) => {
-                        let sessions = sessions.clone();
-                        let event_bus = event_bus.clone();
-                        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async move {
+                loop {
+                    match unix_listener.accept().await {
+                        Ok((stream, _addr)) => {
+                            let sessions = sessions.clone();
+                            let event_bus = event_bus.clone();
                             handle_unix_client(stream, sessions, event_bus).await;
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("unix socket accept error: {e}");
+                        }
+                        Err(e) => {
+                            tracing::warn!("unix socket accept error: {e}");
+                        }
                     }
                 }
-            }
+            })
         });
     }
 

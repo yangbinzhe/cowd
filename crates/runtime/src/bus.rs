@@ -8,6 +8,7 @@ pub enum Event {
     SessionCreated { id: String },
     SessionDeleted { id: String },
     TextDelta { content: String },
+
     TurnCompleted { tokens: u32, model: String },
     ToolExecuted { name: String, duration_ms: u64 },
     MemoryExtracted { count: usize },

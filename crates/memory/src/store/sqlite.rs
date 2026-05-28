@@ -525,6 +525,7 @@ impl SqliteStore {
         let store = Self { pool };
         let conn = store.conn()?;
         init_schema(&conn)?;
+        store.ensure_kv_table()?;
         Ok(store)
     }
 
@@ -538,6 +539,7 @@ impl SqliteStore {
         let store = Self { pool };
         let conn = store.conn()?;
         init_schema(&conn)?;
+        store.ensure_kv_table()?;
         Ok(store)
     }
 
@@ -547,12 +549,24 @@ impl SqliteStore {
         let store = Self { pool };
         let conn = store.conn()?;
         init_schema(&conn)?;
+        store.ensure_kv_table()?;
         Ok(store)
     }
 
     /// Get a connection from the pool.
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))
+    }
+
+    /// Ensure the generic key-value table exists.
+    fn ensure_kv_table(&self) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )
+        .map_err(sql_err)?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2046,6 +2060,46 @@ impl MemoryStore for SqliteStore {
         tokio::task::spawn_blocking(move || {
             let conn = store.conn()?;
             Self::do_find_memories_by_symbol(&conn, &symbol_name)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    // -------------------------------------------------------------------
+    // Key-value store (generic persistence)
+    // -------------------------------------------------------------------
+
+    async fn kv_put(&self, key: &str, value: &str) -> Result<()> {
+        let store = self.clone();
+        let key = key.to_string();
+        let value = value.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .map_err(|e| MemoryError::Store(format!("kv_put: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn kv_get(&self, key: &str) -> Result<Option<String>> {
+        let store = self.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let mut stmt = conn
+                .prepare("SELECT value FROM kv_store WHERE key = ?1")
+                .map_err(|e| MemoryError::Store(format!("kv_get prepare: {e}")))?;
+            let result = stmt.query_row(rusqlite::params![key], |row| row.get::<_, String>(0));
+            match result {
+                Ok(val) => Ok(Some(val)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(MemoryError::Store(format!("kv_get: {e}"))),
+            }
         })
         .await
         .map_err(|e| MemoryError::Store(e.to_string()))?
