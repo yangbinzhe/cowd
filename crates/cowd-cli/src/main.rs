@@ -464,7 +464,7 @@ fn run_gateway_action(
                 .and_then(|p| p.extra.get("host"))
                 .and_then(|h| h.as_str())
                 .map(String::from)
-                .unwrap_or_else(|| "0.0.0.0".to_string());
+                .unwrap_or_else(|| "127.0.0.1".to_string());
             let effective_port = api_server_platform
                 .and_then(|p| p.extra.get("port"))
                 .and_then(|v| v.as_i64())
@@ -483,6 +483,10 @@ fn run_gateway_action(
                 .and_then(|c| c.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
+            let auth_token: Option<String> = api_server_platform
+                .and_then(|p| p.extra.get("auth_token"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let daemon_config = daemon::DaemonConfig {
                 http_addr: format!("{effective_host}:{effective_port}"),
                 unix_sock_path: "/tmp/cowd.sock".to_string(),
@@ -490,6 +494,7 @@ fn run_gateway_action(
                 platform_configs,
                 runtime_config: runtime_config_json,
                 cors_origins,
+                auth_token,
             };
             let r2 = SHARED_RT.handle().clone();
             r2.block_on(async {

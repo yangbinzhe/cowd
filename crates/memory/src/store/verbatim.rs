@@ -12,13 +12,29 @@
 //! while still benefiting from `SQLite`'s built-in concurrency via `PRAGMA
 //! journal_mode=WAL`.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MemoryError;
 
 /// Result alias used throughout the verbatim module.
 pub type Result<T> = std::result::Result<T, MemoryError>;
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+const IN_MEMORY_PATH: &str = ":memory:";
+
+fn new_pool(db_path: &str, max_size: u32) -> Result<Pool<SqliteConnectionManager>> {
+    let manager = SqliteConnectionManager::file(db_path);
+    Pool::builder()
+        .max_size(max_size)
+        .build(manager)
+        .map_err(|e| MemoryError::Store(e.to_string()))
+}
 
 fn sql_err(e: rusqlite::Error) -> MemoryError {
     MemoryError::Store(e.to_string())
@@ -50,17 +66,16 @@ pub struct VerbatimEntry {
 // VerbatimSink
 // ---------------------------------------------------------------------------
 
-/// Zero-loss raw storage sink backed by a SQLite database file.
+/// Zero-loss raw storage sink backed by a SQLite database file with an r2d2
+/// connection pool.
 ///
 /// # Persistence
 ///
 /// The sink reuses the same `sqlite_path` as [`SqliteStore`]
-/// (or `":memory:"` for testing).  Every call opens a fresh connection
-/// with `PRAGMA journal_mode=WAL`, so concurrent access from the main store
-/// and the sink is safe.
+/// (or `":memory:"` for testing).
 #[derive(Debug, Clone)]
 pub struct VerbatimSink {
-    db_path: String,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl VerbatimSink {
@@ -68,19 +83,17 @@ impl VerbatimSink {
     ///
     /// The database must already exist and contain the `verbatim_entries`
     /// table (typically created by [`SqliteStore::open`] during schema init).
-    pub fn new(db_path: &str) -> Self {
-        Self {
-            db_path: db_path.to_owned(),
-        }
+    pub fn new(db_path: &str) -> Result<Self> {
+        let max_size = if db_path == IN_MEMORY_PATH { 1 } else { 4 };
+        let pool = new_pool(db_path, max_size)?;
+        Ok(Self { pool })
     }
 
-    // ------------------------------------------------------------------
-    // Internal helpers
-    // ------------------------------------------------------------------
-
-    /// Open a fresh WAL-enabled connection.
-    fn conn(&self) -> Result<Connection> {
-        super::sqlite::open_conn_for_verbatim(&self.db_path)
+    /// Get a connection from the pool with `PRAGMA foreign_keys=ON`.
+    fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+        let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(sql_err)?;
+        Ok(conn)
     }
 
     // ------------------------------------------------------------------

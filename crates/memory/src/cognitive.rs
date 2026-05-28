@@ -430,6 +430,7 @@ impl CognitiveContextManager {
         &self,
         query: &str,
         messages: &[Message],
+        session_id: Option<&str>,
     ) -> Result<PreparedContext> {
         // ── Step 1 & 2: fixed layers + project context ──────────────────────
         let mut entries: Vec<MemoryEntry> = Vec::new();
@@ -757,6 +758,16 @@ impl CognitiveContextManager {
         }
         entries.extend(re_ranked);
 
+        // ── Session isolation filter ──────────────────────────────────────────
+        if let Some(sid) = session_id {
+            entries = entries.into_iter().filter(|e| {
+                match &e.session_id {
+                    Some(entry_sid) => entry_sid == sid,
+                    None => true, // cross-session entries always visible
+                }
+            }).collect();
+        }
+
         // ── Step 4: check seed triggers ─────────────────────────────────────
         let query_words: Vec<String> = query
             .split_whitespace()
@@ -906,7 +917,7 @@ impl CognitiveContextManager {
         query: &str,
         messages: &[Message],
     ) -> Result<PreparedContext> {
-        self.prepare_context(query, messages).await
+        self.prepare_context(query, messages, None).await
     }
 
     // -----------------------------------------------------------------------
@@ -2378,7 +2389,7 @@ mod tests {
 
         let mgr = CognitiveContextManager::new(cfg).await.unwrap();
         let query = "fix bug in src/auth.rs";
-        let ctx = mgr.prepare_context(query, &[]).await.unwrap();
+        let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
 
         // code_context may be None (no code indexer in test config) or Some
         // This test primarily validates the pipeline doesn't crash
@@ -2393,7 +2404,7 @@ mod tests {
 
         let mgr = CognitiveContextManager::new(cfg).await.unwrap();
         let query = "tell me a joke";
-        let ctx = mgr.prepare_context(query, &[]).await.unwrap();
+        let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
 
         // code_context should be None for non-code queries
         assert!(ctx.code_context.is_none());

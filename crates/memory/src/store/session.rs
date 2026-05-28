@@ -14,6 +14,8 @@
 use std::path::Path;
 
 use chrono::Utc;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{error::MemoryError, store::Result};
@@ -24,23 +26,12 @@ use crate::{error::MemoryError, store::Result};
 
 const IN_MEMORY_PATH: &str = ":memory:";
 
-// ---------------------------------------------------------------------------
-// Helper: open connection with WAL + FK pragmas
-// ---------------------------------------------------------------------------
-
-fn open_conn(db_path: &str) -> Result<Connection> {
-    let conn = if db_path == IN_MEMORY_PATH {
-        Connection::open_in_memory()
-    } else {
-        Connection::open(db_path)
-    }
-    .map_err(sql_err)?;
-    // Enable WAL and foreign-key constraints for every connection.
-    // Ignore WAL pragma errors: in-memory databases always stay in journal mode.
-    let _ = conn.pragma_update(None, "journal_mode", "WAL");
-    conn.pragma_update(None, "foreign_keys", "ON")
-        .map_err(sql_err)?;
-    Ok(conn)
+fn new_pool(db_path: &str, max_size: u32) -> Result<Pool<SqliteConnectionManager>> {
+    let manager = SqliteConnectionManager::file(db_path);
+    Pool::builder()
+        .max_size(max_size)
+        .build(manager)
+        .map_err(|e| MemoryError::Store(e.to_string()))
 }
 
 fn sql_err(e: rusqlite::Error) -> MemoryError {
@@ -192,17 +183,16 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
 
 /// Persistent, SQLite-backed session store.
 ///
-/// Stores only the filesystem path; each operation opens a fresh connection
-/// (WAL mode makes concurrent access safe without `unsafe`).
+/// Uses an r2d2 connection pool so that multiple concurrent operations can
+/// share a bounded set of WAL-enabled connections.
 ///
 /// # In-memory mode (tests)
 ///
-/// Pass `":memory:"` as the path.  Note that because every call opens a new
-/// connection, in-memory databases are **not** shared between calls – use a
-/// file path for anything beyond isolated unit tests.
+/// Pass `":memory:"` as the path. Pool size is 1 for in-memory so that all
+/// operations share the same database handle.
 #[derive(Debug, Clone)]
 pub struct SqliteSessionStore {
-    db_path: String,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl SqliteSessionStore {
@@ -227,7 +217,8 @@ impl SqliteSessionStore {
                 })?;
             }
         }
-        let store = Self { db_path };
+        let pool = new_pool(&db_path, 10)?;
+        let store = Self { pool };
         let conn = store.conn()?;
         init_schema(&conn)?;
         Ok(store)
@@ -235,20 +226,17 @@ impl SqliteSessionStore {
 
     /// Open an in-memory session database (useful for testing).
     pub fn open_in_memory() -> Result<Self> {
-        let store = Self {
-            db_path: IN_MEMORY_PATH.to_string(),
-        };
+        let pool = new_pool(IN_MEMORY_PATH, 1)?;
+        let store = Self { pool };
         let conn = store.conn()?;
         init_schema(&conn)?;
         Ok(store)
     }
 
-    // -----------------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------------
-
-    fn conn(&self) -> Result<Connection> {
-        open_conn(&self.db_path)
+    fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+        let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(sql_err)?;
+        Ok(conn)
     }
 
     // -----------------------------------------------------------------------
@@ -375,18 +363,20 @@ impl SqliteSessionStore {
 
     /// Permanently remove a session and all its memory associations.
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(sql_err)?;
         // session_memories has no FK cascade so delete manually.
-        conn.execute(
+        tx.execute(
             "DELETE FROM session_memories WHERE session_id = ?1",
             params![session_id],
         )
         .map_err(sql_err)?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM sessions WHERE session_id = ?1",
             params![session_id],
         )
         .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
         Ok(())
     }
 
@@ -571,21 +561,23 @@ impl SqliteSessionStore {
     ///
     /// Returns the number of sessions that were removed.
     pub fn prune_before(&self, cutoff_iso8601: &str) -> Result<usize> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(sql_err)?;
         // Remove associated memories first.
-        conn.execute(
+        tx.execute(
             r"DELETE FROM session_memories WHERE session_id IN (
                 SELECT session_id FROM sessions WHERE last_activity < ?1
               )",
             params![cutoff_iso8601],
         )
         .map_err(sql_err)?;
-        let removed = conn
+        let removed = tx
             .execute(
                 "DELETE FROM sessions WHERE last_activity < ?1",
                 params![cutoff_iso8601],
             )
             .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
         Ok(removed)
     }
 }

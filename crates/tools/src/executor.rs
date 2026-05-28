@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -1180,19 +1180,58 @@ fn extract_powershell_path(command: &str) -> Option<String> {
     None
 }
 
-/// Check if a path is within the current workspace.
-fn is_within_workspace(path: &str) -> bool {
-    let path = PathBuf::from(path);
+/// Resolve a path to its canonical form, falling back through multiple strategies.
+///
+/// 1. Try `canonicalize()` for paths that exist on disk.
+/// 2. Fall back to canonicalizing the parent and joining the filename.
+/// 3. Last resort: lexically resolve `..` and `.` components.
+fn resolve_canonical(path: &str) -> Option<PathBuf> {
+    let p = Path::new(path);
 
-    // If path is absolute, check if it starts with CWD
-    if path.is_absolute() {
-        if let Ok(cwd) = std::env::current_dir() {
-            return path.starts_with(&cwd);
+    // Strategy 1: full canonicalize
+    if let Ok(canonical) = p.canonicalize() {
+        return Some(canonical);
+    }
+
+    // Strategy 2: canonicalize parent + join filename
+    if let Some(parent) = p.parent() {
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            if let Some(name) = p.file_name() {
+                return Some(canonical_parent.join(name));
+            }
         }
     }
 
-    // Relative paths are assumed to be within workspace
-    !path.starts_with("/") && !path.starts_with("\\") && !path.starts_with("..")
+    // Strategy 3: lexical resolution of .. and .
+    let mut resolved = PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            other => {
+                resolved.push(other.as_os_str());
+            }
+        }
+    }
+
+    Some(resolved)
+}
+
+/// Check if a path is within the current workspace using canonical path comparison.
+/// This prevents path-traversal attacks like `../../etc/passwd`.
+fn is_within_workspace(path: &str) -> bool {
+    let resolved_path = resolve_canonical(path);
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let resolved_cwd = resolve_canonical(cwd.to_str().unwrap_or(""));
+
+    match (resolved_path, resolved_cwd) {
+        (Some(path), Some(cwd)) => path.starts_with(&cwd),
+        _ => false,
+    }
 }
 
 fn run_powershell(input: PowerShellInput) -> Result<String, String> {
@@ -4739,7 +4778,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
-    use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
     use std::pin::Pin;
     use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};

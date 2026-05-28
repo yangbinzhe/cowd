@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
+
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
 
@@ -232,9 +234,12 @@ impl Session {
         {
             return Ok(());
         }
+        let lock_file = OpenOptions::new().create(true).append(true).open(path)?;
+        lock_file.lock_exclusive()?;
         let snapshot = self.render_jsonl_snapshot()?;
         rotate_session_file_if_needed(path)?;
         write_atomic(path, &snapshot)?;
+        drop(lock_file);
         self.appended_since_snapshot.store(0, std::sync::atomic::Ordering::Relaxed);
         cleanup_rotated_logs(path)?;
         Ok(())
@@ -584,6 +589,7 @@ impl Session {
         }
 
         let mut file = OpenOptions::new().append(true).open(path)?;
+        file.lock_exclusive()?;
         writeln!(file, "{}", message_record(message).render())?;
         Ok(())
     }
@@ -603,6 +609,7 @@ impl Session {
         }
 
         let mut file = OpenOptions::new().append(true).open(path)?;
+        file.lock_exclusive()?;
         writeln!(file, "{}", entry.to_jsonl_record().render())?;
         Ok(())
     }

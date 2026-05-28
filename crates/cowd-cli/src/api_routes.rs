@@ -5,8 +5,10 @@
 use std::{collections::HashMap, convert::Infallible, sync::Arc};
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State as AxumState},
-    http::StatusCode,
+    http::{header, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Json, sse::{Event, KeepAlive, Sse}},
     routing::{get, post},
     Router,
@@ -31,13 +33,44 @@ pub struct AppState {
     pub tool_registry: Arc<GlobalToolRegistry>,
     pub config: Option<serde_json::Value>,
     pub event_bus: Arc<SessionEventBus>,
+    pub auth_token: Option<String>,
+}
+
+// ── Auth middleware ────────────────────────────────────────────
+
+/// If `auth_token` is set on `AppState`, require `Authorization: Bearer <token>`.
+/// When `auth_token` is `None`, all requests are allowed (no auth configured).
+async fn auth_middleware(
+    AxumState(state): AxumState<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if let Some(token) = &state.auth_token {
+        let auth_header = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v: &axum::http::HeaderValue| v.to_str().ok());
+
+        match auth_header {
+            Some(h) if h == format!("Bearer {token}") => Ok(next.run(request).await),
+            _ => Err((
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "unauthorized".to_string(),
+                }),
+            )),
+        }
+    } else {
+        Ok(next.run(request).await)
+    }
 }
 
 // ── Router ─────────────────────────────────────────────────────
 
 pub fn api_router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/health", get(health_handler))
+    let health_route = Router::new().route("/health", get(health_handler));
+
+    let protected_routes = Router::new()
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session).delete(delete_session))
         .route("/api/sessions/:id/messages", post(send_message))
@@ -46,7 +79,9 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/memory/search", get(memory_search_handler))
         .route("/api/tools", get(tools_handler))
         .route("/api/config", get(config_handler))
-        .with_state(state)
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    health_route.merge(protected_routes).with_state(state)
 }
 
 // ── Response types ─────────────────────────────────────────────

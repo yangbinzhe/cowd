@@ -15,6 +15,8 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,32 +41,16 @@ use crate::{
 
 const IN_MEMORY_PATH: &str = ":memory:";
 
-// ---------------------------------------------------------------------------
-// Helper: open a connection and return a MemoryError on failure
-// ---------------------------------------------------------------------------
-
-fn open_conn(db_path: &str) -> Result<Connection> {
-    let conn = if db_path == IN_MEMORY_PATH {
-        let tmp = std::env::temp_dir().join(format!("cowd_memory_{}.db", Uuid::new_v4()));
-        Connection::open(&tmp).map_err(sql_err)?
-    } else {
-        Connection::open(db_path).map_err(sql_err)?
-    };
-    conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())).map_err(sql_err)?;
-    conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(sql_err)?;
-    Ok(conn)
+fn new_pool(db_path: &str, max_size: u32) -> Result<Pool<SqliteConnectionManager>> {
+    let manager = SqliteConnectionManager::file(db_path);
+    Pool::builder()
+        .max_size(max_size)
+        .build(manager)
+        .map_err(|e| MemoryError::Store(e.to_string()))
 }
 
 fn sql_err(e: rusqlite::Error) -> MemoryError {
     MemoryError::Store(e.to_string())
-}
-
-/// Open a fresh WAL-enabled connection for use by the [`VerbatimSink`].
-///
-/// Exposed so that [`VerbatimSink`](super::verbatim::VerbatimSink) can share
-/// the same database file without depending on [`SqliteStore`] directly.
-pub fn open_conn_for_verbatim(db_path: &str) -> Result<Connection> {
-    open_conn(db_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -505,14 +491,12 @@ END",
 
 /// SQLite-backed persistent store.
 ///
-/// The database path (or `":memory:"`) is stored and a fresh [`Connection`] is
-/// opened for each blocking operation inside `tokio::task::spawn_blocking`.
-/// `WAL` mode is enabled on every connection so `SQLite` handles concurrent
-/// access safely via file-level locking without requiring `unsafe` code.
+/// Uses an r2d2 connection pool so that multiple concurrent operations can
+/// share a bounded set of WAL-enabled connections instead of opening a fresh
+/// connection on every call.
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
-    /// Filesystem path or `":memory:"`.
-    db_path: String,
+    pool: Pool<SqliteConnectionManager>,
 }
 
 impl SqliteStore {
@@ -523,8 +507,8 @@ impl SqliteStore {
             .to_str()
             .ok_or_else(|| MemoryError::Store("non-UTF-8 sqlite path".to_string()))?
             .to_owned();
-        let store = Self { db_path };
-        // Verify we can open a connection and initialise the schema.
+        let pool = new_pool(&db_path, 10)?;
+        let store = Self { pool };
         let conn = store.conn()?;
         init_schema(&conn)?;
         Ok(store)
@@ -536,30 +520,27 @@ impl SqliteStore {
             .to_str()
             .ok_or_else(|| MemoryError::Store("non-UTF-8 sqlite path".to_string()))?
             .to_owned();
-        let store = Self { db_path };
+        let pool = new_pool(&db_path, 10)?;
+        let store = Self { pool };
         let conn = store.conn()?;
         init_schema(&conn)?;
         Ok(store)
     }
 
     /// Create an in-memory database (useful for testing).
-    ///
-    /// Note: because every call opens a new connection and `SQLite`
-    /// in-memory databases are connection-scoped, the in-memory store
-    /// cannot share state between calls.  Use a file-backed store for
-    /// production use.
     pub fn open_in_memory() -> Result<Self> {
-        let store = Self {
-            db_path: IN_MEMORY_PATH.to_string(),
-        };
+        let pool = new_pool(IN_MEMORY_PATH, 1)?;
+        let store = Self { pool };
         let conn = store.conn()?;
         init_schema(&conn)?;
         Ok(store)
     }
 
-    /// Open a fresh connection (and WAL/FK pragmas).
-    fn conn(&self) -> Result<Connection> {
-        open_conn(&self.db_path)
+    /// Get a connection from the pool with `PRAGMA foreign_keys=ON`.
+    fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+        let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(sql_err)?;
+        Ok(conn)
     }
 
     // -----------------------------------------------------------------------
@@ -1212,12 +1193,13 @@ impl SqliteStore {
         vectors: &HashMap<MemoryId, Vec<f32>>,
         dimension: u32,
     ) -> Result<()> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(sql_err)?;
         let now = Utc::now().to_rfc3339();
 
         for (id, vec) in vectors {
             let blob = Self::vec_f32_to_blob(vec);
-            conn.execute(
+            tx.execute(
                 "INSERT OR REPLACE INTO vector_embeddings (memory_id, embedding, dimension, created_at) \
                  VALUES (?1, ?2, ?3, ?4)",
                 params![id.to_string(), blob, dimension, &now],
@@ -1228,7 +1210,7 @@ impl SqliteStore {
         // Clean up entries that are no longer in the in-memory map.
         let keep_ids: Vec<String> = vectors.keys().map(|id| id.to_string()).collect();
         if keep_ids.is_empty() {
-            conn.execute("DELETE FROM vector_embeddings", [])
+            tx.execute("DELETE FROM vector_embeddings", [])
                 .map_err(sql_err)?;
         } else {
             // SQLite parameter limit is 999; for large sets we chunk.
@@ -1241,10 +1223,11 @@ impl SqliteStore {
                 );
                 let params: Vec<&dyn rusqlite::types::ToSql> =
                     chunk.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
-                conn.execute(&sql, params.as_slice()).map_err(sql_err)?;
+                tx.execute(&sql, params.as_slice()).map_err(sql_err)?;
             }
         }
 
+        tx.commit().map_err(sql_err)?;
         Ok(())
     }
 
@@ -1326,17 +1309,19 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn do_delete_symbols_for_file(conn: &Connection, file_path: &str) -> Result<()> {
-        conn.execute(
+    fn do_delete_symbols_for_file(conn: &mut Connection, file_path: &str) -> Result<()> {
+        let tx = conn.transaction().map_err(sql_err)?;
+        tx.execute(
             "DELETE FROM code_symbols WHERE file_path = ?1",
             params![file_path],
         )
         .map_err(sql_err)?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM code_edges WHERE file_path = ?1",
             params![file_path],
         )
         .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
         Ok(())
     }
 
@@ -1544,9 +1529,9 @@ impl SqliteStore {
         symbols: &[CodeSymbol],
         edges: &[SymbolEdge],
     ) -> Result<()> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
         // Delete old symbols and edges for this file before inserting new ones
-        Self::do_delete_symbols_for_file(&conn, file_path)?;
+        Self::do_delete_symbols_for_file(&mut conn, file_path)?;
         for sym in symbols {
             Self::do_insert_symbol(&conn, sym)?;
         }

@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
@@ -548,13 +548,31 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     if let Some(parent) = candidate.parent() {
         let canonical_parent = parent
             .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
+            .unwrap_or_else(|_| lexically_resolve(parent));
         if let Some(name) = candidate.file_name() {
             return Ok(canonical_parent.join(name));
         }
     }
 
-    Ok(candidate)
+    Ok(lexically_resolve(&candidate))
+}
+
+/// Walk path components and resolve `.` and `..` segments without touching the filesystem.
+/// This prevents path-traversal attacks from sneaking through when `canonicalize()` fails.
+fn lexically_resolve(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            other => {
+                resolved.push(other.as_os_str());
+            }
+        }
+    }
+    resolved
 }
 
 

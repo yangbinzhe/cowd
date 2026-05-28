@@ -17,6 +17,8 @@ tracing = "0.1"
 async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 parking_lot = "0.12"
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
 walkdir = "2"
 tempfile = "3"
 regex = "1"

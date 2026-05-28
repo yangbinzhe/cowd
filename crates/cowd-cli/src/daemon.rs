@@ -28,6 +28,7 @@ pub struct DaemonConfig {
     pub platform_configs: Vec<PlatformConfig>,
     pub runtime_config: Option<serde_json::Value>,
     pub cors_origins: Vec<String>,
+    pub auth_token: Option<String>,
 }
 
 // ── Daemon entry point ─────────────────────────────────────────
@@ -58,6 +59,7 @@ pub async fn run_daemon(
         tool_registry: tools.clone(),
         config: config.runtime_config.clone(),
         event_bus: event_bus.clone(),
+        auth_token: config.auth_token.clone(),
     });
 
     // 2. Build HTTP router (reuse api_routes + SSE)

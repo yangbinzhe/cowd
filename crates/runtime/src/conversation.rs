@@ -1333,7 +1333,8 @@ self.record_turn_completed(&summary);
             })
             .collect();
 
-        match mgr.prepare_context(user_input, &mem_messages).await {
+        let session_id = self.session().session_id;
+        match mgr.prepare_context(user_input, &mem_messages, Some(&session_id)).await {
             Ok(mut prepared) => {
                 if prepared.entries.is_empty() {
                     tracing::debug!(entries = 0, "memory context prepared");

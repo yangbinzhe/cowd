@@ -8,6 +8,7 @@
 
 use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
 use serde::{Deserialize, Serialize};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome")]
@@ -173,21 +174,66 @@ impl PermissionEnforcer {
     }
 }
 
-/// Simple workspace boundary check via string prefix.
+/// Resolve a path to its canonical form, falling back through multiple strategies.
+///
+/// 1. Try `canonicalize()` for paths that exist on disk.
+/// 2. Fall back to canonicalizing the parent and joining the filename.
+/// 3. Last resort: lexically resolve `..` and `.` components.
+fn resolve_canonical(path: &str) -> Option<PathBuf> {
+    let p = Path::new(path);
+
+    // Strategy 1: full canonicalize
+    if let Ok(canonical) = p.canonicalize() {
+        return Some(canonical);
+    }
+
+    // Strategy 2: canonicalize parent + join filename
+    if let Some(parent) = p.parent() {
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            if let Some(name) = p.file_name() {
+                return Some(canonical_parent.join(name));
+            }
+        }
+    }
+
+    // Strategy 3: lexical resolution of .. and .
+    let mut resolved = PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            other => {
+                resolved.push(other.as_os_str());
+            }
+        }
+    }
+
+    Some(resolved)
+}
+
+/// Workspace boundary check via canonical path comparison.
+///
+/// Resolves both the candidate path and the workspace root to canonical forms
+/// before checking that the candidate is a child of the root. This prevents
+/// path-traversal attacks like `/workspace/../../etc/passwd`.
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    let normalized = if path.starts_with('/') {
-        path.to_owned()
+    // Resolve relative paths against workspace root first
+    let full_path = if Path::new(path).is_relative() {
+        let root = workspace_root.trim_end_matches('/');
+        PathBuf::from(format!("{root}/{path}"))
     } else {
-        format!("{workspace_root}/{path}")
+        PathBuf::from(path)
     };
 
-    let root = if workspace_root.ends_with('/') {
-        workspace_root.to_owned()
-    } else {
-        format!("{workspace_root}/")
-    };
+    let resolved_path = resolve_canonical(full_path.to_str().unwrap_or(path));
+    let resolved_root = resolve_canonical(workspace_root);
 
-    normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
+    match (resolved_path, resolved_root) {
+        (Some(path), Some(root)) => path.starts_with(&root),
+        _ => false,
+    }
 }
 
 /// Conservative heuristic: is this bash command read-only?
@@ -261,24 +307,8 @@ pub fn is_read_only_command(command: &str) -> bool {
             | "tree"
             | "jq"
             | "yq"
-            | "python3"
-            | "python"
-            | "node"
-            | "ruby"
-            | "cargo"
-            | "rustc"
             | "git"
             | "gh"
-            | "docker"
-            | "kubectl"
-            | "helm"
-            | "systemctl"
-            | "journalctl"
-            | "npm"
-            | "pnpm"
-            | "yarn"
-            | "pip"
-            | "pip3"
     ) && !command.contains("-i ")
         && !command.contains("--in-place")
         && !command.contains(" > ")
@@ -382,6 +412,27 @@ mod tests {
         assert!(is_within_workspace("/workspace", "/workspace"));
         assert!(!is_within_workspace("/etc/passwd", "/workspace"));
         assert!(!is_within_workspace("/workspacex/hack", "/workspace"));
+    }
+
+    #[test]
+    fn workspace_boundary_rejects_path_traversal() {
+        // Path traversal attempts — must all be rejected
+        assert!(
+            !is_within_workspace("/workspace/../../etc/passwd", "/workspace"),
+            "parent-dir traversal should be rejected"
+        );
+        assert!(
+            !is_within_workspace("/workspace/../../etc/passwd", "/workspace/"),
+            "parent-dir traversal with trailing slash should be rejected"
+        );
+        assert!(
+            !is_within_workspace("/workspace/../workspace/../../etc/shadow", "/workspace"),
+            "multi-hop traversal should be rejected"
+        );
+        assert!(
+            !is_within_workspace("/workspace/foo/../../etc/passwd", "/workspace"),
+            "deep traversal should be rejected"
+        );
     }
 
     #[test]
@@ -601,13 +652,21 @@ mod tests {
             other => panic!("expected denied result, got {other:?}"),
         }
     }
+
+    #[test]
+    fn bash_heuristic_blocks_interpreter_code_execution() {
+        assert!(!is_read_only_command("python3 -c \"import os; os.system('id')\""));
+        assert!(!is_read_only_command("python -c \"print('x')\""));
+        assert!(!is_read_only_command("node -e \"console.log('x')\""));
+        assert!(!is_read_only_command("ruby -e \"system('id')\""));
+        assert!(!is_read_only_command("cargo run"));
+    }
 }
 
 // ── P0-1: Destructive Command Detection & Approval System ────────────────────
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
