@@ -35,6 +35,7 @@ use telemetry::SessionTracer;
 use tracing;
 
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
+use crate::agent_collaboration::CollaborationOps;
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
@@ -278,6 +279,8 @@ bus: Option<crate::bus::EventBus>,
     memory_callback: Option<Arc<dyn MemoryCallback>>,
     /// Optional smart approval gate for intelligent command approval (P0-1).
     approval_gate: Option<Arc<crate::approval_gate::SmartApprovalGate>>,
+    /// Type-erased collaboration orchestrator for multi-agent task dispatch.
+    collaboration: Option<Arc<dyn CollaborationOps>>,
     /// P2-10: Optional EffectHandler for side-effect recording / mocking.
     effect_handler: Option<Arc<dyn crate::effect::EffectHandler>>,
     /// P2-2: Current project phase (Discovery→Planning→Building→Reviewing→Shipping→Graduated).
@@ -432,6 +435,7 @@ where
             sse_callback: None,
             memory_callback: None,
             approval_gate: None,
+            collaboration: None,
             effect_handler: None,
             project_phase: "Discovery".to_string(),
             gate_evaluator: Some(Arc::new(crate::gates::GateEvaluator::new().with_default_gates())),
@@ -568,6 +572,17 @@ where
     #[must_use]
     pub fn with_approval_gate(mut self, gate: Arc<crate::approval_gate::SmartApprovalGate>) -> Self {
         self.approval_gate = Some(gate);
+        self
+    }
+
+    /// Inject a type-erased [`CollaborationOrchestrator`] for multi-agent dispatch.
+    ///
+    /// # Safety
+    /// The orchestrator MUST NOT capture an `Arc` to the `ConversationRuntime`
+    /// itself, as this would create a reference cycle and leak memory.
+    #[must_use]
+    pub fn with_collaboration(mut self, c: Arc<dyn CollaborationOps>) -> Self {
+        self.collaboration = Some(c);
         self
     }
 

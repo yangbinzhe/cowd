@@ -516,6 +516,27 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
+// ── CollaborationOps ────────────────────────────────────────────────────────────
+
+use std::pin::Pin;
+use futures::Future;
+
+/// Type-erased handle for CollaborationOrchestrator.
+/// Enables storage without generic parameter propagation.
+pub trait CollaborationOps: Send + Sync {
+    fn run_boxed<'a>(&'a self, task: &'a str, skills: &'a [String]) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
+    fn decompose_task(&self, task: &str) -> Vec<SubTask>;
+    fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam>;
+}
+
+impl<E: SubAgentExecutor + 'static> CollaborationOps for CollaborationOrchestrator<E> {
+    fn run_boxed<'a>(&'a self, task: &'a str, skills: &'a [String]) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(self.run(task, skills))
+    }
+    fn decompose_task(&self, task: &str) -> Vec<SubTask> { self.decompose_task(task) }
+    fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam> { self.assemble_team(task) }
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
