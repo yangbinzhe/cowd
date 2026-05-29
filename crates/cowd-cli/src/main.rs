@@ -2519,6 +2519,7 @@ fn run_resume_command(
         | SlashCommand::Tag { .. }
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
+        | SlashCommand::AgentProfile { .. }
         | SlashCommand::Handoff { .. }
         | SlashCommand::SubAgent { .. }
         | SlashCommand::Pipeline { .. }
@@ -4112,7 +4113,8 @@ impl LiveCli {
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
             | SlashCommand::AddDir { .. }
-            | SlashCommand::Handoff { .. } => {
+            | SlashCommand::Handoff { .. }
+            | SlashCommand::AgentProfile { .. } => {
                 eprintln!("{} not yet implemented.", command.slash_name());
                 false
             }
