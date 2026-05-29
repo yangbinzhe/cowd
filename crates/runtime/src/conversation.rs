@@ -34,7 +34,7 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 use tracing;
 
-use crate::agent::{SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentRuntime, ToolCallRecord, TurnOutput};
+use crate::agent::{SubAgentConfig, SubAgentRuntime};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
@@ -2055,94 +2055,6 @@ self.record_turn_completed(&summary);
                 }
             });
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SubAgentExecutor impl (T13)
-// ---------------------------------------------------------------------------
-
-impl<C, T> SubAgentExecutor for ConversationRuntime<C, T>
-where
-    C: ApiClient + Send + Sync,
-    T: ToolExecutor,
-{
-    fn execute_turn(
-        &mut self,
-        prompt: &str,
-        _allowed_tools: &[String],
-        system_prompt: Option<&str>,
-    ) -> Result<TurnOutput, SubAgentError> {
-        let user_input = if let Some(sp) = system_prompt {
-            format!("{}\n\n{}", sp, prompt)
-        } else {
-            prompt.to_string()
-        };
-
-        let prompter = crate::permissions::SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current().map_err(|e| {
-            SubAgentError::ExecutionError(format!("no tokio runtime: {}", e))
-        })?;
-
-        let summary = handle
-            .block_on(self.run_turn_async(user_input, &prompter))
-            .map_err(|e| SubAgentError::ExecutionError(e.to_string()))?;
-
-        let text: String = summary
-            .assistant_messages
-            .iter()
-            .flat_map(|msg| &msg.blocks)
-            .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let tool_calls: Vec<ToolCallRecord> = summary
-            .assistant_messages
-            .iter()
-            .flat_map(|msg| &msg.blocks)
-            .filter_map(|block| {
-                if let ContentBlock::ToolUse { id, name, input } = block {
-                    let output = summary
-                        .tool_results
-                        .iter()
-                        .find_map(|tr| {
-                            tr.blocks.iter().find_map(|b| {
-                                if let ContentBlock::ToolResult {
-                                    tool_use_id, output, ..
-                                } = b
-                                {
-                                    if tool_use_id == id {
-                                        Some(output.clone())
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                        .unwrap_or_default();
-                    Some(ToolCallRecord {
-                        tool_name: name.clone(),
-                        tool_input: input.clone(),
-                        tool_output: output,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        Ok(TurnOutput {
-            text,
-            tool_calls,
-            input_tokens: summary.usage.input_tokens as usize,
-            output_tokens: summary.usage.output_tokens as usize,
-            stop_reason: "end_turn".to_string(),
-        })
     }
 }
 

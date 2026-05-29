@@ -74,7 +74,6 @@ pub mod worker_boot;
 pub mod tool_orchestrator;
 pub mod tool_dispatch;
 pub mod agent;
-pub mod subagent;
 pub mod approval_gate;
 pub mod pairing;
 pub mod mirror;
@@ -82,7 +81,7 @@ pub mod model_registry;
 pub mod profile;
 
 pub use agent::{
-    SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback, SubAgentResult,
+    SubAgentConfig, SubAgentError, SubAgentProgressCallback, SubAgentResult,
     SubAgentToolMode,
 };
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};

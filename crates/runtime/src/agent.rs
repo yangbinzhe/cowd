@@ -9,9 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinSet;
 
-use crate::subagent::DelegationRequest;
 use crate::tool_orchestrator::ToolResultBudget;
 
 use memory::cognitive::CognitiveContextManager;
@@ -181,48 +179,17 @@ pub enum SubAgentError {
     Timeout(u64),
 }
 
-// ---------------------------------------------------------------------------
-// SubAgentExecutor trait (3A-4)
-// ---------------------------------------------------------------------------
-
-/// Trait for executing a single sub-agent turn.
-///
-/// Implemented by the caller (typically `ConversationRuntime`) to provide
-/// the actual LLM call + tool execution capability.
-pub trait SubAgentExecutor: Send + Sync {
-    /// Execute one turn of the sub-agent loop.
-    fn execute_turn(
-        &mut self,
-        prompt: &str,
-        allowed_tools: &[String],
-        system_prompt: Option<&str>,
-    ) -> Result<TurnOutput, SubAgentError>;
-}
-
-/// Output from a single sub-agent turn.
+/// Request to delegate a task to a sub-agent.
 #[derive(Debug, Clone)]
-pub struct TurnOutput {
-    /// The text content produced by the model in this turn.
-    pub text: String,
-    /// Tool calls made during this turn.
-    pub tool_calls: Vec<ToolCallRecord>,
-    /// Input tokens consumed.
-    pub input_tokens: usize,
-    /// Output tokens consumed.
-    pub output_tokens: usize,
-    /// Why the model stopped generating (e.g. "end_turn", "tool_use").
-    pub stop_reason: String,
-}
-
-/// Record of a single tool call within a sub-agent turn.
-#[derive(Debug, Clone)]
-pub struct ToolCallRecord {
-    /// Name of the tool invoked.
-    pub tool_name: String,
-    /// Input provided to the tool.
-    pub tool_input: String,
-    /// Output returned by the tool.
-    pub tool_output: String,
+pub struct DelegationRequest {
+    /// The task description to execute.
+    pub task: String,
+    /// Context information for the sub-agent.
+    pub context: String,
+    /// Expected output format/description.
+    pub expected_output: String,
+    /// Parent session ID for traceability.
+    pub parent_session_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -390,119 +357,6 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
     /// Get remaining turns.
     pub fn remaining_turns(&self) -> usize {
         self.config.max_turns.saturating_sub(self.turns_executed)
-    }
-
-    /// Run the sub-agent loop until completion or budget exhaustion.
-    ///
-    /// Deprecated: use `run_loop_async` which takes the sub-runtime directly.
-    #[deprecated(note = "Use `run_loop_async` instead")]
-    #[allow(deprecated)]
-    pub fn run_loop(
-        &mut self,
-        initial_prompt: &str,
-        executor: &mut dyn SubAgentExecutor,
-    ) -> SubAgentResult {
-        let prompt = initial_prompt.to_string();
-        futures::executor::block_on(self.run_loop_async_legacy(&prompt, executor))
-    }
-
-    /// Legacy version of the async loop using the executor trait.
-    #[deprecated(note = "Use `run_loop_async` instead")]
-    pub async fn run_loop_async_legacy(
-        &mut self,
-        initial_prompt: &str,
-        executor: &mut dyn SubAgentExecutor,
-    ) -> SubAgentResult {
-        let mut output_parts: Vec<String> = Vec::new();
-        let mut tool_call_count: usize = 0;
-        let memory_write_attempts: usize = 0;
-        let memory_writes_denied: usize = 0;
-        let mut current_prompt = initial_prompt.to_string();
-        let mut completed_normally = true;
-
-        loop {
-            if let Err(e) = self.check_budget() {
-                tracing::warn!("SubAgent budget exhausted: {}", e);
-                completed_normally = false;
-                break;
-            }
-            if let Err(e) = self.check_timeout() {
-                tracing::warn!("SubAgent timed out: {}", e);
-                completed_normally = false;
-                break;
-            }
-
-            let turn = match executor.execute_turn(
-                &current_prompt,
-                &self.config.allowed_tools,
-                Some(&self.config.task_description),
-            ) {
-                Ok(t) => t,
-                Err(SubAgentError::ToolNotAllowed(tool)) => {
-                    tracing::warn!("SubAgent tool not allowed: {}", tool);
-                    continue;
-                }
-                Err(e) => {
-                    tracing::error!("SubAgent turn failed: {}", e);
-                    completed_normally = false;
-                    break;
-                }
-            };
-
-            self.record_turn(turn.input_tokens + turn.output_tokens);
-            tool_call_count += turn.tool_calls.len();
-
-            if let Some(ref cb) = self.progress_callback {
-                cb.on_turn_complete(
-                    self.turns_executed as u32,
-                    self.config.max_turns,
-                    self.tokens_consumed,
-                );
-                for tc in &turn.tool_calls {
-                    cb.on_tool_call(&tc.tool_name, &truncate_str(&tc.tool_input, 80));
-                }
-            }
-
-            output_parts.push(turn.text.clone());
-
-            if turn.stop_reason == "end_turn" || turn.stop_reason == "stop" {
-                break;
-            }
-
-            if !turn.tool_calls.is_empty() {
-                let mut set = JoinSet::new();
-                for tc in &turn.tool_calls {
-                    let tool_name = tc.tool_name.clone();
-                    let tool_output = tc.tool_output.clone();
-                    set.spawn(async move {
-                        format!(
-                            "Tool {} returned: {}",
-                            tool_name,
-                            truncate_str(&tool_output, 500)
-                        )
-                    });
-                }
-                let mut summaries = Vec::with_capacity(turn.tool_calls.len());
-                while let Some(res) = set.join_next().await {
-                    if let Ok(s) = res {
-                        summaries.push(s);
-                    }
-                }
-                current_prompt =
-                    format!("Continue based on tool results:\n{}", summaries.join("\n"));
-            } else {
-                break;
-            }
-        }
-
-        SubAgentResult {
-            output: output_parts.join("\n"),
-            tool_call_count,
-            tokens_used: self.tokens_consumed,
-            completed_normally,
-            memory_write_attempts,
-            memory_writes_denied,
-        }
     }
 
     /// Run the sub-agent loop using the owned `ConversationRuntime` for
@@ -722,7 +576,6 @@ async fn team_remember_result(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::pin::Pin;
@@ -874,135 +727,4 @@ mod tests {
         assert!(!result.completed_normally);
     }
 
-    struct StubExecutor {
-        turns: Vec<TurnOutput>,
-        call_count: std::sync::atomic::AtomicUsize,
-    }
-
-    impl StubExecutor {
-        fn new(turns: Vec<TurnOutput>) -> Self {
-            Self {
-                turns,
-                call_count: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl SubAgentExecutor for StubExecutor {
-        fn execute_turn(
-            &mut self,
-            _prompt: &str,
-            _allowed_tools: &[String],
-            _system_prompt: Option<&str>,
-        ) -> Result<TurnOutput, SubAgentError> {
-            let idx = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.turns
-                .get(idx)
-                .cloned()
-                .ok_or_else(|| SubAgentError::ExecutionError("no more stub turns".to_string()))
-        }
-    }
-
-    #[tokio::test]
-    async fn run_loop_completes_on_end_turn() {
-        let mut executor = StubExecutor::new(vec![TurnOutput {
-            text: "task done".to_string(),
-            tool_calls: vec![],
-            input_tokens: 50,
-            output_tokens: 50,
-            stop_reason: "end_turn".to_string(),
-        }]);
-        let config = SubAgentConfig {
-            max_turns: 5,
-            budget_tokens: 10_000,
-            ..SubAgentConfig::default()
-        };
-        let mut runtime = SubAgentRuntime::new(config, make_dummy_runtime());
-        let result = runtime.run_loop_async_legacy("do something", &mut executor).await;
-        assert!(result.completed_normally);
-        assert_eq!(result.output, "task done");
-        assert_eq!(result.tool_call_count, 0);
-    }
-
-    #[tokio::test]
-    async fn run_loop_chains_tool_calls() {
-        let mut executor = StubExecutor::new(vec![
-            TurnOutput {
-                text: "using tool".to_string(),
-                tool_calls: vec![ToolCallRecord {
-                    tool_name: "read".to_string(),
-                    tool_input: "/tmp/file".to_string(),
-                    tool_output: "file contents".to_string(),
-                }],
-                input_tokens: 50,
-                output_tokens: 50,
-                stop_reason: "tool_use".to_string(),
-            },
-            TurnOutput {
-                text: "final answer".to_string(),
-                tool_calls: vec![],
-                input_tokens: 50,
-                output_tokens: 50,
-                stop_reason: "end_turn".to_string(),
-            },
-        ]);
-        let config = SubAgentConfig {
-            max_turns: 5,
-            budget_tokens: 10_000,
-            ..SubAgentConfig::default()
-        };
-        let mut runtime = SubAgentRuntime::new(config, make_dummy_runtime());
-        let result = runtime.run_loop_async_legacy("read a file", &mut executor).await;
-        assert!(result.completed_normally);
-        assert_eq!(result.tool_call_count, 1);
-        assert!(result.output.contains("using tool"));
-        assert!(result.output.contains("final answer"));
-    }
-
-    #[tokio::test]
-    async fn run_loop_stops_on_budget_exhaustion() {
-        let mut executor = StubExecutor::new(vec![
-            TurnOutput {
-                text: "turn 1".to_string(),
-                tool_calls: vec![ToolCallRecord {
-                    tool_name: "read".to_string(),
-                    tool_input: "/tmp/file".to_string(),
-                    tool_output: "contents".to_string(),
-                }],
-                input_tokens: 8000,
-                output_tokens: 8000,
-                stop_reason: "tool_use".to_string(),
-            },
-            TurnOutput {
-                text: "turn 2".to_string(),
-                tool_calls: vec![ToolCallRecord {
-                    tool_name: "read".to_string(),
-                    tool_input: "/tmp/other".to_string(),
-                    tool_output: "more contents".to_string(),
-                }],
-                input_tokens: 5000,
-                output_tokens: 5000,
-                stop_reason: "tool_use".to_string(),
-            },
-        ]);
-        let config = SubAgentConfig {
-            max_turns: 5,
-            budget_tokens: 20_000,
-            ..SubAgentConfig::default()
-        };
-        let mut runtime = SubAgentRuntime::new(config, make_dummy_runtime());
-        let result = runtime.run_loop_async_legacy("expensive task", &mut executor).await;
-        assert!(!result.completed_normally);
-    }
-
-    #[tokio::test]
-    async fn subagent_timeout_stops_execution() {
-        let mut config = SubAgentConfig::default();
-        config.timeout_secs = Some(0);
-        config.budget_tokens = 100_000;
-        let mut runtime = SubAgentRuntime::new(config, make_dummy_runtime());
-        let mut executor = StubExecutor::new(vec![]);
-        let result = runtime.run_loop_async_legacy("test", &mut executor).await;
-        assert!(!result.completed_normally);
-    }
 }
