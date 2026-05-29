@@ -258,6 +258,24 @@ impl LlmSummarizerConfig {
     pub fn is_configured(&self) -> bool {
         self.enabled && !self.api_url.is_empty() && !self.api_key.is_empty()
     }
+
+    /// Resolve the effective API key, using environment variable `CC_LLM_API_KEY`
+    /// in preference to the config file value.
+    pub fn resolved_api_key(&self) -> String {
+        std::env::var("CC_LLM_API_KEY")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| self.api_key.clone())
+    }
+
+    /// Resolve the effective API URL, using environment variable `CC_LLM_API_URL`
+    /// in preference to the config file value.
+    pub fn resolved_api_url(&self) -> String {
+        std::env::var("CC_LLM_API_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| self.api_url.clone())
+    }
 }
 
 fn default_llm_model() -> String { "gpt-4o-mini".to_string() }
@@ -391,6 +409,35 @@ pub struct VectorConfig {
     pub timeout_secs: u64,
     /// Maximum batch size for embedding requests.
     pub batch_size: usize,
+}
+
+impl VectorConfig {
+    /// Resolve the effective API key, using environment variable `COWD_VECTOR_API_KEY`
+    /// in preference to the config file value.
+    pub fn resolved_api_key(&self) -> String {
+        std::env::var("COWD_VECTOR_API_KEY")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| self.api_key.clone())
+    }
+
+    /// Resolve the effective API URL, using environment variable `COWD_MEMORY_VECTOR_API_URL`
+    /// in preference to the config file value.
+    pub fn resolved_api_url(&self) -> String {
+        std::env::var("COWD_MEMORY_VECTOR_API_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| self.api_url.clone())
+    }
+
+    /// Resolve the effective model name, using environment variable `COWD_MEMORY_VECTOR_MODEL`
+    /// in preference to the config file value.
+    pub fn resolved_model(&self) -> String {
+        std::env::var("COWD_MEMORY_VECTOR_MODEL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| self.model.clone())
+    }
 }
 
 impl Default for VectorConfig {

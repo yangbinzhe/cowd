@@ -174,14 +174,24 @@ memory:
     enable_vector_index: false    # 启用向量索引
 
   # ── 向量索引 (可选, 需配置远程 API) ──
+  # 向量索引启用的前提条件:
+  #   1. store.enable_vector_index = true
+  #   2. vector.enabled = true
+  #   3. model 和 api_url 均非空
+  # 若不满足以上条件, 搜索能力降级为 FTS5 (关键词检索), 语义检索不可用。
+  # 配置远程 API 后支持 OpenAI / Ollama / vLLM / LocalAI 等兼容接口。
+  #
+  # API key 优先级: 环境变量 COWD_VECTOR_API_KEY > 配置文件 api_key 值
+  # API URL 优先级: 环境变量 COWD_MEMORY_VECTOR_API_URL > 配置文件 api_url 值
+  # Model 优先级:  环境变量 COWD_MEMORY_VECTOR_MODEL > 配置文件 model 值
   vector:
     enabled: false
     model: ""                     # 环境变量: COWD_MEMORY_VECTOR_MODEL
     api_url: ""                   # 环境变量: COWD_MEMORY_VECTOR_API_URL
     api_key: ""                   # 环境变量: COWD_VECTOR_API_KEY
-    dimension: 0                  # 向量维度 (0=自动检测)
-    timeout_secs: 30
-    batch_size: 32
+    dimension: 0                  # 向量维度 (0=自动检测, 首次调用时确定)
+    timeout_secs: 30              # 嵌入 API 调用超时 (秒)
+    batch_size: 32                # 批量嵌入请求的最大条目数
 
   # ── Token 预算 ──
   budget:
@@ -208,7 +218,19 @@ memory:
     circuit_breaker:
       max_retries: 3
       cooldown_secs: 30
-    # llm: ...
+
+    # LLM 摘要生成 (可选, 需配置 API)
+    # 启用后压缩管线使用 LLM 生成语义摘要, 替代模板回退。
+    # 支持 OpenAI 兼容接口 (也可用于 Ollama / vLLM 等本地服务)。
+    #
+    # API key 优先级: 环境变量 CC_LLM_API_KEY > 配置文件 api_key 值
+    # API URL 优先级: 环境变量 CC_LLM_API_URL > 配置文件 api_url 值
+    # Model 优先级:  环境变量 CC_LLM_MODEL > 配置文件 model 值
+    llm:
+      enabled: false
+      api_url: ""                   # 环境变量: CC_LLM_API_URL
+      api_key: ""                   # 环境变量: CC_LLM_API_KEY
+      model: "gpt-4o-mini"         # 环境变量: CC_LLM_MODEL
 
   # ── 记忆提取器 ──
   extractor:

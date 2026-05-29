@@ -18,9 +18,10 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc,
     },
 };
+use parking_lot::Mutex;
 
 use chrono::Utc;
 
@@ -207,6 +208,14 @@ impl CognitiveContextManager {
         // Determine embedding capability before moving config.
         let embedding_capability = EmbeddingCapability::from_config(&config.store.vector);
 
+        // Startup info logs for optional features.
+        if !embedding_capability.supports_semantic() {
+            tracing::info!("vector search: disabled (FTS5 keyword-only fallback)");
+        }
+        if !config.compression.llm.is_configured() {
+            tracing::info!("LLM summarizer: not configured (template fallback)");
+        }
+
         // Build the memory extractor.
         let extractor = MemoryExtractor::new(config.extractor.clone());
 
@@ -379,7 +388,7 @@ impl CognitiveContextManager {
     /// Set the active agent for source_agent tagging and peer context discovery.
     pub fn set_active_agent(&self, agent_id: String) {
         self.orchestrator.set_active_agent(agent_id.clone());
-        *self.current_agent.lock().unwrap_or_else(|e| e.into_inner()) = Some(agent_id);
+        *self.current_agent.lock() = Some(agent_id);
     }
 
     /// Set the active session ID for auto-filling new entries and intra-turn
@@ -425,10 +434,10 @@ impl CognitiveContextManager {
         let mut guard = self
             .kg
             .lock()
-            .map_err(|_| MemoryError::Other("kg lock poisoned".into()))?;
+            ;
         *guard = kg;
         // Track path for auto-rebuild on staleness
-        *self.project_kg_path.lock().unwrap_or_else(|e| e.into_inner()) = Some(project_path.clone());
+        *self.project_kg_path.lock() = Some(project_path.clone());
         tracing::info!(
             entity_count,
             path = %project_path.display(),
@@ -559,7 +568,7 @@ impl CognitiveContextManager {
             let kg = self
                 .kg
                 .lock()
-                .map_err(|_| MemoryError::Other("kg lock poisoned".into()))?;
+                ;
             let query_tokens: Vec<String> = query
                 .split_whitespace()
                 .map(str::to_lowercase)
@@ -616,7 +625,7 @@ impl CognitiveContextManager {
         // ═══════════════════════════════════════════════════════════════════
         // Group 2: Peer context + L4 recall + L3 recall + SessionResume — all independent
         // ═══════════════════════════════════════════════════════════════════
-        let current_agent = self.current_agent.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let current_agent = self.current_agent.lock().clone();
         let current_session = self.orchestrator.active_session_id();
 
         let ((peers, realtime_peers), l4_project, l4_global, l3_result, resume_result) = tokio::join!(
@@ -808,7 +817,7 @@ impl CognitiveContextManager {
             let mut reg = self
                 .seeds
                 .lock()
-                .map_err(|_| MemoryError::Other("seeds lock poisoned".into()))?;
+                ;
             reg.check_triggers("default", &query_words, Utc::now())
         };
         for seed in triggered {
@@ -920,7 +929,7 @@ impl CognitiveContextManager {
 
         // ── Step 7b: Tool output sandbox injection ──
         {
-            let sandbox = self.tool_sandbox.lock().unwrap_or_else(|e| e.into_inner());
+            let sandbox = self.tool_sandbox.lock();
             let count = sandbox.entry_count();
             if count > 0 {
                 let snippets = sandbox.search_all(query, 3);
@@ -1031,7 +1040,7 @@ impl CognitiveContextManager {
                 let mut delegation_queue = self
                     .delegation_results
                     .lock()
-                    .map_err(|_| MemoryError::Other("delegation_results lock poisoned".into()))?;
+                    ;
                 delegation_queue.drain(..).collect()
             }; // guard dropped before any .await
             for d in drained {
@@ -1115,7 +1124,7 @@ impl CognitiveContextManager {
             }
 
             // ── 0b. Index large tool outputs into sandbox ───────────────────
-            let mut sandbox = self.tool_sandbox.lock().unwrap_or_else(|e| e.into_inner());
+            let mut sandbox = self.tool_sandbox.lock();
             for msg in messages.iter().filter(|m| matches!(m.role, MessageRole::Tool)) {
                 let call_id = msg.tool_use_id.as_deref().unwrap_or("unknown");
                 let tool_name = msg.tool_name.as_deref().unwrap_or("unknown_tool");
@@ -1200,7 +1209,7 @@ impl CognitiveContextManager {
             let mut reg = self
                 .seeds
                 .lock()
-                .map_err(|_| MemoryError::Other("seeds lock poisoned".into()))?;
+                ;
             reg.check_triggers("turn_end", &turn_keywords, Utc::now());
         }
 
@@ -1209,7 +1218,7 @@ impl CognitiveContextManager {
 
         // ── 5a. Check project KG staleness and auto-rebuild if needed ───────
         if let Some(ref mgr) = self.project_scope_mgr {
-            if let Some(proj_path) = self.project_kg_path.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if let Some(proj_path) = self.project_kg_path.lock().as_ref() {
                 let pid = crate::project_scope::hash_path(proj_path);
                 if mgr.is_kg_stale(&pid).unwrap_or(false) {
                     tracing::info!("project KG is stale, auto-rebuilding...");
@@ -1225,7 +1234,7 @@ impl CognitiveContextManager {
         {
             let tick = self.kg_rebuild_tick_counter.fetch_add(1, Ordering::Relaxed) + 1;
             if tick % 100 == 0 {
-                if let Some(proj_path) = self.project_kg_path.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                if let Some(proj_path) = self.project_kg_path.lock().as_ref() {
                     tracing::info!(
                         tick,
                         path = %proj_path.display(),
@@ -1295,14 +1304,14 @@ impl CognitiveContextManager {
         }
 
         // ── 6. Persist vector index ─────────────────────────────────────────
-        if let Err(e) = self.vector_index.lock().unwrap_or_else(|e| e.into_inner()).persist() {
+        if let Err(e) = self.vector_index.lock().persist() {
             tracing::warn!("failed to persist vector index: {}", e);
         }
 
         // ── 7. Persist knowledge graph (every 10 ticks) ──────────────────────
         {
             let (entities, triples): (Vec<_>, Vec<_>) = {
-                let kg = self.kg.lock().map_err(|_| MemoryError::Other("kg lock poisoned".into()))?;
+                let kg = self.kg.lock();
                 let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
                 let triples: Vec<_> = kg.list_triples().into_iter().cloned().collect();
                 (entities, triples)
@@ -1327,7 +1336,7 @@ impl CognitiveContextManager {
             let mut monitor = self
                 .context_rot_monitor
                 .lock()
-                .map_err(|_| MemoryError::Other("context_rot lock poisoned".into()))?;
+                ;
             match monitor.check(total_tokens, budget.total) {
                 crate::context_rot::RotAlert::Warning(msg) => {
                     tracing::warn!("{msg}");
@@ -1348,7 +1357,7 @@ impl CognitiveContextManager {
                         if let Err(e) = self.orchestrator.store().kv_put("closet", &json).await {
                             tracing::warn!("failed to save closet: {}", e);
                         } else {
-                            let mut closet_guard = self.closet.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut closet_guard = self.closet.lock();
                             *closet_guard = Some(manager.closet().clone());
                         }
                     }
@@ -1367,7 +1376,7 @@ impl CognitiveContextManager {
             let reg = self
                 .seeds
                 .lock()
-                .map_err(|_| MemoryError::Other("seeds lock poisoned".into()))?;
+                ;
             match serde_json::to_string(reg.all_seeds()) {
                 Ok(json) => {
                     if let Err(e) = self.orchestrator.store().kv_put("seeds", &json).await {
@@ -1395,7 +1404,7 @@ impl CognitiveContextManager {
                                 "batch embedded {} entries",
                                 embeddings.len()
                             );
-                            let mut vi = self.vector_index.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut vi = self.vector_index.lock();
                             for ((id, _), embedding) in
                                 pending_embeddings.iter().zip(embeddings.into_iter())
                             {
@@ -1442,13 +1451,12 @@ impl CognitiveContextManager {
             parent_session_id: parent_session_id.map(String::from),
             timestamp: Utc::now(),
         };
-        if let Ok(mut queue) = self.delegation_results.lock() {
-            queue.push(d);
-            tracing::debug!(
-                agent_role = %agent_role,
-                "delegation result queued"
-            );
-        }
+        let mut queue = self.delegation_results.lock();
+        queue.push(d);
+        tracing::debug!(
+            agent_role = %agent_role,
+            "delegation result queued"
+        );
     }
 
     /// Write a memory entry to the appropriate layer.
@@ -1635,7 +1643,6 @@ impl CognitiveContextManager {
     pub fn persist_vector_index(&self) -> Result<()> {
         self.vector_index
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .persist()
             .map_err(|e| MemoryError::Store(format!("persist vector index: {e}")))
     }
@@ -1643,14 +1650,14 @@ impl CognitiveContextManager {
     /// Get the number of vectors currently indexed.
     #[must_use]
     pub fn vector_index_count(&self) -> usize {
-        self.vector_index.lock().unwrap_or_else(|e| e.into_inner()).count()
+        self.vector_index.lock().count()
     }
 
     /// Get vector index statistics.
     #[must_use]
     pub fn vector_index_stats(&self) -> VectorIndexStats {
         VectorIndexStats {
-            count: self.vector_index.lock().unwrap_or_else(|e| e.into_inner()).count(),
+            count: self.vector_index.lock().count(),
         }
     }
 
@@ -1819,7 +1826,7 @@ impl CognitiveContextManager {
 
         // Gather decisions from the decision thread store
         let decisions: Vec<Decision> = {
-            let store = self.decisions.lock().unwrap_or_else(|e| e.into_inner());
+            let store = self.decisions.lock();
             let topics: Vec<String> = store
                 .list_threads()
                 .into_iter()
@@ -1844,7 +1851,7 @@ impl CognitiveContextManager {
 
         // Gather blockers from the tracked list
         let blockers: Vec<Blocker> = {
-            let list = self.blockers.lock().unwrap_or_else(|e| e.into_inner());
+            let list = self.blockers.lock();
             list.iter()
                 .enumerate()
                 .map(|(i, desc)| Blocker {
@@ -1859,7 +1866,6 @@ impl CognitiveContextManager {
         let last_action = self
             .last_action
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
             .clone();
         let context_notes = format!(
             "Last action: {}. Session has {} memories and {} decisions logged.",
@@ -2022,7 +2028,7 @@ impl CognitiveContextManager {
         let mut store = self
             .decisions
             .lock()
-            .map_err(|_| MemoryError::Other("decisions lock poisoned".into()))?;
+            ;
 
         // Ensure the thread exists.
         store.create_thread(thread_id);
@@ -2050,8 +2056,7 @@ impl CognitiveContextManager {
         let role = self
             .current_agent
             .lock()
-            .ok()
-            .and_then(|g| g.clone())
+            .clone()
             .unwrap_or_else(|| "Orchestrator".to_string());
         BudgetCalculator::new(self.config.budget.clone()).make_role_budget(&role)
     }
@@ -2067,10 +2072,7 @@ impl CognitiveContextManager {
         //    have corresponding MemoryStore entries.
         {
             let entities: Vec<_> = {
-                let kg = match self.kg.lock() {
-                    Ok(g) => g,
-                    Err(_) => return vec!["kg lock poisoned".into()],
-                };
+                let kg = self.kg.lock();
                 kg.list_entities().into_iter().cloned().collect()
             }; // kg dropped before any .await
             let sample_size = 10usize.min(entities.len());
@@ -2109,7 +2111,7 @@ impl CognitiveContextManager {
         //    exist in MemoryStore.
         {
             let sampled_ids: Vec<String> = {
-                let closet_guard = self.closet.lock().unwrap_or_else(|e| e.into_inner());
+                let closet_guard = self.closet.lock();
                 if let Some(ref closet) = *closet_guard {
                     let all_ids: Vec<&str> = closet
                         .pointers
@@ -2205,10 +2207,7 @@ impl CognitiveContextManager {
         //    MemoryStore entry with a minimum Jaccard similarity.
         {
             let entities: Vec<_> = {
-                let kg = match self.kg.lock() {
-                    Ok(g) => g,
-                    Err(_) => return warnings,
-                };
+                let kg = self.kg.lock();
                 kg.list_entities().into_iter().cloned().collect()
             }; // kg dropped before any .await
             if !entities.is_empty() {
@@ -2278,10 +2277,7 @@ impl CognitiveContextManager {
     /// | > 0.75     | `Critical`|
     #[must_use]
     pub fn ctx_health(&self) -> RotAlert {
-        let monitor = match self.context_rot_monitor.lock() {
-            Ok(m) => m,
-            Err(_) => return RotAlert::None,
-        };
+        let monitor = self.context_rot_monitor.lock();
         let ratio = monitor.metrics.context_usage_ratio;
         let total = self.config.budget.context_window as u64;
         let used = (ratio * total as f32) as u64;
