@@ -73,7 +73,7 @@ pub use fresh_context::{
     FreshContextManager, FreshEntry, SessionTokenBudget, SessionBudgetStatus,
 };
 pub use session_store::UnifiedSessionStore;
-pub use store::session::{SessionRecord, SessionSearchResult};
+pub use store::session::{SessionRecord, SessionSearchResult, SessionMessage};
 pub use store::verbatim::{VerbatimEntry, VerbatimSink};
 pub use embedding::{EmbeddingClient, EmbeddingCapability};
 pub use error::MemoryError;

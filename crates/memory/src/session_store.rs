@@ -25,7 +25,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::store::session::{SessionRecord, SessionSearchResult, SqliteSessionStore};
+use crate::store::session::{SessionRecord, SessionSearchResult, SessionMessage, SqliteSessionStore};
 use crate::store::Result;
 
 // ---------------------------------------------------------------------------
@@ -172,5 +172,62 @@ impl UnifiedSessionStore {
     /// Returns the number of sessions that were removed.
     pub fn prune_before(&self, cutoff_iso8601: &str) -> Result<usize> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).prune_before(cutoff_iso8601)
+    }
+
+    // -----------------------------------------------------------------------
+    // Messages
+    // -----------------------------------------------------------------------
+
+    /// Insert a single message into a session.
+    pub fn insert_message(&self, msg: &SessionMessage) -> Result<()> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert_message(msg)
+    }
+
+    /// Insert multiple messages into a session in a single batch.
+    pub fn insert_messages_batch(&self, messages: &[SessionMessage]) -> Result<()> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert_messages_batch(messages)
+    }
+
+    /// Retrieve messages for a session with pagination.
+    pub fn get_messages(
+        &self,
+        session_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).get_messages(session_id, offset, limit)
+    }
+
+    /// Retrieve ALL messages for a session (unbounded, no pagination).
+    pub fn get_all_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).get_all_messages(session_id)
+    }
+
+    /// Get the total number of messages in a session.
+    pub fn get_message_count(&self, session_id: &str) -> Result<usize> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).get_message_count(session_id)
+    }
+
+    /// Delete all messages from `from_sequence` onward in a session.
+    ///
+    /// Returns the number of deleted messages.
+    pub fn delete_messages_from(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+    ) -> Result<usize> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).delete_messages_from(session_id, from_sequence)
+    }
+
+    /// Search messages using FTS5 full-text search.
+    ///
+    /// Optionally scoped to a single session.
+    pub fn search_messages(
+        &self,
+        query: &str,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).search_messages(query, session_id, limit)
     }
 }
