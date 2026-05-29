@@ -35,6 +35,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{ MemoryScope,
@@ -50,6 +51,80 @@ use crate::{ MemoryScope,
 /// Default maximum token budget for the shared layer.
 const DEFAULT_MAX_TOKENS: u64 = 2000;
 
+// ---------------------------------------------------------------------------
+// L4 Event Bus – push notifications for cross-agent awareness
+// ---------------------------------------------------------------------------
+
+/// An event emitted when an agent modifies L4 shared memory.
+///
+/// Other agents can subscribe to receive real-time notifications so they
+/// become immediately aware of new shared entries without waiting for the
+/// next `prepare_context` pull cycle.
+#[derive(Debug, Clone)]
+pub struct L4Event {
+    /// Which agent performed the operation.
+    pub agent_id: String,
+    /// UUID string of the affected memory entry.
+    pub memory_id: String,
+    /// What kind of operation was performed.
+    pub operation: L4Operation,
+    /// Title of the memory entry.
+    pub title: String,
+    /// Unix timestamp in milliseconds when the event occurred.
+    pub timestamp_ms: u64,
+}
+
+/// Type of L4 modification that triggered an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L4Operation {
+    /// A new entry was created.
+    Insert,
+    /// An existing entry was modified.
+    Update,
+    /// An entry was removed.
+    Delete,
+}
+
+/// Lightweight publish-subscribe bus for L4 memory events.
+///
+/// Built on `tokio::sync::broadcast`, it allows any number of subscribers
+/// to receive push notifications whenever an agent writes to L4.
+pub struct L4EventBus {
+    tx: broadcast::Sender<L4Event>,
+}
+
+impl L4EventBus {
+    /// Create a new bus with the given channel capacity.
+    ///
+    /// `capacity` is the maximum number of buffered events before slow
+    /// receivers start lagging (lagged receivers are closed).
+    pub fn new(capacity: usize) -> Self {
+        let (tx, _) = broadcast::channel(capacity);
+        Self { tx }
+    }
+
+    /// Subscribe to receive all future L4 events.
+    ///
+    /// Returns a [`broadcast::Receiver`] that can be used to drain
+    /// pending events via [`broadcast::Receiver::try_recv`].
+    pub fn subscribe(&self) -> broadcast::Receiver<L4Event> {
+        self.tx.subscribe()
+    }
+
+    /// Publish an L4 event to all active subscribers.
+    ///
+    /// If no subscribers are listening the event is silently dropped.
+    /// Slow receivers that have lagged beyond the channel capacity are
+    /// closed automatically by the underlying broadcast channel.
+    pub fn publish(&self, event: L4Event) {
+        let _ = self.tx.send(event);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SharedLayer
+// ---------------------------------------------------------------------------
+
 /// Manager for the L4 shared team layer.
 pub struct SharedLayer {
     store: Arc<dyn MemoryStore>,
@@ -58,6 +133,8 @@ pub struct SharedLayer {
     /// Scope key used to tag all entries written by this layer.
     shared_scope: Option<MemoryScope>,
     drift: DriftConfig,
+    /// Optional event bus for push-notifying other agents of L4 writes.
+    pub event_bus: Option<Arc<L4EventBus>>,
 }
 
 impl SharedLayer {
@@ -70,6 +147,7 @@ impl SharedLayer {
             max_tokens: DEFAULT_MAX_TOKENS,
             shared_scope: None,
             drift: DriftConfig::default(),
+            event_bus: None,
         }
     }
 
@@ -81,6 +159,7 @@ impl SharedLayer {
             max_tokens: DEFAULT_MAX_TOKENS,
             shared_scope: None,
             drift: DriftConfig::default(),
+            event_bus: None,
         }
     }
 
@@ -98,6 +177,7 @@ impl SharedLayer {
             max_tokens,
             shared_scope,
             drift,
+            event_bus: None,
         }
     }
 
@@ -153,6 +233,16 @@ impl SharedLayer {
             visibility: crate::types::AgentVisibility::default(),
         };
         let id = self.store.insert(&entry).await?;
+        // Publish push notification so other agents become immediately aware.
+        if let Some(ref bus) = self.event_bus {
+            bus.publish(L4Event {
+                agent_id: String::new(),
+                memory_id: id.to_string(),
+                operation: L4Operation::Insert,
+                title: title.to_string(),
+                timestamp_ms: now.timestamp_millis() as u64,
+            });
+        }
         Ok(id)
     }
 
@@ -353,6 +443,16 @@ impl LayerManager for SharedLayer {
             entry.scope = s.clone();
         }
         let id = self.store.insert(&entry).await?;
+        // Publish push notification so other agents become immediately aware.
+        if let Some(ref bus) = self.event_bus {
+            bus.publish(L4Event {
+                agent_id: entry.source_agent.clone().unwrap_or_default(),
+                memory_id: id.to_string(),
+                operation: L4Operation::Insert,
+                title: entry.title.clone(),
+                timestamp_ms: Utc::now().timestamp_millis() as u64,
+            });
+        }
         Ok(id)
     }
 

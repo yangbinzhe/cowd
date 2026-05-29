@@ -37,7 +37,7 @@ use crate::{
         essential::EssentialLayer,
         identity::IdentityLayer,
         project::ProjectLayer,
-        shared::SharedLayer,
+        shared::{L4EventBus, SharedLayer},
         LayerManager,
     },
     store::{sqlite::SqliteStore, MemoryStore},
@@ -86,6 +86,8 @@ pub struct MemoryOrchestrator {
     context_sync: Mutex<ContextSync>,
     /// Write guard for anti-corruption control (optional).
     write_guard: Option<Arc<MemoryWriteGuard>>,
+    /// Optional event bus for L4 push notifications across agents.
+    l4_event_bus: Option<Arc<L4EventBus>>,
 }
 
 impl MemoryOrchestrator {
@@ -135,12 +137,14 @@ impl MemoryOrchestrator {
             ProjectLayer::new(Arc::clone(&store))
         };
         let l3 = DeepLayer::with_config(Arc::clone(&store), 5, config.drift.clone());
-        let l4 = if config.store.enable_vector_index {
+        let event_bus = Arc::new(L4EventBus::new(256));
+        let mut l4 = if config.store.enable_vector_index {
             // When the vector index is enabled we also allow the shared layer.
             SharedLayer::new(Arc::clone(&store))
         } else {
             SharedLayer::new(Arc::clone(&store))
         };
+        l4.event_bus = Some(Arc::clone(&event_bus));
 
         // Build Closet index from L2 (project) + L3 (deep) memory metadata.
         let closet = parking_lot::Mutex::new(ClosetManager::from_closet(Closet::default()));
@@ -161,6 +165,7 @@ impl MemoryOrchestrator {
             closet_rebuild_counter: AtomicU32::new(0),
             context_sync: Mutex::new(ContextSync::new()),
             write_guard: None,
+            l4_event_bus: Some(event_bus),
         })
     }
 
@@ -446,6 +451,11 @@ impl MemoryOrchestrator {
     /// This is useful for advanced operations like custom FTS5 queries.
     pub fn store(&self) -> &Arc<dyn MemoryStore> {
         &self.store
+    }
+
+    /// Get a reference to the L4 event bus for subscribing to push notifications.
+    pub fn l4_event_bus(&self) -> Option<&Arc<L4EventBus>> {
+        self.l4_event_bus.as_ref()
     }
 
     /// Set the active memory scope for new entries.

@@ -72,6 +72,7 @@ pub mod transaction;
 
 // --- Convenience re-exports ---
 
+pub use layers::shared::{L4Event, L4EventBus, L4Operation};
 pub use cognitive::{CognitiveContextManager, SessionRestoreStats, VectorIndexStats};
 pub use config::{MemoryConfig, TuningConfig, VectorConfig};
 pub use fresh_context::{

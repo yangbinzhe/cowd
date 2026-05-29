@@ -195,6 +195,8 @@ pub struct CognitiveContextManager {
     l1_cache: Mutex<Option<CachedLayer>>,
     /// Cache for L2 (project) layer entries.
     l2_cache: Arc<Mutex<Option<CachedLayer>>>,
+    /// Receiver for L4 push notifications from the event bus.
+    l4_event_rx: Mutex<Option<tokio::sync::broadcast::Receiver<crate::layers::shared::L4Event>>>,
 }
 
 impl CognitiveContextManager {
@@ -470,6 +472,9 @@ impl CognitiveContextManager {
             l0_cache: Mutex::new(None),
             l1_cache: Mutex::new(None),
             l2_cache,
+            l4_event_rx: Mutex::new(
+                orchestrator.l4_event_bus().map(|bus| bus.subscribe())
+            ),
             config,
             orchestrator,
             pipeline,
@@ -609,6 +614,31 @@ impl CognitiveContextManager {
     ) -> Result<PreparedContext> {
         let _prepare_start = Instant::now();
         let mut entries: Vec<MemoryEntry> = Vec::new();
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Step -1: Drain pending L4 push events — other agents' writes
+        //          become immediately visible without waiting for a pull.
+        // ═══════════════════════════════════════════════════════════════════
+        {
+            let mut rx_guard = self.l4_event_rx.lock();
+            if let Some(ref mut rx) = *rx_guard {
+                while let Ok(event) = rx.try_recv() {
+                    if event.operation == crate::layers::shared::L4Operation::Insert {
+                        if let Ok(memory_id) = uuid::Uuid::parse_str(&event.memory_id) {
+                            if let Ok(Some(entry)) = self.orchestrator.recall(&memory_id).await {
+                                entries.push(entry);
+                                tracing::debug!(
+                                    memory_id = %memory_id,
+                                    agent = %event.agent_id,
+                                    title = %event.title,
+                                    "L4 push: loaded new shared entry from event bus"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // ═══════════════════════════════════════════════════════════════════
         // Step 0: Closet LRU prefetch — preload hot topics based on
