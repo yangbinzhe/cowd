@@ -29,8 +29,6 @@ use crate::{
 
 /// Default maximum token budget for the essential layer.
 const DEFAULT_MAX_TOKENS: u64 = 2000;
-/// Staleness threshold above which Low-priority entries are evicted.
-const LOW_PRIORITY_PRUNE_THRESHOLD: f32 = 0.8;
 /// Maximum number of hot symbol slots in L1.
 const MAX_HOT_SYMBOLS: usize = 5;
 
@@ -223,7 +221,7 @@ impl LayerManager for EssentialLayer {
 
             // Prune Low-priority entries that have become very stale.
             if entry.priority == Priority::Low
-                && entry.staleness >= LOW_PRIORITY_PRUNE_THRESHOLD
+                && entry.staleness >= self.drift.low_priority_prune_threshold
             {
                 self.store.delete(&entry.id).await?;
                 continue;

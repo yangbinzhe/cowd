@@ -217,6 +217,14 @@ memory:
     batch_size: 20                # 每次提取的条目数上限
     min_confidence: 0.6           # 最低置信度阈值
 
+  # ── 可调阈值 (替代硬编码常量) ──
+  tuning:
+    sandbox_min_lines: 2000
+    rebuild_confidence: 0.3
+    freshness_trigger_ratio: 0.8
+    closet_rebuild_ticks: 10
+    audit_truncate_len: 120
+
   # ── 偏移检测 (自动清理过期记忆) ──
   drift:
     staleness_decay_per_day: 0.02 # 每日陈旧衰减系数

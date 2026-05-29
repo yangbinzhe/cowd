@@ -69,7 +69,7 @@ pub mod tiered_store;
 // --- Convenience re-exports ---
 
 pub use cognitive::{CognitiveContextManager, SessionRestoreStats, VectorIndexStats};
-pub use config::{MemoryConfig, VectorConfig};
+pub use config::{MemoryConfig, TuningConfig, VectorConfig};
 pub use fresh_context::{
     FreshContextManager, FreshEntry, SessionTokenBudget, SessionBudgetStatus,
 };
