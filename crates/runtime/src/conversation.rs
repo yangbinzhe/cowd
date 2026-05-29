@@ -34,7 +34,7 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 use tracing;
 
-use crate::agent::{SubAgentError, SubAgentExecutor, ToolCallRecord, TurnOutput};
+use crate::agent::{SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentRuntime, ToolCallRecord, TurnOutput};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
@@ -320,7 +320,7 @@ where
         Self::new_with_features(
             session,
             api_client,
-            tool_executor,
+            Arc::new(tool_executor),
             permission_policy,
             system_prompt,
             &RuntimeFeatureConfig::default(),
@@ -332,7 +332,7 @@ where
     pub fn new_with_features(
         session: Session,
         api_client: C,
-        tool_executor: T,
+        tool_executor: Arc<T>,
         permission_policy: PermissionPolicy,
         system_prompt: Vec<String>,
         feature_config: &RuntimeFeatureConfig,
@@ -398,7 +398,7 @@ where
         Self {
             session,
             api_client,
-            tool_executor: Arc::new(tool_executor),
+            tool_executor,
             permission_policy,
             system_prompt,
             max_iterations: usize::MAX,
@@ -666,6 +666,42 @@ where
     /// Run all commit quality gates against the current state.
     pub fn check_commit_gates(&self, context: crate::gates::GateContext) -> Option<(bool, Vec<crate::gates::GateResult>)> {
         self.gate_evaluator.as_ref().map(|evaluator| evaluator.evaluate_all(&context))
+    }
+
+    /// Create a sub-agent runtime with independent LLM reasoning capabilities.
+    pub fn create_subagent_runtime(
+        &self,
+        config: &SubAgentConfig,
+    ) -> SubAgentRuntime<C, T>
+    where
+        C: Clone,
+    {
+        let model = config.model.clone().or_else(|| self.model.clone());
+        let filtered_prompt = filter_system_prompt_for_role(
+            &self.system_prompt,
+            &config.task_description,
+        );
+        let mut sub_rt = ConversationRuntime::new_with_features(
+            crate::session::Session::new(),
+            self.api_client.clone(),
+            Arc::clone(&self.tool_executor),
+            self.permission_policy.clone(),
+            filtered_prompt,
+            &RuntimeFeatureConfig::default(),
+        );
+        if let Some(ref m) = model {
+            sub_rt.model = Some(m.clone());
+        }
+        sub_rt.max_iterations = config.max_turns;
+        sub_rt.tool_orchestrator = self.tool_orchestrator.clone();
+        if let Some(ref mem) = self.memory_manager {
+            sub_rt = sub_rt.with_memory_manager(Arc::clone(mem));
+        }
+        let mut sub_agent = SubAgentRuntime::new(config.clone(), sub_rt);
+        if let Some(ref mem) = self.memory_manager {
+            sub_agent = sub_agent.with_parent_memory(Arc::clone(mem));
+        }
+        sub_agent
     }
 
     /// Explicitly disable the memory subsystem, regardless of feature config.
@@ -2130,6 +2166,20 @@ fn resolve_compact_threshold(model_ctx_window: u32) -> u32 {
     (model_ctx_window * 80 / 100).min(model_ctx_window.saturating_sub(8_000))
 }
 
+fn filter_system_prompt_for_role(
+    system_prompt: &[String],
+    task_description: &str,
+) -> Vec<String> {
+    let mut filtered = vec![format!(
+        "You are a sub-agent with the following task:\n\n{}\n\
+         Complete this task faithfully and report your results.\n\
+         Do NOT perform work outside the scope of this task.",
+        task_description
+    )];
+    filtered.extend_from_slice(system_prompt);
+    filtered
+}
+
 /// Convert a [`RuntimeFeatureConfig`] memory section into a [`CcMemoryConfig`]
 /// suitable for [`CognitiveContextManager::new`].
 #[doc(alias = "memory")]
@@ -2692,9 +2742,9 @@ mod tests {
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),
             SingleCallApiClient,
-            StaticToolExecutor::new().register("blocked", |_input| {
+            Arc::new(StaticToolExecutor::new().register("blocked", |_input| {
                 panic!("tool should not execute when hook denies")
-            }),
+            })),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
@@ -2759,9 +2809,9 @@ mod tests {
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),
             SingleCallApiClient,
-            StaticToolExecutor::new().register("blocked", |_input| {
+            Arc::new(StaticToolExecutor::new().register("blocked", |_input| {
                 panic!("tool should not execute when hook fails")
-            }),
+            })),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
@@ -2834,7 +2884,7 @@ mod tests {
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),
             TwoCallApiClient { calls: 0 },
-            StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
+            Arc::new(StaticToolExecutor::new().register("add", |_input| Ok("4".to_string()))),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
@@ -2914,8 +2964,8 @@ mod tests {
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),
             TwoCallApiClient { calls: 0 },
-            StaticToolExecutor::new()
-                .register("fail", |_input| Err(ToolError::new("tool exploded"))),
+            Arc::new(StaticToolExecutor::new()
+                .register("fail", |_input| Err(ToolError::new("tool exploded")))),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(

@@ -83,6 +83,7 @@ pub mod profile;
 
 pub use agent::{
     SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback, SubAgentResult,
+    SubAgentToolMode,
 };
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};

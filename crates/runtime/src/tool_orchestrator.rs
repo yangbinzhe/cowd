@@ -269,6 +269,7 @@ impl ToolResultBudget {
 // ---------------------------------------------------------------------------
 
 /// Orchestrates tool execution based on safety categories and budgets.
+#[derive(Clone)]
 pub struct ToolOrchestrator {
     /// Budget configuration for tool results.
     pub budget: ToolResultBudget,

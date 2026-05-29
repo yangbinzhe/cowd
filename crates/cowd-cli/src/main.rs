@@ -7021,12 +7021,12 @@ fn build_runtime_with_plugin_state(
             tool_registry.clone(),
             stream_callback.clone(),
         )?,
-        CliToolExecutor::new(
+        std::sync::Arc::new(CliToolExecutor::new(
             allowed_tools.clone(),
             emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
-        ),
+        )),
         policy,
         system_prompt,
         &feature_config,
