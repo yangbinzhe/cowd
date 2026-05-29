@@ -5,10 +5,8 @@
 //   - Platform adapters (feishu, wechat_ilink, email)
 // Shared state: ActiveSessions, CognitiveContextManager, GlobalToolRegistry, SessionEventBus
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::http::{header, HeaderValue};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -27,69 +25,7 @@ use runtime::platform::config::PlatformRuntimeConfig;
 use runtime::mirror::MessageMirror;
 use tools::GlobalToolRegistry;
 
-// ── Session lifecycle ──────────────────────────────────────────
-
-/// Status of a session for cleanup decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionStatus {
-    Active,
-    Idle,
-    Expired,
-}
-
-/// Tracks session activity timestamps to determine idle/expired status.
-pub(crate) struct SessionLifecycleManager {
-    last_active: StdMutex<HashMap<String, Instant>>,
-    idle_timeout: Duration,
-    max_lifetime: Duration,
-}
-
-impl SessionLifecycleManager {
-    pub(crate) fn new(idle_timeout: Duration, max_lifetime: Duration) -> Self {
-        Self {
-            last_active: StdMutex::new(HashMap::new()),
-            idle_timeout,
-            max_lifetime,
-        }
-    }
-
-    pub(crate) fn register(&self, id: String) {
-        if let Ok(mut map) = self.last_active.lock() {
-            map.insert(id, Instant::now());
-        }
-    }
-
-    pub(crate) fn mark_active(&self, id: &str) {
-        if let Ok(mut map) = self.last_active.lock() {
-            map.insert(id.to_string(), Instant::now());
-        }
-    }
-
-    pub(crate) fn check_session(&self, id: &str) -> SessionStatus {
-        let Ok(map) = self.last_active.lock() else {
-            return SessionStatus::Active;
-        };
-        match map.get(id) {
-            Some(last) => {
-                let elapsed = last.elapsed();
-                if elapsed >= self.max_lifetime {
-                    SessionStatus::Expired
-                } else if elapsed >= self.idle_timeout {
-                    SessionStatus::Idle
-                } else {
-                    SessionStatus::Active
-                }
-            }
-            None => SessionStatus::Active,
-        }
-    }
-
-    pub(crate) fn unregister(&self, id: &str) {
-        if let Ok(mut map) = self.last_active.lock() {
-            map.remove(id);
-        }
-    }
-}
+use runtime::session_lifecycle::{EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus};
 
 // ── Background session cleanup task ────────────────────────────
 
@@ -109,33 +45,39 @@ fn spawn_session_cleanup_task(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // Run lifecycle's internal TTL/idle/eviction checks first
+            lifecycle.run_cleanup().await;
             let ids = active_sessions.list();
             for id in &ids {
-                let status = lifecycle.check_session(id);
-                if matches!(status, SessionStatus::Expired | SessionStatus::Idle) {
-                    tracing::info!(session_id=%id, ?status, "cleanup: closing session");
-                    if let Some(entry) = active_sessions.get(id) {
-                        let entry = entry.clone();
-                        let store = unified_store.clone();
-                        let id = id.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let handle = tokio::runtime::Handle::current();
-                            handle.block_on(async {
-                                let mut runtime = entry.lock().await;
-                                // Shutdown MCP and plugins before dropping
-                                let _ = runtime.shutdown_mcp();
-                                let _ = runtime.shutdown_plugins();
-                                drop(runtime);
-                                if let Some(ref store) = store {
-                                    let _ = store.delete_session(&id);
-                                }
-                            });
-                        })
-                        .await
-                        .ok();
+                if let Some(status) = lifecycle.check_session(id).await {
+                    if matches!(status, SessionStatus::Expired | SessionStatus::Idle | SessionStatus::Evicted) {
+                        tracing::info!(session_id=%id, ?status, "cleanup: closing session");
+                        if let Some(entry) = active_sessions.get(id) {
+                            let entry = entry.clone();
+                            let store = unified_store.clone();
+                            let id = id.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let handle = tokio::runtime::Handle::current();
+                                handle.block_on(async {
+                                    let mut runtime = entry.lock().await;
+                                    // Shutdown MCP and plugins before dropping
+                                    let _ = runtime.shutdown_mcp();
+                                    let _ = runtime.shutdown_plugins();
+                                    drop(runtime);
+                                    if let Some(ref store) = store {
+                                        let _ = store.delete_session(&id);
+                                    }
+                                });
+                            })
+                            .await
+                            .ok();
+                        }
+                        active_sessions.remove(id);
+                        lifecycle.unregister(id).await;
                     }
+                } else {
+                    // Session tracked in active_sessions but not in lifecycle
                     active_sessions.remove(id);
-                    lifecycle.unregister(id);
                 }
             }
         }
@@ -210,10 +152,14 @@ pub async fn run_daemon(
         .map(|s| Arc::new(s.clone()));
 
     // Spawn background session cleanup (idle/expired session reaper)
-    let lifecycle = Arc::new(SessionLifecycleManager::new(
-        Duration::from_secs(300),   // idle after 5 min
-        Duration::from_secs(86_400), // expired after 24 h
-    ));
+    let lifecycle_config = SessionLifecycleConfig {
+        idle_timeout: Some(Duration::from_secs(300)),
+        max_ttl: Some(Duration::from_secs(86400)),
+        max_active_sessions: 100,
+        eviction_policy: EvictionPolicy::Lru,
+        cleanup_interval: Duration::from_secs(300),
+    };
+    let lifecycle = Arc::new(SessionLifecycleManager::new(lifecycle_config));
     let _cleanup_handle = spawn_session_cleanup_task(
         sessions.clone(),
         lifecycle,
