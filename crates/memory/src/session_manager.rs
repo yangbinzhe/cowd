@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 
 /// Session metadata for unified management
 #[derive(Debug, Clone)]
-pub struct UnifiedSessionMeta {
+pub(crate) struct UnifiedSessionMeta {
     /// Session identifier
     pub id: String,
     /// Session type (cli, gateway_api, gateway_feishu, etc.)
@@ -28,7 +28,7 @@ pub struct UnifiedSessionMeta {
 
 /// Session type enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SessionType {
+pub(crate) enum SessionType {
     /// CLI session
     Cli,
     /// Gateway API session
@@ -54,7 +54,7 @@ impl std::fmt::Display for SessionType {
 }
 
 /// Unified session manager for cross-platform session handling
-pub struct UnifiedSessionManager {
+pub(crate) struct UnifiedSessionManager {
     /// Active sessions
     sessions: RwLock<HashMap<String, UnifiedSessionMeta>>,
     /// Default session ID (for CLI mode)
@@ -63,7 +63,7 @@ pub struct UnifiedSessionManager {
 
 impl UnifiedSessionManager {
     /// Create a new unified session manager
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             default_session: RwLock::new(None),
@@ -71,25 +71,25 @@ impl UnifiedSessionManager {
     }
 
     /// Register a new session
-    pub async fn register_session(&self, meta: UnifiedSessionMeta) {
+    pub(crate) async fn register_session(&self, meta: UnifiedSessionMeta) {
         let mut sessions = self.sessions.write().await;
         sessions.insert(meta.id.clone(), meta);
     }
 
     /// Get session metadata
-    pub async fn get_session(&self, id: &str) -> Option<UnifiedSessionMeta> {
+    pub(crate) async fn get_session(&self, id: &str) -> Option<UnifiedSessionMeta> {
         let sessions = self.sessions.read().await;
         sessions.get(id).cloned()
     }
 
     /// List all sessions
-    pub async fn list_sessions(&self) -> Vec<UnifiedSessionMeta> {
+    pub(crate) async fn list_sessions(&self) -> Vec<UnifiedSessionMeta> {
         let sessions = self.sessions.read().await;
         sessions.values().cloned().collect()
     }
 
     /// List sessions by type
-    pub async fn list_sessions_by_type(&self, session_type: SessionType) -> Vec<UnifiedSessionMeta> {
+    pub(crate) async fn list_sessions_by_type(&self, session_type: SessionType) -> Vec<UnifiedSessionMeta> {
         let sessions = self.sessions.read().await;
         sessions
             .values()
@@ -99,7 +99,7 @@ impl UnifiedSessionManager {
     }
 
     /// Update session activity
-    pub async fn touch_session(&self, id: &str) -> bool {
+    pub(crate) async fn touch_session(&self, id: &str) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -115,25 +115,25 @@ impl UnifiedSessionManager {
     }
 
     /// Remove a session
-    pub async fn remove_session(&self, id: &str) -> bool {
+    pub(crate) async fn remove_session(&self, id: &str) -> bool {
         let mut sessions = self.sessions.write().await;
         sessions.remove(id).is_some()
     }
 
     /// Set default session (CLI mode)
-    pub async fn set_default_session(&self, id: String) {
+    pub(crate) async fn set_default_session(&self, id: String) {
         let mut default = self.default_session.write().await;
         *default = Some(id);
     }
 
     /// Get default session
-    pub async fn get_default_session(&self) -> Option<String> {
+    pub(crate) async fn get_default_session(&self) -> Option<String> {
         let default = self.default_session.read().await;
         default.clone()
     }
 
     /// Get or create default session
-    pub async fn get_or_create_default(&self) -> String {
+    pub(crate) async fn get_or_create_default(&self) -> String {
         // Check if default exists
         if let Some(id) = self.get_default_session().await {
             return id;
@@ -161,7 +161,7 @@ impl UnifiedSessionManager {
     }
 
     /// Clean up stale sessions (older than max_age seconds)
-    pub async fn cleanup_stale_sessions(&self, max_age_seconds: u64) -> usize {
+    pub(crate) async fn cleanup_stale_sessions(&self, max_age_seconds: u64) -> usize {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -178,7 +178,7 @@ impl UnifiedSessionManager {
     }
 
     /// Get session count by type
-    pub async fn session_counts(&self) -> HashMap<SessionType, usize> {
+    pub(crate) async fn session_counts(&self) -> HashMap<SessionType, usize> {
         let sessions = self.sessions.read().await;
         let mut counts = HashMap::new();
 
@@ -197,10 +197,10 @@ impl Default for UnifiedSessionManager {
 }
 
 /// Wrapper for sharing UnifiedSessionManager across threads
-pub type SharedSessionManager = Arc<UnifiedSessionManager>;
+pub(crate) type SharedSessionManager = Arc<UnifiedSessionManager>;
 
 /// Create a new shared session manager
-pub fn create_session_manager() -> SharedSessionManager {
+pub(crate) fn create_session_manager() -> SharedSessionManager {
     Arc::new(UnifiedSessionManager::new())
 }
 
@@ -208,7 +208,7 @@ pub fn create_session_manager() -> SharedSessionManager {
 
 /// Bridge trait for Gateway to use unified session manager
 #[async_trait::async_trait]
-pub trait SessionBridge: Send + Sync {
+pub(crate) trait SessionBridge: Send + Sync {
     /// Get the unified session manager
     fn session_manager(&self) -> SharedSessionManager;
 
@@ -245,7 +245,7 @@ pub trait SessionBridge: Send + Sync {
 // ── CLI Session Bridge ───────────────────────────────────────────────────────
 
 /// Bridge trait for CLI to use unified session manager
-pub trait CliSessionBridge {
+pub(crate) trait CliSessionBridge {
     /// Get the unified session manager
     fn session_manager(&self) -> SharedSessionManager;
 

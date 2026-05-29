@@ -42,7 +42,7 @@ pub mod resolution;
 pub mod seeds;
 #[deprecated(note = "Orphaned abstraction. Real session management in runtime::session. Revisit for multi-platform.")]
 #[doc(hidden)]
-pub mod session_manager;
+pub(crate) mod session_manager;
 pub mod session_store;
 pub mod shared;
 pub mod splitter;
@@ -79,10 +79,6 @@ pub use store::verbatim::{VerbatimEntry, VerbatimSink};
 pub use embedding::{EmbeddingClient, EmbeddingCapability};
 pub use error::MemoryError;
 pub use orchestrator::MemoryOrchestrator;
-pub use session_manager::{
-    UnifiedSessionMeta, UnifiedSessionManager, SessionType,
-    SharedSessionManager, create_session_manager,
-};
 pub use handoff::HandoffManager;
 pub use hot_reload::{
     ConfigChangeEvent, ConfigFile, ConfigHotReloader, HotReloadConfig,
