@@ -2120,6 +2120,7 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
         },
         drift: DriftConfig::default(),
         perf: memory::config::PerfBudget::default(),
+        tuning: Default::default(),
         model: None,
     }
 }
