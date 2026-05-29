@@ -1322,4 +1322,70 @@ mod tests {
         assert!(results[0].success);
         assert!(results[1].success);
     }
+
+    #[test]
+    fn test_safety_limit_exceeded() {
+        let config = WaveConfig {
+            safety_check_enabled: true,
+            ..WaveConfig::default()
+        };
+        let mut orchestrator = WaveOrchestrator::new().with_config(config);
+
+        // Create 5 WriteLocal tasks with no dependencies (all in same wave)
+        for i in 0..5 {
+            let task = WaveTask::new(format!("w{}", i), format!("Write Task {}", i))
+                .with_safety_category(ToolSafetyCategory::WriteLocal);
+            orchestrator.add_task(task);
+        }
+
+        let result = orchestrator.build_waves();
+        assert!(result.is_err());
+        match result {
+            Err(WaveError::SafetyLimitExceeded {
+                wave: 1,
+                category: ToolSafetyCategory::WriteLocal,
+                count: 5,
+                max: 4,
+            }) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                panic!("Expected SafetyLimitExceeded, got: {}", msg);
+            }
+            Ok(_) => panic!("Expected SafetyLimitExceeded, got Ok"),
+        }
+    }
+
+    #[test]
+    fn test_safety_check_disabled_allows_excess() {
+        let config = WaveConfig {
+            safety_check_enabled: false,
+            ..WaveConfig::default()
+        };
+        let mut orchestrator = WaveOrchestrator::new().with_config(config);
+
+        // Create 5 WriteLocal tasks — should succeed when safety check disabled
+        for i in 0..5 {
+            let task = WaveTask::new(format!("w{}", i), format!("Write Task {}", i))
+                .with_safety_category(ToolSafetyCategory::WriteLocal);
+            orchestrator.add_task(task);
+        }
+
+        orchestrator.build_waves().unwrap();
+        assert_eq!(orchestrator.wave_count(), 1);
+    }
+
+    #[test]
+    fn test_safety_within_limit_passes() {
+        let mut orchestrator = WaveOrchestrator::new();
+
+        // Create exactly 4 WriteLocal tasks (limit is 4)
+        for i in 0..4 {
+            let task = WaveTask::new(format!("w{}", i), format!("Write Task {}", i))
+                .with_safety_category(ToolSafetyCategory::WriteLocal);
+            orchestrator.add_task(task);
+        }
+
+        orchestrator.build_waves().unwrap();
+        assert_eq!(orchestrator.wave_count(), 1);
+    }
 }

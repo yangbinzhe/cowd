@@ -1465,7 +1465,11 @@ self.record_turn_completed(&summary);
             "tool_name": &req.tool_name,
             "input": &req.input,
         });
-        let mut task = WaveTask::new(&req.tool_use_id, &req.tool_name).with_payload(payload);
+        let safety_cat =
+            crate::tool_orchestrator::ToolSafetyCategory::from_tool_name(&req.tool_name);
+        let mut task = WaveTask::new(&req.tool_use_id, &req.tool_name)
+            .with_payload(payload)
+            .with_safety_category(safety_cat);
         for dep in &req.depends_on {
             task = task.with_dependency(TaskId::new(dep));
         }
