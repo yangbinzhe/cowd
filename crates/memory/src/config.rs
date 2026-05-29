@@ -510,6 +510,10 @@ pub struct ExtractorConfig {
     pub batch_size: usize,
     /// Minimum confidence score to keep an extracted entry.
     pub min_confidence: f32,
+    /// Debounce window (in seconds) for background LLM extraction (Pass 5).
+    /// Prevents the LLM from being invoked on every single turn — results are
+    /// batched within this window to reduce API costs.
+    pub extractor_debounce_secs: u64,
 }
 
 impl Default for ExtractorConfig {
@@ -518,6 +522,7 @@ impl Default for ExtractorConfig {
             poll_interval_secs: 30,
             batch_size: 20,
             min_confidence: 0.6,
+            extractor_debounce_secs: 30,
         }
     }
 }

@@ -225,6 +225,47 @@ impl MemoryExtractor {
         user_content_len + assistant_content_len >= 50
     }
 
+    /// Return a reference to the LLM client, if one is configured.
+    pub fn llm_client(&self) -> Option<&Arc<dyn LlmSummarizer>> {
+        self.llm_client.as_ref()
+    }
+
+    /// Run the four heuristic extraction passes over `messages` (only).
+    ///
+    /// Returns raw entries **without** confidence filtering, de-duplication,
+    /// or `batch_size` truncation.  Call [`finalize_entries`] afterwards to
+    /// apply those post-processing steps.
+    pub fn extract_heuristic(&self, messages: &[Message]) -> Vec<MemoryEntry> {
+        if !Self::should_extract(messages) {
+            return Vec::new();
+        }
+        let chunked = Self::chunk_large_messages(messages);
+        let mut entries = Vec::new();
+        entries.extend(self.extract_preferences(&chunked));
+        entries.extend(self.extract_decisions(&chunked));
+        entries.extend(self.extract_error_fixes(&chunked));
+        entries.extend(self.extract_patterns(&chunked));
+        entries
+    }
+
+    /// Finalise a batch of entries: filter by `min_confidence`, de-duplicate
+    /// by normalised title, and truncate to `batch_size`.
+    pub fn finalize_entries(&self, mut entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+        entries.retain(|e| e.confidence >= self.config.min_confidence);
+        let mut seen_titles: HashMap<String, ()> = HashMap::new();
+        entries.retain(|e| {
+            let key = e.title.to_lowercase();
+            if let std::collections::hash_map::Entry::Vacant(e) = seen_titles.entry(key) {
+                e.insert(());
+                true
+            } else {
+                false
+            }
+        });
+        entries.truncate(self.config.batch_size);
+        entries
+    }
+
     /// Extract meaningful [`MemoryEntry`] items from `messages`.
     ///
     /// Returns up to `config.batch_size` entries, each with a confidence score
@@ -235,23 +276,12 @@ impl MemoryExtractor {
     /// LLM for deeper extraction; on failure the heuristic results are used
     /// as-is.
     pub async fn extract(&self, messages: &[Message]) -> Result<Vec<MemoryEntry>> {
-        if !Self::should_extract(messages) {
-            return Ok(Vec::new());
-        }
-
-        let mut entries: Vec<MemoryEntry> = Vec::new();
-
-        // Pre-split large messages for better chunking
-        let chunked_messages = Self::chunk_large_messages(messages);
-
-        entries.extend(self.extract_preferences(&chunked_messages));
-        entries.extend(self.extract_decisions(&chunked_messages));
-        entries.extend(self.extract_error_fixes(&chunked_messages));
-        entries.extend(self.extract_patterns(&chunked_messages));
+        let mut entries = self.extract_heuristic(messages);
 
         // Pass 5 – LLM-enhanced extraction (optional)
         if self.llm_client.is_some() {
-            match self.llm_extract(&chunked_messages).await {
+            let chunked = Self::chunk_large_messages(messages);
+            match self.llm_extract(&chunked).await {
                 Ok(llm_entries) => {
                     tracing::info!(
                         count = llm_entries.len(),
@@ -269,25 +299,7 @@ impl MemoryExtractor {
             }
         }
 
-        // Filter by minimum confidence.
-        entries.retain(|e| e.confidence >= self.config.min_confidence);
-
-        // De-duplicate by (normalised) title.
-        let mut seen_titles: HashMap<String, ()> = HashMap::new();
-        entries.retain(|e| {
-            let key = e.title.to_lowercase();
-            if let std::collections::hash_map::Entry::Vacant(e) = seen_titles.entry(key) {
-                e.insert(());
-                true
-            } else {
-                false
-            }
-        });
-
-        // Respect the configured batch size.
-        entries.truncate(self.config.batch_size);
-
-        Ok(entries)
+        Ok(self.finalize_entries(entries))
     }
 
     /// Spawn a **one-shot** background extraction task.
@@ -669,7 +681,7 @@ impl MemoryExtractor {
     // -------------------------------------------------------------------
 
     /// Run the LLM extraction pass over the given messages.
-    async fn llm_extract(&self, messages: &[Message]) -> Result<Vec<MemoryEntry>> {
+    pub async fn llm_extract(&self, messages: &[Message]) -> Result<Vec<MemoryEntry>> {
         let prompt = Self::build_extraction_prompt();
         let content_text = Self::format_messages_for_llm(messages);
 

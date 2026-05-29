@@ -23,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
 
 use chrono::Utc;
 
@@ -147,13 +148,21 @@ pub struct CognitiveContextManager {
     integrity_check_counter: AtomicU64,
     /// Embedding capability level (Remote/Local/FTS5Only).
     embedding_capability: EmbeddingCapability,
-    /// Heuristic memory extractor.
-    extractor: MemoryExtractor,
+    /// Heuristic memory extractor, shared with background LLM extraction task.
+    extractor: Arc<MemoryExtractor>,
     /// In-memory knowledge graph for entity relationships.
     kg: Arc<Mutex<KnowledgeGraph>>,
     /// Handle to the optional background file-system watcher.
     #[allow(dead_code)]
     background_watcher: Mutex<Option<BackgroundWatcherHandle>>,
+    /// Sender for queuing messages to the background LLM extraction worker.
+    extract_tx: mpsc::UnboundedSender<Vec<Message>>,
+    /// Pending memory entries from the background LLM extraction worker,
+    /// drained at the start of each turn-end cycle.
+    pending_llm_entries: Arc<Mutex<Vec<MemoryEntry>>>,
+    /// Handle to the background LLM extraction task.
+    #[allow(dead_code)]
+    extract_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Freshness-priority context manager for session budget management.
     fresh_ctx: FreshContextManager,
     /// Context rotation monitor for GSD-style health warnings.
@@ -242,7 +251,8 @@ impl CognitiveContextManager {
 
         // Build the memory extractor.
         let mut extractor = MemoryExtractor::new(config.extractor.clone());
-        if config.compression.llm.is_configured() {
+        let llm_configured = config.compression.llm.is_configured();
+        if llm_configured {
             let summarizer = OpenAiSummarizer::new(
                 config.compression.llm.api_url.clone(),
                 config.compression.llm.api_key.clone(),
@@ -251,6 +261,51 @@ impl CognitiveContextManager {
             extractor = extractor.with_llm(Arc::new(summarizer));
             tracing::info!("LLM-enhanced extraction enabled (Pass 5)");
         }
+
+        // Wrap extractor in Arc for sharing with the background LLM task.
+        let extractor = Arc::new(extractor);
+
+        // ── Background LLM extraction worker ────────────────────────────────
+        let (extract_tx, mut extract_rx) = mpsc::unbounded_channel::<Vec<Message>>();
+        let pending_llm_entries: Arc<Mutex<Vec<MemoryEntry>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let bg_extractor = Arc::clone(&extractor);
+        let bg_pending = Arc::clone(&pending_llm_entries);
+        let extractor_debounce_secs = config.extractor.extractor_debounce_secs;
+
+        let extract_handle = tokio::spawn(async move {
+            let mut last_run = Instant::now();
+            let debounce = Duration::from_secs(extractor_debounce_secs);
+            while let Some(messages) = extract_rx.recv().await {
+                if last_run.elapsed() < debounce {
+                    tracing::debug!(
+                        elapsed = ?last_run.elapsed(),
+                        "background LLM extract: debouncing, skipping batch"
+                    );
+                    continue;
+                }
+                if bg_extractor.llm_client().is_some() {
+                    match bg_extractor.llm_extract(&messages).await {
+                        Ok(llm_entries) => {
+                            let final_entries = bg_extractor.finalize_entries(llm_entries);
+                            if !final_entries.is_empty() {
+                                tracing::info!(
+                                    count = final_entries.len(),
+                                    "background LLM extract: {} entries ready for merge",
+                                    final_entries.len()
+                                );
+                                bg_pending.lock().extend(final_entries);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, "background LLM extract failed");
+                        }
+                    }
+                }
+                last_run = Instant::now();
+            }
+            tracing::debug!("background LLM extract: worker exiting");
+        });
 
         // Load knowledge graph from persistent store.
         let kg = {
@@ -433,6 +488,9 @@ impl CognitiveContextManager {
             extractor,
             kg,
             background_watcher: Mutex::new(watcher_handle),
+            extract_tx,
+            pending_llm_entries,
+            extract_handle: Mutex::new(Some(extract_handle)),
         })
     }
 
@@ -1261,7 +1319,8 @@ impl CognitiveContextManager {
     /// Extract memories from the current turn's messages and persist them.
     ///
     /// This covers steps 0, 0b, and 11 from the full turn-end sequence:
-    ///   - Heuristic extraction from conversation messages
+    ///   - Heuristic extraction from conversation messages (fast, sync)
+    ///   - LLM extraction queued to background worker (non-blocking)
     ///   - Persist via `orchestrator.remember_batch`
     ///   - Index large tool outputs into the sandbox
     ///   - Batch-embed new entries into the vector index
@@ -1284,40 +1343,70 @@ impl CognitiveContextManager {
                 "extract_and_remember: pre-extraction state"
             );
 
-            match self.extractor.extract(messages).await {
-                Ok(entries) => {
-                    tracing::info!(
-                        entries_count = entries.len(),
-                        "extract_and_remember: extracted {} memory entries",
-                        entries.len()
-                    );
-                    pending_embeddings = entries.iter()
-                        .map(|e| (e.id, e.content.clone()))
-                        .collect();
-                    match self.orchestrator.remember_batch(entries).await {
+            // ── 0a. Drain background LLM results from prior turns ─────────
+            {
+                let mut pending = self.pending_llm_entries.lock();
+                if !pending.is_empty() {
+                    let drained: Vec<MemoryEntry> = pending.drain(..).collect();
+                    drop(pending);
+                    let drained_count = drained.len();
+                    for entry in &drained {
+                        pending_embeddings.push((entry.id, entry.content.clone()));
+                    }
+                    match self.orchestrator.remember_batch(drained).await {
                         Ok(_) => {
-                            tracing::debug!(
-                                "extract_and_remember: {} memories persisted successfully",
-                                pending_embeddings.len()
+                            tracing::info!(
+                                count = drained_count,
+                                "extract_and_remember: persisted {} background LLM entries",
+                                drained_count
                             );
                         }
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
-                                "extract_and_remember: memory persistence failed"
+                                "extract_and_remember: background LLM entries persist failed"
                             );
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "extract_and_remember: extraction failed (non-fatal)"
-                    );
+            }
+
+            // ── 0b. Heuristic extraction (Passes 1-4, fast / non-blocking) ──
+            let heuristic_entries = {
+                let raw = self.extractor.extract_heuristic(messages);
+                self.extractor.finalize_entries(raw)
+            };
+            if !heuristic_entries.is_empty() {
+                tracing::info!(
+                    entries_count = heuristic_entries.len(),
+                    "extract_and_remember: heuristic extracted {} entries",
+                    heuristic_entries.len()
+                );
+                for entry in &heuristic_entries {
+                    pending_embeddings.push((entry.id, entry.content.clone()));
+                }
+                match self.orchestrator.remember_batch(heuristic_entries).await {
+                    Ok(_) => {
+                        tracing::debug!(
+                            "extract_and_remember: heuristic memories persisted successfully"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "extract_and_remember: heuristic memory persistence failed"
+                        );
+                    }
+                }
+
+                // Queue LLM Pass 5 for background processing (non-blocking).
+                if self.extractor.llm_client().is_some() {
+                    let _ = self.extract_tx.send(messages.to_vec());
+                    tracing::debug!("extract_and_remember: queued messages for background LLM extraction");
                 }
             }
 
-            // ── 0b. Index large tool outputs into sandbox ───────────────────
+            // ── 0c. Index large tool outputs into sandbox ───────────────────
             let mut sandbox = self.tool_sandbox.lock();
             for msg in messages.iter().filter(|m| matches!(m.role, MessageRole::Tool)) {
                 let call_id = msg.tool_use_id.as_deref().unwrap_or("unknown");
