@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::Path;
 use thiserror::Error;
 
 /// Gate evaluation result.
@@ -79,6 +80,24 @@ pub enum GateError {
 
     #[error("configuration error: {0}")]
     ConfigError(String),
+}
+
+/// Action the gate evaluator should take after evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GateAction {
+    /// Proceed without restriction.
+    Allow,
+    /// Block the operation with a reason.
+    Deny { reason: String },
+    /// Attempt automatic fix before denying.
+    AutoFix {
+        /// Human-readable description of what the fix will do.
+        fix_description: String,
+        /// Maximum number of fix attempts before giving up.
+        max_attempts: usize,
+    },
+    /// Escalate to a human reviewer.
+    Escalate { reason: String },
 }
 
 /// Context for gate evaluation.
@@ -163,6 +182,124 @@ impl fmt::Display for ViolationSeverity {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Auto-fix infrastructure
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A strategy for automatically fixing code issues detected by gates.
+pub trait FixStrategy: Send + Sync {
+    /// Human-readable name of this fix strategy.
+    fn name(&self) -> &str;
+
+    /// Whether this fixer can handle the given error message.
+    fn can_fix(&self, error: &str) -> bool;
+
+    /// Apply the fix to the given file, returning the tool output on success.
+    fn apply_fix(&self, file_path: &Path, error: &str) -> Result<String, String>;
+}
+
+/// Orchestrates auto-fix attempts using a collection of fix strategies.
+pub struct AutoFixer {
+    max_attempts: usize,
+    fixers: Vec<Box<dyn FixStrategy>>,
+}
+
+impl AutoFixer {
+    pub fn new(max_attempts: usize) -> Self {
+        Self {
+            max_attempts,
+            fixers: Vec::new(),
+        }
+    }
+
+    pub fn with_fixer(mut self, fixer: Box<dyn FixStrategy>) -> Self {
+        self.fixers.push(fixer);
+        self
+    }
+
+    pub fn with_default_fixers(mut self) -> Self {
+        self.fixers.push(Box::new(RustClippyFixer));
+        self.fixers.push(Box::new(RustFmtFixer));
+        self.fixers.push(Box::new(UnusedImportFixer));
+        self
+    }
+}
+
+// ── Concrete fixers ──
+
+struct RustClippyFixer;
+
+impl FixStrategy for RustClippyFixer {
+    fn name(&self) -> &str {
+        "cargo clippy --fix"
+    }
+
+    fn can_fix(&self, error: &str) -> bool {
+        error.contains("clippy") || error.contains("unused")
+    }
+
+    fn apply_fix(&self, file_path: &Path, _error: &str) -> Result<String, String> {
+        let dir = file_path.parent().unwrap_or_else(|| Path::new("."));
+        let output = std::process::Command::new("cargo")
+            .args(["clippy", "--fix", "--allow-dirty", "--allow-staged"])
+            .current_dir(dir)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+}
+
+struct RustFmtFixer;
+
+impl FixStrategy for RustFmtFixer {
+    fn name(&self) -> &str {
+        "cargo fmt"
+    }
+
+    fn can_fix(&self, error: &str) -> bool {
+        error.contains("format") || error.contains("fmt")
+    }
+
+    fn apply_fix(&self, file_path: &Path, _error: &str) -> Result<String, String> {
+        let output = std::process::Command::new("cargo")
+            .args(["fmt", "--", file_path.to_string_lossy().as_ref()])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+}
+
+struct UnusedImportFixer;
+
+impl FixStrategy for UnusedImportFixer {
+    fn name(&self) -> &str {
+        "cargo fix"
+    }
+
+    fn can_fix(&self, error: &str) -> bool {
+        error.contains("unused import") || error.contains("unused")
+    }
+
+    fn apply_fix(&self, file_path: &Path, _error: &str) -> Result<String, String> {
+        let dir = file_path.parent().unwrap_or_else(|| Path::new("."));
+        let output = std::process::Command::new("cargo")
+            .args(["fix", "--allow-dirty", "--allow-staged"])
+            .current_dir(dir)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+}
+
 /// Gate trait for implementing quality gates.
 pub trait Gate: Send + Sync {
     /// Get the gate name.
@@ -182,6 +319,7 @@ pub trait Gate: Send + Sync {
 pub struct PreFlightGate {
     enabled: bool,
     checks: Vec<PreFlightCheck>,
+    auto_fixer: Option<AutoFixer>,
 }
 
 /// A pre-flight check.
@@ -207,6 +345,7 @@ impl PreFlightGate {
     pub fn new() -> Self {
         Self {
             enabled: true,
+            auto_fixer: None,
             checks: vec![
                 PreFlightCheck::MergeConflicts,
                 PreFlightCheck::LargeFiles { max_size_kb: 500 },
@@ -228,6 +367,12 @@ impl PreFlightGate {
     /// Set enabled.
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+
+    /// Attach an auto-fixer to attempt fixes before denying.
+    pub fn with_auto_fixer(mut self, fixer: AutoFixer) -> Self {
+        self.auto_fixer = Some(fixer);
         self
     }
 }
@@ -252,6 +397,82 @@ impl Gate for PreFlightGate {
             return GateResult::pass(self.name(), "PreFlight gate disabled");
         }
 
+        let result = self.run_checks(context);
+        if result.passed {
+            return result;
+        }
+
+        let Some(auto_fixer) = &self.auto_fixer else {
+            return result;
+        };
+
+        let files_to_fix: Vec<&str> = context
+            .violations
+            .iter()
+            .map(|v| v.file.as_str())
+            .chain(context.changed_files.iter().map(|s| s.as_str()))
+            .collect();
+
+        let mut fixed = false;
+        for attempt in 0..auto_fixer.max_attempts {
+            if attempt > 0 && !fixed {
+                break;
+            }
+            fixed = false;
+
+            for fixer in &auto_fixer.fixers {
+                for file in &files_to_fix {
+                    let file_path = Path::new(file);
+                    let has_relevant_violation = context
+                        .violations
+                        .iter()
+                        .any(|v| v.file == *file && fixer.can_fix(&v.message));
+
+                    let should_try = has_relevant_violation
+                        || (file.ends_with(".rs") && fixer.can_fix("lint"));
+
+                    if should_try {
+                        match fixer.apply_fix(file_path, "auto-fix attempt") {
+                            Ok(output) => {
+                                tracing::info!(
+                                    fixer = %fixer.name(),
+                                    file = %file,
+                                    attempt = attempt + 1,
+                                    "auto-fix applied"
+                                );
+                                let _ = output;
+                                fixed = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    fixer = %fixer.name(),
+                                    file = %file,
+                                    error = %e,
+                                    "auto-fix failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            let re_result = self.run_checks(context);
+            if re_result.passed {
+                return re_result;
+            }
+        }
+
+        result
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl PreFlightGate {
+    fn run_checks(&self, context: &GateContext) -> GateResult {
+        let gate_name = "preflight";
         let mut passed = true;
         let mut warnings = Vec::new();
         let mut suggestions = Vec::new();
@@ -350,17 +571,13 @@ impl Gate for PreFlightGate {
         }
 
         if passed {
-            GateResult::pass(self.name(), "All pre-flight checks passed")
+            GateResult::pass(gate_name, "All pre-flight checks passed")
                 .with_warning(warnings.join("; "))
         } else {
-            GateResult::fail(self.name(), "Pre-flight checks failed")
+            GateResult::fail(gate_name, "Pre-flight checks failed")
                 .with_warning(warnings.join("; "))
                 .with_suggestion(suggestions.join("; "))
         }
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.enabled
     }
 }
 

@@ -93,7 +93,7 @@ pub use compact::{
 };
 pub use config::{
     ApprovalConfig, CompressionConfig, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
-    GatewayConfig, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
+    GateAutoFixConfig, GatewayConfig, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
     McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig,
     McpTransport, McpWebSocketServerConfig, MemoryConfig, OAuthConfig, PlatformConfig as GatewayPlatformConfig,
     ProviderFallbackConfig, ProviderFallbackEntry, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
@@ -119,9 +119,9 @@ pub use doc_ingestion::{
     DocumentMetadata, IngestionResult,
 };
 pub use gates::{
-    AbortGate, ApprovalGate, EscalationGate, Gate, GateContext, GateError, GateEvaluator,
-    GateResult, HardStop, ImpactRiskLevel, ImpactSummary, PreFlightGate, PreFlightCheck,
-    RevisionCheck, RevisionGate, ViolationSeverity, ViolationType,
+    AbortGate, ApprovalGate, AutoFixer, EscalationGate, FixStrategy, Gate, GateAction,
+    GateContext, GateError, GateEvaluator, GateResult, HardStop, ImpactRiskLevel, ImpactSummary,
+    PreFlightCheck, PreFlightGate, RevisionCheck, RevisionGate, ViolationSeverity, ViolationType,
 };
 pub use wave::{
     DependencyGraph, ErrorPolicy, TaskContext, TaskId, TaskResult, TaskStatus, Wave, WaveConfig, WaveError,

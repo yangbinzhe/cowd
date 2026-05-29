@@ -536,6 +536,7 @@ pub struct RuntimeFeatureConfig {
     memory: MemoryConfig,
     compression: CompressionConfig,
     gateway: GatewayConfig,
+    gate_auto_fix: GateAutoFixConfig,
 }
 
 /// Configuration for a single named provider (OpenAI-compatible endpoint).
@@ -738,6 +739,22 @@ impl Default for GatewayConfig {
     }
 }
 
+/// Configuration for gate auto-fix behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateAutoFixConfig {
+    pub enabled: bool,
+    pub max_attempts: usize,
+}
+
+impl Default for GateAutoFixConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_attempts: 3,
+        }
+    }
+}
+
 /// Resolve the default cowd config home directory.
 #[must_use]
 pub fn default_config_home() -> PathBuf {
@@ -887,6 +904,7 @@ impl ConfigLoader {
             memory: parse_optional_memory_config(&merged_value)?,
             compression: parse_optional_compression_config(&merged_value)?,
             gateway: parse_optional_gateway_config(&merged_value)?,
+            gate_auto_fix: parse_optional_gate_auto_fix_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -1016,6 +1034,11 @@ impl RuntimeConfig {
     pub fn gateway(&self) -> &GatewayConfig {
         &self.feature_config.gateway
     }
+
+    #[must_use]
+    pub fn gate_auto_fix(&self) -> &GateAutoFixConfig {
+        &self.feature_config.gate_auto_fix
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -1120,6 +1143,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn gateway(&self) -> &GatewayConfig {
         &self.gateway
+    }
+
+    #[must_use]
+    pub fn gate_auto_fix(&self) -> &GateAutoFixConfig {
+        &self.gate_auto_fix
     }
 }
 impl McpConfigCollection {
@@ -1908,6 +1936,24 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
         enabled,
         platforms,
         session_reset,
+    })
+}
+
+fn parse_optional_gate_auto_fix_config(root: &JsonValue) -> Result<GateAutoFixConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(GateAutoFixConfig::default());
+    };
+    let Some(gv) = object.get("gateAutoFix") else {
+        return Ok(GateAutoFixConfig::default());
+    };
+    let cfg = expect_object(gv, "merged settings.gateAutoFix")?;
+    let enabled = optional_bool(cfg, "enabled", "merged settings.gateAutoFix")?
+        .unwrap_or(GateAutoFixConfig::default().enabled);
+    let max_attempts = optional_usize(cfg, "maxAttempts", "merged settings.gateAutoFix")?
+        .unwrap_or(GateAutoFixConfig::default().max_attempts);
+    Ok(GateAutoFixConfig {
+        enabled,
+        max_attempts,
     })
 }
 
