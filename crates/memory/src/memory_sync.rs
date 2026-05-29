@@ -222,7 +222,8 @@ mod tests {
     use crate::config::MemoryConfig;
     use crate::layers::shared::L4Operation;
     use crate::store::sqlite::SqliteStore;
-    use crate::types::{MemoryCategory, MemoryScope, Priority};
+    use crate::types::{MemoryCategory, Priority};
+    use crate::project_scope::MemoryScope;
 
     fn in_memory_store() -> Arc<dyn crate::store::MemoryStore> {
         let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));

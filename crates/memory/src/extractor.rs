@@ -923,6 +923,7 @@ mod tests {
             poll_interval_secs: 30,
             batch_size: 20,
             min_confidence: 0.5,
+            extractor_debounce_secs: 30,
         })
     }
 
@@ -1029,6 +1030,7 @@ mod tests {
             poll_interval_secs: 30,
             batch_size: 20,
             min_confidence: 0.99, // impossibly high
+            extractor_debounce_secs: 30,
         });
         let msgs = make_messages();
         let entries = ex.extract(&msgs).await.unwrap();

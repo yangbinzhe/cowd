@@ -993,7 +993,7 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "agent",
         aliases: &[],
         summary: "Manage sub-agents and spawned sessions",
-        argument_hint: Some("[list|spawn|kill]"),
+        argument_hint: Some("[list|spawn|kill|profile [id]]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1100,6 +1100,9 @@ pub enum SlashCommand {
     },
     Agents {
         args: Option<String>,
+    },
+    AgentProfile {
+        agent_id: Option<String>,
     },
     Skills {
         args: Option<String>,

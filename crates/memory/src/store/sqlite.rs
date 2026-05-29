@@ -502,6 +502,16 @@ END",
         "CREATE INDEX IF NOT EXISTS idx_entity_evol_name ON entity_evolution(entity_name)",
         "CREATE INDEX IF NOT EXISTS idx_entity_evol_agent ON entity_evolution(agent_id)",
         "CREATE INDEX IF NOT EXISTS idx_entity_evol_time ON entity_evolution(recorded_at_ms)",
+        // P9.1: AgentReputation — agent performance tracking
+        r"CREATE TABLE IF NOT EXISTS agent_metrics (
+    agent_id          TEXT    PRIMARY KEY,
+    tasks_completed   INTEGER NOT NULL DEFAULT 0,
+    avg_quality_score REAL    NOT NULL DEFAULT 0.0,
+    on_time_rate      REAL    NOT NULL DEFAULT 0.0,
+    domain_expertise  TEXT    NOT NULL DEFAULT '{}',
+    reputation_score  REAL    NOT NULL DEFAULT 0.0,
+    updated_at        TEXT    NOT NULL
+)",
     ];
 
     for stmt in statements {
