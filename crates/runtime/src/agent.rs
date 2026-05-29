@@ -149,6 +149,9 @@ pub struct SubAgentConfig {
     /// Capture the sub-agent's reasoning trace (ThinkingDelta events) in the result.
     #[serde(default = "default_true")]
     pub retain_reasoning: bool,
+    /// Parent session ID for delegation traceability.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 fn default_write_source() -> String {
@@ -193,6 +196,7 @@ impl Default for SubAgentConfig {
             inject_peer_context: true,
             inject_memory: true,
             retain_reasoning: true,
+            session_id: None,
         }
     }
 }
@@ -414,6 +418,10 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
         if self.registered.swap(false, Ordering::SeqCst) {
             memory::agent_directory::AgentDirectory::global()
                 .unregister(&self.agent_id);
+        }
+
+        if let Some(ref m) = self.parent_memory {
+            m.observe_delegation("sub-agent", self.task_description(), &output, None);
         }
 
         SubAgentResult {
