@@ -522,6 +522,55 @@ impl CognitiveContextManager {
         let mut entries: Vec<MemoryEntry> = Vec::new();
 
         // ═══════════════════════════════════════════════════════════════════
+        // Step 0: Closet LRU prefetch — preload hot topics based on
+        //         access counts tracked in closet pointers (F19).
+        // ═══════════════════════════════════════════════════════════════════
+        {
+            let k = self.config.tuning.prefetch_hot_topics;
+            if k > 0 {
+                // Collect hot topics (owned strings) while holding the lock,
+                // then drop the lock before async operations.
+                let hot_topics: Vec<String> = {
+                    let closet_guard = self.orchestrator.closet_manager().lock();
+                    closet_guard
+                        .get_hot_pointers(k)
+                        .into_iter()
+                        .map(|p| p.topic.clone())
+                        .collect()
+                };
+                for topic in hot_topics {
+                    let prefetch_set: HashSet<MemoryId> =
+                        entries.iter().map(|e| e.id).collect();
+                    let budget = (self.config.budget.available_tokens() / 4)
+                        .min(u64::from(u32::MAX)) as u32;
+                    match self
+                        .orchestrator
+                        .recall_relevant(&topic, None, &prefetch_set, budget)
+                        .await
+                    {
+                        Ok(mut recalled) => {
+                            for entry in &mut recalled {
+                                entry.content =
+                                    format!("[PREFETCH: {}] {}", topic, entry.content);
+                                entry.tags.push("prefetch".into());
+                                entry.source = MemorySource::Prefetch;
+                                entry.priority = Priority::High;
+                            }
+                            entries.extend(recalled);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                topic = %topic,
+                                error = %e,
+                                "closet prefetch: recall_relevant failed for hot topic"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
         // Group 1: Base layers (L0+L1) + Project layer (L2) + query embedding — independent
         // ═══════════════════════════════════════════════════════════════════
         let (l0l1_result, l2_result, query_embedding) = tokio::join!(

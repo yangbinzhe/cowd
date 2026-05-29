@@ -60,6 +60,8 @@ pub enum MemorySource {
     AutoExtracted,
     Compression,
     Import,
+    /// Injected by the closet LRU prefetch system (F19).
+    Prefetch,
 }
 
 /// Visibility level for multi-agent memory sharing.

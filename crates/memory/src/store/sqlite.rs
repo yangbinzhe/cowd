@@ -138,6 +138,7 @@ pub(crate) fn source_to_str(s: MemorySource) -> &'static str {
         MemorySource::AutoExtracted => "AutoExtracted",
         MemorySource::Compression => "Compression",
         MemorySource::Import => "Import",
+        MemorySource::Prefetch => "Prefetch",
     }
 }
 
@@ -147,6 +148,7 @@ fn str_to_source(s: &str) -> std::result::Result<MemorySource, MemoryError> {
         "AutoExtracted" => Ok(MemorySource::AutoExtracted),
         "Compression" => Ok(MemorySource::Compression),
         "Import" => Ok(MemorySource::Import),
+        "Prefetch" => Ok(MemorySource::Prefetch),
         _ => Err(MemoryError::Store(format!("unknown source: {s}"))),
     }
 }

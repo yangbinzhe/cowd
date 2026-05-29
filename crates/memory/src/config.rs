@@ -324,6 +324,8 @@ pub struct TuningConfig {
     pub closet_rebuild_ticks: u32,
     #[serde(default = "default_audit_truncate_len")]
     pub audit_truncate_len: usize,
+    #[serde(default = "default_prefetch_hot_topics")]
+    pub prefetch_hot_topics: usize,
 }
 
 fn default_sandbox_min_lines() -> usize { 2000 }
@@ -331,6 +333,7 @@ fn default_rebuild_confidence() -> f32 { 0.3 }
 fn default_freshness_trigger() -> f32 { 0.8 }
 fn default_closet_rebuild_ticks() -> u32 { 10 }
 fn default_audit_truncate_len() -> usize { 120 }
+fn default_prefetch_hot_topics() -> usize { 5 }
 
 impl Default for TuningConfig {
     fn default() -> Self {
@@ -340,6 +343,7 @@ impl Default for TuningConfig {
             freshness_trigger_ratio: 0.8,
             closet_rebuild_ticks: 10,
             audit_truncate_len: 120,
+            prefetch_hot_topics: 5,
         }
     }
 }

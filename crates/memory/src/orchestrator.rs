@@ -256,7 +256,11 @@ impl MemoryOrchestrator {
         // Phase 1: Closet topic routing – find relevant drawer IDs.
         let drawer_ids: HashSet<String> = {
             let guard = self.closet.lock();
-            guard.search_topics(query)
+            let matched = guard.search_topics(query);
+            for ptr in &matched {
+                guard.record_access(&ptr.topic);
+            }
+            matched
                 .iter()
                 .flat_map(|ptr| ptr.drawer_ids.clone())
                 .collect()
@@ -335,6 +339,12 @@ impl MemoryOrchestrator {
             kept.push(e);
         }
         Ok(kept)
+    }
+
+    /// Get a reference to the closet manager for access-tracking operations.
+    #[must_use]
+    pub fn closet_manager(&self) -> &parking_lot::Mutex<ClosetManager> {
+        &self.closet
     }
 
     /// Rebuild the Closet index from current memory store state (L2 + L3).

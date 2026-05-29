@@ -4,6 +4,11 @@
 //! queries to relevant "drawers" (memory entries) without reading full data.
 //! Ranking boost applied based on closet position (top position = highest boost).
 
+use std::{
+    sync::atomic::{AtomicI64, AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use serde::{Deserialize, Serialize};
 
 /// Closet rank boosts (borrowed from MemPalace: [0.40, 0.25, 0.15, 0.08, 0.04]).
@@ -28,7 +33,7 @@ pub enum PointerKind {
 pub type CodeSymbolId = String;
 
 /// A single pointer row in the closet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ClosetPointer {
     /// Topic keyword or phrase.
     pub topic: String,
@@ -44,6 +49,41 @@ pub struct ClosetPointer {
     pub symbol_name: Option<String>,
     /// Unique identifier for the code symbol (when kind is CodeSymbol).
     pub symbol_id: Option<CodeSymbolId>,
+    /// Access frequency counter (runtime-only, not persisted).
+    #[serde(skip)]
+    pub access_count: AtomicU64,
+    /// Unix timestamp of last access (runtime-only, not persisted).
+    #[serde(skip)]
+    pub last_accessed: AtomicI64,
+}
+
+impl Clone for ClosetPointer {
+    /// Copies all fields, initialises atomics to 0.
+    fn clone(&self) -> Self {
+        Self {
+            topic: self.topic.clone(),
+            entities: self.entities.clone(),
+            drawer_ids: self.drawer_ids.clone(),
+            relevance_score: self.relevance_score,
+            kind: self.kind,
+            symbol_name: self.symbol_name.clone(),
+            symbol_id: self.symbol_id.clone(),
+            access_count: AtomicU64::new(0),
+            last_accessed: AtomicI64::new(0),
+        }
+    }
+}
+
+impl ClosetPointer {
+    /// Record an access: increments `access_count` and updates `last_accessed`.
+    pub fn record_access(&self) {
+        self.access_count.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.last_accessed.store(now, Ordering::Relaxed);
+    }
 }
 
 /// The Closet index: a collection of pointer rows for fast topic routing.
@@ -82,6 +122,8 @@ impl Closet {
                         kind: PointerKind::Memory,
                         symbol_name: None,
                         symbol_id: None,
+                        access_count: AtomicU64::new(0),
+                        last_accessed: AtomicI64::new(0),
                     };
                     pointers.push(ptr);
                 }
@@ -291,6 +333,8 @@ impl ClosetManager {
             kind: PointerKind::CodeSymbol,
             symbol_name: Some(symbol_name.to_string()),
             symbol_id: Some(symbol_name.to_string()),
+            access_count: AtomicU64::new(0),
+            last_accessed: AtomicI64::new(0),
         };
 
         self.closet.pointers.push(ptr);
@@ -315,6 +359,32 @@ impl ClosetManager {
                     && p.symbol_name.as_deref() == Some(name)
             })
             .and_then(|p| p.symbol_id.clone())
+    }
+
+    /// Record an access for the pointer with the given topic.
+    ///
+    /// This is called each time a closet pointer is matched during
+    /// `recall_relevant`, so that the hottest topics can be prefetched.
+    pub fn record_access(&self, topic: &str) {
+        if let Some(ptr) = self.closet.pointers.iter().find(|p| p.topic == topic) {
+            ptr.record_access();
+        }
+    }
+
+    /// Return the top `k` pointers sorted by `access_count` (descending).
+    ///
+    /// Used by the cognitive context manager to prefetch hot topics
+    /// before assembling the context for a new turn.
+    #[must_use]
+    pub fn get_hot_pointers(&self, k: usize) -> Vec<&ClosetPointer> {
+        let mut sorted: Vec<&ClosetPointer> = self.closet.pointers.iter().collect();
+        sorted.sort_by(|a, b| {
+            b.access_count
+                .load(Ordering::Relaxed)
+                .cmp(&a.access_count.load(Ordering::Relaxed))
+        });
+        sorted.truncate(k);
+        sorted
     }
 
     /// Return the total number of pointer rows in the closet.
