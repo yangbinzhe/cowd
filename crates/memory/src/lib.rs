@@ -38,6 +38,7 @@ pub mod extractor;
 pub mod handoff;
 pub mod hot_reload;
 pub mod layers;
+pub mod memory_sync;
 pub mod orchestrator;
 pub mod resolution;
 pub mod seeds;
@@ -177,6 +178,9 @@ pub use impact_analyzer::{CallGraph, ImpactAnalyzer};
 
 // --- Agent directory re-exports (P7.3) ---
 pub use agent_directory::{AgentDirectory, AgentInfo, AgentStatus};
+
+// --- Memory sync re-exports (P8.4) ---
+pub use memory_sync::MemorySyncProtocol;
 
 // --- Transaction re-exports (F20) ---
 pub use transaction::{
