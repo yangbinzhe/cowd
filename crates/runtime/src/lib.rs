@@ -74,6 +74,7 @@ pub mod worker_boot;
 pub mod tool_orchestrator;
 pub mod tool_dispatch;
 pub mod agent;
+pub mod agent_collaboration;
 pub mod approval_gate;
 pub mod pairing;
 pub mod mirror;
@@ -81,8 +82,11 @@ pub mod model_registry;
 pub mod profile;
 
 pub use agent::{
-    SubAgentConfig, SubAgentError, SubAgentProgressCallback, SubAgentResult,
+    SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback, SubAgentResult,
     SubAgentToolMode,
+};
+pub use agent_collaboration::{
+    AgentTeam, CollaborationOrchestrator, CollaborationTask, SubTask,
 };
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};

@@ -24,6 +24,23 @@ pub trait SubAgentProgressCallback: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// SubAgentExecutor
+// ---------------------------------------------------------------------------
+
+/// Trait for executing a sub-agent with a given configuration and task.
+///
+/// Implementations provide the runtime machinery to spawn and run a sub-agent,
+/// returning a structured `SubAgentResult` or a `SubAgentError`.
+/// This is a static dispatch trait — callers invoke `E::execute(config, task)`
+/// for a concrete type `E`.
+pub trait SubAgentExecutor: Send + Sync {
+    fn execute(
+        config: SubAgentConfig,
+        task: &str,
+    ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send;
+}
+
+// ---------------------------------------------------------------------------
 // AgentRole
 // ---------------------------------------------------------------------------
 
