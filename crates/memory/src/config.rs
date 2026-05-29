@@ -96,12 +96,16 @@ pub struct DriftConfig {
     /// Jaccard similarity threshold for contradiction detection.
     #[serde(default = "default_jaccard_threshold")]
     pub contradiction_jaccard_threshold: f32,
+    /// Staleness threshold above which Low-priority entries are evicted (L1).
+    #[serde(default = "default_low_priority_prune_threshold")]
+    pub low_priority_prune_threshold: f32,
 }
 
 fn default_decay() -> f32 { 0.02 }
 fn default_review_threshold() -> f32 { 0.7 }
 fn default_prune_threshold() -> f32 { 0.95 }
 fn default_jaccard_threshold() -> f32 { 0.6 }
+fn default_low_priority_prune_threshold() -> f32 { 0.8 }
 
 impl Default for DriftConfig {
     fn default() -> Self {
@@ -110,6 +114,7 @@ impl Default for DriftConfig {
             review_threshold: 0.7,
             prune_threshold: 0.95,
             contradiction_jaccard_threshold: 0.6,
+            low_priority_prune_threshold: 0.8,
         }
     }
 }
@@ -281,10 +286,44 @@ pub struct MemoryConfig {
     pub extractor: ExtractorConfig,
     pub drift: DriftConfig,
     pub perf: PerfBudget,
+    pub tuning: TuningConfig,
     /// Target model name for adaptive compression thresholds.
     /// When set, compression parameters auto-adjust based on model profile.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+/// Tunable thresholds that were previously hard-coded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TuningConfig {
+    #[serde(default = "default_sandbox_min_lines")]
+    pub sandbox_min_lines: usize,
+    #[serde(default = "default_rebuild_confidence")]
+    pub rebuild_confidence: f32,
+    #[serde(default = "default_freshness_trigger")]
+    pub freshness_trigger_ratio: f32,
+    #[serde(default = "default_closet_rebuild_ticks")]
+    pub closet_rebuild_ticks: u32,
+    #[serde(default = "default_audit_truncate_len")]
+    pub audit_truncate_len: usize,
+}
+
+fn default_sandbox_min_lines() -> usize { 2000 }
+fn default_rebuild_confidence() -> f32 { 0.3 }
+fn default_freshness_trigger() -> f32 { 0.8 }
+fn default_closet_rebuild_ticks() -> u32 { 10 }
+fn default_audit_truncate_len() -> usize { 120 }
+
+impl Default for TuningConfig {
+    fn default() -> Self {
+        Self {
+            sandbox_min_lines: 2000,
+            rebuild_confidence: 0.3,
+            freshness_trigger_ratio: 0.8,
+            closet_rebuild_ticks: 10,
+            audit_truncate_len: 120,
+        }
+    }
 }
 
 impl Default for MemoryConfig {
@@ -296,6 +335,7 @@ impl Default for MemoryConfig {
             extractor: ExtractorConfig::default(),
             drift: DriftConfig::default(),
             perf: PerfBudget::default(),
+            tuning: TuningConfig::default(),
             model: None,
         }
     }

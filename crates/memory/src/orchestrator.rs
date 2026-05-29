@@ -811,7 +811,7 @@ impl MemoryOrchestrator {
 
     /// Check if the Closet should be rebuilt and return true if it's time.
     pub fn should_rebuild_closet(&self) -> bool {
-        self.closet_rebuild_counter.load(Ordering::Relaxed) % 10 == 0
+        self.closet_rebuild_counter.load(Ordering::Relaxed) % self.config.tuning.closet_rebuild_ticks == 0
     }
 
     /// Force an immediate Closet rebuild.

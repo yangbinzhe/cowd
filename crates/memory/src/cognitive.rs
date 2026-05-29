@@ -497,7 +497,7 @@ impl CognitiveContextManager {
         // ── Step 2a2: State rebuild from previous session state ──────────────
         if let Some(ref rebuilder) = self.state_rebuilder {
             let rebuilt = rebuilder.quick_rebuild().await;
-            if rebuilt.overall_confidence > 0.3 {
+            if rebuilt.overall_confidence > self.config.tuning.rebuild_confidence {
                 if let Some(ref summary) = rebuilt.context_summary {
                     entries.push(MemoryEntry {
                         id: uuid::Uuid::new_v4(),
@@ -855,12 +855,13 @@ impl CognitiveContextManager {
         } else {
             1.0
         };
-        if budget_usage_ratio > 0.8 {
+        if budget_usage_ratio > self.config.tuning.freshness_trigger_ratio {
             tracing::info!(
                 ratio = %budget_usage_ratio,
                 used = %used_tokens,
                 available = %budget.available,
-                "freshness priority activated: budget > 80%"
+                "freshness priority activated: budget > {:.0}%",
+                self.config.tuning.freshness_trigger_ratio * 100.0
             );
             let entry_count = entries.len();
             entries = self
@@ -1118,7 +1119,7 @@ impl CognitiveContextManager {
             for msg in messages.iter().filter(|m| matches!(m.role, MessageRole::Tool)) {
                 let call_id = msg.tool_use_id.as_deref().unwrap_or("unknown");
                 let tool_name = msg.tool_name.as_deref().unwrap_or("unknown_tool");
-                let threshold = 2000;
+                let threshold = self.config.tuning.sandbox_min_lines;
                 if let Some(summary) = sandbox.index_tool_output(call_id, tool_name, &msg.content, threshold) {
                     tracing::info!(
                         call_id,
@@ -1474,7 +1475,7 @@ impl CognitiveContextManager {
                     entry_id: entry.id.to_string(),
                     layer: format!("{:?}", entry.layer),
                     source: self.write_guard.as_ref().map(|g| g.source()).unwrap_or(WriteSource::System),
-                    summary: truncate_summary(&entry.content, 120),
+                    summary: truncate_summary(&entry.content, self.config.tuning.audit_truncate_len),
                     agent_id: None,
                     session_id: None,
                 });
@@ -1547,7 +1548,8 @@ impl CognitiveContextManager {
                         entry_id: id.to_string(),
                         layer: format!("{:?}", entry.layer),
                         source: self.write_guard.as_ref().map(|g| g.source()).unwrap_or(WriteSource::System),
-                        summary: truncate_summary(&entry.content, 120),
+                    summary: truncate_summary(&entry.content, self.config.tuning.audit_truncate_len),
+
                         agent_id: None,
                         session_id: None,
                     });

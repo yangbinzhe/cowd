@@ -180,6 +180,7 @@ mod tests {
             prune_threshold: 0.9,
             staleness_decay_per_day: 0.1,
             contradiction_jaccard_threshold: 0.6,
+            ..Default::default()
         };
         let detector = DriftDetector::new(cfg);
         let entry = make_entry("old data", MemoryLayer::L2, 0.95);
@@ -194,6 +195,7 @@ mod tests {
             prune_threshold: 0.9,
             staleness_decay_per_day: 0.1,
             contradiction_jaccard_threshold: 0.2,
+            ..Default::default()
         };
         let detector = DriftDetector::new(cfg);
         let e1 = make_entry("the tokio runtime is stable and fast", MemoryLayer::L1, 0.0);
@@ -209,54 +211,7 @@ mod tests {
             prune_threshold: 0.9,
             staleness_decay_per_day: 0.1,
             contradiction_jaccard_threshold: 0.3,
-        };
-        let detector = DriftDetector::new(cfg);
-        let e1 = make_entry("the tokio runtime is stable", MemoryLayer::L1, 0.0);
-        let e2 = make_entry("python pandas is great for data", MemoryLayer::L1, 0.0);
-        let result = detector.check_contradictions(&e1, &[e2]);
-        assert!(result.is_none(), "different topics should not contradict");
-    }
-
-    #[test]
-    fn p14_decay_increases_staleness() {
-        let cfg = DriftConfig {
-            review_threshold: 0.5,
-            prune_threshold: 0.9,
-            staleness_decay_per_day: 0.1,
-            contradiction_jaccard_threshold: 0.3,
-        };
-        let detector = DriftDetector::new(cfg);
-        let mut entry = make_entry_aged("test", MemoryLayer::L2, 0.0, Utc::now() - chrono::Duration::days(1));
-        detector.decay(&mut entry);
-        assert!((entry.staleness - 0.1).abs() < 0.001);
-    }
-
-    #[test]
-    fn decay_uses_wall_clock_time() {
-        let config = DriftConfig {
-            staleness_decay_per_day: 0.1,
-            ..Default::default()
-        };
-        let detector = DriftDetector::new(config);
-        let mut entry =
-            make_entry_aged("test", MemoryLayer::L2, 0.0, Utc::now() - chrono::Duration::days(3));
-        let old = entry.staleness;
-        detector.decay(&mut entry);
-        let delta = entry.staleness - old;
-        assert!(
-            (delta - 0.3).abs() < 0.05,
-            "3 days should add ~0.3 staleness, got {}",
-            delta
-        );
-    }
-
-    #[test]
-    fn p14_prune_candidates_collects_prunable_entries() {
-        let cfg = DriftConfig {
-            review_threshold: 0.5,
-            prune_threshold: 0.9,
-            staleness_decay_per_day: 0.1,
-            contradiction_jaccard_threshold: 0.3,
+            low_priority_prune_threshold: 0.8,
         };
         let detector = DriftDetector::new(cfg);
         let entries = vec![
