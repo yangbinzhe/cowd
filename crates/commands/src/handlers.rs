@@ -67,6 +67,10 @@ pub fn handle_slash_command(
         SlashCommand::Branch { name } => {
             agent_alias("/branch", &name.unwrap_or_default(), session)
         }
+        SlashCommand::Solve { problem } => {
+            let prompt = format!("Solve the following problem using the Joint Problem Solving protocol (P8.3):\n\n{}\n\nFollow the 7-phase protocol: ProblemFraming, SolutionBrainstorming, SolutionMerger, Evaluation, Selection, Execution, Review.", problem.as_deref().unwrap_or("please describe your problem"));
+            agent_alias("/solve", &prompt, session)
+        }
         SlashCommand::Unknown(name)
             if matches!(
                 name.as_str(),
@@ -609,7 +613,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 140);
+        assert_eq!(slash_command_specs().len(), 141);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

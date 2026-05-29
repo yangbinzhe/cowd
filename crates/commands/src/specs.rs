@@ -1031,6 +1031,13 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: None,
         resume_supported: true,
     },
+    SlashCommandSpec {
+        name: "solve",
+        aliases: &[],
+        summary: "Joint problem solving — collaborate with agents to solve a problem",
+        argument_hint: Some("\"problem description\""),
+        resume_supported: false,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1200,6 +1207,9 @@ pub enum SlashCommand {
     },
     Pipeline {
         task: Option<String>,
+    },
+    Solve {
+        problem: Option<String>,
     },
     Unknown(String),
 }

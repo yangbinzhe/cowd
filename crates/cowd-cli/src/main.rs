@@ -2529,6 +2529,7 @@ fn run_resume_command(
         | SlashCommand::NewSession
         | SlashCommand::Title { .. }
         | SlashCommand::Compress
+        | SlashCommand::Solve { .. }
         | SlashCommand::State => Err("unsupported resumed slash command".into()),
     }
 }
@@ -4148,6 +4149,34 @@ impl LiveCli {
                     let _ = self.run_turn("[Reviewer] Review the implementation. Check correctness and completeness.");
                 } else {
                     println!("Usage: /pipeline <task description>");
+                }
+                false
+            }
+            SlashCommand::Solve { problem } => {
+                let p = problem.as_deref().unwrap_or("");
+                if p.is_empty() {
+                    println!("Usage: /solve \"problem description\"");
+                    println!("Runs the 7-phase Joint Problem Solving protocol (P8.3).");
+                } else {
+                    println!("## Joint Problem Solving (P8.3)");
+                    println!("Problem: {p}");
+                    println!("Phases: ProblemFraming → SolutionBrainstorming → SolutionMerger → Evaluation → Selection → Execution → Review");
+                    let prompt = format!(
+                        "Solve the following problem using the Joint Problem Solving protocol (P8.3).\n\n\
+                         ## Problem\n{p}\n\n\
+                         Follow the 7-phase protocol:\n\
+                         1. ProblemFraming - Analyze and frame the problem\n\
+                         2. SolutionBrainstorming - Propose concrete solutions\n\
+                         3. SolutionMerger - Deduplicate and merge similar solutions\n\
+                         4. Evaluation - Score all solutions on clarity, feasibility, novelty, impact, efficiency\n\
+                         5. Selection - Select the best solution\n\
+                         6. Execution - Implement the selected solution\n\
+                         7. Review - Review the results\n\n\
+                         Begin with Phase 1: ProblemFraming."
+                    );
+                    if let Err(e) = self.run_turn(&prompt) {
+                        eprintln!("Solve error: {e}");
+                    }
                 }
                 false
             }

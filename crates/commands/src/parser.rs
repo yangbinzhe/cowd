@@ -101,6 +101,7 @@ impl SlashCommand {
             Self::State => "/state",
             Self::SubAgent { .. } => "/subagent",
             Self::Pipeline { .. } => "/pipeline",
+            Self::Solve { .. } => "/solve",
             #[allow(unreachable_patterns)]
             _ => "/unknown",
         }
@@ -336,6 +337,9 @@ pub fn validate_slash_command_input(
         "state" => SlashCommand::State,
         "pipeline" => {
             SlashCommand::Pipeline { task: args.first().map(|s| s.to_string()) }
+        }
+        "solve" => {
+            SlashCommand::Solve { problem: args.first().map(|s| s.to_string()) }
         }
         other => SlashCommand::Unknown(other.to_string()),
     }))
