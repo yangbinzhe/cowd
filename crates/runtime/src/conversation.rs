@@ -1674,14 +1674,17 @@ self.record_turn_completed(&summary);
     /// hot path has zero cost.
     async fn prepare_memory_context(&self, user_input: &str) -> Vec<String> {
         let _perf_start = std::time::Instant::now();
-        let memory_high = self.cached_prompt.memory_high_count();
-        if !self.cached_prompt.needs_rebuild(memory_high) {
-            return self.cached_prompt.get();
-        }
+
+        // P5.2: Global invalidation (file changes, max age).
+        self.cached_prompt.check_global();
+
         let Some(mgr) = self.memory_manager.as_ref() else {
-            let prompt = self.system_prompt.clone();
-            self.cached_prompt.rebuild(prompt.clone(), 0);
-            return prompt;
+            // No memory manager — cache empty for all layers, return base prompt.
+            use crate::cached_prompt::CacheLayer;
+            for &layer in &CacheLayer::all() {
+                self.cached_prompt.rebuild_layer(layer, Vec::new(), 0);
+            }
+            return self.system_prompt.clone();
         };
 
         // Convert session messages to memory's Message type for context scoring.
@@ -1748,6 +1751,11 @@ self.record_turn_completed(&summary);
                     if let Some(cb) = &self.memory_callback {
                         cb.on_memory_update(Vec::new(), "no memories found");
                     }
+                    // Cache empty for all layers.
+                    use crate::cached_prompt::CacheLayer;
+                    for &layer in &CacheLayer::all() {
+                        self.cached_prompt.rebuild_layer(layer, Vec::new(), 0);
+                    }
                     return self.system_prompt.clone();
                 }
 
@@ -1775,20 +1783,50 @@ self.record_turn_completed(&summary);
                 let max_entries = prepared.entries.len().min(20);
                 prepared.entries.truncate(max_entries);
 
-                let mut context = String::from("<memory_context>\n");
+                // P5.2: Build per-layer entry fragments with per-layer staleness checks.
+                use crate::cached_prompt::CacheLayer;
+                let mut entries_by_layer: std::collections::HashMap<CacheLayer, Vec<&memory::types::MemoryEntry>> = std::collections::HashMap::new();
                 for entry in &prepared.entries {
                     if used >= budget { break; }
                     let tokens = (entry.title.len() + entry.content.len()) as u64 / 4;
                     used += tokens;
-
-                    let layer_tag = match entry.layer {
-                        MemoryLayer::L0 => "identity", MemoryLayer::L1 => "working",
-                        MemoryLayer::L2 => "project", MemoryLayer::L3 => "recall", MemoryLayer::L4 => "raw",
+                    let cl = match entry.layer {
+                        MemoryLayer::L0 => CacheLayer::L0,
+                        MemoryLayer::L1 => CacheLayer::L1,
+                        MemoryLayer::L2 => CacheLayer::L2,
+                        MemoryLayer::L3 => CacheLayer::L3,
+                        MemoryLayer::L4 => CacheLayer::L4,
                     };
-                    context.push_str(&format!(
-                        "  <entry layer=\"{}\" confidence=\"{:.2}\">\n    <title>{}</title>\n    <content>{}</content>\n  </entry>\n",
-                        layer_tag, entry.confidence, entry.title, entry.content
-                    ));
+                    entries_by_layer.entry(cl).or_default().push(entry);
+                }
+
+                for cache_layer in CacheLayer::all() {
+                    let entries = entries_by_layer.remove(&cache_layer).unwrap_or_default();
+                    let count = entries.len();
+
+                    if self.cached_prompt.needs_rebuild(cache_layer, count) {
+                        let mut layer_text = String::new();
+                        for entry in &entries {
+                            let layer_tag = match entry.layer {
+                                MemoryLayer::L0 => "identity", MemoryLayer::L1 => "working",
+                                MemoryLayer::L2 => "project", MemoryLayer::L3 => "recall", MemoryLayer::L4 => "raw",
+                            };
+                            layer_text.push_str(&format!(
+                                "  <entry layer=\"{}\" confidence=\"{:.2}\">\n    <title>{}</title>\n    <content>{}</content>\n  </entry>\n",
+                                layer_tag, entry.confidence, entry.title, entry.content
+                            ));
+                        }
+                        self.cached_prompt.rebuild_layer(cache_layer, vec![layer_text], count);
+                    }
+                }
+
+                // Compose full context from cached per-layer fragments.
+                let mut context = String::from("<memory_context>\n");
+                for cache_layer in CacheLayer::all() {
+                    let fragment = self.cached_prompt.get_layer(cache_layer);
+                    for line in &fragment {
+                        context.push_str(line);
+                    }
                 }
                 context.push_str("</memory_context>");
 
@@ -1836,10 +1874,6 @@ self.record_turn_completed(&summary);
                     }
                 }
 
-                let actual_memory_high = prepared.entries.iter()
-                    .filter(|e| matches!(e.layer, MemoryLayer::L0 | MemoryLayer::L1))
-                    .count();
-
                 if let Some(cb) = &self.memory_callback {
                     let entries: Vec<(String, String, f64)> = prepared.entries.iter()
                         .map(|e| (format!("{:?}", e.layer), e.content.clone(), e.confidence as f64))
@@ -1851,7 +1885,6 @@ self.record_turn_completed(&summary);
                 tracing::debug!(entries = prepared.entries.len(), "memory context prepared");
                 let mut prompt = self.system_prompt.clone();
                 prompt.insert(0, context);
-                self.cached_prompt.rebuild(prompt.clone(), actual_memory_high);
                 prompt
             }
             Err(err) => {
