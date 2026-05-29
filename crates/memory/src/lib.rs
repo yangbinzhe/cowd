@@ -25,6 +25,7 @@
 
 // --- Public modules ---
 
+pub mod agent_directory;
 pub mod cognitive;
 pub mod compression;
 pub mod config;
@@ -172,6 +173,9 @@ pub use code_indexer::{
 
 // --- Impact analyzer re-exports (F17) ---
 pub use impact_analyzer::{CallGraph, ImpactAnalyzer};
+
+// --- Agent directory re-exports (P7.3) ---
+pub use agent_directory::{AgentDirectory, AgentInfo, AgentStatus};
 
 // --- Transaction re-exports (F20) ---
 pub use transaction::{

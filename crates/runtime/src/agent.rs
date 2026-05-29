@@ -4,6 +4,7 @@
 //! a write guard that prevents writing to protected memory layers (L0/L1),
 //! and a token budget that caps its execution.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -78,9 +79,19 @@ pub struct SubAgentConfig {
     /// Tool access mode: full, read-only, or custom allowlist.
     #[serde(default)]
     pub tool_mode: SubAgentToolMode,
+    /// Human-readable role label for agent discovery (e.g. "Executor", "Reviewer").
+    #[serde(default = "default_agent_role")]
+    pub agent_role: String,
+    /// Declared capabilities for mutual discovery (e.g. ["rust", "testing"]).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 fn default_write_source() -> String {
+    "SubAgent".to_string()
+}
+
+fn default_agent_role() -> String {
     "SubAgent".to_string()
 }
 
@@ -108,6 +119,8 @@ impl Default for SubAgentConfig {
             max_parallel: default_max_parallel(),
             model: None,
             tool_mode: SubAgentToolMode::default(),
+            agent_role: default_agent_role(),
+            capabilities: vec![],
         }
     }
 }
@@ -236,12 +249,33 @@ pub struct SubAgentRuntime<C: ApiClient, T: ToolExecutor> {
     progress_callback: Option<Arc<dyn SubAgentProgressCallback>>,
     /// Reference to parent's memory manager for L4 `team_remember` sharing.
     parent_memory: Option<Arc<CognitiveContextManager>>,
+    /// Unique identifier for this agent instance (used for AgentDirectory registration).
+    agent_id: String,
+    /// Whether this agent has been registered in the global AgentDirectory.
+    registered: AtomicBool,
 }
 
 impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
     /// Create a new sub-agent runtime with the given configuration and conversation runtime.
     #[must_use]
     pub fn new(config: SubAgentConfig, runtime: ConversationRuntime<C, T>) -> Self {
+        let agent_id = uuid::Uuid::new_v4().to_string();
+
+        // Register this sub-agent in the global agent directory.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let info = memory::agent_directory::AgentInfo {
+            agent_id: agent_id.clone(),
+            role: config.agent_role.clone(),
+            capabilities: config.capabilities.clone(),
+            status: memory::agent_directory::AgentStatus::Active,
+            registered_at_ms: now_ms,
+            last_heartbeat_ms: now_ms,
+        };
+        memory::agent_directory::AgentDirectory::global().register(info);
+
         Self {
             result_budget: ToolResultBudget::default(),
             turns_executed: 0,
@@ -249,6 +283,8 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             started_at: Instant::now(),
             progress_callback: None,
             parent_memory: None,
+            agent_id,
+            registered: AtomicBool::new(true),
             config,
             runtime,
         }
@@ -326,6 +362,12 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
 
     /// Build the result from the current state.
     pub fn build_result(&self, output: String) -> SubAgentResult {
+        // Unregister from the global agent directory on first result build.
+        if self.registered.swap(false, Ordering::SeqCst) {
+            memory::agent_directory::AgentDirectory::global()
+                .unregister(&self.agent_id);
+        }
+
         SubAgentResult {
             output,
             tool_call_count: 0, // caller should track
