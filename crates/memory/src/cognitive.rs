@@ -63,6 +63,7 @@ use crate::{ MemoryScope, SessionResume,
     },
     write_guard::{AuditLog, AuditOperation, AuditEntry, IntegrityChecker, MemoryWriteGuard, WriteSource},
 };
+use crate::performance_monitor::{AutoTuner, PerformanceMonitor};
 
 /// Result alias used throughout this module.
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -197,6 +198,12 @@ pub struct CognitiveContextManager {
     l2_cache: Arc<Mutex<Option<CachedLayer>>>,
     /// Receiver for L4 push notifications from the event bus.
     l4_event_rx: Mutex<Option<tokio::sync::broadcast::Receiver<crate::layers::shared::L4Event>>>,
+    /// Performance metrics collector (rolling window).
+    perf_monitor: PerformanceMonitor,
+    /// Auto-tuner that adjusts TuningConfig based on observed performance.
+    auto_tuner: AutoTuner,
+    /// Cross-agent entity evolution tracker (P9.3).
+    entity_registry: Mutex<Option<crate::entity_registry::EntityRegistry>>,
 }
 
 impl CognitiveContextManager {
@@ -475,6 +482,9 @@ impl CognitiveContextManager {
             l4_event_rx: Mutex::new(
                 orchestrator.l4_event_bus().map(|bus| bus.subscribe())
             ),
+            perf_monitor: PerformanceMonitor::default(),
+            auto_tuner: AutoTuner::new(config.tuning.clone()),
+            entity_registry: Mutex::new(None),
             config,
             orchestrator,
             pipeline,
@@ -641,8 +651,42 @@ impl CognitiveContextManager {
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // Step 0: Closet LRU prefetch — preload hot topics based on
-        //         access counts tracked in closet pointers (F19).
+        // Step 0: L4 team query — pull shared entries from other agents
+        //         before loading base layers (feature-gated).
+        // ═══════════════════════════════════════════════════════════════════
+        if self.config.tuning.l4_push_enabled {
+            match self
+                .orchestrator
+                .team_query(&query, Some(&MemoryScope::Global), 5)
+                .await
+            {
+                Ok(mut team_entries) => {
+                    for entry in &mut team_entries {
+                        entry.priority = Priority::High;
+                        entry
+                            .tags
+                            .push("l4_team_query".into());
+                    }
+                    let count = team_entries.len();
+                    entries.extend(team_entries);
+                    tracing::debug!(
+                        count,
+                        "prepare_context: injected {} L4 team entries",
+                        count
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "prepare_context: L4 team query failed"
+                    );
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Step 0a: Closet LRU prefetch — preload hot topics based on
+        //          access counts tracked in closet pointers (F19).
         // ═══════════════════════════════════════════════════════════════════
         {
             let k = self.config.tuning.prefetch_hot_topics;
@@ -703,9 +747,11 @@ impl CognitiveContextManager {
                 .map(|c| c.entries.clone());
 
             if let (Some(l0), Some(l1)) = (l0_hit, l1_hit) {
+                self.perf_monitor.record_cache_hit();
                 entries.extend(l0);
                 entries.extend(l1);
             } else {
+                self.perf_monitor.record_cache_miss();
                 let fixed = self.orchestrator.load_fixed_layers().await?;
                 let l0: Vec<_> = fixed.iter()
                     .filter(|e| matches!(e.layer, MemoryLayer::L0))
@@ -739,8 +785,10 @@ impl CognitiveContextManager {
                 .filter(|c| c.cached_at.elapsed() < Duration::from_secs(self.config.tuning.l2_cache_ttl_secs))
                 .map(|c| c.entries.clone());
             if let Some(l2) = l2_hit {
+                self.perf_monitor.record_cache_hit();
                 entries.extend(l2);
             } else {
+                self.perf_monitor.record_cache_miss();
                 let l2 = self.orchestrator.load_project_context().await?;
                 *self.l2_cache.lock() = Some(CachedLayer {
                     entries: l2.clone(),
@@ -1289,9 +1337,10 @@ impl CognitiveContextManager {
             1.0
         };
 
-        let elapsed_ms = _prepare_start.elapsed().as_millis();
+        let elapsed = _prepare_start.elapsed();
+        self.perf_monitor.record_prepare_context(elapsed);
         tracing::debug!(
-            elapsed_ms,
+            elapsed_ms = elapsed.as_millis(),
             entries = entries.len(),
             total_tokens,
             "prepare_context complete"
@@ -1357,6 +1406,7 @@ impl CognitiveContextManager {
     ///
     /// Failures are logged and swallowed so they never abort the turn.
     pub async fn extract_and_remember(&self, messages: &[Message]) -> Result<()> {
+        let _extract_start = Instant::now();
         // ── 0. Extract and persist memories ──────────────────────────────────
         let mut pending_embeddings: Vec<(MemoryId, String)> = Vec::new();
         if messages.len() >= 2 {
@@ -1415,6 +1465,22 @@ impl CognitiveContextManager {
                 for entry in &heuristic_entries {
                     pending_embeddings.push((entry.id, entry.content.clone()));
                 }
+
+                for entry in &heuristic_entries {
+                    if entry.confidence > 0.7 {
+                        let _ = self
+                            .orchestrator
+                            .team_remember(
+                                &entry.title,
+                                &entry.content,
+                                Priority::Normal,
+                                vec![format!("{:?}", entry.category)],
+                                MemoryScope::Project(String::new()),
+                            )
+                            .await;
+                    }
+                }
+
                 match self.orchestrator.remember_batch(heuristic_entries).await {
                     Ok(_) => {
                         tracing::debug!(
@@ -1496,6 +1562,9 @@ impl CognitiveContextManager {
                 }
             }
         }
+
+        let _extract_elapsed = _extract_start.elapsed();
+        self.perf_monitor.record_extract(_extract_elapsed);
 
         Ok(())
     }
@@ -1580,7 +1649,24 @@ impl CognitiveContextManager {
         // ── Extract ── Drift+Seeds ── Maintenance ──────────────────────
         let _ = self.extract_and_remember(messages).await;
         let _ = self.run_drift_and_seeds(messages).await;
-        self.run_memory_maintenance(messages).await
+        let result = self.run_memory_maintenance(messages).await;
+
+        // ── Auto-tune evaluation ──────────────────────────────────────────
+        if self.auto_tuner.evaluate(&self.perf_monitor) {
+            let cfg = self.auto_tuner.config();
+            tracing::info!(
+                adjustments = self.auto_tuner.adjustments_applied(),
+                prefetch = cfg.prefetch_hot_topics,
+                l0_ttl = cfg.l0_cache_ttl_secs,
+                l1_ttl = cfg.l1_cache_ttl_secs,
+                l2_ttl = cfg.l2_cache_ttl_secs,
+                sandbox_lines = cfg.sandbox_min_lines,
+                freshness_trigger = cfg.freshness_trigger_ratio,
+                "auto_tuner: applied adjustments to TuningConfig"
+            );
+        }
+
+        result
     }
 
     /// Remaining post-turn maintenance: fact-checker, compaction, tick,
@@ -1589,6 +1675,7 @@ impl CognitiveContextManager {
     /// Call this *after* `extract_and_remember` and `run_drift_and_seeds`
     /// have completed (whether sequentially or via `tokio::join!`).
     pub async fn run_memory_maintenance(&self, messages: &mut Vec<Message>) -> Result<()> {
+        let _post_turn_start = Instant::now();
         // ── 0c. Auto-correct contradictions via fact checker ──────────────
         {
             let mut fc = crate::orchestrator::get_fact_checker().lock();
@@ -1602,6 +1689,7 @@ impl CognitiveContextManager {
         }
 
         // ── 1. Micro compact ────────────────────────────────────────────────
+        let pre_compact_tokens: u64 = messages.iter().map(|m| u64::from(m.token_estimate())).sum();
         self.pipeline.micro_compact(messages);
 
         // ── 1b. AAAK compact ────────────────────────────────────────────────
@@ -1610,6 +1698,13 @@ impl CognitiveContextManager {
         // ── 2. Session compact if threshold exceeded ─────────────────────────
         if self.pipeline.should_session_compact(messages) {
             self.pipeline.session_compact(messages, &self.orchestrator).await?;
+        }
+
+        // Record compression ratio (post / pre)
+        let post_compact_tokens: u64 = messages.iter().map(|m| u64::from(m.token_estimate())).sum();
+        if pre_compact_tokens > 0 {
+            let ratio = post_compact_tokens as f64 / pre_compact_tokens as f64;
+            self.perf_monitor.record_compression_ratio(ratio);
         }
 
         // ── 5. Run orchestrator maintenance tick ─────────────────────────────
@@ -1748,6 +1843,9 @@ impl CognitiveContextManager {
                 Err(e) => tracing::warn!("failed to serialize seeds: {}", e),
             }
         }
+
+        let _post_turn_elapsed = _post_turn_start.elapsed();
+        self.perf_monitor.record_extract(_post_turn_elapsed);
 
         Ok(())
     }
@@ -2619,6 +2717,26 @@ impl CognitiveContextManager {
         } else {
             RotAlert::None
         }
+    }
+
+    // ── Performance report (P9.4) ────────────────────────────────────────
+
+    /// Return a snapshot of current performance metrics and auto-tuner state.
+    #[must_use]
+    pub fn performance_report(&self) -> crate::performance_monitor::PerformanceReport {
+        let last_tuning = self
+            .auto_tuner
+            .last_tuning_instant()
+            .map(|i| {
+                let elapsed = i.elapsed();
+                // Approximate wall-clock DateTime by subtracting from now
+                Utc::now()
+                    - chrono::Duration::from_std(elapsed)
+                        .unwrap_or_else(|_| chrono::Duration::seconds(0))
+            });
+        let tuning_applied = self.auto_tuner.adjustments_applied() > 0;
+        let tuning_config = self.auto_tuner.config();
+        self.perf_monitor.report(&tuning_config, tuning_applied, last_tuning)
     }
 }
 

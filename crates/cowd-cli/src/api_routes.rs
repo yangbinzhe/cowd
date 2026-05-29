@@ -86,6 +86,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
         .route("/api/memory", get(memory_handler))
         .route("/api/memory/search", get(memory_search_handler))
+        .route("/api/memory/performance", get(performance_handler))
         .route("/api/tools", get(tools_handler))
         .route("/api/config", get(config_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
@@ -477,6 +478,19 @@ async fn memory_search_handler(
         }
     } else {
         Json(serde_json::json!({ "results": [] }))
+    }
+}
+
+async fn performance_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    if let Some(ref mgr) = state.memory_manager {
+        let report = mgr.performance_report();
+        Json(serde_json::json!(report))
+    } else {
+        Json(serde_json::json!({
+            "error": "memory not configured",
+        }))
     }
 }
 

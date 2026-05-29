@@ -67,6 +67,7 @@ pub mod code_indexer;
 pub mod session_resume;
 pub mod project_scope;
 pub mod impact_analyzer;
+pub mod performance_monitor;
 pub mod tool_sandbox;
 pub mod tiered_store;
 pub mod transaction;
@@ -176,11 +177,17 @@ pub use code_indexer::{
 // --- Impact analyzer re-exports (F17) ---
 pub use impact_analyzer::{CallGraph, ImpactAnalyzer};
 
+// --- Performance monitor re-exports (P9.4) ---
+pub use performance_monitor::{AutoTuner, PerformanceMonitor, PerformanceReport};
+
 // --- Agent directory re-exports (P7.3) ---
 pub use agent_directory::{AgentDirectory, AgentInfo, AgentStatus};
 
 // --- Memory sync re-exports (P8.4) ---
 pub use memory_sync::MemorySyncProtocol;
+
+// --- Entity registry re-exports (P9.3) ---
+pub use entity_registry::{DisambiguationKey, EntityRecord, EntityRegistry, EvolutionRecord};
 
 // --- Transaction re-exports (F20) ---
 pub use transaction::{
