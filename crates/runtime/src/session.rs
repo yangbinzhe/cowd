@@ -1693,11 +1693,22 @@ mod tests {
 /// by the workspace fingerprint of the given working directory.
 /// This prevents parallel `opencode serve` instances from colliding.
 /// Called by external consumers (e.g. cowd-orchestrator) to enumerate sessions for a CWD.
-#[allow(dead_code, deprecated)]
+///
+/// Uses [`crate::cowd_dirs::user_project_sessions_dir`] directly instead of the
+/// deprecated [`SessionStore`](crate::session_control::SessionStore).
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
-    let store = crate::session_control::SessionStore::from_cwd(cwd)
-        .map_err(|e| SessionError::Io(std::io::Error::other(e.to_string())))?;
-    Ok(store.sessions_dir().to_path_buf())
+    // FNV-1a 64-bit hash of the workspace path (mirrors the algorithm in
+    // `session_control::workspace_fingerprint` so fingerprint values are stable).
+    let input = cwd.to_string_lossy();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let fp = format!("{hash:016x}");
+    let dir = crate::cowd_dirs::user_project_sessions_dir(&fp);
+    std::fs::create_dir_all(&dir).map_err(SessionError::Io)?;
+    Ok(dir)
 }
 
 #[cfg(test)]

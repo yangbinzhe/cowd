@@ -20,8 +20,14 @@ use crate::session::{Session, SessionError};
 //   - Freestanding `*_for()` helpers   → Use `UnifiedSessionStore` methods directly
 //
 // This module is retained for backward compatibility until all callers are
-// migrated. The `workspace_sessions_dir()` convenience in `session.rs` is the
-// last remaining internal consumer.
+// migrated.
+//
+// REMAINING CALLERS (post-P9.5 migration):
+//   - `SessionStore` / `from_cwd()` / `create_handle()`:
+//     → `cowd-cli/tests/resume_slash_commands.rs:185-186` (via `runtime::SessionStore`
+//        re-export in `lib.rs:63`)
+//   - All other items have NO callers outside this module.
+//     Their `#[deprecated]` stubs remain until the test above is migrated.
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Per-worktree session store that namespaces on-disk session files by
@@ -37,6 +43,9 @@ use crate::session::{Session, SessionError};
 /// Use [`SessionStore::from_project_dir`] for the legacy project-local layout
 /// (`<project>/.cowd/sessions/<hash>/`) when project-scoped isolation is
 /// explicitly required.
+///
+/// # Remaining caller
+/// `cowd-cli/tests/resume_slash_commands.rs:185-186` (via `runtime::SessionStore` re-export).
 #[deprecated = "Use `UnifiedSessionStore` from `crate::storage` instead. See migration notice at top of file."]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStore {
