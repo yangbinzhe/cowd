@@ -58,8 +58,6 @@ mod session;
 pub use session::workspace_sessions_dir;
 pub mod session_lifecycle;
 pub mod session_control;
-#[allow(deprecated)]
-pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
 pub mod stale_branch;

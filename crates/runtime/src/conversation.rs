@@ -36,6 +36,7 @@ use tracing;
 
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
 use crate::agent_collaboration::CollaborationOps;
+use crate::agent_discussion::DiscussionEngine;
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
@@ -303,6 +304,8 @@ bus: Option<crate::bus::EventBus>,
     destructive_semaphore: Arc<Semaphore>,
     /// T4: Semaphore for default/ReadOnly tool concurrency (permits: 8).
     default_semaphore: Arc<Semaphore>,
+    /// Optional discussion engine for multi-agent debate and conflict resolution.
+    discussion_engine: Option<Arc<std::sync::Mutex<DiscussionEngine>>>,
     /// Maximum duration for a single tool execution. `None` means no timeout.
     tool_timeout: Option<Duration>,
 }
@@ -453,6 +456,7 @@ where
                 crate::tool_orchestrator::ToolSafetyCategory::Destructive.max_concurrency(),
             )),
             default_semaphore: Arc::new(Semaphore::new(8)),
+            discussion_engine: None,
             tool_timeout: Some(Duration::from_secs(120)),
         }
     }
@@ -609,7 +613,12 @@ where
     /// M9: Attach an EventBus for publish/subscribe module communication.
     #[must_use]
     pub fn with_event_bus(mut self, bus: crate::bus::EventBus) -> Self {
-        self.bus = Some(bus);
+        self.bus = Some(bus.clone());
+        if let Some(ref mem) = self.memory_manager {
+            let mut engine = DiscussionEngine::new(Arc::new(bus), Arc::clone(mem));
+            engine.start_watcher();
+            self.discussion_engine = Some(Arc::new(std::sync::Mutex::new(engine)));
+        }
         self
     }
 
