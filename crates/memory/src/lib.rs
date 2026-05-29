@@ -60,9 +60,11 @@ pub mod fresh_context;
 pub mod temporal_graph;
 pub mod write_guard;
 pub mod closet;
+pub mod background_watcher;
 pub mod code_indexer;
 pub mod session_resume;
 pub mod project_scope;
+pub mod impact_analyzer;
 pub mod tool_sandbox;
 pub mod tiered_store;
 
@@ -158,8 +160,14 @@ pub use compression::token_estimation::{
 // --- Project scope re-exports ---
 pub use project_scope::{build_project_kg, MemoryScope, ProjectManifest, ProjectScopeManager};
 
+// --- Background watcher re-exports ---
+pub use background_watcher::{BackgroundWatcher, BackgroundWatcherConfig, BackgroundWatcherHandle};
+
 // --- Code indexer re-exports (Phase 1) ---
 pub use code_indexer::{
     CodeIndexer, CodeSymbol, FileFingerprint, ImpactReport, IndexLanguage, IndexStats,
     SymbolEdge, SymbolEdgeType, SymbolKind,
 };
+
+// --- Impact analyzer re-exports (F17) ---
+pub use impact_analyzer::{CallGraph, ImpactAnalyzer};

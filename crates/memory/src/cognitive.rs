@@ -26,6 +26,7 @@ use parking_lot::Mutex;
 use chrono::Utc;
 
 use crate::{ MemoryScope, SessionResume,
+    background_watcher::{BackgroundWatcher, BackgroundWatcherConfig, BackgroundWatcherHandle},
     closet::{Closet, ClosetManager},
     code_indexer::CodeSymbol,
     coherence,
@@ -136,7 +137,10 @@ pub struct CognitiveContextManager {
     /// Heuristic memory extractor.
     extractor: MemoryExtractor,
     /// In-memory knowledge graph for entity relationships.
-    kg: Mutex<KnowledgeGraph>,
+    kg: Arc<Mutex<KnowledgeGraph>>,
+    /// Handle to the optional background file-system watcher.
+    #[allow(dead_code)]
+    background_watcher: Mutex<Option<BackgroundWatcherHandle>>,
     /// Freshness-priority context manager for session budget management.
     fresh_ctx: FreshContextManager,
     /// Context rotation monitor for GSD-style health warnings.
@@ -262,8 +266,51 @@ impl CognitiveContextManager {
                     graph.list_triples().len()
                 );
             }
-            Mutex::new(graph)
+            Arc::new(Mutex::new(graph))
         };
+
+        // ── Background file-system watcher setup ──────────────────────────
+        // Wire up the channel BEFORE constructing Self so both the receiver
+        // task and the watcher thread can be started with the right handles.
+        let (kg_rebuild_tx, mut kg_rebuild_rx) =
+            tokio::sync::mpsc::unbounded_channel::<KnowledgeGraph>();
+
+        // Spawn a lightweight tokio task that listens for rebuilt KGs and
+        // replaces the in-memory graph.  The task holds a clone of the Arc.
+        let kg_for_receiver = kg.clone();
+        tokio::spawn(async move {
+            while let Some(new_kg) = kg_rebuild_rx.recv().await {
+                let mut guard = kg_for_receiver.lock();
+                let old_count = guard.list_entities().len();
+                *guard = new_kg;
+                let new_count = guard.list_entities().len();
+                tracing::info!(
+                    old_count,
+                    new_count,
+                    "background_watcher: KG replaced in CCM"
+                );
+            }
+            tracing::debug!("background_watcher: receiver task exiting");
+        });
+
+        // Start the OS-level file-system watcher if the config calls for it.
+        let watcher_handle: Option<BackgroundWatcherHandle> =
+            if let Some(ref ws_root) = workspace_root {
+                if config.extractor.poll_interval_secs > 0 {
+                    let watcher_config = BackgroundWatcherConfig {
+                        poll_interval_secs: config.extractor.poll_interval_secs,
+                    };
+                    Some(BackgroundWatcher::start(
+                        ws_root.clone(),
+                        watcher_config,
+                        kg_rebuild_tx,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
         // Restore Closet from KV store and re-inject into orchestrator.
         let closet_json = orchestrator.store().kv_get("closet").await.unwrap_or(None);
@@ -355,6 +402,7 @@ impl CognitiveContextManager {
             embedding_capability,
             extractor,
             kg,
+            background_watcher: Mutex::new(watcher_handle),
         })
     }
 

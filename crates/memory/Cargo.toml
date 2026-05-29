@@ -29,6 +29,7 @@ tree-sitter-typescript = "0.23"
 tree-sitter-go = "0.23"
 tree-sitter-java = "0.23"
 lz4_flex = "0.11"
+notify = { version = "6", features = ["macos_kqueue"] }
 
 [lints.rust]
 unsafe_code = "allow"
