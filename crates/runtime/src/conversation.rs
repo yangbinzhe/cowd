@@ -2173,6 +2173,7 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
             poll_interval_secs: 30,
             batch_size: 20,
             min_confidence: 0.6,
+            extractor_debounce_secs: 30,
         },
         drift: DriftConfig::default(),
         perf: memory::config::PerfBudget::default(),
