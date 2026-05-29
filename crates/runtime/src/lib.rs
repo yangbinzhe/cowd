@@ -75,6 +75,8 @@ pub mod tool_orchestrator;
 pub mod tool_dispatch;
 pub mod agent;
 pub mod agent_collaboration;
+pub mod agent_discussion;
+pub mod joint_problem_solving;
 pub mod approval_gate;
 pub mod pairing;
 pub mod mirror;
@@ -87,6 +89,14 @@ pub use agent::{
 };
 pub use agent_collaboration::{
     AgentTeam, CollaborationOrchestrator, CollaborationTask, SubTask,
+};
+pub use agent_discussion::{
+    ConsensusMethod, ConsensusResult, Contribution, Discussion, DiscussionEngine,
+    DiscussionPhase,
+};
+pub use joint_problem_solving::{
+    AgentDiscussion, DiscussionTurn, PhaseStatus, PipelineResult, ProblemSolvingConfig,
+    ProblemSolvingPipeline, ProblemStatement, Solution, SolutionEvaluation, SolutionScore,
 };
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
