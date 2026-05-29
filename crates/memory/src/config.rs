@@ -335,6 +335,9 @@ pub struct TuningConfig {
     /// TTL in seconds for the L2 (project) layer cache (default: 300 = 5min).
     #[serde(default = "default_l2_cache_ttl")]
     pub l2_cache_ttl_secs: u64,
+    /// Whether L4 push (session → permanent) is enabled.
+    #[serde(default = "default_true")]
+    pub l4_push_enabled: bool,
 }
 
 fn default_sandbox_min_lines() -> usize { 2000 }
@@ -346,6 +349,7 @@ fn default_prefetch_hot_topics() -> usize { 5 }
 fn default_l0_cache_ttl() -> u64 { 86400 }
 fn default_l1_cache_ttl() -> u64 { 3600 }
 fn default_l2_cache_ttl() -> u64 { 300 }
+fn default_true() -> bool { true }
 
 impl Default for TuningConfig {
     fn default() -> Self {
@@ -359,6 +363,7 @@ impl Default for TuningConfig {
             l0_cache_ttl_secs: 86400,
             l1_cache_ttl_secs: 3600,
             l2_cache_ttl_secs: 300,
+            l4_push_enabled: true,
         }
     }
 }
