@@ -24,6 +24,43 @@ pub trait SubAgentProgressCallback: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// AgentRole
+// ---------------------------------------------------------------------------
+
+/// The role assigned to a SubAgent, determining its default tool set and behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentRole {
+    /// Full unrestricted tool access.
+    General,
+    /// Planning/analysis tools (read, grep, glob, lsp).
+    Planner,
+    /// Execution/modification tools (read, write, edit, bash).
+    Executor,
+    /// Review/inspection tools (read, grep, glob, lsp diagnostics, diff).
+    Reviewer,
+}
+
+impl Default for AgentRole {
+    fn default() -> Self {
+        Self::General
+    }
+}
+
+/// Return the default tool allowlist for a given `AgentRole`.
+fn role_tools(role: AgentRole) -> Vec<String> {
+    match role {
+        AgentRole::Planner => vec!["read", "grep", "glob", "lsp_symbols", "lsp_goto_definition"],
+        AgentRole::Executor => vec!["read", "write", "edit", "bash", "grep", "glob"],
+        AgentRole::Reviewer => vec!["read", "grep", "glob", "lsp_diagnostics", "git_diff"],
+        AgentRole::General => vec![],
+    }
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+// ---------------------------------------------------------------------------
 // SubAgentToolMode
 // ---------------------------------------------------------------------------
 
@@ -83,6 +120,18 @@ pub struct SubAgentConfig {
     /// Declared capabilities for mutual discovery (e.g. ["rust", "testing"]).
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// The agent's role — determines default tool set (overridden by tool_mode/allowed_tools).
+    #[serde(default)]
+    pub role: AgentRole,
+    /// Inject peer agent context from AgentDirectory into the system prompt.
+    #[serde(default = "default_true")]
+    pub inject_peer_context: bool,
+    /// Inject parent agent memory into the system prompt via `prepare_context`.
+    #[serde(default = "default_true")]
+    pub inject_memory: bool,
+    /// Capture the sub-agent's reasoning trace (ThinkingDelta events) in the result.
+    #[serde(default = "default_true")]
+    pub retain_reasoning: bool,
 }
 
 fn default_write_source() -> String {
@@ -105,6 +154,10 @@ fn default_max_parallel() -> usize {
     4
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for SubAgentConfig {
     fn default() -> Self {
         Self {
@@ -119,6 +172,10 @@ impl Default for SubAgentConfig {
             tool_mode: SubAgentToolMode::default(),
             agent_role: default_agent_role(),
             capabilities: vec![],
+            role: AgentRole::default(),
+            inject_peer_context: true,
+            inject_memory: true,
+            retain_reasoning: true,
         }
     }
 }
@@ -142,6 +199,9 @@ pub struct SubAgentResult {
     pub memory_write_attempts: usize,
     /// Number of memory writes that were denied by WriteGuard.
     pub memory_writes_denied: usize,
+    /// Reasoning trace captured from ThinkingDelta events (when retain_reasoning is enabled).
+    #[serde(default)]
+    pub reasoning_trace: Option<String>,
 }
 
 impl Default for SubAgentResult {
@@ -153,6 +213,7 @@ impl Default for SubAgentResult {
             completed_normally: true,
             memory_write_attempts: 0,
             memory_writes_denied: 0,
+            reasoning_trace: None,
         }
     }
 }
@@ -220,6 +281,8 @@ pub struct SubAgentRuntime<C: ApiClient, T: ToolExecutor> {
     agent_id: String,
     /// Whether this agent has been registered in the global AgentDirectory.
     registered: AtomicBool,
+    /// Captured reasoning trace from ThinkingDelta events.
+    reasoning_trace: Option<String>,
 }
 
 impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
@@ -252,6 +315,7 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             parent_memory: None,
             agent_id,
             registered: AtomicBool::new(true),
+            reasoning_trace: None,
             config,
             runtime,
         }
@@ -346,6 +410,7 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
                 && self.tokens_consumed <= self.config.budget_tokens,
             memory_write_attempts: 0,
             memory_writes_denied: 0,
+            reasoning_trace: self.reasoning_trace.clone(),
         }
     }
 
@@ -377,6 +442,25 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
         let memory_writes_denied: usize = 0;
         let mut current_prompt = initial_prompt.to_string();
         let mut completed_normally = true;
+
+        // P7.4: Inject parent agent memory into the system prompt before the main loop.
+        if self.config.inject_memory {
+            if let Some(ref mem) = self.parent_memory {
+                match mem.prepare_context(initial_prompt, &[], None).await {
+                    Ok(prepared) => {
+                        let mem_section = format_prepared_context(&prepared);
+                        current_prompt = format!("{mem_section}\n\n{current_prompt}");
+                        tracing::debug!(
+                            "Injected {} memory entries into sub-agent context",
+                            prepared.entries.len()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to prepare memory context for sub-agent: {}", e);
+                    }
+                }
+            }
+        }
 
         loop {
             if let Err(e) = self.check_budget() {
@@ -421,6 +505,19 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             let tokens = summary.usage.total_tokens() as usize;
             self.record_turn(tokens);
             tool_call_count += turn_tool_calls;
+
+            // P7.4: Capture reasoning/thinking trace from the assistant's response.
+            if self.config.retain_reasoning {
+                for msg in &summary.assistant_messages {
+                    for block in &msg.blocks {
+                        if let crate::session::ContentBlock::Thinking { thinking, .. } = block {
+                            self.reasoning_trace
+                                .get_or_insert_with(String::new)
+                                .push_str(thinking);
+                        }
+                    }
+                }
+            }
 
             if let Some(ref cb) = self.progress_callback {
                 cb.on_turn_complete(
@@ -481,6 +578,7 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             completed_normally,
             memory_write_attempts,
             memory_writes_denied,
+            reasoning_trace: self.reasoning_trace.take(),
         }
     }
 
@@ -526,6 +624,31 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let truncated: String = s.chars().take(max_len).collect();
         format!("{}...", truncated)
     }
+}
+
+/// Format a `PreparedContext` into a memory section for injection into the system prompt.
+fn format_prepared_context(prepared: &memory::types::PreparedContext) -> String {
+    let mut buf = String::from("## Memory Context (injected)\n\n");
+    if !prepared.entries.is_empty() {
+        buf.push_str("### Relevant Memories\n\n");
+        for entry in &prepared.entries {
+            buf.push_str(&format!(
+                "- **{}** ({:?}, confidence: {:.2})\n  {}\n",
+                entry.title,
+                entry.layer,
+                entry.confidence,
+                truncate_str(&entry.content, 300),
+            ));
+        }
+    }
+    if let Some(ref code_ctx) = prepared.code_context {
+        if !code_ctx.is_empty() {
+            buf.push_str("\n### Code Context\n\n");
+            buf.push_str(code_ctx);
+            buf.push('\n');
+        }
+    }
+    buf
 }
 
 /// Share sub-agent results with the parent agent via L4 `team_remember`.
@@ -727,4 +850,49 @@ mod tests {
         assert!(!result.completed_normally);
     }
 
+    #[test]
+    fn role_tools_returns_appropriate_sets() {
+        // General: empty list
+        assert!(role_tools(AgentRole::General).is_empty());
+
+        // Planner: read, grep, glob, lsp
+        let planner = role_tools(AgentRole::Planner);
+        assert!(planner.contains(&"read".to_string()));
+        assert!(planner.contains(&"grep".to_string()));
+        assert!(planner.contains(&"glob".to_string()));
+        assert!(planner.contains(&"lsp_symbols".to_string()));
+        assert!(!planner.contains(&"bash".to_string()));
+        assert!(!planner.contains(&"write".to_string()));
+
+        // Executor: read, write, edit, bash, grep, glob
+        let executor = role_tools(AgentRole::Executor);
+        assert!(executor.contains(&"bash".to_string()));
+        assert!(executor.contains(&"write".to_string()));
+        assert!(executor.contains(&"edit".to_string()));
+        assert!(executor.contains(&"read".to_string()));
+        assert!(!executor.contains(&"lsp_diagnostics".to_string()));
+
+        // Reviewer: read, grep, glob, lsp_diagnostics, git_diff
+        let reviewer = role_tools(AgentRole::Reviewer);
+        assert!(reviewer.contains(&"lsp_diagnostics".to_string()));
+        assert!(reviewer.contains(&"git_diff".to_string()));
+        assert!(reviewer.contains(&"read".to_string()));
+        assert!(!reviewer.contains(&"bash".to_string()));
+        assert!(!reviewer.contains(&"write".to_string()));
+    }
+
+    #[test]
+    fn new_config_defaults() {
+        let config = SubAgentConfig::default();
+        assert_eq!(config.role, AgentRole::General);
+        assert!(config.inject_peer_context);
+        assert!(config.inject_memory);
+        assert!(config.retain_reasoning);
+    }
+
+    #[test]
+    fn result_default_has_no_reasoning_trace() {
+        let result = SubAgentResult::default();
+        assert!(result.reasoning_trace.is_none());
+    }
 }
