@@ -326,6 +326,15 @@ pub struct TuningConfig {
     pub audit_truncate_len: usize,
     #[serde(default = "default_prefetch_hot_topics")]
     pub prefetch_hot_topics: usize,
+    /// TTL in seconds for the L0 (identity) layer cache (default: 86400 = 24h).
+    #[serde(default = "default_l0_cache_ttl")]
+    pub l0_cache_ttl_secs: u64,
+    /// TTL in seconds for the L1 (core/working) layer cache (default: 3600 = 1h).
+    #[serde(default = "default_l1_cache_ttl")]
+    pub l1_cache_ttl_secs: u64,
+    /// TTL in seconds for the L2 (project) layer cache (default: 300 = 5min).
+    #[serde(default = "default_l2_cache_ttl")]
+    pub l2_cache_ttl_secs: u64,
 }
 
 fn default_sandbox_min_lines() -> usize { 2000 }
@@ -334,6 +343,9 @@ fn default_freshness_trigger() -> f32 { 0.8 }
 fn default_closet_rebuild_ticks() -> u32 { 10 }
 fn default_audit_truncate_len() -> usize { 120 }
 fn default_prefetch_hot_topics() -> usize { 5 }
+fn default_l0_cache_ttl() -> u64 { 86400 }
+fn default_l1_cache_ttl() -> u64 { 3600 }
+fn default_l2_cache_ttl() -> u64 { 300 }
 
 impl Default for TuningConfig {
     fn default() -> Self {
@@ -344,6 +356,9 @@ impl Default for TuningConfig {
             closet_rebuild_ticks: 10,
             audit_truncate_len: 120,
             prefetch_hot_topics: 5,
+            l0_cache_ttl_secs: 86400,
+            l1_cache_ttl_secs: 3600,
+            l2_cache_ttl_secs: 300,
         }
     }
 }
