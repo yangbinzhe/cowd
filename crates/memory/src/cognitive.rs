@@ -546,6 +546,12 @@ impl CognitiveContextManager {
         self
     }
 
+    /// Attach an EntityRegistry for cross-agent entity evolution tracking (P9.3).
+    pub fn with_entity_registry(self, registry: crate::entity_registry::EntityRegistry) -> Self {
+        *self.entity_registry.lock() = Some(registry);
+        self
+    }
+
     /// Set the active agent for source_agent tagging and peer context discovery.
     pub fn set_active_agent(&self, agent_id: String) {
         self.orchestrator.set_active_agent(agent_id.clone());
@@ -1251,7 +1257,57 @@ impl CognitiveContextManager {
             });
         }
 
-        // ── Step 7: auto-inject relevant code symbols (when applicable) ─────
+        // Step 6c: inject recent entity evolutions from other agents
+        {
+            let registry_guard = self.entity_registry.lock();
+            if let Some(ref registry) = *registry_guard {
+                if registry.has_store() {
+                    match registry.get_recent_evolutions(10) {
+                        Ok(evolutions) if !evolutions.is_empty() => {
+                            let mut story_lines: Vec<String> = Vec::new();
+                            for ev in &evolutions {
+                                story_lines.push(format!("  - {}", ev.to_sentence()));
+                            }
+                            let content = format!(
+                                "Recent entity changes (cross-agent):\n{}",
+                                story_lines.join("\n")
+                            );
+                            entries.push(MemoryEntry {
+                                id: uuid::Uuid::new_v4(),
+                                layer: MemoryLayer::L2,
+                                category: MemoryCategory::Shared,
+                                priority: Priority::Low,
+                                source: MemorySource::AutoExtracted,
+                                title: "Entity Evolution Context".into(),
+                                content,
+                                embedding: None,
+                                tags: vec!["entity_evolution".into(), "cross_agent".into()],
+                                relations: vec![],
+                                confidence: 0.7,
+                                access_count: 0,
+                                staleness: 0.0,
+                                created_at: Utc::now(),
+                                updated_at: Utc::now(),
+                                last_accessed_at: None,
+                                scope: MemoryScope::default(),
+                                session_id: None,
+                                source_agent: None,
+                                visibility: crate::types::AgentVisibility::default(),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "entity evolution: failed to query recent evolutions"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Step 7: auto-inject relevant code symbols (when applicable)
         let code_context = if is_code_query(query) {
             let symbols = self
                 .orchestrator

@@ -487,6 +487,21 @@ END",
 )",
         "CREATE INDEX IF NOT EXISTS idx_symbol_refs_symbol ON symbol_references(symbol_id)",
         "CREATE INDEX IF NOT EXISTS idx_symbol_refs_memory ON symbol_references(memory_id)",
+        // P9.3: EntityEvolutionTracker — cross-agent entity change tracking
+        r"CREATE TABLE IF NOT EXISTS entity_evolution (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_name TEXT NOT NULL,
+    entity_key TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    confidence REAL,
+    operation TEXT NOT NULL,
+    recorded_at_ms INTEGER NOT NULL
+)",
+        "CREATE INDEX IF NOT EXISTS idx_entity_evol_name ON entity_evolution(entity_name)",
+        "CREATE INDEX IF NOT EXISTS idx_entity_evol_agent ON entity_evolution(agent_id)",
+        "CREATE INDEX IF NOT EXISTS idx_entity_evol_time ON entity_evolution(recorded_at_ms)",
     ];
 
     for stmt in statements {
@@ -1628,6 +1643,155 @@ impl SqliteStore {
     pub fn load_fingerprints(&self) -> Result<HashMap<PathBuf, FileFingerprint>> {
         let conn = self.conn()?;
         Self::do_load_fingerprints(&conn)
+    }
+
+    // -------------------------------------------------------------------
+    // P9.3: EntityEvolutionTracker — persistent cross-agent entity tracking
+    // -------------------------------------------------------------------
+
+    fn do_insert_entity_evolution(
+        conn: &Connection,
+        entity_name: &str,
+        entity_key: &str,
+        agent_id: &str,
+        old_value: Option<&str>,
+        new_value: Option<&str>,
+        confidence: Option<f32>,
+        operation: &str,
+        recorded_at_ms: i64,
+    ) -> Result<()> {
+        conn.execute(
+            r"INSERT INTO entity_evolution
+              (entity_name, entity_key, agent_id, old_value, new_value, confidence, operation, recorded_at_ms)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                entity_name,
+                entity_key,
+                agent_id,
+                old_value,
+                new_value,
+                confidence,
+                operation,
+                recorded_at_ms,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(())
+    }
+
+    fn do_get_entity_timeline(
+        conn: &Connection,
+        entity_name: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String, String, Option<String>, Option<String>, Option<f32>, String, i64)>> {
+        let mut stmt = conn
+            .prepare(
+                r"SELECT id, entity_name, entity_key, agent_id, old_value, new_value, confidence, operation, recorded_at_ms
+                 FROM entity_evolution
+                 WHERE entity_name = ?1
+                 ORDER BY recorded_at_ms ASC
+                 LIMIT ?2",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![entity_name, limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<f32>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })
+            .map_err(sql_err)?;
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r.map_err(sql_err)?);
+        }
+        Ok(results)
+    }
+
+    fn do_get_recent_evolutions(
+        conn: &Connection,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String, String, Option<String>, Option<String>, Option<f32>, String, i64)>> {
+        let mut stmt = conn
+            .prepare(
+                r"SELECT id, entity_name, entity_key, agent_id, old_value, new_value, confidence, operation, recorded_at_ms
+                 FROM entity_evolution
+                 ORDER BY recorded_at_ms DESC
+                 LIMIT ?1",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<f32>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })
+            .map_err(sql_err)?;
+        let mut results = Vec::new();
+        for r in rows {
+            results.push(r.map_err(sql_err)?);
+        }
+        Ok(results)
+    }
+
+    /// Record an entity evolution event (register, update, or resolve).
+    pub fn insert_entity_evolution(
+        &self,
+        entity_name: &str,
+        entity_key: &str,
+        agent_id: &str,
+        old_value: Option<&str>,
+        new_value: Option<&str>,
+        confidence: Option<f32>,
+        operation: &str,
+    ) -> Result<()> {
+        let recorded_at_ms = chrono::Utc::now().timestamp_millis();
+        let conn = self.conn()?;
+        Self::do_insert_entity_evolution(
+            &conn,
+            entity_name,
+            entity_key,
+            agent_id,
+            old_value,
+            new_value,
+            confidence,
+            operation,
+            recorded_at_ms,
+        )
+    }
+
+    /// Retrieve the chronological evolution timeline for a given entity name.
+    pub fn get_entity_timeline(
+        &self,
+        entity_name: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String, String, Option<String>, Option<String>, Option<f32>, String, i64)>> {
+        let conn = self.conn()?;
+        Self::do_get_entity_timeline(&conn, entity_name, limit)
+    }
+
+    /// Retrieve the most recent entity evolution events across all entities.
+    pub fn get_recent_evolutions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String, String, Option<String>, Option<String>, Option<f32>, String, i64)>> {
+        let conn = self.conn()?;
+        Self::do_get_recent_evolutions(&conn, limit)
     }
 
     /// Load all vectors from the `vector_embeddings` SQLite table.

@@ -147,6 +147,22 @@ CREATE TABLE IF NOT EXISTS session_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_session_snapshots_session ON session_snapshots(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_snapshots_latest ON session_snapshots(session_id, event_idx DESC);
+
+CREATE TABLE IF NOT EXISTS entity_evolution (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_name TEXT NOT NULL,
+    entity_key TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    confidence REAL,
+    operation TEXT NOT NULL,
+    recorded_at_ms INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_evol_name ON entity_evolution(entity_name);
+CREATE INDEX IF NOT EXISTS idx_entity_evol_agent ON entity_evolution(agent_id);
+CREATE INDEX IF NOT EXISTS idx_entity_evol_time ON entity_evolution(recorded_at_ms);
 ";
 
 /// FTS5 search result for sessions.
