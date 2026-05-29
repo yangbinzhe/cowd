@@ -20,6 +20,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 use parking_lot::Mutex;
 
@@ -90,6 +91,18 @@ pub struct SessionRestoreStats {
     pub decisions_restored: u32,
     pub work_items_restored: u32,
     pub context_summary_length: usize,
+}
+
+// ---------------------------------------------------------------------------
+// CachedLayer
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+struct CachedLayer {
+    entries: Vec<MemoryEntry>,
+    knowledge_graph: String,
+    code_context: String,
+    cached_at: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +180,12 @@ pub struct CognitiveContextManager {
     blockers: Mutex<Vec<String>>,
     /// Last action performed by the agent, used for handoff context.
     last_action: Mutex<Option<String>>,
+    /// Cache for L0 (identity) layer entries.
+    l0_cache: Mutex<Option<CachedLayer>>,
+    /// Cache for L1 (core/working) layer entries.
+    l1_cache: Mutex<Option<CachedLayer>>,
+    /// Cache for L2 (project) layer entries.
+    l2_cache: Arc<Mutex<Option<CachedLayer>>>,
 }
 
 impl CognitiveContextManager {
@@ -275,9 +294,14 @@ impl CognitiveContextManager {
         let (kg_rebuild_tx, mut kg_rebuild_rx) =
             tokio::sync::mpsc::unbounded_channel::<KnowledgeGraph>();
 
+        // L2 cache needs to be shared with the receiver task so it can be
+        // invalidated when the project KG is rebuilt.
+        let l2_cache: Arc<Mutex<Option<CachedLayer>>> = Arc::new(Mutex::new(None));
+
         // Spawn a lightweight tokio task that listens for rebuilt KGs and
         // replaces the in-memory graph.  The task holds a clone of the Arc.
         let kg_for_receiver = kg.clone();
+        let l2_cache_for_receiver = l2_cache.clone();
         tokio::spawn(async move {
             while let Some(new_kg) = kg_rebuild_rx.recv().await {
                 let mut guard = kg_for_receiver.lock();
@@ -289,6 +313,9 @@ impl CognitiveContextManager {
                     new_count,
                     "background_watcher: KG replaced in CCM"
                 );
+                // Invalidate L2 cache when project KG is rebuilt from file changes.
+                l2_cache_for_receiver.lock().take();
+                tracing::debug!("background_watcher: L2 cache invalidated");
             }
             tracing::debug!("background_watcher: receiver task exiting");
         });
@@ -385,6 +412,9 @@ impl CognitiveContextManager {
             state_rebuilder,
             blockers: Mutex::new(Vec::new()),
             last_action: Mutex::new(None),
+            l0_cache: Mutex::new(None),
+            l1_cache: Mutex::new(None),
+            l2_cache,
             config,
             orchestrator,
             pipeline,
@@ -519,6 +549,7 @@ impl CognitiveContextManager {
         messages: &[Message],
         session_id: Option<&str>,
     ) -> Result<PreparedContext> {
+        let _prepare_start = Instant::now();
         let mut entries: Vec<MemoryEntry> = Vec::new();
 
         // ═══════════════════════════════════════════════════════════════════
@@ -571,41 +602,96 @@ impl CognitiveContextManager {
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // Group 1: Base layers (L0+L1) + Project layer (L2) + query embedding — independent
+        // Group 1: Base layers (L0+L1) + Project layer (L2) — cache-aware
         // ═══════════════════════════════════════════════════════════════════
-        let (l0l1_result, l2_result, query_embedding) = tokio::join!(
-            self.orchestrator.load_fixed_layers(),
-            self.orchestrator.load_project_context(),
-            async {
-                if self.embedding_capability.supports_semantic() {
-                    match &self.embedding_capability {
-                        EmbeddingCapability::Remote { client } => {
-                            match client.embed_one(query).await {
-                                Ok(embed) => {
-                                    tracing::debug!(
-                                        dim = embed.len(),
-                                        "query embedding generated for hybrid search"
-                                    );
-                                    Some(embed)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "embedding failed, falling back to FTS5 search"
-                                    );
-                                    None
-                                }
+
+        // L0 + L1: check cache first; reload both together if either expired.
+        {
+            let l0_hit = self.l0_cache.lock().as_ref()
+                .filter(|c| c.cached_at.elapsed() < Duration::from_secs(self.config.tuning.l0_cache_ttl_secs))
+                .map(|c| c.entries.clone());
+            let l1_hit = self.l1_cache.lock().as_ref()
+                .filter(|c| c.cached_at.elapsed() < Duration::from_secs(self.config.tuning.l1_cache_ttl_secs))
+                .map(|c| c.entries.clone());
+
+            if let (Some(l0), Some(l1)) = (l0_hit, l1_hit) {
+                entries.extend(l0);
+                entries.extend(l1);
+            } else {
+                let fixed = self.orchestrator.load_fixed_layers().await?;
+                let l0: Vec<_> = fixed.iter()
+                    .filter(|e| matches!(e.layer, MemoryLayer::L0))
+                    .cloned()
+                    .collect();
+                let l1: Vec<_> = fixed.iter()
+                    .filter(|e| matches!(e.layer, MemoryLayer::L1))
+                    .cloned()
+                    .collect();
+                let now = Instant::now();
+                *self.l0_cache.lock() = Some(CachedLayer {
+                    entries: l0.clone(),
+                    knowledge_graph: String::new(),
+                    code_context: String::new(),
+                    cached_at: now,
+                });
+                *self.l1_cache.lock() = Some(CachedLayer {
+                    entries: l1.clone(),
+                    knowledge_graph: String::new(),
+                    code_context: String::new(),
+                    cached_at: now,
+                });
+                entries.extend(l0);
+                entries.extend(l1);
+            }
+        }
+
+        // L2: project context with cache
+        {
+            let l2_hit = self.l2_cache.lock().as_ref()
+                .filter(|c| c.cached_at.elapsed() < Duration::from_secs(self.config.tuning.l2_cache_ttl_secs))
+                .map(|c| c.entries.clone());
+            if let Some(l2) = l2_hit {
+                entries.extend(l2);
+            } else {
+                let l2 = self.orchestrator.load_project_context().await?;
+                *self.l2_cache.lock() = Some(CachedLayer {
+                    entries: l2.clone(),
+                    knowledge_graph: String::new(),
+                    code_context: String::new(),
+                    cached_at: Instant::now(),
+                });
+                entries.extend(l2);
+            }
+        }
+
+        // Query embedding (async, independent of cached loads)
+        let query_embedding = {
+            if self.embedding_capability.supports_semantic() {
+                match &self.embedding_capability {
+                    EmbeddingCapability::Remote { client } => {
+                        match client.embed_one(query).await {
+                            Ok(embed) => {
+                                tracing::debug!(
+                                    dim = embed.len(),
+                                    "query embedding generated for hybrid search"
+                                );
+                                Some(embed)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "embedding failed, falling back to FTS5 search"
+                                );
+                                None
                             }
                         }
-                        _ => None,
                     }
-                } else {
-                    None
+                    _ => None,
                 }
-            },
-        );
-        entries.extend(l0l1_result?);
-        entries.extend(l2_result?);
+            } else {
+                None
+            }
+        };
 
         // Track which IDs are already loaded so other layers can skip them.
         let mut already_surfaced: HashSet<MemoryId> = entries.iter().map(|e| e.id).collect();
@@ -1115,6 +1201,14 @@ impl CognitiveContextManager {
             1.0
         };
 
+        let elapsed_ms = _prepare_start.elapsed().as_millis();
+        tracing::debug!(
+            elapsed_ms,
+            entries = entries.len(),
+            total_tokens,
+            "prepare_context complete"
+        );
+
         Ok(PreparedContext {
             entries,
             total_tokens,
@@ -1149,53 +1243,34 @@ impl CognitiveContextManager {
     /// 3. Runs drift detection on recently loaded entries.
     /// 4. Checks seed trigger conditions for turn-end keywords.
     /// 5. Persists vector index for durability.
-    pub async fn on_turn_end(&self, messages: &mut Vec<Message>) -> Result<()> {
-        // ── Delegation observation ────────────────────────────────────────────
-        // Write child agent results to L4 with parent_session_id.
-        {
-            let drained: Vec<_> = {
-                let mut delegation_queue = self
-                    .delegation_results
-                    .lock()
-                    ;
-                delegation_queue.drain(..).collect()
-            }; // guard dropped before any .await
-            for d in drained {
-                let title = format!("delegation:{}:{}", d.agent_role, &d.task[..d.task.len().min(40)]);
-                let content = format!(
-                    "Agent: {}\nTask: {}\nResult: {}",
-                    d.agent_role, d.task, d.result
-                );
-                let tags = vec!["delegation".into(), d.agent_role.clone()];
-                if let Err(e) = self
-                    .orchestrator
-                    .write(
-                        MemoryLayer::L4,
-                        MemoryCategory::Shared,
-                        &title,
-                        &content,
-                        Priority::Normal,
-                        MemorySource::AutoExtracted,
-                        tags,
-                        MemoryScope::default(),
-                    )
-                    .await
-                {
-                    tracing::warn!("delegation observation write failed: {e}");
-                } else {
-                    tracing::info!(
-                        agent_role = %d.agent_role,
-                        "delegation result written to L4"
-                    );
-                }
-            }
-        }
+    ///
+    /// # Parallel-friendly decomposition
+    ///
+    /// This method is a sequential wrapper around three sub-operations which
+    /// callers can also execute in parallel:
+    ///
+    /// | Step | Method                | Description                |
+    /// |------|-----------------------|----------------------------|
+    /// | 0    | `extract_and_remember`| Extract + persist memories |
+    /// | 3-4  | `run_drift_and_seeds` | Drift detection + seeds    |
+    /// | rest | (inline in on_turn_end)| Compaction, tick, KG, …  |
+    ///
+    /// [`run_memory_post_turn`] uses `tokio::join!` to run steps 0 and 3-4
+    /// concurrently while keeping the remaining maintenance sequential.
 
+    /// Extract memories from the current turn's messages and persist them.
+    ///
+    /// This covers steps 0, 0b, and 11 from the full turn-end sequence:
+    ///   - Heuristic extraction from conversation messages
+    ///   - Persist via `orchestrator.remember_batch`
+    ///   - Index large tool outputs into the sandbox
+    ///   - Batch-embed new entries into the vector index
+    ///
+    /// Failures are logged and swallowed so they never abort the turn.
+    pub async fn extract_and_remember(&self, messages: &[Message]) -> Result<()> {
         // ── 0. Extract and persist memories ──────────────────────────────────
-        // Only extract if we have enough messages (requirement from extractor).
         let mut pending_embeddings: Vec<(MemoryId, String)> = Vec::new();
         if messages.len() >= 2 {
-            // Record pre-extraction state for debugging.
             tracing::debug!(
                 messages_count = messages.len(),
                 has_user = messages.iter().any(|m| matches!(m.role, MessageRole::User)),
@@ -1206,28 +1281,30 @@ impl CognitiveContextManager {
                     .filter(|m| matches!(m.role, MessageRole::User))
                     .map(|m| m.content.len())
                     .sum::<usize>(),
-                "on_turn_end: pre-extraction state"
+                "extract_and_remember: pre-extraction state"
             );
 
             match self.extractor.extract(messages).await {
                 Ok(entries) => {
                     tracing::info!(
                         entries_count = entries.len(),
-                        "on_turn_end: extracted {} memory entries",
+                        "extract_and_remember: extracted {} memory entries",
                         entries.len()
                     );
-                    // Collect embedding pairs before consuming entries
                     pending_embeddings = entries.iter()
                         .map(|e| (e.id, e.content.clone()))
                         .collect();
                     match self.orchestrator.remember_batch(entries).await {
                         Ok(_) => {
-                            tracing::debug!("on_turn_end: {} memories persisted successfully", pending_embeddings.len());
+                            tracing::debug!(
+                                "extract_and_remember: {} memories persisted successfully",
+                                pending_embeddings.len()
+                            );
                         }
                         Err(e) => {
                             tracing::error!(
                                 error = %e,
-                                "on_turn_end: memory persistence failed"
+                                "extract_and_remember: memory persistence failed"
                             );
                         }
                     }
@@ -1235,7 +1312,7 @@ impl CognitiveContextManager {
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "on_turn_end: extraction failed (non-fatal)"
+                        "extract_and_remember: extraction failed (non-fatal)"
                     );
                 }
             }
@@ -1259,251 +1336,8 @@ impl CognitiveContextManager {
         } else {
             tracing::debug!(
                 messages_count = messages.len(),
-                "on_turn_end: skipped (insufficient messages)"
+                "extract_and_remember: skipped (insufficient messages)"
             );
-        }
-
-        // ── 0c. Auto-correct contradictions via fact checker ──────────────
-        let mut fc = crate::orchestrator::get_fact_checker().lock();
-        let report = fc.auto_correct();
-        if report.corrected > 0 || report.pruned > 0 {
-            tracing::info!(
-                corrected = report.corrected,
-                pruned = report.pruned,
-                flagged = report.flagged,
-                "auto-correction applied"
-            );
-        }
-
-        // ── 1. Micro compact ────────────────────────────────────────────────
-        self.pipeline.micro_compact(messages);
-
-        // ── 1b. AAAK compact (entity-aware compression for code-heavy content) ─
-        self.pipeline.aaak_compact(messages);
-
-        // ── 2. Session compact if threshold exceeded ─────────────────────────
-        if self.pipeline.should_session_compact(messages) {
-            self.pipeline
-                .session_compact(messages, &self.orchestrator)
-                .await?;
-        }
-
-        // ── 3. Drift detection on L1 entries ────────────────────────────────
-        // Load essential layer entries and check for staleness.
-        let l1_entries = self.orchestrator.load_fixed_layers().await?;
-        for entry in &l1_entries {
-            match self.drift.check(entry) {
-                crate::drift::DriftVerdict::Prune { reason } => {
-                    // Log the pruning verdict (no direct delete without the store).
-                    // The orchestrator's forget() can be called with the entry ID.
-                    tracing::debug!(
-                        id = %entry.id,
-                        reason = %reason,
-                        "drift: pruning entry"
-                    );
-                    let _ = self.orchestrator.forget(&entry.id).await;
-                }
-                crate::drift::DriftVerdict::FlagForReview { reason } => {
-                    tracing::debug!(
-                        id = %entry.id,
-                        reason = %reason,
-                        "drift: entry flagged for review"
-                    );
-                }
-                crate::drift::DriftVerdict::Ok => {}
-            }
-        }
-
-        // ── 4. Check seed triggers at turn-end ──────────────────────────────
-        let turn_keywords: Vec<String> = messages
-            .iter()
-            .flat_map(|m| m.content.split_whitespace().map(str::to_lowercase))
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        {
-            let mut reg = self
-                .seeds
-                .lock()
-                ;
-            reg.check_triggers("turn_end", &turn_keywords, Utc::now());
-        }
-
-        // ── 5. Run orchestrator maintenance tick ─────────────────────────────
-        self.orchestrator.tick().await?;
-
-        // ── 5a. Check project KG staleness and auto-rebuild if needed ───────
-        if let Some(ref mgr) = self.project_scope_mgr {
-            if let Some(proj_path) = self.project_kg_path.lock().as_ref() {
-                let pid = crate::project_scope::hash_path(proj_path);
-                if mgr.is_kg_stale(&pid).unwrap_or(false) {
-                    tracing::info!("project KG is stale, auto-rebuilding...");
-                    if let Err(e) = self.load_project_kg(proj_path) {
-                        tracing::warn!("auto-rebuild of project KG failed: {e}");
-                    }
-                }
-            }
-        }
-
-        // ── 5a2. Periodic KG rebuild every 100 ticks (T1) ───────────────────
-        // Rebuilds KG even when no file-change detected, catching rapid saves.
-        {
-            let tick = self.kg_rebuild_tick_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if tick % 100 == 0 {
-                if let Some(proj_path) = self.project_kg_path.lock().as_ref() {
-                    tracing::info!(
-                        tick,
-                        path = %proj_path.display(),
-                        "periodic KG rebuild triggered (every 100 ticks)"
-                    );
-                    if let Err(e) = self.load_project_kg(proj_path) {
-                        tracing::warn!("periodic KG rebuild failed: {e}");
-                    } else {
-                        tracing::debug!("periodic KG rebuild succeeded");
-                    }
-                }
-            }
-        }
-
-        // ── 5a3. Cross-store consistency verification every 50 ticks (T2) ────
-        {
-            let tick = self.cross_store_verify_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if tick % 50 == 0 {
-                let warnings = self.cross_store_verify().await;
-                for w in &warnings {
-                    tracing::warn!("cross-store-verify: {w}");
-                }
-                if !warnings.is_empty() {
-                    tracing::warn!(
-                        count = warnings.len(),
-                        "cross-store consistency check found {} issues",
-                        warnings.len()
-                    );
-                }
-            }
-        }
-
-        // ── 5a4. Integrity anomaly detection every 50 ticks (T9) ────────────
-        {
-            let tick = self.integrity_check_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if tick % 50 == 0 {
-                if let Some(ref checker) = self.integrity_checker {
-                    match checker.check_anomalies() {
-                        Ok(report) => {
-                            if !report.anomalies.is_empty() {
-                                for anomaly in &report.anomalies {
-                                    tracing::warn!(
-                                        "integrity anomaly detected: {:?}",
-                                        anomaly
-                                    );
-                                }
-                                tracing::warn!(
-                                    count = report.anomalies.len(),
-                                    "integrity check found {} anomaly(ies)",
-                                    report.anomalies.len()
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("integrity check failed: {e}");
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── 5b. Auto-rebuild Closet periodically ────────────────────────────
-        if self.orchestrator.should_rebuild_closet() {
-            if let Err(e) = self.orchestrator.force_rebuild_closet().await {
-                tracing::warn!("auto closet rebuild failed: {e}");
-            }
-        }
-
-        // ── 6. Persist vector index ─────────────────────────────────────────
-        if let Err(e) = self.vector_index.lock().persist() {
-            tracing::warn!("failed to persist vector index: {}", e);
-        }
-
-        // ── 7. Persist knowledge graph (every 10 ticks) ──────────────────────
-        {
-            let (entities, triples): (Vec<_>, Vec<_>) = {
-                let kg = self.kg.lock();
-                let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
-                let triples: Vec<_> = kg.list_triples().into_iter().cloned().collect();
-                (entities, triples)
-            }; // kg dropped before any .await
-            if !entities.is_empty() || !triples.is_empty() {
-                if let Err(e) = self.orchestrator.store().save_entities(&entities).await {
-                    tracing::warn!("failed to persist KG entities: {}", e);
-                }
-                if let Err(e) = self.orchestrator.store().save_triples(&triples).await {
-                    tracing::warn!("failed to persist KG triples: {}", e);
-                }
-            }
-        }
-
-        // ── 8. Context rotation health check ────────────────────────────────
-        {
-            let total_tokens: u64 = messages
-                .iter()
-                .map(|m| u64::from(m.token_estimate()))
-                .sum();
-            let budget = self.compute_budget();
-            let mut monitor = self
-                .context_rot_monitor
-                .lock()
-                ;
-            match monitor.check(total_tokens, budget.total) {
-                crate::context_rot::RotAlert::Warning(msg) => {
-                    tracing::warn!("{msg}");
-                }
-                crate::context_rot::RotAlert::Critical(msg) => {
-                    tracing::error!("{msg}");
-                }
-                crate::context_rot::RotAlert::None => {}
-            }
-        }
-
-        // ── 9. Save Closet to KV store ────────────────────────────────────────
-        match ClosetManager::build_from_orchestrator(&self.orchestrator).await {
-            Ok(manager) => {
-                let pointers = &manager.closet().pointers;
-                match serde_json::to_string(pointers) {
-                    Ok(json) => {
-                        if let Err(e) = self.orchestrator.store().kv_put("closet", &json).await {
-                            tracing::warn!("failed to save closet: {}", e);
-                        } else {
-                            let mut closet_guard = self.closet.lock();
-                            *closet_guard = Some(manager.closet().clone());
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to serialize closet pointers: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("failed to build closet: {}", e);
-            }
-        }
-
-        // ── 10. Save Seeds to KV store ──────────────────────────────────────
-        {
-            let reg = self
-                .seeds
-                .lock()
-                ;
-            match serde_json::to_string(reg.all_seeds()) {
-                Ok(json) => {
-                    if let Err(e) = self.orchestrator.store().kv_put("seeds", &json).await {
-                        tracing::warn!("failed to save seeds: {}", e);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("failed to serialize seeds: {}", e);
-                }
-            }
         }
 
         // ── 11. Batch-embed new entries ─────────────────────────────────────
@@ -1541,6 +1375,258 @@ impl CognitiveContextManager {
                         "skipping batch embed: no remote embedding client configured"
                     );
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Run drift detection on L1 entries and check seed triggers at turn end.
+    ///
+    /// This covers steps 3 and 4 from the full turn-end sequence:
+    ///   - Load essential layer entries, check each for staleness
+    ///   - Prune stale entries via `orchestrator.forget`
+    ///   - Check pre-authored seed trigger conditions against turn keywords
+    ///
+    /// Failures are logged and swallowed so they never abort the turn.
+    pub async fn run_drift_and_seeds(&self, messages: &[Message]) -> Result<()> {
+        // ── 3. Drift detection on L1 entries ────────────────────────────────
+        let l1_entries = self.orchestrator.load_fixed_layers().await?;
+        for entry in &l1_entries {
+            match self.drift.check(entry) {
+                crate::drift::DriftVerdict::Prune { reason } => {
+                    tracing::debug!(
+                        id = %entry.id,
+                        reason = %reason,
+                        "drift: pruning entry"
+                    );
+                    let _ = self.orchestrator.forget(&entry.id).await;
+                }
+                crate::drift::DriftVerdict::FlagForReview { reason } => {
+                    tracing::debug!(
+                        id = %entry.id,
+                        reason = %reason,
+                        "drift: entry flagged for review"
+                    );
+                }
+                crate::drift::DriftVerdict::Ok => {}
+            }
+        }
+
+        // ── 4. Check seed triggers at turn-end ──────────────────────────────
+        let turn_keywords: Vec<String> = messages
+            .iter()
+            .flat_map(|m| m.content.split_whitespace().map(str::to_lowercase))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        {
+            let mut reg = self.seeds.lock();
+            reg.check_triggers("turn_end", &turn_keywords, Utc::now());
+        }
+
+        Ok(())
+    }
+
+    /// Run the full post-turn sequence.
+    ///
+    /// Convenience wrapper that calls [`extract_and_remember`],
+    /// [`run_drift_and_seeds`], and [`run_memory_maintenance`] sequentially.
+    ///
+    /// For callers who want parallelism, combine the first two with
+    /// `tokio::join!` and still call [`run_memory_maintenance`] after.
+    pub async fn on_turn_end(&self, messages: &mut Vec<Message>) -> Result<()> {
+        // ── Delegation observation ────────────────────────────────────────────
+        {
+            let drained: Vec<_> = {
+                let mut delegation_queue = self.delegation_results.lock();
+                delegation_queue.drain(..).collect()
+            };
+            for d in drained {
+                let title = format!("delegation:{}:{}", d.agent_role, &d.task[..d.task.len().min(40)]);
+                let content = format!("Agent: {}\nTask: {}\nResult: {}", d.agent_role, d.task, d.result);
+                let tags = vec!["delegation".into(), d.agent_role.clone()];
+                if let Err(e) = self.orchestrator.write(
+                    MemoryLayer::L4, MemoryCategory::Shared, &title, &content,
+                    Priority::Normal, MemorySource::AutoExtracted, tags, MemoryScope::default(),
+                ).await {
+                    tracing::warn!("delegation observation write failed: {e}");
+                } else {
+                    tracing::info!(agent_role = %d.agent_role, "delegation result written to L4");
+                }
+            }
+        }
+
+        // ── Extract ── Drift+Seeds ── Maintenance ──────────────────────
+        let _ = self.extract_and_remember(messages).await;
+        let _ = self.run_drift_and_seeds(messages).await;
+        self.run_memory_maintenance(messages).await
+    }
+
+    /// Remaining post-turn maintenance: fact-checker, compaction, tick,
+    /// KG persistence, context rotation, closet/seeds save, etc.
+    ///
+    /// Call this *after* `extract_and_remember` and `run_drift_and_seeds`
+    /// have completed (whether sequentially or via `tokio::join!`).
+    pub async fn run_memory_maintenance(&self, messages: &mut Vec<Message>) -> Result<()> {
+        // ── 0c. Auto-correct contradictions via fact checker ──────────────
+        {
+            let mut fc = crate::orchestrator::get_fact_checker().lock();
+            let report = fc.auto_correct();
+            if report.corrected > 0 || report.pruned > 0 {
+                tracing::info!(
+                    corrected = report.corrected, pruned = report.pruned,
+                    flagged = report.flagged, "auto-correction applied"
+                );
+            }
+        }
+
+        // ── 1. Micro compact ────────────────────────────────────────────────
+        self.pipeline.micro_compact(messages);
+
+        // ── 1b. AAAK compact ────────────────────────────────────────────────
+        self.pipeline.aaak_compact(messages);
+
+        // ── 2. Session compact if threshold exceeded ─────────────────────────
+        if self.pipeline.should_session_compact(messages) {
+            self.pipeline.session_compact(messages, &self.orchestrator).await?;
+        }
+
+        // ── 5. Run orchestrator maintenance tick ─────────────────────────────
+        self.orchestrator.tick().await?;
+
+        // ── 5a. Check project KG staleness and auto-rebuild if needed ───────
+        if let Some(ref mgr) = self.project_scope_mgr {
+            if let Some(proj_path) = self.project_kg_path.lock().as_ref() {
+                let pid = crate::project_scope::hash_path(proj_path);
+                if mgr.is_kg_stale(&pid).unwrap_or(false) {
+                    tracing::info!("project KG is stale, auto-rebuilding...");
+                    if let Err(e) = self.load_project_kg(proj_path) {
+                        tracing::warn!("auto-rebuild of project KG failed: {e}");
+                    }
+                }
+            }
+        }
+
+        // ── 5a2. Periodic KG rebuild every 100 ticks (T1) ───────────────────
+        {
+            let tick = self.kg_rebuild_tick_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if tick % 100 == 0 {
+                if let Some(proj_path) = self.project_kg_path.lock().as_ref() {
+                    tracing::info!(tick, path = %proj_path.display(), "periodic KG rebuild triggered (every 100 ticks)");
+                    if let Err(e) = self.load_project_kg(proj_path) {
+                        tracing::warn!("periodic KG rebuild failed: {e}");
+                    } else {
+                        tracing::debug!("periodic KG rebuild succeeded");
+                    }
+                }
+            }
+        }
+
+        // ── 5a3. Cross-store consistency verification every 50 ticks (T2) ────
+        {
+            let tick = self.cross_store_verify_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if tick % 50 == 0 {
+                let warnings = self.cross_store_verify().await;
+                for w in &warnings { tracing::warn!("cross-store-verify: {w}"); }
+                if !warnings.is_empty() {
+                    tracing::warn!(count = warnings.len(), "cross-store consistency check found {} issues", warnings.len());
+                }
+            }
+        }
+
+        // ── 5a4. Integrity anomaly detection every 50 ticks (T9) ────────────
+        {
+            let tick = self.integrity_check_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if tick % 50 == 0 {
+                if let Some(ref checker) = self.integrity_checker {
+                    match checker.check_anomalies() {
+                        Ok(report) => {
+                            if !report.anomalies.is_empty() {
+                                for anomaly in &report.anomalies {
+                                    tracing::warn!("integrity anomaly detected: {:?}", anomaly);
+                                }
+                                tracing::warn!(count = report.anomalies.len(), "integrity check found {} anomaly(ies)", report.anomalies.len());
+                            }
+                        }
+                        Err(e) => tracing::warn!("integrity check failed: {e}"),
+                    }
+                }
+            }
+        }
+
+        // ── 5b. Auto-rebuild Closet periodically ────────────────────────────
+        if self.orchestrator.should_rebuild_closet() {
+            if let Err(e) = self.orchestrator.force_rebuild_closet().await {
+                tracing::warn!("auto closet rebuild failed: {e}");
+            }
+        }
+
+        // ── 6. Persist vector index ─────────────────────────────────────────
+        if let Err(e) = self.vector_index.lock().persist() {
+            tracing::warn!("failed to persist vector index: {}", e);
+        }
+
+        // ── 7. Persist knowledge graph (every 10 ticks) ──────────────────────
+        {
+            let (entities, triples): (Vec<_>, Vec<_>) = {
+                let kg = self.kg.lock();
+                let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
+                let triples: Vec<_> = kg.list_triples().into_iter().cloned().collect();
+                (entities, triples)
+            };
+            if !entities.is_empty() || !triples.is_empty() {
+                if let Err(e) = self.orchestrator.store().save_entities(&entities).await {
+                    tracing::warn!("failed to persist KG entities: {}", e);
+                }
+                if let Err(e) = self.orchestrator.store().save_triples(&triples).await {
+                    tracing::warn!("failed to persist KG triples: {}", e);
+                }
+            }
+        }
+
+        // ── 8. Context rotation health check ────────────────────────────────
+        {
+            let total_tokens: u64 = messages.iter().map(|m| u64::from(m.token_estimate())).sum();
+            let budget = self.compute_budget();
+            let mut monitor = self.context_rot_monitor.lock();
+            match monitor.check(total_tokens, budget.total) {
+                crate::context_rot::RotAlert::Warning(msg) => tracing::warn!("{msg}"),
+                crate::context_rot::RotAlert::Critical(msg) => tracing::error!("{msg}"),
+                crate::context_rot::RotAlert::None => {}
+            }
+        }
+
+        // ── 9. Save Closet to KV store ────────────────────────────────────────
+        match ClosetManager::build_from_orchestrator(&self.orchestrator).await {
+            Ok(manager) => {
+                let pointers = &manager.closet().pointers;
+                match serde_json::to_string(pointers) {
+                    Ok(json) => {
+                        if let Err(e) = self.orchestrator.store().kv_put("closet", &json).await {
+                            tracing::warn!("failed to save closet: {}", e);
+                        } else {
+                            let mut closet_guard = self.closet.lock();
+                            *closet_guard = Some(manager.closet().clone());
+                        }
+                    }
+                    Err(e) => tracing::warn!("failed to serialize closet pointers: {}", e),
+                }
+            }
+            Err(e) => tracing::warn!("failed to build closet: {}", e),
+        }
+
+        // ── 10. Save Seeds to KV store ──────────────────────────────────────
+        {
+            let reg = self.seeds.lock();
+            match serde_json::to_string(reg.all_seeds()) {
+                Ok(json) => {
+                    if let Err(e) = self.orchestrator.store().kv_put("seeds", &json).await {
+                        tracing::warn!("failed to save seeds: {}", e);
+                    }
+                }
+                Err(e) => tracing::warn!("failed to serialize seeds: {}", e),
             }
         }
 

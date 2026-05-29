@@ -1877,7 +1877,7 @@ self.record_turn_completed(&summary);
 
         // Convert session messages to memory's Message type for post-turn extraction.
         // DESIGN: Tool blocks are excluded (same rationale as prepare_memory_context).
-        let mut mem_messages: Vec<MemMessage> = self
+        let mem_messages: Vec<MemMessage> = self
             .session.read().await
             .messages
             .iter()
@@ -1911,7 +1911,30 @@ self.record_turn_completed(&summary);
                 MemMessage { turn_index: idx, role, content, tool_use_id, tool_name, pinned: false }
             }).collect();
 
-        let _ = mgr.on_turn_end(&mut mem_messages).await;
+        let mgr_clone = Arc::clone(&mgr);
+
+        // P5.3: Run Extractor and Drift+Seeds in PARALLEL — they're independent.
+        let start = Instant::now();
+        let (extract_result, drift_result) = tokio::join!(
+            async { mgr.extract_and_remember(&mem_messages).await },
+            async { mgr_clone.run_drift_and_seeds(&mem_messages).await },
+        );
+        let elapsed = start.elapsed();
+        tracing::info!(
+            elapsed_ms = elapsed.as_millis(),
+            "post_turn: extract ∥ drift+seeds completed"
+        );
+
+        if let Err(ref e) = extract_result {
+            tracing::warn!(%e, "post_turn: extraction failed");
+        }
+        if let Err(ref e) = drift_result {
+            tracing::warn!(%e, "post_turn: drift failed");
+        }
+
+        // ── Remaining sequential maintenance ──────────────────────────────────
+        let mut maintenance_messages = mem_messages;
+        let _ = mgr.run_memory_maintenance(&mut maintenance_messages).await;
 
         if let Some(cb) = &self.memory_callback {
             let layers_data = mgr.list_layers().await;
