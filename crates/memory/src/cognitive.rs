@@ -31,6 +31,7 @@ use crate::{ MemoryScope, SessionResume,
     coherence,
     compression::{
         budget::BudgetManager,
+        llm_summarizer::OpenAiSummarizer,
         monitor::ContextWindowMonitor,
         CompressionPipeline,
     },
@@ -217,7 +218,16 @@ impl CognitiveContextManager {
         }
 
         // Build the memory extractor.
-        let extractor = MemoryExtractor::new(config.extractor.clone());
+        let mut extractor = MemoryExtractor::new(config.extractor.clone());
+        if config.compression.llm.is_configured() {
+            let summarizer = OpenAiSummarizer::new(
+                config.compression.llm.api_url.clone(),
+                config.compression.llm.api_key.clone(),
+                config.compression.llm.model.clone(),
+            );
+            extractor = extractor.with_llm(Arc::new(summarizer));
+            tracing::info!("LLM-enhanced extraction enabled (Pass 5)");
+        }
 
         // Load knowledge graph from persistent store.
         let kg = {
@@ -1092,7 +1102,7 @@ impl CognitiveContextManager {
                 "on_turn_end: pre-extraction state"
             );
 
-            match self.extractor.extract(messages) {
+            match self.extractor.extract(messages).await {
                 Ok(entries) => {
                     tracing::info!(
                         entries_count = entries.len(),

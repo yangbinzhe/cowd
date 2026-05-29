@@ -42,12 +42,14 @@ use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
 use crate::{ MemoryScope,
+    compression::llm_summarizer::LlmSummarizer,
     config::ExtractorConfig,
     error::MemoryError,
     splitter,
     store::MemoryStore,
     types::{
-        MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Message, MessageRole, Priority,
+        AgentVisibility, MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Message,
+        MessageRole, Priority,
     },
 };
 
@@ -150,6 +152,8 @@ pub struct MemoryExtractor {
     config: ExtractorConfig,
     /// Guards against concurrent extraction runs.
     running: Arc<AtomicBool>,
+    /// Optional LLM client for Pass 5 extraction enhancement.
+    llm_client: Option<Arc<dyn LlmSummarizer>>,
 }
 
 impl MemoryExtractor {
@@ -163,7 +167,15 @@ impl MemoryExtractor {
         Self {
             config,
             running: Arc::new(AtomicBool::new(false)),
+            llm_client: None,
         }
+    }
+
+    /// Attach an LLM summariser for Pass 5 extraction enhancement.
+    #[must_use]
+    pub fn with_llm(mut self, llm: Arc<dyn LlmSummarizer>) -> Self {
+        self.llm_client = Some(llm);
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -218,7 +230,11 @@ impl MemoryExtractor {
     /// Returns up to `config.batch_size` entries, each with a confidence score
     /// at or above `config.min_confidence`.  Entries are de-duplicated by
     /// title before returning.
-    pub fn extract(&self, messages: &[Message]) -> Result<Vec<MemoryEntry>> {
+    ///
+    /// When an LLM client is attached via [`with_llm`], a fifth pass calls the
+    /// LLM for deeper extraction; on failure the heuristic results are used
+    /// as-is.
+    pub async fn extract(&self, messages: &[Message]) -> Result<Vec<MemoryEntry>> {
         if !Self::should_extract(messages) {
             return Ok(Vec::new());
         }
@@ -232,6 +248,26 @@ impl MemoryExtractor {
         entries.extend(self.extract_decisions(&chunked_messages));
         entries.extend(self.extract_error_fixes(&chunked_messages));
         entries.extend(self.extract_patterns(&chunked_messages));
+
+        // Pass 5 – LLM-enhanced extraction (optional)
+        if self.llm_client.is_some() {
+            match self.llm_extract(&chunked_messages).await {
+                Ok(llm_entries) => {
+                    tracing::info!(
+                        count = llm_entries.len(),
+                        "LLM Pass 5 extracted {} entries",
+                        llm_entries.len()
+                    );
+                    entries = self.merge_entries(entries, llm_entries);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "LLM Pass 5 extraction failed, continuing with heuristic-only results"
+                    );
+                }
+            }
+        }
 
         // Filter by minimum confidence.
         entries.retain(|e| e.confidence >= self.config.min_confidence);
@@ -283,7 +319,7 @@ impl MemoryExtractor {
             let _guard = RunningGuard(&running);
 
             let extractor = MemoryExtractor::new(config);
-            let entries = extractor.extract(&messages)?;
+            let entries = extractor.extract(&messages).await?;
 
             // Persist each entry to the store.
             let mut persisted: Vec<MemoryEntry> = Vec::with_capacity(entries.len());
@@ -627,6 +663,225 @@ impl MemoryExtractor {
             out
         }
     }
+
+    // -------------------------------------------------------------------
+    // Pass 5 – LLM-enhanced extraction
+    // -------------------------------------------------------------------
+
+    /// Run the LLM extraction pass over the given messages.
+    async fn llm_extract(&self, messages: &[Message]) -> Result<Vec<MemoryEntry>> {
+        let prompt = Self::build_extraction_prompt();
+        let content_text = Self::format_messages_for_llm(messages);
+
+        let llm = self
+            .llm_client
+            .as_ref()
+            .ok_or_else(|| MemoryError::Other("LLM client not configured".into()))?;
+
+        let response = llm
+            .summarize(&prompt, &content_text)
+            .await
+            .map_err(|e| MemoryError::Other(format!("LLM extraction failed: {e}")))?;
+
+        let trimmed = response.trim();
+        // Strip markdown fences if present.
+        let json_str = if trimmed.starts_with("```") {
+            trimmed
+                .trim_start_matches("```json")
+                .trim_start_matches("```")
+                .trim_end_matches("```")
+                .trim()
+        } else {
+            trimmed
+        };
+
+        let llm_entries: Vec<LlmExtractedEntry> = serde_json::from_str(json_str).map_err(|e| {
+            tracing::warn!(
+                error = %e,
+                raw_preview = %json_str.chars().take(400).collect::<String>(),
+                "LLM extraction: failed to parse JSON response",
+            );
+            MemoryError::Other(format!("LLM JSON parse error: {e}"))
+        })?;
+
+        Ok(llm_entries
+            .into_iter()
+            .map(LlmExtractedEntry::into_memory_entry)
+            .collect())
+    }
+
+    /// Build the extraction prompt instructing the LLM to return a JSON array.
+    fn build_extraction_prompt() -> String {
+        r#"You are a memory extraction system. Analyze the following conversation and extract key memories as a JSON array.
+
+Each memory entry must have these fields:
+- "title": A short, clear title (max 80 characters)
+- "content": Detailed description of the memory
+- "category": One of "UserPreference", "Decision", "Reference", "ProjectConvention", "ProjectKnowledge", "CompressedSummary", "Shared"
+- "layer": One of "L1" (critical identity/preferences), "L2" (project context/decisions), "L3" (reference/patterns)
+- "priority": One of "High", "Normal", "Low"
+- "confidence": A float from 0.0 to 1.0
+- "tags": Array of short keyword strings
+
+Extraction guidelines:
+- Extract user preferences and coding style preferences as "UserPreference" / "L1"
+- Extract architectural decisions and approach choices as "Decision" / "L2"
+- Extract error resolutions, fixes, and workarounds as "Reference" / "L2"
+- Extract repeated patterns and conventions as "ProjectConvention" / "L2"
+- Extract project facts and entity knowledge as "ProjectKnowledge" / "L2"
+- Extract summaries and compressed content as "CompressedSummary" / "L3"
+- Extract cross-agent shared knowledge as "Shared" / "L4"
+- L1 entries should have confidence >= 0.8; L2/L3 >= 0.6
+
+Only extract genuinely new and useful information. Skip trivial, obvious, or redundant content.
+Return ONLY the JSON array, no other text or explanation."#
+            .to_string()
+    }
+
+    /// Format messages into a text block suitable for LLM consumption.
+    ///
+    /// Tool output is truncated to 500 chars to keep the prompt manageable.
+    fn format_messages_for_llm(messages: &[Message]) -> String {
+        let mut out = String::new();
+        for msg in messages {
+            let role_label = match msg.role {
+                MessageRole::User => "User",
+                MessageRole::Assistant => "Assistant",
+                MessageRole::Tool => {
+                    let name = msg.tool_name.as_deref().unwrap_or("unknown");
+                    out.push_str(&format!(
+                        "[Tool {}]: {}\n",
+                        name,
+                        Self::truncate(&msg.content, 500),
+                    ));
+                    continue;
+                }
+                MessageRole::System => continue,
+            };
+            out.push_str(&format!("[{role_label}]: {}\n", msg.content));
+        }
+        out
+    }
+
+    /// Merge heuristic entries with LLM entries, keeping the highest-confidence
+    /// version of each title and respecting `batch_size`.
+    fn merge_entries(
+        &self,
+        heuristic: Vec<MemoryEntry>,
+        llm: Vec<MemoryEntry>,
+    ) -> Vec<MemoryEntry> {
+        let mut merged = heuristic;
+        merged.extend(llm);
+
+        // Deduplicate by normalised title, preferring higher confidence.
+        let mut seen: HashMap<String, (usize, f32)> = HashMap::new();
+        let mut i = 0;
+        while i < merged.len() {
+            let key = merged[i].title.to_lowercase();
+            if let Some(&(prev_idx, prev_conf)) = seen.get(&key) {
+                if merged[i].confidence > prev_conf {
+                    merged.swap_remove(prev_idx);
+                    // Rebuild the index after mutation.
+                    seen.clear();
+                    i = 0;
+                    continue;
+                }
+                merged.swap_remove(i);
+                continue;
+            }
+            seen.insert(key, (i, merged[i].confidence));
+            i += 1;
+        }
+
+        merged.truncate(self.config.batch_size);
+        merged
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LlmExtractedEntry – deserialisation helper for LLM JSON responses
+// ---------------------------------------------------------------------------
+
+/// Simplified entry deserialised from the LLM JSON response.
+#[derive(Debug, serde::Deserialize)]
+struct LlmExtractedEntry {
+    title: String,
+    content: String,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    layer: Option<String>,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default)]
+    confidence: Option<f32>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+impl LlmExtractedEntry {
+    fn into_memory_entry(self) -> MemoryEntry {
+        let category = self
+            .category
+            .as_deref()
+            .and_then(|c| match c {
+                "UserPreference" => Some(MemoryCategory::UserPreference),
+                "Decision" => Some(MemoryCategory::Decision),
+                "Reference" => Some(MemoryCategory::Reference),
+                "ProjectConvention" => Some(MemoryCategory::ProjectConvention),
+                "ProjectKnowledge" => Some(MemoryCategory::ProjectKnowledge),
+                "CompressedSummary" => Some(MemoryCategory::CompressedSummary),
+                "Shared" => Some(MemoryCategory::Shared),
+                _ => None,
+            })
+            .unwrap_or(MemoryCategory::Reference);
+
+        let layer = self
+            .layer
+            .as_deref()
+            .and_then(|l| match l {
+                "L1" => Some(MemoryLayer::L1),
+                "L2" => Some(MemoryLayer::L2),
+                "L3" => Some(MemoryLayer::L3),
+                _ => None,
+            })
+            .unwrap_or(MemoryLayer::L2);
+
+        let priority = self
+            .priority
+            .as_deref()
+            .and_then(|p| match p {
+                "High" => Some(Priority::High),
+                "Normal" => Some(Priority::Normal),
+                "Low" => Some(Priority::Low),
+                _ => None,
+            })
+            .unwrap_or(Priority::Normal);
+
+        let now = Utc::now();
+        MemoryEntry {
+            id: Uuid::new_v4(),
+            layer,
+            category,
+            priority,
+            source: MemorySource::AutoExtracted,
+            title: self.title,
+            content: self.content,
+            embedding: None,
+            tags: self.tags.unwrap_or_default(),
+            relations: vec![],
+            confidence: self.confidence.unwrap_or(0.7),
+            access_count: 0,
+            staleness: 0.0,
+            created_at: now,
+            updated_at: now,
+            last_accessed_at: None,
+            scope: MemoryScope::default(),
+            session_id: None,
+            source_agent: None,
+            visibility: AgentVisibility::default(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -711,60 +966,60 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_yields_preference_entry() {
+    #[tokio::test]
+    async fn extract_yields_preference_entry() {
         let ex = default_extractor();
         let msgs = make_messages();
-        let entries = ex.extract(&msgs).unwrap();
+        let entries = ex.extract(&msgs).await.unwrap();
         let pref = entries
             .iter()
             .find(|e| e.category == MemoryCategory::UserPreference);
         assert!(pref.is_some(), "expected a UserPreference entry");
     }
 
-    #[test]
-    fn extract_yields_decision_entry() {
+    #[tokio::test]
+    async fn extract_yields_decision_entry() {
         let ex = default_extractor();
         let msgs = make_messages();
-        let entries = ex.extract(&msgs).unwrap();
+        let entries = ex.extract(&msgs).await.unwrap();
         let dec = entries
             .iter()
             .find(|e| e.category == MemoryCategory::Decision);
         assert!(dec.is_some(), "expected a Decision entry");
     }
 
-    #[test]
-    fn extract_yields_error_fix_entry() {
+    #[tokio::test]
+    async fn extract_yields_error_fix_entry() {
         let ex = default_extractor();
         let msgs = make_messages();
-        let entries = ex.extract(&msgs).unwrap();
+        let entries = ex.extract(&msgs).await.unwrap();
         let fix = entries
             .iter()
             .find(|e| e.category == MemoryCategory::Reference && e.tags.contains(&"fix".into()));
         assert!(fix.is_some(), "expected an error-fix Reference entry");
     }
 
-    #[test]
-    fn extract_empty_for_trivial_conversation() {
+    #[tokio::test]
+    async fn extract_empty_for_trivial_conversation() {
         let ex = default_extractor();
         let msgs = vec![
             Message::user("hi"),
             Message::assistant("hello"),
         ];
-        let entries = ex.extract(&msgs).unwrap();
+        let entries = ex.extract(&msgs).await.unwrap();
         // Should_extract returns false → empty result.
         assert!(entries.is_empty());
     }
 
-    #[test]
-    fn confidence_filter_applied() {
+    #[tokio::test]
+    async fn confidence_filter_applied() {
         let ex = MemoryExtractor::new(ExtractorConfig {
             poll_interval_secs: 30,
             batch_size: 20,
             min_confidence: 0.99, // impossibly high
         });
         let msgs = make_messages();
-        let entries = ex.extract(&msgs).unwrap();
+        let entries = ex.extract(&msgs).await.unwrap();
         assert!(entries.is_empty(), "all entries should be filtered out");
     }
 }
