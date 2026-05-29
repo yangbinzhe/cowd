@@ -661,9 +661,19 @@ impl CognitiveContextManager {
                 }
             },
             // L4 project-scoped recall
-            async { self.orchestrator.recall_l4_project(query, 5).await.unwrap_or_default() },
+            async {
+                match self.orchestrator.recall_l4_project(query, 5).await {
+                    Ok(r) => r,
+                    Err(e) => { tracing::warn!(error=%e, "L4 project recall failed"); Vec::new() }
+                }
+            },
             // L4 global-scoped recall
-            async { self.orchestrator.recall_l4_global(query, 5).await.unwrap_or_default() },
+            async {
+                match self.orchestrator.recall_l4_global(query, 5).await {
+                    Ok(r) => r,
+                    Err(e) => { tracing::warn!(error=%e, "L4 global recall failed"); Vec::new() }
+                }
+            },
             // L3 deep recall (hybrid semantic + BM25)
             async {
                 self.orchestrator.recall_relevant(
