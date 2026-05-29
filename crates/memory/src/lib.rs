@@ -67,6 +67,7 @@ pub mod project_scope;
 pub mod impact_analyzer;
 pub mod tool_sandbox;
 pub mod tiered_store;
+pub mod transaction;
 
 // --- Convenience re-exports ---
 
@@ -171,3 +172,8 @@ pub use code_indexer::{
 
 // --- Impact analyzer re-exports (F17) ---
 pub use impact_analyzer::{CallGraph, ImpactAnalyzer};
+
+// --- Transaction re-exports (F20) ---
+pub use transaction::{
+    FileEditEffect, ReversibleEffect, TransactionError, TransactionGuard, TransactionManager,
+};
