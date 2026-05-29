@@ -185,7 +185,6 @@ pub struct PreFlightGate {
 }
 
 /// A pre-flight check.
-#[derive(Debug, Clone)]
 pub enum PreFlightCheck {
     /// Check for merge conflicts.
     MergeConflicts,
@@ -199,6 +198,8 @@ pub enum PreFlightCheck {
     CommitMessageFormat { pattern: String },
     /// Check for TODO/FIXME without owners.
     UnownedTodos,
+    /// Impact analysis gate — runs an impact function and warns on HIGH/CRITICAL risk.
+    ImpactAnalysis(Box<dyn Fn() -> ImpactSummary + Send + Sync>),
 }
 
 impl PreFlightGate {
@@ -326,6 +327,23 @@ impl Gate for PreFlightGate {
                                 warnings.push(format!("Unowned TODO/FIXME found: {}", line.trim()));
                             }
                         }
+                    }
+                }
+                PreFlightCheck::ImpactAnalysis(impact_fn) => {
+                    let summary = impact_fn();
+                    if summary.risk_level == ImpactRiskLevel::High
+                        || summary.risk_level == ImpactRiskLevel::Critical
+                    {
+                        warnings.push(format!(
+                            "Impact analysis HIGH RISK: {} has {} direct + {} indirect callers across {} files",
+                            summary.symbol_name,
+                            summary.direct_callers.len(),
+                            summary.indirect.len(),
+                            summary.affected_files.len()
+                        ));
+                        suggestions.push(
+                            "Review impact before proceeding with changes".to_string(),
+                        );
                     }
                 }
             }

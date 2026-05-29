@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::{
-        code_indexer::{CodeSymbol, FileFingerprint, SymbolEdge, SymbolKind},
+        code_indexer::{CodeSymbol, FileFingerprint, SymbolEdge, SymbolEdgeType, SymbolKind},
     config::StoreConfig,
     entity::{Entity, Triple},
     error::MemoryError,
@@ -1464,6 +1464,55 @@ impl SqliteStore {
         Ok(symbols)
     }
 
+    fn do_list_all_symbols(conn: &Connection) -> Result<Vec<CodeSymbol>> {
+        let sql = "SELECT id, name, kind, file_path, line, signature, doc FROM code_symbols";
+        let mut stmt = conn.prepare(sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CodeSymbol {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?).unwrap_or(SymbolKind::Function),
+                    file_path: row.get(3)?,
+                    line: row.get::<_, i64>(4)? as usize,
+                    signature: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    doc: row.get(6)?,
+                })
+            })
+            .map_err(sql_err)?;
+        let mut symbols = Vec::new();
+        for r in rows {
+            symbols.push(r.map_err(sql_err)?);
+        }
+        Ok(symbols)
+    }
+
+    fn do_list_all_edges(conn: &Connection) -> Result<Vec<SymbolEdge>> {
+        let sql = "SELECT source_id, target_id, edge_type, file_path FROM code_edges";
+        let mut stmt = conn.prepare(sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SymbolEdge {
+                    source_id: row.get(0)?,
+                    target_id: row.get(1)?,
+                    edge_type: match row.get::<_, String>(2)?.as_str() {
+                        "calls" => SymbolEdgeType::Calls,
+                        "imports" => SymbolEdgeType::Imports,
+                        "extends" => SymbolEdgeType::Extends,
+                        "implements" => SymbolEdgeType::Implements,
+                        _ => SymbolEdgeType::Calls,
+                    },
+                    file_path: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                })
+            })
+            .map_err(sql_err)?;
+        let mut edges = Vec::new();
+        for r in rows {
+            edges.push(r.map_err(sql_err)?);
+        }
+        Ok(edges)
+    }
+
     // -------------------------------------------------------------------
     // Symbol ↔ memory linking (Phase 2: L3 deep recall integration)
     // -------------------------------------------------------------------
@@ -2022,6 +2071,26 @@ impl MemoryStore for SqliteStore {
         tokio::task::spawn_blocking(move || {
             let conn = store.conn()?;
             Self::do_get_callees(&conn, &symbol_id)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn list_all_symbols(&self) -> Result<Vec<CodeSymbol>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_list_all_symbols(&conn)
+        })
+        .await
+        .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn list_all_edges(&self) -> Result<Vec<SymbolEdge>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            Self::do_list_all_edges(&conn)
         })
         .await
         .map_err(|e| MemoryError::Store(e.to_string()))?

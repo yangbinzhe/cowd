@@ -169,6 +169,16 @@ pub trait MemoryStore: Send + Sync {
         Err(MemoryError::Store("code symbol callees not supported by this backend".into()))
     }
 
+    /// List all code symbols in the index (no filtering).
+    async fn list_all_symbols(&self) -> Result<Vec<CodeSymbol>> {
+        Err(MemoryError::Store("code symbol listing not supported by this backend".into()))
+    }
+
+    /// List all code edges in the index (no filtering).
+    async fn list_all_edges(&self) -> Result<Vec<SymbolEdge>> {
+        Err(MemoryError::Store("code edge listing not supported by this backend".into()))
+    }
+
     // -----------------------------------------------------------------------
     // Symbol ↔ memory linking (Phase 2: L3 deep recall integration)
     // -----------------------------------------------------------------------
