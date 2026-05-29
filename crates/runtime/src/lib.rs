@@ -70,6 +70,7 @@ mod usage;
 pub mod worker_boot;
 pub mod tool_orchestrator;
 pub mod tool_dispatch;
+pub mod team_discovery;
 pub mod agent;
 pub mod agent_collaboration;
 pub mod agent_discussion;
@@ -85,7 +86,10 @@ pub use agent::{
     SubAgentToolMode,
 };
 pub use agent_collaboration::{
-    AgentTeam, CollaborationOrchestrator, CollaborationTask, SubTask,
+    AgentTeam, CollaborationOrchestrator, CollaborationTask, CollaborationOps, SubTask,
+};
+pub use team_discovery::{
+    DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol,
 };
 pub use agent_discussion::{
     ConsensusMethod, ConsensusResult, Contribution, Discussion, DiscussionEngine,

@@ -382,3 +382,164 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
         "post-recovery green+approved lane should be merge-ready"
     );
 }
+
+/// TeamDiscovery + AgentDirectory integration:
+/// TeamDiscoveryProtocol correctly discovers and ranks agents from the
+/// global AgentDirectory by skill overlap.
+#[test]
+fn team_discovery_ranks_by_skill_overlap_from_directory() {
+    use runtime::team_discovery::TeamDiscoveryProtocol;
+    use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus};
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Register agents with varying capabilities
+    let agents = [
+        AgentInfo {
+            agent_id: "rust-expert".into(),
+            role: "Executor".into(),
+            capabilities: vec!["rust".into(), "testing".into(), "refactoring".into()],
+            status: AgentStatus::Active,
+            registered_at_ms: now,
+            last_heartbeat_ms: now,
+            reputation: None,
+        },
+        AgentInfo {
+            agent_id: "python-dev".into(),
+            role: "Executor".into(),
+            capabilities: vec!["python".into()],
+            status: AgentStatus::Active,
+            registered_at_ms: now,
+            last_heartbeat_ms: now,
+            reputation: None,
+        },
+        AgentInfo {
+            agent_id: "tester".into(),
+            role: "Reviewer".into(),
+            capabilities: vec!["testing".into()],
+            status: AgentStatus::Active,
+            registered_at_ms: now,
+            last_heartbeat_ms: now,
+            reputation: None,
+        },
+    ];
+
+    for a in &agents {
+        AgentDirectory::global().register(a.clone());
+    }
+
+    let discovery = TeamDiscoveryProtocol::new();
+    let ranked = discovery.discover_team(
+        "Build a Rust microservice with tests",
+        &["rust".into(), "testing".into()],
+    );
+
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(ranked[0].agent_id, "rust-expert"); // 2 matches (rust+testing)
+    assert_eq!(ranked[1].agent_id, "tester");       // 1 match (testing)
+
+    // python-dev doesn't match rust or testing
+    assert!(ranked.iter().all(|a| a.agent_id != "python-dev"));
+
+    // Cleanup
+    for a in &agents {
+        AgentDirectory::global().unregister(&a.agent_id);
+    }
+}
+
+/// TeamDiscovery + CollaborationOrchestrator integration:
+/// The orchestrator's assemble_team() uses reputation-aware discovery
+/// and produces a valid AgentTeam with leader and workers.
+#[test]
+fn orchestrator_assemble_team_uses_discovery_protocol() {
+    use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus, ReputationScore};
+    use runtime::agent_collaboration::{CollaborationOrchestrator, CollaborationTask};
+    use runtime::agent::{SubAgentExecutor, SubAgentConfig, SubAgentResult, SubAgentError};
+
+    struct NoopExecutor;
+    impl SubAgentExecutor for NoopExecutor {
+        fn execute(
+            _config: SubAgentConfig,
+            _task: &str,
+        ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
+            async { Ok(SubAgentResult::default()) }
+        }
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Register agents with reputation — leader should be the one with highest rep
+    let agents = [
+        AgentInfo {
+            agent_id: "high-rep".into(),
+            role: "Executor".into(),
+            capabilities: vec!["rust".into()],
+            status: AgentStatus::Active,
+            registered_at_ms: now,
+            last_heartbeat_ms: now,
+            reputation: Some(ReputationScore {
+                success_rate: 0.95,
+                task_count: 50,
+                peer_rating: 4.9,
+                last_success_at_ms: now,
+                recent_failures: 0,
+            }),
+        },
+        AgentInfo {
+            agent_id: "low-rep".into(),
+            role: "Executor".into(),
+            capabilities: vec!["rust".into(), "testing".into()],
+            status: AgentStatus::Active,
+            registered_at_ms: now,
+            last_heartbeat_ms: now,
+            reputation: Some(ReputationScore {
+                success_rate: 0.2,
+                task_count: 3,
+                peer_rating: 1.0,
+                last_success_at_ms: 0,
+                recent_failures: 5,
+            }),
+        },
+    ];
+
+    for a in &agents {
+        AgentDirectory::global().register(a.clone());
+    }
+
+    let orch = CollaborationOrchestrator::<NoopExecutor>::new();
+
+    let task = CollaborationTask {
+        description: "Rust refactoring".into(),
+        required_skills: vec!["rust".into()],
+        subtasks: vec![],
+        review_criteria: None,
+    };
+
+    let team = orch.assemble_team(&task).expect("should assemble team");
+
+    // High-rep agent should be leader despite fewer skill matches
+    assert_eq!(team.leader.agent_id, "high-rep");
+    assert!(!team.workers.is_empty());
+    assert_eq!(team.workers[0].agent_id, "low-rep");
+
+    // Cleanup
+    for a in &agents {
+        AgentDirectory::global().unregister(&a.agent_id);
+    }
+}
+
+/// TeamDiscovery auto_assemble + empty directory returns None.
+#[test]
+fn auto_assemble_returns_none_when_directory_empty() {
+    use runtime::team_discovery::TeamDiscoveryProtocol;
+
+    let discovery = TeamDiscoveryProtocol::new();
+    let result = discovery.auto_assemble("any task", &["rust".into()]);
+    assert!(result.is_none());
+}

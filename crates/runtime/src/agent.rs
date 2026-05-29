@@ -304,6 +304,8 @@ pub struct SubAgentRuntime<C: ApiClient, T: ToolExecutor> {
     registered: AtomicBool,
     /// Captured reasoning trace from ThinkingDelta events.
     reasoning_trace: Option<String>,
+    /// Reputation manager for recording task completion metrics (P9.1).
+    reputation_manager: Option<memory::agent_reputation::ReputationManager>,
 }
 
 impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
@@ -324,6 +326,7 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             status: memory::agent_directory::AgentStatus::Active,
             registered_at_ms: now_ms,
             last_heartbeat_ms: now_ms,
+            reputation: None,
         };
         memory::agent_directory::AgentDirectory::global().register(info);
 
@@ -337,6 +340,7 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             agent_id,
             registered: AtomicBool::new(true),
             reasoning_trace: None,
+            reputation_manager: None,
             config,
             runtime,
         }
@@ -353,6 +357,16 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
     #[must_use]
     pub fn with_result_budget(mut self, budget: ToolResultBudget) -> Self {
         self.result_budget = budget;
+        self
+    }
+
+    /// Attach a reputation manager for P9.1 agent performance tracking.
+    #[must_use]
+    pub fn with_reputation_manager(
+        mut self,
+        mgr: memory::agent_reputation::ReputationManager,
+    ) -> Self {
+        self.reputation_manager = Some(mgr);
         self
     }
 
@@ -424,6 +438,21 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             m.observe_delegation("sub-agent", self.task_description(), &output, None);
         }
 
+        let completed_normally = self.turns_executed <= self.config.max_turns
+            && self.tokens_consumed <= self.config.budget_tokens;
+
+        // P9.1: Record completion metrics for reputation tracking.
+        if let Some(ref rep_mgr) = self.reputation_manager {
+            let quality = if completed_normally { 0.85 } else { 0.4 };
+            let domains: Vec<String> = self.config.capabilities.clone();
+            let _ = rep_mgr.record_completion(
+                &self.agent_id,
+                quality,
+                completed_normally,
+                &domains,
+            );
+        }
+
         SubAgentResult {
             output,
             tool_call_count: 0, // caller should track
@@ -431,8 +460,7 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             // 3A-4 fix: use <= instead of < — using exactly max_turns or
             // exactly budget_tokens is still within budget and counts as
             // normal completion.
-            completed_normally: self.turns_executed <= self.config.max_turns
-                && self.tokens_consumed <= self.config.budget_tokens,
+            completed_normally,
             memory_write_attempts: 0,
             memory_writes_denied: 0,
             reasoning_trace: self.reasoning_trace.clone(),
@@ -594,6 +622,19 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
                 &output_snippet,
                 &parent_agent,
             ).await;
+        }
+
+        // P9.1: Record completion metrics for reputation tracking.
+        if let Some(ref rep_mgr) = self.reputation_manager {
+            let quality = if completed_normally { 0.85 } else { 0.4 };
+            let on_time = completed_normally;
+            let domains: Vec<String> = self.config.capabilities.clone();
+            let _ = rep_mgr.record_completion(
+                &self.agent_id,
+                quality,
+                on_time,
+                &domains,
+            );
         }
 
         SubAgentResult {

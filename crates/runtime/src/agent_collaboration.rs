@@ -9,6 +9,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{SubAgentConfig, SubAgentExecutor, SubAgentResult};
+use crate::team_discovery::TeamDiscoveryProtocol;
 use crate::wave::{TaskId, WaveConfig, WaveOrchestrator, WaveTask};
 
 use memory::agent_directory::{AgentDirectory, AgentInfo};
@@ -51,6 +52,7 @@ pub struct AgentTeam {
 
 pub struct CollaborationOrchestrator<E: SubAgentExecutor> {
     parent_memory: Option<Arc<memory::CognitiveContextManager>>,
+    discovery: TeamDiscoveryProtocol,
     _executor: PhantomData<E>,
 }
 
@@ -58,6 +60,7 @@ impl<E: SubAgentExecutor> CollaborationOrchestrator<E> {
     pub fn new() -> Self {
         Self {
             parent_memory: None,
+            discovery: TeamDiscoveryProtocol::new(),
             _executor: PhantomData,
         }
     }
@@ -67,6 +70,12 @@ impl<E: SubAgentExecutor> CollaborationOrchestrator<E> {
         memory: Arc<memory::CognitiveContextManager>,
     ) -> Self {
         self.parent_memory = Some(memory);
+        self
+    }
+
+    /// Inject a `TeamDiscoveryProtocol` for reputation-aware team assembly.
+    pub fn with_discovery(mut self, discovery: TeamDiscoveryProtocol) -> Self {
+        self.discovery = discovery;
         self
     }
 
@@ -104,12 +113,26 @@ impl<E: SubAgentExecutor> CollaborationOrchestrator<E> {
 
     // ── assemble_team ──────────────────────────────────────────────────────
 
-    /// Query the global `AgentDirectory` for agents whose declared
-    /// capabilities match the task's required skills.
+    /// Query the `TeamDiscoveryProtocol` for agents matching required skills,
+    /// ranked by skill-overlap * reputation composite.
     ///
-    /// The agent with the most matching capabilities is elected leader;
-    /// the rest become workers.
+    /// Falls back to the basic `AgentDirectory::discover()` if the discovery
+    /// protocol produces no results but raw candidates exist.
+    ///
+    /// The highest-ranked agent is elected leader; the rest become workers.
     pub fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam> {
+        // Try reputation-aware discovery first.
+        if let Some(discovered) =
+            self.discovery
+                .auto_assemble(&task.description, &task.required_skills)
+        {
+            return Some(AgentTeam {
+                leader: discovered.leader,
+                workers: discovered.workers,
+            });
+        }
+
+        // Fallback: simple AgentDirectory discovery.
         let candidates = AgentDirectory::global().discover(&task.required_skills);
         if candidates.is_empty() {
             return None;
@@ -693,6 +716,7 @@ mod tests {
             status: AgentStatus::Active,
             registered_at_ms: now,
             last_heartbeat_ms: now,
+            reputation: None,
         }
     }
 }

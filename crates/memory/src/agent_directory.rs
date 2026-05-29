@@ -9,6 +9,47 @@ use std::sync::OnceLock;
 
 static DIRECTORY: OnceLock<AgentDirectory> = OnceLock::new();
 
+/// Quality / reputation score accumulated by an agent across tasks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReputationScore {
+    /// Success rate (0.0 – 1.0) over all completed tasks.
+    pub success_rate: f64,
+    /// Total number of tasks this agent has participated in.
+    pub task_count: u64,
+    /// Peer-assigned rating (0.0 – 5.0).
+    pub peer_rating: f64,
+    /// Timestamp (ms since epoch) of the most recent successful completion.
+    pub last_success_at_ms: u64,
+    /// Number of consecutive failures since the last success (resets on success).
+    pub recent_failures: u32,
+}
+
+impl ReputationScore {
+    /// Composite score combining success rate, peer rating, and recency.
+    /// Returns a value in [0.0, 10.0] suitable for ranking.
+    pub fn composite(&self) -> f64 {
+        let success_component = self.success_rate * 4.0;
+        let peer_component = (self.peer_rating / 5.0) * 3.0;
+        // Recency bonus — max 3.0 for successes within the last hour, decays over 24h
+        let now_ms = current_time_millis();
+        let recency = if self.last_success_at_ms > 0 {
+            let age_secs = (now_ms.saturating_sub(self.last_success_at_ms) as f64) / 1000.0;
+            if age_secs < 3_600.0 {
+                3.0
+            } else if age_secs < 86_400.0 {
+                3.0 * (1.0 - (age_secs - 3_600.0) / (86_400.0 - 3_600.0))
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        // Penalty for recent failures
+        let failure_penalty = (self.recent_failures as f64 * 0.5).min(2.0);
+        (success_component + peer_component + recency - failure_penalty).max(0.0)
+    }
+}
+
 /// Metadata for a single registered agent.
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
@@ -24,6 +65,8 @@ pub struct AgentInfo {
     pub registered_at_ms: u64,
     /// Timestamp (ms since epoch) of the last status update / heartbeat.
     pub last_heartbeat_ms: u64,
+    /// Accumulated reputation score (optional — populated by TeamDiscovery).
+    pub reputation: Option<ReputationScore>,
 }
 
 /// Operational status of an agent.
@@ -95,6 +138,12 @@ impl AgentDirectory {
             .cloned()
             .collect()
     }
+
+    /// Clear all agents from the directory (mainly for testing).
+    #[doc(hidden)]
+    pub fn clear_all(&self) {
+        self.agents.lock().clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +174,7 @@ mod tests {
             status: AgentStatus::Active,
             registered_at_ms: current_time_millis(),
             last_heartbeat_ms: current_time_millis(),
+            reputation: None,
         }
     }
 

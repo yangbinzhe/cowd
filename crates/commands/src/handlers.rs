@@ -67,6 +67,74 @@ pub fn handle_slash_command(
         SlashCommand::Branch { name } => {
             agent_alias("/branch", &name.unwrap_or_default(), session)
         }
+        SlashCommand::AgentProfile { agent_id } => {
+            let dir = memory::agent_directory::AgentDirectory::global();
+            match agent_id {
+                Some(id) => {
+                    let active = dir.list_active();
+                    let mut found = None;
+                    for agent in &active {
+                        if agent.agent_id.starts_with(&id) || agent.agent_id == id {
+                            found = Some(agent.clone());
+                            break;
+                        }
+                    }
+                    match found {
+                        Some(info) => {
+                            let repscore = info.reputation
+                                .map(|r| format!("{:.3}", r.composite()))
+                                .unwrap_or_else(|| "N/A".to_string());
+                            let caps = info.capabilities.join(", ");
+                            let msg = format!(
+                                "Agent Profile — {}\n  Role:       {}\n  Status:     {:?}\n  Capabilities: [{}]\n  Reputation: {}\n  Heartbeat:  {}",
+                                info.agent_id,
+                                info.role,
+                                info.status,
+                                caps,
+                                repscore,
+                                info.last_heartbeat_ms,
+                            );
+                            Some(SlashCommandResult {
+                                message: msg,
+                                error: None,
+                                session: session.clone(),
+                            })
+                        }
+                        None => Some(SlashCommandResult {
+                            message: format!("No agent found matching '{id}'."),
+                            error: Some("agent_not_found".into()),
+                            session: session.clone(),
+                        }),
+                    }
+                }
+                None => {
+                    let active = dir.list_active();
+                    if active.is_empty() {
+                        Some(SlashCommandResult {
+                            message: "No active agents registered.".to_string(),
+                            error: None,
+                            session: session.clone(),
+                        })
+                    } else {
+                        let lines: Vec<String> = active.iter().map(|info| {
+                            let repscore = info.reputation
+                                .map(|r| format!("{:.3}", r.composite()))
+                                .unwrap_or_else(|| "N/A".to_string());
+                            format!(
+                                "  {}  {:?}  {}  rep:{}",
+                                info.agent_id, info.status, info.role, repscore
+                            )
+                        }).collect();
+                        let msg = format!("Registered agents ({}):\n{}", active.len(), lines.join("\n"));
+                        Some(SlashCommandResult {
+                            message: msg,
+                            error: None,
+                            session: session.clone(),
+                        })
+                    }
+                }
+            }
+        }
         SlashCommand::Solve { problem } => {
             let prompt = format!("Solve the following problem using the Joint Problem Solving protocol (P8.3):\n\n{}\n\nFollow the 7-phase protocol: ProblemFraming, SolutionBrainstorming, SolutionMerger, Evaluation, Selection, Execution, Review.", problem.as_deref().unwrap_or("please describe your problem"));
             agent_alias("/solve", &prompt, session)
@@ -523,9 +591,9 @@ mod tests {
 
         // then
         assert!(agents_error.contains(
-            "Unexpected arguments for /agents: show planner. Use /agents, /agents list, or /agents help."
+            "Unexpected arguments for /agents: show planner. Use /agents, /agents list, /agents discover <task>, or /agents help."
         ));
-        assert!(agents_error.contains("  Usage            /agents [list|help]"));
+        assert!(agents_error.contains("  Usage            /agents [list|discover <task>|help]"));
     }
 
     #[test]
@@ -608,7 +676,7 @@ mod tests {
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
-        assert!(help.contains("/agents [list|help]"));
+        assert!(help.contains("/agents [list|discover <task>|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
@@ -1005,7 +1073,7 @@ mod tests {
         let help = handle_agents_slash_command_json(Some("help"), &workspace).expect("agents help");
         assert_eq!(help["kind"], "agents");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["direct_cli"], "cowd agents [list|help]");
+        assert_eq!(help["usage"]["direct_cli"], "cowd agents [list|discover <task>|help]");
 
         let unexpected = handle_agents_slash_command_json(Some("show planner"), &workspace)
             .expect("agents usage");
@@ -1144,7 +1212,7 @@ mod tests {
 
         let agents_help =
             handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
-        assert!(agents_help.contains("Usage            /agents [list|help]"));
+        assert!(agents_help.contains("Usage            /agents [list|discover <task>|help]"));
         assert!(agents_help.contains("Direct CLI       cowd agents"));
         assert!(agents_help
             .contains("Sources          .cowd/agents, ~/.cowd/agents, $CC_CONFIG_HOME/agents"));

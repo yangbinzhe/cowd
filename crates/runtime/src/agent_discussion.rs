@@ -778,6 +778,7 @@ mod tests {
             status: AgentStatus::Active,
             registered_at_ms: now,
             last_heartbeat_ms: now,
+            reputation: None,
         }
     }
 

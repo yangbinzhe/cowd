@@ -26,6 +26,7 @@
 // --- Public modules ---
 
 pub mod agent_directory;
+pub mod agent_reputation;
 pub mod cognitive;
 pub mod compression;
 pub mod config;
@@ -181,7 +182,7 @@ pub use impact_analyzer::{CallGraph, ImpactAnalyzer};
 pub use performance_monitor::{AutoTuner, PerformanceMonitor, PerformanceReport};
 
 // --- Agent directory re-exports (P7.3) ---
-pub use agent_directory::{AgentDirectory, AgentInfo, AgentStatus};
+pub use agent_directory::{AgentDirectory, AgentInfo, AgentStatus, ReputationScore};
 
 // --- Memory sync re-exports (P8.4) ---
 pub use memory_sync::MemorySyncProtocol;
@@ -192,4 +193,10 @@ pub use entity_registry::{DisambiguationKey, EntityRecord, EntityRegistry, Evolu
 // --- Transaction re-exports (F20) ---
 pub use transaction::{
     FileEditEffect, ReversibleEffect, TransactionError, TransactionGuard, TransactionManager,
+};
+
+// --- Agent reputation re-exports (P9.1) ---
+pub use agent_reputation::{
+    AgentMetrics, DecayConfig, ReputationManager,
+    apply_decay, compute_reputation,
 };

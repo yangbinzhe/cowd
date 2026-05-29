@@ -102,6 +102,8 @@ impl SlashCommand {
             Self::SubAgent { .. } => "/subagent",
             Self::Pipeline { .. } => "/pipeline",
             Self::Solve { .. } => "/solve",
+            Self::Agents { .. } => "/agent",
+            Self::AgentProfile { .. } => "/agent",
             #[allow(unreachable_patterns)]
             _ => "/unknown",
         }
@@ -202,6 +204,7 @@ pub fn validate_slash_command_input(
         "agents" => SlashCommand::Agents {
             args: parse_list_or_help_args(command, remainder)?,
         },
+        "agent" => parse_agent_command(remainder.as_deref())?,
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
@@ -598,15 +601,41 @@ fn parse_list_or_help_args(
     command: &str,
     args: Option<String>,
 ) -> Result<Option<String>, SlashCommandParseError> {
-    match normalize_optional_args(args.as_deref()) {
+    let normalized = normalize_optional_args(args.as_deref());
+    match normalized {
         None | Some("list" | "help" | "-h" | "--help") => Ok(args),
+        Some(rest) if rest.starts_with("discover") => Ok(args),
         Some(unexpected) => Err(command_error(
             &format!(
-                "Unexpected arguments for /{command}: {unexpected}. Use /{command}, /{command} list, or /{command} help."
+                "Unexpected arguments for /{command}: {unexpected}. Use /{command}, /{command} list, /{command} discover <task>, or /{command} help."
             ),
             command,
-            &format!("/{command} [list|help]"),
+            &format!("/{command} [list|discover <task>|help]"),
         )),
+    }
+}
+
+fn parse_agent_command(
+    args: Option<&str>,
+) -> Result<SlashCommand, SlashCommandParseError> {
+    match normalize_optional_args(args) {
+        None | Some("list" | "help" | "-h" | "--help") => {
+            Ok(SlashCommand::Agents { args: args.map(String::from) })
+        }
+        Some(profile_args) if profile_args.starts_with("profile") => {
+            let agent_id = profile_args
+                .strip_prefix("profile")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            Ok(SlashCommand::AgentProfile { agent_id })
+        }
+        Some(other) => {
+            // Treat unknown subcommand as agents list/help.
+            Ok(SlashCommand::Agents {
+                args: Some(other.to_string()),
+            })
+        }
     }
 }
 
@@ -1163,6 +1192,57 @@ pub fn handle_agents_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
             let agents = load_agents_from_roots(&roots)?;
             Ok(render_agents_report(&agents))
         }
+        Some(args) if args.starts_with("discover") => {
+            let task_desc = args.strip_prefix("discover").unwrap_or("").trim();
+            if task_desc.is_empty() {
+                return Ok("Usage: /agents discover <task description>\n\nProvide a task description to discover a matching agent team.".to_string());
+            }
+            let discovery = runtime::TeamDiscoveryProtocol::new();
+            let ranked = discovery.discover_team(task_desc, &[]);
+            if ranked.is_empty() {
+                return Ok(format!(
+                    "No agents matched the task: \"{task_desc}\"\n\nRegister agents with relevant capabilities first."
+                ));
+            }
+            let mut report = format!(
+                "Discovered {} agent(s) for \"{task_desc}\"\n\n",
+                ranked.len()
+            );
+            for (i, agent) in ranked.iter().enumerate() {
+                let rep_line = agent
+                    .reputation
+                    .as_ref()
+                    .map(|r| format!(" | rep: {:.1}/10", r.composite()))
+                    .unwrap_or_default();
+                report.push_str(&format!(
+                    "  {}. {} ({}) — [{}] {}\n",
+                    i + 1,
+                    agent.role,
+                    agent.agent_id,
+                    agent.capabilities.join(", "),
+                    rep_line,
+                ));
+            }
+            // Show auto-assembly result
+            if let Some(team) = discovery.auto_assemble(task_desc, &[]) {
+                report.push_str(&format!(
+                    "\nAuto-assembled team:\n  Leader: {} ({})\n",
+                    team.leader.agent_id, team.leader.role
+                ));
+                if !team.workers.is_empty() {
+                    report.push_str("  Workers:\n");
+                    for w in &team.workers {
+                        report.push_str(&format!(
+                            "    - {} ({}) [{}]\n",
+                            w.agent_id, w.role, w.capabilities.join(", ")
+                        ));
+                    }
+                } else {
+                    report.push_str("  Workers: none\n");
+                }
+            }
+            Ok(report)
+        }
         Some(args) if is_help_arg(args) => Ok(render_agents_usage(None)),
         Some(args) => Ok(render_agents_usage(Some(args))),
     }
@@ -1183,6 +1263,38 @@ pub fn handle_agents_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
             let roots = discover_definition_roots(cwd, "agents");
             let agents = load_agents_from_roots(&roots)?;
             Ok(render_agents_report_json(cwd, &agents))
+        }
+        Some(args) if args.starts_with("discover") => {
+            let task_desc = args.strip_prefix("discover").unwrap_or("").trim();
+            let discovery = runtime::TeamDiscoveryProtocol::new();
+            let ranked = discovery.discover_team(task_desc, &[]);
+            let agents_json: Vec<Value> = ranked
+                .iter()
+                .map(|a| {
+                    json!({
+                        "agent_id": a.agent_id,
+                        "role": a.role,
+                        "capabilities": a.capabilities,
+                        "reputation": a.reputation.as_ref().map(|r| r.composite()),
+                        "status": format!("{:?}", a.status),
+                    })
+                })
+                .collect();
+            let team = discovery.auto_assemble(task_desc, &[]);
+            let team_json = team.map(|t| {
+                json!({
+                    "leader": { "agent_id": t.leader.agent_id, "role": t.leader.role },
+                    "workers": t.workers.iter().map(|w| json!({ "agent_id": w.agent_id, "role": w.role })).collect::<Vec<_>>(),
+                })
+            });
+            Ok(json!({
+                "kind": "agents",
+                "action": "discover",
+                "task": task_desc,
+                "count": ranked.len(),
+                "agents": agents_json,
+                "team": team_json,
+            }))
         }
         Some(args) if is_help_arg(args) => Ok(render_agents_usage_json(None)),
         Some(args) => Ok(render_agents_usage_json(Some(args))),
@@ -3195,7 +3307,7 @@ fn help_path_from_args(args: &str) -> Option<Vec<&str>> {
 fn render_agents_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "Agents".to_string(),
-        "  Usage            /agents [list|help]".to_string(),
+        "  Usage            /agents [list|discover <task>|help]".to_string(),
         "  Direct CLI       cowd agents".to_string(),
         "  Sources          .cowd/agents, ~/.cowd/agents, $CC_CONFIG_HOME/agents".to_string(),
     ];
@@ -3210,8 +3322,8 @@ fn render_agents_usage_json(unexpected: Option<&str>) -> Value {
         "kind": "agents",
         "action": "help",
         "usage": {
-            "slash_command": "/agents [list|help]",
-            "direct_cli": "cowd agents [list|help]",
+            "slash_command": "/agents [list|discover <task>|help]",
+            "direct_cli": "cowd agents [list|discover <task>|help]",
             "sources": [".cowd/agents", "~/.cowd/agents", "$CC_CONFIG_HOME/agents"],
         },
         "unexpected": unexpected,
