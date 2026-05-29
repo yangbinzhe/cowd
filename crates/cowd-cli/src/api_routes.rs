@@ -18,7 +18,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use tools::GlobalToolRegistry;
 
@@ -201,7 +201,7 @@ async fn list_sessions(
 
     // Try unified store first for DB-backed listing
     if let Some(ref store) = state.unified_store {
-        let all = store.list_sessions().unwrap_or_default();
+        let all = store.list_sessions().await.unwrap_or_default();
         let total = all.len();
         let sessions: Vec<SessionInfo> = all
             .into_iter()
@@ -310,7 +310,7 @@ async fn delete_session(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if state.sessions.remove(&id).is_some() {
         if let Some(ref store) = state.unified_store {
-            let _ = store.delete_session(&id);
+            let _ = store.delete_session(&id).await;
         }
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -519,8 +519,8 @@ async fn get_session_messages(
 
     // Try unified store for DB-backed pagination
     if let Some(ref store) = state.unified_store {
-        let total = store.get_message_count(&id).unwrap_or(0);
-        let db_messages = store.get_messages(&id, offset, limit).unwrap_or_default();
+        let total = store.get_message_count(&id).await.unwrap_or(0);
+        let db_messages = store.get_messages(&id, offset, limit).await.unwrap_or_default();
         let messages: Vec<serde_json::Value> = db_messages
             .iter()
             .map(|m| {
@@ -644,7 +644,7 @@ async fn search_messages_handler(
         }))
     })?;
 
-    let db_messages = store.search_messages(&params.q, None, params.limit)
+    let db_messages = store.search_messages(&params.q, None, params.limit).await
         .map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
                 error: format!("search failed: {e}"),
@@ -801,7 +801,7 @@ async fn update_session_handler(
 
     // Persist to UnifiedSessionStore if available (read-modify-write)
     if let Some(ref store) = state.unified_store {
-        if let Ok(Some(mut record)) = store.get_session(&id) {
+        if let Ok(Some(mut record)) = store.get_session(&id).await {
             if let Some(ref model) = body.model {
                 record.model = Some(model.clone());
             }
@@ -827,7 +827,7 @@ async fn update_session_handler(
                 }
                 record.metadata_json = Some(serde_json::to_string(&meta).unwrap_or_default());
             }
-            let _ = store.update_session(&record);
+            let _ = store.update_session(&record).await;
         }
     }
 
@@ -904,10 +904,10 @@ async fn verify_handler(
 /// Wraps an `UnboundedReceiverStream` and unsubscribes from the event bus
 /// when the stream is dropped (client disconnects), preventing sender leaks.
 struct SseStream {
-    rx: UnboundedReceiverStream<String>,
+    rx: ReceiverStream<String>,
     session_id: String,
     event_bus: Arc<SessionEventBus>,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
 }
 
 impl Stream for SseStream {
@@ -944,14 +944,14 @@ async fn sse_stream_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(256);
     // Clone tx before subscribing — one copy moves into the event bus,
     // the other stays with SseStream for cleanup on drop.
     let bus_tx = tx.clone();
     state.event_bus.subscribe(&session_id, bus_tx).await;
 
     let stream = SseStream {
-        rx: UnboundedReceiverStream::new(rx),
+        rx: ReceiverStream::new(rx),
         session_id,
         event_bus: state.event_bus.clone(),
         tx,
