@@ -1398,14 +1398,23 @@ self.record_turn_completed(&summary);
                     let tname = tool_name.to_string();
                     let tname_for_err = tname.clone();
                     let tinput = effective_input.clone();
-                    let tool_timeout = self.tool_timeout.unwrap_or(Duration::from_secs(120));
+                    // Per-tool timeout: check registry for per-tool override or category default,
+                    // then cap with the global self.tool_timeout if set.
+                    let registry_timeout = Duration::from_secs(
+                        crate::tool_orchestrator::ToolSafetyRegistry::global().get_timeout_secs(tool_name)
+                    );
+                    let tool_timeout = self.tool_timeout
+                        .map_or(registry_timeout, |t| t.min(registry_timeout));
                     match tokio::time::timeout(tool_timeout, tokio::task::spawn_blocking(move || {
                         tool_exec.execute(&tname, &tinput)
                     })).await {
                         Ok(Ok(Ok(output))) => (output, false),
                         Ok(Ok(Err(error))) => (error.to_string(), true),
                         Ok(Err(join_error)) => (format!("tool execution panicked: {join_error}"), true),
-                        Err(_elapsed) => (format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"), true),
+                        Err(_elapsed) => {
+                            tracing::warn!(tool = %tname_for_err, timeout_secs = tool_timeout.as_secs(), "tool execution timed out, returning partial result");
+                            (format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"), true)
+                        },
                     }
                 };
                 let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -2379,33 +2388,49 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
             .unwrap_or("")
             .to_string();
 
+        let tname = tool_name.clone();
+        let tool_timeout = Duration::from_secs(
+            crate::tool_orchestrator::ToolSafetyRegistry::global().get_timeout_secs(&tname)
+        );
         Box::pin(async move {
             let start = std::time::Instant::now();
-            let raw = tokio::task::spawn_blocking(move || tool_exec.execute(&tool_name, &input))
-                .await;
+            let raw = tokio::time::timeout(tool_timeout, tokio::task::spawn_blocking(move || {
+                tool_exec.execute(&tool_name, &input)
+            }))
+            .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             match raw {
-                Ok(Ok(output)) => Ok(TaskResult {
+                Ok(Ok(Ok(output))) => Ok(TaskResult {
                     task_id,
                     success: true,
                     output: Some(output),
                     error: None,
                     duration_ms,
                 }),
-                Ok(Err(e)) => Ok(TaskResult {
+                Ok(Ok(Err(e))) => Ok(TaskResult {
                     task_id,
                     success: false,
                     output: None,
                     error: Some(e.to_string()),
                     duration_ms,
                 }),
-                Err(e) => Ok(TaskResult {
+                Ok(Err(e)) => Ok(TaskResult {
                     task_id,
                     success: false,
                     output: None,
                     error: Some(format!("tool panicked: {e}")),
                     duration_ms: 0,
                 }),
+                Err(_elapsed) => {
+                    tracing::warn!(tool = %tname, timeout_secs = tool_timeout.as_secs(), "wave tool execution timed out");
+                    Ok(TaskResult {
+                        task_id,
+                        success: false,
+                        output: None,
+                        error: Some(format!("tool timed out after {:?}", tool_timeout)),
+                        duration_ms: 0,
+                    })
+                },
             }
         })
     }

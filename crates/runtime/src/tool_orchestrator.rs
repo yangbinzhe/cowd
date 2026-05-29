@@ -69,6 +69,15 @@ impl ToolSafetyCategory {
             Self::Destructive => 1,
         }
     }
+
+    /// Default timeout in seconds for tools in this category.
+    /// ReadOnly tools get 30s (fast read operations), others get 120s.
+    pub fn default_timeout_secs(&self) -> u64 {
+        match self {
+            Self::ReadOnly => 30,
+            Self::WriteLocal | Self::Network | Self::Destructive => 120,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +94,9 @@ pub struct ToolSafetyRegistry {
     explicit: HashMap<String, ToolSafetyCategory>,
     patterns: Vec<(String, ToolSafetyCategory)>, // prefix patterns, checked in order
     default: ToolSafetyCategory,
+    /// Per-tool timeout overrides (seconds). If a tool is not in this map,
+    /// the category default is used (30s for ReadOnly, 120s for others).
+    tool_timeout_secs: HashMap<String, u64>,
 }
 
 impl ToolSafetyRegistry {
@@ -114,6 +126,7 @@ impl ToolSafetyRegistry {
             explicit,
             patterns,
             default: ToolSafetyCategory::ReadOnly,
+            tool_timeout_secs: HashMap::new(),
         }
     }
 
@@ -137,6 +150,23 @@ impl ToolSafetyRegistry {
     /// Register a custom tool with an explicit category (for plugin tools).
     pub fn register(&mut self, tool_name: &str, category: ToolSafetyCategory) {
         self.explicit.insert(tool_name.to_string(), category);
+    }
+
+    /// Get the timeout in seconds for a tool.
+    ///
+    /// 1. Check per-tool override in `tool_timeout_secs`.
+    /// 2. Fall back to the category default (`ReadOnly` → 30s, others → 120s).
+    pub fn get_timeout_secs(&self, tool_name: &str) -> u64 {
+        if let Some(&timeout) = self.tool_timeout_secs.get(tool_name) {
+            return timeout;
+        }
+        let cat = self.classify(tool_name);
+        cat.default_timeout_secs()
+    }
+
+    /// Set a per-tool timeout override (seconds).
+    pub fn set_tool_timeout(&mut self, tool_name: &str, timeout_secs: u64) {
+        self.tool_timeout_secs.insert(tool_name.to_string(), timeout_secs);
     }
 }
 
