@@ -1,5 +1,5 @@
 use crate::session::ConversationMessage;
-use crate::tool_orchestrator::ToolSafetyCategory;
+use crate::tool_orchestrator::{ToolSafetyCategory, ToolSafetyRegistry};
 use std::collections::HashMap;
 
 pub struct ToolRequest {
@@ -18,10 +18,11 @@ pub struct ToolDispatchResult {
 }
 
 pub fn categorize(requests: &[ToolRequest]) -> (Vec<usize>, Vec<usize>) {
+    let registry = ToolSafetyRegistry::global();
     let mut read_only: Vec<usize> = Vec::new();
     let mut rest: Vec<usize> = Vec::new();
     for (i, req) in requests.iter().enumerate() {
-        match ToolSafetyCategory::from_tool_name(&req.tool_name) {
+        match registry.classify(&req.tool_name) {
             ToolSafetyCategory::ReadOnly => read_only.push(i),
             _ => rest.push(i),
         }

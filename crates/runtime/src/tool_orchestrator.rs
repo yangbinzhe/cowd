@@ -11,6 +11,7 @@
 //! truncated using a configurable strategy (HeadOnly, TailOnly, HeadAndTail).
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,75 @@ impl ToolSafetyCategory {
             Self::Network => 3,
             Self::Destructive => 1,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ToolSafetyRegistry
+// ---------------------------------------------------------------------------
+
+static TOOL_REGISTRY: OnceLock<ToolSafetyRegistry> = OnceLock::new();
+
+/// A registry for classifying tool safety by name.
+///
+/// Checks an explicit map first, then prefix patterns in registration order,
+/// and finally falls back to a default category.
+pub struct ToolSafetyRegistry {
+    explicit: HashMap<String, ToolSafetyCategory>,
+    patterns: Vec<(String, ToolSafetyCategory)>, // prefix patterns, checked in order
+    default: ToolSafetyCategory,
+}
+
+impl ToolSafetyRegistry {
+    /// Access the global singleton (initialized with builtin rules on first access).
+    pub fn global() -> &'static ToolSafetyRegistry {
+        TOOL_REGISTRY.get_or_init(|| Self::builtin())
+    }
+
+    /// Create the built-in registry with default prefix-based classification.
+    pub fn builtin() -> Self {
+        let explicit = HashMap::new();
+        let patterns = vec![
+            ("read".into(), ToolSafetyCategory::ReadOnly),
+            ("grep".into(), ToolSafetyCategory::ReadOnly),
+            ("glob".into(), ToolSafetyCategory::ReadOnly),
+            ("lsp".into(), ToolSafetyCategory::ReadOnly),
+            ("write".into(), ToolSafetyCategory::WriteLocal),
+            ("edit".into(), ToolSafetyCategory::WriteLocal),
+            ("ast_grep".into(), ToolSafetyCategory::WriteLocal),
+            ("bash".into(), ToolSafetyCategory::Destructive),
+            ("rm".into(), ToolSafetyCategory::Destructive),
+            ("git".into(), ToolSafetyCategory::Destructive),
+            ("web_fetch".into(), ToolSafetyCategory::Network),
+            ("web_search".into(), ToolSafetyCategory::Network),
+        ];
+        Self {
+            explicit,
+            patterns,
+            default: ToolSafetyCategory::ReadOnly,
+        }
+    }
+
+    /// Classify a tool name into a safety category.
+    ///
+    /// 1. Check explicit (exact-match) entries.
+    /// 2. Check prefix patterns in registration order.
+    /// 3. Fall back to the default category.
+    pub fn classify(&self, tool_name: &str) -> ToolSafetyCategory {
+        if let Some(cat) = self.explicit.get(tool_name) {
+            return *cat;
+        }
+        for (prefix, cat) in &self.patterns {
+            if tool_name.starts_with(prefix) {
+                return *cat;
+            }
+        }
+        self.default
+    }
+
+    /// Register a custom tool with an explicit category (for plugin tools).
+    pub fn register(&mut self, tool_name: &str, category: ToolSafetyCategory) {
+        self.explicit.insert(tool_name.to_string(), category);
     }
 }
 

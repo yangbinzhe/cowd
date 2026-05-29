@@ -10,6 +10,7 @@
 //! - `WaveOrchestrator`: Manages task registration, wave building, and execution
 //! - `WaveExecutor`: Trait for executing tasks (implement by application)
 
+use crate::tool_orchestrator::ToolSafetyCategory;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -40,6 +41,14 @@ pub enum WaveError {
 
     #[error("cancelled")]
     Cancelled,
+
+    #[error("wave {wave}: {category:?} limit exceeded ({count} > max {max})")]
+    SafetyLimitExceeded {
+        wave: u32,
+        category: ToolSafetyCategory,
+        count: usize,
+        max: usize,
+    },
 }
 
 /// Task identifier.
@@ -117,6 +126,8 @@ pub struct WaveTask {
     pub parallelizable: bool,
     /// Task payload/data.
     pub payload: serde_json::Value,
+    /// Safety category for resource-aware scheduling (P6.1).
+    pub safety_category: Option<ToolSafetyCategory>,
 }
 
 impl WaveTask {
@@ -130,6 +141,7 @@ impl WaveTask {
             priority: 0,
             parallelizable: true,
             payload: serde_json::Value::Null,
+            safety_category: None,
         }
     }
 
@@ -154,6 +166,12 @@ impl WaveTask {
     /// Set payload.
     pub fn with_payload(mut self, payload: serde_json::Value) -> Self {
         self.payload = payload;
+        self
+    }
+
+    /// Set safety category.
+    pub fn with_safety_category(mut self, cat: ToolSafetyCategory) -> Self {
+        self.safety_category = Some(cat);
         self
     }
 }
@@ -252,6 +270,8 @@ pub struct WaveConfig {
     pub wave_timeout_ms: u64,
     /// Error recovery policy.
     pub error_policy: ErrorPolicy,
+    /// Enable safety category limit checking (P6.1).
+    pub safety_check_enabled: bool,
 }
 
 impl Default for WaveConfig {
@@ -263,6 +283,7 @@ impl Default for WaveConfig {
             task_timeout_ms: 300000, // 5 minutes
             wave_timeout_ms: 1800000, // 30 minutes
             error_policy: ErrorPolicy::default(),
+            safety_check_enabled: true,
         }
     }
 }
@@ -301,6 +322,12 @@ impl WaveConfig {
     /// Set error recovery policy.
     pub fn with_error_policy(mut self, policy: ErrorPolicy) -> Self {
         self.error_policy = policy;
+        self
+    }
+
+    /// Enable or disable safety category limit checking.
+    pub fn with_safety_check(mut self, enabled: bool) -> Self {
+        self.safety_check_enabled = enabled;
         self
     }
 }
@@ -532,7 +559,38 @@ impl WaveOrchestrator {
             })
             .collect();
 
+        // P6.1: Safety category balancing
+        if self.config.safety_check_enabled {
+            self.balance_safety_categories()?;
+        }
+
         Ok(self)
+    }
+
+    /// P6.1: Check safety category concurrency limits across all waves.
+    fn balance_safety_categories(&self) -> Result<(), WaveError> {
+        for wave in &self.waves {
+            let mut counts: HashMap<ToolSafetyCategory, usize> = HashMap::new();
+            for task_id in &wave.tasks {
+                if let Some(task) = self.tasks.get(task_id) {
+                    if let Some(ref cat) = task.safety_category {
+                        *counts.entry(*cat).or_default() += 1;
+                    }
+                }
+            }
+            for (cat, count) in &counts {
+                let max = cat.max_concurrency();
+                if *count > max {
+                    return Err(WaveError::SafetyLimitExceeded {
+                        wave: wave.number,
+                        category: *cat,
+                        count: *count,
+                        max,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Detect circular dependencies.
