@@ -3003,7 +3003,10 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                     state.is_loading = true;
 
                                     let callback: std::sync::Arc<dyn runtime::ToolCallback> =
-                                        std::sync::Arc::new(tui::TuiToolCallback::new(tui_tx.clone()));
+                                        std::sync::Arc::new(tui::TuiToolCallback::new(
+                                            tui_tx.clone(),
+                                            state.memory_orchestrator.clone(),
+                                        ));
                                     let (mut prepared, monitor, abort_signal) =
                                         cli.prepare_turn_runtime(false, Some(callback), Some(tui_tx.clone()))?;
                                     prepared.set_memory_callback(

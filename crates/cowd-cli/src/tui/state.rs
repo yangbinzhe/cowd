@@ -107,6 +107,9 @@ pub struct TuiState {
     /// Toast notification manager for transient status messages.
     pub toast_manager: ToastManager,
 
+    /// Memory orchestrator for persistent memory operations (vector store, layers).
+    pub memory_orchestrator: Option<std::sync::Arc<memory::MemoryOrchestrator>>,
+
     /// Agents overlay showing subagent tree hierarchy.
     pub agents_overlay: AgentsOverlay,
 
@@ -187,6 +190,11 @@ pub struct TuiState {
     pub startup_start: Instant,
     /// Instant when the overlay first became visible (for min-display calculation).
     pub startup_show_time: Option<Instant>,
+
+    /// Count of events dropped due to channel full conditions.
+    /// With `send()` backpressure (P0.6), the producer blocks instead of dropping,
+    /// so this counter is a diagnostic for future non-blocking send paths.
+    pub dropped_events: usize,
 }
 
 impl TuiState {
@@ -253,6 +261,7 @@ impl TuiState {
             theme_engine,
             dialog_manager,
             toast_manager,
+            memory_orchestrator: None,
             agents_overlay,
             thinking_panel,
             command_palette,
@@ -281,6 +290,7 @@ impl TuiState {
             startup_phase: StartupPhase::Hidden,
             startup_start: Instant::now(),
             startup_show_time: None,
+            dropped_events: 0,
         }
     }
 
@@ -307,6 +317,11 @@ impl TuiState {
     /// Set the tool registry for the skills panel.
     pub fn set_tool_registry(&mut self, registry: std::sync::Arc<dyn crate::tui::app::ToolRegistry>) {
         self.skills_panel.set_registry(registry);
+    }
+
+    /// Set the memory orchestrator for persistent memory operations.
+    pub fn set_memory_orchestrator(&mut self, orch: std::sync::Arc<memory::MemoryOrchestrator>) {
+        self.memory_orchestrator = Some(orch);
     }
 
     // ── Event Bridging ──────────────────────────────────────────

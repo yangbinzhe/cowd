@@ -939,7 +939,7 @@ mod tests {
 
         // Start at 0, press Down → 1
         assert!(mgr.handle_key(&key(KeyCode::Down)));
-        let current = match mgr.current() { Some(c) => c, None => return };
+        let current = match mgr.current() { Some(c) => c, None => { return } };
         assert_eq!(
             match &current.kind {
                 DialogKind::Select { selected, .. } => *selected,
@@ -950,7 +950,7 @@ mod tests {
 
         // Press Down → 2
         assert!(mgr.handle_key(&key(KeyCode::Down)));
-        let current = match mgr.current() { Some(c) => c, None => return };
+        let current = match mgr.current() { Some(c) => c, None => { return } };
         assert_eq!(
             match &current.kind {
                 DialogKind::Select { selected, .. } => *selected,
@@ -961,7 +961,7 @@ mod tests {
 
         // Press Down again → stays at 2 (clamped)
         assert!(mgr.handle_key(&key(KeyCode::Down)));
-        let current = match mgr.current() { Some(c) => c, None => return };
+        let current = match mgr.current() { Some(c) => c, None => { return } };
         assert_eq!(
             match &current.kind {
                 DialogKind::Select { selected, .. } => *selected,
@@ -972,7 +972,7 @@ mod tests {
 
         // Press Up → 1
         assert!(mgr.handle_key(&key(KeyCode::Up)));
-        let current = match mgr.current() { Some(c) => c, None => return };
+        let current = match mgr.current() { Some(c) => c, None => { return } };
         assert_eq!(
             match &current.kind {
                 DialogKind::Select { selected, .. } => *selected,
@@ -1067,7 +1067,7 @@ mod tests {
         mgr.handle_key(&key(KeyCode::Char('i')));
 
         // Verify input was accumulated
-        let current = match mgr.current() { Some(c) => c, None => return };
+        let current = match mgr.current() { Some(c) => c, None => { return } };
         match &current.kind {
             DialogKind::Prompt { input, .. } => assert_eq!(input, "hi"),
             _ => unreachable!(),
@@ -1109,7 +1109,7 @@ mod tests {
         mgr.handle_key(&key(KeyCode::Char('a')));
         mgr.handle_key(&key(KeyCode::Char('b')));
         mgr.handle_key(&key(KeyCode::Char('c')));
-        let current = match mgr.current() { Some(c) => c, None => return };
+        let current = match mgr.current() { Some(c) => c, None => { return } };
         assert_eq!(
             match &current.kind {
                 DialogKind::Prompt { input, .. } => input.as_str(),
@@ -1119,7 +1119,7 @@ mod tests {
         );
 
         mgr.handle_key(&key(KeyCode::Backspace));
-        let current = match mgr.current() { Some(c) => c, None => return };
+        let current = match mgr.current() { Some(c) => c, None => { return } };
         assert_eq!(
             match &current.kind {
                 DialogKind::Prompt { input, .. } => input.as_str(),
@@ -1178,7 +1178,7 @@ mod tests {
             state.height = 20;
         }
 
-        let current = match mgr.current() { Some(c) => c, None => return };
+        let current = match mgr.current() { Some(c) => c, None => { return } };
         assert_eq!(current.width, 80);
         assert_eq!(current.height, 20);
     }
@@ -1493,7 +1493,7 @@ mod tests {
         assert!(!mgr.is_empty(), "Dialog should stay open for reason input");
 
         // Verify we're in reject-input mode
-        let current = match mgr.current() { Some(c) => c, None => return };
+        let current = match mgr.current() { Some(c) => c, None => { return } };
         match &current.kind {
             DialogKind::Permission { showing_reject_input, .. } => {
                 assert!(*showing_reject_input, "Should be in reject-input mode");
@@ -1543,7 +1543,7 @@ mod tests {
 
         // Enter reject mode
         mgr.handle_key(&key(KeyCode::Char('r')));
-        let current = match mgr.current() { Some(c) => c, None => return };
+        let current = match mgr.current() { Some(c) => c, None => { return } };
         match &current.kind {
             DialogKind::Permission { showing_reject_input, .. } => {
                 assert!(*showing_reject_input);
@@ -1559,7 +1559,7 @@ mod tests {
         assert!(consumed);
         assert!(!mgr.is_empty(), "Dialog should still be open");
 
-        let current = match mgr.current() { Some(c) => c, None => return };
+        let current = match mgr.current() { Some(c) => c, None => { return } };
         match &current.kind {
             DialogKind::Permission { showing_reject_input, reject_input_buffer, .. } => {
                 assert!(!*showing_reject_input, "Should be back in main view");
