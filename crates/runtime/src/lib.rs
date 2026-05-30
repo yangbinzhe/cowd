@@ -96,8 +96,9 @@ pub use agent_discussion::{
     DiscussionPhase,
 };
 pub use joint_problem_solving::{
-    AgentDiscussion, DiscussionTurn, PhaseStatus, PipelineResult, ProblemSolvingConfig,
-    ProblemSolvingPipeline, ProblemStatement, Solution, SolutionEvaluation, SolutionScore,
+    AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult,
+    ProblemSolvingConfig, ProblemSolvingPipeline, ProblemStatement, Solution,
+    SolutionEvaluation, SolutionScore,
 };
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};

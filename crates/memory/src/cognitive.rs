@@ -204,6 +204,8 @@ pub struct CognitiveContextManager {
     auto_tuner: AutoTuner,
     /// Cross-agent entity evolution tracker (P9.3).
     entity_registry: Mutex<Option<crate::entity_registry::EntityRegistry>>,
+    /// Cross-agent L4 memory sync protocol (P7).
+    memory_sync: Option<Arc<crate::memory_sync::MemorySyncProtocol>>,
 }
 
 impl CognitiveContextManager {
@@ -485,6 +487,7 @@ impl CognitiveContextManager {
             perf_monitor: PerformanceMonitor::default(),
             auto_tuner: AutoTuner::new(config.tuning.clone()),
             entity_registry: Mutex::new(None),
+            memory_sync: None,
             config,
             orchestrator,
             pipeline,
@@ -549,6 +552,11 @@ impl CognitiveContextManager {
     /// Attach an EntityRegistry for cross-agent entity evolution tracking (P9.3).
     pub fn with_entity_registry(self, registry: crate::entity_registry::EntityRegistry) -> Self {
         *self.entity_registry.lock() = Some(registry);
+        self
+    }
+
+    pub fn with_memory_sync(mut self, sync: Arc<crate::memory_sync::MemorySyncProtocol>) -> Self {
+        self.memory_sync = Some(sync);
         self
     }
 
@@ -1084,6 +1092,24 @@ impl CognitiveContextManager {
             if !already_surfaced.contains(&entry.id) {
                 already_surfaced.insert(entry.id);
                 entries.push(entry);
+            }
+        }
+
+        // P10: Recall L4 collaboration synthesis results via MemorySyncProtocol
+        if let Some(ref sync) = self.memory_sync {
+            let agent_id = current_agent.as_deref().unwrap_or_default();
+            match sync.import_from_l4("collaboration-synthesis", agent_id).await {
+                Ok(synthesis_entries) => {
+                    for entry in synthesis_entries {
+                        if !already_surfaced.contains(&entry.id) {
+                            already_surfaced.insert(entry.id);
+                            entries.push(entry);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "memory_sync: import_from_l4 failed");
+                }
             }
         }
 
@@ -1700,6 +1726,12 @@ impl CognitiveContextManager {
                     tracing::info!(agent_role = %d.agent_role, "delegation result written to L4");
                 }
             }
+        }
+
+        // P7: Sync new L4 entries to peer agents via MemorySyncProtocol
+        if let Some(ref sync) = self.memory_sync {
+            let agent_id = self.current_agent.lock().clone().unwrap_or_default();
+            let _ = sync.import_from_l4("memory_update", &agent_id).await;
         }
 
         // ── Extract ── Drift+Seeds ── Maintenance ──────────────────────

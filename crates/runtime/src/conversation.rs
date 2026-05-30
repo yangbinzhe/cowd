@@ -37,6 +37,7 @@ use tracing;
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
 use crate::agent_collaboration::CollaborationOps;
 use crate::agent_discussion::DiscussionEngine;
+use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
@@ -282,6 +283,8 @@ bus: Option<crate::bus::EventBus>,
     approval_gate: Option<Arc<crate::approval_gate::SmartApprovalGate>>,
     /// Type-erased collaboration orchestrator for multi-agent task dispatch.
     collaboration: Option<Arc<dyn CollaborationOps>>,
+    /// Type-erased Joint Problem Solving pipeline for high-complexity tasks.
+    jps_pipeline: Option<Arc<dyn JpsOps>>,
     /// When true, inject available peer agents from AgentDirectory into the system prompt.
     inject_peer_context: bool,
     /// P2-10: Optional EffectHandler for side-effect recording / mocking.
@@ -441,6 +444,7 @@ where
             memory_callback: None,
             approval_gate: None,
             collaboration: None,
+            jps_pipeline: None,
             inject_peer_context: true,
             effect_handler: None,
             project_phase: "Discovery".to_string(),
@@ -590,6 +594,12 @@ where
     #[must_use]
     pub fn with_collaboration(mut self, c: Arc<dyn CollaborationOps>) -> Self {
         self.collaboration = Some(c);
+        self
+    }
+
+    #[must_use]
+    pub fn with_jps_pipeline(mut self, pipeline: Arc<dyn JpsOps>) -> Self {
+        self.jps_pipeline = Some(pipeline);
         self
     }
 
@@ -1553,6 +1563,28 @@ pub async fn run_turn_async(
                                 visibility: memory::types::AgentVisibility::Shared,
                             };
                             let _ = mem.remember(entry).await;
+                        }
+                    }
+                }
+            }
+
+            // JPS routing for very high-complexity tasks (10+ clauses or explicit keywords).
+            let word_count = last_user_msg
+                .split(|c: char| c.is_ascii_punctuation() || c == '\n')
+                .filter(|s| !s.trim().is_empty())
+                .count();
+            let is_jps_complex = word_count > 10
+                || last_user_msg.to_lowercase().contains("analyze")
+                || last_user_msg.to_lowercase().contains("refactor");
+            if is_jps_complex {
+                if let Some(ref jps) = self.jps_pipeline {
+                    let problem = ProblemStatement::new(last_user_msg);
+                    match jps.run_boxed(problem).await {
+                        Some(result) => {
+                            tracing::info!(solutions_count = result.solutions.len(), "JPS pipeline completed");
+                        }
+                        None => {
+                            tracing::info!("JPS pipeline returned no solution");
                         }
                     }
                 }

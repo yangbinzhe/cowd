@@ -38,7 +38,6 @@ pub trait SubAgentExecutor: Send + Sync {
         task: &str,
     ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>>;
 }
-
 // ---------------------------------------------------------------------------
 // ProductionExecutor
 // ---------------------------------------------------------------------------
