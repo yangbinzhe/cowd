@@ -451,6 +451,21 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
                 completed_normally,
                 &domains,
             );
+
+            // P9.1: Sync reputation to AgentDirectory for TeamDiscovery consumption.
+            if let Ok(Some(metrics)) = rep_mgr.get(&self.agent_id) {
+                use memory::agent_directory::ReputationScore;
+                memory::agent_directory::AgentDirectory::global().update_reputation(
+                    &self.agent_id,
+                    ReputationScore {
+                        success_rate: metrics.avg_quality_score,
+                        task_count: metrics.tasks_completed,
+                        peer_rating: 0.0,
+                        last_success_at_ms: metrics.updated_at.timestamp_millis() as u64,
+                        recent_failures: 0,
+                    },
+                );
+            }
         }
 
         SubAgentResult {
@@ -635,6 +650,21 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
                 on_time,
                 &domains,
             );
+
+            // P9.1: Sync reputation to AgentDirectory for TeamDiscovery consumption.
+            if let Ok(Some(metrics)) = rep_mgr.get(&self.agent_id) {
+                use memory::agent_directory::ReputationScore;
+                memory::agent_directory::AgentDirectory::global().update_reputation(
+                    &self.agent_id,
+                    ReputationScore {
+                        success_rate: metrics.avg_quality_score,
+                        task_count: metrics.tasks_completed,
+                        peer_rating: 0.0,
+                        last_success_at_ms: metrics.updated_at.timestamp_millis() as u64,
+                        recent_failures: 0,
+                    },
+                );
+            }
         }
 
         SubAgentResult {
