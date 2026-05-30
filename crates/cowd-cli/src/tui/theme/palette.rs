@@ -8,7 +8,7 @@ use ratatui::style::Color;
 use serde::de::{Deserialize, Deserializer};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 
-/// 8 semantic colors that make up a TUI theme palette.
+/// 14 semantic colors that make up a TUI theme palette.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Palette {
     pub accent: Color,
@@ -19,6 +19,12 @@ pub struct Palette {
     pub error: Color,
     pub success: Color,
     pub muted: Color,
+    pub agent_planner: Color,
+    pub agent_executor: Color,
+    pub agent_reviewer: Color,
+    pub agent_idle: Color,
+    pub agent_busy: Color,
+    pub agent_offline: Color,
 }
 
 impl Palette {
@@ -33,6 +39,12 @@ impl Palette {
             error: Color::Red,
             success: Color::Green,
             muted: Color::DarkGray,
+            agent_planner: Color::Blue,
+            agent_executor: Color::Green,
+            agent_reviewer: Color::Magenta,
+            agent_idle: Color::Gray,
+            agent_busy: Color::Yellow,
+            agent_offline: Color::Red,
         }
     }
 
@@ -47,6 +59,12 @@ impl Palette {
             error: Color::Red,
             success: Color::Green,
             muted: Color::Gray,
+            agent_planner: Color::Blue,
+            agent_executor: Color::Green,
+            agent_reviewer: Color::Magenta,
+            agent_idle: Color::DarkGray,
+            agent_busy: Color::Yellow,
+            agent_offline: Color::Red,
         }
     }
 }
@@ -96,7 +114,7 @@ pub fn parse_hex(hex: &str) -> Color {
 
 impl Serialize for Palette {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut s = serializer.serialize_struct("Palette", 8)?;
+        let mut s = serializer.serialize_struct("Palette", 14)?;
         s.serialize_field("accent", &color_to_hex_str(&self.accent))?;
         s.serialize_field("bg", &color_to_hex_str(&self.bg))?;
         s.serialize_field("fg", &color_to_hex_str(&self.fg))?;
@@ -105,6 +123,12 @@ impl Serialize for Palette {
         s.serialize_field("error", &color_to_hex_str(&self.error))?;
         s.serialize_field("success", &color_to_hex_str(&self.success))?;
         s.serialize_field("muted", &color_to_hex_str(&self.muted))?;
+        s.serialize_field("agent_planner", &color_to_hex_str(&self.agent_planner))?;
+        s.serialize_field("agent_executor", &color_to_hex_str(&self.agent_executor))?;
+        s.serialize_field("agent_reviewer", &color_to_hex_str(&self.agent_reviewer))?;
+        s.serialize_field("agent_idle", &color_to_hex_str(&self.agent_idle))?;
+        s.serialize_field("agent_busy", &color_to_hex_str(&self.agent_busy))?;
+        s.serialize_field("agent_offline", &color_to_hex_str(&self.agent_offline))?;
         s.end()
     }
 }
@@ -123,7 +147,26 @@ impl<'de> Deserialize<'de> for Palette {
             error: String,
             success: String,
             muted: String,
+            #[serde(rename = "agent_planner", default = "default_hex_blue")]
+            agent_planner: String,
+            #[serde(rename = "agent_executor", default = "default_hex_green")]
+            agent_executor: String,
+            #[serde(rename = "agent_reviewer", default = "default_hex_magenta")]
+            agent_reviewer: String,
+            #[serde(rename = "agent_idle", default = "default_hex_gray")]
+            agent_idle: String,
+            #[serde(rename = "agent_busy", default = "default_hex_yellow")]
+            agent_busy: String,
+            #[serde(rename = "agent_offline", default = "default_hex_red")]
+            agent_offline: String,
         }
+
+        fn default_hex_blue() -> String { "#0000FF".into() }
+        fn default_hex_green() -> String { "#00FF00".into() }
+        fn default_hex_magenta() -> String { "#FF00FF".into() }
+        fn default_hex_gray() -> String { "#808080".into() }
+        fn default_hex_yellow() -> String { "#FFFF00".into() }
+        fn default_hex_red() -> String { "#FF0000".into() }
 
         let data = PaletteData::deserialize(deserializer)?;
         Ok(Palette {
@@ -135,6 +178,12 @@ impl<'de> Deserialize<'de> for Palette {
             error: parse_hex(&data.error),
             success: parse_hex(&data.success),
             muted: parse_hex(&data.muted),
+            agent_planner: parse_hex(&data.agent_planner),
+            agent_executor: parse_hex(&data.agent_executor),
+            agent_reviewer: parse_hex(&data.agent_reviewer),
+            agent_idle: parse_hex(&data.agent_idle),
+            agent_busy: parse_hex(&data.agent_busy),
+            agent_offline: parse_hex(&data.agent_offline),
         })
     }
 }
@@ -155,6 +204,12 @@ mod tests {
         assert_eq!(p.error, Color::Red);
         assert_eq!(p.success, Color::Green);
         assert_eq!(p.muted, Color::DarkGray);
+        assert_eq!(p.agent_planner, Color::Blue);
+        assert_eq!(p.agent_executor, Color::Green);
+        assert_eq!(p.agent_reviewer, Color::Magenta);
+        assert_eq!(p.agent_idle, Color::Gray);
+        assert_eq!(p.agent_busy, Color::Yellow);
+        assert_eq!(p.agent_offline, Color::Red);
     }
 
     #[test]
@@ -168,6 +223,12 @@ mod tests {
         assert_eq!(p.error, Color::Red);
         assert_eq!(p.success, Color::Green);
         assert_eq!(p.muted, Color::Gray);
+        assert_eq!(p.agent_planner, Color::Blue);
+        assert_eq!(p.agent_executor, Color::Green);
+        assert_eq!(p.agent_reviewer, Color::Magenta);
+        assert_eq!(p.agent_idle, Color::DarkGray);
+        assert_eq!(p.agent_busy, Color::Yellow);
+        assert_eq!(p.agent_offline, Color::Red);
     }
 
     #[test]
@@ -202,6 +263,12 @@ mod tests {
             error: Color::Rgb(255, 0, 0),
             success: Color::Rgb(0, 255, 0),
             muted: Color::Rgb(169, 169, 169),
+            agent_planner: Color::Rgb(0, 0, 255),
+            agent_executor: Color::Rgb(0, 255, 0),
+            agent_reviewer: Color::Rgb(255, 0, 255),
+            agent_idle: Color::Rgb(128, 128, 128),
+            agent_busy: Color::Rgb(255, 255, 0),
+            agent_offline: Color::Rgb(255, 0, 0),
         };
         let yaml = serde_yaml::to_string(&palette).expect("serialize");
         let deserialized: Palette = serde_yaml::from_str(&yaml).expect("deserialize");

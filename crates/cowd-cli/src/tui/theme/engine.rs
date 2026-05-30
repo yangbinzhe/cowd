@@ -110,11 +110,13 @@ impl ThemeEngine {
 
     /// Map a semantic context string to a ratatui `Style`.
     ///
-    /// Supported contexts (16 tokens):
+    /// Supported contexts (22 tokens):
     /// `"heading1"`–`"heading6"`, `"code_block"`, `"inline_code"`,
     /// `"tool_status_running"`, `"tool_status_done"`, `"tool_status_error"`,
     /// `"diff_add"`, `"diff_del"`, `"search_highlight"`, `"border_focused"`,
-    /// `"border_unfocused"`.
+    /// `"border_unfocused"`,
+    /// `"agent_planner"`, `"agent_executor"`, `"agent_reviewer"`,
+    /// `"agent_idle"`, `"agent_busy"`, `"agent_offline"`.
     ///
     /// Unknown contexts return `Style::default().fg(palette.fg)`.
     pub fn compute_style(&self, context: &str) -> Style {
@@ -136,6 +138,12 @@ impl ThemeEngine {
             "search_highlight" => ss.search_highlight,
             "border_focused" => ss.border_focused,
             "border_unfocused" => ss.border_unfocused,
+            "agent_planner" => ss.agent_planner,
+            "agent_executor" => ss.agent_executor,
+            "agent_reviewer" => ss.agent_reviewer,
+            "agent_idle" => ss.agent_idle,
+            "agent_busy" => ss.agent_busy,
+            "agent_offline" => ss.agent_offline,
             _ => Style::default().fg(self.theme.palette.fg),
         }
     }
@@ -248,6 +256,8 @@ mod tests {
             "tool_status_running", "tool_status_done", "tool_status_error",
             "diff_add", "diff_del",
             "search_highlight", "border_focused", "border_unfocused",
+            "agent_planner", "agent_executor", "agent_reviewer",
+            "agent_idle", "agent_busy", "agent_offline",
         ];
         for ctx in &contexts {
             let style = engine.compute_style(ctx);

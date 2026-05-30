@@ -117,6 +117,12 @@ pub fn high_contrast_dark_palette() -> Palette {
         error: Color::Rgb(255, 80, 80),        // Bright red — ~10:1 on black
         success: Color::Rgb(0, 255, 0),        // Green — 15.3:1 on black
         muted: Color::Rgb(180, 180, 180),      // Light gray — ~12:1 on black
+        agent_planner: Color::Rgb(100, 149, 237),   // Cornflower blue — ~6:1 on black
+        agent_executor: Color::Rgb(50, 205, 50),    // Lime green — ~9:1 on black
+        agent_reviewer: Color::Rgb(218, 112, 214),  // Orchid — ~10:1 on black
+        agent_idle: Color::Rgb(169, 169, 169),      // Dark gray — ~11:1 on black
+        agent_busy: Color::Rgb(255, 215, 0),        // Gold — ~16:1 on black
+        agent_offline: Color::Rgb(255, 99, 71),     // Tomato — ~7:1 on black
     }
 }
 
@@ -133,6 +139,12 @@ pub fn high_contrast_light_palette() -> Palette {
         error: Color::Rgb(180, 0, 0),          // Dark red — >8:1 on white
         success: Color::Rgb(0, 110, 0),        // Dark green — >8:1 on white
         muted: Color::Rgb(90, 90, 90),         // Dark gray — >5:1 on white
+        agent_planner: Color::Rgb(0, 0, 180),        // Dark blue — >10:1 on white
+        agent_executor: Color::Rgb(0, 110, 0),       // Dark green — >8:1 on white
+        agent_reviewer: Color::Rgb(139, 0, 139),     // Dark magenta — >6:1 on white
+        agent_idle: Color::Rgb(90, 90, 90),          // Dark gray — >5:1 on white
+        agent_busy: Color::Rgb(180, 150, 0),         // Dark gold — >5:1 on white
+        agent_offline: Color::Rgb(180, 0, 0),        // Dark red — >8:1 on white
     }
 }
 
@@ -403,6 +415,12 @@ mod tests {
             error: Color::Rgb(255, 0, 0),
             success: Color::Rgb(0, 255, 0),
             muted: Color::Rgb(40, 40, 40),    // Very dark on black — will fail WCAG
+            agent_planner: Color::Blue,
+            agent_executor: Color::Green,
+            agent_reviewer: Color::Magenta,
+            agent_idle: Color::Gray,
+            agent_busy: Color::Yellow,
+            agent_offline: Color::Red,
         };
         let failures = audit_palette_contrast(&palette);
         // fg and muted should fail on black background

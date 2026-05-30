@@ -27,6 +27,7 @@ use ratatui::style::{Color, Modifier, Style};
 pub enum ThemeSource {
     Builtin,
     YamlFile(PathBuf),
+    TomlFile(PathBuf),
 }
 
 // ── StyleSheet ──────────────────────────────────────────────────
@@ -53,6 +54,12 @@ pub struct StyleSheet {
     pub search_highlight: Style,
     pub border_focused: Style,
     pub border_unfocused: Style,
+    pub agent_planner: Style,
+    pub agent_executor: Style,
+    pub agent_reviewer: Style,
+    pub agent_idle: Style,
+    pub agent_busy: Style,
+    pub agent_offline: Style,
 }
 
 impl StyleSheet {
@@ -90,6 +97,15 @@ impl StyleSheet {
             search_highlight: Style::default().bg(p.warn).fg(p.bg),
             border_focused: Style::default().fg(p.accent),
             border_unfocused: Style::default().fg(p.muted),
+
+            agent_planner: Style::default().fg(p.agent_planner),
+            agent_executor: Style::default().fg(p.agent_executor),
+            agent_reviewer: Style::default().fg(p.agent_reviewer),
+            agent_idle: Style::default().fg(p.agent_idle),
+            agent_busy: Style::default()
+                .fg(p.agent_busy)
+                .add_modifier(Modifier::BOLD),
+            agent_offline: Style::default().fg(p.agent_offline),
         }
     }
 }
@@ -178,6 +194,71 @@ impl ThemeLoader {
         }
     }
 
+    /// Load a Theme from a TOML file.
+    ///
+    /// Expected TOML structure:
+    /// ```toml
+    /// name = "my-theme"
+    /// [colors]
+    /// accent = "#00FFFF"
+    /// bg = "#000000"
+    /// fg = "#FFFFFF"
+    /// user_color = "#00FF00"
+    /// warn = "#FFFF00"
+    /// error = "#FF0000"
+    /// success = "#00FF00"
+    /// muted = "#808080"
+    /// agent_planner = "#0000FF"
+    /// agent_executor = "#00FF00"
+    /// agent_reviewer = "#FF00FF"
+    /// agent_idle = "#808080"
+    /// agent_busy = "#FFFF00"
+    /// agent_offline = "#FF0000"
+    /// ```
+    pub fn load_toml(path: &Path) -> Result<Theme, String> {
+        let content =
+            std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+        let value: toml::Value =
+            content.parse().map_err(|e| format!("parse: {e}"))?;
+
+        let name = value
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("custom")
+            .to_string();
+
+        let colors = value
+            .get("colors")
+            .and_then(|v| v.as_table())
+            .ok_or_else(|| "missing [colors] table".to_string())?;
+
+        let palette = Palette {
+            accent: parse_hex(colors.get("accent").and_then(|v| v.as_str()).unwrap_or("#00FFFF")),
+            bg: parse_hex(colors.get("bg").and_then(|v| v.as_str()).unwrap_or("#000000")),
+            fg: parse_hex(colors.get("fg").and_then(|v| v.as_str()).unwrap_or("#FFFFFF")),
+            user_color: parse_hex(colors.get("user_color").and_then(|v| v.as_str()).unwrap_or("#00FF00")),
+            warn: parse_hex(colors.get("warn").and_then(|v| v.as_str()).unwrap_or("#FFFF00")),
+            error: parse_hex(colors.get("error").and_then(|v| v.as_str()).unwrap_or("#FF0000")),
+            success: parse_hex(colors.get("success").and_then(|v| v.as_str()).unwrap_or("#00FF00")),
+            muted: parse_hex(colors.get("muted").and_then(|v| v.as_str()).unwrap_or("#808080")),
+            agent_planner: parse_hex(colors.get("agent_planner").and_then(|v| v.as_str()).unwrap_or("#0000FF")),
+            agent_executor: parse_hex(colors.get("agent_executor").and_then(|v| v.as_str()).unwrap_or("#00FF00")),
+            agent_reviewer: parse_hex(colors.get("agent_reviewer").and_then(|v| v.as_str()).unwrap_or("#FF00FF")),
+            agent_idle: parse_hex(colors.get("agent_idle").and_then(|v| v.as_str()).unwrap_or("#808080")),
+            agent_busy: parse_hex(colors.get("agent_busy").and_then(|v| v.as_str()).unwrap_or("#FFFF00")),
+            agent_offline: parse_hex(colors.get("agent_offline").and_then(|v| v.as_str()).unwrap_or("#FF0000")),
+        };
+
+        let stylesheet = StyleSheet::from_palette(&palette);
+
+        Ok(Theme {
+            name,
+            palette,
+            stylesheet,
+            source: ThemeSource::TomlFile(path.to_path_buf()),
+        })
+    }
+
     /// Migrate an old `SkinConfig` (skin.yaml) into a `Theme`.
     ///
     /// Legacy SkinConfig has 7 color fields (no `muted`);
@@ -193,6 +274,12 @@ impl ThemeLoader {
             error: parse_hex(&skin.colors.error),
             success: parse_hex(&skin.colors.success),
             muted: Color::DarkGray,
+            agent_planner: Color::Blue,
+            agent_executor: Color::Green,
+            agent_reviewer: Color::Magenta,
+            agent_idle: Color::Gray,
+            agent_busy: Color::Yellow,
+            agent_offline: Color::Red,
         };
         let stylesheet = StyleSheet::from_palette(&palette);
         Ok(Theme {
@@ -270,6 +357,12 @@ mod tests {
             error: Color::Rgb(255, 0, 0),
             success: Color::Rgb(0, 255, 0),
             muted: Color::Rgb(169, 169, 169),
+            agent_planner: Color::Rgb(0, 0, 255),
+            agent_executor: Color::Rgb(0, 255, 0),
+            agent_reviewer: Color::Rgb(255, 0, 255),
+            agent_idle: Color::Rgb(128, 128, 128),
+            agent_busy: Color::Rgb(255, 255, 0),
+            agent_offline: Color::Rgb(255, 0, 0),
         };
         let yaml = serde_yaml::to_string(&palette).expect("serialize");
         let deserialized: Palette = serde_yaml::from_str(&yaml).expect("deserialize");
