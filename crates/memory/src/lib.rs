@@ -43,9 +43,6 @@ pub mod memory_sync;
 pub mod orchestrator;
 pub mod resolution;
 pub mod seeds;
-#[deprecated(note = "Orphaned abstraction. Real session management in runtime::session. Revisit for multi-platform.")]
-#[doc(hidden)]
-pub(crate) mod session_manager;
 pub mod session_store;
 pub mod shared;
 pub mod splitter;

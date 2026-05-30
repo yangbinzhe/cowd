@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::types::{MemoryEntry, MemoryId, Relation, RelationKind, TemporalMarker};
+use crate::types::{MemoryId, Relation, RelationKind, TemporalMarker};
 use crate::store::MemoryStore;
 
 // ─── Entity Types ─────────────────────────────────────────────────────────────
