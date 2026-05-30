@@ -530,6 +530,26 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             }
         }
 
+        // A2: Inject available peer agents from AgentDirectory into the system prompt.
+        if self.config.inject_peer_context {
+            let active_agents = memory::agent_directory::AgentDirectory::global()
+                .list_active();
+            let peers: Vec<String> = active_agents.iter()
+                .filter(|a| a.agent_id != self.agent_id)
+                .map(|a| format!("  - {} (role: {}, capabilities: {:?})",
+                    &a.agent_id[..std::cmp::min(8, a.agent_id.len())],
+                    a.role,
+                    a.capabilities))
+                .collect();
+            if !peers.is_empty() {
+                current_prompt = format!(
+                    "{}\n## Available Peer Agents\n{}\n",
+                    current_prompt,
+                    peers.join("\n")
+                );
+            }
+        }
+
         loop {
             if let Err(e) = self.check_budget() {
                 tracing::warn!("SubAgent budget exhausted: {}", e);

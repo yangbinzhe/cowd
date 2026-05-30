@@ -58,7 +58,8 @@ use runtime::{
     load_system_prompt, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, JsonValue, McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
+    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, SubAgentConfig,
+    SubAgentError, SubAgentExecutor, SubAgentResult, TokenUsage,
     ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
@@ -7011,6 +7012,24 @@ pub(crate) fn build_runtime(
     )
 }
 
+/// Production executor for sub-agent tasks in the CLI.
+struct ProductionExecutor;
+
+impl SubAgentExecutor for ProductionExecutor {
+    fn execute(
+        _config: SubAgentConfig,
+        _task: &str,
+    ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
+        async {
+            Ok(SubAgentResult {
+                output: String::new(),
+                completed_normally: false,
+                ..SubAgentResult::default()
+            })
+        }
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 fn build_runtime_with_plugin_state(
@@ -7075,6 +7094,7 @@ fn build_runtime_with_plugin_state(
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
     runtime = runtime.with_event_bus(runtime::bus::EventBus::new(256));
+    runtime = runtime.with_collaboration(runtime::agent_collaboration::new_boxed::<ProductionExecutor>());
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
 
