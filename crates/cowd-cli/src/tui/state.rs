@@ -910,12 +910,29 @@ impl TuiState {
                     self.agent_team_panel.handle_key(&event);
                     return true;
                 }
-                KeyCode::Tab => {
+                KeyCode::Esc => {
                     self.agent_team_panel.visible = false;
                     return true;
                 }
                 _ => {}
             }
+        }
+
+        // 1.75. Tab/BackTab sidebar cycling (before keybind engine which maps Tab to no-op NextPanel)
+        match event.code {
+            KeyCode::Tab => {
+                self.sidebar_active_tab = (self.sidebar_active_tab + 1) % 9;
+                return true;
+            }
+            KeyCode::BackTab => {
+                self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
+                    8
+                } else {
+                    self.sidebar_active_tab - 1
+                };
+                return true;
+            }
+            _ => {}
         }
 
         // 2. Route through keybind engine

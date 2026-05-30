@@ -9365,7 +9365,7 @@ mod tests {
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -9690,7 +9690,7 @@ mod tests {
                         .map(str::to_string)
                         .collect()
                 ),
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -9874,7 +9874,7 @@ mod tests {
             parse_args(&["status".to_string()]).expect("status should parse"),
             CliAction::Status {
                 model: DEFAULT_MODEL.to_string(),
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 output_format: CliOutputFormat::Text,
             }
         );

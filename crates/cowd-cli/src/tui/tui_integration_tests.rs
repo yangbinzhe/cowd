@@ -86,22 +86,12 @@ fn integration_panel_switch() {
     // Default tab is Chat (index 0)
     assert_eq!(state.sidebar_active_tab, 0);
 
-    // Tab cycles through panels: 0→1→2→3→4→5→0
-    state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.sidebar_active_tab, 1);
-
-    state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.sidebar_active_tab, 2);
-
-    state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.sidebar_active_tab, 3);
-
-    state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.sidebar_active_tab, 4);
-
-    state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.sidebar_active_tab, 5);
-
+    // Tab cycles through 9 sidebar tabs: 0→1→2→3→4→5→6→7→8→0
+    for expected in 1..9 {
+        state.handle_input(key(KeyCode::Tab));
+        assert_eq!(state.sidebar_active_tab, expected, "Tab cycle step to tab {expected}");
+    }
+    // 9th Tab wraps back to 0
     state.handle_input(key(KeyCode::Tab));
     assert_eq!(state.sidebar_active_tab, 0);
 }
