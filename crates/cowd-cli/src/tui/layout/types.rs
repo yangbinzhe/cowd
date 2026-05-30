@@ -126,6 +126,31 @@ pub enum LayoutNode {
     Leaf(Box<dyn Component>),
 }
 
+impl LayoutNode {
+    pub(crate) fn compute_bounds(&mut self, area: Rect) {
+        match self {
+            LayoutNode::Split(s) => {
+                let areas = s.compute_areas(area);
+                for (child, child_area) in s.children.iter_mut().zip(areas) {
+                    child.compute_bounds(child_area);
+                }
+            }
+            LayoutNode::Panel(p) => {
+                p.bounds = Some(area);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn find_area(&self, id: &str) -> Option<Rect> {
+        match self {
+            LayoutNode::Panel(p) if p.id == id => p.bounds,
+            LayoutNode::Split(s) => s.children.iter().find_map(|c| c.find_area(id)),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Debug for LayoutNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -207,6 +232,8 @@ impl fmt::Debug for TabDef {
 pub struct PanelDef {
     pub id: String,
     pub component: Box<dyn Component>,
+    /// Computed screen bounds, set by [`LayoutNode::compute_bounds`].
+    pub bounds: Option<Rect>,
 }
 
 impl fmt::Debug for PanelDef {
@@ -269,10 +296,12 @@ mod tests {
                 LayoutNode::Panel(PanelDef {
                     id: "left".into(),
                     component: tc("left"),
+                    bounds: None,
                 }),
                 LayoutNode::Panel(PanelDef {
                     id: "right".into(),
                     component: tc("right"),
+                    bounds: None,
                 }),
             ],
         };
@@ -293,10 +322,12 @@ mod tests {
                 LayoutNode::Panel(PanelDef {
                     id: "top".into(),
                     component: tc("top"),
+                    bounds: None,
                 }),
                 LayoutNode::Panel(PanelDef {
                     id: "bottom".into(),
                     component: tc("bottom"),
+                    bounds: None,
                 }),
             ],
         };
@@ -327,6 +358,7 @@ mod tests {
             children: vec![LayoutNode::Panel(PanelDef {
                 id: "only".into(),
                 component: tc("only"),
+                bounds: None,
             })],
         };
         let areas = split.compute_areas(Rect::new(0, 0, 100, 100));
@@ -344,14 +376,17 @@ mod tests {
                 LayoutNode::Panel(PanelDef {
                     id: "a".into(),
                     component: tc("a"),
+                    bounds: None,
                 }),
                 LayoutNode::Panel(PanelDef {
                     id: "b".into(),
                     component: tc("b"),
+                    bounds: None,
                 }),
                 LayoutNode::Panel(PanelDef {
                     id: "c".into(),
                     component: tc("c"),
+                    bounds: None,
                 }),
             ],
         };
@@ -494,6 +529,7 @@ mod tests {
             LayoutNode::Panel(PanelDef {
                 id: "p".into(),
                 component: tc("p"),
+                bounds: None,
             }),
         ];
 

@@ -457,6 +457,7 @@ mod tests {
         PanelDef {
             id: id.to_string(),
             component: MockComponent::boxed(id),
+            bounds: None,
         }
     }
 

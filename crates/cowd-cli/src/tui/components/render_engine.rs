@@ -314,6 +314,7 @@ mod tests {
                         text: "NESTED-PANEL-CONTENT".into(),
                     }
                 }),
+                bounds: None,
             }),
         };
 
@@ -336,6 +337,7 @@ mod tests {
                     id: "inside",
                     text: "INSIDE".into(),
                 }),
+                bounds: None,
             }),
         };
 
