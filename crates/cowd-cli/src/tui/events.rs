@@ -70,7 +70,7 @@ pub type TuiEventReceiver = mpsc::Receiver<TuiEvent>;
 /// without dropping, while bounded to prevent runaway memory.
 #[must_use]
 pub fn tui_event_channel() -> (TuiEventSender, TuiEventReceiver) {
-    mpsc::sync_channel::<TuiEvent>(2048)
+    mpsc::sync_channel::<TuiEvent>(256)
 }
 
 #[cfg(test)]
@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn channel_backpressure_no_panic() {
         let (tx, _rx) = tui_event_channel();
-        for i in 0..2048 {
+        for i in 0..256 {
             let _ = tx.try_send(TuiEvent::TextDelta { text: format!("msg{i}") });
         }
         // After channel fills, try_send returns Err — should not panic
