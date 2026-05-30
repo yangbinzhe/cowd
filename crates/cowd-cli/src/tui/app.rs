@@ -146,6 +146,9 @@ pub struct App {
     pub skin: crate::tui::skin::SkinConfig,
     pub memory_status: Option<String>,
 
+    /// Reputation score of the currently selected agent (if any).
+    pub selected_agent_reputation: Option<f64>,
+
     /// Number of MCP servers connected.
     pub mcp_count: usize,
     /// Number of LSP servers available.
@@ -310,6 +313,7 @@ impl App {
             skin: crate::tui::skin::SkinConfig::default(),
             memory_status: None,
 
+            selected_agent_reputation: None,
             mcp_count: 0,
             lsp_available: 0,
             permission_count: 0,

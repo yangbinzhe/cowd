@@ -117,9 +117,9 @@ fn score_entry(query: &str, entry: &CommandEntry) -> usize {
 fn default_entries() -> Vec<CommandEntry> {
     let mut entries: Vec<CommandEntry> = Vec::new();
 
-    // ── Slash commands ──────────────────────────────────────────
+    // ── Slash commands (agents/solve/discuss/perf use register() in new()) ──
     let slash_cmds: &[&str] = &[
-        "add-dir", "advisor", "agents", "allowed-tools", "api-key",
+        "add-dir", "advisor", "allowed-tools", "api-key",
         "approve", "branch", "brief", "bughunter", "clear", "color",
         "commit", "compact", "config", "context", "copy", "cost",
         "debug-tool-call", "deny", "desktop", "diff", "doctor",
@@ -233,7 +233,7 @@ impl CommandPalette {
     #[must_use]
     pub fn new() -> Self {
         let all_commands = default_entries();
-        Self {
+        let mut palette = Self {
             all_commands,
             search_input: String::new(),
             cursor: 0,
@@ -241,7 +241,29 @@ impl CommandPalette {
             selected_index: 0,
             visible: false,
             pending_action: None,
-        }
+        };
+        // Register commands with refined descriptions
+        palette.register(
+            "/solve",
+            "Start joint problem-solving (7-phase)",
+            Action::Execute("/solve".into()),
+        );
+        palette.register(
+            "/discuss",
+            "Start agent discussion for consensus",
+            Action::Execute("/discuss".into()),
+        );
+        palette.register(
+            "/agents",
+            "Show agent team panel",
+            Action::Execute("/agents".into()),
+        );
+        palette.register(
+            "/perf",
+            "Toggle performance dashboard",
+            Action::Execute("/perf".into()),
+        );
+        palette
     }
 
     // ── Registration ────────────────────────────────────────────

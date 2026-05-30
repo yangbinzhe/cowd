@@ -95,6 +95,7 @@ impl StatusBar {
         let mut sb = Self::new();
         sb.add_section(Self::brand_section());
         sb.add_section(Self::panel_model_status_section());
+        sb.add_section(Self::reputation_section());
         sb.add_section(Self::token_bar_section());
         sb.add_section(Self::token_count_section());
         sb.add_section(Self::turn_token_section());
@@ -199,6 +200,17 @@ impl StatusBar {
             content: None,
             style: Style::default().fg(Color::Cyan),
             width: SectionWidth::Fixed(28),
+        }
+    }
+
+    // ── Reputation section ──────────────────────────────────────
+
+    fn reputation_section() -> StatusSection {
+        StatusSection {
+            id: "reputation".into(),
+            content: None,
+            style: Style::default().fg(Color::Yellow),
+            width: SectionWidth::Fixed(8),
         }
     }
 
@@ -312,6 +324,19 @@ impl StatusBar {
                         api::ProviderKind::OpenAi => "OpenAI",
                     };
                     Some(format!("{provider_label} │ {status} │ {}", app.model))
+                }
+                "reputation" => {
+                    app.selected_agent_reputation.map(|r| {
+                        // Gold/Yellow for >=4.0, Silver/Gray for >=2.0
+                        let style = if r >= 4.0 {
+                            Color::Yellow
+                        } else {
+                            Color::Gray
+                        };
+                        // Override the section's style with dynamic color
+                        section.style = section.style.fg(style);
+                        format!("⭐{r:.1}")
+                    })
                 }
                 "token_bar" => token_bar(app),
                 "token_count" => {
