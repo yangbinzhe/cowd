@@ -442,22 +442,6 @@ impl TuiState {
         let max_input = (area.height / 2).max(3);
         let input_h = (input_lines + 2).min(max_input).max(3);
 
-        // FIX A: When search is active, reserve top 1 line for search bar.
-        // This prevents search bar from overlapping chat content.
-        let search_bar_h: u16 = if self.app.search_active { 1 } else { 0 };
-
-        // Compute content area: exclude status bar (1 line), dynamic input from bottom,
-        // and search bar (1 line from top when active).
-        let bottom_reserved = input_h + 1; // input + status bar
-        let top_reserved = search_bar_h;
-        let content_y = top_reserved;
-        let content_h = area.height.saturating_sub(bottom_reserved + top_reserved);
-        let content_area = if content_h > 0 {
-            ratatui::layout::Rect::new(0, content_y, area.width, content_h)
-        } else {
-            ratatui::layout::Rect::new(0, content_y, area.width, 0)
-        };
-
         // FIX A: Render search bar BEFORE content to prevent overlap
         if self.app.search_active {
             let search_area = ratatui::layout::Rect::new(0, 0, area.width, 1);
@@ -487,12 +471,12 @@ impl TuiState {
         // ── Main content: one RenderContext for chat, sidebar, status, input ──
         let mut main_ctx: RenderContext = RenderContext::new(frame, &skin);
 
-        // 1. Render chat view (70% left) + sidebar (30% right) in content area
+        // 1. Render chat view + sidebar using the layout tree
         {
-            let chat_w = ((content_area.width as f32 * 0.7).round() as u16).min(content_area.width);
-            let sidebar_w = content_area.width.saturating_sub(chat_w);
-            let chat_area = ratatui::layout::Rect::new(0, 0, chat_w, content_area.height);
-            let sidebar_area = ratatui::layout::Rect::new(chat_w, 0, sidebar_w, content_area.height);
+            self.layout_tree.resize(area);
+            let chat_area = self.layout_tree.area_of("chat").unwrap_or(area);
+            let sidebar_w = area.width.saturating_sub(chat_area.width);
+            let sidebar_area = ratatui::layout::Rect::new(chat_area.width, 0, sidebar_w, area.height);
 
             // Render chat view (already synced above)
             {
