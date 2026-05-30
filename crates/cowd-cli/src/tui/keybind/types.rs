@@ -1,6 +1,8 @@
 use crossterm::event::KeyEvent;
 use std::hash::{Hash, Hasher};
 
+use crate::tui::layout::LayoutPreset;
+
 /// A sequence of key presses that triggers an action.
 ///
 /// Supports multi-chord keybindings (e.g., `g` then `g` for "go to top").
@@ -85,14 +87,20 @@ pub enum Action {
     HistoryBrowse(bool),
     /// Toggle the command palette overlay.
     ToggleCommandPalette,
+    /// Toggle the performance dashboard overlay.
+    TogglePerformanceDashboard,
     /// Toggle the agents overlay visibility.
     ToggleAgentsOverlay,
+    /// Toggle the agent team panel visibility.
+    ToggleAgentPanel,
     /// Focus the Diff sidebar tab.
     FocusDiff,
     /// Focus the File Tree sidebar tab.
     FocusFileTree,
     /// Focus the Sessions sidebar tab.
     FocusSessions,
+    /// Apply a F-key layout preset (F1=Coding, F2=Review, F3=Collaboration).
+    ApplyPreset(LayoutPreset),
     /// No operation — consumes the event without side effects.
     Noop,
 }

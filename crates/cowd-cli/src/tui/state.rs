@@ -40,6 +40,7 @@ use crate::tui::components::gateway_panel::GatewayPanel;
 use crate::tui::components::prompt::Prompt;
 use crate::tui::components::question_form::QuestionForm;
 use crate::tui::components::memory_panel::MemoryPanel;
+use crate::tui::components::performance_dashboard::PerformanceDashboard;
 use crate::tui::components::session_sidebar::SessionSidebar;
 use crate::tui::components::status_bar::StatusBar;
 use crate::tui::components::revert_dialog::RevertDialog;
@@ -168,6 +169,9 @@ pub struct TuiState {
     /// Memory browser panel with layer filter, search, detail view, delete.
     pub memory_panel: MemoryPanel,
 
+    /// Performance dashboard overlay with sparkline, gauge, compression bar.
+    pub performance_dashboard: PerformanceDashboard,
+
     /// Skills panel showing categorized skill/plugin browsing.
     pub skills_panel: SkillsPanel,
 
@@ -262,6 +266,7 @@ impl TuiState {
         let file_tree = FileTree::new();
         let session_sidebar = SessionSidebar::new(session_id);
         let memory_panel = MemoryPanel::new();
+        let performance_dashboard = PerformanceDashboard::new();
         let skills_panel = SkillsPanel::new();
         let gateway_panel = GatewayPanel::new();
 
@@ -299,6 +304,7 @@ impl TuiState {
             file_tree,
             session_sidebar,
             memory_panel,
+            performance_dashboard,
             skills_panel,
             gateway_panel,
             sidebar_active_tab: 0,
@@ -438,6 +444,10 @@ impl TuiState {
 
         // Sync memory panel from App state
         self.memory_panel.sync_from_app(&self.app);
+
+        // Sync performance dashboard from memory orchestrator
+        self.performance_dashboard.tick();
+        self.performance_dashboard.sync(&self.memory_orchestrator);
 
         // Sync skills panel from App state
         self.skills_panel.sync_from_app(&self.app);
@@ -714,6 +724,28 @@ impl TuiState {
                 let _guard = self.render_profiler.guard("agent_team_panel");
                 match error_recovery::catch_render_panic("agent_team_panel", AssertUnwindSafe(|| {
                     self.agent_team_panel.render(&mut overlay_ctx, area);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
+        }
+
+        // 5.1. Render performance dashboard when visible
+        if self.performance_dashboard.visible {
+            let degraded = {
+                let _guard = self.render_profiler.guard("performance_dashboard");
+                match error_recovery::catch_render_panic("performance_dashboard", AssertUnwindSafe(|| {
+                    // Render in a centered rectangle (70% width, 60% height)
+                    let dash_w = (area.width as f32 * 0.7) as u16;
+                    let dash_h = (area.height as f32 * 0.55) as u16;
+                    let dash_x = (area.width.saturating_sub(dash_w)) / 2;
+                    let dash_y = (area.height.saturating_sub(dash_h)) / 2;
+                    let dash_area = ratatui::layout::Rect::new(dash_x, dash_y, dash_w, dash_h);
+                    self.performance_dashboard.render(&mut overlay_ctx, dash_area);
                 })) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
@@ -1144,6 +1176,11 @@ impl TuiState {
 
         // 6. Esc/Ctrl+C special handling for turn-active cancel and exit
         if key.code == KeyCode::Esc {
+            // Performance dashboard consumes Esc to close itself
+            if self.performance_dashboard.visible {
+                self.performance_dashboard.visible = false;
+                return ProcessedKey::Nothing;
+            }
             if self.app.turn_active {
                 return ProcessedKey::Cancel;
             }
@@ -1359,6 +1396,9 @@ impl TuiState {
             Action::ToggleAgentPanel => {
                 self.agent_team_panel.toggle();
             }
+            Action::TogglePerformanceDashboard => {
+                self.performance_dashboard.toggle();
+            }
             Action::ToggleTheme => {
                 self.app.theme.toggle();
                 self.theme_engine.toggle_dark_light();
@@ -1476,6 +1516,20 @@ impl TuiState {
             }
             Action::Execute(ref _cmd) => {}
             Action::TogglePanel(ref _name) => {}
+            Action::ApplyPreset(preset) => {
+                self.layout_tree.apply_preset(preset);
+                let label = match preset {
+                    crate::tui::layout::LayoutPreset::Coding => "Coding",
+                    crate::tui::layout::LayoutPreset::Review => "Review",
+                    crate::tui::layout::LayoutPreset::Collaboration => "Collaboration",
+                };
+                self.toast_manager.push(
+                    ToastVariant::Info,
+                    Some("Layout".into()),
+                    format!("Switched to {label} layout"),
+                    2000,
+                );
+            }
             Action::Noop => {}
         }
     }

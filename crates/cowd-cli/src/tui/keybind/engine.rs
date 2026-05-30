@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::types::{Action, KeyBinding, KeyChord, KeyMap, ModalLayer};
+use crate::tui::layout::LayoutPreset;
 
 // ── Group constants for which-key ─────────────────────────────────
 pub const GROUP_NAVIGATION: &str = "Navigation";
@@ -27,6 +28,7 @@ pub const GROUP_SESSION: &str = "Session";
 pub const GROUP_FILES: &str = "Files";
 pub const GROUP_DIALOG: &str = "Dialog";
 pub const GROUP_SYSTEM: &str = "System";
+pub const GROUP_LAYOUT: &str = "Layout";
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -414,6 +416,14 @@ pub fn default_bindings() -> KeyMap {
         KeyChord {
             keys: vec![KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)],
         },
+        Action::TogglePerformanceDashboard,
+        "Performance dashboard",
+        GROUP_DIALOG,
+    );
+    map.add_grouped(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)],
+        },
         Action::ToggleCommandPalette,
         "Command palette",
         GROUP_DIALOG,
@@ -424,6 +434,14 @@ pub fn default_bindings() -> KeyMap {
         },
         Action::ToggleAgentsOverlay,
         "Toggle agents overlay",
+        GROUP_SYSTEM,
+    );
+    map.add_grouped(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)],
+        },
+        Action::ToggleAgentPanel,
+        "Toggle agent team panel",
         GROUP_SYSTEM,
     );
 
@@ -513,6 +531,32 @@ pub fn default_bindings() -> KeyMap {
         Action::SubmitInput,
         "Submit input",
         GROUP_SESSION,
+    );
+
+    // ── F-key layout presets ──
+    map.add_grouped(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)],
+        },
+        Action::ApplyPreset(LayoutPreset::Coding),
+        "Coding layout (70/30)",
+        GROUP_LAYOUT,
+    );
+    map.add_grouped(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)],
+        },
+        Action::ApplyPreset(LayoutPreset::Review),
+        "Review layout (50/50)",
+        GROUP_LAYOUT,
+    );
+    map.add_grouped(
+        KeyChord {
+            keys: vec![KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)],
+        },
+        Action::ApplyPreset(LayoutPreset::Collaboration),
+        "Collaboration layout (30/30/40)",
+        GROUP_LAYOUT,
     );
 
     // ── Space-leader chords ──

@@ -3,7 +3,7 @@ pub mod engine;
 pub mod defaults;
 
 pub use types::LayoutNode;
-pub use defaults::{build_default_layout, LayoutState};
+pub use defaults::{build_default_layout, LayoutPreset, LayoutState};
 
 use ratatui::layout::Rect;
 

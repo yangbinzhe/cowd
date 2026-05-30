@@ -1,13 +1,17 @@
 use crate::tui::components::chat_view::ChatView;
 // ── Default Layout & State Management ──────────────────────────────
 // build_default_layout(), LayoutState (toggle_sidebar, resize_sidebar),
+// layout presets (F1=Coding, F2=Review, F3=Collaboration),
 // and unit tests for the default split-view layout.
 // --------------------------------------------------------------------
 
 use ratatui::layout::Rect;
 
+use crate::tui::components::agent_team_panel::AgentTeamPanel;
 use crate::tui::components::agents_overlay::AgentsOverlay;
 use crate::tui::components::context_panel::ContextPanel;
+use crate::tui::components::diff_viewer::DiffViewer;
+use crate::tui::components::discussion_thread_view::DiscussionThreadView;
 use crate::tui::components::file_changes_panel::FileChangesPanel;
 use crate::tui::components::file_tree::FileTree;
 use crate::tui::components::gateway_panel::GatewayPanel;
@@ -16,7 +20,7 @@ use crate::tui::components::skills_panel::SkillsPanel;
 use crate::tui::components::todo_panel::TodoPanel;
 use crate::tui::components::{Component, EventResult, RenderContext};
 use super::LayoutTree;
-use super::types::{LayoutNode, Split, SplitDirection, TabDef, TabGroup};
+use super::types::{LayoutNode, PanelDef, Split, SplitDirection, TabDef, TabGroup};
 
 // ── Placeholder Component ──────────────────────────────────────────
 
@@ -124,6 +128,75 @@ pub fn build_default_layout() -> LayoutTree {
     });
 
     LayoutTree { root }
+}
+
+// ── Layout Presets ────────────────────────────────────────────────
+
+/// Pre-defined layout configurations activated by F1/F2/F3 keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutPreset {
+    /// 70/30 split: ChatView | Sidebar (default)
+    Coding,
+    /// 50/50 split: ChatView | DiffViewer
+    Review,
+    /// 30/30/40 split: AgentPanel | ChatView | DiscussionThreadView
+    Collaboration,
+}
+
+impl LayoutTree {
+    /// Replace the root layout node with a preset configuration.
+    pub fn apply_preset(&mut self, preset: LayoutPreset) {
+        self.root = match preset {
+            LayoutPreset::Coding => build_default_layout().root,
+            LayoutPreset::Review => {
+                LayoutNode::Split(Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.5,
+                    children: vec![
+                        LayoutNode::Panel(PanelDef {
+                            id: "chat".into(),
+                            component: Box::new(ChatView::new()),
+                            bounds: None,
+                        }),
+                        LayoutNode::Panel(PanelDef {
+                            id: "diff".into(),
+                            component: Box::new(DiffViewer::new("Diff")),
+                            bounds: None,
+                        }),
+                    ],
+                })
+            }
+            LayoutPreset::Collaboration => {
+                LayoutNode::Split(Split {
+                    direction: SplitDirection::Horizontal,
+                    ratio: 0.3,
+                    children: vec![
+                        LayoutNode::Panel(PanelDef {
+                            id: "agent_team".into(),
+                            component: Box::new(AgentTeamPanel::new()),
+                            bounds: None,
+                        }),
+                        LayoutNode::Split(Split {
+                            direction: SplitDirection::Horizontal,
+                            ratio: 3.0 / 7.0,
+                            children: vec![
+                                LayoutNode::Panel(PanelDef {
+                                    id: "chat".into(),
+                                    component: Box::new(ChatView::new()),
+                                    bounds: None,
+                                }),
+                                LayoutNode::Panel(PanelDef {
+                                    id: "discussion".into(),
+                                    component: Box::new(DiscussionThreadView::new()),
+                                    bounds: None,
+                                }),
+                            ],
+                        }),
+                    ],
+                })
+            }
+        };
+    }
 }
 
 // ── LayoutState ────────────────────────────────────────────────────
