@@ -119,8 +119,8 @@ struct CachedLayer {
 pub struct CognitiveContextManager {
     /// Merged configuration.
     config: MemoryConfig,
-    /// Five-layer memory orchestrator.
-    orchestrator: MemoryOrchestrator,
+    /// Five-layer memory orchestrator (Arc-wrapped for shared access).
+    orchestrator: Arc<MemoryOrchestrator>,
     /// Three-stage compression pipeline.
     pipeline: CompressionPipeline,
     /// In-process vector index for semantic search.
@@ -204,6 +204,8 @@ pub struct CognitiveContextManager {
     auto_tuner: AutoTuner,
     /// Cross-agent entity evolution tracker (P9.3).
     entity_registry: Mutex<Option<crate::entity_registry::EntityRegistry>>,
+    /// Cross-agent L4 memory sync protocol (P7).
+    memory_sync: Option<Arc<crate::memory_sync::MemorySyncProtocol>>,
 }
 
 impl CognitiveContextManager {
@@ -223,8 +225,9 @@ impl CognitiveContextManager {
         workspace_root: Option<PathBuf>,
     ) -> Result<Self> {
         // Build the orchestrator (opens SQLite, wires all layers).
-        let orchestrator =
-            MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root.clone()).await?;
+        let orchestrator = Arc::new(
+            MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root.clone()).await?,
+        );
 
         // Build the compression pipeline from config.
         let pipeline = CompressionPipeline::from_config(&config.compression);
@@ -485,6 +488,7 @@ impl CognitiveContextManager {
             perf_monitor: PerformanceMonitor::default(),
             auto_tuner: AutoTuner::new(config.tuning.clone()),
             entity_registry: Mutex::new(None),
+            memory_sync: None,
             config,
             orchestrator,
             pipeline,
@@ -529,7 +533,14 @@ impl CognitiveContextManager {
     /// Propagates the guard to the underlying [`MemoryOrchestrator`] so that
     /// [`MemoryOrchestrator::remember`] also enforces layer permissions.
     pub fn with_write_guard(mut self, guard: MemoryWriteGuard) -> Self {
-        self.orchestrator = self.orchestrator.with_write_guard(Arc::new(guard.clone()));
+        let inner = match Arc::try_unwrap(self.orchestrator) {
+            Ok(inner) => inner,
+            Err(_) => panic!(
+                "orchestrator Arc must have exactly 1 reference when applying write guard; \
+                 ensure init_memory_sync is called after with_write_guard"
+            ),
+        };
+        self.orchestrator = Arc::new(inner.with_write_guard(Arc::new(guard.clone())));
         self.write_guard = Some(guard);
         self
     }
@@ -549,6 +560,28 @@ impl CognitiveContextManager {
     /// Attach an EntityRegistry for cross-agent entity evolution tracking (P9.3).
     pub fn with_entity_registry(self, registry: crate::entity_registry::EntityRegistry) -> Self {
         *self.entity_registry.lock() = Some(registry);
+        self
+    }
+
+    pub fn with_memory_sync(mut self, sync: Arc<crate::memory_sync::MemorySyncProtocol>) -> Self {
+        self.memory_sync = Some(sync);
+        self
+    }
+
+    /// Initialise the MemorySyncProtocol from the internal orchestrator and
+    /// L4 event bus. This shares the orchestrator Arc so the sync protocol
+    /// can access L4 independently.
+    pub fn init_memory_sync(mut self) -> Self {
+        let event_bus = self
+            .orchestrator
+            .l4_event_bus()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crate::layers::shared::L4EventBus::new(256)));
+        let sync = Arc::new(crate::memory_sync::MemorySyncProtocol::new(
+            Arc::clone(&self.orchestrator),
+            event_bus,
+        ));
+        self.memory_sync = Some(sync);
         self
     }
 
@@ -1084,6 +1117,24 @@ impl CognitiveContextManager {
             if !already_surfaced.contains(&entry.id) {
                 already_surfaced.insert(entry.id);
                 entries.push(entry);
+            }
+        }
+
+        // P10: Recall L4 collaboration synthesis results via MemorySyncProtocol
+        if let Some(ref sync) = self.memory_sync {
+            let agent_id = current_agent.as_deref().unwrap_or_default();
+            match sync.import_from_l4("collaboration-synthesis", agent_id).await {
+                Ok(synthesis_entries) => {
+                    for entry in synthesis_entries {
+                        if !already_surfaced.contains(&entry.id) {
+                            already_surfaced.insert(entry.id);
+                            entries.push(entry);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "memory_sync: import_from_l4 failed");
+                }
             }
         }
 
@@ -1700,6 +1751,12 @@ impl CognitiveContextManager {
                     tracing::info!(agent_role = %d.agent_role, "delegation result written to L4");
                 }
             }
+        }
+
+        // P7: Sync new L4 entries to peer agents via MemorySyncProtocol
+        if let Some(ref sync) = self.memory_sync {
+            let agent_id = self.current_agent.lock().clone().unwrap_or_default();
+            let _ = sync.import_from_l4("memory_update", &agent_id).await;
         }
 
         // ── Extract ── Drift+Seeds ── Maintenance ──────────────────────

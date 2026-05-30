@@ -112,6 +112,20 @@ impl AgentDirectory {
         }
     }
 
+    /// Update the reputation score of a registered agent.
+    ///
+    /// This is the bridge between ReputationManager (persistent SQLite storage)
+    /// and TeamDiscovery (which reads AgentInfo.reputation for ranking).
+    /// Called after each `record_completion()` in agent.rs.
+    ///
+    /// If the agent_id is not registered, this is a no-op.
+    pub fn update_reputation(&self, agent_id: &str, rep: ReputationScore) {
+        let mut lock = self.agents.lock();
+        if let Some(info) = lock.get_mut(agent_id) {
+            info.reputation = Some(rep);
+        }
+    }
+
     /// Discover agents that match at least one of the required capabilities.
     ///
     /// Offline agents are excluded from results.
@@ -180,8 +194,8 @@ mod tests {
 
     #[test]
     fn register_and_lookup() {
-        // NOTE: global singleton is shared across tests — clear after.
         let dir = AgentDirectory::global();
+        dir.clear_all(); // ensure clean state
         let info = dummy_agent("test-1", vec!["rust".to_string()]);
         dir.register(info);
         let active = dir.list_active();
@@ -192,6 +206,7 @@ mod tests {
     #[test]
     fn discover_by_capability() {
         let dir = AgentDirectory::global();
+        dir.clear_all(); // ensure clean state
         dir.register(dummy_agent("a1", vec!["rust".to_string(), "testing".to_string()]));
         dir.register(dummy_agent("a2", vec!["python".to_string()]));
 
@@ -207,6 +222,7 @@ mod tests {
     #[test]
     fn offline_agents_are_excluded() {
         let dir = AgentDirectory::global();
+        dir.clear_all(); // ensure clean state
         let mut offline = dummy_agent("off-1", vec!["rust".to_string()]);
         offline.status = AgentStatus::Offline;
         dir.register(offline);
@@ -218,8 +234,43 @@ mod tests {
     }
 
     #[test]
+    fn test_update_reputation_and_read_back() {
+        let dir = AgentDirectory::global();
+        dir.clear_all();
+        let info = dummy_agent("rep-1", vec!["rust".to_string()]);
+        dir.register(info);
+
+        dir.update_reputation(
+            "rep-1",
+            ReputationScore {
+                success_rate: 0.85,
+                task_count: 10,
+                peer_rating: 4.0,
+                last_success_at_ms: current_time_millis(),
+                recent_failures: 0,
+            },
+        );
+
+        let active = dir.list_active();
+        let agent = active.iter().find(|a| a.agent_id == "rep-1").unwrap();
+        assert_eq!(agent.reputation.unwrap().success_rate, 0.85);
+        assert_eq!(agent.reputation.unwrap().task_count, 10);
+
+        dir.unregister("rep-1");
+    }
+
+    #[test]
+    fn test_update_reputation_noop_on_missing() {
+        let dir = AgentDirectory::global();
+        dir.update_reputation("ghost", ReputationScore::default());
+        let active = dir.list_active();
+        assert!(active.iter().find(|a| a.agent_id == "ghost").is_none());
+    }
+
+    #[test]
     fn update_status_preserves_other_fields() {
         let dir = AgentDirectory::global();
+        dir.clear_all();
         let info = dummy_agent("st-1", vec!["go".to_string()]);
         let orig_registered = info.registered_at_ms;
         dir.register(info);

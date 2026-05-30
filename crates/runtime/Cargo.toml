@@ -43,6 +43,8 @@ lru = "0.12"
 
 [dev-dependencies]
 httpmock = "0.7"
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 

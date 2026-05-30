@@ -37,6 +37,7 @@ use tracing;
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
 use crate::agent_collaboration::CollaborationOps;
 use crate::agent_discussion::DiscussionEngine;
+use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
@@ -282,6 +283,10 @@ bus: Option<crate::bus::EventBus>,
     approval_gate: Option<Arc<crate::approval_gate::SmartApprovalGate>>,
     /// Type-erased collaboration orchestrator for multi-agent task dispatch.
     collaboration: Option<Arc<dyn CollaborationOps>>,
+    /// Type-erased Joint Problem Solving pipeline for high-complexity tasks.
+    jps_pipeline: Option<Arc<dyn JpsOps>>,
+    /// When true, inject available peer agents from AgentDirectory into the system prompt.
+    inject_peer_context: bool,
     /// P2-10: Optional EffectHandler for side-effect recording / mocking.
     effect_handler: Option<Arc<dyn crate::effect::EffectHandler>>,
     /// P2-2: Current project phase (Discovery→Planning→Building→Reviewing→Shipping→Graduated).
@@ -362,6 +367,7 @@ where
                     match handle.join().expect("memory init thread panicked") {
                         Ok(mgr) => {
                             mgr.set_active_agent("primary".to_string());
+                            let mgr = mgr.init_memory_sync();
                             tracing::debug!("memory: CognitiveContextManager initialised, active_agent=primary");
                             (Some(Arc::new(mgr)), None)
                         }
@@ -380,6 +386,7 @@ where
                         Ok(rt) => match rt.block_on(CognitiveContextManager::new(mem_cfg)) {
                             Ok(mgr) => {
                                 mgr.set_active_agent("primary".to_string());
+                                let mgr = mgr.init_memory_sync();
                                 tracing::debug!("memory: CognitiveContextManager initialised, active_agent=primary");
                                 (Some(Arc::new(mgr)), None)
                             }
@@ -439,6 +446,8 @@ where
             memory_callback: None,
             approval_gate: None,
             collaboration: None,
+            jps_pipeline: None,
+            inject_peer_context: true,
             effect_handler: None,
             project_phase: "Discovery".to_string(),
             gate_evaluator: Some(Arc::new(crate::gates::GateEvaluator::new().with_default_gates())),
@@ -587,6 +596,12 @@ where
     #[must_use]
     pub fn with_collaboration(mut self, c: Arc<dyn CollaborationOps>) -> Self {
         self.collaboration = Some(c);
+        self
+    }
+
+    #[must_use]
+    pub fn with_jps_pipeline(mut self, pipeline: Arc<dyn JpsOps>) -> Self {
+        self.jps_pipeline = Some(pipeline);
         self
     }
 
@@ -741,6 +756,54 @@ where
     #[must_use]
     pub fn memory_manager(&self) -> Option<&Arc<CognitiveContextManager>> {
         self.memory_manager.as_ref()
+    }
+
+    /// Determine whether the current user message warrants multi-agent collaboration.
+    ///
+    /// Uses a simple keyword heuristic; can be upgraded to LLM-based classification.
+    fn should_use_collaboration(&self, user_message: &str) -> bool {
+        let multi_step_keywords = [
+            "multi-step", "parallel", "refactor", "重构",
+            "migrate", "迁移", "deploy", "部署",
+            "analyze", "分析", "implement", "实现",
+        ];
+        let lower = user_message.to_lowercase();
+        multi_step_keywords.iter().any(|k| lower.contains(k))
+            || user_message
+                .split(|c: char| c.is_ascii_punctuation() || c == '\n')
+                .filter(|s| !s.trim().is_empty())
+                .count()
+                > 5
+    }
+
+    /// Infer required capability keywords from a task description.
+    fn infer_required_skills(user_message: &str) -> Vec<String> {
+        let lower = user_message.to_lowercase();
+        let keyword_map: &[(&str, &[&str])] = &[
+            ("rust", &["rust", "cargo", "borrow checker", "lifetime"]),
+            ("testing", &["test", "assert", "mock", "coverage", "fixture"]),
+            ("refactoring", &["refactor", "extract", "rename", "restructure", "clean"]),
+            ("review", &["review", "audit", "inspect", "examine", "check"]),
+            ("documentation", &["document", "doc", "readme", "explain", "describe"]),
+            ("planning", &["plan", "design", "architect", "spec", "outline"]),
+            ("execution", &["execute", "run", "build", "compile", "deploy"]),
+            ("debugging", &["debug", "fix", "bug", "error", "crash"]),
+            ("security", &["security", "vuln", "exploit", "injection", "xss"]),
+            ("performance", &["perf", "benchmark", "optimize", "slow", "latency"]),
+        ];
+        let mut skills = Vec::new();
+        for (skill, keywords) in keyword_map {
+            for kw in *keywords {
+                if lower.contains(kw) {
+                    skills.push(skill.to_string());
+                    break;
+                }
+            }
+        }
+        if skills.is_empty() {
+            skills.push("general".to_string());
+        }
+        skills
     }
 
     /// Create a cross-session handoff packet from the current memory state.
@@ -911,6 +974,25 @@ pub async fn run_turn_async(
         self.dual_write_message(&ConversationMessage::user_text(user_input.clone()), self.session().messages.len().wrapping_sub(1));
 
         let mut effective_system_prompt = self.prepare_memory_context(&user_input).await;
+
+        // A2: Inject available peer agents from AgentDirectory into the system prompt.
+        if self.inject_peer_context {
+            let active_agents = memory::agent_directory::AgentDirectory::global()
+                .list_active();
+            let peers: Vec<String> = active_agents.iter()
+                .filter(|a| a.agent_id != self.session().session_id)
+                .map(|a| format!("  - {} (role: {}, capabilities: {:?})",
+                    &a.agent_id[..std::cmp::min(8, a.agent_id.len())],
+                    a.role,
+                    a.capabilities))
+                .collect();
+            if !peers.is_empty() {
+                effective_system_prompt.push(format!(
+                    "\n## Available Peer Agents\n{}\n",
+                    peers.join("\n")
+                ));
+            }
+        }
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -1316,6 +1398,200 @@ pub async fn run_turn_async(
 
         let auto_compaction = self.maybe_auto_compact();
         let _ = self.run_memory_post_turn().await;
+
+        // A3: Synchronously check for L4 conflicts after each turn.
+        if let Some(ref engine_arc) = self.discussion_engine {
+            if let Ok(engine) = engine_arc.lock() {
+                let conflict_count = match engine.check_for_conflicts_sync() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "DiscussionEngine conflict check failed");
+                        0
+                    }
+                };
+
+                if conflict_count > 0 {
+                    tracing::info!(conflict_count, "L4 conflicts detected");
+
+                    // P3: Trigger discussion if conflicts found
+                    let topic = format!(
+                        "L4 memory conflict resolution ({} conflicts)",
+                        conflict_count
+                    );
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let participants = vec![
+                        memory::agent_directory::AgentInfo {
+                            agent_id: "primary".to_string(),
+                            role: "Resolver".to_string(),
+                            capabilities: vec![
+                                "conflict-resolution".to_string(),
+                                "memory".to_string(),
+                            ],
+                            status: memory::agent_directory::AgentStatus::Active,
+                            registered_at_ms: now_ms,
+                            last_heartbeat_ms: 0,
+                            reputation: None,
+                        },
+                    ];
+
+                    // Drop the lock before async operations
+                    drop(engine);
+
+                    // Re-acquire for async operations via spawn_blocking
+                    let engine_clone = Arc::clone(engine_arc);
+                    let session = Arc::clone(&self.session);
+                    tokio::task::spawn_blocking(move || {
+                        let handle = tokio::runtime::Handle::try_current();
+                        let handle = match handle {
+                            Ok(h) => h,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "No tokio handle in spawn_blocking — skipping discussion");
+                                return;
+                            }
+                        };
+                        handle.block_on(async {
+                            if let Ok(mut eng) = engine_clone.lock() {
+                                let _ = eng
+                                    .start_discussion(
+                                        topic,
+                                        participants,
+                                        crate::agent_discussion::ConsensusMethod::MajorityVote,
+                                        2,
+                                    )
+                                    .await;
+                                // After discussion, check and log consensus
+                                match eng.check_consensus().await {
+                                    Ok(consensus) if consensus.reached => {
+                                        tracing::info!(
+                                            score = consensus.score,
+                                            agreeing = consensus.agreeing_count,
+                                            total = consensus.total_count,
+                                            "Discussion reached consensus"
+                                        );
+                                        match eng.finalize().await {
+                                            Ok(decision) if !decision.is_empty() => {
+                                                tracing::info!(decision_len = decision.len(), "Discussion finalized, injecting decision into session");
+                                                use crate::session::{ContentBlock, ConversationMessage, MessageRole};
+                                                let msg = ConversationMessage {
+                                                    role: MessageRole::System,
+                                                    blocks: vec![ContentBlock::Text { text: format!("[AGENT DISCUSSION DECISION]\n{}", decision) }],
+                                                    usage: None,
+                                                };
+                                                if let Err(e) = session.write().await.push_message(msg) {
+                                                    tracing::warn!(error = %e, "Failed to inject discussion decision into session");
+                                                }
+                                            }
+                                            Ok(_) => tracing::debug!("Discussion finalized with empty decision"),
+                                            Err(e) => tracing::warn!(error = %e, "Discussion finalize failed"),
+                                        }
+                                    }
+                                    Ok(consensus) => {
+                                        tracing::info!(
+                                            score = consensus.score,
+                                            "Discussion did not reach consensus"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "Consensus check failed"
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    });
+                }
+            }
+        }
+
+        // A4: Trigger multi-agent collaboration for complex tasks.
+        if let Some(ref collab) = self.collaboration {
+            let last_user_msg = self.session().messages.iter()
+                .rev()
+                .find(|m| matches!(m.role, crate::session::MessageRole::User))
+                .map(|m| {
+                    m.blocks.iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+
+            if self.should_use_collaboration(&last_user_msg) {
+                let skills: Vec<String> = Self::infer_required_skills(&last_user_msg);
+                if !skills.is_empty() {
+                    let collab_clone = Arc::clone(collab);
+                    let task = last_user_msg.clone();
+                    let skills_clone = skills.clone();
+                    let memory = self.memory_manager().cloned();
+
+                    if let Some(synthesis) = collab_clone
+                        .run_boxed(&task, &skills_clone).await
+                    {
+                        tracing::info!(
+                            synthesis_len = synthesis.len(),
+                            skills = ?skills_clone,
+                            "Collaboration synthesis complete"
+                        );
+                        if let Some(mem) = memory {
+                            let entry = memory::types::MemoryEntry {
+                                id: memory::types::MemoryId::new_v4(),
+                                layer: memory::types::MemoryLayer::L4,
+                                category: memory::types::MemoryCategory::Shared,
+                                priority: memory::types::Priority::Normal,
+                                source: memory::types::MemorySource::Import,
+                                title: format!("collaboration-synthesis: {}",
+                                    &task[..task.len().min(80)]),
+                                content: synthesis,
+                                embedding: None,
+                                tags: vec!["collaboration".to_string(), "synthesis".to_string()],
+                                relations: vec![],
+                                confidence: 0.8,
+                                access_count: 0,
+                                staleness: 0.0,
+                                created_at: chrono::Utc::now(),
+                                updated_at: chrono::Utc::now(),
+                                last_accessed_at: None,
+                                scope: memory::project_scope::MemoryScope::Global,
+                                session_id: None,
+                                source_agent: Some("collaboration-orchestrator".to_string()),
+                                visibility: memory::types::AgentVisibility::Shared,
+                            };
+                            let _ = mem.remember(entry).await;
+                        }
+                    }
+                }
+            }
+
+            // JPS routing for very high-complexity tasks (10+ clauses or explicit keywords).
+            let word_count = last_user_msg
+                .split(|c: char| c.is_ascii_punctuation() || c == '\n')
+                .filter(|s| !s.trim().is_empty())
+                .count();
+            let is_jps_complex = word_count > 10
+                || last_user_msg.to_lowercase().contains("analyze")
+                || last_user_msg.to_lowercase().contains("refactor");
+            if is_jps_complex {
+                if let Some(ref jps) = self.jps_pipeline {
+                    let problem = ProblemStatement::new(last_user_msg);
+                    match jps.run_boxed(problem).await {
+                        Some(result) => {
+                            tracing::info!(solutions_count = result.solutions.len(), "JPS pipeline completed");
+                        }
+                        None => {
+                            tracing::info!("JPS pipeline returned no solution");
+                        }
+                    }
+                }
+            }
+        }
 
         let summary = TurnSummary {
             assistant_messages,

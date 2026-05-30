@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use memory::agent_directory::{AgentDirectory, AgentInfo};
+use memory::agent_reputation::ReputationManager;
 use serde::{Deserialize, Serialize};
 
 // ── TeamDiscoveryProtocol ──────────────────────────────────────────────────────
@@ -217,6 +218,17 @@ impl TeamDiscoveryProtocol {
             }
             agent.reputation = Some(rep);
             AgentDirectory::global().register(agent);
+
+            // P9: Bidirectional sync — also update ReputationManager
+            if let Some(mgr) = ReputationManager::global_opt() {
+                let _ = mgr.record_completion(
+                    agent_id,
+                    if success { 0.85 } else { 0.4 },
+                    success,
+                    &[],
+                );
+            }
+
             return;
         }
     }

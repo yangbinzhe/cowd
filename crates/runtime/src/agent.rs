@@ -31,13 +31,72 @@ pub trait SubAgentProgressCallback: Send + Sync {
 ///
 /// Implementations provide the runtime machinery to spawn and run a sub-agent,
 /// returning a structured `SubAgentResult` or a `SubAgentError`.
-/// This is a static dispatch trait — callers invoke `E::execute(config, task)`
-/// for a concrete type `E`.
 pub trait SubAgentExecutor: Send + Sync {
     fn execute(
+        &self,
         config: SubAgentConfig,
         task: &str,
-    ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send;
+    ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>>;
+}
+// ---------------------------------------------------------------------------
+// ProductionExecutor
+// ---------------------------------------------------------------------------
+
+/// Production implementation of `SubAgentExecutor`.
+///
+/// Wraps a factory for creating API clients and a shared tool executor,
+/// enabling real sub-agent execution via `SubAgentRuntime`.
+pub struct ProductionExecutor<C, T> {
+    /// Factory that creates a new API client for each sub-agent invocation.
+    make_client: std::sync::Arc<dyn Fn() -> C + Send + Sync>,
+    /// Shared tool executor across all sub-agent invocations.
+    tool_executor: std::sync::Arc<T>,
+}
+
+impl<C, T> ProductionExecutor<C, T>
+where
+    C: crate::conversation::ApiClient + Send + 'static,
+    T: crate::conversation::ToolExecutor,
+{
+    /// Create a new `ProductionExecutor` with the given API-client factory and
+    /// shared tool executor.
+    pub fn new(
+        make_client: impl Fn() -> C + Send + Sync + 'static,
+        tool_executor: std::sync::Arc<T>,
+    ) -> Self {
+        Self {
+            make_client: std::sync::Arc::new(make_client),
+            tool_executor,
+        }
+    }
+}
+
+impl<C, T> SubAgentExecutor for ProductionExecutor<C, T>
+where
+    C: crate::conversation::ApiClient + Send + Sync + 'static,
+    T: crate::conversation::ToolExecutor,
+{
+    fn execute(
+        &self,
+        config: SubAgentConfig,
+        task: &str,
+    ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
+        let client = (self.make_client)();
+        let rt = crate::conversation::ConversationRuntime::<C, T>::new_with_features(
+            crate::session::Session::new(),
+            client,
+            std::sync::Arc::clone(&self.tool_executor),
+            crate::permissions::PermissionPolicy::new(crate::permissions::PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &crate::config::RuntimeFeatureConfig::default(),
+        );
+        let config_for_sub = config;
+        let task_owned = task.to_string();
+        async move {
+            let mut sub_rt = SubAgentRuntime::new(config_for_sub, rt);
+            Ok(sub_rt.run_loop_async(&task_owned).await)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +510,21 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
                 completed_normally,
                 &domains,
             );
+
+            // P9.1: Sync reputation to AgentDirectory for TeamDiscovery consumption.
+            if let Ok(Some(metrics)) = rep_mgr.get(&self.agent_id) {
+                use memory::agent_directory::ReputationScore;
+                memory::agent_directory::AgentDirectory::global().update_reputation(
+                    &self.agent_id,
+                    ReputationScore {
+                        success_rate: metrics.avg_quality_score,
+                        task_count: metrics.tasks_completed,
+                        peer_rating: (metrics.avg_quality_score as f64).clamp(0.0, 5.0),
+                        last_success_at_ms: metrics.updated_at.timestamp_millis() as u64,
+                        recent_failures: if completed_normally { 0u32 } else { 1u32 },
+                    },
+                );
+            }
         }
 
         SubAgentResult {
@@ -512,6 +586,26 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
                         tracing::warn!("Failed to prepare memory context for sub-agent: {}", e);
                     }
                 }
+            }
+        }
+
+        // A2: Inject available peer agents from AgentDirectory into the system prompt.
+        if self.config.inject_peer_context {
+            let active_agents = memory::agent_directory::AgentDirectory::global()
+                .list_active();
+            let peers: Vec<String> = active_agents.iter()
+                .filter(|a| a.agent_id != self.agent_id)
+                .map(|a| format!("  - {} (role: {}, capabilities: {:?})",
+                    &a.agent_id[..std::cmp::min(8, a.agent_id.len())],
+                    a.role,
+                    a.capabilities))
+                .collect();
+            if !peers.is_empty() {
+                current_prompt = format!(
+                    "{}\n## Available Peer Agents\n{}\n",
+                    current_prompt,
+                    peers.join("\n")
+                );
             }
         }
 
@@ -635,6 +729,21 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
                 on_time,
                 &domains,
             );
+
+            // P9.1: Sync reputation to AgentDirectory for TeamDiscovery consumption.
+            if let Ok(Some(metrics)) = rep_mgr.get(&self.agent_id) {
+                use memory::agent_directory::ReputationScore;
+                memory::agent_directory::AgentDirectory::global().update_reputation(
+                    &self.agent_id,
+                    ReputationScore {
+                        success_rate: metrics.avg_quality_score,
+                        task_count: metrics.tasks_completed,
+                        peer_rating: (metrics.avg_quality_score as f64).clamp(0.0, 5.0),
+                        last_success_at_ms: metrics.updated_at.timestamp_millis() as u64,
+                        recent_failures: if completed_normally { 0u32 } else { 1u32 },
+                    },
+                );
+            }
         }
 
         SubAgentResult {

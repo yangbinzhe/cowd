@@ -11,6 +11,7 @@ use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use crate::error::MemoryError;
 
@@ -140,7 +141,20 @@ pub struct ReputationManager {
     decay_config: DecayConfig,
 }
 
+/// Global singleton for bidirectional reputation sync between modules.
+static GLOBAL_REP_MGR: OnceLock<Arc<ReputationManager>> = OnceLock::new();
+
 impl ReputationManager {
+    /// Register a global [`ReputationManager`] instance for cross-module access.
+    pub fn set_global(mgr: Arc<ReputationManager>) {
+        let _ = GLOBAL_REP_MGR.set(mgr);
+    }
+
+    /// Retrieve the global [`ReputationManager`] if it has been set.
+    pub fn global_opt() -> Option<Arc<ReputationManager>> {
+        GLOBAL_REP_MGR.get().cloned()
+    }
+
     /// Create a new manager using the provided r2d2 pool.
     pub fn new(pool: Pool<SqliteConnectionManager>, decay_config: DecayConfig) -> Self {
         Self { pool, decay_config }

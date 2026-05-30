@@ -84,8 +84,8 @@ pub mod model_registry;
 pub mod profile;
 
 pub use agent::{
-    SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback, SubAgentResult,
-    SubAgentToolMode,
+    ProductionExecutor, SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback,
+    SubAgentResult, SubAgentToolMode,
 };
 pub use agent_collaboration::{
     AgentTeam, CollaborationOrchestrator, CollaborationTask, CollaborationOps, SubTask,
@@ -98,8 +98,9 @@ pub use agent_discussion::{
     DiscussionPhase,
 };
 pub use joint_problem_solving::{
-    AgentDiscussion, DiscussionTurn, PhaseStatus, PipelineResult, ProblemSolvingConfig,
-    ProblemSolvingPipeline, ProblemStatement, Solution, SolutionEvaluation, SolutionScore,
+    AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult,
+    ProblemSolvingConfig, ProblemSolvingPipeline, ProblemStatement, Solution,
+    SolutionEvaluation, SolutionScore,
 };
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
