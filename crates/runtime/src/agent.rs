@@ -370,7 +370,11 @@ pub struct SubAgentRuntime<C: ApiClient, T: ToolExecutor> {
 impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
     /// Create a new sub-agent runtime with the given configuration and conversation runtime.
     #[must_use]
-    pub fn new(config: SubAgentConfig, runtime: ConversationRuntime<C, T>) -> Self {
+    pub fn new(mut config: SubAgentConfig, runtime: ConversationRuntime<C, T>) -> Self {
+        if config.allowed_tools.is_empty() && config.role != AgentRole::General {
+            config.allowed_tools = role_tools(config.role);
+        }
+
         let agent_id = uuid::Uuid::new_v4().to_string();
 
         // Register this sub-agent in the global agent directory.

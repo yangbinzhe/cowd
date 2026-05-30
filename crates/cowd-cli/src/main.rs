@@ -5066,7 +5066,6 @@ fn migrate_session_messages(
     jsonl_path: &Path,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     use std::io::{BufRead, BufReader};
-    use memory::store::session::SessionMessage;
 
     let file = std::fs::File::open(jsonl_path)?;
     let reader = BufReader::new(file);
