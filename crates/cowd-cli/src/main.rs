@@ -58,8 +58,7 @@ use runtime::{
     load_system_prompt, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, JsonValue, McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, SubAgentConfig,
-    SubAgentError, SubAgentExecutor, SubAgentResult, TokenUsage,
+    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
     ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
@@ -7013,22 +7012,6 @@ pub(crate) fn build_runtime(
 }
 
 /// Production executor for sub-agent tasks in the CLI.
-struct ProductionExecutor;
-
-impl SubAgentExecutor for ProductionExecutor {
-    fn execute(
-        _config: SubAgentConfig,
-        _task: &str,
-    ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
-        async {
-            Ok(SubAgentResult {
-                output: String::new(),
-                completed_normally: false,
-                ..SubAgentResult::default()
-            })
-        }
-    }
-}
 
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
@@ -7060,6 +7043,15 @@ fn build_runtime_with_plugin_state(
         .map_err(std::io::Error::other)?;
     let overrides = feature_config.model_context_windows();
     let model_ctx = api::model_context_window_with_overrides(&model, Some(&overrides));
+    // Clone model for sub-agent usage before it's consumed by the main runtime.
+    let subagent_model = model.clone();
+    // Shared tool executor — used by both the main runtime and sub-agent factory.
+    let subagent_tool_executor = std::sync::Arc::new(CliToolExecutor::new(
+        allowed_tools.clone(),
+        emit_output,
+        tool_registry.clone(),
+        mcp_state.clone(),
+    ));
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -7071,12 +7063,7 @@ fn build_runtime_with_plugin_state(
             tool_registry.clone(),
             stream_callback.clone(),
         )?,
-        std::sync::Arc::new(CliToolExecutor::new(
-            allowed_tools.clone(),
-            emit_output,
-            tool_registry.clone(),
-            mcp_state.clone(),
-        )),
+        subagent_tool_executor.clone(),
         policy,
         system_prompt,
         &feature_config,
@@ -7094,7 +7081,29 @@ fn build_runtime_with_plugin_state(
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
     runtime = runtime.with_event_bus(runtime::bus::EventBus::new(256));
-    runtime = runtime.with_collaboration(runtime::agent_collaboration::new_boxed::<ProductionExecutor>());
+    // Wire the production sub-agent executor so the collaboration pipeline
+    // can delegate real work to sub-agents.
+    {
+        let session_id_owned = session_id.to_string();
+        let allowed_tools_clone = allowed_tools.clone();
+        let tool_registry_clone = tool_registry.clone();
+        let executor = runtime::agent::ProductionExecutor::new(
+            move || {
+                AnthropicRuntimeClient::new(
+                    &session_id_owned,
+                    subagent_model.clone(),
+                    true, // sub-agents need tool access
+                    false, // no TUI streaming for sub-agents
+                    allowed_tools_clone.clone(),
+                    tool_registry_clone.clone(),
+                    None, // no stream callback for sub-agents
+                )
+                .expect("sub-agent API client creation failed")
+            },
+            subagent_tool_executor.clone(),
+        );
+        runtime = runtime.with_collaboration(runtime::agent_collaboration::new_boxed(std::sync::Arc::new(executor)));
+    }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
 

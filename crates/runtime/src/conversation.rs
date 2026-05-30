@@ -441,7 +441,7 @@ where
             memory_callback: None,
             approval_gate: None,
             collaboration: None,
-            inject_peer_context: false,
+            inject_peer_context: true,
             effect_handler: None,
             project_phase: "Discovery".to_string(),
             gate_evaluator: Some(Arc::new(crate::gates::GateEvaluator::new().with_default_gates())),
@@ -1390,17 +1390,108 @@ pub async fn run_turn_async(
         // A3: Synchronously check for L4 conflicts after each turn.
         if let Some(ref engine_arc) = self.discussion_engine {
             if let Ok(engine) = engine_arc.lock() {
-                match engine.check_for_conflicts_sync() {
-                    Ok(n) if n > 0 => {
-                        tracing::info!(
-                            conflict_count = n,
-                            "L4 conflicts detected after turn; consider triggering agent discussion"
-                        );
-                    }
-                    Ok(_) => {}
+                let conflict_count = match engine.check_for_conflicts_sync() {
+                    Ok(n) => n,
                     Err(e) => {
                         tracing::warn!(error = %e, "DiscussionEngine conflict check failed");
+                        0
                     }
+                };
+
+                if conflict_count > 0 {
+                    tracing::info!(conflict_count, "L4 conflicts detected");
+
+                    // P3: Trigger discussion if conflicts found
+                    let topic = format!(
+                        "L4 memory conflict resolution ({} conflicts)",
+                        conflict_count
+                    );
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let participants = vec![
+                        memory::agent_directory::AgentInfo {
+                            agent_id: "primary".to_string(),
+                            role: "Resolver".to_string(),
+                            capabilities: vec![
+                                "conflict-resolution".to_string(),
+                                "memory".to_string(),
+                            ],
+                            status: memory::agent_directory::AgentStatus::Active,
+                            registered_at_ms: now_ms,
+                            last_heartbeat_ms: 0,
+                            reputation: None,
+                        },
+                    ];
+
+                    // Drop the lock before async operations
+                    drop(engine);
+
+                    // Re-acquire for async operations via spawn_blocking
+                    let engine_clone = Arc::clone(engine_arc);
+                    let session = Arc::clone(&self.session);
+                    tokio::task::spawn_blocking(move || {
+                        let handle = tokio::runtime::Handle::try_current();
+                        let handle = match handle {
+                            Ok(h) => h,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "No tokio handle in spawn_blocking — skipping discussion");
+                                return;
+                            }
+                        };
+                        handle.block_on(async {
+                            if let Ok(mut eng) = engine_clone.lock() {
+                                let _ = eng
+                                    .start_discussion(
+                                        topic,
+                                        participants,
+                                        crate::agent_discussion::ConsensusMethod::MajorityVote,
+                                        2,
+                                    )
+                                    .await;
+                                // After discussion, check and log consensus
+                                match eng.check_consensus().await {
+                                    Ok(consensus) if consensus.reached => {
+                                        tracing::info!(
+                                            score = consensus.score,
+                                            agreeing = consensus.agreeing_count,
+                                            total = consensus.total_count,
+                                            "Discussion reached consensus"
+                                        );
+                                        match eng.finalize().await {
+                                            Ok(decision) if !decision.is_empty() => {
+                                                tracing::info!(decision_len = decision.len(), "Discussion finalized, injecting decision into session");
+                                                use crate::session::{ContentBlock, ConversationMessage, MessageRole};
+                                                let msg = ConversationMessage {
+                                                    role: MessageRole::System,
+                                                    blocks: vec![ContentBlock::Text { text: format!("[AGENT DISCUSSION DECISION]\n{}", decision) }],
+                                                    usage: None,
+                                                };
+                                                if let Err(e) = session.write().await.push_message(msg) {
+                                                    tracing::warn!(error = %e, "Failed to inject discussion decision into session");
+                                                }
+                                            }
+                                            Ok(_) => tracing::debug!("Discussion finalized with empty decision"),
+                                            Err(e) => tracing::warn!(error = %e, "Discussion finalize failed"),
+                                        }
+                                    }
+                                    Ok(consensus) => {
+                                        tracing::info!(
+                                            score = consensus.score,
+                                            "Discussion did not reach consensus"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "Consensus check failed"
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    });
                 }
             }
         }
@@ -1429,43 +1520,41 @@ pub async fn run_turn_async(
                     let skills_clone = skills.clone();
                     let memory = self.memory_manager().cloned();
 
-                    tokio::spawn(async move {
-                        if let Some(synthesis) = collab_clone
-                            .run_boxed(&task, &skills_clone).await
-                        {
-                            tracing::info!(
-                                synthesis_len = synthesis.len(),
-                                skills = ?skills_clone,
-                                "Collaboration synthesis complete"
-                            );
-                            if let Some(mem) = memory {
-                                let entry = memory::types::MemoryEntry {
-                                    id: memory::types::MemoryId::new_v4(),
-                                    layer: memory::types::MemoryLayer::L4,
-                                    category: memory::types::MemoryCategory::Shared,
-                                    priority: memory::types::Priority::Normal,
-                                    source: memory::types::MemorySource::Import,
-                                    title: format!("collaboration-synthesis: {}",
-                                        &task[..task.len().min(80)]),
-                                    content: synthesis,
-                                    embedding: None,
-                                    tags: vec!["collaboration".to_string(), "synthesis".to_string()],
-                                    relations: vec![],
-                                    confidence: 0.8,
-                                    access_count: 0,
-                                    staleness: 0.0,
-                                    created_at: chrono::Utc::now(),
-                                    updated_at: chrono::Utc::now(),
-                                    last_accessed_at: None,
-                                    scope: memory::project_scope::MemoryScope::Global,
-                                    session_id: None,
-                                    source_agent: Some("collaboration-orchestrator".to_string()),
-                                    visibility: memory::types::AgentVisibility::Shared,
-                                };
-                                let _ = mem.remember(entry).await;
-                            }
+                    if let Some(synthesis) = collab_clone
+                        .run_boxed(&task, &skills_clone).await
+                    {
+                        tracing::info!(
+                            synthesis_len = synthesis.len(),
+                            skills = ?skills_clone,
+                            "Collaboration synthesis complete"
+                        );
+                        if let Some(mem) = memory {
+                            let entry = memory::types::MemoryEntry {
+                                id: memory::types::MemoryId::new_v4(),
+                                layer: memory::types::MemoryLayer::L4,
+                                category: memory::types::MemoryCategory::Shared,
+                                priority: memory::types::Priority::Normal,
+                                source: memory::types::MemorySource::Import,
+                                title: format!("collaboration-synthesis: {}",
+                                    &task[..task.len().min(80)]),
+                                content: synthesis,
+                                embedding: None,
+                                tags: vec!["collaboration".to_string(), "synthesis".to_string()],
+                                relations: vec![],
+                                confidence: 0.8,
+                                access_count: 0,
+                                staleness: 0.0,
+                                created_at: chrono::Utc::now(),
+                                updated_at: chrono::Utc::now(),
+                                last_accessed_at: None,
+                                scope: memory::project_scope::MemoryScope::Global,
+                                session_id: None,
+                                source_agent: Some("collaboration-orchestrator".to_string()),
+                                visibility: memory::types::AgentVisibility::Shared,
+                            };
+                            let _ = mem.remember(entry).await;
                         }
-                    });
+                    }
                 }
             }
         }

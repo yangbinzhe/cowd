@@ -462,6 +462,7 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
     struct NoopExecutor;
     impl SubAgentExecutor for NoopExecutor {
         fn execute(
+            &self,
             _config: SubAgentConfig,
             _task: &str,
         ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
@@ -512,7 +513,7 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
         AgentDirectory::global().register(a.clone());
     }
 
-    let orch = CollaborationOrchestrator::<NoopExecutor>::new();
+    let orch = CollaborationOrchestrator::<NoopExecutor>::new(std::sync::Arc::new(NoopExecutor));
 
     let task = CollaborationTask {
         description: "Rust refactoring".into(),

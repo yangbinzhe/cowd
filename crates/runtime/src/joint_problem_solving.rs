@@ -9,7 +9,6 @@
 //! 6. Execution        – Wave tasks → SubAgents execute
 //! 7. Review           – Reviewer agent checks results
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -206,15 +205,15 @@ pub struct DiscussionTurn {
 /// Each agent contributes their perspective in turn, and the discussion
 /// results are aggregated.
 pub struct AgentDiscussion<E: SubAgentExecutor> {
+    executor: Arc<E>,
     parent_memory: Option<Arc<memory::CognitiveContextManager>>,
-    _executor: PhantomData<E>,
 }
 
 impl<E: SubAgentExecutor> AgentDiscussion<E> {
-    pub fn new() -> Self {
+    pub fn new(executor: Arc<E>) -> Self {
         Self {
+            executor,
             parent_memory: None,
-            _executor: PhantomData,
         }
     }
 
@@ -241,7 +240,7 @@ impl<E: SubAgentExecutor> AgentDiscussion<E> {
                 ..SubAgentConfig::default()
             };
 
-            let turn = match E::execute(config, prompt).await {
+            let turn = match self.executor.execute(config, prompt).await {
                 Ok(result) => DiscussionTurn {
                     agent_id: agent_id.clone(),
                     agent_role: "Evaluator".to_string(),
@@ -304,9 +303,9 @@ impl<E: SubAgentExecutor> AgentDiscussion<E> {
     }
 }
 
-impl<E: SubAgentExecutor> Default for AgentDiscussion<E> {
+impl<E: SubAgentExecutor + Default> Default for AgentDiscussion<E> {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(E::default()))
     }
 }
 
@@ -357,16 +356,16 @@ pub struct PipelineResult {
 /// Generic parameter `E` provides the SubAgent execution backend.
 pub struct ProblemSolvingPipeline<E: SubAgentExecutor> {
     config: ProblemSolvingConfig,
+    executor: Arc<E>,
     parent_memory: Option<Arc<memory::CognitiveContextManager>>,
-    _executor: PhantomData<E>,
 }
 
-impl<E: SubAgentExecutor> ProblemSolvingPipeline<E> {
-    pub fn new() -> Self {
+impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
+    pub fn new(executor: Arc<E>) -> Self {
         Self {
             config: ProblemSolvingConfig::default(),
+            executor,
             parent_memory: None,
-            _executor: PhantomData,
         }
     }
 
@@ -441,7 +440,7 @@ impl<E: SubAgentExecutor> ProblemSolvingPipeline<E> {
                     max_turns: 3,
                     ..SubAgentConfig::default()
                 };
-                match E::execute(config, &prompt).await {
+                match self.executor.execute(config, &prompt).await {
                     Ok(result) => perspectives.push(result.output),
                     Err(e) => tracing::warn!("Agent {} framing failed: {e}", agent.agent_id),
                 }
@@ -475,7 +474,7 @@ impl<E: SubAgentExecutor> ProblemSolvingPipeline<E> {
         problem: &ProblemStatement,
         perspectives: &[String],
     ) -> Vec<Solution> {
-        let collab = CollaborationOrchestrator::<E>::new();
+        let collab = CollaborationOrchestrator::<E>::new(Arc::clone(&self.executor));
         let skills = vec!["planning".to_string(), "execution".to_string(), "refactoring".to_string()];
 
         let perspective_text = perspectives.join("\n\n");
@@ -512,7 +511,7 @@ impl<E: SubAgentExecutor> ProblemSolvingPipeline<E> {
                     max_turns: 5,
                     ..SubAgentConfig::default()
                 };
-                match E::execute(config, &prompt).await {
+                match self.executor.execute(config, &prompt).await {
                     Ok(result) => {
                         return parse_solutions_from_text(&result.output);
                     }
@@ -586,7 +585,7 @@ impl<E: SubAgentExecutor> ProblemSolvingPipeline<E> {
 
         // Prepare evaluation prompts for each agent × solution.
         let eval_agents = ["evaluator-alpha", "evaluator-beta", "evaluator-gamma"];
-        let discussion = AgentDiscussion::<E>::new();
+        let discussion = AgentDiscussion::<E>::new(Arc::clone(&self.executor));
 
         // Build agent prompts: each evaluator agent scores all solutions.
         let mut agent_prompts: Vec<(String, String)> = Vec::new();
@@ -702,7 +701,7 @@ impl<E: SubAgentExecutor> ProblemSolvingPipeline<E> {
         problem: &ProblemStatement,
         solution: &Solution,
     ) -> Vec<SubAgentResult> {
-        let collab = CollaborationOrchestrator::<E>::new();
+        let collab = CollaborationOrchestrator::<E>::new(Arc::clone(&self.executor));
 
         let prompt = format!(
             "Execute the following solution for the problem.\n\n\
@@ -739,7 +738,7 @@ impl<E: SubAgentExecutor> ProblemSolvingPipeline<E> {
                     max_turns: 8,
                     ..SubAgentConfig::default()
                 };
-                match E::execute(config, &prompt).await {
+                match self.executor.execute(config, &prompt).await {
                     Ok(result) => return vec![result],
                     Err(e) => {
                         tracing::warn!("Execution fallback failed: {e}");
@@ -802,7 +801,7 @@ impl<E: SubAgentExecutor> ProblemSolvingPipeline<E> {
             ..SubAgentConfig::default()
         };
 
-        match E::execute(config, &prompt).await {
+        match self.executor.execute(config, &prompt).await {
             Ok(result) => result.output,
             Err(e) => {
                 tracing::warn!("Review failed: {e}");
@@ -972,9 +971,9 @@ impl<E: SubAgentExecutor> ProblemSolvingPipeline<E> {
     }
 }
 
-impl<E: SubAgentExecutor> Default for ProblemSolvingPipeline<E> {
+impl<E: SubAgentExecutor + Default + 'static> Default for ProblemSolvingPipeline<E> {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(E::default()))
     }
 }
 
@@ -1161,10 +1160,12 @@ mod tests {
     use crate::agent::SubAgentError;
 
     // Minimal executor that always returns OK.
+    #[derive(Default)]
     struct TestExecutor;
 
     impl SubAgentExecutor for TestExecutor {
         fn execute(
+            &self,
             _config: SubAgentConfig,
             _task: &str,
         ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
@@ -1228,7 +1229,7 @@ mod tests {
 
     #[test]
     fn merge_deduplicates_by_title() {
-        let pipeline = ProblemSolvingPipeline::<TestExecutor>::new();
+        let pipeline = ProblemSolvingPipeline::<TestExecutor>::new(Arc::new(TestExecutor));
 
         let solutions = vec![
             Solution::new("s1", "Alpha", "desc1", "agent-a"),
@@ -1242,7 +1243,7 @@ mod tests {
 
     #[test]
     fn merge_prefers_higher_confidence() {
-        let pipeline = ProblemSolvingPipeline::<TestExecutor>::new();
+        let pipeline = ProblemSolvingPipeline::<TestExecutor>::new(Arc::new(TestExecutor));
 
         let s1 = Solution {
             id: "s1".to_string(),
@@ -1269,7 +1270,7 @@ mod tests {
 
     #[test]
     fn merge_empty_input() {
-        let pipeline = ProblemSolvingPipeline::<TestExecutor>::new();
+        let pipeline = ProblemSolvingPipeline::<TestExecutor>::new(Arc::new(TestExecutor));
         let merged = pipeline.phase3_merge(vec![]);
         assert!(merged.is_empty());
     }
@@ -1278,7 +1279,7 @@ mod tests {
 
     #[test]
     fn select_top_solution_by_average() {
-        let pipeline = ProblemSolvingPipeline::<TestExecutor>::new();
+        let pipeline = ProblemSolvingPipeline::<TestExecutor>::new(Arc::new(TestExecutor));
 
         let solutions = vec![
             Solution::new("s1", "Alpha", "desc", "agent-a"),
@@ -1327,7 +1328,7 @@ mod tests {
 
     #[test]
     fn select_empty_returns_none() {
-        let pipeline = ProblemSolvingPipeline::<TestExecutor>::new();
+        let pipeline = ProblemSolvingPipeline::<TestExecutor>::new(Arc::new(TestExecutor));
         let (selected, score) = pipeline.phase5_select(&[], &[]);
         assert!(selected.is_none());
         assert!(score.is_none());
@@ -1402,6 +1403,7 @@ mod tests {
         struct EmptyExecutor;
         impl SubAgentExecutor for EmptyExecutor {
             fn execute(
+                &self,
                 _config: SubAgentConfig,
                 _task: &str,
             ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
@@ -1417,7 +1419,7 @@ mod tests {
 
         // We can't easily test the full phase2 since it needs AgentDirectory,
         // but we can verify the executor works.
-        let result = EmptyExecutor::execute(SubAgentConfig::default(), "test").await;
+        let result = EmptyExecutor.execute(SubAgentConfig::default(), "test").await;
         assert!(result.is_ok());
         assert!(result.unwrap().output.is_empty());
     }
@@ -1475,6 +1477,7 @@ mod tests {
 
     impl SubAgentExecutor for IntegrationTestExecutor {
         fn execute(
+            &self,
             config: SubAgentConfig,
             task: &str,
         ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
@@ -1506,7 +1509,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_pipeline_brainstorm_and_merge() {
-        let pipeline = ProblemSolvingPipeline::<IntegrationTestExecutor>::new();
+        let pipeline = ProblemSolvingPipeline::<IntegrationTestExecutor>::new(Arc::new(IntegrationTestExecutor { responses: vec![] }));
 
         let problem = ProblemStatement::new("build system is slow")
             .with_constraints(vec!["must not break CI".to_string()])

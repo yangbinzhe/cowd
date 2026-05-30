@@ -82,8 +82,8 @@ pub mod model_registry;
 pub mod profile;
 
 pub use agent::{
-    SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback, SubAgentResult,
-    SubAgentToolMode,
+    ProductionExecutor, SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentProgressCallback,
+    SubAgentResult, SubAgentToolMode,
 };
 pub use agent_collaboration::{
     AgentTeam, CollaborationOrchestrator, CollaborationTask, CollaborationOps, SubTask,

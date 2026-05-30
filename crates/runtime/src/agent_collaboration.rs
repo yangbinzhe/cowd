@@ -2,7 +2,6 @@
 //! wave-based parallel dispatch, result synthesis with fact-checking, and
 //! L4 team memory finalization.
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -51,17 +50,17 @@ pub struct AgentTeam {
 // ── CollaborationOrchestrator ──────────────────────────────────────────────────
 
 pub struct CollaborationOrchestrator<E: SubAgentExecutor> {
+    executor: Arc<E>,
     parent_memory: Option<Arc<memory::CognitiveContextManager>>,
     discovery: TeamDiscoveryProtocol,
-    _executor: PhantomData<E>,
 }
 
-impl<E: SubAgentExecutor> CollaborationOrchestrator<E> {
-    pub fn new() -> Self {
+impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
+    pub fn new(executor: Arc<E>) -> Self {
         Self {
+            executor,
             parent_memory: None,
             discovery: TeamDiscoveryProtocol::new(),
-            _executor: PhantomData,
         }
     }
 
@@ -159,11 +158,8 @@ impl<E: SubAgentExecutor> CollaborationOrchestrator<E> {
 
     // ── dispatch_subtasks ──────────────────────────────────────────────────
 
-    /// Dispatch subtasks in dependency-resolved waves using `WaveOrchestrator`.
-    ///
-    /// Each wave runs subtasks in parallel (via `tokio::spawn`), respecting
-    /// the dependency graph.  After all waves complete, the aggregated
-    /// results are returned.
+    /// Dispatch subtasks in dependency-resolved waves.
+    /// Tasks within each wave run sequentially.
     pub async fn dispatch_subtasks(
         &self,
         _team: &AgentTeam,
@@ -207,36 +203,19 @@ impl<E: SubAgentExecutor> CollaborationOrchestrator<E> {
                 None => continue,
             };
 
-            let mut handles: Vec<tokio::task::JoinHandle<SubAgentResult>> = Vec::new();
-
             for task in tasks {
                 let desc = task.description.clone().unwrap_or_default();
                 let config = SubAgentConfig {
                     task_description: task.name.clone(),
                     ..SubAgentConfig::default()
                 };
-                handles.push(tokio::spawn(async move {
-                    match E::execute(config, &desc).await {
-                        Ok(result) => result,
-                        Err(e) => SubAgentResult {
-                            output: format!("dispatch error: {e}"),
-                            completed_normally: false,
-                            ..SubAgentResult::default()
-                        },
-                    }
-                }));
-            }
-
-            for handle in handles {
-                match handle.await {
+                match self.executor.execute(config, &desc).await {
                     Ok(result) => all_results.push(result),
-                    Err(e) => {
-                        all_results.push(SubAgentResult {
-                            output: format!("join error: {e}"),
-                            completed_normally: false,
-                            ..SubAgentResult::default()
-                        });
-                    }
+                    Err(e) => all_results.push(SubAgentResult {
+                        output: format!("dispatch error: {e}"),
+                        completed_normally: false,
+                        ..SubAgentResult::default()
+                    }),
                 }
             }
         }
@@ -252,7 +231,7 @@ impl<E: SubAgentExecutor> CollaborationOrchestrator<E> {
                 task_description: st.description.clone(),
                 ..SubAgentConfig::default()
             };
-            match E::execute(config, &st.description).await {
+            match self.executor.execute(config, &st.description).await {
                 Ok(r) => results.push(r),
                 Err(e) => results.push(SubAgentResult {
                     output: format!("error: {e}"),
@@ -412,9 +391,9 @@ impl<E: SubAgentExecutor> CollaborationOrchestrator<E> {
     }
 }
 
-impl<E: SubAgentExecutor + 'static> Default for CollaborationOrchestrator<E> {
+impl<E: SubAgentExecutor + Default + 'static> Default for CollaborationOrchestrator<E> {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(E::default()))
     }
 }
 
@@ -423,11 +402,11 @@ impl<E: SubAgentExecutor + 'static> Default for CollaborationOrchestrator<E> {
 /// Produces a boxed orchestrator that can be passed to
 /// `ConversationRuntime::with_collaboration()` without propagating the
 /// `E` type parameter.
-pub fn new_boxed<E>() -> Arc<dyn CollaborationOps>
+pub fn new_boxed<E>(executor: Arc<E>) -> Arc<dyn CollaborationOps>
 where
     E: SubAgentExecutor + 'static,
 {
-    Arc::new(CollaborationOrchestrator::<E>::new())
+    Arc::new(CollaborationOrchestrator::<E>::new(executor))
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────
@@ -559,13 +538,13 @@ use futures::Future;
 /// Type-erased handle for CollaborationOrchestrator.
 /// Enables storage without generic parameter propagation.
 pub trait CollaborationOps: Send + Sync {
-    fn run_boxed<'a>(&'a self, task: &'a str, skills: &'a [String]) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
+    fn run_boxed<'a>(&'a self, task: &'a str, skills: &'a [String]) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>>;
     fn decompose_task(&self, task: &str) -> Vec<SubTask>;
     fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam>;
 }
 
 impl<E: SubAgentExecutor + 'static> CollaborationOps for CollaborationOrchestrator<E> {
-    fn run_boxed<'a>(&'a self, task: &'a str, skills: &'a [String]) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
+    fn run_boxed<'a>(&'a self, task: &'a str, skills: &'a [String]) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>> {
         Box::pin(self.run(task, skills))
     }
     fn decompose_task(&self, task: &str) -> Vec<SubTask> { self.decompose_task(task) }
@@ -580,10 +559,12 @@ mod tests {
     use memory::agent_directory::AgentStatus;
 
     // Minimal executor that always succeeds.
+    #[derive(Default)]
     pub(crate) struct DummyExecutor;
 
     impl SubAgentExecutor for DummyExecutor {
         fn execute(
+            &self,
             _config: SubAgentConfig,
             task: &str,
         ) -> impl std::future::Future<Output = Result<SubAgentResult, crate::agent::SubAgentError>> + Send {
@@ -600,7 +581,7 @@ mod tests {
 
     #[test]
     fn decompose_splits_by_delimiters() {
-        let orch = CollaborationOrchestrator::<DummyExecutor>::new();
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
         let input = "Step 1: analyze code. Step 2: refactor module. Step 3: write tests.";
         let subtasks = orch.decompose_task(input);
         assert!(subtasks.len() >= 2, "expected >= 2 subtasks, got {}", subtasks.len());
@@ -612,7 +593,7 @@ mod tests {
 
     #[test]
     fn decompose_falls_back_to_sentences() {
-        let orch = CollaborationOrchestrator::<DummyExecutor>::new();
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
         let input = "Analyze the code. Refactor the module. Write tests.";
         let subtasks = orch.decompose_task(input);
         assert!(subtasks.len() >= 2);
@@ -620,7 +601,7 @@ mod tests {
 
     #[test]
     fn decompose_sequential_chains_dependencies() {
-        let orch = CollaborationOrchestrator::<DummyExecutor>::new();
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
         let subtasks = orch.decompose_sequential("Step 1: plan. Step 2: execute.");
         assert!(subtasks.len() >= 1);
         for (i, st) in subtasks.iter().enumerate() {
@@ -636,7 +617,7 @@ mod tests {
 
     #[test]
     fn assemble_team_returns_none_for_unknown_skills() {
-        let orch = CollaborationOrchestrator::<DummyExecutor>::new();
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
         let task = CollaborationTask {
             description: "do something obscure".to_string(),
             required_skills: vec!["quantum-xeno-linguistics".to_string()],
@@ -648,7 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_subtasks_empty_input() {
-        let orch = CollaborationOrchestrator::<DummyExecutor>::new();
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
         let team = AgentTeam {
             leader: dummy_agent_info("lead", vec![]),
             workers: vec![],
@@ -659,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_subtasks_single_subtask() {
-        let orch = CollaborationOrchestrator::<DummyExecutor>::new();
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
         let team = AgentTeam {
             leader: dummy_agent_info("lead", vec![]),
             workers: vec![],
@@ -677,14 +658,14 @@ mod tests {
 
     #[test]
     fn synthesize_handles_empty_results() {
-        let orch = CollaborationOrchestrator::<DummyExecutor>::new();
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
         let output = orch.synthesize(&[]);
         assert!(output.contains("Sub-agents completed"));
     }
 
     #[test]
     fn synthesize_detects_conflicts() {
-        let orch = CollaborationOrchestrator::<DummyExecutor>::new();
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
         let results = vec![
             SubAgentResult {
                 output: "alpha".to_string(),
