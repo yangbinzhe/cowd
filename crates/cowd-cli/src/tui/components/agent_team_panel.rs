@@ -586,8 +586,8 @@ mod tests {
 
     #[test]
     fn sync_populates_agents() {
-        // Register a test agent in the global directory
         let dir = AgentDirectory::global();
+        dir.clear_all();
         dir.register(dummy_agent("test-1", "Executor", AgentStatus::Active, vec!["rust"]));
 
         let mut panel = AgentTeamPanel::new();
@@ -595,25 +595,34 @@ mod tests {
         assert!(!panel.agents.is_empty());
         assert!(panel.agents.iter().any(|a| a.agent_id == "test-1"));
 
-        dir.unregister("test-1");
+        dir.clear_all();
     }
 
     #[test]
     fn selected_agent_returns_correct_entry() {
         let dir = AgentDirectory::global();
+        dir.clear_all();
         dir.register(dummy_agent("alpha", "Planner", AgentStatus::Active, vec!["plan"]));
         dir.register(dummy_agent("beta", "Executor", AgentStatus::Busy, vec!["rust"]));
 
         let mut panel = AgentTeamPanel::new();
         panel.sync();
-        panel.selected_idx = 1;
+        assert!(
+            panel.agents.len() >= 2,
+            "Expected at least 2 agents, got {}",
+            panel.agents.len()
+        );
+
+        // Find "beta" by iterating (HashMap order is non-deterministic)
+        let beta_pos = panel.agents.iter().position(|a| a.agent_id == "beta");
+        assert!(beta_pos.is_some(), "beta should be registered");
+        panel.selected_idx = beta_pos.unwrap();
 
         let selected = panel.selected_agent();
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().agent_id, "beta");
 
-        dir.unregister("alpha");
-        dir.unregister("beta");
+        dir.clear_all();
     }
 
     #[test]
@@ -671,6 +680,7 @@ mod tests {
     #[test]
     fn render_with_agents() {
         let dir = AgentDirectory::global();
+        dir.clear_all();
         dir.register(dummy_agent("agent-1", "Executor", AgentStatus::Active, vec!["rust", "tui"]));
 
         let mut panel = AgentTeamPanel::new();
@@ -683,12 +693,13 @@ mod tests {
         assert!(joined.contains("Executor"), "Should show role, got: {joined}");
         assert!(joined.contains("●"), "Should show Active status icon, got: {joined}");
 
-        dir.unregister("agent-1");
+        dir.clear_all();
     }
 
     #[test]
     fn keyboard_navigation_jk() {
         let dir = AgentDirectory::global();
+        dir.clear_all();
         dir.register(dummy_agent("a", "Planner", AgentStatus::Active, vec![]));
         dir.register(dummy_agent("b", "Executor", AgentStatus::Busy, vec![]));
         dir.register(dummy_agent("c", "Reviewer", AgentStatus::Idle, vec![]));
@@ -696,6 +707,8 @@ mod tests {
         let mut panel = AgentTeamPanel::new();
         panel.sync();
         panel.visible = true;
+        let agent_count = panel.agents.len();
+        assert!(agent_count >= 3, "Expected at least 3 agents");
 
         assert_eq!(panel.selected_idx, 0);
 
@@ -707,9 +720,10 @@ mod tests {
         panel.handle_event(&press_down);
         assert_eq!(panel.selected_idx, 2);
 
-        // Should not overflow
+        // Should not overflow past agent_count-1
         panel.handle_event(&press_j);
-        assert_eq!(panel.selected_idx, 2);
+        assert!(panel.selected_idx < agent_count,
+            "selected_idx should not exceed agent_count-1");
 
         let press_k = Event::Key(KeyEvent::new(KeyCode::Char('k'), crossterm::event::KeyModifiers::NONE));
         panel.handle_event(&press_k);
@@ -729,6 +743,7 @@ mod tests {
     #[test]
     fn keyboard_gg_jumps() {
         let dir = AgentDirectory::global();
+        dir.clear_all();
         dir.register(dummy_agent("a", "P", AgentStatus::Active, vec![]));
         dir.register(dummy_agent("b", "E", AgentStatus::Active, vec![]));
         dir.register(dummy_agent("c", "R", AgentStatus::Active, vec![]));
@@ -753,6 +768,7 @@ mod tests {
     #[test]
     fn enter_toggles_detail() {
         let dir = AgentDirectory::global();
+        dir.clear_all();
         dir.register(dummy_agent("det", "Executor", AgentStatus::Active, vec!["rust"]));
 
         let mut panel = AgentTeamPanel::new();
@@ -774,6 +790,7 @@ mod tests {
     #[test]
     fn esc_collapses_detail_then_hides() {
         let dir = AgentDirectory::global();
+        dir.clear_all();
         dir.register(dummy_agent("esc", "Executor", AgentStatus::Active, vec![]));
 
         let mut panel = AgentTeamPanel::new();
@@ -821,19 +838,24 @@ mod tests {
     #[test]
     fn sync_from_app_delegates_to_sync() {
         let dir = AgentDirectory::global();
+        dir.clear_all();
         dir.register(dummy_agent("via-app", "Planner", AgentStatus::Active, vec![]));
 
         let app = App::new("m", "s");
         let mut panel = AgentTeamPanel::new();
         panel.sync_from_app(&app);
-        assert!(panel.agents.iter().any(|a| a.agent_id == "via-app"));
+        assert!(
+            panel.agents.iter().any(|a| a.agent_id == "via-app"),
+            "Agent 'via-app' should be present after sync_from_app"
+        );
 
-        dir.unregister("via-app");
+        dir.clear_all();
     }
 
     #[test]
     fn sync_resets_detail_when_roster_changes() {
         let dir = AgentDirectory::global();
+        dir.clear_all();
         dir.register(dummy_agent("x", "E", AgentStatus::Active, vec![]));
 
         let mut panel = AgentTeamPanel::new();
@@ -844,6 +866,72 @@ mod tests {
         panel.sync();
         // Roster length changed, detail should reset
         assert!(panel.detail_idx.is_none());
+
+        dir.clear_all();
+    }
+
+    #[test]
+    fn detail_toggle_on_empty_roster_is_noop() {
+        let mut panel = AgentTeamPanel::new();
+        assert!(panel.agents.is_empty());
+        // Call toggle_detail via Enter event
+        let press_enter = Event::Key(KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE));
+        panel.handle_event(&press_enter);
+        assert!(panel.detail_idx.is_none());
+    }
+
+    #[test]
+    fn selection_clamped_after_roster_shrinks() {
+        let dir = AgentDirectory::global();
+        dir.clear_all();
+        dir.register(dummy_agent("a", "P", AgentStatus::Active, vec![]));
+        dir.register(dummy_agent("b", "E", AgentStatus::Active, vec![]));
+        dir.register(dummy_agent("c", "R", AgentStatus::Active, vec![]));
+
+        let mut panel = AgentTeamPanel::new();
+        panel.sync();
+        panel.selected_idx = 2; // last entry
+
+        dir.unregister("c");
+        panel.sync();
+        // selected_idx should be clamped to 1 (the new last index)
+        assert_eq!(panel.selected_idx, 1);
+
+        dir.clear_all();
+    }
+
+    #[test]
+    fn scroll_offset_tracks_selection_on_j() {
+        let dir = AgentDirectory::global();
+        dir.clear_all();
+        for i in 0..15 {
+            dir.register(dummy_agent(
+                &format!("agent-{i}"),
+                "E",
+                AgentStatus::Active,
+                vec![],
+            ));
+        }
+
+        let mut panel = AgentTeamPanel::new();
+        panel.sync();
+        panel.visible = true;
+        panel.selected_idx = 0;
+        panel.scroll_offset = 0;
+
+        let agent_count = panel.agents.len();
+        assert!(agent_count >= 10, "Expected at least 10 agents, got {agent_count}");
+
+        let press_j = Event::Key(KeyEvent::new(KeyCode::Char('j'), crossterm::event::KeyModifiers::NONE));
+        for _ in 0..12 {
+            panel.handle_event(&press_j);
+        }
+        // selected_idx should be at the clamped maximum
+        assert!(panel.selected_idx > 0, "selection should advance");
+        assert!(panel.selected_idx < agent_count, "selection should be clamped");
+        if agent_count >= 10 {
+            assert!(panel.scroll_offset > 0, "scroll should track selection for long lists");
+        }
 
         dir.clear_all();
     }

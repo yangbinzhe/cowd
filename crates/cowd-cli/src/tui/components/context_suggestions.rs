@@ -297,4 +297,55 @@ mod tests {
         let lines = terminal.buffer_lines();
         assert!(lines.iter().all(|l| l.is_empty()));
     }
+
+    #[test]
+    fn closed_channel_clears_receiver() {
+        let mut cs = ContextSuggestions::new();
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        cs.set_l4_receiver(rx);
+        drop(tx); // close the channel
+
+        cs.tick(); // should handle closed channel gracefully
+        assert!(!cs.is_active());
+    }
+
+    #[test]
+    fn multiple_insert_events_keep_last() {
+        let event1 = L4Event {
+            agent_id: "Alice".into(),
+            memory_id: "mem-1".into(),
+            operation: L4Operation::Insert,
+            title: "first event".into(),
+            timestamp_ms: 1000,
+        };
+        let event2 = L4Event {
+            agent_id: "Bob".into(),
+            memory_id: "mem-2".into(),
+            operation: L4Operation::Insert,
+            title: "second event".into(),
+            timestamp_ms: 2000,
+        };
+
+        let mut cs = ContextSuggestions::new();
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        cs.set_l4_receiver(rx);
+        tx.send(event1).ok();
+        tx.send(event2).ok();
+        cs.tick();
+
+        assert!(cs.is_active());
+        // Should display the last event
+        let suggestion = cs.current.as_ref().unwrap();
+        let text = suggestion.display_text();
+        assert!(text.contains("Bob"));
+        assert!(text.contains("second event"));
+    }
+
+    #[test]
+    fn tick_without_receiver_is_noop() {
+        let mut cs = ContextSuggestions::new();
+        // No receiver set
+        cs.tick();
+        assert!(!cs.is_active());
+    }
 }

@@ -247,25 +247,20 @@ impl TaskDecompositionView {
 
     /// Compute the depth of each node in the DAG.
     ///
-    /// Depth is the maximum distance from a root node (no incoming edges).
-    /// Root nodes have depth 0; their children have depth 1, and so on.
+    /// Depth is the maximum distance from a root node (a node with no
+    /// dependencies of its own). Root nodes have depth 0; their children
+    /// have depth 1, and so on.
     fn compute_depths(&self) -> HashMap<String, u32> {
-        // Identify root nodes: subtasks not listed as a dependency of any other subtask.
-        let has_parent: HashSet<&str> = self
-            .subtasks
-            .iter()
-            .flat_map(|s| s.depends_on.iter().map(String::as_str))
-            .collect();
-
+        // Root nodes are subtasks that don't depend on anything.
         let roots: Vec<&SubTask> = self
             .subtasks
             .iter()
-            .filter(|s| !has_parent.contains(s.id.as_str()))
+            .filter(|s| s.depends_on.is_empty())
             .collect();
 
         let mut depths: HashMap<String, u32> = HashMap::new();
 
-        // If everything has a parent (circular or all interdependent),
+        // If every node has a dependency (circular or all interdependent),
         // treat the first subtask as the root.
         if roots.is_empty() && !self.subtasks.is_empty() {
             self.assign_depth(&self.subtasks[0].id, 0, &mut depths);
@@ -284,20 +279,43 @@ impl TaskDecompositionView {
     }
 
     /// Recursively assign depth to a node and its descendants.
+    /// `visiting` tracks nodes on the current call stack to break cycles.
+    fn assign_depth_inner(
+        &self,
+        node_id: &str,
+        depth: u32,
+        depths: &mut HashMap<String, u32>,
+        visiting: &mut HashSet<String>,
+    ) {
+        if visiting.contains(node_id) {
+            return; // cycle detected
+        }
+        if let Some(&existing) = depths.get(node_id) {
+            if existing >= depth {
+                return; // already reached with equal or greater depth
+            }
+        }
+        depths.insert(node_id.to_string(), depth);
+        visiting.insert(node_id.to_string());
+
+        if let Some(children) = self.dag.get(node_id) {
+            let child_ids: Vec<String> = children.clone();
+            for child in &child_ids {
+                self.assign_depth_inner(child, depth + 1, depths, visiting);
+            }
+        }
+
+        visiting.remove(node_id);
+    }
+
     fn assign_depth(
         &self,
         node_id: &str,
         depth: u32,
         depths: &mut HashMap<String, u32>,
     ) {
-        let current = depths.entry(node_id.to_string()).or_insert(depth);
-        *current = (*current).max(depth);
-
-        if let Some(children) = self.dag.get(node_id) {
-            for child in children {
-                self.assign_depth(child, depth + 1, depths);
-            }
-        }
+        let mut visiting = HashSet::new();
+        self.assign_depth_inner(node_id, depth, depths, &mut visiting);
     }
 
     /// Check whether all dependencies of a subtask are present in the
@@ -499,5 +517,166 @@ mod tests {
         assert!(view.dag.is_empty());
         assert!(view.expanded.is_empty());
         assert!(!view.visible);
+    }
+
+    #[test]
+    fn new_is_empty_and_hidden() {
+        let view = TaskDecompositionView::new();
+        assert!(view.subtasks.is_empty());
+        assert!(view.dag.is_empty());
+        assert!(!view.visible);
+    }
+
+    // ── DAG edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn build_dag_clears_previous_dag() {
+        let mut view = TaskDecompositionView::new();
+        view.subtasks = vec![
+            make_subtask("a", "A", vec!["rust"], vec![]),
+            make_subtask("b", "B", vec!["test"], vec!["a"]),
+        ];
+        view.build_dag();
+        assert_eq!(view.dag.len(), 1);
+
+        // Replace subtasks with new set
+        view.subtasks = vec![
+            make_subtask("x", "X", vec!["docs"], vec![]),
+            make_subtask("y", "Y", vec!["docs"], vec!["x"]),
+            make_subtask("z", "Z", vec!["docs"], vec!["y"]),
+        ];
+        view.build_dag();
+        assert_eq!(view.dag.len(), 2); // x→[y], y→[z]
+        assert!(!view.dag.contains_key("a"));
+    }
+
+    #[test]
+    fn compute_depths_empty_subtasks() {
+        let view = TaskDecompositionView::new();
+        let depths = view.compute_depths();
+        assert!(depths.is_empty());
+    }
+
+    #[test]
+    fn compute_depths_disconnected_nodes() {
+        let mut view = TaskDecompositionView::new();
+        view.subtasks = vec![
+            make_subtask("independent", "No deps", vec![], vec![]),
+            make_subtask("other", "Also no deps", vec![], vec![]),
+        ];
+        view.build_dag();
+
+        let depths = view.compute_depths();
+        assert_eq!(depths["independent"], 0);
+        assert_eq!(depths["other"], 0);
+    }
+
+    #[test]
+    fn compute_depths_circular_dependency_fallback() {
+        let mut view = TaskDecompositionView::new();
+        view.subtasks = vec![
+            make_subtask("a", "A", vec![], vec!["b"]),
+            make_subtask("b", "B", vec![], vec!["a"]),
+        ];
+        view.build_dag();
+
+        let depths = view.compute_depths();
+        // In a circular graph, fallback picks the first subtask as root (depth 0),
+        // and the second gets depth 1 as a child of the first.
+        assert_eq!(depths["a"], 0);
+        assert_eq!(depths["b"], 1);
+        // Both nodes should have a depth assigned (no crash)
+        assert_eq!(depths.len(), 2);
+    }
+
+    #[test]
+    fn all_deps_satisfied_with_mixed_presence() {
+        let mut view = TaskDecompositionView::new();
+        view.subtasks = vec![
+            make_subtask("a", "A", vec![], vec![]),
+            make_subtask("b", "B", vec![], vec!["a"]),
+            make_subtask("c", "C", vec![], vec!["a", "missing"]),
+        ];
+        view.build_dag();
+
+        assert!(view.all_deps_satisfied(&view.subtasks[1])); // b: a present
+        assert!(!view.all_deps_satisfied(&view.subtasks[2])); // c: missing not present
+    }
+
+    // ── Render edge cases ────────────────────────────────────────
+
+    #[test]
+    fn render_invisible_does_nothing() {
+        let mut view = TaskDecompositionView::new();
+        view.visible = false;
+        view.subtasks = vec![make_subtask("x", "X", vec!["rust"], vec![])];
+
+        let mut terminal = crate::tui::test_utils::MockTerminal::new(80, 20);
+        terminal.draw(|f: &mut Frame| {
+            view.render(Rect::new(0, 0, 80, 20), f);
+        });
+        // Should not crash — invisible panels skip rendering
+        let lines = terminal.buffer_lines();
+        let joined = lines.join("\n");
+        assert!(!joined.contains("Task Decomposition"));
+    }
+
+    #[test]
+    fn render_empty_subtasks_shows_message() {
+        let mut view = TaskDecompositionView::new();
+        view.visible = true;
+
+        let mut terminal = crate::tui::test_utils::MockTerminal::new(80, 20);
+        terminal.draw(|f: &mut Frame| {
+            view.render(Rect::new(0, 0, 80, 20), f);
+        });
+        let lines = terminal.buffer_lines();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("No subtasks"),
+            "Empty view should show message, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn render_subtasks_shows_tree() {
+        let mut view = TaskDecompositionView::new();
+        view.visible = true;
+        view.subtasks = vec![
+            make_subtask("root", "Root task", vec!["plan"], vec![]),
+            make_subtask("child", "Child task", vec!["rust"], vec!["root"]),
+        ];
+        view.build_dag();
+
+        let mut terminal = crate::tui::test_utils::MockTerminal::new(80, 20);
+        terminal.draw(|f: &mut Frame| {
+            view.render(Rect::new(0, 0, 80, 20), f);
+        });
+        let lines = terminal.buffer_lines();
+        let joined = lines.join("\n");
+        assert!(joined.contains("Root task"), "Should show root description");
+        assert!(joined.contains("Child task"), "Should show child description");
+    }
+
+    #[test]
+    fn expand_toggle_shows_detail() {
+        let mut view = TaskDecompositionView::new();
+        view.visible = true;
+        view.subtasks = vec![
+            make_subtask("t1", "Task One", vec!["rust", "test"], vec![]),
+        ];
+        view.build_dag();
+        view.toggle_expand("t1");
+
+        let mut terminal = crate::tui::test_utils::MockTerminal::new(80, 20);
+        terminal.draw(|f: &mut Frame| {
+            view.render(Rect::new(0, 0, 80, 20), f);
+        });
+        let lines = terminal.buffer_lines();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Details") || joined.contains("──"),
+            "Expanded subtask should show detail lines"
+        );
     }
 }

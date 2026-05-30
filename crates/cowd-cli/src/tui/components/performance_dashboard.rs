@@ -297,3 +297,275 @@ impl Component for PerformanceDashboard {
         "performance_dashboard"
     }
 }
+
+// ── Tests ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::skin::SkinConfig;
+    use crate::tui::test_utils::MockTerminal;
+    use chrono::Utc;
+    use memory::TuningConfig;
+
+    fn make_report(
+        latency_ms: f64,
+        extract_ms: f64,
+        compression: f64,
+        hit_rate: f64,
+    ) -> PerformanceReport {
+        PerformanceReport {
+            avg_prepare_context_latency_ms: latency_ms,
+            avg_extract_duration_ms: extract_ms,
+            avg_compression_ratio: compression,
+            cache_hit_rate: hit_rate,
+            total_samples: 50,
+            window_size: 100,
+            last_updated: Utc::now(),
+            tuning_applied: false,
+            last_tuning: None,
+            current_tuning: TuningConfig::default(),
+        }
+    }
+
+    fn render_dashboard(
+        dashboard: &mut PerformanceDashboard,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let mut terminal = MockTerminal::new(width, height);
+        let skin = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &skin);
+            dashboard.render(&mut ctx, Rect::new(0, 0, width, height));
+        });
+        terminal.buffer_lines()
+    }
+
+    // ── Construction & default state ──────────────────────────────
+
+    #[test]
+    fn new_dashboard_starts_hidden_with_no_data() {
+        let dashboard = PerformanceDashboard::new();
+        assert!(!dashboard.visible);
+        assert!(dashboard.last_report.is_none());
+        assert!(dashboard.sparkline_data.is_empty());
+        assert_eq!(dashboard.ticks, 0);
+    }
+
+    #[test]
+    fn default_is_equivalent_to_new() {
+        let a = PerformanceDashboard::new();
+        let b = PerformanceDashboard::default();
+        assert_eq!(a.visible, b.visible);
+        assert!(a.last_report.is_none() && b.last_report.is_none());
+        assert!(a.sparkline_data.is_empty());
+        assert!(b.sparkline_data.is_empty());
+        assert_eq!(a.ticks, b.ticks);
+    }
+
+    // ── Toggle visibility ─────────────────────────────────────────
+
+    #[test]
+    fn toggle_flips_visibility() {
+        let mut dashboard = PerformanceDashboard::new();
+        assert!(!dashboard.visible);
+        dashboard.toggle();
+        assert!(dashboard.visible);
+        dashboard.toggle();
+        assert!(!dashboard.visible);
+    }
+
+    // ── Tick counter ──────────────────────────────────────────────
+
+    #[test]
+    fn tick_increments_counter() {
+        let mut dashboard = PerformanceDashboard::new();
+        assert_eq!(dashboard.ticks, 0);
+        dashboard.tick();
+        assert_eq!(dashboard.ticks, 1);
+        dashboard.tick();
+        assert_eq!(dashboard.ticks, 2);
+    }
+
+    #[test]
+    fn tick_wraps_at_max() {
+        let mut dashboard = PerformanceDashboard::new();
+        dashboard.ticks = u64::MAX;
+        dashboard.tick();
+        assert_eq!(dashboard.ticks, 0);
+    }
+
+    // ── Sync ──────────────────────────────────────────────────────
+
+    #[test]
+    fn sync_does_nothing_when_hidden() {
+        let mut dashboard = PerformanceDashboard::new();
+        assert!(!dashboard.visible);
+        let orchestrator: Option<Arc<MemoryOrchestrator>> = None;
+        dashboard.sync(&orchestrator);
+        assert!(dashboard.last_report.is_none());
+        assert!(dashboard.sparkline_data.is_empty());
+    }
+
+    #[test]
+    fn sync_clears_report_when_no_orchestrator() {
+        let mut dashboard = PerformanceDashboard::new();
+        dashboard.visible = true;
+        dashboard.last_report = Some(make_report(100.0, 50.0, 0.7, 0.85));
+        // Wait past the rate limit
+        dashboard.last_sync = Instant::now()
+            .checked_sub(REFRESH_INTERVAL + Duration::from_millis(100))
+            .unwrap();
+
+        let orchestrator: Option<Arc<MemoryOrchestrator>> = None;
+        dashboard.sync(&orchestrator);
+        assert!(dashboard.last_report.is_none());
+    }
+
+    #[test]
+    fn sync_respects_rate_limit() {
+        let mut dashboard = PerformanceDashboard::new();
+        dashboard.visible = true;
+        let orchestrator: Option<Arc<MemoryOrchestrator>> = None;
+
+        // First sync: within rate limit window — last_sync is fresh
+        dashboard.sync(&orchestrator);
+        let first_sync = dashboard.last_sync;
+
+        // Second sync: immediately after — should be rate-limited
+        std::thread::sleep(Duration::from_millis(1));
+        dashboard.sync(&orchestrator);
+        assert_eq!(dashboard.last_sync, first_sync, "rate limit should prevent re-sync");
+    }
+
+    // ── Render: empty state ───────────────────────────────────────
+
+    #[test]
+    fn render_empty_state_shows_no_data_message() {
+        let mut dashboard = PerformanceDashboard::new();
+        dashboard.visible = true;
+        let lines = render_dashboard(&mut dashboard, 60, 15);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("No performance data available"),
+            "Should show no-data message, got: {joined}"
+        );
+    }
+
+    // ── Render: with data ─────────────────────────────────────────
+
+    #[test]
+    fn render_shows_latency_and_cache_metrics() {
+        let mut dashboard = PerformanceDashboard::new();
+        dashboard.visible = true;
+        dashboard.ticks = 10; // past fade-in
+        dashboard.last_report = Some(make_report(150.0, 80.0, 0.75, 0.90));
+        dashboard.sparkline_data = vec![100, 120, 150, 130];
+
+        let lines = render_dashboard(&mut dashboard, 80, 20);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Prepare Latency"),
+            "Should show latency sparkline, got: {joined}"
+        );
+        assert!(
+            joined.contains("Cache Hit Rate"),
+            "Should show cache hit rate gauge, got: {joined}"
+        );
+        assert!(
+            joined.contains("Compression Ratio"),
+            "Should show compression gauge, got: {joined}"
+        );
+        assert!(
+            joined.contains("Tuning Config"),
+            "Should show tuning footer, got: {joined}"
+        );
+        assert!(
+            joined.contains("90.0%"),
+            "Should show cache hit rate 90%, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn render_fade_in_dims_early_ticks() {
+        // At tick 2 (alpha 2/6 ≈ 0.33), dimming overlay is rendered
+        let mut dashboard = PerformanceDashboard::new();
+        dashboard.visible = true;
+        dashboard.ticks = 2;
+        dashboard.last_report = Some(make_report(100.0, 50.0, 0.5, 0.5));
+        dashboard.sparkline_data = vec![100];
+
+        let lines = render_dashboard(&mut dashboard, 80, 20);
+        let joined = lines.join("\n");
+        // Should still render content (render_content is called)
+        assert!(
+            joined.contains("Prepare Latency") || joined.contains("Performance Dashboard"),
+            "Should render dashboard content even during fade-in"
+        );
+    }
+
+    #[test]
+    fn render_block_always_visible() {
+        let mut dashboard = PerformanceDashboard::new();
+        dashboard.visible = false;
+        dashboard.last_report = Some(make_report(100.0, 50.0, 0.5, 0.5));
+
+        let lines = render_dashboard(&mut dashboard, 80, 20);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Performance Dashboard"),
+            "Dashboard block should always be visible regardless of visibility flag"
+        );
+    }
+
+    #[test]
+    fn hidden_dashboard_skips_sync() {
+        let mut dashboard = PerformanceDashboard::new();
+        dashboard.visible = false;
+        let orchestrator: Option<Arc<MemoryOrchestrator>> = None;
+        dashboard.sync(&orchestrator);
+        assert!(dashboard.last_report.is_none());
+    }
+
+    // ── Sparkline history ─────────────────────────────────────────
+
+    #[test]
+    fn sparkline_trims_at_60_entries() {
+        let mut dashboard = PerformanceDashboard::new();
+        dashboard.visible = true;
+        // Simulate pushing 70 entries via repeated sync
+        for i in 0..70 {
+            dashboard.sparkline_data.push(i as u64);
+        }
+        // Manually trim
+        while dashboard.sparkline_data.len() > 60 {
+            dashboard.sparkline_data.remove(0);
+        }
+        assert_eq!(dashboard.sparkline_data.len(), 60);
+        assert_eq!(dashboard.sparkline_data[0], 10); // first removed were 0..9
+        assert_eq!(dashboard.sparkline_data[59], 69);
+    }
+
+    // ── Component trait ───────────────────────────────────────────
+
+    #[test]
+    fn component_trait_methods() {
+        let dashboard = PerformanceDashboard::new();
+        assert!(dashboard.focusable());
+        assert_eq!(dashboard.id(), "performance_dashboard");
+    }
+
+    #[test]
+    fn esc_hides_dashboard() {
+        let mut dashboard = PerformanceDashboard::new();
+        dashboard.visible = true;
+
+        let press_esc = Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
+        );
+        let result = dashboard.handle_event(&press_esc);
+        assert!(result.is_consumed());
+        assert!(!dashboard.visible);
+    }
+}

@@ -951,4 +951,111 @@ mod tests {
         assert_eq!(view.view_mode, ViewMode::Detail);
         assert_eq!(view.expanded_entry, Some(0));
     }
+
+    #[test]
+    fn detail_view_renders_entry_content() {
+        let mut view = L4KnowledgeView::new();
+        view.entries = vec![make_entry(
+            "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+            "Detailed Entry",
+            "orchestrator",
+        )];
+        view.apply_filter();
+        view.expanded_entry = Some(0);
+        view.view_mode = ViewMode::Detail;
+
+        let lines = render_panel(&mut view, 60, 15);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Detailed Entry"),
+            "Detail view should show entry title, got: {joined}"
+        );
+        assert!(
+            joined.contains("Content for Detailed Entry") || joined.contains("Content for"),
+            "Detail view should show entry content, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn esc_from_detail_returns_to_list() {
+        let mut view = L4KnowledgeView::new();
+        view.entries = vec![make_entry("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "Test", "agent")];
+        view.apply_filter();
+        view.expanded_entry = Some(0);
+        view.view_mode = ViewMode::Detail;
+
+        let key_esc = crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE);
+        let result = view.handle_detail_key(&key_esc);
+        assert!(result.is_consumed());
+        assert_eq!(view.view_mode, ViewMode::List);
+        assert!(view.expanded_entry.is_none());
+    }
+
+    #[test]
+    fn search_executes_and_filters() {
+        let mut view = L4KnowledgeView::new();
+        view.entries = vec![
+            make_entry("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "Entry A", "agent1"),
+            make_entry("b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e", "Entry B", "agent2"),
+        ];
+        view.apply_filter();
+        view.begin_search(FilterKind::Agent);
+        // Simulate typing "agent1" and pressing Enter
+        let key_a = crossterm::event::KeyEvent::new(KeyCode::Char('a'), crossterm::event::KeyModifiers::NONE);
+        let key_g = crossterm::event::KeyEvent::new(KeyCode::Char('g'), crossterm::event::KeyModifiers::NONE);
+        let key_e = crossterm::event::KeyEvent::new(KeyCode::Char('e'), crossterm::event::KeyModifiers::NONE);
+        let key_n = crossterm::event::KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE);
+        let key_t = crossterm::event::KeyEvent::new(KeyCode::Char('t'), crossterm::event::KeyModifiers::NONE);
+        let key_1 = crossterm::event::KeyEvent::new(KeyCode::Char('1'), crossterm::event::KeyModifiers::NONE);
+        let key_enter = crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+
+        view.handle_search_key(&key_a);
+        view.handle_search_key(&key_g);
+        view.handle_search_key(&key_e);
+        view.handle_search_key(&key_n);
+        view.handle_search_key(&key_t);
+        view.handle_search_key(&key_1);
+        view.handle_search_key(&key_enter);
+
+        assert_eq!(view.view_mode, ViewMode::List);
+        assert_eq!(view.filtered_entries.len(), 1);
+        assert_eq!(view.filter_agent.as_deref(), Some("agent1"));
+    }
+
+    #[test]
+    fn entry_title_truncation_long_text() {
+        // Entry with a very long title should be truncated in render
+        let long_title = "A".repeat(100);
+        let mut view = L4KnowledgeView::new();
+        view.entries = vec![make_entry(
+            "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+            &long_title,
+            "agent",
+        )];
+        view.apply_filter();
+
+        let lines = render_panel(&mut view, 50, 10);
+        let joined = lines.join("\n");
+        // Should contain truncated version with ellipsis
+        assert!(
+            joined.contains("…"),
+            "Long title should be truncated with ellipsis, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn filter_on_empty_entries_is_noop() {
+        let mut view = L4KnowledgeView::new();
+        view.filter_agent = Some("nonexistent".to_string());
+        view.apply_filter();
+        assert!(view.filtered_entries.is_empty());
+        assert_eq!(view.selected_idx, 0);
+        // Should not panic
+        let lines = render_panel(&mut view, 50, 10);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("No matching entries"),
+            "Should show empty filter message"
+        );
+    }
 }

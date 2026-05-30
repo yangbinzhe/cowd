@@ -770,4 +770,167 @@ mod tests {
             Color::Red
         );
     }
+
+    #[test]
+    fn render_waiting_contributions_when_empty() {
+        use runtime::agent_discussion::ConsensusMethod;
+
+        let participants = vec![dummy_agent_info("x")];
+        let discussion = Discussion::new(
+            "Empty contributions".to_string(),
+            participants,
+            ConsensusMethod::MajorityVote,
+            2,
+        );
+
+        let mut view = DiscussionThreadView::new();
+        view.discussion = Some(discussion);
+        view.visible = true;
+
+        let lines = render_view(&mut view, 60, 15);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Waiting for contributions"),
+            "Should show waiting message when no contributions yet"
+        );
+    }
+
+    #[test]
+    fn scroll_jk_updates_offset() {
+        let participants = vec![dummy_agent_info("a")];
+        let mut discussion = Discussion::new(
+            "Scroll test".to_string(),
+            participants,
+            runtime::agent_discussion::ConsensusMethod::MajorityVote,
+            1,
+        );
+        discussion.contributions.insert(
+            1,
+            vec![Contribution {
+                agent_id: "a".to_string(),
+                round: 1,
+                content: "line1\nline2\nline3\nline4\nline5".to_string(),
+                confidence: 0.9,
+                claims: vec![],
+            }],
+        );
+
+        let mut view = DiscussionThreadView::new();
+        view.discussion = Some(discussion);
+        view.visible = true;
+        view.scroll_offset = 0;
+
+        // Scroll down
+        let key_j = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        view.handle_event(&key_j);
+        assert_eq!(view.scroll_offset, 1);
+
+        // Scroll up
+        let key_k = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('k'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        view.handle_event(&key_k);
+        assert_eq!(view.scroll_offset, 0);
+
+        // Can't underflow
+        view.handle_event(&key_k);
+        assert_eq!(view.scroll_offset, 0);
+    }
+
+    #[test]
+    fn gg_jump_to_top() {
+        let participants = vec![dummy_agent_info("a")];
+        let discussion = Discussion::new(
+            "jump test".to_string(),
+            participants,
+            runtime::agent_discussion::ConsensusMethod::MajorityVote,
+            1,
+        );
+
+        let mut view = DiscussionThreadView::new();
+        view.discussion = Some(discussion);
+        view.visible = true;
+        view.scroll_offset = 42;
+
+        let key_g = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('g'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        view.handle_event(&key_g);
+        assert_eq!(view.scroll_offset, 0);
+    }
+
+    #[test]
+    fn phase_label_mapping() {
+        assert_eq!(
+            DiscussionThreadView::phase_label(DiscussionPhase::Contributing),
+            "Contributing"
+        );
+        assert_eq!(
+            DiscussionThreadView::phase_label(DiscussionPhase::Synthesizing),
+            "Synthesizing"
+        );
+        assert_eq!(
+            DiscussionThreadView::phase_label(DiscussionPhase::CheckingConsensus),
+            "Checking Consensus"
+        );
+        assert_eq!(
+            DiscussionThreadView::phase_label(DiscussionPhase::Complete),
+            "Complete"
+        );
+    }
+
+    #[test]
+    fn phase_icon_mapping() {
+        assert_eq!(
+            DiscussionThreadView::phase_icon(DiscussionPhase::Contributing),
+            "●"
+        );
+        assert_eq!(
+            DiscussionThreadView::phase_icon(DiscussionPhase::Synthesizing),
+            "◉"
+        );
+        assert_eq!(
+            DiscussionThreadView::phase_icon(DiscussionPhase::CheckingConsensus),
+            "◈"
+        );
+        assert_eq!(
+            DiscussionThreadView::phase_icon(DiscussionPhase::Complete),
+            "✓"
+        );
+    }
+
+    #[test]
+    fn tab_toggles_via_event() {
+        let mut view = DiscussionThreadView::new();
+        assert!(!view.visible);
+
+        let press_tab = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        view.handle_event(&press_tab);
+        assert!(view.visible);
+
+        view.handle_event(&press_tab);
+        assert!(!view.visible);
+    }
+
+    #[test]
+    fn events_ignored_when_hidden() {
+        let mut view = DiscussionThreadView::new();
+        view.visible = false;
+
+        let key_j = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let result = view.handle_event(&key_j);
+        assert!(!result.is_consumed());
+        assert_eq!(view.scroll_offset, 0);
+    }
 }
