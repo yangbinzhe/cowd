@@ -46,6 +46,25 @@ pub struct StatusSection {
     pub width: SectionWidth,
 }
 
+// ── WaveState ─────────────────────────────────────────────────────
+
+/// Tracks the current agentic loop wave execution state.
+#[derive(Debug, Clone, Default)]
+pub struct WaveState {
+    /// Current wave index (1-based).
+    pub current: u32,
+    /// Total number of waves planned.
+    pub total: u32,
+    /// Tasks waiting to be dispatched.
+    pub pending: usize,
+    /// Tasks currently running.
+    pub running: usize,
+    /// Tasks completed successfully.
+    pub done: usize,
+    /// Tasks that failed.
+    pub failed: usize,
+}
+
 // ── StatusBar ────────────────────────────────────────────────────
 
 /// A modular status bar rendered as a single-line bar at the top.
@@ -83,6 +102,7 @@ impl StatusBar {
         sb.add_section(Self::cache_section());
         sb.add_section(Self::search_section());
         sb.add_section(Self::history_section());
+        sb.add_section(Self::wave_section());
         // Task 12: Footer status sections (right-aligned)
         sb.add_section(Self::mcp_status_section());
         sb.add_section(Self::lsp_status_section());
@@ -170,6 +190,15 @@ impl StatusBar {
             content: None,
             style: Style::default().fg(Color::DarkGray),
             width: SectionWidth::Fixed(10),
+        }
+    }
+
+    fn wave_section() -> StatusSection {
+        StatusSection {
+            id: "wave".into(),
+            content: None,
+            style: Style::default().fg(Color::Cyan),
+            width: SectionWidth::Fixed(28),
         }
     }
 
@@ -339,6 +368,18 @@ impl StatusBar {
                 }
                 "history" => {
                     app.history_idx.map(|hidx| format!("hist:{}", hidx + 1))
+                }
+                "wave" => {
+                    let ws = &app.wave_state;
+                    if ws.total > 0 {
+                        let task_total = ws.pending + ws.running + ws.done + ws.failed;
+                        Some(format!(
+                            "Wave {}/{} ∥ {} tasks · ⏳{} 🔄{} ✅{}",
+                            ws.current, ws.total, task_total, ws.pending, ws.running, ws.done,
+                        ))
+                    } else {
+                        None
+                    }
                 }
                 "mcp_status" => {
                     Some(format!("● MCP:{}", app.mcp_count))

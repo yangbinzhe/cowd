@@ -153,6 +153,9 @@ pub struct App {
     /// Number of pending permission requests.
     pub permission_count: usize,
 
+    /// Wave execution state for agentic loop tracking.
+    pub wave_state: crate::tui::components::status_bar::WaveState,
+
     /// Whether the API server is currently running.
     pub server_running: bool,
     /// Server uptime in seconds.
@@ -311,6 +314,7 @@ impl App {
             lsp_available: 0,
             permission_count: 0,
 
+            wave_state: crate::tui::components::status_bar::WaveState::default(),
             server_running: false,
             server_uptime_secs: None,
             active_api_sessions: 0,

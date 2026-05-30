@@ -19,16 +19,18 @@
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 
 use crate::tui::accessibility::AccessibilityMode;
 use crate::tui::animation::{AnimationEngine, AnimationKind};
 use crate::tui::app::App;
+use crate::tui::components::agent_team_panel::AgentTeamPanel;
 use crate::tui::components::agents_overlay::AgentsOverlay;
 use crate::tui::components::chat_view::ChatView;
 use crate::tui::components::command_palette::CommandPalette;
 use crate::tui::components::context_panel::ContextPanel;
+use crate::tui::components::context_suggestions::ContextSuggestions;
 use crate::tui::components::dialog::DialogManager;
 use crate::tui::components::diff_viewer::DiffViewer;
 use crate::tui::components::export_dialog::ExportDialog;
@@ -113,6 +115,12 @@ pub struct TuiState {
     /// Agents overlay showing subagent tree hierarchy.
     pub agents_overlay: AgentsOverlay,
 
+    /// Agent team panel showing team hierarchy and status.
+    pub agent_team_panel: AgentTeamPanel,
+
+    /// L4 knowledge view showing shared/team-scoped memory entries.
+    pub l4_knowledge_view: L4KnowledgeView,
+
     /// Thinking panel for reasoning + tool progress during active turns.
     pub thinking_panel: ThinkingPanel,
 
@@ -135,6 +143,9 @@ pub struct TuiState {
 
     /// Context panel showing token usage and cost.
     pub context_panel: ContextPanel,
+
+    /// Context suggestions bar for L4 Insert event awareness.
+    pub context_suggestions: ContextSuggestions,
 
     /// File changes panel showing modified files with +/- counts.
     pub file_changes_panel: FileChangesPanel,
@@ -226,6 +237,8 @@ impl TuiState {
         let dialog_manager = DialogManager::new();
         let toast_manager = ToastManager::new();
         let agents_overlay = AgentsOverlay::new();
+        let agent_team_panel = AgentTeamPanel::new();
+        let l4_knowledge_view = L4KnowledgeView::new();
         let thinking_panel = ThinkingPanel::new();
         let command_palette = CommandPalette::new();
         let question_form = None;
@@ -234,6 +247,7 @@ impl TuiState {
         let pending_export_options = None;
         let revert_dialog = RevertDialog::new();
         let context_panel = ContextPanel::new();
+        let context_suggestions = ContextSuggestions::new();
         let file_changes_panel = FileChangesPanel::new();
         let todo_panel = TodoPanel::new();
         let status_bar = StatusBar::with_default_sections();
@@ -263,6 +277,8 @@ impl TuiState {
             toast_manager,
             memory_orchestrator: None,
             agents_overlay,
+            agent_team_panel,
+            l4_knowledge_view,
             thinking_panel,
             command_palette,
             question_form,
@@ -271,6 +287,7 @@ impl TuiState {
             pending_export_options,
             revert_dialog,
             context_panel,
+            context_suggestions,
             file_changes_panel,
             todo_panel,
             status_bar,
@@ -320,7 +337,14 @@ impl TuiState {
     }
 
     /// Set the memory orchestrator for persistent memory operations.
+    ///
+    /// Also wires up the L4 event bus subscription for context suggestions.
     pub fn set_memory_orchestrator(&mut self, orch: std::sync::Arc<memory::MemoryOrchestrator>) {
+        // Subscribe to L4 events for context-aware suggestions
+        if let Some(event_bus) = orch.l4_event_bus() {
+            let rx = event_bus.subscribe();
+            self.context_suggestions.set_l4_receiver(rx);
+        }
         self.memory_orchestrator = Some(orch);
     }
 
@@ -373,6 +397,9 @@ impl TuiState {
 
         // Toast tick: advance auto-dismiss timers
         self.toast_manager.tick();
+
+        // Context suggestions tick: drain L4 events, expire stale suggestions
+        self.context_suggestions.tick();
 
         // Sync chat view from App state before rendering
         self.chat_view.sync_from_app(&self.app);
@@ -638,6 +665,12 @@ impl TuiState {
                     self.prompt.render_dropdown(&mut main_ctx, input_area);
                 }));
             }
+            // Render context suggestion bar above the input area
+            if self.context_suggestions.is_active() {
+                let _ = error_recovery::catch_render_panic("context_suggestions", AssertUnwindSafe(|| {
+                    self.context_suggestions.render(&mut main_ctx, input_area);
+                }));
+            }
         }
 
         // ── Overlays: one RenderContext for all conditional overlays ──
@@ -675,7 +708,42 @@ impl TuiState {
             }
         }
 
-        // 5. Render toast notifications at top-right
+        // 5. Render agent team panel when visible
+        if self.agent_team_panel.visible {
+            let degraded = {
+                let _guard = self.render_profiler.guard("agent_team_panel");
+                match error_recovery::catch_render_panic("agent_team_panel", AssertUnwindSafe(|| {
+                    self.agent_team_panel.render(&mut overlay_ctx, area);
+                })) {
+                    RenderResult::Ok => None,
+                    RenderResult::Degraded(msg) => Some(msg),
+                }
+            };
+            if let Some(msg) = degraded {
+                self.add_message("system", &msg);
+            }
+        }
+
+        // 5.5 Sync and render L4KnowledgeView when memory orchestrator is available
+        if self.memory_orchestrator.is_some() {
+            self.l4_knowledge_view.sync(&self.memory_orchestrator);
+            if !self.l4_knowledge_view.entries.is_empty() {
+                let degraded = {
+                    let _guard = self.render_profiler.guard("l4_knowledge_view");
+                    match error_recovery::catch_render_panic("l4_knowledge_view", AssertUnwindSafe(|| {
+                        self.l4_knowledge_view.render(&mut overlay_ctx, area);
+                    })) {
+                        RenderResult::Ok => None,
+                        RenderResult::Degraded(msg) => Some(msg),
+                    }
+                };
+                if let Some(msg) = degraded {
+                    self.add_message("system", &msg);
+                }
+            }
+        }
+
+        // 6. Render toast notifications at top-right
         if !self.toast_manager.is_empty() {
             let degraded = {
                 let _guard = self.render_profiler.guard("toast_manager");
@@ -801,6 +869,21 @@ impl TuiState {
         // 1. Dialog focus trap: if a dialog is active, keys go to it
         if !self.dialog_manager.is_empty() {
             return self.dialog_manager.handle_key(&event);
+        }
+
+        // 1.5. Agent team panel focus trap: route j/k/Up/Down/Tab to panel
+        if self.agent_team_panel.visible {
+            match event.code {
+                KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down => {
+                    self.agent_team_panel.handle_key(&event);
+                    return true;
+                }
+                KeyCode::Tab => {
+                    self.agent_team_panel.visible = false;
+                    return true;
+                }
+                _ => {}
+            }
         }
 
         // 2. Route through keybind engine
@@ -1273,6 +1356,9 @@ impl TuiState {
             Action::ToggleAgentsOverlay => {
                 self.agents_overlay.toggle();
             }
+            Action::ToggleAgentPanel => {
+                self.agent_team_panel.toggle();
+            }
             Action::ToggleTheme => {
                 self.app.theme.toggle();
                 self.theme_engine.toggle_dark_light();
@@ -1602,6 +1688,107 @@ pub enum StartupPhase {
 
 const STARTUP_SHOW_DELAY_MS: u64 = 500;
 const STARTUP_MIN_DISPLAY_MS: u64 = 3000;
+
+// ── L4KnowledgeView ──────────────────────────────────────────────
+
+/// Displays L4 (shared/team-scoped) memory entries in the overlay layer.
+///
+/// Synced from `MemoryOrchestrator` each render frame when available.
+/// Shows a compact list of recent L4 memory entries with title, tags,
+/// and confidence.
+pub struct L4KnowledgeView {
+    /// Cached L4 entry titles (synced from orchestrator).
+    pub entries: Vec<String>,
+    /// Whether the view has been synced at least once.
+    pub synced: bool,
+    /// Status message (e.g. "Orchestrator available" / "No L4 entries").
+    pub status: String,
+}
+
+impl L4KnowledgeView {
+    /// Create a new empty L4KnowledgeView.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            synced: false,
+            status: String::new(),
+        }
+    }
+
+    /// Sync from an optional memory orchestrator reference.
+    /// Since orchestrator operations are async, this just checks availability
+    /// and sets the status. Actual L4 entries are populated via events.
+    pub fn sync(&mut self, memory_orchestrator: &Option<std::sync::Arc<memory::MemoryOrchestrator>>) {
+        if memory_orchestrator.is_some() {
+            if !self.synced {
+                self.status = "L4 orchestrator available".to_string();
+                self.synced = true;
+            }
+        } else if self.synced {
+            self.status = "No L4 orchestrator".to_string();
+            self.synced = false;
+        }
+    }
+
+    /// Render the L4 knowledge view as a compact overlay.
+    pub fn render(&self, ctx: &mut crate::tui::components::RenderContext, area: ratatui::layout::Rect) {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Paragraph};
+
+        let block = Block::default()
+            .title(" L4 Knowledge ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+
+        let mut lines: Vec<Line> = Vec::new();
+
+        if self.entries.is_empty() {
+            lines.push(Line::from(Span::styled(
+                if self.synced { "No L4 entries yet." } else { "Orchestrator not available." },
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for entry in self.entries.iter().take(8) {
+                lines.push(Line::from(Span::styled(
+                    format!(" • {entry}"),
+                    Style::default().fg(Color::White),
+                )));
+            }
+            if self.entries.len() > 8 {
+                lines.push(Line::from(Span::styled(
+                    format!("... {} more", self.entries.len() - 8),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+
+        if !self.status.is_empty() {
+            lines.push(Line::from(Span::styled(
+                &self.status,
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            )));
+        }
+
+        let height = (lines.len() as u16 + 2).min(area.height);
+        let rect = ratatui::layout::Rect::new(
+            area.width.saturating_sub(40),
+            0,
+            40,
+            height,
+        );
+
+        let paragraph = Paragraph::new(lines).block(block);
+        ctx.frame_mut().render_widget(paragraph, rect);
+    }
+}
+
+impl Default for L4KnowledgeView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ── Tests ───────────────────────────────────────────────────────
 
