@@ -25,6 +25,7 @@ pub mod status_bar;
 pub mod task_decomposition_view;
 pub mod thinking_panel;
 pub mod memory_panel;
+pub mod performance_dashboard;
 pub mod question_form;
 pub mod toast;
 pub mod skills_panel;
