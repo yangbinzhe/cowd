@@ -7102,7 +7102,13 @@ fn build_runtime_with_plugin_state(
             },
             subagent_tool_executor.clone(),
         );
-        runtime = runtime.with_collaboration(runtime::agent_collaboration::new_boxed(std::sync::Arc::new(executor)));
+        let executor_arc = std::sync::Arc::new(executor);
+        runtime = runtime.with_collaboration(runtime::agent_collaboration::new_boxed(executor_arc.clone()));
+        // Wire JPS pipeline for complex task routing
+        let jps_pipeline = runtime::joint_problem_solving::new_boxed::<runtime::agent::ProductionExecutor<
+            AnthropicRuntimeClient, CliToolExecutor
+        >>(executor_arc);
+        runtime = runtime.with_jps_pipeline(jps_pipeline);
     }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }

@@ -119,8 +119,8 @@ struct CachedLayer {
 pub struct CognitiveContextManager {
     /// Merged configuration.
     config: MemoryConfig,
-    /// Five-layer memory orchestrator.
-    orchestrator: MemoryOrchestrator,
+    /// Five-layer memory orchestrator (Arc-wrapped for shared access).
+    orchestrator: Arc<MemoryOrchestrator>,
     /// Three-stage compression pipeline.
     pipeline: CompressionPipeline,
     /// In-process vector index for semantic search.
@@ -225,8 +225,9 @@ impl CognitiveContextManager {
         workspace_root: Option<PathBuf>,
     ) -> Result<Self> {
         // Build the orchestrator (opens SQLite, wires all layers).
-        let orchestrator =
-            MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root.clone()).await?;
+        let orchestrator = Arc::new(
+            MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root.clone()).await?,
+        );
 
         // Build the compression pipeline from config.
         let pipeline = CompressionPipeline::from_config(&config.compression);
@@ -532,7 +533,14 @@ impl CognitiveContextManager {
     /// Propagates the guard to the underlying [`MemoryOrchestrator`] so that
     /// [`MemoryOrchestrator::remember`] also enforces layer permissions.
     pub fn with_write_guard(mut self, guard: MemoryWriteGuard) -> Self {
-        self.orchestrator = self.orchestrator.with_write_guard(Arc::new(guard.clone()));
+        let inner = match Arc::try_unwrap(self.orchestrator) {
+            Ok(inner) => inner,
+            Err(_) => panic!(
+                "orchestrator Arc must have exactly 1 reference when applying write guard; \
+                 ensure init_memory_sync is called after with_write_guard"
+            ),
+        };
+        self.orchestrator = Arc::new(inner.with_write_guard(Arc::new(guard.clone())));
         self.write_guard = Some(guard);
         self
     }
@@ -556,6 +564,23 @@ impl CognitiveContextManager {
     }
 
     pub fn with_memory_sync(mut self, sync: Arc<crate::memory_sync::MemorySyncProtocol>) -> Self {
+        self.memory_sync = Some(sync);
+        self
+    }
+
+    /// Initialise the MemorySyncProtocol from the internal orchestrator and
+    /// L4 event bus. This shares the orchestrator Arc so the sync protocol
+    /// can access L4 independently.
+    pub fn init_memory_sync(mut self) -> Self {
+        let event_bus = self
+            .orchestrator
+            .l4_event_bus()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crate::layers::shared::L4EventBus::new(256)));
+        let sync = Arc::new(crate::memory_sync::MemorySyncProtocol::new(
+            Arc::clone(&self.orchestrator),
+            event_bus,
+        ));
         self.memory_sync = Some(sync);
         self
     }

@@ -1000,6 +1000,18 @@ impl<E: SubAgentExecutor + Send + Sync + 'static> JpsOps for ProblemSolvingPipel
     }
 }
 
+/// Factory: create a type-erased `Arc<dyn JpsOps>`.
+///
+/// Produces a boxed pipeline that can be passed to
+/// `ConversationRuntime::with_jps_pipeline()` without propagating the
+/// `E` type parameter.
+pub fn new_boxed<E>(executor: Arc<E>) -> Arc<dyn JpsOps>
+where
+    E: SubAgentExecutor + Send + Sync + 'static,
+{
+    Arc::new(ProblemSolvingPipeline::<E>::new(executor))
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Truncate a string for display.

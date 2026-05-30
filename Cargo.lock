@@ -2911,6 +2911,8 @@ dependencies = [
  "native-tls",
  "plugins",
  "prost",
+ "r2d2",
+ "r2d2_sqlite",
  "rand 0.8.6",
  "regex",
  "reqwest",

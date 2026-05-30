@@ -367,6 +367,7 @@ where
                     match handle.join().expect("memory init thread panicked") {
                         Ok(mgr) => {
                             mgr.set_active_agent("primary".to_string());
+                            let mgr = mgr.init_memory_sync();
                             tracing::debug!("memory: CognitiveContextManager initialised, active_agent=primary");
                             (Some(Arc::new(mgr)), None)
                         }
@@ -385,6 +386,7 @@ where
                         Ok(rt) => match rt.block_on(CognitiveContextManager::new(mem_cfg)) {
                             Ok(mgr) => {
                                 mgr.set_active_agent("primary".to_string());
+                                let mgr = mgr.init_memory_sync();
                                 tracing::debug!("memory: CognitiveContextManager initialised, active_agent=primary");
                                 (Some(Arc::new(mgr)), None)
                             }
