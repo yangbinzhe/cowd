@@ -553,6 +553,10 @@ impl BudgetCalculator {
             .saturating_sub(self.config.reserved_response)
     }
 
+    pub fn memory_budget(&self) -> u64 {
+        (self.base_available() as f64 * self.model_profile.memory_budget_ratio as f64) as u64
+    }
+
     pub fn make_budget(&self) -> TokenBudget {
         TokenBudget {
             total: self.config.context_window,
@@ -772,5 +776,21 @@ mod tests {
 
         let mini = ModelProfile::for_model("04-mini");
         assert_eq!(mini.context_window, 8_192);
+    }
+
+    #[test]
+    fn test_memory_budget_with_default_model() {
+        let calc = BudgetCalculator::new(BudgetConfig::default());
+        let budget = calc.memory_budget();
+        let expected = (calc.base_available() as f64 * 0.30) as u64;
+        assert_eq!(budget, expected);
+    }
+
+    #[test]
+    fn test_memory_budget_preserves_base_available() {
+        let calc = BudgetCalculator::new(BudgetConfig::default());
+        let base = calc.base_available();
+        let _ = calc.memory_budget();
+        assert_eq!(calc.base_available(), base, "base_available must not change");
     }
 }
