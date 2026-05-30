@@ -29,6 +29,7 @@ uuid = { version = "1", features = ["v4"] }
 native-tls = "0.2"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls"] }
 imap = "2"
+imap-proto = "0.16"
 mail-parser = "0.9"
 # WeCom crypto support
 aes = "0.8"
