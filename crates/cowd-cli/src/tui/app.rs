@@ -15,7 +15,7 @@ pub struct TimelinePage {
     pub start_index: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TimelineEntry {
     Message {
         role: String,
@@ -387,6 +387,10 @@ impl App {
             }
         }
         None
+    }
+
+    pub fn timeline_entry(&self, idx: usize) -> Option<TimelineEntry> {
+        self.timeline_get(idx).cloned()
     }
 
     pub fn timeline_get_mut(&mut self, idx: usize) -> Option<&mut TimelineEntry> {

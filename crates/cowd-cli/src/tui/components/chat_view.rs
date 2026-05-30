@@ -112,8 +112,31 @@ impl ChatView {
 
     /// Sync view-model from the shared App state.
     /// Called once per frame before rendering.
+    /// Uses incremental append: clones only new entries, falls back to
+    /// full rebuild on eviction, and patches the streaming tail in-place.
     pub fn sync_from_app(&mut self, app: &crate::tui::App) {
-        self.timeline = app.timeline_clone_vec();
+        let new_len = app.timeline_len();
+        if new_len > self.timeline.len() {
+            // Append-only: clone only new entries
+            for i in self.timeline.len()..new_len {
+                if let Some(entry) = app.timeline_entry(i) {
+                    self.timeline.push(entry);
+                }
+            }
+        } else if new_len < self.timeline.len() {
+            // Eviction → full rebuild
+            self.timeline = app.timeline_clone_vec();
+        }
+        // Update streaming tail (last entry) if content changed
+        if new_len > 0 {
+            if let (Some(fresh), Some(last)) =
+                (app.timeline_entry(new_len - 1), self.timeline.last_mut())
+            {
+                if fresh != *last {
+                    *last = fresh;
+                }
+            }
+        }
         self.timeline_cursor = app.timeline_cursor;
         self.scroll_state.offset = app.scroll_offset;
         self.scroll_state.auto_scroll = app.auto_scroll;
