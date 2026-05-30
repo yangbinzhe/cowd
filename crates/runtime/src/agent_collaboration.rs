@@ -412,10 +412,22 @@ impl<E: SubAgentExecutor> CollaborationOrchestrator<E> {
     }
 }
 
-impl<E: SubAgentExecutor> Default for CollaborationOrchestrator<E> {
+impl<E: SubAgentExecutor + 'static> Default for CollaborationOrchestrator<E> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Factory: create a type-erased `Arc<dyn CollaborationOps>`.
+///
+/// Produces a boxed orchestrator that can be passed to
+/// `ConversationRuntime::with_collaboration()` without propagating the
+/// `E` type parameter.
+pub fn new_boxed<E>() -> Arc<dyn CollaborationOps>
+where
+    E: SubAgentExecutor + 'static,
+{
+    Arc::new(CollaborationOrchestrator::<E>::new())
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────
@@ -568,7 +580,7 @@ mod tests {
     use memory::agent_directory::AgentStatus;
 
     // Minimal executor that always succeeds.
-    struct DummyExecutor;
+    pub(crate) struct DummyExecutor;
 
     impl SubAgentExecutor for DummyExecutor {
         fn execute(
