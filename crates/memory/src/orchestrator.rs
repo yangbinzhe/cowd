@@ -30,7 +30,9 @@ use crate::{
     closet::{ClosetManager, Closet},
     error::MemoryError,
     fact_checker::{FactChecker, FactCheckResult},
+    performance_monitor::PerformanceReport,
     project_scope::MemoryScope,
+    shared::SharedMemoryManager,
     temporal_graph::{Triple, EntityFacts},
     layers::{
         deep::DeepLayer,
@@ -481,6 +483,16 @@ impl MemoryOrchestrator {
     /// Get the current active session ID (if set).
     pub fn active_session_id(&self) -> Option<String> {
         self.active_session.lock().clone()
+    }
+
+    /// Return a snapshot of current performance metrics from the shared
+    /// cognitive context manager, if available.
+    #[must_use]
+    pub fn performance_report(&self) -> PerformanceReport {
+        SharedMemoryManager::global()
+            .get()
+            .map(|ccm| ccm.performance_report())
+            .unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------

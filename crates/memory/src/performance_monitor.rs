@@ -41,7 +41,7 @@ const DEFAULT_TUNING_INTERVAL_SECS: u64 = 300; // 5 minutes
 // ── PerformanceReport ──────────────────────────────────────────────────────
 
 /// JSON-serializable performance snapshot for the memory subsystem.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct PerformanceReport {
     /// Rolling average latency of `prepare_context` (ms).
     pub avg_prepare_context_latency_ms: f64,
