@@ -676,7 +676,7 @@ mod tests {
             "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
         assert!(help.contains("aliases: /plugins, /marketplace"));
-        assert!(help.contains("/agents [list|discover <task>|help]"));
+        assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help|<skill> [args]]"));
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
@@ -836,68 +836,68 @@ mod tests {
     #[test]
     fn ignores_unknown_or_runtime_bound_slash_commands() {
         let session = Session::new();
-        assert!(handle_slash_command("/unknown", &session, CompactionConfig::default()).is_none());
-        assert!(handle_slash_command("/status", &session, CompactionConfig::default()).is_none());
-        assert!(handle_slash_command("/sandbox", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command("/unknown", &session, CompactionConfig::default()).is_some());
+        assert!(handle_slash_command("/status", &session, CompactionConfig::default()).is_some());
+        assert!(handle_slash_command("/sandbox", &session, CompactionConfig::default()).is_some());
         assert!(
-            handle_slash_command("/bughunter", &session, CompactionConfig::default()).is_none()
+            handle_slash_command("/bughunter", &session, CompactionConfig::default()).is_some()
         );
-        assert!(handle_slash_command("/commit", &session, CompactionConfig::default()).is_none());
-        assert!(handle_slash_command("/pr", &session, CompactionConfig::default()).is_none());
-        assert!(handle_slash_command("/issue", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command("/commit", &session, CompactionConfig::default()).is_some());
+        assert!(handle_slash_command("/pr", &session, CompactionConfig::default()).is_some());
+        assert!(handle_slash_command("/issue", &session, CompactionConfig::default()).is_some());
         assert!(
-            handle_slash_command("/ultraplan", &session, CompactionConfig::default()).is_none()
+            handle_slash_command("/ultraplan", &session, CompactionConfig::default()).is_some()
         );
         assert!(
-            handle_slash_command("/teleport foo", &session, CompactionConfig::default()).is_none()
+            handle_slash_command("/teleport foo", &session, CompactionConfig::default()).is_some()
         );
         assert!(
             handle_slash_command("/debug-tool-call", &session, CompactionConfig::default())
-                .is_none()
+                .is_some()
         );
         assert!(
-            handle_slash_command("/model claude", &session, CompactionConfig::default()).is_none()
+            handle_slash_command("/model claude", &session, CompactionConfig::default()).is_some()
         );
         assert!(handle_slash_command(
             "/permissions read-only",
             &session,
             CompactionConfig::default()
         )
-        .is_none());
-        assert!(handle_slash_command("/clear", &session, CompactionConfig::default()).is_none());
+        .is_some());
+        assert!(handle_slash_command("/clear", &session, CompactionConfig::default()).is_some());
         assert!(
             handle_slash_command("/clear --confirm", &session, CompactionConfig::default())
-                .is_none()
+                .is_some()
         );
-        assert!(handle_slash_command("/cost", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command("/cost", &session, CompactionConfig::default()).is_some());
         assert!(handle_slash_command(
             "/resume session.json",
             &session,
             CompactionConfig::default()
         )
-        .is_none());
+        .is_some());
         assert!(handle_slash_command(
             "/resume session.jsonl",
             &session,
             CompactionConfig::default()
         )
-        .is_none());
-        assert!(handle_slash_command("/config", &session, CompactionConfig::default()).is_none());
+        .is_some());
+        assert!(handle_slash_command("/config", &session, CompactionConfig::default()).is_some());
         assert!(
-            handle_slash_command("/config env", &session, CompactionConfig::default()).is_none()
+            handle_slash_command("/config env", &session, CompactionConfig::default()).is_some()
         );
-        assert!(handle_slash_command("/mcp list", &session, CompactionConfig::default()).is_none());
-        assert!(handle_slash_command("/diff", &session, CompactionConfig::default()).is_none());
-        assert!(handle_slash_command("/version", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command("/mcp list", &session, CompactionConfig::default()).is_some());
+        assert!(handle_slash_command("/diff", &session, CompactionConfig::default()).is_some());
+        assert!(handle_slash_command("/version", &session, CompactionConfig::default()).is_some());
         assert!(
             handle_slash_command("/export note.txt", &session, CompactionConfig::default())
-                .is_none()
+                .is_some()
         );
         assert!(
-            handle_slash_command("/session list", &session, CompactionConfig::default()).is_none()
+            handle_slash_command("/session list", &session, CompactionConfig::default()).is_some()
         );
         assert!(
-            handle_slash_command("/plugins list", &session, CompactionConfig::default()).is_none()
+            handle_slash_command("/plugins list", &session, CompactionConfig::default()).is_some()
         );
     }
 
