@@ -996,7 +996,7 @@ pub async fn run_turn_async(
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
-        let prompt_cache_events = Vec::new();
+        let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
 
         loop {
@@ -1157,6 +1157,9 @@ pub async fn run_turn_async(
                                         cb(json.to_string());
                                     }
                                 }
+                                Ok(AssistantEvent::PromptCache(event)) => {
+                                    prompt_cache_events.push(event);
+                                }
                                 Ok(AssistantEvent::ToolComplete { id, name, result_summary, exit_code }) => {
                                     if let Some(callback) = &self.tool_callback {
                                         callback.on_tool_complete(&id, &name, &result_summary, exit_code);
@@ -1249,6 +1252,7 @@ pub async fn run_turn_async(
             self.session.write().await.push_message(assistant_msg.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             self.dual_write_message(&assistant_msg, self.session().messages.len().wrapping_sub(1));
+            self.record_assistant_iteration(iterations, &assistant_msg, pending_tool_uses.len());
             assistant_messages.push(assistant_msg);
 
             if pending_tool_uses.is_empty() {
@@ -1635,8 +1639,13 @@ self.record_turn_completed(&summary);
                 reason: format!("PreToolUse hook cancelled tool `{tool_name}`"),
             }
         } else if pre_hook_result.is_failed() {
+            let hook_msgs = pre_hook_result.messages().join("; ");
             PermissionOutcome::Deny {
-                reason: format!("PreToolUse hook failed for tool `{tool_name}`"),
+                reason: if hook_msgs.is_empty() {
+                    format!("PreToolUse hook failed for tool `{tool_name}`")
+                } else {
+                    format!("PreToolUse hook failed for tool `{tool_name}`: {hook_msgs}")
+                },
             }
         } else if pre_hook_result.is_denied() {
             PermissionOutcome::Deny {
@@ -1777,13 +1786,24 @@ self.record_turn_completed(&summary);
                 }
 
                 // T36: Truncate oversized tool results before storing.
-                let truncated = self.tool_orchestrator.truncate_result(&output);
+                // Append hook feedback messages to the tool output.
+                let mut combined = output;
+                for msg in pre_hook_result.messages() {
+                    combined.push_str("\n");
+                    combined.push_str(msg);
+                }
+                for msg in post_hook_result.messages() {
+                    combined.push_str("\n");
+                    combined.push_str(msg);
+                }
+                let truncated = self.tool_orchestrator.truncate_result(&combined);
                 let result = ConversationMessage::tool_result(
                     tool_use_id.to_string(), tool_name.to_string(), truncated, is_error,
                 );
                 self.session.write().await.push_message(result.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.dual_write_message(&result, self.session().messages.len().wrapping_sub(1));
+                self.record_tool_finished(iterations, &result);
                 Ok(result)
             }
             PermissionOutcome::Deny { reason } => {
@@ -2803,10 +2823,8 @@ mod tests {
         );
 
         let prompter = SharedPrompter::new(Box::new(PromptAllowOnce));
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
-        let summary = handle
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let summary = rt
             .block_on(runtime.run_turn_async("what is 2 + 2?", &prompter))
             .expect("conversation loop should succeed");
 
@@ -2844,10 +2862,8 @@ mod tests {
         .with_session_tracer(tracer);
 
         let prompter = SharedPrompter::new(Box::new(PromptAllowOnce));
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
-        handle
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt
             .block_on(runtime.run_turn_async("what is 2 + 2?", &prompter))
             .expect("conversation loop should succeed");
 
@@ -3035,10 +3051,8 @@ mod tests {
 
         // when
         let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
-        let summary = handle
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let summary = rt
             .block_on(runtime.run_turn_async("use the tool", &prompter))
             .expect("conversation should continue after hook failure");
 
@@ -3107,10 +3121,8 @@ mod tests {
         );
 
         let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
-        let summary = handle
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let summary = rt
             .block_on(runtime.run_turn_async("use add", &prompter))
             .expect("tool loop succeeds");
 
@@ -3189,10 +3201,8 @@ mod tests {
 
         // when
         let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
-        let summary = handle
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let summary = rt
             .block_on(runtime.run_turn_async("use fail", &prompter))
             .expect("tool loop succeeds");
 

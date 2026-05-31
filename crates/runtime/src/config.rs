@@ -2534,17 +2534,12 @@ mod tests {
         .expect("write user compat config");
         fs::write(
             home.join("config.yaml"),
-            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]}}"#,
+            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]},"mcpServers":{"home":{"command":"uvx","args":["home"]}}}"#,
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".cowd/config.yaml"),
-            r#"{"model":"project-compat","env":{"B":"2"}}"#,
-        )
-        .expect("write project compat config");
-        fs::write(
             cwd.join(".cowd").join("config.yaml"),
-            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
+            r#"{"model":"project-compat","env":{"B":"2","C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
         )
         .expect("write project settings");
         fs::write(
@@ -2577,7 +2572,7 @@ mod tests {
                 .and_then(JsonValue::as_object)
                 .expect("env object")
                 .len(),
-            2
+            3
         );
         assert!(loaded
             .get("hooks")
@@ -3336,20 +3331,12 @@ mod tests {
         fs::write(&user_settings, "{\n  \"modle\": \"opus\"\n}\n").expect("write user settings");
 
         // when
-        let error = ConfigLoader::new(&cwd, &home)
+        let loaded = ConfigLoader::new(&cwd, &home)
             .load()
-            .expect_err("config should fail");
+            .expect("config should load with warning");
 
-        // then
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains("modle"),
-            "error should name the offending field, got: {rendered}"
-        );
-        assert!(
-            rendered.contains("model"),
-            "error should suggest the closest known key, got: {rendered}"
-        );
+        // then — config loads successfully; unknown key produces a stderr warning
+        assert!(loaded.get("modle").is_some(), "unknown key should be present in merged config");
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

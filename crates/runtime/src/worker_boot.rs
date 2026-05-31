@@ -1432,12 +1432,18 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&cwd_path).expect("test dir should create");
+        let config_home = cwd_path.join(".cowd");
+        std::fs::create_dir_all(&config_home).expect("config dir should create");
+        // Temporarily override COWD_CONFIG_HOME so the state file lands in our temp dir
+        let prev = std::env::var_os("COWD_CONFIG_HOME");
+        std::env::set_var("COWD_CONFIG_HOME", &config_home);
+
         let cwd = cwd_path.to_str().expect("test path should be utf8");
         let registry = WorkerRegistry::new();
         let worker = registry.create(cwd, &[], true);
 
         // After create the worker is Spawning — state file should exist
-        let state_path = cwd_path.join(".cowd").join("worker-state.json");
+        let state_path = crate::cowd_dirs::worker_state_path();
         assert!(
             state_path.exists(),
             "state file should exist after worker creation"
@@ -1472,6 +1478,13 @@ mod tests {
             Some(true),
             "is_ready should be true when ReadyForPrompt"
         );
+
+        // Restore previous env value
+        match prev {
+            Some(v) => std::env::set_var("COWD_CONFIG_HOME", v),
+            None => std::env::remove_var("COWD_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&cwd_path);
     }
 
     #[test]
