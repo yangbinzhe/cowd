@@ -117,7 +117,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             status TEXT NOT NULL DEFAULT 'active'
         )",
         r"CREATE TABLE IF NOT EXISTS session_memories (
-            session_id TEXT NOT NULL,
+            session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
             memory_id  TEXT NOT NULL,
             created_at TEXT NOT NULL,
             PRIMARY KEY (session_id, memory_id)
@@ -529,7 +529,7 @@ impl SqliteSessionStore {
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let mut conn = self.conn()?;
         let tx = conn.transaction().map_err(sql_err)?;
-        // session_memories has no FK cascade so delete manually.
+        // FK ON DELETE CASCADE handles cleanup; manual delete is belt-and-suspenders
         tx.execute(
             "DELETE FROM session_memories WHERE session_id = ?1",
             params![session_id],

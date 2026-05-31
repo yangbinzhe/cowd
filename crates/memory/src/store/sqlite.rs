@@ -389,12 +389,6 @@ END",
     INSERT INTO memories_fts(rowid, id, title, content, tags_json)
         VALUES (new.rowid, new.id, new.title, new.content, new.tags_json);
 END",
-        r"CREATE TABLE IF NOT EXISTS memory_meta (
-    memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
-    requires  TEXT,
-    provides  TEXT,
-    affects   TEXT
-)",
         r"CREATE TABLE IF NOT EXISTS relations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     subject_id  TEXT    NOT NULL,
@@ -434,14 +428,6 @@ END",
     embedding BLOB    NOT NULL,
     dimension INTEGER NOT NULL,
     created_at TEXT   NOT NULL
-)",
-        r"CREATE TABLE IF NOT EXISTS closet_store (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-)",
-        r"CREATE TABLE IF NOT EXISTS seed_store (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
 )",
         // Code symbol tables (Phase 1: code indexer storage)
         r"CREATE TABLE IF NOT EXISTS code_symbols (
@@ -567,7 +553,7 @@ impl SqliteStore {
         let store = Self { pool };
         let conn = store.conn()?;
         init_schema(&conn)?;
-        store.ensure_kv_table()?;
+        store.ensure_kv_table(&conn)?;
         Ok(store)
     }
 
@@ -581,7 +567,7 @@ impl SqliteStore {
         let store = Self { pool };
         let conn = store.conn()?;
         init_schema(&conn)?;
-        store.ensure_kv_table()?;
+        store.ensure_kv_table(&conn)?;
         Ok(store)
     }
 
@@ -591,8 +577,13 @@ impl SqliteStore {
         let store = Self { pool };
         let conn = store.conn()?;
         init_schema(&conn)?;
-        store.ensure_kv_table()?;
+        store.ensure_kv_table(&conn)?;
         Ok(store)
+    }
+
+    /// Returns the internal connection pool (for sharing with ReputationManager etc.)
+    pub fn pool(&self) -> Pool<SqliteConnectionManager> {
+        self.pool.clone()
     }
 
     /// Get a connection from the pool.
@@ -604,8 +595,7 @@ impl SqliteStore {
     }
 
     /// Ensure the generic key-value table exists.
-    fn ensure_kv_table(&self) -> Result<()> {
-        let conn = self.conn()?;
+    fn ensure_kv_table(&self, conn: &Connection) -> Result<()> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
             [],
@@ -1300,60 +1290,6 @@ impl SqliteStore {
 
         tx.commit().map_err(sql_err)?;
         Ok(())
-    }
-
-    // -------------------------------------------------------------------
-    // Closet persistence
-    // -------------------------------------------------------------------
-
-    /// Save closet pointers as JSON to the `closet_store` table.
-    pub fn save_closet(&self, pointers_json: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO closet_store (key, value) VALUES (?1, ?2)",
-            params!["pointers", pointers_json],
-        )
-        .map_err(sql_err)?;
-        Ok(())
-    }
-
-    /// Load closet pointers JSON from the `closet_store` table.
-    pub fn load_closet(&self) -> Result<Option<String>> {
-        let conn = self.conn()?;
-        conn.query_row(
-            "SELECT value FROM closet_store WHERE key = ?1",
-            params!["pointers"],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(sql_err)
-    }
-
-    // -------------------------------------------------------------------
-    // Seeds persistence
-    // -------------------------------------------------------------------
-
-    /// Save seeds as JSON to the `seed_store` table.
-    pub fn save_seeds(&self, seeds_json: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO seed_store (key, value) VALUES (?1, ?2)",
-            params!["seeds", seeds_json],
-        )
-        .map_err(sql_err)?;
-        Ok(())
-    }
-
-    /// Load seeds JSON from the `seed_store` table.
-    pub fn load_seeds(&self) -> Result<Option<String>> {
-        let conn = self.conn()?;
-        conn.query_row(
-            "SELECT value FROM seed_store WHERE key = ?1",
-            params!["seeds"],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(sql_err)
     }
 
     // -------------------------------------------------------------------

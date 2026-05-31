@@ -167,8 +167,22 @@ impl ReputationManager {
 
     /// Get a connection from the pool.
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, MemoryError> {
+        use rusqlite::Error as RusqliteError;
         let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+        // Handle PRAGMAs that may return results in rusqlite 0.31+
+        let _ = conn
+            .execute("PRAGMA foreign_keys=ON", [])
+            .or_else(|e| match e {
+                RusqliteError::ExecuteReturnedResults => Ok(0),
+                other => Err(other),
+            })
+            .map_err(|e| MemoryError::Store(e.to_string()))?;
+        let _ = conn
+            .execute("PRAGMA busy_timeout=5000", [])
+            .or_else(|e| match e {
+                RusqliteError::ExecuteReturnedResults => Ok(0),
+                other => Err(other),
+            })
             .map_err(|e| MemoryError::Store(e.to_string()))?;
         Ok(conn)
     }
@@ -439,41 +453,17 @@ impl ReputationManager {
 }
 
 // ---------------------------------------------------------------------------
-// DDL — call this from `init_schema()` in sqlite.rs
-// ---------------------------------------------------------------------------
-
-/// Returns the CREATE TABLE statement for `agent_metrics`.
-/// Callers should execute this during schema initialization.
-pub fn schema_ddl() -> &'static str {
-    r"CREATE TABLE IF NOT EXISTS agent_metrics (
-    agent_id          TEXT    PRIMARY KEY,
-    tasks_completed   INTEGER NOT NULL DEFAULT 0,
-    avg_quality_score REAL    NOT NULL DEFAULT 0.0,
-    on_time_rate      REAL    NOT NULL DEFAULT 0.0,
-    domain_expertise  TEXT    NOT NULL DEFAULT '{}',
-    reputation_score  REAL    NOT NULL DEFAULT 0.0,
-    updated_at        TEXT    NOT NULL
-)"
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::sqlite::SqliteStore;
 
     fn test_pool() -> Pool<SqliteConnectionManager> {
-        let manager = SqliteConnectionManager::memory();
-        let pool = Pool::builder()
-            .max_size(1)
-            .build(manager)
-            .expect("in-memory pool");
-        // Create schema
-        let conn = pool.get().expect("conn");
-        conn.execute_batch(schema_ddl()).expect("ddl");
-        pool
+        let store = SqliteStore::open_in_memory().expect("store");
+        store.pool()
     }
 
     #[test]
