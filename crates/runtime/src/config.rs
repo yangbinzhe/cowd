@@ -1673,7 +1673,17 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     let mem = expect_object(mem_value, "merged settings.memory")?;
     let enabled = optional_bool(mem, "enabled", "merged settings.memory")?;
     let store_path = optional_string_dual(mem, "store_path", "merged settings.memory")?
-        .map(PathBuf::from);
+        .map(|s| {
+            if s.starts_with('~') {
+                if let Ok(home) = std::env::var("HOME") {
+                    PathBuf::from(s.replacen('~', &home, 1))
+                } else {
+                    PathBuf::from(s)
+                }
+            } else {
+                PathBuf::from(s)
+            }
+        });
     let layers = if let Some(layers_val) = mem.get("layers") {
         let l = expect_object(layers_val, "merged settings.memory.layers")?;
         LayerConfig {
