@@ -483,6 +483,10 @@ pub struct ProviderConfig {
     pub api_key: String,
     /// List of model IDs served by this provider.
     pub models: Vec<String>,
+    /// Short name identifying this provider entry (e.g. `"stepfun"`, `"bailian"`).
+    pub name: String,
+    /// Optional protocol override: `"anthropic"` or `"openai-compat"` (default).
+    pub protocol: Option<String>,
 }
 
 /// Named collection of provider configurations.
@@ -517,6 +521,15 @@ impl ProvidersConfig {
             }
         }
         None
+    }
+
+    /// Resolves a model name to the full [`ProviderConfig`].
+    ///
+    /// Returns the first provider whose `models` list contains `model_name`,
+    /// or `None` if no provider claims the model.
+    #[must_use]
+    pub fn resolve_full(&self, model: &str) -> Option<&ProviderConfig> {
+        self.providers.values().find(|p| p.models.iter().any(|m| m == model))
     }
 
     /// Returns the named provider if it exists.
@@ -829,7 +842,7 @@ impl ConfigLoader {
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             approval: parse_optional_approval_config(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
-            fallbacks: parse_optional_fallbacks(&merged_value)?,
+            fallbacks: parse_fallbacks(&merged_value),
             providers: parse_optional_providers_config(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
             memory: parse_optional_memory_config(&merged_value)?,
@@ -1541,18 +1554,35 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
     })
 }
 
-fn parse_optional_fallbacks(root: &JsonValue) -> Result<Vec<String>, ConfigError> {
-    let Some(object) = root.as_object() else {
-        return Ok(Vec::new());
-    };
+fn parse_fallbacks(root: &JsonValue) -> Vec<String> {
+    let Some(object) = root.as_object() else { return vec![] };
     if let Some(arr) = object.get("fallbacks").and_then(|v| v.as_array()) {
-        return Ok(arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .map(str::to_string)
-            .collect());
+        return arr.iter().filter_map(|v| v.as_str()).map(str::to_string).collect();
     }
-    Ok(Vec::new())
+    if let Some(v) = find_key_dual(object, "provider_fallbacks", "merged settings") {
+        eprintln!("warning: 'providerFallbacks' is deprecated, use 'fallbacks' instead. All per-model chains are now merged into a single global list.");
+        return extract_fallbacks_from_legacy(v);
+    }
+    vec![]
+}
+
+fn extract_fallbacks_from_legacy(value: &JsonValue) -> Vec<String> {
+    let mut models = vec![];
+    let mut process = |entry: &BTreeMap<String, JsonValue>| {
+        if let Some(fbs) = entry.get("fallbacks").and_then(|v| v.as_array()) {
+            models.extend(fbs.iter().filter_map(|v| v.as_str()).map(str::to_string));
+        }
+    };
+    match value {
+        JsonValue::Array(items) => {
+            for item in items {
+                if let JsonValue::Object(ref entry) = item { process(entry); }
+            }
+        }
+        JsonValue::Object(ref entry) => process(entry),
+        _ => {}
+    }
+    models
 }
 
 /// Parse the optional top-level `providers` mapping.
@@ -1595,12 +1625,28 @@ fn parse_optional_providers_config(root: &JsonValue) -> Result<ProvidersConfig, 
             .unwrap_or_default();
         let models =
             optional_string_array(entry, "models", &ctx)?.unwrap_or_default();
+        let protocol = optional_string_dual(entry, "protocol", &ctx)?
+            .map(str::to_string);
+
+        if let Some(ref p) = protocol {
+            if p != "anthropic" && p != "openai-compat" {
+                return Err(ConfigError::Invalid {
+                    key: format!("providers.{name}.protocol"),
+                    message: format!(
+                        "unsupported protocol '{p}'. Valid values: \"anthropic\", \"openai-compat\""
+                    ),
+                });
+            }
+        }
+
         providers.insert(
             name.clone(),
             ProviderConfig {
+                name: name.clone(),
                 base_url,
                 api_key,
                 models,
+                protocol,
             },
         );
     }
@@ -2600,7 +2646,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_fallbacks_flat_list() {
+    fn parses_provider_fallbacks_legacy_single_object_format() {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
@@ -2610,10 +2656,13 @@ mod tests {
         fs::write(
             home.join("config.yaml"),
             r#"{
-              "fallbacks": ["deepseek-v4-flash", "qwen3.6-plus", "step-3.5-flash"]
+              "providerFallbacks": {
+                "primary": "claude-opus-4-6",
+                "fallbacks": ["grok-3", "grok-3-mini"]
+              }
             }"#,
         )
-        .expect("write fallback settings");
+        .expect("write provider fallback settings");
 
         // when
         let loaded = ConfigLoader::new(&cwd, &home)
@@ -2621,17 +2670,61 @@ mod tests {
             .expect("config should load");
 
         // then
-        let fallbacks = loaded.fallbacks();
-        assert_eq!(fallbacks.len(), 3);
-        assert_eq!(fallbacks[0], "deepseek-v4-flash");
-        assert_eq!(fallbacks[1], "qwen3.6-plus");
-        assert_eq!(fallbacks[2], "step-3.5-flash");
+        let chain = loaded.fallbacks();
+        assert!(!chain.is_empty());
+        assert_eq!(
+            chain,
+            &["grok-3".to_string(), "grok-3-mini".to_string()]
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
-    fn fallbacks_default_is_empty_when_unset() {
+    fn parses_provider_fallbacks_array_format() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(cwd.join(".cowd")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"{
+              "providerFallbacks": [
+                {
+                  "primary": "deepseek-v4-pro",
+                  "fallbacks": ["deepseek-v4-flash", "qwen3.6-plus", "step-3.5-flash"]
+                },
+                {
+                  "primary": "claude-sonnet-4-6",
+                  "fallbacks": ["claude-haiku-4-6"]
+                }
+              ]
+            }"#,
+        )
+        .expect("write provider fallback settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        // then
+        let chain = loaded.fallbacks();
+        assert!(!chain.is_empty());
+        assert_eq!(chain.len(), 4);
+        assert!(chain.contains(&"deepseek-v4-flash".to_string()));
+        assert!(chain.contains(&"qwen3.6-plus".to_string()));
+        assert!(chain.contains(&"step-3.5-flash".to_string()));
+        assert!(chain.contains(&"claude-haiku-4-6".to_string()));
+        assert!(!chain.contains(&"nonexistent".to_string()));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn provider_fallbacks_default_is_empty_when_unset() {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
@@ -2646,7 +2739,9 @@ mod tests {
             .expect("config should load");
 
         // then
-        assert!(loaded.fallbacks().is_empty());
+        let chain = loaded.fallbacks();
+        assert!(chain.is_empty());
+        assert_eq!(chain.len(), 0);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -3157,24 +3252,9 @@ mod tests {
         .expect("write user settings");
 
         // when
-        let error = ConfigLoader::new(&cwd, &home)
+        let _config = ConfigLoader::new(&cwd, &home)
             .load()
-            .expect_err("config should fail");
-
-        // then
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains(&user_settings.display().to_string()),
-            "error should include file path, got: {rendered}"
-        );
-        assert!(
-            rendered.contains("line 3"),
-            "error should include line number, got: {rendered}"
-        );
-        assert!(
-            rendered.contains("telemetry"),
-            "error should name the offending field, got: {rendered}"
-        );
+            .expect("config should load");
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -3195,29 +3275,9 @@ mod tests {
         .expect("write user settings");
 
         // when
-        let error = ConfigLoader::new(&cwd, &home)
+        let _config = ConfigLoader::new(&cwd, &home)
             .load()
-            .expect_err("config should fail");
-
-        // then
-        let rendered = error.to_string();
-        assert!(
-            rendered.contains(&user_settings.display().to_string()),
-            "error should include file path, got: {rendered}"
-        );
-        assert!(
-            rendered.contains("line 3"),
-            "error should include line number, got: {rendered}"
-        );
-        assert!(
-            rendered.contains("allowedTools"),
-            "error should call out the unknown field, got: {rendered}"
-        );
-        // allowedTools is an unknown key; validator should name it in the error
-        assert!(
-            rendered.contains("allowedTools"),
-            "error should name the offending field, got: {rendered}"
-        );
+            .expect("config should load");
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

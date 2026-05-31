@@ -35,7 +35,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
+    detect_provider_kind, resolve_startup_auth_source, AuthSource,
     CachedProviderClient, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
     MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
     ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
@@ -4346,21 +4346,10 @@ impl LiveCli {
         }
 
         let previous = self.model.clone();
-        let session = self.runtime.session().without_persistence();
-        let message_count = session.messages.len();
-        let runtime = build_runtime(
-            session,
-            &self.session.id,
-            model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
+        let message_count = self.runtime.session().messages.len();
+        if let Some(rt) = self.runtime.runtime.as_mut() {
+            rt.api_client_mut().switch_model(&model)?;
+        }
         self.model.clone_from(&model);
         println!(
             "{}",
@@ -6608,6 +6597,84 @@ fn summarize_tool_payload_for_markdown(payload: &str) -> String {
     truncate_for_summary(&compact, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT)
 }
 
+/// Fallback: load providers directly from ~/.cowd/config.yaml
+/// when ConfigLoader merge loses them.
+fn fallback_init_providers_from_user_config() {
+    let user_cfg = match std::env::var("HOME") {
+        Ok(home) => std::path::PathBuf::from(home).join(".cowd").join("config.yaml"),
+        Err(_) => return,
+    };
+    if !user_cfg.exists() {
+        return;
+    }
+    let raw = match std::fs::read_to_string(&user_cfg) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let yaml_val: serde_yaml::Value = match serde_yaml::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let providers_yaml = match yaml_val.get("providers") {
+        Some(v) => v,
+        None => return,
+    };
+    let providers_map = match providers_yaml.as_mapping() {
+        Some(m) => m,
+        None => return,
+    };
+
+    let mut providers = std::collections::HashMap::new();
+    for (key, value) in providers_map {
+        let name = match key.as_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let entry = match value.as_mapping() {
+            Some(m) => m,
+            None => continue,
+        };
+        let base_url = entry
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let api_key = entry
+            .get("api_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let models: Vec<String> = entry
+            .get("models")
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let protocol = entry
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        providers.insert(
+            name.clone(),
+            runtime::ProviderConfig {
+                name: name.clone(),
+                base_url,
+                api_key,
+                models,
+                protocol,
+            },
+        );
+    }
+
+    runtime::init_global_providers(runtime::ProvidersConfig { providers });
+    eprintln!("[init] fallback: loaded {} providers from ~/.cowd/config.yaml", 
+        runtime::list_all_providers().len());
+}
+
 fn run_prompt(
     text: &str,
     model: String,
@@ -6625,6 +6692,25 @@ fn run_prompt(
     let system_prompt = build_system_prompt()?;
     let session_state = new_cli_session()?;
     let session = create_managed_session_handle(&session_state.session_id)?;
+    // Initialize global provider registry so resolve_global_provider works
+    let cwd = std::env::current_dir()?;
+    let loader = runtime::ConfigLoader::default_for(&cwd);
+    match loader.load() {
+        Ok(cfg) => {
+            let providers = cfg.providers().clone();
+            println!("[init] merged providers count: {}", providers.providers.len());
+            if !providers.is_empty() {
+                runtime::init_global_providers(providers);
+            } else {
+                // Fallback: ConfigLoader merge may lose providers. Load user config directly.
+                fallback_init_providers_from_user_config();
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: failed to load config for provider registry: {e}");
+            fallback_init_providers_from_user_config();
+        }
+    }
     let mut runtime = build_runtime(
         session_state.with_persistence_path(session.path.clone()),
         &session.id,
@@ -7246,31 +7332,18 @@ impl AnthropicRuntimeClient {
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
         let resolved_model = model.trim().to_string();
-        apply_config_provider_overrides(&resolved_model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
-            }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
-            }
-        };
-        // Wrap in a CachedProviderClient so ALL providers (including
-        // OpenAI-compat) benefit from deterministic prompt caching.
+
+        let provider = runtime::resolve_global_provider(&resolved_model)
+            .ok_or_else(|| api::ApiError::NoProviderConfigured {
+                model: resolved_model.clone(),
+            })?;
+
+        let mut client = ApiProviderClient::from_config(provider)?;
+
+        if provider.protocol.as_deref() == Some("anthropic") {
+            client = client.with_prompt_cache(PromptCache::new(session_id));
+        }
+
         let cached_client = CachedProviderClient::new(client.clone(), session_id);
         Ok(Self {
             client,
@@ -7289,39 +7362,25 @@ impl AnthropicRuntimeClient {
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
     }
-}
 
-fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    Ok(resolve_cli_auth_source_for_cwd()?)
-}
+    /// 运行时切换模型（不改配置文件）。重建内部 ProviderClient 和 CachedProviderClient
+    pub fn switch_model(&mut self, new_model: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let provider = runtime::resolve_global_provider(new_model)
+            .ok_or_else(|| api::ApiError::NoProviderConfigured {
+                model: new_model.to_string(),
+            })?;
 
-fn apply_config_provider_overrides(model: &str) {
-    let Ok(cwd) = env::current_dir() else { return };
-    let loader = ConfigLoader::default_for(&cwd);
-    let Ok(config) = loader.load() else { return };
-    if let Some((base_url, api_key)) = config.providers().resolve(model) {
-        // Config file providers take priority over environment variables.
-        // Only apply overrides when env vars are not already set — config first,
-        // environment variables serve as fallback.
-        match detect_provider_kind(model) {
-            ProviderKind::Anthropic => {
-                if std::env::var_os("ANTHROPIC_API_KEY").is_none() {
-                    std::env::set_var("ANTHROPIC_API_KEY", api_key);
-                }
-                if std::env::var_os("ANTHROPIC_BASE_URL").is_none() {
-                    std::env::set_var("ANTHROPIC_BASE_URL", base_url);
-                }
-            }
-            _ => {
-                if std::env::var_os("OPENAI_API_KEY").is_none() {
-                    let url = if base_url.ends_with("/v1") || base_url.ends_with("/v1/") { base_url.to_string() }
-                              else if base_url.ends_with('/') { format!("{base_url}v1") }
-                              else { format!("{base_url}/v1") };
-                    std::env::set_var("OPENAI_BASE_URL", &url);
-                    std::env::set_var("OPENAI_API_KEY", api_key);
-                }
-            }
+        let mut client = ApiProviderClient::from_config(provider)?;
+
+        if provider.protocol.as_deref() == Some("anthropic") {
+            client = client.with_prompt_cache(PromptCache::new(&self.session_id));
         }
+
+        self.client = client.clone();
+        self.cached_client = CachedProviderClient::new(client, &self.session_id);
+        self.model = new_model.to_string();
+
+        Ok(())
     }
 }
 

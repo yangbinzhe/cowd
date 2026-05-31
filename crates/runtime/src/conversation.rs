@@ -295,7 +295,7 @@ bus: Option<crate::bus::EventBus>,
     gate_evaluator: Option<Arc<crate::gates::GateEvaluator>>,
     /// Current model ID (used for provider fallback chain lookup).
     model: Option<String>,
-    /// Flat list of fallback model names for automatic retry on 429/5xx errors.
+    /// Provider fallback configuration for automatic retry on 429/5xx errors.
     fallbacks: Vec<String>,
     /// T35: Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
@@ -1039,10 +1039,13 @@ pub async fn run_turn_async(
                 model: String::new(), // filled by fallback loop below
             };
 
-            let primary = self.model.as_deref().unwrap_or("");
-            let model_list: Vec<String> = std::iter::once(primary.to_string())
-                .chain(self.fallbacks.clone())
-                .collect();
+            let mut model_list: Vec<String> = std::iter::once(
+                self.model.as_deref().unwrap_or("").to_string(),
+            )
+            .chain(self.fallbacks.clone())
+            .collect();
+            // dedup in case primary also appears in fallbacks
+            model_list.dedup();
 
             // Use the new Stream-based API — consume events as they arrive
             use futures::StreamExt;

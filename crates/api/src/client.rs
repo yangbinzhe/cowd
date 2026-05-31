@@ -46,6 +46,44 @@ impl ProviderClient {
         }
     }
 
+    /// 从配置文件 ProviderConfig 直接构造，不读任何环境变量。
+    pub fn from_config(provider: &runtime::ProviderConfig) -> Result<Self, ApiError> {
+        match provider.protocol.as_deref().unwrap_or("openai-compat") {
+            "anthropic" => {
+                let auth = AuthSource::ApiKey(provider.api_key.clone());
+                Ok(Self::Anthropic(
+                    AnthropicClient::from_auth(auth)
+                        .with_base_url(&provider.base_url)
+                ))
+            }
+            "openai-compat" => {
+                let url = Self::normalize_openai_url(&provider.base_url);
+                Ok(Self::OpenAi(
+                    OpenAiCompatClient::new_custom(
+                        provider.api_key.clone(),
+                        url,
+                        &provider.name,
+                    )
+                ))
+            }
+            other => Err(ApiError::InvalidProviderConfig {
+                provider: provider.name.clone(),
+                reason: format!("unknown protocol: {other:?}"),
+            }),
+        }
+    }
+
+    /// 规范化 OpenAI 兼容 API 的 base URL：确保以 /v1 结尾
+    fn normalize_openai_url(base_url: &str) -> String {
+        if base_url.ends_with("/v1") || base_url.ends_with("/v1/") {
+            base_url.to_string()
+        } else if base_url.ends_with('/') {
+            format!("{base_url}v1")
+        } else {
+            format!("{base_url}/v1")
+        }
+    }
+
     #[must_use]
     pub const fn provider_kind(&self) -> ProviderKind {
         match self {

@@ -389,7 +389,7 @@ fn run_cowd(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output 
             let _ = fs::create_dir_all(config_dir);
             let _ = fs::write(config_dir.join("config.yaml"), "model: \"sonnet\"\n\
                 providers:\n  anthropic:\n    base_url: \"https://api.anthropic.com/v1\"\n    \
-                api_key: \"test-key\"\n    models: [\"sonnet\"]\n\
+                api_key: \"test-key\"\n    models: [\"sonnet\"]\n    protocol: \"anthropic\"\n\
                 permissions:\n  defaultMode: \"acceptEdits\"\n  allow: []\n  deny: []\n  ask: []\n\
                 memory:\n  enabled: false\n\
                 gateway:\n  enabled: false\n");

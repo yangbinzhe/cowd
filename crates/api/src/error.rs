@@ -70,6 +70,14 @@ pub enum ApiError {
         attempt: u32,
         base_delay: Duration,
     },
+    NoProviderConfigured {
+        model: String,
+    },
+
+    InvalidProviderConfig {
+        provider: String,
+        reason: String,
+    },
 }
 
 impl ApiError {
@@ -148,75 +156,9 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
-        }
-    }
-
-    #[must_use]
-    pub fn request_id(&self) -> Option<&str> {
-        match self {
-            Self::Api { request_id, .. } => request_id.as_deref(),
-            Self::RetriesExhausted { last_error, .. } => last_error.request_id(),
-            Self::MissingCredentials { .. }
-            | Self::ContextWindowExceeded { .. }
-            | Self::RequestBodyTooLarge { .. }
-            | Self::ExpiredOAuthToken
-            | Self::Auth(_)
-            | Self::InvalidApiKeyEnv(_)
-            | Self::Http(_)
-            | Self::Io(_)
-            | Self::Json { .. }
-            | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => None,
-        }
-    }
-
-    #[must_use]
-    pub fn safe_failure_class(&self) -> &'static str {
-        match self {
-            Self::RetriesExhausted { .. } if self.is_context_window_failure() => "context_window",
-            Self::RetriesExhausted { .. } if self.is_generic_fatal_wrapper() => {
-                "provider_retry_exhausted"
-            }
-            Self::RetriesExhausted { last_error, .. } => last_error.safe_failure_class(),
-            Self::MissingCredentials { .. } | Self::ExpiredOAuthToken | Self::Auth(_) => {
-                "provider_auth"
-            }
-            Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => "provider_auth",
-            Self::ContextWindowExceeded { .. } => "context_window",
-            Self::Api { .. } if self.is_context_window_failure() => "context_window",
-            Self::Api { status, .. } if status.as_u16() == 429 => "provider_rate_limit",
-            Self::Api { .. } if self.is_generic_fatal_wrapper() => "provider_internal",
-            Self::Api { .. } => "provider_error",
-            Self::Http(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
-                "provider_transport"
-            }
-            Self::RequestBodyTooLarge { .. } => "request_too_large",
-            Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
-        }
-    }
-
-    #[must_use]
-    pub fn is_generic_fatal_wrapper(&self) -> bool {
-        match self {
-            Self::Api { message, body, .. } => {
-                message
-                    .as_deref()
-                    .is_some_and(looks_like_generic_fatal_wrapper)
-                    || looks_like_generic_fatal_wrapper(body)
-            }
-            Self::RetriesExhausted { last_error, .. } => last_error.is_generic_fatal_wrapper(),
-            Self::MissingCredentials { .. }
-            | Self::ContextWindowExceeded { .. }
-            | Self::RequestBodyTooLarge { .. }
-            | Self::ExpiredOAuthToken
-            | Self::Auth(_)
-            | Self::InvalidApiKeyEnv(_)
-            | Self::Http(_)
-            | Self::Io(_)
-            | Self::Json { .. }
-            | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::NoProviderConfigured { .. }
+            | Self::InvalidProviderConfig { .. } => false,
         }
     }
 
@@ -246,7 +188,83 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::NoProviderConfigured { .. }
+            | Self::InvalidProviderConfig { .. } => false,
+        }
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Api { request_id, .. } => request_id.as_deref(),
+            Self::RetriesExhausted { last_error, .. } => last_error.request_id(),
+            Self::MissingCredentials { .. }
+            | Self::ContextWindowExceeded { .. }
+            | Self::RequestBodyTooLarge { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json { .. }
+            | Self::InvalidSseFrame(_)
+            | Self::BackoffOverflow { .. }
+            | Self::NoProviderConfigured { .. }
+            | Self::InvalidProviderConfig { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn safe_failure_class(&self) -> &'static str {
+        match self {
+            Self::RetriesExhausted { .. } if self.is_context_window_failure() => "context_window",
+            Self::RetriesExhausted { .. } if self.is_generic_fatal_wrapper() => {
+                "provider_retry_exhausted"
+            }
+            Self::RetriesExhausted { last_error, .. } => last_error.safe_failure_class(),
+            Self::MissingCredentials { .. } | Self::ExpiredOAuthToken | Self::Auth(_) => {
+                "provider_auth"
+            }
+            Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => "provider_auth",
+            Self::ContextWindowExceeded { .. } => "context_window",
+            Self::Api { .. } if self.is_context_window_failure() => "context_window",
+            Self::Api { status, .. } if status.as_u16() == 429 => "provider_rate_limit",
+            Self::Api { .. } if self.is_generic_fatal_wrapper() => "provider_internal",
+            Self::Api { .. } => "provider_error",
+            Self::Http(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
+                "provider_transport"
+            }
+            Self::RequestBodyTooLarge { .. } => "request_too_large",
+            Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
+            Self::NoProviderConfigured { .. } => "provider_auth",
+            Self::InvalidProviderConfig { .. } => "runtime_io",
+        }
+    }
+
+    #[must_use]
+    pub fn is_generic_fatal_wrapper(&self) -> bool {
+        match self {
+            Self::Api { message, body, .. } => {
+                message
+                    .as_deref()
+                    .is_some_and(looks_like_generic_fatal_wrapper)
+                    || looks_like_generic_fatal_wrapper(body)
+            }
+            Self::RetriesExhausted { last_error, .. } => last_error.is_generic_fatal_wrapper(),
+            Self::MissingCredentials { .. }
+            | Self::ContextWindowExceeded { .. }
+            | Self::RequestBodyTooLarge { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json { .. }
+            | Self::InvalidSseFrame(_)
+            | Self::BackoffOverflow { .. }
+            | Self::NoProviderConfigured { .. }
+            | Self::InvalidProviderConfig { .. } => false,
         }
     }
 }
@@ -355,6 +373,13 @@ impl Display for ApiError {
                 f,
                 "retry backoff overflowed on attempt {attempt} with base delay {base_delay:?}"
             ),
+            Self::NoProviderConfigured { model } => write!(
+                f,
+                "没有为模型 '{model}' 配置 provider。\n请在 ~/.cowd/config.yaml 的 providers 段添加配置，例如：\n  providers:\n    my_provider:\n      base_url: 'https://api.example.com/v1'\n      api_key: 'sk-...'\n      models: ['{model}']\n      protocol: 'openai-compat'"
+            ),
+            Self::InvalidProviderConfig { provider, reason } => {
+                write!(f, "invalid provider config for {provider}: {reason}")
+            }
         }
     }
 }

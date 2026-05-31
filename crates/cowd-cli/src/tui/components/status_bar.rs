@@ -12,7 +12,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use api;
+use runtime;
 
 use crate::tui::app::App;
 use crate::tui::components::{Component, EventResult, RenderContext};
@@ -317,13 +317,14 @@ impl StatusBar {
             section.content = match section.id.as_str() {
                 "brand" => Some("Cowd".to_string()),
                 "panel_model_status" => {
-                    let provider = api::detect_provider_kind(&app.model);
-                    let provider_label = match provider {
-                        api::ProviderKind::Anthropic => "Anthropic",
-                        api::ProviderKind::Xai => "Xai",
-                        api::ProviderKind::OpenAi => "OpenAI",
+                    let label = match runtime::resolve_global_provider(&app.model) {
+                        Some(p) => {
+                            let proto = p.protocol.as_deref().unwrap_or("openai-compat");
+                            format!("{} ({})", p.name, proto)
+                        }
+                        None => "未配置".to_string(),
                     };
-                    Some(format!("{provider_label} │ {status} │ {}", app.model))
+                    Some(format!("{label} │ {status} │ {}", app.model))
                 }
                 "reputation" => {
                     app.selected_agent_reputation.map(|r| {

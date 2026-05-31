@@ -123,6 +123,7 @@ pub struct OpenAiCompatClient {
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    override_provider_name: Option<String>,
 }
 
 impl OpenAiCompatClient {
@@ -144,6 +145,27 @@ impl OpenAiCompatClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            override_provider_name: None,
+        }
+    }
+
+    /// 从配置直接构造，不读环境变量。
+    /// 与 `from_env` 不同，不调用 `read_base_url`，不使用 `OPENAI_BASE_URL`。
+    #[must_use]
+    pub fn new_custom(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        provider_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            http: build_http_client_or_default(),
+            api_key: api_key.into(),
+            config: OpenAiCompatConfig::openai(),
+            base_url: base_url.into(),
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+            override_provider_name: Some(provider_name.into()),
         }
     }
 
@@ -174,6 +196,12 @@ impl OpenAiCompatClient {
         self.initial_backoff = initial_backoff;
         self.max_backoff = max_backoff;
         self
+    }
+
+    fn provider_name(&self) -> &str {
+        self.override_provider_name
+            .as_deref()
+            .unwrap_or(self.config.provider_name)
     }
 
     pub async fn send_message(
@@ -219,7 +247,7 @@ impl OpenAiCompatClient {
             }
         }
         let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
+            ApiError::json_deserialize(self.provider_name(), &request.model, &body, error)
         })?;
         let mut normalized = normalize_response(&request.model, payload)?;
         if normalized.request_id.is_none() {
@@ -239,7 +267,7 @@ impl OpenAiCompatClient {
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
             response,
-            parser: OpenAiSseParser::with_context(self.config.provider_name, request.model.clone()),
+            parser: OpenAiSseParser::with_context(self.provider_name(), request.model.clone()),
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone()),

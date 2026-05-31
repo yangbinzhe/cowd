@@ -134,7 +134,7 @@ fn write_minimal_config(config_home: &std::path::Path) {
     fs::create_dir_all(config_dir).expect("config dir should exist");
     let config_content = "model: \"sonnet\"\n\
         providers:\n  anthropic:\n    base_url: \"https://api.anthropic.com/v1\"\n    \
-        api_key: \"test-key\"\n    models: [\"sonnet\"]\n\
+            api_key: \"test-key\"\n    models: [\"sonnet\"]\n    protocol: \"anthropic\"\n\
         permissions:\n  defaultMode: \"acceptEdits\"\n  allow: []\n  deny: []\n  ask: []\n\
         memory:\n  enabled: false\n\
         gateway:\n  enabled: false\n";

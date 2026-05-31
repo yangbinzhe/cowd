@@ -3192,8 +3192,8 @@ pub(crate) struct ProviderRuntimeClient {
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
     fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        let fallbacks = load_provider_fallbacks();
-        Self::new_with_fallback_config(model, allowed_tools, &fallbacks)
+        let fallback_config = load_provider_fallback_config();
+        Self::new_with_fallback_config(model, allowed_tools, &fallback_config)
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -3214,6 +3214,7 @@ impl ProviderRuntimeClient {
                 }
             }
         }
+        chain.dedup_by(|a, b| a.model == b.model);
         Ok(Self {
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3227,14 +3228,22 @@ impl ProviderRuntimeClient {
 
 fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
     let resolved = model.trim().to_string();
-    let client = ProviderClient::from_model(&resolved).map_err(|error| error.to_string())?;
+    let client = match runtime::resolve_global_provider(&resolved) {
+        Some(provider) => ProviderClient::from_config(provider)
+            .map_err(|e| e.to_string())?,
+        None => {
+            eprintln!("warning: model '{resolved}' not in providers config, falling back to environment variables");
+            ProviderClient::from_model(&resolved)
+                .map_err(|e| e.to_string())?
+        }
+    };
     Ok(ProviderEntry {
         model: resolved,
         client,
     })
 }
 
-fn load_provider_fallbacks() -> Vec<String> {
+fn load_provider_fallback_config() -> Vec<String> {
     std::env::current_dir()
         .ok()
         .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
@@ -4842,6 +4851,7 @@ use std::path::{Path, PathBuf};
     };
     use crate::{mvp_tool_specs, permission_mode_from_plugin, GlobalToolRegistry};
     use api::OutputContentBlock;
+    use runtime::ConfigLoader;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
         LaneEventName, LaneFailureClass, PermissionMode, PermissionPolicy, RuntimeError, Session, SharedPrompter, TaskPacket, TaskScope, ToolExecutor,
@@ -7871,13 +7881,13 @@ printf 'pwsh:%s' "$1"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-        let fallbacks: Vec<String> = Vec::new();
+        let fallback_config: Vec<String> = vec![];
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
             "claude-sonnet-4-6".to_string(),
             BTreeSet::new(),
-            &fallbacks,
+            &fallback_config,
         )
         .expect("primary-only chain should construct");
 
@@ -7901,13 +7911,16 @@ printf 'pwsh:%s' "$1"
         let original_xai = std::env::var_os("XAI_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
         std::env::set_var("XAI_API_KEY", "xai-test-key");
-        let fallbacks = vec!["grok-3".to_string(), "grok-3-mini".to_string()];
+        let fallback_config: Vec<String> = vec![
+            "grok-3".to_string(),
+            "grok-3-mini".to_string(),
+        ];
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
             "claude-sonnet-4-6".to_string(),
             BTreeSet::new(),
-            &fallbacks,
+            &fallback_config,
         )
         .expect("chain with fallbacks should construct");
 
@@ -7937,13 +7950,15 @@ printf 'pwsh:%s' "$1"
         let original_xai = std::env::var_os("XAI_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
         std::env::set_var("XAI_API_KEY", "xai-test-key");
-        let fallbacks = vec!["claude-sonnet-4-6".to_string()];
+        let fallback_config: Vec<String> = vec![
+            "claude-sonnet-4-6".to_string(),
+        ];
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
             "grok-3".to_string(),
             BTreeSet::new(),
-            &fallbacks,
+            &fallback_config,
         )
         .expect("chain with matching entry should construct");
 
@@ -7972,7 +7987,7 @@ printf 'pwsh:%s' "$1"
         let original_xai = std::env::var_os("XAI_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
         std::env::remove_var("XAI_API_KEY");
-        let fallbacks = vec![
+        let fallback_config: Vec<String> = vec![
             "grok-3".to_string(),
             "claude-haiku-4-5-20251213".to_string(),
         ];
@@ -7981,7 +7996,7 @@ printf 'pwsh:%s' "$1"
         let client = ProviderRuntimeClient::new_with_fallback_config(
             "claude-sonnet-4-6".to_string(),
             BTreeSet::new(),
-            &fallbacks,
+            &fallback_config,
         )
         .expect("chain construction should not fail when only some fallbacks are unavailable");
 

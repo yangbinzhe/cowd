@@ -81,6 +81,7 @@ pub mod approval_gate;
 pub mod pairing;
 pub mod mirror;
 pub mod model_registry;
+pub mod provider_registry;
 pub mod profile;
 
 pub use agent::{
@@ -114,9 +115,14 @@ pub use config::{
     GateAutoFixConfig, GatewayConfig, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
     McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig,
     McpTransport, McpWebSocketServerConfig, MemoryConfig, OAuthConfig, PlatformConfig as GatewayPlatformConfig,
+    ProviderConfig, ProvidersConfig,
     ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
     SessionResetPolicy, COWD_SETTINGS_SCHEMA_NAME,
+};
+pub use provider_registry::{
+    init_global_providers, list_all_models, list_all_providers, list_models_for_provider,
+    resolve_global_provider,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

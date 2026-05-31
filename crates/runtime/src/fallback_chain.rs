@@ -1,8 +1,6 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-
-
 /// Retryable HTTP status codes that trigger a fallback switch.
 const RETRYABLE_STATUSES: &[&str] = &["429", "500", "502", "503", "504"];
 
@@ -31,12 +29,9 @@ impl FallbackChain {
         self
     }
 
-    /// Build a fallback chain from the runtime config for the given model.
-    ///
-    /// The `fallbacks` list contains alternative model names. The primary is
-    /// the requested model itself (not a config-driven primary).
-    pub fn from_config(fallbacks: &[String], model: &str) -> Self {
-        Self::new(model, fallbacks)
+    /// Returns an iterator over all models in the chain (primary first, then fallbacks).
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.primary.as_str()).chain(self.fallbacks.iter().map(String::as_str))
     }
 
     /// Iterates primary → fallbacks, calling `send_fn` for each model.
@@ -206,11 +201,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_config_uses_fallbacks_list() {
-        let fallbacks = vec!["fb1".to_string(), "fb2".to_string()];
-        let chain = FallbackChain::from_config(&fallbacks, "primary");
-        assert_eq!(chain.primary, "primary");
-        assert_eq!(chain.fallbacks, vec!["fb1", "fb2"]);
+    async fn new_with_empty_fallbacks_returns_self_chain() {
+        let chain = FallbackChain::new("some-model", &[]);
+        assert_eq!(chain.primary, "some-model");
+        assert!(chain.fallbacks.is_empty());
     }
 
     #[tokio::test]
