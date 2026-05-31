@@ -1396,7 +1396,7 @@ pub async fn run_turn_async(
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        let auto_compaction = self.maybe_auto_compact().await;
         let _ = self.run_memory_post_turn().await;
 
         // A3: Synchronously check for L4 conflicts after each turn.
@@ -1865,18 +1865,18 @@ self.record_turn_completed(&summary);
         Arc::try_unwrap(self.session).map(|lock| lock.into_inner()).unwrap_or_else(|arc| arc.blocking_read().clone())
     }
 
-    fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
+    async fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
         // Use the session's estimated token count directly, not the cumulative
         // usage tracker which spans across multiple sessions and doesn't
         // reflect the current conversation window pressure.
-        let session_tokens = estimate_session_tokens(&*self.session.blocking_read());
+        let session_tokens = estimate_session_tokens(&*self.session.read().await);
 
         if session_tokens < self.auto_compaction_input_tokens_threshold as usize {
             return None;
         }
 
         let result = compact_session(
-            &self.session.blocking_read(),
+            &*self.session.read().await,
             CompactionConfig {
                 max_estimated_tokens: 0, priority_threshold: 3, keep_high_priority: true,
                 ..CompactionConfig::default()
@@ -1889,7 +1889,7 @@ self.record_turn_completed(&summary);
 
         tracing::info!(removed = result.removed_message_count, "compaction");
         let compacted_len = result.compacted_session.messages.len();
-        *self.session.blocking_write() = result.compacted_session;
+        *self.session.write().await = result.compacted_session;
         // Record compaction as a MessagesTruncated event for event log.
         if let Some(ref log) = self.event_log {
             if let Ok(mut guard) = log.lock() {

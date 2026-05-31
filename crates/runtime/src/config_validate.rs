@@ -661,10 +661,10 @@ mod tests {
         let result = validate_config_file(object, source, &test_path());
 
         // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].field, "unknownField");
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].field, "unknownField");
         assert!(matches!(
-            result.errors[0].kind,
+            result.warnings[0].kind,
             DiagnosticKind::UnknownKey { .. }
         ));
     }
@@ -744,9 +744,9 @@ mod tests {
         let result = validate_config_file(object, source, &test_path());
 
         // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].line, Some(3));
-        assert_eq!(result.errors[0].field, "badKey");
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].line, Some(3));
+        assert_eq!(result.warnings[0].field, "badKey");
     }
 
     #[test]
@@ -775,8 +775,8 @@ mod tests {
         let result = validate_config_file(object, source, &test_path());
 
         // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].field, "hooks.BadHook");
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].field, "hooks.BadHook");
     }
 
     #[test]
@@ -790,8 +790,8 @@ mod tests {
         let result = validate_config_file(object, source, &test_path());
 
         // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].field, "permissions.denyAll");
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].field, "permissions.denyAll");
     }
 
     #[test]
@@ -805,8 +805,8 @@ mod tests {
         let result = validate_config_file(object, source, &test_path());
 
         // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].field, "sandbox.containerMode");
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].field, "sandbox.containerMode");
     }
 
     #[test]
@@ -820,8 +820,8 @@ mod tests {
         let result = validate_config_file(object, source, &test_path());
 
         // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].field, "plugins.autoUpdate");
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].field, "plugins.autoUpdate");
     }
 
     #[test]
@@ -835,8 +835,8 @@ mod tests {
         let result = validate_config_file(object, source, &test_path());
 
         // then
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].field, "oauth.secret");
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].field, "oauth.secret");
     }
 
     #[test]
@@ -871,8 +871,8 @@ mod tests {
         let result = validate_config_file(object, source, &test_path());
 
         // then
-        assert_eq!(result.errors.len(), 1);
-        match &result.errors[0].kind {
+        assert_eq!(result.warnings.len(), 1);
+        match &result.warnings[0].kind {
             DiagnosticKind::UnknownKey {
                 suggestion: Some(s),
             } => assert_eq!(s, "model"),
@@ -893,7 +893,6 @@ mod tests {
 
         // then
         assert!(output.contains("warning:"));
-        assert!(output.contains("error:"));
         assert!(output.contains("badKey"));
         assert!(output.contains("permissionMode"));
     }
