@@ -207,50 +207,55 @@ impl DiscussionEngine {
         let memory = Arc::clone(&self.memory);
         let _bus = Arc::clone(&self.event_bus);
 
-        let handle = tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(Event::TurnCompleted { tokens, model }) => {
-                        tracing::debug!(
-                            tokens,
-                            %model,
-                            "TurnCompleted: scanning L4 for conflicts"
-                        );
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h.spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(Event::TurnCompleted { tokens, model }) => {
+                            tracing::debug!(
+                                tokens,
+                                %model,
+                                "TurnCompleted: scanning L4 for conflicts"
+                            );
 
-                        // Query L4 for recent entries that may conflict.
-                        match Self::detect_l4_conflicts(&memory).await {
-                            Ok(conflicts) if !conflicts.is_empty() => {
-                                tracing::info!(
-                                    conflict_count = conflicts.len(),
-                                    "L4 conflicts detected — consider triggering discussion"
-                                );
-                                // Emit a conflict-detected event for subscribers.
-                                // Note: We don't add a new Event variant here to
-                                // avoid modifying bus.rs; instead we log and
-                                // let callers poll `check_for_conflicts()`.
-                            }
-                            Ok(_) => {
-                                tracing::debug!("No L4 conflicts detected");
-                            }
-                            Err(e) => {
-                                tracing::warn!("L4 conflict scan failed: {}", e);
+                            // Query L4 for recent entries that may conflict.
+                            match Self::detect_l4_conflicts(&memory).await {
+                                Ok(conflicts) if !conflicts.is_empty() => {
+                                    tracing::info!(
+                                        conflict_count = conflicts.len(),
+                                        "L4 conflicts detected — consider triggering discussion"
+                                    );
+                                    // Emit a conflict-detected event for subscribers.
+                                    // Note: We don't add a new Event variant here to
+                                    // avoid modifying bus.rs; instead we log and
+                                    // let callers poll `check_for_conflicts()`.
+                                }
+                                Ok(_) => {
+                                    tracing::debug!("No L4 conflicts detected");
+                                }
+                                Err(e) => {
+                                    tracing::warn!("L4 conflict scan failed: {}", e);
+                                }
                             }
                         }
-                    }
-                    Ok(_) => {
-                        // Ignore other event types.
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "TurnCompleted watcher lagged");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        tracing::debug!("EventBus closed — watcher stopping");
-                        break;
+                        Ok(_) => {
+                            // Ignore other event types.
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(skipped = n, "TurnCompleted watcher lagged");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::debug!("EventBus closed — watcher stopping");
+                            break;
+                        }
                     }
                 }
+            }),
+            Err(_) => {
+                tracing::warn!("no tokio runtime available; discussion watcher disabled");
+                return;
             }
-        });
-
+        };
         self.watcher_handle = Some(handle);
     }
 
