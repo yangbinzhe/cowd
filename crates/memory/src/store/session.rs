@@ -113,7 +113,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
             metadata_json TEXT,
             input_tokens  INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
-            estimated_cost_usd REAL NOT NULL DEFAULT 0.0
+            estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
+            status TEXT NOT NULL DEFAULT 'active'
         )",
         r"CREATE TABLE IF NOT EXISTS session_memories (
             session_id TEXT NOT NULL,

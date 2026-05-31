@@ -43,8 +43,13 @@ impl TeamDiscoveryProtocol {
     /// Create a discovery protocol backed by a SQLite database at `db_path`.
     ///
     /// The `teams` table is created on first open if it does not exist.
-    pub fn with_db(db_path: &Path) -> Result<Self, rusqlite::Error> {
-        let conn = rusqlite::Connection::open(db_path)?;
+    pub fn with_db(db_path: &Path) -> Result<Self, String> {
+        let conn = rusqlite::Connection::open(db_path)
+            .map_err(|e| format!("open db: {e}"))?;
+        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .map_err(|e| format!("WAL pragma: {e}"))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+            .map_err(|e| format!("pragma: {e}"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS teams (
                 team_id    TEXT PRIMARY KEY,
@@ -54,7 +59,8 @@ impl TeamDiscoveryProtocol {
                 created_at INTEGER NOT NULL,
                 status     TEXT NOT NULL DEFAULT 'active'
             );",
-        )?;
+        )
+        .map_err(|e| format!("create table: {e}"))?;
         Ok(Self {
             db: Some(Arc::new(Mutex::new(conn))),
         })

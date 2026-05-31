@@ -13,6 +13,12 @@ pub struct SqliteStorage {
 impl SqliteStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CowdError> {
         let conn = Connection::open(path).map_err(|e| CowdError::other(e.to_string()))?;
+        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .map_err(|e| CowdError::other(e.to_string()))?;
+        conn.query_row("PRAGMA busy_timeout=5000", [], |_| Ok(()))
+            .map_err(|e| CowdError::other(e.to_string()))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|e| CowdError::other(e.to_string()))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS kv (
                 key TEXT PRIMARY KEY,
@@ -79,10 +85,14 @@ impl StorageBackend for SqliteStorage {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_db() -> (SqliteStorage, String) {
+        let counter = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
         let path = format!(
-            "{}/cowd-sqlite-test-{}.db",
+            "{}/cowd-sqlite-test-{}-{counter}.db",
             std::env::temp_dir().display(),
             std::process::id()
         );
