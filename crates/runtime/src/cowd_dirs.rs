@@ -262,4 +262,30 @@ mod tests {
         let h = home_dir();
         assert!(!h.as_os_str().is_empty());
     }
+
+    #[test]
+    fn expand_tilde_expands_home() {
+        let home = std::env::var("HOME").unwrap();
+        let result = expand_tilde("~");
+        assert_eq!(result, PathBuf::from(&home));
+    }
+
+    #[test]
+    fn expand_tilde_expands_home_slash_path() {
+        let home = std::env::var("HOME").unwrap();
+        let result = expand_tilde("~/some/path");
+        assert_eq!(result, PathBuf::from(&home).join("some/path"));
+    }
+
+    #[test]
+    fn expand_tilde_passes_absolute_path_unchanged() {
+        let result = expand_tilde("/absolute/path");
+        assert_eq!(result, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn expand_tilde_passes_empty_string() {
+        let result = expand_tilde("");
+        assert_eq!(result, PathBuf::from(""));
+    }
 }
