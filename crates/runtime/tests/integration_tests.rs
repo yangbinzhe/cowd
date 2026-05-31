@@ -551,9 +551,8 @@ fn auto_assemble_returns_none_when_directory_empty() {
 #[tokio::test]
 async fn test_reputation_flows_to_agent_directory() {
     use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus, ReputationScore};
-    use memory::agent_reputation::{schema_ddl, ReputationManager};
-    use r2d2::Pool;
-    use r2d2_sqlite::SqliteConnectionManager;
+    use memory::agent_reputation::ReputationManager;
+    use memory::store::sqlite::SqliteStore;
     use std::sync::Arc;
 
     let now = std::time::SystemTime::now()
@@ -561,16 +560,8 @@ async fn test_reputation_flows_to_agent_directory() {
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // 1. Create in-memory DB pool for ReputationManager
-    let manager = SqliteConnectionManager::memory();
-    let pool = Pool::builder()
-        .max_size(1)
-        .build(manager)
-        .expect("in-memory pool");
-    {
-        let conn = pool.get().expect("conn");
-        conn.execute_batch(schema_ddl()).expect("ddl");
-    }
+    let store = SqliteStore::open_in_memory().expect("store");
+    let pool = store.pool();
 
     let rep_mgr = Arc::new(ReputationManager::with_default_config(pool));
     ReputationManager::set_global(rep_mgr.clone());
