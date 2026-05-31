@@ -319,11 +319,17 @@ impl DiscussionEngine {
 
     /// Synchronous wrapper for `check_for_conflicts()`.
     ///
-    /// Uses `tokio::runtime::Handle::current().block_on()` internally.
-    /// This allows callers holding a `std::sync::Mutex<DiscussionEngine>` to
-    /// invoke conflict checking without async lock contention.
+    /// Tries to create a new Tokio runtime to avoid panicking when called from
+    /// within an existing async context. If a runtime is already active, returns
+    /// an error instructing the caller to use the async version instead.
     pub fn check_for_conflicts_sync(&self) -> Result<usize, String> {
-        tokio::runtime::Handle::current().block_on(self.check_for_conflicts())
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => Err("check_for_conflicts_sync cannot be called from within a tokio runtime; use async check_for_conflicts()".into()),
+            Err(_) => {
+                let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+                rt.block_on(self.check_for_conflicts())
+            }
+        }
     }
 
     // ── Discussion Lifecycle ──────────────────────────────────────────────
