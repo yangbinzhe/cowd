@@ -46,8 +46,6 @@ pub mod provider_pool;
 pub mod effect;
 pub mod bus;
 pub mod context_profiler;
-pub mod fallback_chain;
-
 pub mod platform;
 mod policy_engine;
 mod prompt;
@@ -259,8 +257,6 @@ pub use prompt_cache::{
     PromptCacheRecord, PromptCacheStats, RequestFingerprintHashes, hash_serializable,
     now_unix_secs, request_hash_hex_from_fnv, sanitize_path_segment, stable_hash_bytes,
 };
-pub use fallback_chain::FallbackChain;
-
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
