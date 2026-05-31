@@ -592,7 +592,10 @@ impl SqliteStore {
 
     /// Get a connection from the pool.
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
-        self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))
+        let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
+        exec_pragma(&conn, "PRAGMA foreign_keys=ON")?;
+        exec_pragma(&conn, "PRAGMA busy_timeout=5000")?;
+        Ok(conn)
     }
 
     /// Ensure the generic key-value table exists.

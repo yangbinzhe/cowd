@@ -59,111 +59,7 @@ fn set_conn_pragmas(conn: &Connection) -> Result<()> {
 // Schema DDL
 // ---------------------------------------------------------------------------
 
-const SCHEMA_SQL: &str = r"
-CREATE TABLE IF NOT EXISTS sessions (
-    session_id    TEXT PRIMARY KEY,
-    platform      TEXT NOT NULL,
-    chat_id       TEXT NOT NULL,
-    user_id       TEXT,
-    model         TEXT,
-    created_at    TEXT NOT NULL,
-    last_activity TEXT NOT NULL,
-    message_count INTEGER NOT NULL DEFAULT 0,
-    reset_policy  TEXT NOT NULL,
-    metadata_json TEXT,
-    input_tokens  INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    estimated_cost_usd REAL NOT NULL DEFAULT 0.0
-);
 
-CREATE TABLE IF NOT EXISTS session_memories (
-    session_id TEXT NOT NULL,
-    memory_id  TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (session_id, memory_id)
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
-    session_id UNINDEXED,
-    platform,
-    chat_id,
-    user_id,
-    metadata_json,
-    content=sessions,
-    content_rowid=rowid
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_platform      ON sessions(platform);
-CREATE INDEX IF NOT EXISTS idx_sessions_last_activity ON sessions(last_activity);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id      TEXT NOT NULL,
-    sequence        INTEGER NOT NULL,
-    role            TEXT NOT NULL,
-    content_json    TEXT NOT NULL,
-    blocks_count    INTEGER NOT NULL DEFAULT 1,
-    tool_use_id     TEXT,
-    tool_name       TEXT,
-    token_usage_json TEXT,
-    created_at_ms   INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
-    UNIQUE(session_id, sequence)
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, sequence);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    session_id UNINDEXED,
-    role,
-    content_text,
-    tool_name,
-    content=messages,
-    content_rowid=id
-);
-
-CREATE TABLE IF NOT EXISTS session_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    event_json TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    created_at_ms INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
-CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, sequence);
-
-CREATE TABLE IF NOT EXISTS session_snapshots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    event_idx INTEGER NOT NULL,
-    messages_json TEXT NOT NULL,
-    created_at_ms INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_session_snapshots_session ON session_snapshots(session_id);
-CREATE INDEX IF NOT EXISTS idx_session_snapshots_latest ON session_snapshots(session_id, event_idx DESC);
-
-CREATE TABLE IF NOT EXISTS entity_evolution (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    entity_name TEXT NOT NULL,
-    entity_key TEXT NOT NULL,
-    agent_id TEXT NOT NULL,
-    old_value TEXT,
-    new_value TEXT,
-    confidence REAL,
-    operation TEXT NOT NULL,
-    recorded_at_ms INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_entity_evol_name ON entity_evolution(entity_name);
-CREATE INDEX IF NOT EXISTS idx_entity_evol_agent ON entity_evolution(agent_id);
-CREATE INDEX IF NOT EXISTS idx_entity_evol_time ON entity_evolution(recorded_at_ms);
-";
 
 /// FTS5 search result for sessions.
 #[derive(Debug, Clone)]
@@ -199,10 +95,41 @@ pub struct SessionMessage {
 
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE;").map_err(sql_err)?;
-    conn.execute_batch(SCHEMA_SQL).map_err(sql_err)?;
 
-    // Create FTS5 triggers for sessions (must be separate from batch)
-    let triggers: &[&str] = &[
+    // Execute each DDL statement individually to avoid rusqlite's execute_batch
+    // returning "Execute returned results" errors when FTS5 virtual tables or
+    // triggers are involved in a multi-statement batch.
+    let statements: &[&str] = &[
+        r"CREATE TABLE IF NOT EXISTS sessions (
+            session_id    TEXT PRIMARY KEY,
+            platform      TEXT NOT NULL,
+            chat_id       TEXT NOT NULL,
+            user_id       TEXT,
+            model         TEXT,
+            created_at    TEXT NOT NULL,
+            last_activity TEXT NOT NULL,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            reset_policy  TEXT NOT NULL,
+            metadata_json TEXT,
+            input_tokens  INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            estimated_cost_usd REAL NOT NULL DEFAULT 0.0
+        )",
+        r"CREATE TABLE IF NOT EXISTS session_memories (
+            session_id TEXT NOT NULL,
+            memory_id  TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, memory_id)
+        )",
+        r"CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+            session_id UNINDEXED,
+            platform,
+            chat_id,
+            user_id,
+            metadata_json,
+            content=sessions,
+            content_rowid=rowid
+        )",
         r"CREATE TRIGGER IF NOT EXISTS sessions_fts_ai AFTER INSERT ON sessions BEGIN
             INSERT INTO sessions_fts(rowid, session_id, platform, chat_id, user_id, metadata_json)
                 VALUES (new.rowid, new.session_id, new.platform, new.chat_id, new.user_id, new.metadata_json);
@@ -217,12 +144,32 @@ fn init_schema(conn: &Connection) -> Result<()> {
             INSERT INTO sessions_fts(rowid, session_id, platform, chat_id, user_id, metadata_json)
                 VALUES (new.rowid, new.session_id, new.platform, new.chat_id, new.user_id, new.metadata_json);
         END",
-    ];
-    for trigger in triggers {
-        let _ = conn.execute_batch(trigger); // Ignore if already exists
-    }
-    // Create FTS5 triggers for messages (must be separate from batch)
-    let msg_triggers: &[&str] = &[
+        r"CREATE INDEX IF NOT EXISTS idx_sessions_platform      ON sessions(platform)",
+        r"CREATE INDEX IF NOT EXISTS idx_sessions_last_activity ON sessions(last_activity)",
+        r"CREATE TABLE IF NOT EXISTS messages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id      TEXT NOT NULL,
+            sequence        INTEGER NOT NULL,
+            role            TEXT NOT NULL,
+            content_json    TEXT NOT NULL,
+            blocks_count    INTEGER NOT NULL DEFAULT 1,
+            tool_use_id     TEXT,
+            tool_name       TEXT,
+            token_usage_json TEXT,
+            created_at_ms   INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+            UNIQUE(session_id, sequence)
+        )",
+        r"CREATE INDEX IF NOT EXISTS idx_messages_session     ON messages(session_id)",
+        r"CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, sequence)",
+        r"CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            session_id UNINDEXED,
+            role,
+            content_text,
+            tool_name,
+            content=messages,
+            content_rowid=id
+        )",
         r"CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
             INSERT INTO messages_fts(rowid, session_id, role, content_text, tool_name)
             VALUES (new.id, new.session_id, new.role,
@@ -241,10 +188,47 @@ fn init_schema(conn: &Connection) -> Result<()> {
                     (SELECT group_concat(json_extract(value,'$.text'),' ') FROM json_each(new.content_json) WHERE json_extract(value,'$.type')='text'),
                     new.tool_name);
         END",
+        r"CREATE TABLE IF NOT EXISTS session_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        )",
+        r"CREATE INDEX IF NOT EXISTS idx_session_events_session     ON session_events(session_id)",
+        r"CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, sequence)",
+        r"CREATE TABLE IF NOT EXISTS session_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            event_idx INTEGER NOT NULL,
+            messages_json TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        )",
+        r"CREATE INDEX IF NOT EXISTS idx_session_snapshots_session ON session_snapshots(session_id)",
+        r"CREATE INDEX IF NOT EXISTS idx_session_snapshots_latest  ON session_snapshots(session_id, event_idx DESC)",
+        r"CREATE TABLE IF NOT EXISTS entity_evolution (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_name TEXT NOT NULL,
+            entity_key TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            old_value TEXT,
+            new_value TEXT,
+            confidence REAL,
+            operation TEXT NOT NULL,
+            recorded_at_ms INTEGER NOT NULL
+        )",
+        r"CREATE INDEX IF NOT EXISTS idx_entity_evol_name  ON entity_evolution(entity_name)",
+        r"CREATE INDEX IF NOT EXISTS idx_entity_evol_agent ON entity_evolution(agent_id)",
+        r"CREATE INDEX IF NOT EXISTS idx_entity_evol_time  ON entity_evolution(recorded_at_ms)",
     ];
-    for trigger in msg_triggers {
-        let _ = conn.execute_batch(trigger); // Ignore if already exists
+
+    for stmt in statements {
+        conn.execute_batch(stmt).map_err(sql_err)?;
     }
+
     conn.execute_batch("COMMIT;").map_err(sql_err)?;
     Ok(())
 }
@@ -1102,7 +1086,7 @@ impl SqliteSessionStore {
     /// Updates the session's status to `'closed'` and refreshes
     /// `last_activity`.  Messages are preserved for auditing.
     pub fn mark_session_closed(&self, session_id: &str) -> Result<()> {
-        let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
+        let conn = self.conn()?;
         conn.execute(
             "UPDATE sessions SET status = 'closed', last_activity = ?1 WHERE session_id = ?2",
             params![chrono::Utc::now().to_rfc3339(), session_id],

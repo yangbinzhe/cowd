@@ -102,6 +102,7 @@ impl VerbatimSink {
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
         exec_pragma(&conn, "PRAGMA foreign_keys=ON")?;
+        exec_pragma(&conn, "PRAGMA busy_timeout=5000")?;
         Ok(conn)
     }
 
