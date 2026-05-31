@@ -128,76 +128,7 @@ pub struct OAuthConfig {
 
 // ── Runtime Config Types ───────────────────────────────────────────────
 
-/// A single provider fallback chain entry.
-///
-/// Maps a primary model to its ordered list of fallback models.
-/// When the primary model returns a retryable error (429/500/502/503/504),
-/// the runtime automatically tries the fallbacks in order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderFallbackEntry {
-    pub primary: String,
-    #[serde(default)]
-    pub fallbacks: Vec<String>,
-}
 
-impl ProviderFallbackEntry {
-    #[must_use]
-    pub fn new(primary: String, fallbacks: Vec<String>) -> Self {
-        Self { primary, fallbacks }
-    }
-
-    /// Check whether this fallback entry matches the given model name.
-    #[must_use]
-    pub fn matches(&self, model: &str) -> bool {
-        self.primary == model
-    }
-}
-
-/// Collection of provider fallback chain entries.
-///
-/// Each entry defines a primary model and its ordered fallback models.
-/// The `providerFallbacks` config key accepts either:
-/// - An array of fallback entries (preferred):
-///   ```yaml
-///   providerFallbacks:
-///     - primary: "deepseek-v4-pro"
-///       fallbacks: ["deepseek-v4-flash", "qwen3.6-plus"]
-///   ```
-/// - A single fallback entry object (legacy):
-///   ```yaml
-///   providerFallbacks:
-///     primary: "claude-opus-4-6"
-///     fallbacks: ["grok-3", "grok-3-mini"]
-///   ```
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ProviderFallbackConfig {
-    #[serde(default)]
-    pub entries: Vec<ProviderFallbackEntry>,
-}
-
-impl ProviderFallbackConfig {
-    #[must_use]
-    pub fn new(entries: Vec<ProviderFallbackEntry>) -> Self {
-        Self { entries }
-    }
-
-    /// Find the fallback chain entry that matches the given model name.
-    #[must_use]
-    pub fn find(&self, model: &str) -> Option<&ProviderFallbackEntry> {
-        self.entries.iter().find(|e| e.matches(model))
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Returns all fallback chain entries.
-    #[must_use]
-    pub fn entries(&self) -> &[ProviderFallbackEntry] {
-        &self.entries
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RuntimeHookConfig {
@@ -530,7 +461,7 @@ pub struct RuntimeFeatureConfig {
     permission_rules: RuntimePermissionRuleConfig,
     approval: ApprovalConfig,
     sandbox: SandboxConfig,
-    provider_fallbacks: ProviderFallbackConfig,
+    fallbacks: Vec<String>,
     providers: ProvidersConfig,
     trusted_roots: Vec<String>,
     memory: MemoryConfig,
@@ -898,7 +829,7 @@ impl ConfigLoader {
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             approval: parse_optional_approval_config(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
-            provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
+            fallbacks: parse_optional_fallbacks(&merged_value)?,
             providers: parse_optional_providers_config(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
             memory: parse_optional_memory_config(&merged_value)?,
@@ -1006,8 +937,8 @@ impl RuntimeConfig {
     }
 
     #[must_use]
-    pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
-        &self.feature_config.provider_fallbacks
+    pub fn fallbacks(&self) -> &[String] {
+        &self.feature_config.fallbacks
     }
 
     #[must_use]
@@ -1116,8 +1047,8 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
-    pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
-        &self.provider_fallbacks
+    pub fn fallbacks(&self) -> &[String] {
+        &self.fallbacks
     }
 
     #[must_use]
@@ -1610,48 +1541,18 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
     })
 }
 
-fn parse_optional_provider_fallbacks(
-    root: &JsonValue,
-) -> Result<ProviderFallbackConfig, ConfigError> {
+fn parse_optional_fallbacks(root: &JsonValue) -> Result<Vec<String>, ConfigError> {
     let Some(object) = root.as_object() else {
-        return Ok(ProviderFallbackConfig::default());
+        return Ok(Vec::new());
     };
-    let Some(value) = find_key_dual(object, "provider_fallbacks", "merged settings") else {
-        return Ok(ProviderFallbackConfig::default());
-    };
-
-    match value {
-        // Array format (preferred): list of { primary, fallbacks } entries
-        JsonValue::Array(items) => {
-            let mut entries = Vec::new();
-            for (i, item) in items.iter().enumerate() {
-                let ctx = format!("merged settings.providerFallbacks[{i}]");
-                let entry = expect_object(item, &ctx)?;
-                let primary = expect_string(entry, "primary", &ctx)?.to_string();
-                let fallbacks = optional_string_array(entry, "fallbacks", &ctx)?
-                    .unwrap_or_default();
-                entries.push(ProviderFallbackEntry { primary, fallbacks });
-            }
-            Ok(ProviderFallbackConfig { entries })
-        }
-        // Legacy single-object format: { primary, fallbacks }
-        JsonValue::Object(entry) => {
-            let primary =
-                optional_string(entry, "primary", "merged settings.providerFallbacks")?
-                    .map(str::to_string);
-            let fallbacks =
-                optional_string_array(entry, "fallbacks", "merged settings.providerFallbacks")?
-                    .unwrap_or_default();
-            let entries = match primary {
-                Some(p) => vec![ProviderFallbackEntry { primary: p, fallbacks }],
-                None => Vec::new(),
-            };
-            Ok(ProviderFallbackConfig { entries })
-        }
-        _ => Err(ConfigError::Parse(
-            "merged settings.providerFallbacks: expected an object or array".to_string(),
-        )),
+    if let Some(arr) = object.get("fallbacks").and_then(|v| v.as_array()) {
+        return Ok(arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect());
     }
+    Ok(Vec::new())
 }
 
 /// Parse the optional top-level `providers` mapping.
@@ -2699,7 +2600,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_provider_fallbacks_legacy_single_object_format() {
+    fn parses_fallbacks_flat_list() {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
@@ -2709,13 +2610,10 @@ mod tests {
         fs::write(
             home.join("config.yaml"),
             r#"{
-              "providerFallbacks": {
-                "primary": "claude-opus-4-6",
-                "fallbacks": ["grok-3", "grok-3-mini"]
-              }
+              "fallbacks": ["deepseek-v4-flash", "qwen3.6-plus", "step-3.5-flash"]
             }"#,
         )
-        .expect("write provider fallback settings");
+        .expect("write fallback settings");
 
         // when
         let loaded = ConfigLoader::new(&cwd, &home)
@@ -2723,61 +2621,17 @@ mod tests {
             .expect("config should load");
 
         // then
-        let chain = loaded.provider_fallbacks();
-        assert!(!chain.is_empty());
-        assert_eq!(chain.entries().len(), 1);
-        let entry = chain.find("claude-opus-4-6").expect("should find entry by primary");
-        assert_eq!(entry.primary, "claude-opus-4-6");
-        assert_eq!(entry.fallbacks, vec!["grok-3".to_string(), "grok-3-mini".to_string()]);
+        let fallbacks = loaded.fallbacks();
+        assert_eq!(fallbacks.len(), 3);
+        assert_eq!(fallbacks[0], "deepseek-v4-flash");
+        assert_eq!(fallbacks[1], "qwen3.6-plus");
+        assert_eq!(fallbacks[2], "step-3.5-flash");
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
-    fn parses_provider_fallbacks_array_format() {
-        // given
-        let root = temp_dir();
-        let cwd = root.join("project");
-        let home = root.join("home").join(".cowd");
-        fs::create_dir_all(cwd.join(".cowd")).expect("project config dir");
-        fs::create_dir_all(&home).expect("home config dir");
-        fs::write(
-            home.join("config.yaml"),
-            r#"{
-              "providerFallbacks": [
-                {
-                  "primary": "deepseek-v4-pro",
-                  "fallbacks": ["deepseek-v4-flash", "qwen3.6-plus", "step-3.5-flash"]
-                },
-                {
-                  "primary": "claude-sonnet-4-6",
-                  "fallbacks": ["claude-haiku-4-6"]
-                }
-              ]
-            }"#,
-        )
-        .expect("write provider fallback settings");
-
-        // when
-        let loaded = ConfigLoader::new(&cwd, &home)
-            .load()
-            .expect("config should load");
-
-        // then
-        let chain = loaded.provider_fallbacks();
-        assert!(!chain.is_empty());
-        assert_eq!(chain.entries().len(), 2);
-        let ds = chain.find("deepseek-v4-pro").expect("should find deepseek");
-        assert_eq!(ds.fallbacks, vec!["deepseek-v4-flash", "qwen3.6-plus", "step-3.5-flash"]);
-        let cs = chain.find("claude-sonnet-4-6").expect("should find claude");
-        assert_eq!(cs.fallbacks, vec!["claude-haiku-4-6"]);
-        assert!(chain.find("nonexistent").is_none());
-
-        fs::remove_dir_all(root).expect("cleanup temp dir");
-    }
-
-    #[test]
-    fn provider_fallbacks_default_is_empty_when_unset() {
+    fn fallbacks_default_is_empty_when_unset() {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
@@ -2792,9 +2646,7 @@ mod tests {
             .expect("config should load");
 
         // then
-        let chain = loaded.provider_fallbacks();
-        assert!(chain.is_empty());
-        assert_eq!(chain.entries().len(), 0);
+        assert!(loaded.fallbacks().is_empty());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -198,8 +198,8 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Object,
     },
     FieldSpec {
-        name: "providerFallbacks",
-        expected: FieldType::ObjectOrObjectArray,
+        name: "fallbacks",
+        expected: FieldType::StringArray,
     },
     FieldSpec {
         name: "trustedRoots",

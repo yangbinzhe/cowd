@@ -41,7 +41,7 @@ use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
-use crate::config::{RuntimeFeatureConfig, ProviderFallbackConfig};
+use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy,
@@ -295,8 +295,8 @@ bus: Option<crate::bus::EventBus>,
     gate_evaluator: Option<Arc<crate::gates::GateEvaluator>>,
     /// Current model ID (used for provider fallback chain lookup).
     model: Option<String>,
-    /// Provider fallback configuration for automatic retry on 429/5xx errors.
-    provider_fallbacks_config: ProviderFallbackConfig,
+    /// Flat list of fallback model names for automatic retry on 429/5xx errors.
+    fallbacks: Vec<String>,
     /// T35: Cancellation token for graceful shutdown.
     cancellation_token: CancellationToken,
     /// T36: Tool orchestrator for result budgeting and truncation.
@@ -452,7 +452,7 @@ where
             project_phase: "Discovery".to_string(),
             gate_evaluator: Some(Arc::new(crate::gates::GateEvaluator::new().with_default_gates())),
             model: feature_config.model().map(str::to_string),
-            provider_fallbacks_config: feature_config.provider_fallbacks().clone(),
+            fallbacks: feature_config.fallbacks().to_vec(),
             cancellation_token: CancellationToken::new(),
             tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
             write_semaphore: Arc::new(Semaphore::new(
@@ -1039,12 +1039,9 @@ pub async fn run_turn_async(
                 model: String::new(), // filled by fallback loop below
             };
 
-            let fallback_chain = crate::fallback_chain::FallbackChain::from_config(
-                &self.provider_fallbacks_config,
-                self.model.as_deref().unwrap_or(""),
-            );
-            let model_list: Vec<String> = std::iter::once(fallback_chain.primary.clone())
-                .chain(fallback_chain.fallbacks.clone())
+            let primary = self.model.as_deref().unwrap_or("");
+            let model_list: Vec<String> = std::iter::once(primary.to_string())
+                .chain(self.fallbacks.clone())
                 .collect();
 
             // Use the new Stream-based API — consume events as they arrive

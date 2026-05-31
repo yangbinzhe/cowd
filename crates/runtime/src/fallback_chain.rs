@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use crate::config::ProviderFallbackConfig;
+
 
 /// Retryable HTTP status codes that trigger a fallback switch.
 const RETRYABLE_STATUSES: &[&str] = &["429", "500", "502", "503", "504"];
@@ -33,15 +33,10 @@ impl FallbackChain {
 
     /// Build a fallback chain from the runtime config for the given model.
     ///
-    /// Looks up `providerFallbacks` in the config. If a matching entry is found,
-    /// the chain includes the primary + its fallbacks. Otherwise the chain has
-    /// only the requested model with no fallbacks.
-    pub fn from_config(config: &ProviderFallbackConfig, model: &str) -> Self {
-        if let Some(fb) = config.find(model) {
-            Self::new(&fb.primary, &fb.fallbacks)
-        } else {
-            Self::new(model, &[])
-        }
+    /// The `fallbacks` list contains alternative model names. The primary is
+    /// the requested model itself (not a config-driven primary).
+    pub fn from_config(fallbacks: &[String], model: &str) -> Self {
+        Self::new(model, fallbacks)
     }
 
     /// Iterates primary → fallbacks, calling `send_fn` for each model.
@@ -211,11 +206,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_config_no_match_returns_self_chain() {
-        let config = ProviderFallbackConfig::default();
-        let chain = FallbackChain::from_config(&config, "some-model");
-        assert_eq!(chain.primary, "some-model");
-        assert!(chain.fallbacks.is_empty());
+    async fn from_config_uses_fallbacks_list() {
+        let fallbacks = vec!["fb1".to_string(), "fb2".to_string()];
+        let chain = FallbackChain::from_config(&fallbacks, "primary");
+        assert_eq!(chain.primary, "primary");
+        assert_eq!(chain.fallbacks, vec!["fb1", "fb2"]);
     }
 
     #[tokio::test]

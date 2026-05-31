@@ -114,7 +114,7 @@ pub use config::{
     GateAutoFixConfig, GatewayConfig, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
     McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig,
     McpTransport, McpWebSocketServerConfig, MemoryConfig, OAuthConfig, PlatformConfig as GatewayPlatformConfig,
-    ProviderFallbackConfig, ProviderFallbackEntry, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
+    ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
     RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
     SessionResetPolicy, COWD_SETTINGS_SCHEMA_NAME,
 };
