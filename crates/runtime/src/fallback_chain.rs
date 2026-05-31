@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Retryable HTTP status codes that trigger a fallback switch.
-const RETRYABLE_STATUSES: &[&str] = &["429", "500", "502", "503", "504"];
+const RETRYABLE_STATUSES: &[&str] = &["408", "409", "429", "500", "502", "503", "504"];
 
 /// Provider fallback chain that automatically retries on retryable errors
 /// across a primary model and its ordered list of fallback models.

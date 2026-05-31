@@ -2721,7 +2721,7 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
 /// Check whether an error string indicates a retryable HTTP status (429/5xx).
 #[inline]
 fn is_retryable_error(err_str: &str) -> bool {
-    const RETRYABLE: &[&str] = &["429", "500", "502", "503", "504"];
+    const RETRYABLE: &[&str] = &["408", "409", "429", "500", "502", "503", "504"];
     RETRYABLE.iter().any(|code| err_str.contains(code))
 }
 
