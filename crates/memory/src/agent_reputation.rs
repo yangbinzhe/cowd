@@ -167,9 +167,10 @@ impl ReputationManager {
 
     /// Get a connection from the pool.
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, MemoryError> {
-        self.pool
-            .get()
-            .map_err(|e| MemoryError::Store(e.to_string()))
+        let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+            .map_err(|e| MemoryError::Store(e.to_string()))?;
+        Ok(conn)
     }
 
     // -----------------------------------------------------------------------
