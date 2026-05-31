@@ -200,6 +200,18 @@ pub fn env_var(key: &str) -> String {
     buf
 }
 
+/// Expand a leading `~` in a path to the user's home directory.
+/// Returns the original path unchanged if no `~` prefix is found.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home_dir().join(rest);
+    }
+    if path == "~" {
+        return home_dir();
+    }
+    PathBuf::from(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

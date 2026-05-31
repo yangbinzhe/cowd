@@ -9,6 +9,7 @@
 #![deny(deprecated)]
 
 pub mod cowd_dirs;
+pub use cowd_dirs::expand_tilde;
 pub mod error;
 pub mod storage;
 mod bash;

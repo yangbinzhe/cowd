@@ -1483,13 +1483,17 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
     }
     config.external_directories =
         optional_string_array(plugins, "externalDirectories", "merged settings.plugins")?
+            .map(|v| v.into_iter().map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string()).collect())
             .unwrap_or_default();
     config.install_root =
-        optional_string_dual(plugins, "install_root", "merged settings.plugins")?.map(str::to_string);
+        optional_string_dual(plugins, "install_root", "merged settings.plugins")?
+            .map(|s| crate::cowd_dirs::expand_tilde(s).display().to_string());
     config.registry_path =
-        optional_string_dual(plugins, "registry_path", "merged settings.plugins")?.map(str::to_string);
+        optional_string_dual(plugins, "registry_path", "merged settings.plugins")?
+            .map(|s| crate::cowd_dirs::expand_tilde(s).display().to_string());
     config.bundled_root =
-        optional_string_dual(plugins, "bundled_root", "merged settings.plugins")?.map(str::to_string);
+        optional_string_dual(plugins, "bundled_root", "merged settings.plugins")?
+            .map(|s| crate::cowd_dirs::expand_tilde(s).display().to_string());
     config.max_output_tokens = optional_u32(plugins, "maxOutputTokens", "merged settings.plugins")?
         .or_else(|| std::env::var("COWD_MAX_OUTPUT_TOKENS").ok().and_then(|v| v.parse().ok()));
     Ok(config)
@@ -1550,6 +1554,7 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         network_isolation: optional_bool(sandbox, "networkIsolation", "merged settings.sandbox")?,
         filesystem_mode,
         allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
+            .map(|v| v.into_iter().map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string()).collect())
             .unwrap_or_default(),
     })
 }
@@ -1659,6 +1664,7 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
     };
     Ok(
         optional_string_array_dual(object, "trusted_roots", "merged settings")?
+            .map(|v| v.into_iter().map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string()).collect())
             .unwrap_or_default(),
     )
 }
@@ -1673,17 +1679,7 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     let mem = expect_object(mem_value, "merged settings.memory")?;
     let enabled = optional_bool(mem, "enabled", "merged settings.memory")?;
     let store_path = optional_string_dual(mem, "store_path", "merged settings.memory")?
-        .map(|s| {
-            if s.starts_with('~') {
-                if let Ok(home) = std::env::var("HOME") {
-                    PathBuf::from(s.replacen('~', &home, 1))
-                } else {
-                    PathBuf::from(s)
-                }
-            } else {
-                PathBuf::from(s)
-            }
-        });
+        .map(|s| crate::cowd_dirs::expand_tilde(s));
     let layers = if let Some(layers_val) = mem.get("layers") {
         let l = expect_object(layers_val, "merged settings.memory.layers")?;
         LayerConfig {
