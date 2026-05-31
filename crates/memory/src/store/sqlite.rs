@@ -48,9 +48,19 @@ fn new_pool(db_path: &str, max_size: u32) -> Result<Pool<SqliteConnectionManager
         .build(manager)
         .map_err(|e| MemoryError::Store(e.to_string()))?;
     let conn = pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
-        .map_err(sql_err)?;
+    exec_pragma(&conn, "PRAGMA journal_mode=WAL")?;
+    exec_pragma(&conn, "PRAGMA foreign_keys=ON")?;
+    exec_pragma(&conn, "PRAGMA busy_timeout=5000")?;
     Ok(pool)
+}
+
+/// Execute a pragma that may return rows (rusqlite 0.31+ treats this as an error).
+fn exec_pragma(conn: &Connection, sql: &str) -> Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::ExecuteReturnedResults) => Ok(()),
+        Err(e) => Err(sql_err(e)),
+    }
 }
 
 fn sql_err(e: rusqlite::Error) -> MemoryError {

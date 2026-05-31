@@ -14,7 +14,7 @@
 
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MemoryError;
@@ -38,6 +38,15 @@ fn new_pool(db_path: &str, max_size: u32) -> Result<Pool<SqliteConnectionManager
 
 fn sql_err(e: rusqlite::Error) -> MemoryError {
     MemoryError::Store(e.to_string())
+}
+
+/// Execute a pragma that may return rows (rusqlite 0.31+ treats this as an error).
+fn exec_pragma(conn: &Connection, sql: &str) -> Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::ExecuteReturnedResults) => Ok(()),
+        Err(e) => Err(sql_err(e)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +101,7 @@ impl VerbatimSink {
     /// Get a connection from the pool with `PRAGMA foreign_keys=ON`.
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(sql_err)?;
+        exec_pragma(&conn, "PRAGMA foreign_keys=ON")?;
         Ok(conn)
     }
 
