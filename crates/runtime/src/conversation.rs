@@ -253,7 +253,8 @@ pub struct ConversationRuntime<C, T> {
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
-bus: Option<crate::bus::EventBus>,
+    bus: Option<crate::bus::EventBus>,
+    cowd_bus: Option<Arc<crate::cowd_event::CowdEventBus>>,
     turn_callback: Option<Arc<TurnCallback>>,
     profiler: crate::context_profiler::ContextProfiler,
     use_aaak_index: bool,
@@ -418,6 +419,7 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             bus: None,
+            cowd_bus: None,
             turn_callback: None,
             profiler: crate::context_profiler::ContextProfiler::new(),
             use_aaak_index: feature_config.memory().aaak_index_enabled,
@@ -642,6 +644,21 @@ where
             // Watcher is started lazily on first turn (L1409) to ensure tokio context
             self.discussion_engine = Some(Arc::new(std::sync::Mutex::new(engine)));
         }
+        self
+    }
+
+    /// Attach a CowdEventBus for domain event emission and drain pending warnings.
+    #[must_use]
+    pub fn with_cowd_event_bus(mut self, bus: crate::cowd_event::CowdEventBus) -> Self {
+        // Drain config warnings into the cowd bus now that it's available
+        if let Ok(mut pending) = crate::config::PENDING_WARNINGS.lock() {
+            for event in pending.drain(..) {
+                if let crate::bus::Event::Warning { message } = event {
+                    let _ = bus.emit(crate::cowd_event::CowdEvent::Warning { message });
+                }
+            }
+        }
+        self.cowd_bus = Some(Arc::new(bus));
         self
     }
 
@@ -1106,6 +1123,9 @@ pub async fn run_turn_async(
                                     model_current_text.push_str(&text);
                                     if let Some(ref bus) = self.bus {
                                         bus.emit(crate::bus::Event::TextDelta { content: text.clone() });
+                                    }
+                                    if let Some(ref cowd) = self.cowd_bus {
+                                        cowd.emit(crate::cowd_event::CowdEvent::TextDelta { text: text.clone() });
                                     }
                                     model_stream_events.push(("text_delta".into(), "assistant".into(), text[..text.len().min(80)].to_string(), 3));
                                     if let Some(ref cb) = self.sse_callback {
@@ -1619,6 +1639,21 @@ self.record_turn_completed(&summary);
                 model: "async".to_string(),
             });
         }
+        if let Some(ref cowd) = self.cowd_bus {
+            let assistant_text = summary.assistant_messages
+                .iter()
+                .flat_map(|m| m.blocks.iter())
+                .filter_map(|b| match b {
+                    crate::session::ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            cowd.emit(crate::cowd_event::CowdEvent::TurnComplete {
+                assistant_text,
+                iterations: summary.iterations as u32,
+            });
+        }
         Ok(summary)
     }
 
@@ -1789,6 +1824,9 @@ self.record_turn_completed(&summary);
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 if let Some(ref bus) = self.bus {
                     bus.emit(crate::bus::Event::ToolExecuted { name: tool_name.to_string(), duration_ms: elapsed_ms });
+                }
+                if let Some(ref cowd) = self.cowd_bus {
+                    cowd.emit(crate::cowd_event::CowdEvent::ToolExecuted { name: tool_name.to_string(), duration_ms: elapsed_ms });
                 }
 
                 // T36: Truncate oversized tool results before storing.
