@@ -1151,6 +1151,9 @@ pub async fn run_turn_async(
                                         });
                                         cb(json.to_string());
                                     }
+                                    if let Some(ref cowd) = self.cowd_bus {
+                                        cowd.emit(crate::cowd_event::CowdEvent::ThinkingDelta { thinking: thinking.clone() });
+                                    }
                                 }
                                 Ok(AssistantEvent::SignatureDelta(signature)) => {
                                     model_thinking_signature = Some(signature);
@@ -1174,6 +1177,9 @@ pub async fn run_turn_async(
                                             "preview": &preview,
                                         });
                                         cb(json.to_string());
+                                    }
+                                    if let Some(ref cowd) = self.cowd_bus {
+                                        cowd.emit(crate::cowd_event::CowdEvent::ToolStart { id: id.clone(), name: name.clone(), preview: preview.clone() });
                                     }
                                 }
                                 Ok(AssistantEvent::ToolProgress { id, name, progress }) => {

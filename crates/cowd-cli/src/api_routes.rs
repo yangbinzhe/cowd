@@ -341,24 +341,7 @@ async fn send_message(
     let session_id = id.clone();
     let event_bus = Arc::clone(&state.event_bus);
 
-    // Phase 1: Subscribe runtime EventBus → forward TextDelta to SessionEventBus
-    // This phase is Send — it only spawns a background task and drops the guard.
-    {
-        let runtime_guard = runtime_entry.lock().await;
-        if let Some(bus) = runtime_guard.bus() {
-            let mut rx = bus.subscribe();
-            let eb = event_bus.clone();
-            let sid = session_id.clone();
-            tokio::spawn(async move {
-                while let Ok(event) = rx.recv().await {
-                    if let runtime::bus::Event::TextDelta { content } = event {
-                        let sse = serde_json::json!({"type":"TextDelta","content":content});
-                        let _ = eb.broadcast(&sid, &sse.to_string()).await;
-                    }
-                }
-            });
-        }
-    } // runtime_guard dropped — no MutexGuard held across the .await below
+
 
     // Phase 1b: Subscribe CowdEventBus → forward text/thinking/tool events to SessionEventBus
     {
