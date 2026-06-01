@@ -630,8 +630,8 @@ where
     pub fn with_event_bus(mut self, bus: crate::bus::EventBus) -> Self {
         self.bus = Some(bus.clone());
         if let Some(ref mem) = self.memory_manager {
-            let mut engine = DiscussionEngine::new(Arc::new(bus), Arc::clone(mem));
-            engine.start_watcher();
+            let engine = DiscussionEngine::new(Arc::new(bus), Arc::clone(mem));
+            // Watcher is started lazily on first turn (L1409) to ensure tokio context
             self.discussion_engine = Some(Arc::new(std::sync::Mutex::new(engine)));
         }
         self
