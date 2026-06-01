@@ -48,8 +48,8 @@ impl TeamDiscoveryProtocol {
             .map_err(|e| format!("open db: {e}"))?;
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
             .map_err(|e| format!("WAL pragma: {e}"))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
-            .map_err(|e| format!("pragma: {e}"))?;
+        let _ = conn.execute("PRAGMA foreign_keys=ON", []);
+        let _ = conn.execute("PRAGMA busy_timeout=5000", []);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS teams (
                 team_id    TEXT PRIMARY KEY,

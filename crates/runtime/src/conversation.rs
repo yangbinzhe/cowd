@@ -828,10 +828,12 @@ where
         };
         let mgr = Arc::clone(mgr);
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                if let Err(err) = handle.block_on(mgr.restore_handoff(data)) {
-                    tracing::warn!(%err, "memory: failed to restore handoff");
-                }
+            Ok(_handle) => {
+                tokio::spawn(async move {
+                    if let Err(err) = mgr.restore_handoff(data).await {
+                        tracing::warn!(%err, "memory: failed to restore handoff");
+                    }
+                });
             }
             Err(_) => {
                 tracing::warn!("memory: no tokio runtime, cannot restore handoff");
