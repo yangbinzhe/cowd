@@ -7163,12 +7163,22 @@ fn build_runtime_with_plugin_state(
     if let Some(callback) = tool_callback {
         runtime = runtime.with_tool_callback(callback);
     }
-    let bus = runtime::bus::EventBus::new(256);
-    runtime = runtime.with_event_bus(bus);
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
-    runtime = runtime.with_event_bus(runtime::bus::EventBus::new(256));
+    let bus = runtime::bus::EventBus::new(256);
+    runtime = runtime.with_event_bus(bus.clone());
+    // Bridge runtime EventBus → TuiEvent for notifications
+    if let Some(tx) = stream_callback.clone() {
+        let mut rx = bus.subscribe();
+        std::thread::spawn(move || {
+            while let Ok(event) = rx.blocking_recv() {
+                if let runtime::bus::Event::Warning { message } = event {
+                    let _ = tx.send(crate::tui::TuiEvent::Warning { message });
+                }
+            }
+        });
+    }
     // Wire the production sub-agent executor so the collaboration pipeline
     // can delegate real work to sub-agents.
     {

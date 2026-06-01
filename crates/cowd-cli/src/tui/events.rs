@@ -59,6 +59,8 @@ pub enum TuiEvent {
     SessionDeleted { id: String },
     /// Session switched (active session changed)
     SessionSwitched { id: String, name: String },
+    /// Config or runtime warning that should be shown to the user
+    Warning { message: String },
 }
 
 /// Channel sender/receiver type aliases for the TUI event pipeline.

@@ -999,6 +999,9 @@ impl App {
                 self.active_session_name = name;
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
+            TuiEvent::Warning { message } => {
+                self.show_notification(&message);
+            }
         }
     }
 }
