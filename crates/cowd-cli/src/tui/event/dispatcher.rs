@@ -23,7 +23,7 @@ use std::sync::Mutex;
 /// ## Design notes
 /// - Uses `std::sync::mpsc::channel()` (unbounded) for fire-and-forget sends.
 /// - Priority ordering is applied at drain time via `BinaryHeap`.
-/// - Not related to `tui::events::TuiEvent` — this is an orthogonal channel
+/// - Not related to `tui::events::CowdEvent` — this is an orthogonal channel
 ///   for TUI-internal component-to-dispatcher messages.
 pub struct EventBus {
     /// Clonable sender for fire-and-forget event submission.

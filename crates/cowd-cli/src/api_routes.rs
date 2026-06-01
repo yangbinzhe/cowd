@@ -369,8 +369,11 @@ async fn send_message(
                             eb.tool_complete(&sid, &id, &name, &summary, exit_code).await;
                         }
                         // Events without dedicated SessionEventBus methods (SSE relay not needed yet)
-                        runtime::CowdEvent::TurnComplete { .. }
-                        | runtime::CowdEvent::TurnError { .. }
+                        runtime::CowdEvent::TurnComplete { assistant_text, iterations, .. } => {
+                            let json = serde_json::json!({"type":"TurnComplete","text":assistant_text,"iterations":iterations});
+                            eb.broadcast(&sid, &json.to_string()).await;
+                        }
+                        runtime::CowdEvent::TurnError { .. }
                         | runtime::CowdEvent::Warning { .. }
                         | runtime::CowdEvent::TokenUsage { .. }
                         | runtime::CowdEvent::TurnStarted

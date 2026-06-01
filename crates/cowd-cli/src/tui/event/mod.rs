@@ -142,11 +142,11 @@ mod tests {
 
     // ── existing_events_tests_still_pass ──────────────────────
     // Verifies backward compatibility: the CowdEvent channel
-    // (tui_event_channel / TuiEventSender / TuiEventReceiver)
+    // (cowd_event_channel / CowdEventSender / CowdEventReceiver)
     // in tui::events still works after the EventBus module is introduced.
     #[test]
     fn existing_events_tests_still_pass() {
-        let (tx, rx) = crate::tui::events::tui_event_channel();
+        let (tx, rx) = crate::tui::events::cowd_event_channel();
         tx.send(runtime::CowdEvent::TextDelta {
             text: "backward-compat".into(),
         })

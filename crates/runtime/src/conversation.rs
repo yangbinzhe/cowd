@@ -1000,6 +1000,10 @@ pub async fn run_turn_async(
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
 
+        if let Some(ref cowd) = self.cowd_bus {
+            cowd.emit(crate::cowd_event::CowdEvent::TurnStarted);
+        }
+
         loop {
             iterations += 1;
             if iterations > self.max_iterations {

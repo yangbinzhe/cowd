@@ -2855,7 +2855,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let (tui_tx, tui_rx) = tui::tui_event_channel();
+    let (tui_tx, tui_rx) = tui::cowd_event_channel();
 
     let session_id = cli.session.id.clone();
     let mut state = TuiState::new(&cli.model, &session_id);
@@ -3060,7 +3060,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(16)) => {
-                    drain_tui_events_state(&tui_rx, &mut state);
+                    drain_cowd_events_state(&tui_rx, &mut state);
                     if turn_handle.as_ref().is_some_and(|h| h.is_finished()) {
                         turn_handle = None;
                         state.is_loading = false;
@@ -3087,7 +3087,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
 /// Process all pending CowdEvents from the channel without blocking,
 /// routing through TuiState::apply_event for EventBus bridging.
-fn drain_tui_events_state(rx: &tui::TuiEventReceiver, state: &mut tui::state::TuiState) {
+fn drain_cowd_events_state(rx: &tui::CowdEventReceiver, state: &mut tui::state::TuiState) {
     let mut count = 0;
     let limit = if state.turn_active { 64 } else { 256 };
     while let Ok(event) = rx.try_recv() {
@@ -3263,7 +3263,7 @@ where F: FnOnce() -> Result<R, Box<dyn std::error::Error>>
     Ok((result?, buf))
 }
 
-fn drain_tui_events(rx: &tui::TuiEventReceiver, app: &mut tui::App) {
+fn drain_cowd_events(rx: &tui::CowdEventReceiver, app: &mut tui::App) {
     let mut count = 0;
     let limit = if app.turn_active { 64 } else { 256 };
     while let Ok(event) = rx.try_recv() {

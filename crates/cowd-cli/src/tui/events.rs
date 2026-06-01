@@ -10,14 +10,14 @@ use std::sync::mpsc;
 pub use runtime::CowdEvent as TuiEvent;
 
 /// Channel sender/receiver type aliases for the event pipeline.
-pub type TuiEventSender = mpsc::SyncSender<runtime::CowdEvent>;
-pub type TuiEventReceiver = mpsc::Receiver<runtime::CowdEvent>;
+pub type CowdEventSender = mpsc::SyncSender<runtime::CowdEvent>;
+pub type CowdEventReceiver = mpsc::Receiver<runtime::CowdEvent>;
 
 /// Create a bounded event channel.
 /// Buffer size 2048 provides headroom for bursty streaming events
 /// without dropping, while bounded to prevent runaway memory.
 #[must_use]
-pub fn tui_event_channel() -> (TuiEventSender, TuiEventReceiver) {
+pub fn cowd_event_channel() -> (CowdEventSender, CowdEventReceiver) {
     mpsc::sync_channel::<runtime::CowdEvent>(256)
 }
 
@@ -27,7 +27,7 @@ mod tests {
 
     #[test]
     fn event_channel_send_recv() {
-        let (tx, rx) = tui_event_channel();
+        let (tx, rx) = cowd_event_channel();
         tx.send(runtime::CowdEvent::TextDelta { text: "hello".into() }).unwrap();
         let event = rx.recv().unwrap();
         assert!(matches!(event, runtime::CowdEvent::TextDelta { text } if text == "hello"));
@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn channel_backpressure_no_panic() {
-        let (tx, _rx) = tui_event_channel();
+        let (tx, _rx) = cowd_event_channel();
         for i in 0..256 {
             let _ = tx.try_send(runtime::CowdEvent::TextDelta { text: format!("msg{i}") });
         }

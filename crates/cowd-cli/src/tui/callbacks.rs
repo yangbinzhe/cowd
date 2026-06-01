@@ -94,7 +94,7 @@ mod tests {
 
     #[test]
     fn tool_start_sends_event() {
-        let (tx, rx) = crate::tui::tui_event_channel();
+        let (tx, rx) = crate::tui::cowd_event_channel();
         let cb = TuiToolCallback::new(tx, None);
         cb.on_tool_start("t1", "bash", "ls -la");
         let event = rx.recv().unwrap();
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn tool_progress_sends_event() {
-        let (tx, rx) = crate::tui::tui_event_channel();
+        let (tx, rx) = crate::tui::cowd_event_channel();
         let cb = TuiToolCallback::new(tx, None);
         cb.on_tool_progress("t1", "bash", "running...");
         let event = rx.recv().unwrap();
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn tool_complete_sends_event() {
-        let (tx, rx) = crate::tui::tui_event_channel();
+        let (tx, rx) = crate::tui::cowd_event_channel();
         let cb = TuiToolCallback::new(tx, None);
         cb.on_tool_complete("t1", "bash", "files listed", Some(0));
         let event = rx.recv().unwrap();
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn tool_complete_error_exit_code() {
-        let (tx, rx) = crate::tui::tui_event_channel();
+        let (tx, rx) = crate::tui::cowd_event_channel();
         let cb = TuiToolCallback::new(tx, None);
         cb.on_tool_complete("t2", "grep", "not found", Some(1));
         let event = rx.recv().unwrap();
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn channel_full_applies_backpressure() {
-        let (tx, rx) = crate::tui::tui_event_channel();
+        let (tx, rx) = crate::tui::cowd_event_channel();
         let cb = TuiToolCallback::new(tx, None);
         // Spawn a drainer that matches the producer rate
         let _drainer = std::thread::spawn(move || {
