@@ -11,7 +11,7 @@ pub enum Effect {
     ExecuteTool(String, String),
     ApiCall(crate::conversation::ApiRequest),
     MemorySearch(String),
-    EmitEvent(crate::bus::Event),
+    EmitEvent(crate::cowd_event::CowdEvent),
 }
 
 /// Result of handling an Effect.
@@ -68,5 +68,5 @@ mod tests {
 
     #[test] fn p210_read_file_effect() { let h = RealEffectHandler; let r = h.handle(Effect::ReadFile(PathBuf::from("/dev/null"))); assert!(r.success); }
     #[test] fn p210_mock_handler_returns_predefined() { let mut m = MockEffectHandler { responses: Default::default() }; m.responses.insert("search:test".into(), "result".into()); let r = m.handle(Effect::MemorySearch("test".into())); assert_eq!(r.data, "result"); }
-    #[test] fn p210_emit_event_is_noop() { let h = RealEffectHandler; let r = h.handle(Effect::EmitEvent(crate::bus::Event::SessionCreated{id:"x".into()})); assert!(r.success); }
+    #[test] fn p210_emit_event_is_noop() { let h = RealEffectHandler; let r = h.handle(Effect::EmitEvent(crate::cowd_event::CowdEvent::Warning{message:"x".into()})); assert!(r.success); }
 }

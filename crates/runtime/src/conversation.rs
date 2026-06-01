@@ -253,7 +253,6 @@ pub struct ConversationRuntime<C, T> {
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
-    bus: Option<crate::bus::EventBus>,
     cowd_bus: Option<Arc<crate::cowd_event::CowdEventBus>>,
     turn_callback: Option<Arc<TurnCallback>>,
     profiler: crate::context_profiler::ContextProfiler,
@@ -418,7 +417,6 @@ where
             max_iterations: usize::MAX,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
-            bus: None,
             cowd_bus: None,
             turn_callback: None,
             profiler: crate::context_profiler::ContextProfiler::new(),
@@ -482,13 +480,6 @@ where
     pub fn with_tool_timeout(mut self, timeout: Duration) -> Self {
         self.tool_timeout = Some(timeout);
         self
-    }
-
-    /// Return a new subscriber for runtime bus events.
-    /// Returns `None` if no bus has been wired.
-    #[must_use]
-    pub fn subscribe_to_bus(&self) -> Option<tokio::sync::broadcast::Receiver<crate::bus::Event>> {
-        self.bus.as_ref().map(|bus| bus.subscribe())
     }
 
     /// Return a human-readable description of memory subsystem health.
@@ -627,44 +618,24 @@ where
         self
     }
 
-    /// M9: Attach an EventBus for publish/subscribe module communication.
-    #[must_use]
-    pub fn with_event_bus(mut self, bus: crate::bus::EventBus) -> Self {
-        self.bus = Some(bus.clone());
-
-        // Drain config warnings into the bus now that it's available
-        if let Ok(mut pending) = crate::config::PENDING_WARNINGS.lock() {
-            for event in pending.drain(..) {
-                let _ = bus.emit(event);
-            }
-        }
-
-        if let Some(ref mem) = self.memory_manager {
-            let engine = DiscussionEngine::new(Arc::new(bus), Arc::clone(mem));
-            // Watcher is started lazily on first turn (L1409) to ensure tokio context
-            self.discussion_engine = Some(Arc::new(std::sync::Mutex::new(engine)));
-        }
-        self
-    }
-
     /// Attach a CowdEventBus for domain event emission and drain pending warnings.
     #[must_use]
     pub fn with_cowd_event_bus(mut self, bus: crate::cowd_event::CowdEventBus) -> Self {
         // Drain config warnings into the cowd bus now that it's available
         if let Ok(mut pending) = crate::config::PENDING_WARNINGS.lock() {
             for event in pending.drain(..) {
-                if let crate::bus::Event::Warning { message } = event {
+                if let crate::cowd_event::CowdEvent::Warning { message } = event {
                     let _ = bus.emit(crate::cowd_event::CowdEvent::Warning { message });
                 }
             }
         }
-        self.cowd_bus = Some(Arc::new(bus));
+        self.cowd_bus = Some(Arc::new(bus.clone()));
+        if let Some(ref mem) = self.memory_manager {
+            let engine = DiscussionEngine::new(Arc::new(bus), Arc::clone(mem));
+            // Watcher is started lazily on first turn (L1409) to ensure tokio context
+            self.discussion_engine = Some(Arc::new(std::sync::Mutex::new(engine)));
+        }
         self
-    }
-
-    /// M9: Get a reference to the attached EventBus, if any.
-    pub fn bus(&self) -> Option<&crate::bus::EventBus> {
-        self.bus.as_ref()
     }
 
     /// Get a reference to the attached CowdEventBus, if any.
@@ -1126,9 +1097,6 @@ pub async fn run_turn_async(
                             match next_event {
                                 Ok(AssistantEvent::TextDelta(text)) => {
                                     model_current_text.push_str(&text);
-                                    if let Some(ref bus) = self.bus {
-                                        bus.emit(crate::bus::Event::TextDelta { content: text.clone() });
-                                    }
                                     if let Some(ref cowd) = self.cowd_bus {
                                         cowd.emit(crate::cowd_event::CowdEvent::TextDelta { text: text.clone() });
                                     }
@@ -1195,6 +1163,9 @@ pub async fn run_turn_async(
                                         });
                                         cb(json.to_string());
                                     }
+                                    if let Some(ref cowd) = self.cowd_bus {
+                                        cowd.emit(crate::cowd_event::CowdEvent::ToolProgress { id: id.clone(), name: name.clone(), progress: progress.clone() });
+                                    }
                                 }
                                 Ok(AssistantEvent::PromptCache(event)) => {
                                     prompt_cache_events.push(event);
@@ -1212,6 +1183,9 @@ pub async fn run_turn_async(
                                             "exit_code": exit_code,
                                         });
                                         cb(json.to_string());
+                                    }
+                                    if let Some(ref cowd) = self.cowd_bus {
+                                        cowd.emit(crate::cowd_event::CowdEvent::ToolComplete { id: id.clone(), name: name.clone(), summary: result_summary.clone(), exit_code });
                                     }
                                 }
                                 Ok(_) => {}
@@ -1644,12 +1618,6 @@ pub async fn run_turn_async(
         };
 self.record_turn_completed(&summary);
         tracing::info!(iterations = %summary.iterations, tokens = %summary.usage.total_tokens(), "turn completed");
-        if let Some(ref bus) = self.bus {
-            bus.emit(crate::bus::Event::TurnCompleted {
-                tokens: summary.usage.total_tokens(),
-                model: "async".to_string(),
-            });
-        }
         if let Some(ref cowd) = self.cowd_bus {
             let assistant_text = summary.assistant_messages
                 .iter()
@@ -1833,9 +1801,6 @@ self.record_turn_completed(&summary);
                 }
 
                 let elapsed_ms = start.elapsed().as_millis() as u64;
-                if let Some(ref bus) = self.bus {
-                    bus.emit(crate::bus::Event::ToolExecuted { name: tool_name.to_string(), duration_ms: elapsed_ms });
-                }
                 if let Some(ref cowd) = self.cowd_bus {
                     cowd.emit(crate::cowd_event::CowdEvent::ToolExecuted { name: tool_name.to_string(), duration_ms: elapsed_ms });
                 }

@@ -15,8 +15,8 @@ pub trait LifecycleHook: Send + Sync {
 
 pub struct HookRunner {
     hooks: Vec<Box<dyn LifecycleHook>>,
-    /// M9: optional EventBus for tool lifecycle events
-    pub bus: Option<crate::bus::EventBus>,
+    /// M9: optional CowdEventBus for tool lifecycle events
+    pub bus: Option<crate::cowd_event::CowdEventBus>,
 }
 
 impl HookRunner {
@@ -32,7 +32,7 @@ impl HookRunner {
     pub async fn fire_post_tool(&self, name: &str, result: &str, is_error: bool, duration_ms: u64) {
         for hook in &self.hooks { let _ = hook.post_tool_call(name, result, is_error).await; }
         if let Some(ref bus) = self.bus {
-            bus.emit(crate::bus::Event::ToolExecuted { name: name.to_string(), duration_ms });
+            bus.emit(crate::cowd_event::CowdEvent::ToolExecuted { name: name.to_string(), duration_ms });
         }
     }
     pub async fn fire_turn_end(&self, summary: &str) {

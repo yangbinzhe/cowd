@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing;
 
-use crate::bus::{Event, EventBus};
+use crate::cowd_event::{CowdEvent, CowdEventBus};
 
 use memory::agent_directory::AgentInfo;
 use memory::cognitive::CognitiveContextManager;
@@ -166,8 +166,8 @@ impl Discussion {
 /// Orchestrates multi-agent discussions with round-based contributions,
 /// L4-backed knowledge sharing, and consensus computation.
 pub struct DiscussionEngine {
-    /// Reference to the event bus for TurnCompleted subscription.
-    pub event_bus: Arc<EventBus>,
+    /// Reference to the cowd event bus for TurnCompleted subscription.
+    pub event_bus: Arc<CowdEventBus>,
     /// Reference to the cognitive context manager for L4 operations.
     pub memory: Arc<CognitiveContextManager>,
     /// Active discussion (one at a time).
@@ -180,7 +180,7 @@ pub struct DiscussionEngine {
 
 impl DiscussionEngine {
     /// Create a new discussion engine.
-    pub fn new(event_bus: Arc<EventBus>, memory: Arc<CognitiveContextManager>) -> Self {
+    pub fn new(event_bus: Arc<CowdEventBus>, memory: Arc<CognitiveContextManager>) -> Self {
         Self {
             event_bus,
             memory,
@@ -205,18 +205,13 @@ impl DiscussionEngine {
 
         let mut rx = self.event_bus.subscribe();
         let memory = Arc::clone(&self.memory);
-        let _bus = Arc::clone(&self.event_bus);
 
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h.spawn(async move {
                 loop {
                     match rx.recv().await {
-                        Ok(Event::TurnCompleted { tokens, model }) => {
-                            tracing::debug!(
-                                tokens,
-                                %model,
-                                "TurnCompleted: scanning L4 for conflicts"
-                            );
+                        Ok(CowdEvent::TurnComplete { .. }) => {
+                            tracing::debug!("TurnComplete: scanning L4 for conflicts");
 
                             // Query L4 for recent entries that may conflict.
                             match Self::detect_l4_conflicts(&memory).await {

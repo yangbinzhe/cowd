@@ -7165,21 +7165,8 @@ fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
-    let bus = runtime::bus::EventBus::new(256);
-    runtime = runtime.with_event_bus(bus.clone());
     let cowd_bus = runtime::CowdEventBus::new();
-    runtime = runtime.with_cowd_event_bus(cowd_bus.clone());
-    // Bridge runtime EventBus → CowdEvent for notifications
-    if let Some(tx) = stream_callback.clone() {
-        let mut rx = bus.subscribe();
-        std::thread::spawn(move || {
-            while let Ok(event) = rx.blocking_recv() {
-                if let runtime::bus::Event::Warning { message } = event {
-                    let _ = tx.send(runtime::CowdEvent::Warning { message });
-                }
-            }
-        });
-    }
+    runtime = runtime.with_cowd_event_bus(cowd_bus);
     // Wire the production sub-agent executor so the collaboration pipeline
     // can delegate real work to sub-agents.
     {

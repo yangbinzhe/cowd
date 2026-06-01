@@ -618,7 +618,7 @@ async fn test_reputation_flows_to_agent_directory() {
 async fn test_discussion_engine_detects_conflicts() {
     use memory::cognitive::CognitiveContextManager;
     use memory::config::MemoryConfig;
-    use runtime::bus::EventBus;
+    use runtime::cowd_event::CowdEventBus;
     use runtime::agent_discussion::DiscussionEngine;
     use std::sync::Arc;
 
@@ -639,7 +639,7 @@ async fn test_discussion_engine_detects_conflicts() {
     };
     let memory = Arc::new(memory);
 
-    let bus = Arc::new(EventBus::new(10));
+    let bus = Arc::new(CowdEventBus::new());
     let engine = DiscussionEngine::new(Arc::clone(&bus), Arc::clone(&memory));
 
     let conflicts = engine

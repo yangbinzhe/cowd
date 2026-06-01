@@ -45,7 +45,6 @@ pub mod lifecycle_hooks;
 pub mod plugin_lifecycle;
 pub mod provider_pool;
 pub mod effect;
-pub mod bus;
 pub mod context_profiler;
 pub mod platform;
 mod policy_engine;
