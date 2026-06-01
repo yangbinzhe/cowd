@@ -18,6 +18,9 @@ pub enum Event {
     ToolProgress { id: String, name: String, progress: String },
     ToolComplete { id: String, name: String, summary: String, exit_code: Option<i32> },
     SignatureDelta { signature: String },
+
+    /// Config/startup warnings that consumers (TUI/API) can display
+    Warning { message: String },
 }
 
 #[derive(Clone)]

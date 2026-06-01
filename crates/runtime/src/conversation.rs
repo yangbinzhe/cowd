@@ -629,6 +629,14 @@ where
     #[must_use]
     pub fn with_event_bus(mut self, bus: crate::bus::EventBus) -> Self {
         self.bus = Some(bus.clone());
+
+        // Drain config warnings into the bus now that it's available
+        if let Ok(mut pending) = crate::config::PENDING_WARNINGS.lock() {
+            for event in pending.drain(..) {
+                let _ = bus.emit(event);
+            }
+        }
+
         if let Some(ref mem) = self.memory_manager {
             let engine = DiscussionEngine::new(Arc::new(bus), Arc::clone(mem));
             // Watcher is started lazily on first turn (L1409) to ensure tokio context

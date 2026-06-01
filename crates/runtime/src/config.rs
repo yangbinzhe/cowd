@@ -1,6 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Config warnings buffered before the EventBus is available.
+/// Drained by ConversationRuntime::with_event_bus().
+pub static PENDING_WARNINGS: std::sync::LazyLock<Mutex<Vec<crate::bus::Event>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
 use serde::{Deserialize, Serialize};
 
@@ -824,6 +830,9 @@ impl ConfigLoader {
 
         for warning in &all_warnings {
             tracing::warn!("{warning}");
+            if let Ok(mut w) = PENDING_WARNINGS.lock() {
+                w.push(crate::bus::Event::Warning { message: warning.to_string() });
+            }
         }
 
         let merged_value = JsonValue::Object(merged.clone());
@@ -1565,7 +1574,11 @@ fn parse_fallbacks(root: &JsonValue) -> Vec<String> {
         return arr.iter().filter_map(|v| v.as_str()).map(str::to_string).collect();
     }
     if let Some(v) = find_key_dual(object, "provider_fallbacks", "merged settings") {
-        tracing::warn!("'providerFallbacks' is deprecated, use 'fallbacks' instead. All per-model chains are now merged into a single global list.");
+        let msg = "'providerFallbacks' is deprecated, use 'fallbacks' instead. All per-model chains are now merged into a single global list.".to_string();
+        tracing::warn!("{msg}");
+        if let Ok(mut w) = PENDING_WARNINGS.lock() {
+            w.push(crate::bus::Event::Warning { message: msg });
+        }
         return extract_fallbacks_from_legacy(v);
     }
     vec![]
