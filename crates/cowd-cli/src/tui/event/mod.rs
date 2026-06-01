@@ -1,7 +1,7 @@
 // ── Event System v2 — TUI-internal routing ──────────────────────
 // Core types: EventPriority, ComponentId, RoutedEvent.
 // Re-exports EventBus from dispatcher module.
-// Separate from tui::events (TuiEvent background→TUI protocol).
+// Separate from tui::events (CowdEvent background→TUI protocol).
 #![allow(dead_code)]
 
 use std::cmp::Ordering;
@@ -141,19 +141,19 @@ mod tests {
     }
 
     // ── existing_events_tests_still_pass ──────────────────────
-    // Verifies backward compatibility: the original TuiEvent channel
-    // (tui_event_channel / TuiEvent / TuiEventSender / TuiEventReceiver)
+    // Verifies backward compatibility: the CowdEvent channel
+    // (tui_event_channel / TuiEventSender / TuiEventReceiver)
     // in tui::events still works after the EventBus module is introduced.
     #[test]
     fn existing_events_tests_still_pass() {
         let (tx, rx) = crate::tui::events::tui_event_channel();
-        tx.send(crate::tui::events::TuiEvent::TextDelta {
+        tx.send(runtime::CowdEvent::TextDelta {
             text: "backward-compat".into(),
         })
         .unwrap();
         let event = rx.recv().unwrap();
         assert!(
-            matches!(event, crate::tui::events::TuiEvent::TextDelta { text } if text == "backward-compat")
+            matches!(event, runtime::CowdEvent::TextDelta { text } if text == "backward-compat")
         );
     }
 

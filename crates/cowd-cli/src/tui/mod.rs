@@ -25,5 +25,6 @@ pub mod render;
 mod tui_integration_tests;
 
 pub use app::{App, FileEntry, DelegateTask, MemoryEntry, SkillSummary};
+#[allow(unused_imports)]
 pub use events::{TuiEvent, TuiEventReceiver, tui_event_channel};
 pub use callbacks::{TuiMemoryCallback, TuiToolCallback};

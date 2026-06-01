@@ -3,7 +3,7 @@
 //   LayoutTree, KeybindEngine, EventBus, ThemeEngine, DialogManager.
 //
 // Delegates all App public methods via Deref/DerefMut.
-// Bridges old App::apply_event(TuiEvent) → EventBus for new components.
+// Bridges App::apply_event(CowdEvent) → EventBus for new components.
 // Orchestrates rendering via direct component layout + ChatView + dialogs.
 //
 // Architecture:
@@ -58,7 +58,7 @@ use crate::tui::keybind::{default_bindings, KeybindEngine};
 use crate::tui::layout::LayoutTree;
 use crate::tui::profiler::{FrameTimer, RenderProfiler};
 use crate::tui::theme::ThemeEngine;
-use crate::tui::TuiEvent;
+use runtime::CowdEvent;
 
 /// Result of processing a key event through the TUI input pipeline.
 #[derive(Debug, Clone)]
@@ -356,7 +356,7 @@ impl TuiState {
 
     // ── Event Bridging ──────────────────────────────────────────
 
-    /// Apply a `TuiEvent` from the background turn runner to the display.
+    /// Apply a `CowdEvent` from the background turn runner to the display.
     ///
     /// **Preserves existing behavior**: delegates to `App::apply_event()`
     /// for all timeline updates, token tracking, and state transitions.
@@ -368,9 +368,9 @@ impl TuiState {
     /// The synthetic event uses `Resize(0, 0)` as a signal since
     /// crossterm has no custom event type. Components should check
     /// for this and re-sync from App state as needed.
-    pub fn apply_event(&mut self, event: TuiEvent) {
+    pub fn apply_event(&mut self, event: CowdEvent) {
         // Push toast on errors
-        if let TuiEvent::TurnError { ref error } = event {
+        if let CowdEvent::TurnError { ref error } = event {
             self.toast_manager.push(
                 ToastVariant::Error,
                 Some("Error".into()),
@@ -1961,11 +1961,11 @@ mod tests {
     fn apply_event_text_delta_adds_to_timeline() {
         let mut state = TuiState::new("m", "s");
 
-        state.apply_event(TuiEvent::TurnStarted);
-        state.apply_event(TuiEvent::TextDelta {
+        state.apply_event(CowdEvent::TurnStarted);
+        state.apply_event(CowdEvent::TextDelta {
             text: "Hello world".into(),
         });
-        state.apply_event(TuiEvent::TurnComplete {
+        state.apply_event(CowdEvent::TurnComplete {
             assistant_text: String::new(),
             iterations: 1,
         });
@@ -1982,8 +1982,8 @@ mod tests {
     fn apply_event_tool_lifecycle() {
         let mut state = TuiState::new("m", "s");
 
-        state.apply_event(TuiEvent::TurnStarted);
-        state.apply_event(TuiEvent::ToolStart {
+        state.apply_event(CowdEvent::TurnStarted);
+        state.apply_event(CowdEvent::ToolStart {
             id: "t1".into(),
             name: "bash".into(),
             preview: "ls -la".into(),
@@ -1998,7 +1998,7 @@ mod tests {
     fn apply_event_token_usage_updates_counters() {
         let mut state = TuiState::new("m", "s");
 
-        state.apply_event(TuiEvent::TokenUsage {
+        state.apply_event(CowdEvent::TokenUsage {
             input: 100,
             output: 50,
             cache_create: 10,

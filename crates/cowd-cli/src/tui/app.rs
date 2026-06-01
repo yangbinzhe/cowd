@@ -2,7 +2,7 @@
 use std::collections::VecDeque;
 use tui_textarea::TextArea;
 use ratatui::widgets::{Block, Borders};
-use crate::tui::TuiEvent;
+use runtime::CowdEvent;
 use crate::tui::layout::{LayoutState, LayoutTree, build_default_layout};
 
 const PAGE_SIZE: usize = 500;
@@ -769,9 +769,9 @@ impl App {
         self.input_history.get(idx).cloned()
     }
 
-    pub fn apply_event(&mut self, event: TuiEvent) {
+    pub fn apply_event(&mut self, event: CowdEvent) {
         match event {
-            TuiEvent::TextDelta { text } => {
+            CowdEvent::TextDelta { text } => {
                 self.streaming_received = true;
                 self.auto_scroll = true;
                 let mut found = false;
@@ -794,7 +794,7 @@ impl App {
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
             }
 
-            TuiEvent::ThinkingDelta { thinking } => {
+            CowdEvent::ThinkingDelta { thinking } => {
                 let mut found = false;
                 if let Some(TimelineEntry::Thinking { content, complete, .. }) = self.timeline_last_mut() {
                     if !*complete {
@@ -818,7 +818,7 @@ impl App {
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
             }
 
-            TuiEvent::ThinkingComplete => {
+            CowdEvent::ThinkingComplete => {
                 if let Some(TimelineEntry::Thinking { complete, expanded, .. }) = self.timeline_last_mut() {
                     *complete = true;
                     *expanded = false;
@@ -826,7 +826,7 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::ToolStart { id, name, preview } => {
+            CowdEvent::ToolStart { id, name, preview } => {
                 self.auto_scroll = true;
                 self.timeline_push(TimelineEntry::ToolCall {
                     id,
@@ -841,7 +841,7 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::ToolProgress { id, name: _, progress } => {
+            CowdEvent::ToolProgress { id, name: _, progress } => {
                 let mut found_output: Option<&mut String> = None;
                 for entry in self.timeline_iter_mut() {
                     if let TimelineEntry::ToolCall { id: tid, output, .. } = entry {
@@ -859,7 +859,7 @@ impl App {
                 }
             }
 
-            TuiEvent::ToolComplete { id, name: _, summary, exit_code } => {
+            CowdEvent::ToolComplete { id, name: _, summary, exit_code } => {
                 let mut found: Option<(&mut String, &mut bool, &mut bool, &mut Option<i32>)> = None;
                 for entry in self.timeline_iter_mut() {
                     if let TimelineEntry::ToolCall { id: tid, output, done, expanded, exit_code: ec, .. } = entry {
@@ -877,7 +877,7 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::TokenUsage { input, output, cache_create, cache_read } => {
+            CowdEvent::TokenUsage { input, output, cache_create, cache_read } => {
                 self.input_tokens = input;
                 self.output_tokens = output;
                 self.token_count = input + output + cache_create + cache_read;
@@ -885,11 +885,11 @@ impl App {
                 self.turn_output_tokens = output.saturating_sub(self.pre_turn_output);
             }
 
-            TuiEvent::ContextWindow(ctx) => {
+            CowdEvent::ContextWindow(ctx) => {
                 self.context_window = ctx;
             }
 
-            TuiEvent::TurnStarted => {
+            CowdEvent::TurnStarted => {
                 self.is_loading = true;
                 self.turn_active = true;
                 self.streaming_received = false;
@@ -901,7 +901,7 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::TurnComplete { assistant_text, iterations: _ } => {
+            CowdEvent::TurnComplete { assistant_text, iterations: _ } => {
                 self.is_loading = false;
                 self.turn_active = false;
                 for entry in self.timeline_iter_mut() {
@@ -927,7 +927,7 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::TurnError { error } => {
+            CowdEvent::TurnError { error } => {
                 self.is_loading = false;
                 self.turn_active = false;
                 self.timeline_push(TimelineEntry::Message {
@@ -939,7 +939,7 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::CompactionNotice { removed_count } => {
+            CowdEvent::CompactionNotice { removed_count } => {
                 self.compaction_count += 1;
                 self.timeline_push(TimelineEntry::Message {
                     role: "system".into(),
@@ -950,7 +950,7 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::MemoryEntry { layer, content, relevance } => {
+            CowdEvent::MemoryEntry { layer, content, relevance } => {
                 self.timeline_push(TimelineEntry::Message {
                     role: "system".into(),
                     content: format!("[Memory:{layer}] (rel={relevance:.2}) {content}"),
@@ -960,7 +960,7 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::MemoryUpdate { entries, status } => {
+            CowdEvent::MemoryUpdate { entries, status } => {
                 self.timeline_push(TimelineEntry::Message {
                     role: "system".into(),
                     content: format!("[Memory] {status}: {} entries updated", entries.len()),
@@ -970,7 +970,7 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::MemoryStats { total_entries, vector_count, layers } => {
+            CowdEvent::MemoryStats { total_entries, vector_count, layers } => {
                 self.timeline_push(TimelineEntry::Message {
                     role: "system".into(),
                     content: format!("[Memory] total={total_entries}, vectors={vector_count}, layers={}", layers.join(", ")),
@@ -980,28 +980,31 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::SessionList { sessions } => {
+            CowdEvent::SessionList { sessions } => {
                 self.sessions = sessions;
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::SessionCreated { id, name } => {
+            CowdEvent::SessionCreated { id, name } => {
                 self.sessions.push((id, name, App::format_timestamp()));
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::SessionDeleted { id } => {
+            CowdEvent::SessionDeleted { id } => {
                 self.sessions.retain(|(sid, _, _)| sid != &id);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            TuiEvent::SessionSwitched { id: _, name } => {
+            CowdEvent::SessionSwitched { id: _, name } => {
                 self.active_session_name = name;
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
-            TuiEvent::Warning { message } => {
+            CowdEvent::Warning { message } => {
                 self.show_notification(&message);
             }
+
+            // New CowdEvent variants not yet consumed by TUI
+            _ => {}
         }
     }
 }

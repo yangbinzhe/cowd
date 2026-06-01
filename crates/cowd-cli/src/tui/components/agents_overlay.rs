@@ -320,7 +320,7 @@ mod tests {
 
         // Sync from app with done entries
         let mut app = App::new("m", "s");
-        app.apply_event(crate::tui::TuiEvent::ToolStart {
+        app.apply_event(runtime::CowdEvent::ToolStart {
             id: "t1".into(),
             name: "bash".into(),
             preview: "echo".into(),

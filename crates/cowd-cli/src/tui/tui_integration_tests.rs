@@ -21,7 +21,7 @@
 use crate::tui::app::App;
 use crate::tui::state::{ProcessedKey, TuiState};
 use crate::tui::test_utils::{MockTerminal, app_with_messages};
-use crate::tui::TuiEvent;
+use runtime::CowdEvent;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -46,14 +46,14 @@ fn integration_launch_type_stream() {
     assert!(matches!(result, ProcessedKey::Submit(text) if text == "Hello"));
 
     state.add_message("user", "Hello");
-    state.apply_event(TuiEvent::TurnStarted);
+    state.apply_event(CowdEvent::TurnStarted);
     assert!(state.turn_active);
     assert!(state.is_loading);
 
-    state.apply_event(TuiEvent::TextDelta {
+    state.apply_event(CowdEvent::TextDelta {
         text: "Hi there!".into(),
     });
-    state.apply_event(TuiEvent::TurnComplete {
+    state.apply_event(CowdEvent::TurnComplete {
         assistant_text: "Hi there!".into(),
         iterations: 1,
     });
@@ -286,8 +286,8 @@ fn integration_input_history_navigation() {
 fn integration_timeline_entry_lifecycle() {
     let mut state = TuiState::new("test-model", "test-session");
 
-    state.apply_event(TuiEvent::TurnStarted);
-    state.apply_event(TuiEvent::ToolStart {
+    state.apply_event(CowdEvent::TurnStarted);
+    state.apply_event(CowdEvent::ToolStart {
         id: "tool-1".into(),
         name: "bash".into(),
         preview: "ls -la".into(),
@@ -298,7 +298,7 @@ fn integration_timeline_entry_lifecycle() {
     });
     assert!(has_tool);
 
-    state.apply_event(TuiEvent::ToolComplete {
+    state.apply_event(CowdEvent::ToolComplete {
         id: "tool-1".into(),
         name: "bash".into(),
         summary: "file1 file2 file3".into(),

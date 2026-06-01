@@ -2663,8 +2663,7 @@ fn list_workspace_files(workspace: &PathBuf) -> Vec<tui::FileEntry> {
 }
 
 fn load_session_history(app: &mut tui::App, session: &runtime::Session) {
-    use runtime::{ContentBlock, MessageRole};
-    use crate::tui::TuiEvent;
+    use runtime::{ContentBlock, MessageRole, CowdEvent};
 
     for msg in &session.messages {
         match msg.role {
@@ -2691,7 +2690,7 @@ fn load_session_history(app: &mut tui::App, session: &runtime::Session) {
                             } else {
                                 input.clone()
                             };
-                            app.apply_event(TuiEvent::ToolStart {
+                            app.apply_event(CowdEvent::ToolStart {
                                 id: id.clone(),
                                 name: name.clone(),
                                 preview,
@@ -2701,7 +2700,7 @@ fn load_session_history(app: &mut tui::App, session: &runtime::Session) {
                             tool_use_id, output, is_error, ..
                         } => {
                             let exit = if *is_error { Some(1) } else { Some(0) };
-                            app.apply_event(TuiEvent::ToolComplete {
+                            app.apply_event(CowdEvent::ToolComplete {
                                 id: tool_use_id.clone(),
                                 name: String::new(),
                                 summary: output.clone(),
@@ -2921,7 +2920,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                 (r.session_id.clone(), name, r.created_at.clone())
             })
             .collect();
-        let _ = tui_tx.send(tui::TuiEvent::SessionList { sessions: session_list });
+        let _ = tui_tx.send(runtime::CowdEvent::SessionList { sessions: session_list });
     }
 
     // Startup phase: ready after init completes.
@@ -3021,21 +3020,21 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                     abort_flag = Some(abort_signal.clone());
                                     let task = std::thread::spawn(move || {
                                         tracing::debug!("TUI turn started");
-                                        let _ = tx.send(tui::TuiEvent::TurnStarted);
+                                        let _ = tx.send(runtime::CowdEvent::TurnStarted);
                                         if abort_signal.load(std::sync::atomic::Ordering::Relaxed) { return; }
                                         rt_handle.block_on(async move {
                                             match prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await {
                                                 Ok(summary) => {
                                                     let final_text = final_assistant_text(&summary);
                                                     tracing::info!(text_len = final_text.len(), iterations = summary.iterations, "TUI turn complete");
-                                                    let _ = tx.send(tui::TuiEvent::TurnComplete {
+                                                    let _ = tx.send(runtime::CowdEvent::TurnComplete {
                                                         assistant_text: final_text.clone(),
                                                         iterations: summary.iterations as u32,
                                                     });
                                                 }
                                                 Err(e) => {
                                                     tracing::error!(error = %e, "TUI turn error");
-                                                    let _ = tx.send(tui::TuiEvent::TurnError { error: e.to_string() });
+                                                    let _ = tx.send(runtime::CowdEvent::TurnError { error: e.to_string() });
                                                 }
                                             }
                                         });
@@ -3086,7 +3085,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     res
 }
 
-/// Process all pending TuiEvents from the channel without blocking,
+/// Process all pending CowdEvents from the channel without blocking,
 /// routing through TuiState::apply_event for EventBus bridging.
 fn drain_tui_events_state(rx: &tui::TuiEventReceiver, state: &mut tui::state::TuiState) {
     let mut count = 0;
@@ -3240,7 +3239,7 @@ fn consume_session_sidebar_actions(
     }
 }
 
-/// Process all pending TuiEvents from the channel without blocking.
+/// Process all pending CowdEvents from the channel without blocking.
 /// This is called at the top of the TUI render loop to keep the display
 /// in sync with the background turn runner.
 fn capture_stdout<F, R>(f: F) -> Result<(R, String), Box<dyn std::error::Error>>
@@ -3871,7 +3870,7 @@ impl LiveCli {
         &self,
         emit_output: bool,
         tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
-        stream_callback: Option<std::sync::mpsc::SyncSender<crate::tui::TuiEvent>>,
+        stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
     ) -> Result<(BuiltRuntime, HookAbortMonitor, runtime::HookAbortSignal), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
         let abort_for_caller = hook_abort_signal.clone();
@@ -7081,7 +7080,7 @@ pub(crate) fn build_runtime(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
-    stream_callback: Option<std::sync::mpsc::SyncSender<crate::tui::TuiEvent>>,
+    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let runtime_plugin_state = build_runtime_plugin_state()?;
     build_runtime_with_plugin_state(
@@ -7113,7 +7112,7 @@ fn build_runtime_with_plugin_state(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
-    stream_callback: Option<std::sync::mpsc::SyncSender<crate::tui::TuiEvent>>,
+    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
     runtime_plugin_state: RuntimePluginState,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     // Persist the model in session metadata so resumed sessions can report it.
@@ -7158,7 +7157,7 @@ fn build_runtime_with_plugin_state(
     );
     runtime = runtime.with_model_context_window(model_ctx);
     if let Some(ref tx) = stream_callback {
-        let _ = tx.try_send(crate::tui::TuiEvent::ContextWindow(model_ctx as u64));
+        let _ = tx.try_send(runtime::CowdEvent::ContextWindow(model_ctx as u64));
     }
     if let Some(callback) = tool_callback {
         runtime = runtime.with_tool_callback(callback);
@@ -7168,13 +7167,13 @@ fn build_runtime_with_plugin_state(
     }
     let bus = runtime::bus::EventBus::new(256);
     runtime = runtime.with_event_bus(bus.clone());
-    // Bridge runtime EventBus → TuiEvent for notifications
+    // Bridge runtime EventBus → CowdEvent for notifications
     if let Some(tx) = stream_callback.clone() {
         let mut rx = bus.subscribe();
         std::thread::spawn(move || {
             while let Ok(event) = rx.blocking_recv() {
                 if let runtime::bus::Event::Warning { message } = event {
-                    let _ = tx.send(crate::tui::TuiEvent::Warning { message });
+                    let _ = tx.send(runtime::CowdEvent::Warning { message });
                 }
             }
         });
@@ -7309,7 +7308,7 @@ struct AnthropicRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     reasoning_effort: Option<String>,
-    stream_callback: Option<std::sync::mpsc::SyncSender<crate::tui::TuiEvent>>,
+    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
 }
 
 impl AnthropicRuntimeClient {
@@ -7320,7 +7319,7 @@ impl AnthropicRuntimeClient {
         emit_output: bool,
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
-        stream_callback: Option<std::sync::mpsc::SyncSender<crate::tui::TuiEvent>>,
+        stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
@@ -7585,7 +7584,7 @@ impl AnthropicRuntimeClient {
                             }
                             events.push(AssistantEvent::TextDelta(text.clone()));
                             if let Some(ref cb) = self.stream_callback {
-                                let _ = cb.try_send(crate::tui::TuiEvent::TextDelta { text });
+                                let _ = cb.try_send(runtime::CowdEvent::TextDelta { text });
                             }
                         }
                     }
@@ -7601,7 +7600,7 @@ impl AnthropicRuntimeClient {
                         }
                         events.push(AssistantEvent::ThinkingDelta(thinking.clone()));
                         if let Some(ref cb) = self.stream_callback {
-                            let _ = cb.try_send(crate::tui::TuiEvent::ThinkingDelta { thinking });
+                            let _ = cb.try_send(runtime::CowdEvent::ThinkingDelta { thinking });
                         }
                     }
                     ContentBlockDelta::SignatureDelta { signature } => {
@@ -7688,7 +7687,7 @@ async fn consume_stream_standalone(
     client: ApiProviderClient,
     session_id: String,
     emit_output: bool,
-    stream_callback: Option<std::sync::mpsc::SyncSender<crate::tui::TuiEvent>>,
+    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
     message_request: MessageRequest,
     apply_stall_timeout: bool,
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -7769,7 +7768,7 @@ async fn consume_stream_standalone(
                         }
                         events.push(AssistantEvent::TextDelta(text.clone()));
                         if let Some(ref cb) = stream_callback {
-                            let _ = cb.try_send(crate::tui::TuiEvent::TextDelta { text });
+                            let _ = cb.try_send(runtime::CowdEvent::TextDelta { text });
                         }
                     }
                 }
@@ -7785,7 +7784,7 @@ async fn consume_stream_standalone(
                     }
                     events.push(AssistantEvent::ThinkingDelta(thinking.clone()));
                     if let Some(ref cb) = stream_callback {
-                        let _ = cb.try_send(crate::tui::TuiEvent::ThinkingDelta { thinking });
+                        let _ = cb.try_send(runtime::CowdEvent::ThinkingDelta { thinking });
                     }
                 }
                 ContentBlockDelta::SignatureDelta { signature } => {

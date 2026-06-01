@@ -13,7 +13,7 @@ use ratatui::{
 };
 
 use crate::tui::app::App;
-use crate::tui::TuiEvent;
+use runtime::CowdEvent;
 
 // ── MockTerminal ──────────────────────────────────────────────────
 
@@ -189,12 +189,12 @@ pub fn app_with_messages(n: usize) -> App {
 pub fn app_with_tool_calls(n: usize) -> App {
     let mut app = App::new("fixture-model", "fixture-session");
     for i in 0..n {
-        app.apply_event(TuiEvent::ToolStart {
+        app.apply_event(CowdEvent::ToolStart {
             id: format!("tool_{i}"),
             name: "bash".into(),
             preview: format!("echo {i}"),
         });
-        app.apply_event(TuiEvent::ToolComplete {
+        app.apply_event(CowdEvent::ToolComplete {
             id: format!("tool_{i}"),
             name: "bash".into(),
             summary: format!("Output of tool {i}"),
@@ -209,8 +209,8 @@ pub fn app_with_tool_calls(n: usize) -> App {
 #[must_use]
 pub fn app_streaming() -> App {
     let mut app = App::new("fixture-model", "fixture-session");
-    app.apply_event(TuiEvent::TurnStarted);
-    app.apply_event(TuiEvent::TextDelta {
+    app.apply_event(CowdEvent::TurnStarted);
+    app.apply_event(CowdEvent::TextDelta {
         text: "Streaming response...".into(),
     });
     app

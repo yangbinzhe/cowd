@@ -5,74 +5,20 @@
 
 use std::sync::mpsc;
 
-/// Events emitted by StreamingTurnRunner and consumed by the TUI event loop.
-#[derive(Debug, Clone)]
-pub enum TuiEvent {
-    // ── Streaming content ──
-    /// Incremental text delta from the model's response
-    TextDelta { text: String },
-    /// Incremental thinking/reasoning delta (extended thinking models)
-    ThinkingDelta { thinking: String },
-    /// Thinking block complete — close the thinking panel
-    ThinkingComplete,
+/// Deprecated alias — use `runtime::CowdEvent` directly.
+#[deprecated(note = "use runtime::CowdEvent instead")]
+pub use runtime::CowdEvent as TuiEvent;
 
-    // ── Tool lifecycle ──
-    /// A tool call has been initiated
-    ToolStart { id: String, name: String, preview: String },
-    /// Progress update for a running tool
-    ToolProgress { id: String, name: String, progress: String },
-    /// Tool execution completed
-    ToolComplete { id: String, name: String, summary: String, exit_code: Option<i32> },
+/// Channel sender/receiver type aliases for the event pipeline.
+pub type TuiEventSender = mpsc::SyncSender<runtime::CowdEvent>;
+pub type TuiEventReceiver = mpsc::Receiver<runtime::CowdEvent>;
 
-    // ── Statistics ──
-    /// Cumulative token usage
-    TokenUsage { input: u64, output: u64, cache_create: u64, cache_read: u64 },
-
-    // ── Turn lifecycle ──
-    /// Current model context window size (sent at turn start)
-    ContextWindow(u64),
-    /// A new turn has started (user input being processed)
-    TurnStarted,
-    /// Turn completed successfully with summary data
-    TurnComplete { assistant_text: String, iterations: u32 },
-    /// Turn failed with an error
-    TurnError { error: String },
-
-    // ── System ──
-    /// Auto-compaction notification
-    CompactionNotice { removed_count: usize },
-
-    // ── Memory events ──
-    /// New memory entry added (from cognitive context)
-    MemoryEntry { layer: String, content: String, relevance: f64 },
-    /// Batch memory update after context preparation
-    MemoryUpdate { entries: Vec<(String, String, f64)>, status: String },
-    /// Memory statistics after turn completion
-    MemoryStats { total_entries: usize, vector_count: usize, layers: Vec<String> },
-
-    // ── Session events ──
-    /// Session list updated
-    SessionList { sessions: Vec<(String, String, String)> }, // (id, name, created_at)
-    /// Session created
-    SessionCreated { id: String, name: String },
-    /// Session deleted
-    SessionDeleted { id: String },
-    /// Session switched (active session changed)
-    SessionSwitched { id: String, name: String },
-    /// Config or runtime warning that should be shown to the user
-    Warning { message: String },
-}
-
-/// Channel sender/receiver type aliases for the TUI event pipeline.
-pub type TuiEventSender = mpsc::SyncSender<TuiEvent>;
-pub type TuiEventReceiver = mpsc::Receiver<TuiEvent>;
-
-/// Create a bounded TUI event channel.
+/// Create a bounded event channel.
 /// Buffer size 2048 provides headroom for bursty streaming events
 /// without dropping, while bounded to prevent runaway memory.
 #[must_use]
 pub fn tui_event_channel() -> (TuiEventSender, TuiEventReceiver) {
-    mpsc::sync_channel::<TuiEvent>(256)
+    mpsc::sync_channel::<runtime::CowdEvent>(256)
 }
 
 #[cfg(test)]
@@ -82,20 +28,20 @@ mod tests {
     #[test]
     fn event_channel_send_recv() {
         let (tx, rx) = tui_event_channel();
-        tx.send(TuiEvent::TextDelta { text: "hello".into() }).unwrap();
+        tx.send(runtime::CowdEvent::TextDelta { text: "hello".into() }).unwrap();
         let event = rx.recv().unwrap();
-        assert!(matches!(event, TuiEvent::TextDelta { text } if text == "hello"));
+        assert!(matches!(event, runtime::CowdEvent::TextDelta { text } if text == "hello"));
     }
 
     #[test]
     fn event_clone_roundtrip() {
-        let event = TuiEvent::ToolStart {
+        let event = runtime::CowdEvent::ToolStart {
             id: "t1".into(),
             name: "bash".into(),
             preview: "ls".into(),
         };
         let cloned = event.clone();
-        assert!(matches!(cloned, TuiEvent::ToolStart { id, name, preview }
+        assert!(matches!(cloned, runtime::CowdEvent::ToolStart { id, name, preview }
             if id == "t1" && name == "bash" && preview == "ls"));
     }
 
@@ -103,10 +49,10 @@ mod tests {
     fn channel_backpressure_no_panic() {
         let (tx, _rx) = tui_event_channel();
         for i in 0..256 {
-            let _ = tx.try_send(TuiEvent::TextDelta { text: format!("msg{i}") });
+            let _ = tx.try_send(runtime::CowdEvent::TextDelta { text: format!("msg{i}") });
         }
         // After channel fills, try_send returns Err — should not panic
-        let result = tx.try_send(TuiEvent::TextDelta { text: "overflow".into() });
+        let result = tx.try_send(runtime::CowdEvent::TextDelta { text: "overflow".into() });
         assert!(result.is_err());
     }
 
@@ -114,17 +60,17 @@ mod tests {
     fn all_event_variants_debug() {
         // Ensure all variants produce valid Debug output
         let events = vec![
-            TuiEvent::TextDelta { text: "t".into() },
-            TuiEvent::ThinkingDelta { thinking: "t".into() },
-            TuiEvent::ThinkingComplete,
-            TuiEvent::ToolStart { id: "i".into(), name: "n".into(), preview: "p".into() },
-            TuiEvent::ToolProgress { id: "i".into(), name: "n".into(), progress: "p".into() },
-            TuiEvent::ToolComplete { id: "i".into(), name: "n".into(), summary: "s".into(), exit_code: Some(0) },
-            TuiEvent::TokenUsage { input: 1, output: 2, cache_create: 3, cache_read: 4 },
-            TuiEvent::TurnStarted,
-            TuiEvent::TurnComplete { assistant_text: "ok".into(), iterations: 1 },
-            TuiEvent::TurnError { error: "e".into() },
-            TuiEvent::CompactionNotice { removed_count: 5 },
+            runtime::CowdEvent::TextDelta { text: "t".into() },
+            runtime::CowdEvent::ThinkingDelta { thinking: "t".into() },
+            runtime::CowdEvent::ThinkingComplete,
+            runtime::CowdEvent::ToolStart { id: "i".into(), name: "n".into(), preview: "p".into() },
+            runtime::CowdEvent::ToolProgress { id: "i".into(), name: "n".into(), progress: "p".into() },
+            runtime::CowdEvent::ToolComplete { id: "i".into(), name: "n".into(), summary: "s".into(), exit_code: Some(0) },
+            runtime::CowdEvent::TokenUsage { input: 1, output: 2, cache_create: 3, cache_read: 4 },
+            runtime::CowdEvent::TurnStarted,
+            runtime::CowdEvent::TurnComplete { assistant_text: "ok".into(), iterations: 1 },
+            runtime::CowdEvent::TurnError { error: "e".into() },
+            runtime::CowdEvent::CompactionNotice { removed_count: 5 },
         ];
         for event in &events {
             let _ = format!("{event:?}");
@@ -136,7 +82,7 @@ mod tests {
         use crate::tui::app::App;
         let mut app = App::new("test", "test-session");
         assert_eq!(app.context_window, 0);
-        app.apply_event(TuiEvent::ContextWindow(200_000));
+        app.apply_event(runtime::CowdEvent::ContextWindow(200_000));
         assert_eq!(app.context_window, 200_000);
     }
 
@@ -144,8 +90,8 @@ mod tests {
     fn token_usage_event_updates_all_counters() {
         use crate::tui::app::App;
         let mut app = App::new("test", "test-session");
-        app.apply_event(TuiEvent::TurnStarted);
-        app.apply_event(TuiEvent::TokenUsage {
+        app.apply_event(runtime::CowdEvent::TurnStarted);
+        app.apply_event(runtime::CowdEvent::TokenUsage {
             input: 100, output: 50, cache_create: 10, cache_read: 5,
         });
         assert_eq!(app.input_tokens, 100);
