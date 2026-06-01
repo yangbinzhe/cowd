@@ -362,7 +362,20 @@ async fn send_message(
                         runtime::CowdEvent::ToolStart { id, name, preview: _ } => {
                             eb.tool_start(&sid, &id, &name).await;
                         }
-                        _ => {}
+                        runtime::CowdEvent::ToolProgress { id, name, progress } => {
+                            eb.tool_progress(&sid, &id, &name, &progress).await;
+                        }
+                        runtime::CowdEvent::ToolComplete { id, name, summary, exit_code } => {
+                            eb.tool_complete(&sid, &id, &name, &summary, exit_code).await;
+                        }
+                        // Events without dedicated SessionEventBus methods (SSE relay not needed yet)
+                        runtime::CowdEvent::TurnComplete { .. }
+                        | runtime::CowdEvent::TurnError { .. }
+                        | runtime::CowdEvent::Warning { .. }
+                        | runtime::CowdEvent::TokenUsage { .. }
+                        | runtime::CowdEvent::TurnStarted
+                        | runtime::CowdEvent::CompactionNotice { .. }
+                        | _ => {}
                     }
                 }
             });
