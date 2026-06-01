@@ -1406,13 +1406,10 @@ pub async fn run_turn_async(
         // A3: Synchronously check for L4 conflicts after each turn.
         if let Some(ref engine_arc) = self.discussion_engine {
             if let Ok(engine) = engine_arc.lock() {
-                let conflict_count = match engine.check_for_conflicts_sync() {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "DiscussionEngine conflict check failed");
-                        0
-                    }
-                };
+                let conflict_count = engine.check_for_conflicts_sync().unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "DiscussionEngine conflict check failed");
+                    0
+                });
 
                 if conflict_count > 0 {
                     tracing::info!(conflict_count, "L4 conflicts detected");
