@@ -187,7 +187,7 @@ fn build_memory_config(
 
     // Ensure the store directory exists before SQLite tries to open the database.
     if let Err(e) = std::fs::create_dir_all(&store_path) {
-        eprintln!("warn: failed to create memory store dir {:?}: {e}", store_path);
+        tracing::warn!("failed to create memory store dir {:?}: {e}", store_path);
     }
 
     let mut mc = memory::MemoryConfig::default();
@@ -951,7 +951,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
             let piped = buf.trim().to_string();
             if !piped.is_empty() {
-                eprintln!("warning: piped stdin ignored — v0.6.2 removed one-shot CLI prompt; use TUI instead");
+                tracing::warn!("piped stdin ignored — v0.6.2 removed one-shot CLI prompt; use TUI instead");
             }
         }
         return Ok(CliAction::Repl {
