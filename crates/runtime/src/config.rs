@@ -823,7 +823,7 @@ impl ConfigLoader {
         inject_config_env(&merged);
 
         for warning in &all_warnings {
-            eprintln!("warning: {warning}");
+            tracing::warn!("{warning}");
         }
 
         let merged_value = JsonValue::Object(merged.clone());
@@ -1565,7 +1565,7 @@ fn parse_fallbacks(root: &JsonValue) -> Vec<String> {
         return arr.iter().filter_map(|v| v.as_str()).map(str::to_string).collect();
     }
     if let Some(v) = find_key_dual(object, "provider_fallbacks", "merged settings") {
-        eprintln!("warning: 'providerFallbacks' is deprecated, use 'fallbacks' instead. All per-model chains are now merged into a single global list.");
+        tracing::warn!("'providerFallbacks' is deprecated, use 'fallbacks' instead. All per-model chains are now merged into a single global list.");
         return extract_fallbacks_from_legacy(v);
     }
     vec![]
