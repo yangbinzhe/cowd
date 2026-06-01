@@ -319,7 +319,7 @@ fn init_logging() {
         .with_writer(file_appender);
 
     // Stderr layer: debug builds only
-    if cfg!(debug_assertions) {
+    if cfg!(debug_assertions) && std::env::var("COWD_LOG_STDERR").is_ok() {
         let stderr_layer = fmt::layer()
             .with_target(false)
             .with_writer(std::io::stderr);

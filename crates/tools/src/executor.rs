@@ -3208,9 +3208,7 @@ impl ProviderRuntimeClient {
             match build_provider_entry(fallback_model) {
                 Ok(entry) => chain.push(entry),
                 Err(error) => {
-                    eprintln!(
-                        "warning: skipping unavailable fallback provider {fallback_model}: {error}"
-                    );
+                    tracing::warn!("skipping unavailable fallback provider {fallback_model}: {error}");
                 }
             }
         }
@@ -3232,7 +3230,7 @@ fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
         Some(provider) => ProviderClient::from_config(provider)
             .map_err(|e| e.to_string())?,
         None => {
-            eprintln!("warning: model '{resolved}' not in providers config, falling back to environment variables");
+            tracing::warn!("model '{resolved}' not in providers config, falling back to environment variables");
             ProviderClient::from_model(&resolved)
                 .map_err(|e| e.to_string())?
         }
@@ -3295,10 +3293,7 @@ impl ProviderRuntimeClient {
             match attempt {
                 Ok(events) => return Ok(events),
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {
-                    eprintln!(
-                        "provider {} failed with retryable error, falling back: {error}",
-                        entry.model
-                    );
+                    tracing::warn!("provider {} failed with retryable error, falling back: {error}", entry.model);
                     last_error = Some(error);
                 }
                 Err(error) => return Err(RuntimeError::new(error.to_string())),

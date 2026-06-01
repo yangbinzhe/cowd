@@ -20,6 +20,7 @@ serde_yaml.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 urlencoding = "2"
 thiserror = "2"
+tracing.workspace = true
 
 [lints]
 workspace = true

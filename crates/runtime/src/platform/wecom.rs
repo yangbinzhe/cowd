@@ -705,16 +705,16 @@ mod tests {
 
         let crypto = match WeComCrypto::new(encoding_aes_key, token, corp_id) {
             Ok(c) => c,
-            Err(_) => { eprintln!("skipping: crypto init failed (env-dependent)"); return; }
+            Err(_) => { tracing::debug!("skipping: crypto init failed (env-dependent)"); return; }
         };
         let plaintext = "Hello, WeCom!";
         let encrypted = match crypto.encrypt(plaintext) {
             Ok(e) => e,
-            Err(_) => { eprintln!("skipping: encrypt failed (env-dependent)"); return; }
+            Err(_) => { tracing::debug!("skipping: encrypt failed (env-dependent)"); return; }
         };
         match crypto.decrypt(&encrypted) {
             Ok(decrypted) => assert_eq!(decrypted, plaintext),
-            Err(_) => eprintln!("skipping: decrypt failed (env-dependent)"),
+            Err(_) => tracing::debug!("skipping: decrypt failed (env-dependent)"),
         }
     }
 
@@ -723,7 +723,7 @@ mod tests {
         let encoding_aes_key = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFA";
         let crypto = match WeComCrypto::new(encoding_aes_key, "test_token", "test_corp") {
             Ok(c) => c,
-            Err(_) => { eprintln!("skipping: crypto init failed"); return; }
+            Err(_) => { tracing::debug!("skipping: crypto init failed"); return; }
         };
 
         let encrypted = crypto.encrypt("test").unwrap();
