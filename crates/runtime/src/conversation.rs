@@ -667,6 +667,11 @@ where
         self.bus.as_ref()
     }
 
+    /// Get a reference to the attached CowdEventBus, if any.
+    pub fn cowd_bus(&self) -> Option<&crate::cowd_event::CowdEventBus> {
+        self.cowd_bus.as_deref()
+    }
+
     /// T36: Set a custom tool orchestrator for result budgeting.
     #[must_use]
     pub fn with_tool_orchestrator(

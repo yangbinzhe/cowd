@@ -7167,6 +7167,8 @@ fn build_runtime_with_plugin_state(
     }
     let bus = runtime::bus::EventBus::new(256);
     runtime = runtime.with_event_bus(bus.clone());
+    let cowd_bus = runtime::CowdEventBus::new();
+    runtime = runtime.with_cowd_event_bus(cowd_bus.clone());
     // Bridge runtime EventBus → CowdEvent for notifications
     if let Some(tx) = stream_callback.clone() {
         let mut rx = bus.subscribe();

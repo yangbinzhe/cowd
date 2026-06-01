@@ -360,6 +360,32 @@ async fn send_message(
         }
     } // runtime_guard dropped — no MutexGuard held across the .await below
 
+    // Phase 1b: Subscribe CowdEventBus → forward text/thinking/tool events to SessionEventBus
+    {
+        let runtime_guard = runtime_entry.lock().await;
+        if let Some(cowd_bus) = runtime_guard.cowd_bus() {
+            let mut rx = cowd_bus.subscribe();
+            let eb = event_bus.clone();
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                while let Ok(event) = rx.recv().await {
+                    match event {
+                        runtime::CowdEvent::TextDelta { text } => {
+                            eb.text_delta(&sid, &text).await;
+                        }
+                        runtime::CowdEvent::ThinkingDelta { thinking } => {
+                            eb.thinking_delta(&sid, &thinking).await;
+                        }
+                        runtime::CowdEvent::ToolStart { id, name, preview: _ } => {
+                            eb.tool_start(&sid, &id, &name).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+
     const TURN_TIMEOUT: Duration = Duration::from_secs(300);
 
     // Phase 2: Run turn in spawn_blocking — ConversationRuntime::run_turn_async
