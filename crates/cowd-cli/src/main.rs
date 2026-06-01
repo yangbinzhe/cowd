@@ -6670,7 +6670,7 @@ fn fallback_init_providers_from_user_config() {
     }
 
     runtime::init_global_providers(runtime::ProvidersConfig { providers });
-    eprintln!("[init] fallback: loaded {} providers from ~/.cowd/config.yaml", 
+    tracing::warn!("[init] fallback: loaded {} providers from ~/.cowd/config.yaml", 
         runtime::list_all_providers().len());
 }
 
@@ -6706,7 +6706,7 @@ fn run_prompt(
             }
         }
         Err(e) => {
-            eprintln!("warning: failed to load config for provider registry: {e}");
+            tracing::warn!("failed to load config for provider registry: {e}");
             fallback_init_providers_from_user_config();
         }
     }
@@ -7208,7 +7208,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
-            } => eprintln!(
+            } => tracing::info!(
                 "[hook {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
             ),
@@ -7216,7 +7216,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
-            } => eprintln!(
+            } => tracing::info!(
                 "[hook done {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
             ),
@@ -7224,7 +7224,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
-            } => eprintln!(
+            } => tracing::info!(
                 "[hook cancelled {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
             ),

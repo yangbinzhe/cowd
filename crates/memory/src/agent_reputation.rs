@@ -171,6 +171,13 @@ impl ReputationManager {
         let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
         // Handle PRAGMAs that may return results in rusqlite 0.31+
         let _ = conn
+            .execute("PRAGMA journal_mode=WAL", [])
+            .or_else(|e| match e {
+                RusqliteError::ExecuteReturnedResults => Ok(0),
+                other => Err(other),
+            })
+            .map_err(|e| MemoryError::Store(e.to_string()))?;
+        let _ = conn
             .execute("PRAGMA foreign_keys=ON", [])
             .or_else(|e| match e {
                 RusqliteError::ExecuteReturnedResults => Ok(0),
