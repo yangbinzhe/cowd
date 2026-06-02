@@ -1,17 +1,18 @@
 use std::env;
 use std::io;
+use std::sync::Mutex;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command as TokioCommand;
-use tokio::time::timeout;
+
 
 use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
     SandboxConfig, SandboxStatus,
 };
 use crate::ConfigLoader;
+
+static SIGCHLD_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Input schema for the built-in bash execution tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +102,8 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     // Temporarily restore SIGCHLD to SIG_DFL during the waitpid call.
     // The binary sets SIGCHLD=SIG_IGN (auto-reap), which makes
     // std::process::Command::output() fail with ECHILD.
+    // Guard with a process-wide mutex — signal() is process-global.
+    let _sigchld_lock = SIGCHLD_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let output = unsafe {
         let old = libc::signal(libc::SIGCHLD, libc::SIG_DFL);
         let result = command.output();
@@ -110,6 +113,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
             Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("command failed: {e}"))),
         }
     };
+    drop(_sigchld_lock);
     let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
     let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
@@ -134,71 +138,6 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
     });
-}
-
-async fn execute_bash_async(
-    input: BashCommandInput,
-    sandbox_status: SandboxStatus,
-    cwd: std::path::PathBuf,
-) -> io::Result<BashCommandOutput> {
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
-
-    let output_result = if let Some(timeout_ms) = input.timeout {
-        match timeout(Duration::from_millis(timeout_ms), command.output()).await {
-            Ok(result) => (result?, false),
-            Err(_) => {
-                return Ok(BashCommandOutput {
-                    stdout: String::new(),
-                    stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
-                    raw_output_path: None,
-                    interrupted: true,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: input.dangerously_disable_sandbox,
-                    return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(true),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: Some(sandbox_status),
-                });
-            }
-        }
-    } else {
-        (command.output().await?, false)
-    };
-
-    let (output, interrupted) = output_result;
-    let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-    let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
-    let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
-    let return_code_interpretation = output.status.code().and_then(|code| {
-        if code == 0 {
-            None
-        } else {
-            Some(format!("exit_code:{code}"))
-        }
-    });
-
-    Ok(BashCommandOutput {
-        stdout,
-        stderr,
-        raw_output_path: None,
-        interrupted,
-        is_image: None,
-        background_task_id: None,
-        backgrounded_by_user: None,
-        assistant_auto_backgrounded: None,
-        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
-        return_code_interpretation,
-        no_output_expected,
-        structured_content: None,
-        persisted_output_path: None,
-        persisted_output_size: None,
-        sandbox_status: Some(sandbox_status),
-    })
 }
 
 fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
@@ -235,33 +174,6 @@ fn prepare_command(
     }
 
     let mut prepared = Command::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
-        prepared.env("HOME", crate::cowd_dirs::sandbox_home_dir());
-        prepared.env("TMPDIR", crate::cowd_dirs::sandbox_tmp_dir());
-    }
-    prepared
-}
-
-fn prepare_tokio_command(
-    command: &str,
-    cwd: &std::path::Path,
-    sandbox_status: &SandboxStatus,
-    create_dirs: bool,
-) -> TokioCommand {
-    if create_dirs {
-        prepare_sandbox_dirs();
-    }
-
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = TokioCommand::new(launcher.program);
-        prepared.args(launcher.args);
-        prepared.current_dir(cwd);
-        prepared.envs(launcher.env);
-        return prepared;
-    }
-
-    let mut prepared = TokioCommand::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", crate::cowd_dirs::sandbox_home_dir());
