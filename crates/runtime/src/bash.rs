@@ -1,8 +1,6 @@
 use std::env;
 use std::io;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -99,16 +97,43 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         });
     }
 
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("bash tokio rt");
-        let result = rt.block_on(execute_bash_async(input, sandbox_status, cwd));
-        let _ = tx.send(result);
+    let mut command = prepare_command(&input.command, &cwd, &sandbox_status, true);
+    // Temporarily restore SIGCHLD to SIG_DFL during the waitpid call.
+    // The binary sets SIGCHLD=SIG_IGN (auto-reap), which makes
+    // std::process::Command::output() fail with ECHILD.
+    let output = unsafe {
+        let old = libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+        let result = command.output();
+        libc::signal(libc::SIGCHLD, old);
+        match result {
+            Ok(o) => o,
+            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("command failed: {e}"))),
+        }
+    };
+    let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
+    let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
+    let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
+    let return_code_interpretation = output.status.code().and_then(|code| {
+        if code == 0 { None } else { Some(format!("exit_code:{code}")) }
     });
-    rx.recv().map_err(|_| io::Error::new(io::ErrorKind::Other, "bash thread panicked"))?
+
+    return Ok(BashCommandOutput {
+        stdout,
+        stderr,
+        raw_output_path: None,
+        interrupted: false,
+        is_image: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+        return_code_interpretation,
+        no_output_expected,
+        structured_content: None,
+        persisted_output_path: None,
+        persisted_output_size: None,
+        sandbox_status: Some(sandbox_status),
+    });
 }
 
 async fn execute_bash_async(

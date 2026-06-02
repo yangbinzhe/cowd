@@ -185,7 +185,7 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             continue;
         }
         let workspace = HarnessWorkspace::new(unique_temp_dir(case.name));
-        workspace.create().expect("workspace should exist");
+        workspace.create(&base_url).expect("workspace should exist");
         (case.prepare)(&workspace);
 
         let run = run_case(case, &workspace, &base_url);
@@ -292,16 +292,19 @@ impl HarnessWorkspace {
         }
     }
 
-    fn create(&self) -> std::io::Result<()> {
+    fn create(&self, base_url: &str) -> std::io::Result<()> {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(&self.config_home)?;
         fs::create_dir_all(&self.home)?;
-        let config_content = "model: \"sonnet\"\n\
-            providers:\n  anthropic:\n    base_url: \"https://api.anthropic.com/v1\"\n    \
-            api_key: \"test-key\"\n    models: [\"sonnet\"]\n    protocol: \"anthropic\"\n\
-            permissions:\n  defaultMode: \"acceptEdits\"\n  allow: []\n  deny: []\n  ask: []\n\
-            memory:\n  enabled: false\n\
-            gateway:\n  enabled: false\n";
+        let config_content = format!(
+            "model: \"sonnet\"\n\
+             providers:\n  anthropic:\n    base_url: \"{}\"\n    \
+             api_key: \"test-key\"\n    models: [\"sonnet\"]\n    protocol: \"anthropic\"\n\
+             permissions:\n  defaultMode: \"acceptEdits\"\n  allow: []\n  deny: []\n  ask: []\n\
+             memory:\n  enabled: false\n\
+             gateway:\n  enabled: false\n",
+            base_url
+        );
         fs::write(self.config_home.join("config.yaml"), config_content)?;
         Ok(())
     }
@@ -344,6 +347,8 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         .env("HOME", &workspace.home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
+        .env("SHELL", "/bin/bash")
+        .env("TMPDIR", "/tmp")
         .args([
             "--model",
             "sonnet",

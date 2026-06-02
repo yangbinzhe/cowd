@@ -6782,60 +6782,70 @@ fn run_prompt(
             fallback_init_providers_from_user_config();
         }
     }
-    // Try daemon mode first, fallback to local runtime
-    let daemon_result: Result<String, Box<dyn std::error::Error>> = SHARED_RT.block_on(async {
-        let mut daemon = DaemonClient::connect(&resolved_model).await
-            .map_err(|e| -> Box<dyn std::error::Error> { format!("daemon connect: {e}").into() })?;
-        daemon.send_chat(text).await
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        loop {
-            match daemon.recv_event().await {
-                Some(runtime::CowdEvent::TurnComplete { assistant_text, .. }) => {
-                    return Ok(assistant_text);
-                }
-                Some(runtime::CowdEvent::TurnError { error }) => {
-                    return Err(error.into());
-                }
-                None => {
-                    return Err("daemon connection closed unexpectedly".into());
-                }
-                _ => {}
-            }
-        }
-    });
-
-    let final_text = match daemon_result {
-        Ok(text) => text.trim().to_string(),
-        Err(_) => {
-            let mut runtime = build_runtime(
-                session_state.with_persistence_path(session.path.clone()),
-                &session.id,
-                resolved_model,
-                system_prompt,
-                true,
-                false,
-                allowed_tools,
-                permission_mode,
-                None,
-                None,
-            )?;
-            if let Some(effort) = reasoning_effort {
-                if let Some(rt) = runtime.runtime.as_mut() {
-                    rt.api_client_mut().set_reasoning_effort(Some(effort));
+    // Try daemon mode first, fallback to local runtime.
+    // Preserve TurnSummary for JSON output that needs tool_uses/tool_results.
+    enum PromptOutcome {
+        Daemon { text: String, iterations: u32 },
+        Local(runtime::TurnSummary),
+    }
+    let outcome = {
+        let daemon_result: Result<(String, u32), Box<dyn std::error::Error>> = SHARED_RT.block_on(async {
+            let mut daemon = DaemonClient::connect(&resolved_model).await
+                .map_err(|e| -> Box<dyn std::error::Error> { format!("daemon connect: {e}").into() })?;
+            daemon.send_chat(text).await
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            loop {
+                match daemon.recv_event().await {
+                    Some(runtime::CowdEvent::TurnComplete { assistant_text, iterations }) => {
+                        return Ok((assistant_text, iterations));
+                    }
+                    Some(runtime::CowdEvent::TurnError { error }) => {
+                        return Err(error.into());
+                    }
+                    None => {
+                        return Err("daemon connection closed unexpectedly".into());
+                    }
+                    _ => {}
                 }
             }
-            let prompter = runtime::permissions::SharedPrompter::new(Box::new(
-                CliPermissionPrompter::new(permission_mode),
-            ));
-            let handle = tokio::runtime::Handle::try_current()
-                .unwrap_or_else(|_| SHARED_RT.handle().clone());
-            let summary = handle.block_on(runtime.run_turn_async(text, &prompter))?;
-            runtime.shutdown_plugins()?;
-            final_assistant_text(&summary).trim().to_string()
+        });
+        match daemon_result {
+            Ok((text, iterations)) => PromptOutcome::Daemon { text: text.trim().to_string(), iterations },
+            Err(_) => {
+                let mut runtime = build_runtime(
+                    session_state.with_persistence_path(session.path.clone()),
+                    &session.id,
+                    resolved_model,
+                    system_prompt,
+                    true,
+                    false,
+                    allowed_tools,
+                    permission_mode,
+                    None,
+                    None,
+                )?;
+                if let Some(effort) = reasoning_effort {
+                    if let Some(rt) = runtime.runtime.as_mut() {
+                        rt.api_client_mut().set_reasoning_effort(Some(effort));
+                    }
+                }
+                let prompter = runtime::permissions::SharedPrompter::new(Box::new(
+                    CliPermissionPrompter::new(permission_mode),
+                ));
+                let handle = tokio::runtime::Handle::try_current()
+                    .unwrap_or_else(|_| SHARED_RT.handle().clone());
+                let summary = handle.block_on(runtime.run_turn_async(text, &prompter))?;
+                runtime.shutdown_plugins()?;
+                PromptOutcome::Local(summary)
+            }
         }
     };
     match output_format {
         CliOutputFormat::Text => {
+            let final_text = match &outcome {
+                PromptOutcome::Daemon { text, .. } => text.as_str(),
+                PromptOutcome::Local(summary) => &final_assistant_text(summary).trim().to_string(),
+            };
             if compact {
                 // --compact: print only the final assistant text
                 println!("{final_text}");
@@ -6845,11 +6855,67 @@ fn run_prompt(
             }
         }
         CliOutputFormat::Json => {
-            let response = serde_json::json!({
-                "text": final_text,
-                "compact": compact,
+            let (final_text, iterations, tool_uses, tool_results, usage_json, auto_compaction_json, estimated_cost) = match &outcome {
+                PromptOutcome::Daemon { text, iterations } => {
+                    (text.clone(), *iterations, vec![], vec![], json!({}), json!(null), String::new())
+                }
+                PromptOutcome::Local(summary) => {
+                    let text = final_assistant_text(summary).trim().to_string();
+                    let tool_uses = summary
+                        .assistant_messages
+                        .iter()
+                        .flat_map(|m| m.blocks.iter())
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolUse { name, input, .. } => {
+                                Some(json!({ "name": name, "input": input }))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let tool_results = summary
+                        .tool_results
+                        .iter()
+                        .flat_map(|m| m.blocks.iter())
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolResult { output, is_error, .. } => {
+                                Some(json!({ "output": output, "is_error": is_error }))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let usage_json = json!({
+                        "input_tokens": summary.usage.input_tokens,
+                        "output_tokens": summary.usage.output_tokens,
+                        "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+                    });
+                    let auto_compaction_json = summary
+                        .auto_compaction
+                        .map(|ac| json!({ "removed_message_count": ac.removed_message_count }))
+                        .unwrap_or(json!(null));
+                    let cost = summary.usage.estimate_cost_usd().total_cost_usd();
+                    let estimated_cost = format!("${:.4}", cost);
+                    (
+                        text,
+                        summary.iterations as u32,
+                        tool_uses,
+                        tool_results,
+                        usage_json,
+                        auto_compaction_json,
+                        estimated_cost,
+                    )
+                }
+            };
+            let response = json!({
+                "message": final_text,
+                "iterations": iterations,
+                "tool_uses": tool_uses,
+                "tool_results": tool_results,
+                "usage": usage_json,
+                "auto_compaction": auto_compaction_json,
+                "estimated_cost": estimated_cost,
             });
-            println!("{}", serde_json::to_string_pretty(&response)?);
+            println!("{}", serde_json::to_string(&response)?);
         }
     }
     Ok(())
