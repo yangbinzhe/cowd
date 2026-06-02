@@ -44,6 +44,11 @@ pub fn addr_file() -> PathBuf {
     pid_file().with_extension("addr")
 }
 
+/// Path to the Unix domain socket
+pub fn socket_file() -> PathBuf {
+    PathBuf::from("/tmp/cowd.sock")
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerInfo {
     pub pid: u32,
