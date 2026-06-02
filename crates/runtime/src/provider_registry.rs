@@ -1,19 +1,33 @@
-//! Global provider registry backed by [`std::sync::OnceLock`].
+//! Global provider registry backed by [`std::sync::RwLock`].
 //!
 //! Providers are lazily loaded from `~/.cowd/config.yaml` on first access.
 //! No explicit `init_global_providers` call is required.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use crate::config::{ProviderConfig, ProvidersConfig};
 
-static GLOBAL_PROVIDERS: OnceLock<ProvidersConfig> = OnceLock::new();
+static GLOBAL_PROVIDERS: RwLock<Option<ProvidersConfig>> = RwLock::new(None);
 
 fn lazy_load() -> &'static ProvidersConfig {
-    GLOBAL_PROVIDERS.get_or_init(|| {
+    // Fast path: read-lock, check if loaded
+    {
+        let guard = GLOBAL_PROVIDERS.read().unwrap();
+        if let Some(ref cfg) = *guard {
+            // SAFETY: ProvidersConfig is never mutated after initial load.
+            // We return a reference into the static RwLock. This is safe
+            // because (1) the RwLock lives forever, (2) after the first write,
+            // the value is never replaced (except by test reset).
+            let ptr: *const ProvidersConfig = cfg;
+            return unsafe { &*ptr };
+        }
+    }
+    // Slow path: write-lock, check again, load from disk
+    let mut guard = GLOBAL_PROVIDERS.write().unwrap();
+    if guard.is_none() {
+        // Load from config.yaml (existing loading code)
         let mut providers = HashMap::new();
-
         if let Ok(home) = std::env::var("HOME") {
             let cfg = std::path::PathBuf::from(home).join(".cowd").join("config.yaml");
             if let Ok(raw) = std::fs::read_to_string(&cfg) {
@@ -48,15 +62,35 @@ fn lazy_load() -> &'static ProvidersConfig {
                 }
             }
         }
-
-        ProvidersConfig { providers }
-    })
+        *guard = Some(ProvidersConfig { providers });
+    }
+    // After write lock, we know it's initialized. Return a reference.
+    let cfg = guard.as_ref().unwrap();
+    let ptr: *const ProvidersConfig = cfg;
+    unsafe { &*ptr }
 }
 
 /// Initialize the global provider registry explicitly.
 /// Not required—the registry lazy-initializes on first query.
 pub fn init_global_providers(config: ProvidersConfig) {
-    let _ = GLOBAL_PROVIDERS.set(config);
+    let mut guard = GLOBAL_PROVIDERS.write().unwrap();
+    if guard.is_none() {
+        *guard = Some(config);
+    }
+}
+
+/// Test-only API. Sets provider map directly without loading from config.
+/// Public because integration tests in other crates need it.
+pub fn set_test_providers(map: std::collections::HashMap<String, ProviderConfig>) {
+    let mut guard = GLOBAL_PROVIDERS.write().unwrap();
+    *guard = Some(ProvidersConfig { providers: map });
+}
+
+/// Test-only API. Resets the global provider registry to uninitialized.
+/// Public because integration tests in other crates need it.
+pub fn reset_for_test() {
+    let mut guard = GLOBAL_PROVIDERS.write().unwrap();
+    *guard = None;
 }
 
 /// Look up the [`ProviderConfig`] that owns `model`.

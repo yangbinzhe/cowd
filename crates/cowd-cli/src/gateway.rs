@@ -136,7 +136,20 @@ impl Default for ActiveSessions {
 mod tests {
     use super::*;
 
+    fn ensure_test_provider() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("test-provider".to_string(), runtime::ProviderConfig {
+            name: "test-provider".to_string(),
+            base_url: "http://localhost:9999/v1".to_string(),
+            api_key: "test-key".to_string(),
+            models: vec!["test-model".to_string()],
+            protocol: Some("anthropic".to_string()),
+        });
+        runtime::set_test_providers(map);
+    }
+
     fn dummy_runtime() -> crate::BuiltRuntime {
+        ensure_test_provider();
         let session = runtime::Session::new();
         crate::build_runtime(
             session,

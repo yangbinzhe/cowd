@@ -49,5 +49,8 @@ r2d2_sqlite = "0.24"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "allow"
+dead_code = "warn"
+unused_imports = "warn"
+unused_variables = "warn"

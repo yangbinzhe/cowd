@@ -10739,6 +10739,16 @@ mod tests {
     #[test]
     fn startup_banner_mentions_workflow_completions() {
         let _guard = env_lock();
+        runtime::reset_for_test();
+        let mut map = std::collections::HashMap::new();
+        map.insert("test-provider".to_string(), runtime::ProviderConfig {
+            name: "test-provider".to_string(),
+            base_url: "http://localhost:9999/v1".to_string(),
+            api_key: "test-key".to_string(),
+            models: vec!["claude-sonnet-4-6".to_string()],
+            protocol: Some("anthropic".to_string()),
+        });
+        runtime::set_test_providers(map);
         // Inject dummy credentials so LiveCli can construct without real Anthropic key
         std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-banner-test");
         let root = temp_dir();

@@ -121,7 +121,7 @@ pub use config::{
 };
 pub use provider_registry::{
     init_global_providers, list_all_models, list_all_providers, list_models_for_provider,
-    resolve_global_provider,
+    resolve_global_provider, reset_for_test, set_test_providers,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

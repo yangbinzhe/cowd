@@ -541,6 +541,7 @@ impl Component for AgentTeamPanel {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+    use serial_test::serial;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
 
@@ -585,6 +586,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn sync_populates_agents() {
         let dir = AgentDirectory::global();
         dir.clear_all();
@@ -599,6 +601,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn selected_agent_returns_correct_entry() {
         let dir = AgentDirectory::global();
         dir.clear_all();
@@ -678,6 +681,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn render_with_agents() {
         let dir = AgentDirectory::global();
         dir.clear_all();
@@ -697,6 +701,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn keyboard_navigation_jk() {
         let dir = AgentDirectory::global();
         dir.clear_all();
@@ -741,6 +746,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn keyboard_gg_jumps() {
         let dir = AgentDirectory::global();
         dir.clear_all();
@@ -766,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn enter_toggles_detail() {
         let dir = AgentDirectory::global();
         dir.clear_all();
@@ -788,6 +795,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn esc_collapses_detail_then_hides() {
         let dir = AgentDirectory::global();
         dir.clear_all();
@@ -836,6 +844,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn sync_from_app_delegates_to_sync() {
         let dir = AgentDirectory::global();
         dir.clear_all();
@@ -853,6 +862,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn sync_resets_detail_when_roster_changes() {
         let dir = AgentDirectory::global();
         dir.clear_all();
@@ -881,6 +891,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn selection_clamped_after_roster_shrinks() {
         let dir = AgentDirectory::global();
         dir.clear_all();
@@ -901,6 +912,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn scroll_offset_tracks_selection_on_j() {
         let dir = AgentDirectory::global();
         dir.clear_all();
