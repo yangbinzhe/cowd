@@ -116,7 +116,7 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
         if let Ok(content) = fs::read_to_string(&claude_json) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(mode) = val.get("permissions").and_then(|p| p.get("defaultMode")).and_then(|m| m.as_str()) {
-                    fs::write(&project_local, format!("permissions:\n  defaultMode: {mode}\n"))?;
+                    fs::write(&project_local, format!("permissions:\n  default_mode: {mode}\n"))?;
                     artifacts.push(InitArtifact {
                         name: ".cowd/config.local.yaml (migrated from .claude.json)",
                         status: InitStatus::Created,

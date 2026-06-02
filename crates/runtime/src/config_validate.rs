@@ -170,7 +170,19 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "permission_mode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "mcpServers",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "mcp_servers",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "mcp",
         expected: FieldType::Object,
     },
     FieldSpec {
@@ -179,6 +191,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "enabledPlugins",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "enabled_plugins",
         expected: FieldType::Object,
     },
     FieldSpec {
@@ -203,6 +219,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "trustedRoots",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "trusted_roots",
         expected: FieldType::StringArray,
     },
     FieldSpec {
@@ -248,6 +268,10 @@ const PERMISSIONS_FIELDS: &[FieldSpec] = &[
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "default_mode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "allow",
         expected: FieldType::StringArray,
     },
@@ -275,7 +299,15 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
         expected: FieldType::StringArray,
     },
     FieldSpec {
+        name: "external_dirs",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
         name: "installRoot",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "install_root",
         expected: FieldType::String,
     },
     FieldSpec {
@@ -283,11 +315,23 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "registry_path",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "bundledRoot",
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "bundled_root",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "maxOutputTokens",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "max_output_tokens",
         expected: FieldType::Number,
     },
 ];
@@ -302,7 +346,15 @@ const SANDBOX_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Bool,
     },
     FieldSpec {
+        name: "namespace_restrictions",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
         name: "networkIsolation",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "network_isolation",
         expected: FieldType::Bool,
     },
     FieldSpec {
@@ -310,7 +362,15 @@ const SANDBOX_FIELDS: &[FieldSpec] = &[
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "filesystem_mode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "allowedMounts",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "allowed_dirs",
         expected: FieldType::StringArray,
     },
 ];
@@ -321,7 +381,15 @@ const OAUTH_FIELDS: &[FieldSpec] = &[
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "client_id",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "authorizeUrl",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "authorize_url",
         expected: FieldType::String,
     },
     FieldSpec {
@@ -329,11 +397,23 @@ const OAUTH_FIELDS: &[FieldSpec] = &[
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "token_url",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "callbackPort",
         expected: FieldType::Number,
     },
     FieldSpec {
+        name: "callback_port",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
         name: "manualRedirectUrl",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "manual_redirect_url",
         expected: FieldType::String,
     },
     FieldSpec {
@@ -345,6 +425,10 @@ const OAUTH_FIELDS: &[FieldSpec] = &[
 const COMPRESSION_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "circuitBreaker",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "circuit_breaker",
         expected: FieldType::Object,
     },
     FieldSpec {
@@ -369,6 +453,13 @@ const COMPRESSION_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "cheap",
+        expected: FieldType::Object,
+    },
+];
+
+const MCP_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "servers",
         expected: FieldType::Object,
     },
 ];
@@ -403,7 +494,7 @@ const APPROVAL_FIELDS: &[FieldSpec] = &[
 const DEPRECATED_FIELDS: &[DeprecatedField] = &[
     DeprecatedField {
         name: "permissionMode",
-        replacement: "permissions.defaultMode",
+        replacement: "permissions.default_mode",
     },
     DeprecatedField {
         name: "enabledPlugins",
@@ -600,6 +691,15 @@ pub fn validate_config_file(
             &path_display,
         ));
     }
+    if let Some(mcp) = object.get("mcp").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            mcp,
+            MCP_FIELDS,
+            "mcp",
+            source,
+            &path_display,
+        ));
+    }
     if let Some(permissions_obj) = object.get("permissions").and_then(JsonValue::as_object) {
         if let Some(approval) = permissions_obj.get("approval").and_then(JsonValue::as_object) {
             result.merge(validate_object_keys(
@@ -707,7 +807,7 @@ mod tests {
         assert!(matches!(
             result.warnings[0].kind,
             DiagnosticKind::Deprecated {
-                replacement: "permissions.defaultMode"
+                replacement: "permissions.default_mode"
             }
         ));
     }
@@ -812,7 +912,7 @@ mod tests {
     #[test]
     fn validates_nested_plugins_keys() {
         // given
-        let source = r#"{"plugins": {"installRoot": "/tmp", "autoUpdate": true}}"#;
+        let source = r#"{"plugins": {"install_root": "/tmp", "autoUpdate": true}}"#;
         let parsed = JsonValue::parse(source).expect("valid json");
         let object = parsed.as_object().expect("object");
 
@@ -827,7 +927,7 @@ mod tests {
     #[test]
     fn validates_nested_oauth_keys() {
         // given
-        let source = r#"{"oauth": {"clientId": "abc", "secret": "hidden"}}"#;
+        let source = r#"{"oauth": {"client_id": "abc", "secret": "hidden"}}"#;
         let parsed = JsonValue::parse(source).expect("valid json");
         let object = parsed.as_object().expect("object");
 
@@ -845,7 +945,7 @@ mod tests {
         let source = r#"{
   "model": "opus",
   "hooks": {"PreToolUse": ["guard"]},
-  "permissions": {"defaultMode": "plan", "allow": ["Read"]},
+  "permissions": {"default_mode": "plan", "allow": ["Read"]},
   "mcpServers": {},
   "sandbox": {"enabled": false}
 }"#;
@@ -994,7 +1094,7 @@ mod tests {
             field: "permissionMode".to_string(),
             line: Some(3),
             kind: DiagnosticKind::Deprecated {
-                replacement: "permissions.defaultMode",
+                replacement: "permissions.default_mode",
             },
         };
 
@@ -1004,7 +1104,7 @@ mod tests {
         // then
         assert_eq!(
             output,
-            r#"/test/config.yaml: field "permissionMode" is deprecated (line 3). Use "permissions.defaultMode" instead"#
+            r#"/test/config.yaml: field "permissionMode" is deprecated (line 3). Use "permissions.default_mode" instead"#
         );
     }
 }

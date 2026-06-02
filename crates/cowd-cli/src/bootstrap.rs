@@ -217,26 +217,26 @@ memory:
 compression:
   micro:
     enabled: true
-    toolResultMaxChars: 6000
-    timeDecayFactor: 0.9
+    tool_result_max_chars: 6000
+    time_decay_factor: 0.9
   session:
-    thresholdTokens: 180000
-    preserveRecent: 10
-    summaryMaxTokens: 2000
-    bufferTokens: 13000
+    threshold_tokens: 180000
+    preserve_recent: 10
+    summary_max_tokens: 2000
+    buffer_tokens: 13000
   deep:
     enabled: true
-    iterativeUpdate: true
-  circuitBreaker:
-    maxRetries: 3
-    cooldownSecs: 30
+    iterative_update: true
+  circuit_breaker:
+    max_retries: 3
+    cooldown_secs: 30
 
 # =============================================================================
 # 运行时配置
 # =============================================================================
 runtime:
   model: "gpt-4o"
-  permissionMode: "acceptEdits"
+  permission_mode: "acceptEdits"
 
 # =============================================================================
 # 多渠道网关配置
@@ -245,7 +245,7 @@ gateway:
   enabled: {gateway_enabled_str}
   sessionReset: "none"
   platforms:
-    - platformType: "api_server"
+    - platform_type: "api_server"
       enabled: {gateway_enabled_str}
       host: "127.0.0.1"
       port: {port}
@@ -258,15 +258,15 @@ gateway:
 # =============================================================================
 sandbox:
   enabled: false
-  namespaceRestrictions: false
-  networkIsolation: false
+  namespace_restrictions: false
+  network_isolation: false
   filesystemMode: "none"
-  allowedMounts: []
+  allowed_dirs: []
 
 # =============================================================================
 # MCP 服务器配置
 # =============================================================================
-mcpServers: {{}}
+mcp_servers: {{}}
 
 # =============================================================================
 # 钩子配置
@@ -281,7 +281,7 @@ hooks:
 # =============================================================================
 plugins:
   enabled: {{}}
-  externalDirectories: []
+  external_dirs: []
   installRoot: null
   registryPath: null
   bundledRoot: null

@@ -4016,7 +4016,7 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
     }
 }
 
-const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "defaultMode"];
+const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "default_mode"];
 
 fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput, String> {
     let settings_path = config_file_for_scope(ConfigScope::Settings)?;
@@ -4357,10 +4357,10 @@ fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
             path: &["alwaysThinkingEnabled"],
             options: None,
         },
-        "permissions.defaultMode" => ConfigSettingSpec {
+        "permissions.default_mode" => ConfigSettingSpec {
             scope: ConfigScope::Settings,
             kind: ConfigKind::String,
-            path: &["permissions", "defaultMode"],
+            path: &["permissions", "default_mode"],
             options: Some(&["default", "plan", "acceptEdits", "dontAsk", "auto"]),
         },
         "language" => ConfigSettingSpec {
@@ -5025,13 +5025,13 @@ use std::path::{Path, PathBuf};
     #[test]
     fn worker_create_merges_config_trusted_roots_without_per_call_override() {
         use std::fs;
-        // Write a .cowd/config.yaml in a temp dir with trustedRoots
+        // Write a .cowd/config.yaml in a temp dir with trusted_roots
         let worktree = temp_path("config-trust-worktree");
         let cc_dir = worktree.join(".cowd");
         fs::create_dir_all(&cc_dir).expect("create .cc dir");
         // Use the actual OS temp dir so the worktree path matches the allowlist
         let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
-        let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
+        let settings = format!("{{\"trusted_roots\": [\"{tmp_root}\"]}}");
         fs::write(cc_dir.join("config.yaml"), settings).expect("write settings");
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
@@ -5049,7 +5049,7 @@ use std::path::{Path, PathBuf};
         // worktree is under /tmp, so config roots auto-resolve trust
         assert_eq!(
             output["trust_auto_resolve"], true,
-            "config-level trustedRoots should auto-resolve trust without per-call override"
+            "config-level trusted_roots should auto-resolve trust without per-call override"
         );
 
         fs::remove_dir_all(&worktree).ok();
@@ -7465,7 +7465,7 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
 
         let set = execute_tool(
             "Config",
-            &json!({"setting": "permissions.defaultMode", "value": "plan"}),
+            &json!({"setting": "permissions.default_mode", "value": "plan"}),
         )
         .expect("set config");
         let set_output: serde_json::Value = serde_json::from_str(&set).expect("json");
@@ -7474,7 +7474,7 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
 
         let invalid = execute_tool(
             "Config",
-            &json!({"setting": "permissions.defaultMode", "value": "bogus"}),
+            &json!({"setting": "permissions.default_mode", "value": "bogus"}),
         )
         .expect_err("invalid config value should error");
         assert!(invalid.contains("Invalid value"));
@@ -7514,7 +7514,7 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
         std::fs::create_dir_all(cwd.join(".cowd")).expect("cwd dir");
         std::fs::write(
             cwd.join(".cowd").join("config.local.yaml"),
-            r#"{"permissions":{"defaultMode":"acceptEdits"}}"#,
+            r#"{"permissions":{"default_mode":"acceptEdits"}}"#,
         )
         .expect("write local config");
 
@@ -7534,7 +7534,7 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
 
         let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("config.local.yaml"))
             .expect("local config after enter");
-        assert!(local_settings.contains(r#""defaultMode": "plan""#));
+        assert!(local_settings.contains(r#""default_mode": "plan""#));
         let state =
             std::fs::read_to_string(cwd.join(".cowd").join("tool-state").join("plan-mode.json"))
                 .expect("plan mode state");
@@ -7550,7 +7550,7 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
 
         let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("config.local.yaml"))
             .expect("local settings after exit");
-        assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
+        assert!(local_settings.contains(r#""default_mode": "acceptEdits""#));
         assert!(!cwd
             .join(".cowd")
             .join("tool-state")

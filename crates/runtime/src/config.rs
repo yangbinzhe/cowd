@@ -1337,7 +1337,10 @@ fn merge_mcp_servers(
     root: &BTreeMap<String, JsonValue>,
     path: &Path,
 ) -> Result<(), ConfigError> {
-    let Some(mcp_servers) = root.get("mcpServers") else {
+    let Some(mcp_servers) = root.get("mcp_servers")
+        .or_else(|| root.get("mcpServers"))
+        .or_else(|| root.get("mcp").and_then(|m| m.as_object()).and_then(|m| m.get("servers")))
+    else {
         return Ok(());
     };
     let servers = expect_object(mcp_servers, &format!("{}: mcpServers", path.display()))?;
@@ -1491,7 +1494,7 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
         config.enabled_plugins = parse_bool_map(enabled_value, "merged settings.plugins.enabled")?;
     }
     config.external_directories =
-        optional_string_array(plugins, "externalDirectories", "merged settings.plugins")?
+        optional_string_array_dual(plugins, "external_dirs", "merged settings.plugins")?
             .map(|v| v.into_iter().map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string()).collect())
             .unwrap_or_default();
     config.install_root =
@@ -1503,7 +1506,7 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
     config.bundled_root =
         optional_string_dual(plugins, "bundled_root", "merged settings.plugins")?
             .map(|s| crate::cowd_dirs::expand_tilde(s).display().to_string());
-    config.max_output_tokens = optional_u32(plugins, "maxOutputTokens", "merged settings.plugins")?
+    config.max_output_tokens = optional_u32_dual(plugins, "max_output_tokens", "merged settings.plugins")?
         .or_else(|| std::env::var("COWD_MAX_OUTPUT_TOKENS").ok().and_then(|v| v.parse().ok()));
     Ok(config)
 }
@@ -1514,18 +1517,19 @@ fn parse_optional_permission_mode(
     let Some(object) = root.as_object() else {
         return Ok(None);
     };
+    // Deprecated top-level permissionMode
     if let Some(mode) = object.get("permissionMode").and_then(JsonValue::as_str) {
         return parse_permission_mode_label(mode, "merged settings.permissionMode").map(Some);
     }
     let Some(mode) = object
         .get("permissions")
         .and_then(JsonValue::as_object)
-        .and_then(|permissions| permissions.get("defaultMode"))
+        .and_then(|permissions| find_key_dual(permissions, "default_mode", "merged settings"))
         .and_then(JsonValue::as_str)
     else {
         return Ok(None);
     };
-    parse_permission_mode_label(mode, "merged settings.permissions.defaultMode").map(Some)
+    parse_permission_mode_label(mode, "merged settings.permissions.default_mode").map(Some)
 }
 
 fn parse_permission_mode_label(
@@ -1555,14 +1559,14 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         .transpose()?;
     Ok(SandboxConfig {
         enabled: optional_bool(sandbox, "enabled", "merged settings.sandbox")?,
-        namespace_restrictions: optional_bool(
+        namespace_restrictions: optional_bool_dual(
             sandbox,
-            "namespaceRestrictions",
+            "namespace_restrictions",
             "merged settings.sandbox",
         )?,
-        network_isolation: optional_bool(sandbox, "networkIsolation", "merged settings.sandbox")?,
+        network_isolation: optional_bool_dual(sandbox, "network_isolation", "merged settings.sandbox")?,
         filesystem_mode,
-        allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
+        allowed_mounts: optional_string_array_dual(sandbox, "allowed_dirs", "merged settings.sandbox")?
             .map(|v| v.into_iter().map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string()).collect())
             .unwrap_or_default(),
     })
@@ -1715,7 +1719,7 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
     {
         let e = expect_object(ext_val, "merged settings.memory.extraction")?;
         ExtractionConfig {
-            auto_extract: optional_bool(e, "autoExtract", "merged settings.memory.extraction")?
+            auto_extract: optional_bool_dual(e, "auto_extract", "merged settings.memory.extraction")?
                 .unwrap_or(ExtractionConfig::default().auto_extract),
         }
     } else {
@@ -1728,10 +1732,10 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         let enabled = optional_bool(v, "enabled", "merged settings.memory.vector")?;
         let model_name = optional_string_dual(v, "model", "merged settings.memory.vector")?;
         let dimension = optional_usize(v, "dimension", "merged settings.memory.vector")?;
-        let api_url = optional_string_dual(v, "apiUrl", "merged settings.memory.vector")?;
-        let api_key = optional_string_dual(v, "apiKey", "merged settings.memory.vector")?;
-        let timeout_secs = optional_u64(v, "timeoutSecs", "merged settings.memory.vector")?;
-        let batch_size = optional_usize(v, "batchSize", "merged settings.memory.vector")?;
+        let api_url = optional_string_dual(v, "api_url", "merged settings.memory.vector")?;
+        let api_key = optional_string_dual(v, "api_key", "merged settings.memory.vector")?;
+        let timeout_secs = optional_u64_dual(v, "timeout_secs", "merged settings.memory.vector")?;
+        let batch_size = optional_usize_dual(v, "batch_size", "merged settings.memory.vector")?;
 
         // Environment variable overrides.
         let resolved_model = std::env::var("COWD_MEMORY_VECTOR_MODEL")
@@ -1787,9 +1791,9 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         layers,
         extraction,
         vector,
-        aaak_index_enabled: optional_bool(mem, "aaakIndexEnabled", "merged settings.memory")?
+        aaak_index_enabled: optional_bool_dual(mem, "aaak_index_enabled", "merged settings.memory")?
             .unwrap_or(MemoryConfig::default().aaak_index_enabled),
-        coherence_threshold_bp: optional_u32(mem, "coherenceThreshold", "merged settings.memory")?
+        coherence_threshold_bp: optional_u32_dual(mem, "coherence_threshold_bp", "merged settings.memory")?
             .unwrap_or(MemoryConfig::default().coherence_threshold_bp),
     })
 }
@@ -1807,9 +1811,9 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
         MicroCompactConfig {
             enabled: optional_bool(m, "enabled", "merged settings.compression.micro")?
                 .unwrap_or(MicroCompactConfig::default().enabled),
-            tool_result_max_chars: optional_u32(m, "toolResultMaxChars", "merged settings.compression.micro")?
+            tool_result_max_chars: optional_u32_dual(m, "tool_result_max_chars", "merged settings.compression.micro")?
                 .unwrap_or(MicroCompactConfig::default().tool_result_max_chars),
-            time_decay_factor: optional_f32(m, "timeDecayFactor", "merged settings.compression.micro")?
+            time_decay_factor: optional_f32_dual(m, "time_decay_factor", "merged settings.compression.micro")?
                 .unwrap_or(MicroCompactConfig::default().time_decay_factor),
         }
     } else {
@@ -1818,13 +1822,13 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
     let session = if let Some(sess_val) = cmp.get("session") {
         let s = expect_object(sess_val, "merged settings.compression.session")?;
         SessionCompactConfig {
-            threshold_tokens: optional_u32(s, "thresholdTokens", "merged settings.compression.session")?
+            threshold_tokens: optional_u32_dual(s, "threshold_tokens", "merged settings.compression.session")?
                 .unwrap_or(SessionCompactConfig::default().threshold_tokens),
-            preserve_recent: optional_u32(s, "preserveRecent", "merged settings.compression.session")?
+            preserve_recent: optional_u32_dual(s, "preserve_recent", "merged settings.compression.session")?
                 .unwrap_or(SessionCompactConfig::default().preserve_recent),
-            summary_max_tokens: optional_u32(s, "summaryMaxTokens", "merged settings.compression.session")?
+            summary_max_tokens: optional_u32_dual(s, "summary_max_tokens", "merged settings.compression.session")?
                 .unwrap_or(SessionCompactConfig::default().summary_max_tokens),
-            buffer_tokens: optional_u32(s, "bufferTokens", "merged settings.compression.session")?
+            buffer_tokens: optional_u32_dual(s, "buffer_tokens", "merged settings.compression.session")?
                 .unwrap_or(SessionCompactConfig::default().buffer_tokens),
         }
     } else {
@@ -1835,18 +1839,18 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
         DeepCompactConfig {
             enabled: optional_bool(d, "enabled", "merged settings.compression.deep")?
                 .unwrap_or(DeepCompactConfig::default().enabled),
-            iterative_update: optional_bool(d, "iterativeUpdate", "merged settings.compression.deep")?
+            iterative_update: optional_bool_dual(d, "iterative_update", "merged settings.compression.deep")?
                 .unwrap_or(DeepCompactConfig::default().iterative_update),
         }
     } else {
         DeepCompactConfig::default()
     };
-    let circuit_breaker = if let Some(cb_val) = cmp.get("circuitBreaker") {
-        let cb = expect_object(cb_val, "merged settings.compression.circuitBreaker")?;
+    let circuit_breaker = if let Some(cb) = find_key_dual(cmp, "circuit_breaker", "compression") {
+        let cb = expect_object(cb, "merged settings.compression.circuit_breaker")?;
         CircuitBreakerConfig {
-            max_retries: optional_u32(cb, "maxRetries", "merged settings.compression.circuitBreaker")?
+            max_retries: optional_u32_dual(cb, "max_retries", "merged settings.compression.circuit_breaker")?
                 .unwrap_or(CircuitBreakerConfig::default().max_retries),
-            cooldown_secs: optional_u32(cb, "cooldownSecs", "merged settings.compression.circuitBreaker")?
+            cooldown_secs: optional_u32_dual(cb, "cooldown_secs", "merged settings.compression.circuit_breaker")?
                 .unwrap_or(CircuitBreakerConfig::default().cooldown_secs),
         }
     } else {
@@ -1883,13 +1887,13 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
                 let ctx = format!("merged settings.gateway.platforms[{i}]");
                 let p = expect_object(v, &ctx)?;
                 Ok(PlatformConfig {
-                    platform_type: expect_string(p, "platformType", &ctx)
-                        .or_else(|_| expect_string(p, "type", &ctx))  // fallback: "type" key
-                        .map(|s| s.to_string())?,
+                    platform_type: optional_string_dual(p, "platform_type", &ctx)?
+                        .unwrap_or("api_server")
+                        .to_string(),
                     enabled: optional_bool(p, "enabled", &ctx)?.unwrap_or(true),
                     extra: p
                         .iter()
-                        .filter(|(k, _)| k.as_str() != "platformType" && k.as_str() != "enabled")
+                        .filter(|(k, _)| k.as_str() != "platform_type" && k.as_str() != "platformType" && k.as_str() != "enabled")
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
                 })
@@ -1999,12 +2003,18 @@ fn parse_optional_oauth_config(
         return Ok(None);
     };
     let object = expect_object(oauth_value, context)?;
-    let client_id = expect_string(object, "clientId", context)?.to_string();
-    let authorize_url = expect_string(object, "authorizeUrl", context)?.to_string();
-    let token_url = expect_string(object, "tokenUrl", context)?.to_string();
-    let callback_port = optional_u16(object, "callbackPort", context)?;
+    let client_id = optional_string_dual(object, "client_id", context)?
+        .map(str::to_string)
+        .ok_or_else(|| ConfigError::Parse(format!("{context}: missing string field client_id")))?;
+    let authorize_url = optional_string_dual(object, "authorize_url", context)?
+        .map(str::to_string)
+        .ok_or_else(|| ConfigError::Parse(format!("{context}: missing string field authorize_url")))?;
+    let token_url = optional_string_dual(object, "token_url", context)?
+        .map(str::to_string)
+        .ok_or_else(|| ConfigError::Parse(format!("{context}: missing string field token_url")))?;
+    let callback_port = optional_u16_dual(object, "callback_port", context)?;
     let manual_redirect_url =
-        optional_string(object, "manualRedirectUrl", context)?.map(str::to_string);
+        optional_string_dual(object, "manual_redirect_url", context)?.map(str::to_string);
     let scopes = optional_string_array(object, "scopes", context)?.unwrap_or_default();
     Ok(Some(OAuthConfig {
         client_id,
@@ -2084,9 +2094,9 @@ fn parse_optional_mcp_oauth_config(
     };
     let oauth = expect_object(value, &format!("{context}.oauth"))?;
     Ok(Some(McpOAuthConfig {
-        client_id: optional_string(oauth, "clientId", context)?.map(str::to_string),
-        callback_port: optional_u16(oauth, "callbackPort", context)?,
-        auth_server_metadata_url: optional_string(oauth, "authServerMetadataUrl", context)?
+        client_id: optional_string_dual(oauth, "client_id", context)?.map(str::to_string),
+        callback_port: optional_u16_dual(oauth, "callback_port", context)?,
+        auth_server_metadata_url: optional_string_dual(oauth, "auth_server_metadata_url", context)?
             .map(str::to_string),
         xaa: optional_bool(oauth, "xaa", context)?,
     }))
@@ -2159,6 +2169,25 @@ fn optional_u16(
             Ok(Some(number))
         }
     }
+}
+
+/// Look up a u16 config value, supporting both snake_case (preferred) and camelCase (deprecated).
+fn optional_u16_dual(
+    object: &BTreeMap<String, JsonValue>,
+    snake_key: &str,
+    ctx: &str,
+) -> Result<Option<u16>, ConfigError> {
+    if object.contains_key(snake_key) {
+        return optional_u16(object, snake_key, ctx);
+    }
+    let camel_key = to_camel_case(snake_key);
+    if object.contains_key(&camel_key) {
+        tracing::warn!(
+            "config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
+        return optional_u16(object, &camel_key, ctx);
+    }
+    Ok(None)
 }
 
 fn optional_u32(
@@ -2452,6 +2481,63 @@ fn optional_u32_dual(
     Ok(None)
 }
 
+/// Look up an f32 config value, supporting both snake_case (preferred) and camelCase (deprecated).
+fn optional_f32_dual(
+    object: &BTreeMap<String, JsonValue>,
+    snake_key: &str,
+    ctx: &str,
+) -> Result<Option<f32>, ConfigError> {
+    if object.contains_key(snake_key) {
+        return optional_f32(object, snake_key, ctx);
+    }
+    let camel_key = to_camel_case(snake_key);
+    if object.contains_key(&camel_key) {
+        tracing::warn!(
+            "config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
+        return optional_f32(object, &camel_key, ctx);
+    }
+    Ok(None)
+}
+
+/// Look up a u64 config value, supporting both snake_case (preferred) and camelCase (deprecated).
+fn optional_u64_dual(
+    object: &BTreeMap<String, JsonValue>,
+    snake_key: &str,
+    ctx: &str,
+) -> Result<Option<u64>, ConfigError> {
+    if object.contains_key(snake_key) {
+        return optional_u64(object, snake_key, ctx);
+    }
+    let camel_key = to_camel_case(snake_key);
+    if object.contains_key(&camel_key) {
+        tracing::warn!(
+            "config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
+        return optional_u64(object, &camel_key, ctx);
+    }
+    Ok(None)
+}
+
+/// Look up a usize config value, supporting both snake_case (preferred) and camelCase (deprecated).
+fn optional_usize_dual(
+    object: &BTreeMap<String, JsonValue>,
+    snake_key: &str,
+    ctx: &str,
+) -> Result<Option<usize>, ConfigError> {
+    if object.contains_key(snake_key) {
+        return optional_usize(object, snake_key, ctx);
+    }
+    let camel_key = to_camel_case(snake_key);
+    if object.contains_key(&camel_key) {
+        tracing::warn!(
+            "config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
+        return optional_usize(object, &camel_key, ctx);
+    }
+    Ok(None)
+}
+
 fn deep_merge_objects(
     target: &mut BTreeMap<String, JsonValue>,
     source: &BTreeMap<String, JsonValue>,
@@ -2553,7 +2639,7 @@ mod tests {
         .expect("write user compat config");
         fs::write(
             home.join("config.yaml"),
-            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]},"mcpServers":{"home":{"command":"uvx","args":["home"]}}}"#,
+            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"default_mode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]},"mcpServers":{"home":{"command":"uvx","args":["home"]}}}"#,
         )
         .expect("write user settings");
         fs::write(
@@ -2634,10 +2720,10 @@ mod tests {
             r#"{
               "sandbox": {
                 "enabled": true,
-                "namespaceRestrictions": false,
-                "networkIsolation": true,
-                "filesystemMode": "allow-list",
-                "allowedMounts": ["logs", "tmp/cache"]
+                "namespace_restrictions": false,
+                "network_isolation": true,
+                "filesystem_mode": "allow-list",
+                "allowed_dirs": ["logs", "tmp/cache"]
               }
             }"#,
         )
@@ -2770,7 +2856,7 @@ mod tests {
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
             home.join("config.yaml"),
-            r#"{"trustedRoots": ["/tmp/worktrees", "/home/user/projects"]}"#,
+            r#"{"trusted_roots": ["/tmp/worktrees", "/home/user/projects"]}"#,
         )
         .expect("write settings");
 
@@ -2830,19 +2916,19 @@ mod tests {
                   "headers": {"Authorization": "Bearer token"},
                   "headersHelper": "helper.sh",
                   "oauth": {
-                    "clientId": "mcp-client",
-                    "callbackPort": 7777,
-                    "authServerMetadataUrl": "https://issuer.test/.well-known/oauth-authorization-server",
+                    "client_id": "mcp-client",
+                    "callback_port": 7777,
+                    "auth_server_metadata_url": "https://issuer.test/.well-known/oauth-authorization-server",
                     "xaa": true
                   }
                 }
               },
               "oauth": {
-                "clientId": "runtime-client",
-                "authorizeUrl": "https://console.test/oauth/authorize",
-                "tokenUrl": "https://console.test/oauth/token",
-                "callbackPort": 54545,
-                "manualRedirectUrl": "https://console.test/oauth/callback",
+                "client_id": "runtime-client",
+                "authorize_url": "https://console.test/oauth/authorize",
+                "token_url": "https://console.test/oauth/token",
+                "callback_port": 54545,
+                "manual_redirect_url": "https://console.test/oauth/callback",
                 "scopes": ["org:read", "user:write"]
               }
             }"#,
@@ -2989,10 +3075,10 @@ mod tests {
                 "core-helpers@builtin": true
               },
               "plugins": {
-                "externalDirectories": ["./external-plugins"],
-                "installRoot": "plugin-cache/installed",
-                "registryPath": "plugin-cache/installed.json",
-                "bundledRoot": "./bundled-plugins"
+                "external_dirs": ["./external-plugins"],
+                "install_root": "plugin-cache/installed",
+                "registry_path": "plugin-cache/installed.json",
+                "bundled_root": "./bundled-plugins"
               }
             }"#,
         )
@@ -3397,5 +3483,73 @@ mod tests {
 
         // then — should fall back to None (not panic)
         assert_eq!(config.max_output_tokens(), None);
+    }
+
+    #[test]
+    fn test_platform_type_snake_case_parses() {
+        // Verifies optional_string_dual correctly reads platform_type in snake_case
+        // within a gateway.platforms entry.
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"{
+              "gateway": {
+                "enabled": true,
+                "platforms": [
+                  {
+                    "platform_type": "feishu",
+                    "enabled": true,
+                    "app_id": "cli_abc"
+                  }
+                ]
+              }
+            }"#,
+        )
+        .expect("write gateway config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(loaded.gateway().platforms.len(), 1);
+        assert_eq!(loaded.gateway().platforms[0].platform_type, "feishu");
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn test_circuit_breaker_snake_case_section_key() {
+        // Verifies find_key_dual correctly locates the circuit_breaker
+        // sub-section within compression config when the key is snake_case.
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"{
+              "compression": {
+                "circuit_breaker": {
+                  "max_retries": 5,
+                  "cooldown_secs": 60
+                }
+              }
+            }"#,
+        )
+        .expect("write compression config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(loaded.compression().circuit_breaker.max_retries, 5);
+        assert_eq!(loaded.compression().circuit_breaker.cooldown_secs, 60);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }

@@ -60,7 +60,7 @@ provider_fallbacks:
 
 permissions:
   # 默认权限模式: plan(只读) | acceptEdits(可写工作区) | dontAsk(危险全访问)
-  defaultMode: "acceptEdits"
+  default_mode: "acceptEdits"
   # 允许列表 (即使权限模式更低也允许)
   allow: []
   # 拒绝列表 (即使权限模式更高也禁止)
@@ -333,7 +333,7 @@ gateway:
   # idle_timeout_minutes: 30
   platforms:
     # Web API Server — cowd serve 命令使用此配置
-    - platformType: api_server
+    - platform_type: api_server
       enabled: true
       host: "127.0.0.1"
       port: 8642
@@ -343,7 +343,7 @@ gateway:
 
     # ── 飞书机器人（Feishu/Lark）─────────────────────────────────────────────
     # 支持 WebSocket 长连接事件推送 + 富文本消息 + 图片/文件/音视频发送
-    # - platformType: feishu
+    # - platform_type: feishu
     #   enabled: false
     #
     #   # ── 基础凭证（必填）──
@@ -386,14 +386,14 @@ gateway:
     #   reactions_cache_size: 1024         # 反应 LRU 缓存大小
 
     # ── 微信个人机器人（iLink Bot API）─────────────────────────────────────
-    # - platformType: wechat_ilink
+    # - platform_type: wechat_ilink
     #   enabled: false
     #   bot_id: ""                          # 微信 iLink 控制台的 Bot ID
     #   bot_secret: ""                      # Bot Secret
     #   base_url: "https://ilinkai.weixin.qq.com"  # iLink API 基础 URL
 
     # 邮箱
-    # - platformType: email
+    # - platform_type: email
     #   enabled: false
     #   smtp_host: "smtp.gmail.com"
     #   smtp_port: 587
