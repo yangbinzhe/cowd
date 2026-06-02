@@ -415,6 +415,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
         } => {
+            // Note: TUI runs independent runtime; daemon spawn is a legacy side-effect
             // Auto-start daemon if not already running
             let sock = std::path::Path::new("/tmp/cowd.sock");
             if !sock.exists() {
@@ -7082,8 +7083,9 @@ pub(crate) fn build_runtime(
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
     stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    let t0 = std::time::Instant::now();
     let runtime_plugin_state = build_runtime_plugin_state()?;
-    build_runtime_with_plugin_state(
+    let result = build_runtime_with_plugin_state(
         session,
         session_id,
         model,
@@ -7095,7 +7097,10 @@ pub(crate) fn build_runtime(
         tool_callback,
         stream_callback,
         runtime_plugin_state,
-    )
+    );
+    let elapsed = t0.elapsed();
+    tracing::info!(elapsed_ms = elapsed.as_millis() as u64, "TUI runtime built in {}ms", elapsed.as_millis());
+    result
 }
 
 /// Production executor for sub-agent tasks in the CLI.

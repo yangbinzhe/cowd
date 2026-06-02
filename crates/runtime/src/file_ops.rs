@@ -332,7 +332,7 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 /// Runs a regex search over workspace files with optional context lines.
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let pattern = match &input.pattern {
-        Some(p) if !p.is_empty() => p.as_str(),
+        Some(p) if !p.trim().is_empty() => p.as_str(),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -373,6 +373,10 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
 
     for file_path in collect_search_files(&base_path)? {
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
+            continue;
+        }
+
+        if std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0) > MAX_READ_SIZE {
             continue;
         }
 
@@ -454,8 +458,13 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
         return Ok(vec![base_path.to_path_buf()]);
     }
 
+    let skip_dirs = ["target", "node_modules", ".git", ".cargo", ".gitnexus"];
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
+    for entry in WalkDir::new(base_path)
+        .max_depth(20)
+        .into_iter()
+        .filter_entry(|e| !skip_dirs.iter().any(|d| e.file_name().to_str() == Some(d)))
+    {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
         if entry.file_type().is_file() {
             files.push(entry.path().to_path_buf());

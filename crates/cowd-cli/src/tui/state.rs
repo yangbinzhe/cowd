@@ -520,6 +520,7 @@ impl TuiState {
                 let _guard = self.render_profiler.guard("chat_view");
                 self.chat_view.render(&mut main_ctx, chat_area);
             }
+            self.chat_view.sync_to_app(&mut self.app);
 
             // Render sidebar: tab bar + active panel
             let tab_height = 1u16;
@@ -1141,20 +1142,6 @@ impl TuiState {
 
         if self.app.search_active {
             return self.handle_search_key(key);
-        }
-
-        // FIX D: Empty input + j/k → navigate timeline cursor (open code behavior)
-        // When input is empty, j/k move the cursor between entries instead of scrolling.
-        if self.app.input.is_empty()
-            && key.modifiers.is_empty()
-            && matches!(key.code, KeyCode::Char('j' | 'k'))
-        {
-            if key.code == KeyCode::Char('j') {
-                self.app.cursor_down();
-            } else {
-                self.app.cursor_up();
-            }
-            return ProcessedKey::Nothing;
         }
 
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)

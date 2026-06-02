@@ -385,6 +385,16 @@ impl App {
         self.total_entries == 0
     }
 
+    fn timeline_has_recent_done(&self) -> bool {
+        let len = self.timeline_len();
+        if len == 0 {
+            return false;
+        }
+        self.timeline_get(len - 1).map_or(false, |e| {
+            matches!(e, TimelineEntry::Message { content, .. } if content == "✓ Done")
+        })
+    }
+
     pub fn timeline_get(&self, idx: usize) -> Option<&TimelineEntry> {
         if idx >= self.total_entries {
             return None;
@@ -773,7 +783,6 @@ impl App {
         match event {
             CowdEvent::TextDelta { text } => {
                 self.streaming_received = true;
-                self.auto_scroll = true;
                 let mut found = false;
                 if let Some(TimelineEntry::Message { role, content, .. }) = self.timeline_last_mut() {
                     if role == "assistant" && content != "✓ Done" {
@@ -890,6 +899,7 @@ impl App {
             }
 
             CowdEvent::TurnStarted => {
+                self.auto_scroll = true;
                 self.is_loading = true;
                 self.turn_active = true;
                 self.streaming_received = false;
@@ -902,6 +912,7 @@ impl App {
             }
 
             CowdEvent::TurnComplete { assistant_text, iterations: _ } => {
+                self.auto_scroll = true;
                 self.is_loading = false;
                 self.turn_active = false;
                 for entry in self.timeline_iter_mut() {
@@ -918,11 +929,13 @@ impl App {
                         timestamp: App::format_timestamp(),
                     });
                 }
-                self.timeline_push(TimelineEntry::Message {
-                    role: "assistant".into(),
-                    content: "✓ Done".into(),
-                    timestamp: App::format_timestamp(),
-                });
+                if !self.timeline_has_recent_done() {
+                    self.timeline_push(TimelineEntry::Message {
+                        role: "assistant".into(),
+                        content: "✓ Done".into(),
+                        timestamp: App::format_timestamp(),
+                    });
+                }
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }

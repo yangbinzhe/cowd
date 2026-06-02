@@ -74,7 +74,7 @@ impl ToolSafetyCategory {
     /// ReadOnly tools get 30s (fast read operations), others get 120s.
     pub fn default_timeout_secs(&self) -> u64 {
         match self {
-            Self::ReadOnly => 30,
+            Self::ReadOnly => 120,
             Self::WriteLocal | Self::Network | Self::Destructive => 120,
         }
     }
