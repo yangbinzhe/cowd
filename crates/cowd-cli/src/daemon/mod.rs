@@ -140,8 +140,14 @@ pub async fn run_daemon(
     });
     singletons::GLOBAL_MEMORY.get_or_init(|| {
         let mem_cfg = config.memory_config.clone().unwrap_or_default();
-        let handle = tokio::runtime::Handle::current();
-        Arc::new(handle.block_on(CognitiveContextManager::new(mem_cfg)).expect("global memory init"))
+        // Use block_in_place to yield the current runtime thread before
+        // performing a nested block_on. This prevents tokio v1.52+ from
+        // rejecting same-runtime nested block_on.
+        let cognitive = tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(CognitiveContextManager::new(mem_cfg))
+        });
+        Arc::new(cognitive.expect("global memory init"))
     });
     singletons::GLOBAL_STORE.get_or_init(|| {
         Arc::new(crate::get_unified_store().expect("global store init").clone())
