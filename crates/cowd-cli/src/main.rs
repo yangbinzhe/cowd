@@ -1030,6 +1030,20 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             reasoning_effort,
             allow_broad_cwd,
         ),
+        _other if output_format == CliOutputFormat::Json => {
+            let text = rest.join(" ");
+            Ok(CliAction::Prompt {
+                text,
+                model,
+                allowed_tools,
+                permission_mode,
+                base_commit,
+                reasoning_effort: reasoning_effort.clone(),
+                allow_broad_cwd,
+                compact,
+                output_format,
+            })
+        }
         _other => Ok(CliAction::Repl {
             model,
             allowed_tools,
