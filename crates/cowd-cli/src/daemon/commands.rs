@@ -286,6 +286,12 @@ pub(crate) async fn handle_unix_client(
                                 }
                                 continue;
                             }
+                            Some("poll_events") => {
+                                // Non-blocking: return empty events array immediately
+                                // Real implementation would buffer events per session
+                                let _ = writer.write_all(b"{\"events\":[]}\n").await;
+                                continue;
+                            }
                             Some(other) => {
                                 serde_json::json!({
                                     "ok": false,

@@ -9,6 +9,7 @@ mod api_routes;
 mod bootstrap;
 mod cli;
 mod daemon;
+mod daemon_client;
 mod event_bus;
 mod init;
 mod mcp_serve;
@@ -68,6 +69,7 @@ use tools::{
     GlobalToolRegistry, RuntimeToolDefinition,
 };
 
+use daemon_client::DaemonClient;
 use futures::StreamExt;
 use tui::state::TuiState;
 
@@ -2951,6 +2953,10 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
     let res = SHARED_RT.block_on(async {
         let mut reader = crossterm::event::EventStream::new();
+
+        // Connect to daemon for event integration (best-effort, non-blocking)
+        cli.daemon_client = DaemonClient::connect(&cli.model).await.ok();
+
         loop {
             tokio::select! {
                 Some(Ok(event)) = reader.next() => {
@@ -3076,7 +3082,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(16)) => {
-                    drain_cowd_events_state(&tui_rx, &mut state);
+                    drain_cowd_events_state(&tui_rx, &mut state, cli.daemon_client.as_mut());
                     if turn_handle.as_ref().is_some_and(|h| h.is_finished()) {
                         turn_handle = None;
                         state.is_loading = false;
@@ -3103,7 +3109,11 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
 /// Process all pending CowdEvents from the channel without blocking,
 /// routing through TuiState::apply_event for EventBus bridging.
-fn drain_cowd_events_state(rx: &tui::CowdEventReceiver, state: &mut tui::state::TuiState) {
+fn drain_cowd_events_state(
+    rx: &tui::CowdEventReceiver,
+    state: &mut tui::state::TuiState,
+    daemon: Option<&mut DaemonClient>,
+) {
     let mut count = 0;
     let limit = if state.turn_active { 64 } else { 256 };
     while let Ok(event) = rx.try_recv() {
@@ -3111,6 +3121,14 @@ fn drain_cowd_events_state(rx: &tui::CowdEventReceiver, state: &mut tui::state::
         count += 1;
         if count >= limit {
             break;
+        }
+    }
+
+    // Also drain daemon events if connected
+    if let Some(daemon) = daemon {
+        let events = daemon.try_recv_events();
+        for event in events {
+            state.apply_event(event);
         }
     }
 }
@@ -3317,6 +3335,7 @@ pub(crate) struct LiveCli {
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
     active_sessions: Option<Arc<crate::gateway::ActiveSessions>>,
+    daemon_client: Option<DaemonClient>,
 }
 
 #[derive(Debug, Clone)]
@@ -3880,6 +3899,7 @@ impl LiveCli {
             session,
             prompt_history: Vec::new(),
             active_sessions: None,
+            daemon_client: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -6775,31 +6795,58 @@ fn run_prompt(
             fallback_init_providers_from_user_config();
         }
     }
-    let mut runtime = build_runtime(
-        session_state.with_persistence_path(session.path.clone()),
-        &session.id,
-        resolved_model,
-        system_prompt,
-        true,
-        false,
-        allowed_tools,
-        permission_mode,
-        None,
-        None,
-    )?;
-    if let Some(effort) = reasoning_effort {
-        if let Some(rt) = runtime.runtime.as_mut() {
-            rt.api_client_mut().set_reasoning_effort(Some(effort));
+    // Try daemon mode first, fallback to local runtime
+    let daemon_result: Result<String, Box<dyn std::error::Error>> = SHARED_RT.block_on(async {
+        let mut daemon = DaemonClient::connect(&resolved_model).await
+            .map_err(|e| -> Box<dyn std::error::Error> { format!("daemon connect: {e}").into() })?;
+        daemon.send_chat(text).await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        loop {
+            match daemon.recv_event().await {
+                Some(runtime::CowdEvent::TurnComplete { assistant_text, .. }) => {
+                    return Ok(assistant_text);
+                }
+                Some(runtime::CowdEvent::TurnError { error }) => {
+                    return Err(error.into());
+                }
+                None => {
+                    return Err("daemon connection closed unexpectedly".into());
+                }
+                _ => {}
+            }
         }
-    }
-    let prompter = runtime::permissions::SharedPrompter::new(Box::new(
-        CliPermissionPrompter::new(permission_mode),
-    ));
-    let handle = tokio::runtime::Handle::try_current()
-        .unwrap_or_else(|_| SHARED_RT.handle().clone());
-    let summary = handle.block_on(runtime.run_turn_async(text, &prompter))?;
-    runtime.shutdown_plugins()?;
-    let final_text = final_assistant_text(&summary).trim().to_string();
+    });
+
+    let final_text = match daemon_result {
+        Ok(text) => text.trim().to_string(),
+        Err(_) => {
+            let mut runtime = build_runtime(
+                session_state.with_persistence_path(session.path.clone()),
+                &session.id,
+                resolved_model,
+                system_prompt,
+                true,
+                false,
+                allowed_tools,
+                permission_mode,
+                None,
+                None,
+            )?;
+            if let Some(effort) = reasoning_effort {
+                if let Some(rt) = runtime.runtime.as_mut() {
+                    rt.api_client_mut().set_reasoning_effort(Some(effort));
+                }
+            }
+            let prompter = runtime::permissions::SharedPrompter::new(Box::new(
+                CliPermissionPrompter::new(permission_mode),
+            ));
+            let handle = tokio::runtime::Handle::try_current()
+                .unwrap_or_else(|_| SHARED_RT.handle().clone());
+            let summary = handle.block_on(runtime.run_turn_async(text, &prompter))?;
+            runtime.shutdown_plugins()?;
+            final_assistant_text(&summary).trim().to_string()
+        }
+    };
     match output_format {
         CliOutputFormat::Text => {
             if compact {
