@@ -511,7 +511,10 @@ impl TuiState {
         // 1. Render chat view + sidebar using the layout tree
         {
             self.layout_tree.resize(area);
-            let chat_area = self.layout_tree.area_of("chat").unwrap_or(area);
+            let mut chat_area = self.layout_tree.area_of("chat").unwrap_or(area);
+            // Subtract status bar (1 line) + input area from chat viewport height
+            // so scroll calculation doesn't think it has more visible lines than available
+            chat_area.height = chat_area.height.saturating_sub(1).saturating_sub(input_h);
             let sidebar_w = area.width.saturating_sub(chat_area.width);
             let sidebar_area = ratatui::layout::Rect::new(chat_area.width, 0, sidebar_w, area.height);
 
