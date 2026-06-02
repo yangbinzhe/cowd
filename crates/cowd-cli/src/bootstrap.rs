@@ -193,7 +193,7 @@ trusted_roots:
 # =============================================================================
 memory:
   enabled: true
-  storePath: "~/.cowd/memory"
+  store_path: "~/.cowd/memory"
   layers:
     l0_enabled: true
     l1_max_tokens: 3000
@@ -204,9 +204,9 @@ memory:
     auto_extract: true
   vector:
     enabled: false
-    embeddingModel: "text-embedding-3-small"
-    apiUrl: "https://api.openai.com/v1/embeddings"
-    apiKey: ""
+    embedding_model: "text-embedding-3-small"
+    api_url: "https://api.openai.com/v1/embeddings"
+    api_key: ""
     dimension: 1536
     timeout_secs: 30
     batch_size: 32
@@ -272,9 +272,9 @@ mcp_servers: {{}}
 # 钩子配置
 # =============================================================================
 hooks:
-  PreToolUse: []
-  PostToolUse: []
-  PostToolUseFailure: []
+  pre_tool_use: []
+  post_tool_use: []
+  post_tool_use_failure: []
 
 # =============================================================================
 # 插件配置
@@ -282,9 +282,9 @@ hooks:
 plugins:
   enabled: {{}}
   external_dirs: []
-  installRoot: null
-  registryPath: null
-  bundledRoot: null
+  install_root: null
+  registry_path: null
+  bundled_root: null
   max_output_tokens: null
 "#)
 }
