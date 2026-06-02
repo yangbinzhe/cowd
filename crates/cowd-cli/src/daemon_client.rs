@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -14,8 +13,7 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     pub async fn connect(model: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let sock = Path::new("/tmp/cowd.sock");
-        let stream = UnixStream::connect(sock).await?;
+        let stream = UnixStream::connect(crate::server::socket_file()).await?;
         let mut client = Self {
             stream: BufReader::new(stream),
             session_id: String::new(),

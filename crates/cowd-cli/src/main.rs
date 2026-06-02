@@ -130,6 +130,30 @@ fn reap_daemon_children() {
     }
 }
 
+/// Spawn daemon process (gateway run) as a detached child.
+/// If `wait_for_pid` is true, polls for the PID file up to 5s.
+fn spawn_daemon(wait_for_pid: bool) -> Result<u32, String> {
+    setup_sigchld_handler();
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let child = unsafe {
+        std::process::Command::new(&exe)
+            .arg("gateway").arg("run")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .pre_exec(|| { libc::setsid(); Ok(()) })
+            .spawn().map_err(|e| e.to_string())?
+    };
+    let pid = adopt_daemon_child(child);
+    if wait_for_pid {
+        for _ in 0..50 {
+            if server::pid_file().exists() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    Ok(pid)
+}
+
 static SHARED_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -427,37 +451,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Ok(None) | Err(_) => {
                     // Clean up stale socket file if present
-                    let sock = std::path::Path::new("/tmp/cowd.sock");
-                    let _ = std::fs::remove_file(sock);
+                    let _ = std::fs::remove_file(server::socket_file());
                     tracing::info!("daemon not running, auto-starting...");
-                    setup_sigchld_handler();
-                    if let Ok(exe) = std::env::current_exe() {
-                        match unsafe {
-                            std::process::Command::new(&exe)
-                                .arg("gateway")
-                                .arg("run")
-                                .stdin(std::process::Stdio::null())
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .pre_exec(|| { libc::setsid(); Ok(()) })
-                                .spawn()
-                        } {
-                            Ok(child) => {
-                                let pid = adopt_daemon_child(child);
-                                tracing::info!(pid, "daemon auto-started for REPL");
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to auto-start daemon");
-                            }
-                        }
-                        // Wait for PID file to appear (max 5s)
-                        let pid_path = server::pid_file();
-                        for _ in 0..50 {
-                            if pid_path.exists() {
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
+                    if let Err(e) = spawn_daemon(true) {
+                        tracing::warn!(error = %e, "failed to auto-start daemon");
                     }
                 }
             }
@@ -504,21 +501,7 @@ fn run_gateway_action(
                 println!("Gateway is already running");
                 return Ok(());
             }
-            setup_sigchld_handler();
-            let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
-            tracing::info!(binary = %exe.display(), "gateway start: spawning daemon");
-            let child = unsafe {
-                std::process::Command::new(&exe)
-                    .arg("gateway")
-                    .arg("run")
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .pre_exec(|| { libc::setsid(); Ok(()) })
-                    .spawn()
-            }
-            .map_err(|e| format!("failed to start gateway daemon: {e}"))?;
-            let pid = adopt_daemon_child(child);
+            let pid = spawn_daemon(false)?;
             println!("Gateway started (pid: {pid})");
             tracing::info!(pid, "gateway daemon spawned");
             Ok(())
@@ -601,7 +584,7 @@ fn run_gateway_action(
 
             let daemon_config = daemon::DaemonConfig {
                 http_addr: format!("{effective_host}:{effective_port}"),
-                unix_sock_path: "/tmp/cowd.sock".to_string(),
+                unix_sock_path: server::socket_file().to_string_lossy().to_string(),
                 memory_config,
                 platform_configs,
                 runtime_config: runtime_config_json,
@@ -616,22 +599,9 @@ fn run_gateway_action(
             Ok(())
         }
         GatewayAction::Restart => {
-            setup_sigchld_handler();
             server::stop_server().map_err(|e| e.to_string())?;
             tracing::info!("gateway restart: stopped, re-spawning");
-            let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
-            let child = unsafe {
-                std::process::Command::new(&exe)
-                    .arg("gateway")
-                    .arg("run")
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .pre_exec(|| { libc::setsid(); Ok(()) })
-                    .spawn()
-            }
-            .map_err(|e| format!("failed to start gateway daemon: {e}"))?;
-            let pid = adopt_daemon_child(child);
+            let pid = spawn_daemon(false)?;
             println!("Gateway restarted (pid: {pid})");
             tracing::info!(pid, "gateway restarted");
             Ok(())

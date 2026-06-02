@@ -44,6 +44,10 @@ pub fn pid_file() -> PathBuf {
     dir.join("cowd-serve.pid")
 }
 
+pub fn socket_file() -> PathBuf {
+    PathBuf::from("/tmp/cowd.sock")
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerInfo {
     pub pid: u32,
@@ -87,6 +91,7 @@ fn process_exists(_pid: u32) -> bool {
 }
 
 pub fn stop_server() -> Result<(), ServerError> {
+    let _ = std::fs::remove_file(socket_file());
     if let Some(info) = get_server_status()? {
         #[cfg(unix)]
         {

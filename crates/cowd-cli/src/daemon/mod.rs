@@ -412,7 +412,7 @@ mod tests {
     fn daemon_config_defaults() {
         let config = DaemonConfig {
             http_addr: "0.0.0.0:8642".into(),
-            unix_sock_path: "/tmp/cowd.sock".into(),
+            unix_sock_path: crate::server::socket_file().to_string_lossy().to_string(),
             memory_config: None,
             platform_configs: vec![],
             runtime_config: None,
@@ -421,7 +421,7 @@ mod tests {
             message_mirror: None,
         };
         assert_eq!(config.http_addr, "0.0.0.0:8642");
-        assert_eq!(config.unix_sock_path, "/tmp/cowd.sock");
+        assert_eq!(config.unix_sock_path, crate::server::socket_file().to_string_lossy());
         assert!(config.memory_config.is_none());
         assert!(config.platform_configs.is_empty());
         assert!(config.auth_token.is_none());
@@ -449,7 +449,7 @@ mod tests {
         let mem_cfg = MemoryConfig::default();
         let config = DaemonConfig {
             http_addr: "0.0.0.0:8642".into(),
-            unix_sock_path: "/tmp/cowd.sock".into(),
+            unix_sock_path: crate::server::socket_file().to_string_lossy().to_string(),
             memory_config: Some(mem_cfg),
             platform_configs: vec![],
             runtime_config: None,
