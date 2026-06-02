@@ -3325,7 +3325,7 @@ pub(crate) struct PromptHistoryEntry {
     text: String,
 }
 
-struct RuntimePluginState {
+pub(crate) struct RuntimePluginState {
     feature_config: runtime::RuntimeFeatureConfig,
     tool_registry: GlobalToolRegistry,
     plugin_registry: PluginRegistry,
@@ -3368,6 +3368,55 @@ impl BuiltRuntime {
             .take()
             .expect("runtime should exist before installing hook abort signal");
         self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
+        self
+    }
+
+    /// Inject a CowdEventBus for domain event emission (Phase A2).
+    pub(crate) fn with_cowd_event_bus(mut self, bus: runtime::CowdEventBus) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before injecting cowd event bus");
+        self.runtime = Some(runtime.with_cowd_event_bus(bus));
+        self
+    }
+
+    /// Inject a ToolCallback for daemon-side tool progress visualization (Phase A2).
+    pub(crate) fn with_tool_callback(
+        mut self,
+        callback: std::sync::Arc<dyn runtime::ToolCallback>,
+    ) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before injecting tool callback");
+        self.runtime = Some(runtime.with_tool_callback(callback));
+        self
+    }
+
+    /// Inject a HookProgressReporter for daemon-side hook status (Phase A2).
+    pub(crate) fn with_hook_progress_reporter(
+        mut self,
+        reporter: Box<dyn runtime::HookProgressReporter + Send>,
+    ) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before injecting hook progress reporter");
+        self.runtime = Some(runtime.with_hook_progress_reporter(reporter));
+        self
+    }
+
+    /// Override the memory manager with a pre-constructed instance (Phase A2).
+    pub(crate) fn with_memory_manager(
+        mut self,
+        manager: std::sync::Arc<memory::cognitive::CognitiveContextManager>,
+    ) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before injecting memory manager");
+        self.runtime = Some(runtime.with_memory_manager(manager));
         self
     }
 
@@ -6990,7 +7039,7 @@ pub(crate) fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::E
     )?)
 }
 
-fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+pub(crate) fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load()?;

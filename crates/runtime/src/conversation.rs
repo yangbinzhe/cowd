@@ -1207,11 +1207,14 @@ pub async fn run_turn_async(
                                         if attempt == max_retries - 1 {
                                             tracing::warn!(model, "exhausted retries, switching fallback");
                                         }
-                                        failed = true;
-                                        stream_error = Some(e);
-                                        break;
-                                    }
-                                    return Err(e);
+                                    failed = true;
+                                    stream_error = Some(e);
+                                    break;
+                                }
+                                if let Some(bus) = &self.cowd_bus {
+                                    bus.emit(crate::cowd_event::CowdEvent::TurnError { error: e.to_string() });
+                                }
+                                return Err(e);
                                 }
                             }
                         }
@@ -1622,8 +1625,17 @@ pub async fn run_turn_async(
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
         };
-self.record_turn_completed(&summary);
+        self.record_turn_completed(&summary);
         tracing::info!(iterations = %summary.iterations, tokens = %summary.usage.total_tokens(), "turn completed");
+        if let Some(ref cowd) = self.cowd_bus {
+            let usage = self.usage_tracker.cumulative_usage();
+            cowd.emit(crate::cowd_event::CowdEvent::TokenUsage {
+                input: usage.input_tokens as u64,
+                output: usage.output_tokens as u64,
+                cache_create: usage.cache_creation_input_tokens as u64,
+                cache_read: usage.cache_read_input_tokens as u64,
+            });
+        }
         if let Some(ref cowd) = self.cowd_bus {
             let assistant_text = summary.assistant_messages
                 .iter()
