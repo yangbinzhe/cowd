@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use serde_json::{json, Value};
@@ -23,8 +24,10 @@ impl DaemonClient {
         // Create session
         let cmd = json!({"cmd":"create_session","model":model});
         client.write_cmd(&cmd).await?;
-        let resp: Value = client.read_json().await?;
-        client.session_id = resp["session_id"].as_str().unwrap_or_default().to_string();
+        client.session_id = match client.read_json().await {
+            Some(CowdEvent::SessionCreated { id, .. }) => id,
+            _ => String::new(),
+        };
         Ok(client)
     }
 
@@ -34,10 +37,17 @@ impl DaemonClient {
         self.stream.get_mut().write_all(json.as_bytes()).await
     }
 
-    async fn read_json(&mut self) -> Result<Value, std::io::Error> {
+    async fn read_json(&mut self) -> Option<CowdEvent> {
         self.buf.clear();
-        self.stream.read_line(&mut self.buf).await?;
-        Ok(serde_json::from_str(&self.buf).unwrap_or(Value::Null))
+        match tokio::time::timeout(Duration::from_secs(30), self.stream.read_line(&mut self.buf)).await {
+            Ok(Ok(0)) => None,  // connection closed
+            Ok(Ok(_)) => serde_json::from_str(&self.buf).ok(),
+            Ok(Err(_)) => None,
+            Err(_) => {
+                tracing::warn!("daemon response timeout, connection will be re-established");
+                None
+            }
+        }
     }
 
     pub async fn send_chat(&mut self, content: &str) -> Result<(), std::io::Error> {
@@ -47,57 +57,28 @@ impl DaemonClient {
 
     /// Blocking receive — waits for next event
     pub async fn recv_event(&mut self) -> Option<CowdEvent> {
-        match self.read_json().await {
-            Ok(v) => parse_cowd_event(&v),
-            Err(_) => None,
-        }
+        self.read_json().await
     }
 
     /// Non-blocking drain — reads all available events without blocking
     pub fn try_recv_events(&mut self) -> Vec<CowdEvent> {
-        let mut events = Vec::new();
-        // Read available lines from buffer
-        while let Ok(line) = self.try_read_line() {
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                if let Some(event) = parse_cowd_event(&v) {
-                    events.push(event);
-                }
-            }
-        }
-        events
-    }
-
-    fn try_read_line(&mut self) -> Result<String, std::io::Error> {
         let mut buf = [0u8; 4096];
         match self.stream.get_mut().try_read(&mut buf) {
-            Ok(n) if n > 0 => Ok(String::from_utf8_lossy(&buf[..n]).to_string()),
-            _ => Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "")),
+            Ok(n) if n > 0 => {
+                self.buf.push_str(&String::from_utf8_lossy(&buf[..n]));
+                let mut events = Vec::new();
+                while let Some(pos) = self.buf.find('\n') {
+                    let line = self.buf[..pos].to_string();
+                    self.buf = self.buf[pos + 1..].to_string();
+                    if let Ok(event) = serde_json::from_str::<CowdEvent>(&line) {
+                        events.push(event);
+                    }
+                }
+                events
+            }
+            _ => Vec::new(),
         }
     }
 }
 
-fn parse_cowd_event(v: &Value) -> Option<CowdEvent> {
-    match v.get("type")?.as_str()? {
-        "TextDelta" => Some(CowdEvent::TextDelta {
-            text: v["content"].as_str()?.to_string(),
-        }),
-        "TurnComplete" => Some(CowdEvent::TurnComplete {
-            assistant_text: v
-                .get("text")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string(),
-            iterations: v
-                .get("iterations")
-                .and_then(|i| i.as_u64())
-                .unwrap_or(0) as u32,
-        }),
-        "TurnError" => Some(CowdEvent::TurnError {
-            error: v["error"].as_str()?.to_string(),
-        }),
-        _ => {
-            // Try serde deserialization for other variants
-            serde_json::from_value(v.clone()).ok()
-        }
-    }
-}
+
