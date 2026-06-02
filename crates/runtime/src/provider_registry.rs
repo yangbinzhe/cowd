@@ -1,6 +1,6 @@
 //! Global provider registry backed by [`std::sync::RwLock`].
 //!
-//! Providers are lazily loaded from `~/.cowd/config.yaml` on first access.
+//! Providers are lazily loaded from `config.yaml` (resolved via [`crate::cowd_dirs::config_home_dir()`]).
 //! No explicit `init_global_providers` call is required.
 
 use std::collections::HashMap;
@@ -28,9 +28,8 @@ fn lazy_load() -> &'static ProvidersConfig {
     if guard.is_none() {
         // Load from config.yaml (existing loading code)
         let mut providers = HashMap::new();
-        if let Ok(home) = std::env::var("HOME") {
-            let cfg = std::path::PathBuf::from(home).join(".cowd").join("config.yaml");
-            if let Ok(raw) = std::fs::read_to_string(&cfg) {
+        let cfg = crate::cowd_dirs::config_home_dir().join("config.yaml");
+        if let Ok(raw) = std::fs::read_to_string(&cfg) {
                 if let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(&raw) {
                     if let Some(mapping) = val.get("providers").and_then(|v| v.as_mapping()) {
                         for (key, value) in mapping {
@@ -59,7 +58,6 @@ fn lazy_load() -> &'static ProvidersConfig {
                             });
                         }
                     }
-                }
             }
         }
         *guard = Some(ProvidersConfig { providers });
