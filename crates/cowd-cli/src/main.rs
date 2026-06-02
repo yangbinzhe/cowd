@@ -5022,8 +5022,20 @@ impl LiveCli {
 static UNIFIED_STORE: std::sync::OnceLock<memory::UnifiedSessionStore> =
     std::sync::OnceLock::new();
 
+/// Guards against concurrent JSONL migration — prevents OnceLock double-init race.
+static MIGRATION_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Return the global unified session store, lazily initialised on first call.
 fn get_unified_store() -> Result<&'static memory::UnifiedSessionStore, Box<dyn std::error::Error>> {
+    // Fast path: already initialized
+    if let Some(store) = UNIFIED_STORE.get() {
+        return Ok(store);
+    }
+
+    // Slow path: serialize initialization
+    let _guard = MIGRATION_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Double-check: another thread might have initialized while we waited
     if let Some(store) = UNIFIED_STORE.get() {
         return Ok(store);
     }
@@ -5041,7 +5053,6 @@ fn get_unified_store() -> Result<&'static memory::UnifiedSessionStore, Box<dyn s
         tracing::warn!("JSONL session migration error (non-fatal): {e}");
     }
 
-    // set() fails if another thread already initialised — either way get() works.
     UNIFIED_STORE.set(store).unwrap_or_else(|_| {});
     Ok(UNIFIED_STORE.get().unwrap())
 }
@@ -5100,6 +5111,10 @@ fn migrate_jsonl_sessions(
                     Err(_) => continue,
                 };
                 let record = session_to_record(&session, &path);
+                // Skip already-migrated sessions (idempotency — migration may have run partially)
+                if SHARED_RT.block_on(store.get_session(&record.session_id)).is_ok() {
+                    continue;
+                }
                 if SHARED_RT.block_on(store.create_session(&record)).is_ok() {
                     count += 1;
                 }
