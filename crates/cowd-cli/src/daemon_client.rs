@@ -9,6 +9,7 @@ pub struct DaemonClient {
     stream: BufReader<UnixStream>,
     pub session_id: String,
     buf: String,
+    drain_buf: String,
 }
 
 impl DaemonClient {
@@ -19,15 +20,14 @@ impl DaemonClient {
             stream: BufReader::new(stream),
             session_id: String::new(),
             buf: String::new(),
+            drain_buf: String::new(),
         };
 
-        // Create session
+        // Create session — daemon returns plain JSON {"ok":true,"session_id":"..."}
         let cmd = json!({"cmd":"create_session","model":model});
         client.write_cmd(&cmd).await?;
-        client.session_id = match client.read_json().await {
-            Some(CowdEvent::SessionCreated { id, .. }) => id,
-            _ => String::new(),
-        };
+        let resp = client.read_json_value().await?;
+        client.session_id = resp["session_id"].as_str().unwrap_or_default().to_string();
         Ok(client)
     }
 
@@ -35,6 +35,13 @@ impl DaemonClient {
         let mut json = cmd.to_string();
         json.push('\n');
         self.stream.get_mut().write_all(json.as_bytes()).await
+    }
+
+    /// Read a raw JSON value (not necessarily a CowdEvent)
+    async fn read_json_value(&mut self) -> Result<serde_json::Value, std::io::Error> {
+        self.buf.clear();
+        self.stream.read_line(&mut self.buf).await?;
+        Ok(serde_json::from_str(&self.buf).unwrap_or(serde_json::Value::Null))
     }
 
     async fn read_json(&mut self) -> Option<CowdEvent> {
@@ -65,11 +72,11 @@ impl DaemonClient {
         let mut buf = [0u8; 4096];
         match self.stream.get_mut().try_read(&mut buf) {
             Ok(n) if n > 0 => {
-                self.buf.push_str(&String::from_utf8_lossy(&buf[..n]));
+                self.drain_buf.push_str(&String::from_utf8_lossy(&buf[..n]));
                 let mut events = Vec::new();
-                while let Some(pos) = self.buf.find('\n') {
-                    let line = self.buf[..pos].to_string();
-                    self.buf = self.buf[pos + 1..].to_string();
+                while let Some(pos) = self.drain_buf.find('\n') {
+                    let line = self.drain_buf[..pos].to_string();
+                    self.drain_buf = self.drain_buf[pos + 1..].to_string();
                     if let Ok(event) = serde_json::from_str::<CowdEvent>(&line) {
                         events.push(event);
                     }
