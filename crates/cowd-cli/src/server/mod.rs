@@ -4,10 +4,6 @@
 use std::{fmt, fs, path::PathBuf};
 
 use serde::Serialize;
-use runtime::platform::PlatformConfig;
-use runtime::{ApprovalConfig, SessionResetPolicy};
-
-use memory::MemoryConfig;
 
 // ── Error type ───────────────────────────────────────────────────
 
@@ -44,6 +40,10 @@ pub fn pid_file() -> PathBuf {
     dir.join("cowd-serve.pid")
 }
 
+pub fn addr_file() -> PathBuf {
+    pid_file().with_extension("addr")
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerInfo {
     pub pid: u32,
@@ -65,9 +65,12 @@ pub fn get_server_status() -> Result<Option<ServerInfo>, ServerError> {
         return Ok(None);
     }
 
+    let address = std::fs::read_to_string(addr_file())
+        .unwrap_or_else(|_| "http://127.0.0.1:8642".to_string());
+
     Ok(Some(ServerInfo {
         pid,
-        address: "http://127.0.0.1:8642".to_string(),
+        address,
     }))
 }
 
@@ -96,41 +99,9 @@ pub fn stop_server() -> Result<(), ServerError> {
                 .output()?;
         }
         fs::remove_file(pid_file())?;
+        let _ = std::fs::remove_file(addr_file());
     }
     Ok(())
 }
 
-// ── HTTP config ──────────────────────────────────────────────────
 
-#[derive(Clone)]
-pub struct HttpConfig {
-    pub host: String,
-    pub port: u16,
-    pub auth_enabled: bool,
-    pub auth_token: String,
-    pub with_webui: bool,
-    pub memory_config: Option<MemoryConfig>,
-    pub session_store_path: Option<PathBuf>,
-    pub platform_configs: Vec<PlatformConfig>,
-    pub cors_origins: Vec<String>,
-    pub approval_config: Option<ApprovalConfig>,
-    pub session_reset: SessionResetPolicy,
-}
-
-impl Default for HttpConfig {
-    fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 8642,
-            auth_enabled: true,
-            auth_token: String::new(),
-            with_webui: true,
-            memory_config: None,
-            session_store_path: None,
-            platform_configs: Vec::new(),
-            cors_origins: Vec::new(),
-            approval_config: None,
-            session_reset: SessionResetPolicy::None,
-        }
-    }
-}

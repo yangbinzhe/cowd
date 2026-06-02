@@ -117,6 +117,7 @@ impl Drop for PidFileGuard {
         let pid_path = crate::server::pid_file();
         if pid_path.exists() {
             std::fs::remove_file(&pid_path).ok();
+            let _ = std::fs::remove_file(crate::server::addr_file());
             tracing::info!(path = %pid_path.display(), "PID file removed");
         }
     }
@@ -216,6 +217,10 @@ pub async fn run_daemon(
         .await
         .map_err(|e| format!("failed to bind HTTP {}: {}", config.http_addr, e))?;
     tracing::info!("HTTP + SSE on {}", config.http_addr);
+
+    if let Err(e) = std::fs::write(crate::server::addr_file(), format!("http://{}", config.http_addr)) {
+        tracing::warn!("failed to write addr file: {e}");
+    }
 
     // 4. Unix socket
     let _ = std::fs::remove_file(&config.unix_sock_path);
