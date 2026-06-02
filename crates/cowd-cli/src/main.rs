@@ -432,8 +432,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(exe) = std::env::current_exe() {
                         match unsafe {
                             std::process::Command::new(&exe)
-                                .arg("gateway")
-                                .arg("run")
+                                .arg("serve")
                                 .stdin(std::process::Stdio::null())
                                 .stdout(std::process::Stdio::null())
                                 .stderr(std::process::Stdio::null())
@@ -507,8 +506,7 @@ fn run_gateway_action(
             tracing::info!(binary = %exe.display(), "gateway start: spawning daemon");
             let child = unsafe {
                 std::process::Command::new(&exe)
-                    .arg("gateway")
-                    .arg("run")
+                    .arg("serve")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -620,8 +618,7 @@ fn run_gateway_action(
             let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
             let child = unsafe {
                 std::process::Command::new(&exe)
-                    .arg("gateway")
-                    .arg("run")
+                    .arg("serve")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
