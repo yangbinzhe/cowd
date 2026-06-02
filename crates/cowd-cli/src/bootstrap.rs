@@ -176,16 +176,16 @@ fallbacks:
 
 # =============================================================================
 # 全局权限配置
-# defaultMode: "plan"(只读) | "acceptEdits"(可写工作区) | "dontAsk"(危险全访问)
+# default_mode: "plan"(只读) | "acceptEdits"(可写工作区) | "dontAsk"(危险全访问)
 # =============================================================================
 permissions:
-  defaultMode: "acceptEdits"
+  default_mode: "acceptEdits"
   allow: []
   deny: []
   ask: []
 
 # 可信工作区根目录
-trustedRoots:
+trusted_roots:
   - "/media/yi/Datas/workspace"
 
 # =============================================================================
@@ -195,21 +195,21 @@ memory:
   enabled: true
   storePath: "~/.cowd/memory"
   layers:
-    l0Enabled: true
-    l1MaxTokens: 3000
-    l2MaxTokens: 8000
-    l3SearchLimit: 5
-    l4Enabled: false
+    l0_enabled: true
+    l1_max_tokens: 3000
+    l2_max_tokens: 8000
+    l3_search_limit: 5
+    l4_enabled: false
   extraction:
-    autoExtract: true
+    auto_extract: true
   vector:
     enabled: false
     embeddingModel: "text-embedding-3-small"
     apiUrl: "https://api.openai.com/v1/embeddings"
     apiKey: ""
     dimension: 1536
-    timeoutSecs: 30
-    batchSize: 32
+    timeout_secs: 30
+    batch_size: 32
 
 # =============================================================================
 # 压缩管线配置
@@ -243,7 +243,7 @@ runtime:
 # =============================================================================
 gateway:
   enabled: {gateway_enabled_str}
-  sessionReset: "none"
+  session_reset: "none"
   platforms:
     - platform_type: "api_server"
       enabled: {gateway_enabled_str}
@@ -260,7 +260,7 @@ sandbox:
   enabled: false
   namespace_restrictions: false
   network_isolation: false
-  filesystemMode: "none"
+  filesystem_mode: "none"
   allowed_dirs: []
 
 # =============================================================================
@@ -285,6 +285,6 @@ plugins:
   installRoot: null
   registryPath: null
   bundledRoot: null
-  maxOutputTokens: null
+  max_output_tokens: null
 "#)
 }
