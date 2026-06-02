@@ -135,6 +135,7 @@ impl Default for ActiveSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn ensure_test_provider() {
         let mut map = std::collections::HashMap::new();
@@ -173,6 +174,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn register_and_get() {
         let sessions = ActiveSessions::new();
         let rt = dummy_runtime();
@@ -182,6 +184,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn list_returns_sorted_ids() {
         let sessions = ActiveSessions::new();
         sessions.register("b".into(), dummy_runtime()).unwrap();
@@ -192,6 +195,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn remove_drops_session() {
         let sessions = ActiveSessions::new();
         sessions.register("sess-1".into(), dummy_runtime()).unwrap();
@@ -213,6 +217,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn register_overwrite() {
         let sessions = ActiveSessions::new();
         sessions.register("sess-1".into(), dummy_runtime()).unwrap();

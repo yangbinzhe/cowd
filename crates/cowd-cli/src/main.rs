@@ -9191,6 +9191,7 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     #![allow(unused_imports)]
+    use serial_test::serial;
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         collect_session_prompt_history, create_managed_session_handle,
@@ -10737,6 +10738,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn startup_banner_mentions_workflow_completions() {
         let _guard = env_lock();
         runtime::reset_for_test();

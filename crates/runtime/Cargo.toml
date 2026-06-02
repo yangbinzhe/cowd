@@ -54,3 +54,9 @@ unsafe_code = "allow"
 dead_code = "warn"
 unused_imports = "warn"
 unused_variables = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -2 }
+unwrap_used = { level = "warn", priority = -1 }
+expect_used = { level = "warn", priority = -1 }
