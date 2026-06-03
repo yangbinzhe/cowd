@@ -1730,7 +1730,8 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         let defaults = VectorConfig::default();
         // Static config values.
         let enabled = optional_bool(v, "enabled", "merged settings.memory.vector")?;
-        let model_name = optional_string_dual(v, "model", "merged settings.memory.vector")?;
+        let model_name = optional_string_dual(v, "model", "merged settings.memory.vector")?
+            .or_else(|| optional_string_dual(v, "embedding_model", "merged settings.memory.vector").ok().flatten());
         let dimension = optional_usize(v, "dimension", "merged settings.memory.vector")?;
         let api_url = optional_string_dual(v, "api_url", "merged settings.memory.vector")?;
         let api_key = optional_string_dual(v, "api_key", "merged settings.memory.vector")?;
