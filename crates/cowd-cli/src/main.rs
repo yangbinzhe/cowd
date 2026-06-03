@@ -5112,7 +5112,8 @@ fn migrate_jsonl_sessions(
                 };
                 let record = session_to_record(&session, &path);
                 // Skip already-migrated sessions (idempotency — migration may have run partially)
-                if SHARED_RT.block_on(store.get_session(&record.session_id)).is_ok() {
+                // Only skip sessions already present in SQLite (Some), migrate new ones (None)
+                if let Ok(Some(_)) = SHARED_RT.block_on(store.get_session(&record.session_id)) {
                     continue;
                 }
                 if SHARED_RT.block_on(store.create_session(&record)).is_ok() {
