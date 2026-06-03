@@ -119,7 +119,11 @@ pub fn build_default_layout() -> LayoutTree {
         direction: SplitDirection::Horizontal,
         ratio: 0.7,
         children: vec![
-            LayoutNode::Leaf(Box::new(ChatView::new())),
+            LayoutNode::Panel(PanelDef {
+                id: "chat".to_string(),
+                component: Box::new(ChatView::new()),
+                bounds: None,
+            }),
             LayoutNode::TabGroup(TabGroup {
                 tabs: sidebar_tabs,
                 active: 0,
@@ -365,8 +369,8 @@ mod tests {
 
                 // First child: chat view (Leaf)
                 assert!(
-                    matches!(&split.children[0], LayoutNode::Leaf(_)),
-                    "first child should be Leaf (chat_view)"
+                    matches!(&split.children[0], LayoutNode::Panel(_)),
+                    "first child should be Panel (chat_view)"
                 );
 
                 // Second child: TabGroup with 5 tabs
