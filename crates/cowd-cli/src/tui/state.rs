@@ -210,6 +210,11 @@ pub struct TuiState {
     /// With `send()` backpressure (P0.6), the producer blocks instead of dropping,
     /// so this counter is a diagnostic for future non-blocking send paths.
     pub dropped_events: usize,
+
+    /// Pending cancel: ESC was pressed once during an active turn — requires second press
+    pending_cancel: bool,
+    /// Pending quit: Ctrl+C was pressed once — requires second press
+    pending_quit: bool,
 }
 
 impl TuiState {
@@ -314,6 +319,8 @@ impl TuiState {
             startup_start: Instant::now(),
             startup_show_time: None,
             dropped_events: 0,
+            pending_cancel: false,
+            pending_quit: false,
         }
     }
 
@@ -1181,23 +1188,74 @@ impl TuiState {
             return ProcessedKey::Submit(text);
         }
 
-        // 6. Esc/Ctrl+C special handling for turn-active cancel and exit
+        // Reset pending cancel/quit on any non-ESC/Ctrl+C key
+        if key.code != KeyCode::Esc
+            && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.pending_cancel = false;
+            self.pending_quit = false;
+        }
+
+        // 6. Esc/Ctrl+C: separate cancel (Esc) from exit (Ctrl+C), both double-press
         if key.code == KeyCode::Esc {
             // Performance dashboard consumes Esc to close itself
             if self.performance_dashboard.visible {
                 self.performance_dashboard.visible = false;
+                self.pending_cancel = false;
+                self.pending_quit = false;
                 return ProcessedKey::Nothing;
             }
             if self.app.turn_active {
-                return ProcessedKey::Cancel;
+                if self.pending_cancel {
+                    self.pending_cancel = false;
+                    return ProcessedKey::Cancel;
+                }
+                self.pending_cancel = true;
+                self.pending_quit = false;
+                self.toast_manager.push(
+                    ToastVariant::Warning,
+                    None,
+                    "Press ESC again to cancel the current turn".into(),
+                    2000,
+                );
+                return ProcessedKey::Nothing;
             }
-            return ProcessedKey::Exit;
+            // ESC when no turn active: dismiss overlays, not exit
+            self.pending_cancel = false;
+            self.pending_quit = false;
+            return ProcessedKey::Nothing;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.app.turn_active {
-                return ProcessedKey::Cancel;
+                // Ctrl+C during active turn: cancel
+                if self.pending_cancel {
+                    self.pending_cancel = false;
+                    return ProcessedKey::Cancel;
+                }
+                self.pending_cancel = true;
+                self.pending_quit = false;
+                self.toast_manager.push(
+                    ToastVariant::Warning,
+                    None,
+                    "Press Ctrl+C again to cancel the current turn".into(),
+                    2000,
+                );
+                return ProcessedKey::Nothing;
             }
-            return ProcessedKey::Exit;
+            // Ctrl+C when idle: exit
+            if self.pending_quit {
+                self.pending_quit = false;
+                return ProcessedKey::Exit;
+            }
+            self.pending_quit = true;
+            self.pending_cancel = false;
+            self.toast_manager.push(
+                ToastVariant::Warning,
+                None,
+                "Press Ctrl+C again to exit".into(),
+                2000,
+            );
+            return ProcessedKey::Nothing;
         }
 
         // 7. Ctrl+V: paste from system clipboard
