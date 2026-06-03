@@ -865,6 +865,7 @@ impl App {
                         *output = output[output.len() - 4096..].to_string();
                     }
                     self.lines_dirty = true;
+                    self.msg_version = self.msg_version.wrapping_add(1);
                 }
             }
 
