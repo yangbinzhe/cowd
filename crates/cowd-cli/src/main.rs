@@ -764,6 +764,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
     let mut compact = false;
+    let mut wants_continue = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -881,6 +882,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--tui" => {
                 index += 1;
             }
+            "--continue" => {
+                wants_continue = true;
+                index += 1;
+            }
 
             "--print" => {
                 // Legacy compat: --print makes output non-interactive
@@ -964,6 +969,16 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         parse_single_word_command_alias(&rest, &model, permission_mode_override, output_format)
     {
         return action;
+    }
+
+    if wants_continue {
+        let ref_path = resolve_session_reference(LATEST_SESSION_REFERENCE)
+            .map_err(|e| format!("--continue: no sessions found ({})", e))?;
+        return Ok(CliAction::ResumeSession {
+            session_path: ref_path.path,
+            commands: rest.clone(),
+            output_format,
+        });
     }
 
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
@@ -3091,6 +3106,16 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+
+    // Print session recovery info on exit
+    let session_id = cli.session.id.clone();
+    if !session_id.is_empty() {
+        println!();
+        println!("Session saved: {}", session_id);
+        println!("Resume:  cowd --resume {}", session_id);
+        println!("         cowd --continue");
+    }
+
     res
 }
 
@@ -9141,6 +9166,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "      Inspect or maintain a saved session without entering the REPL"
+    )?;
+    writeln!(
+        out,
+        "  cowd --continue              Resume the most recent session in the current workspace (alias for --resume latest)"
     )?;
     writeln!(out, "  cowd help")?;
     writeln!(out, "      Alias for --help")?;
