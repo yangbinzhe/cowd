@@ -525,6 +525,19 @@ impl TuiState {
             let sidebar_w = area.width.saturating_sub(chat_area.width);
             let sidebar_area = ratatui::layout::Rect::new(chat_area.width, 0, sidebar_w, area.height);
 
+            // Auto-scroll during streaming — computed BEFORE render to eliminate 1-frame lag
+            if self.app.auto_scroll {
+                let total = self.chat_view.total_lines();
+                let vh = self.app.viewport_height as usize;
+                if total > vh {
+                    self.app.scroll_offset = (total - vh) as u16;
+                } else {
+                    self.app.scroll_offset = 0;
+                }
+            }
+            self.chat_view.scroll_state.offset = self.app.scroll_offset;
+            self.chat_view.scroll_state.auto_scroll = self.app.auto_scroll;
+
             // Render chat view (already synced above)
             {
                 let _guard = self.render_profiler.guard("chat_view");
@@ -620,22 +633,7 @@ impl TuiState {
             }
         }
 
-        // BUG 3 FIX: Sync back only viewport height to App.
-        // scroll_offset stays in app as single source of truth.
-        // Auto-scroll during streaming is handled here directly.
-        if self.app.auto_scroll {
-            // Compute bottom position from chat_view's total lines
-            let total = self.chat_view.total_lines();
-            let vh = self.app.viewport_height as usize;
-            if total > vh {
-                self.app.scroll_offset = (total - vh) as u16;
-            } else {
-                self.app.scroll_offset = 0;
-            }
-        }
-        // Re-sync chat_view's scroll state from app after potential update
-        self.chat_view.scroll_state.offset = self.app.scroll_offset;
-        self.chat_view.scroll_state.auto_scroll = self.app.auto_scroll;
+
 
         // 2. Render status bar at bottom (reuses main_ctx)
         {

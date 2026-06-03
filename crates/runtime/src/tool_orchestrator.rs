@@ -228,25 +228,38 @@ impl Default for ToolResultBudget {
 impl ToolResultBudget {
     /// Truncate output text according to the configured strategy.
     pub fn truncate(&self, output: &str) -> String {
+        // Track if we've already consumed the output via char-based iteration
+        // to avoid re-slicing at mid-UTF-8 boundaries.
         let budget = self.per_tool_max_tokens;
-        // Rough estimate: ~4 chars per token
-        let max_chars = budget * 4;
+        // Rough estimate: ~4 bytes per token (safe for UTF-8)
+        let max_bytes = budget * 4;
 
-        if output.len() <= max_chars {
+        if output.len() <= max_bytes {
             return output.to_string();
         }
 
         match self.truncation_strategy {
             TruncationStrategy::HeadOnly => {
-                format!("{}...\n[truncated: {} chars omitted]", &output[..max_chars.min(output.len())], output.len().saturating_sub(max_chars))
+                let end = output.floor_char_boundary(max_bytes.min(output.len()));
+                let omitted = output.len().saturating_sub(end);
+                format!("{}...\n[truncated: {} chars omitted]", &output[..end], omitted)
             }
             TruncationStrategy::TailOnly => {
-                let start = output.len().saturating_sub(max_chars);
-                format!("[truncated: {} chars omitted]\n{}", output.len().saturating_sub(max_chars), &output[start..])
+                let raw = output.len().saturating_sub(max_bytes);
+                // Ceil to the next char boundary so we don't split a multi-byte char
+                let start = (raw..output.len())
+                    .find(|&i| output.is_char_boundary(i))
+                    .unwrap_or(output.len());
+                let omitted = output.len().saturating_sub(max_bytes);
+                format!("[truncated: {} chars omitted]\n{}", omitted, &output[start..])
             }
             TruncationStrategy::HeadAndTail | TruncationStrategy::Summary => {
-                let head_end = self.head_chars.min(output.len());
-                let tail_start = output.len().saturating_sub(self.tail_chars);
+                let head_end = output.floor_char_boundary(self.head_chars.min(output.len()));
+                let raw_tail = output.len().saturating_sub(self.tail_chars);
+                // Ceil to the next char boundary
+                let tail_start = (raw_tail..output.len())
+                    .find(|&i| output.is_char_boundary(i))
+                    .unwrap_or(output.len());
                 if tail_start <= head_end {
                     // Output is small enough after all
                     output.to_string()

@@ -116,24 +116,27 @@ impl ChatView {
     /// full rebuild on eviction, and patches the streaming tail in-place.
     pub fn sync_from_app(&mut self, app: &crate::tui::App) {
         let new_len = app.timeline_len();
+        // Append new entries
         if new_len > self.timeline.len() {
-            // Append-only: clone only new entries
             for i in self.timeline.len()..new_len {
                 if let Some(entry) = app.timeline_entry(i) {
                     self.timeline.push(entry);
                 }
             }
         } else if new_len < self.timeline.len() {
-            // Eviction → full rebuild
             self.timeline = app.timeline_clone_vec();
         }
-        // Update streaming tail (last entry) if content changed
-        if new_len > 0 {
-            if let (Some(fresh), Some(last)) =
-                (app.timeline_entry(new_len - 1), self.timeline.last_mut())
-            {
-                if fresh != *last {
-                    *last = fresh;
+        // Fix: sync ALL entries that changed, not just the last one
+        // This catches mid-timeline mutations like ToolProgress/ToolComplete
+        if new_len <= self.timeline.len() {
+            let sync_len = new_len.min(self.timeline.len());
+            for i in 0..sync_len {
+                if let (Some(fresh), Some(local)) =
+                    (app.timeline_entry(i), self.timeline.get_mut(i))
+                {
+                    if fresh != *local {
+                        *local = fresh;
+                    }
                 }
             }
         }

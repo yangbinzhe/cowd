@@ -562,6 +562,12 @@ impl Prompt {
         &self.shell_command
     }
 
+    /// Safe access to the highlighted suggestion, with bounds protection
+    /// against stale indices when suggestions are updated externally.
+    fn highlighted_suggestion(&self) -> Option<&Suggestion> {
+        self.suggestions.get(self.highlighted)
+    }
+
     /// Update shell mode based on current text content.
     /// Call this after each text change.
     pub fn update_shell_mode(&mut self) {
@@ -636,7 +642,9 @@ impl Prompt {
 
         // Generate inline preview
         self.inline_preview = if self.show_suggestions {
-            let top = &self.suggestions[self.highlighted].text;
+            let top = self.highlighted_suggestion()
+                .map(|s| &s.text)
+                .unwrap_or(&self.current_prefix);
             // The complement is the part of the suggestion after the prefix
             if top.starts_with(&self.current_prefix) {
                 top[self.current_prefix.len()..].to_string()
@@ -654,14 +662,17 @@ impl Prompt {
             return;
         }
 
-        let suggestion = &self.suggestions[self.highlighted].clone();
+        let suggestion = match self.highlighted_suggestion() {
+            Some(s) => s.clone(),
+            None => return,
+        };
         let suggestion_text = suggestion.text.clone();
 
         // Replace the current word with the suggestion text
         self.replace_current_word(&suggestion_text);
 
         // Record the use for frecency
-        self.engine.record_use(suggestion);
+        self.engine.record_use(&suggestion);
 
         // If it's a directory, re-trigger suggestions
         if suggestion_text.ends_with('/') {
@@ -709,7 +720,7 @@ impl Prompt {
         if !self.show_suggestions || self.suggestions.is_empty() {
             return None;
         }
-        Some(self.suggestions[self.highlighted].text.clone())
+        self.highlighted_suggestion().map(|s| s.text.clone())
     }
 
     /// Get the current autocomplete prefix being matched.
@@ -736,7 +747,10 @@ impl Prompt {
         if !self.show_suggestions || self.suggestions.is_empty() {
             return;
         }
-        let suggestion = self.suggestions[self.highlighted].clone();
+        let suggestion = match self.highlighted_suggestion() {
+            Some(s) => s.clone(),
+            None => return,
+        };
         self.engine.record_use(&suggestion);
         // If it's a directory, re-trigger suggestions; otherwise clear
         if suggestion.text.ends_with('/') {
@@ -781,7 +795,9 @@ impl Prompt {
     /// Update the inline preview based on the currently highlighted suggestion.
     fn update_inline_preview(&mut self) {
         self.inline_preview = if self.show_suggestions && !self.suggestions.is_empty() {
-            let top = &self.suggestions[self.highlighted].text;
+            let top = self.highlighted_suggestion()
+                .map(|s| &s.text)
+                .unwrap_or(&self.current_prefix);
             if top.starts_with(&self.current_prefix) {
                 top[self.current_prefix.len()..].to_string()
             } else {
@@ -818,7 +834,9 @@ impl Prompt {
         self.show_suggestions = !self.suggestions.is_empty();
 
         self.inline_preview = if self.show_suggestions {
-            let top = &self.suggestions[self.highlighted].text;
+            let top = self.highlighted_suggestion()
+                .map(|s| &s.text)
+                .unwrap_or(&self.current_prefix);
             if top.starts_with(&self.current_prefix) {
                 top[self.current_prefix.len()..].to_string()
             } else {
