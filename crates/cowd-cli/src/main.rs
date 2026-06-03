@@ -59,8 +59,8 @@ use runtime::{
     check_base_commit, format_stale_base_warning,
     load_system_prompt, resolve_expected_base, resolve_sandbox_status,
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, JsonValue, McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
+    ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy,
+    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, SessionRecord, TokenUsage,
     ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
@@ -383,6 +383,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Force-initialize SHARED_RT on main thread where no tokio runtime exists yet
     let _ = SHARED_RT.handle();
+
+    // Initialize persistence
+    let cleanup_config = runtime::load_cleanup_config();
+    let db_path = runtime::cowd_dirs::config_home_dir().join("sessions.db");
+    let sqlite = match runtime::persistence::sqlite::SqlitePersistence::open(&db_path, cleanup_config.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("failed to open persistence: {e}, using in-memory fallback");
+            runtime::persistence::sqlite::SqlitePersistence::open_in_memory(cleanup_config.clone())
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?
+        }
+    };
+    let cached = runtime::persistence::CachedPersistence::new(sqlite, 50);
+    runtime::persistence::init_persistence(std::sync::Arc::new(cached));
+    // Async startup cleanup
+    SHARED_RT.handle().spawn(async {
+        if let Err(e) = runtime::persistence::persistence().cleanup().await {
+            tracing::warn!("startup cleanup failed: {e}");
+        }
+    });
 
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
@@ -3902,7 +3922,7 @@ impl LiveCli {
             None,
             None,
         )?;
-        let cli = Self {
+        let mut cli = Self {
             model,
             allowed_tools,
             permission_mode,
@@ -4307,27 +4327,19 @@ impl LiveCli {
         })
     }
 
-    fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.session().save_to_path(&self.session.path)?;
-        // Sync metadata to the unified SQLite store.
-        if let Ok(store) = get_unified_store() {
-            let session = self.runtime.session();
-            let record = memory::store::session::SessionRecord {
-                session_id: session.session_id.clone(),
-                platform: "cli".to_string(),
-                chat_id: self.session.id.clone(),
-                user_id: None,
+    fn persist_session(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(p) = runtime::persistence::persistence_opt().cloned() {
+            let record = SessionRecord {
+                session_id: self.session.id.clone(),
+                title: None,
                 model: Some(self.model.clone()),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                last_activity: chrono::Utc::now().to_rfc3339(),
-                message_count: session.messages.len() as i64,
-                reset_policy: "none".to_string(),
-                metadata_json: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                estimated_cost_usd: 0.0,
+                message_count: self.runtime.session().messages.len(),
+                created_at_ms: 0,
+                last_activity: 0,
             };
-            let _ = SHARED_RT.block_on(store.upsert_session(&record));
+            // Fire-and-forget
+            let record = record.clone();
+            tokio::spawn(async move { let _ = p.create_session(&record).await; });
         }
         Ok(())
     }
@@ -5074,188 +5086,12 @@ fn get_unified_store() -> Result<&'static memory::UnifiedSessionStore, Box<dyn s
         Box::<dyn std::error::Error>::from(msg)
     })?;
 
-    if let Err(e) = migrate_jsonl_sessions(&store) {
-        tracing::warn!("JSONL session migration error (non-fatal): {e}");
-    }
-
     UNIFIED_STORE.set(store).unwrap_or_else(|_| {});
     Ok(UNIFIED_STORE.get().unwrap())
 }
 
-/// Flat directory where JSONL session content files live.
-fn jsonl_sessions_dir() -> PathBuf {
-    runtime::cowd_dirs::config_home_dir().join("sessions")
-}
-
-/// Scan legacy `~/.cowd/sessions/projects/*/` and `global/` for `.jsonl`/`.json`
-/// files and import their metadata into the SQLite store.
-fn migrate_jsonl_sessions(
-    store: &memory::UnifiedSessionStore,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let base = jsonl_sessions_dir();
-    let mut count: u64 = 0;
-
-    for sub in &["projects", "global"] {
-        let dir = base.join(sub);
-        if !dir.is_dir() {
-            continue;
-        }
-        let hash_dirs = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(Box::new(err)),
-        };
-        for entry in hash_dirs {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let hash_dir = entry.path();
-            if !hash_dir.is_dir() {
-                continue;
-            }
-            let files = match std::fs::read_dir(&hash_dir) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            for file in files {
-                let file = match file {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                let path = file.path();
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                if ext != "jsonl" && ext != "json" {
-                    continue;
-                }
-                let session = match Session::load_from_path(&path) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let record = session_to_record(&session, &path);
-                // Skip already-migrated sessions (idempotency — migration may have run partially)
-                // Only skip sessions already present in SQLite (Some), migrate new ones (None)
-                if let Ok(Some(_)) = SHARED_RT.block_on(store.get_session(&record.session_id)) {
-                    continue;
-                }
-                if SHARED_RT.block_on(store.create_session(&record)).is_ok() {
-                    count += 1;
-                }
-                // Migrate messages from the JSONL file
-                if let Err(e) = migrate_session_messages(store, &record.session_id, &path) {
-                    tracing::warn!(%e, path=%path.display(), "failed to migrate messages, continuing");
-                }
-            }
-        }
-    }
-
-    if count > 0 {
-        tracing::info!("migrated {count} sessions from JSONL");
-    }
-    Ok(())
-}
-
-/// Stream JSONL session file line-by-line, converting each message to
-/// [`SessionMessage`] and batch-inserting into SQLite.
-/// Avoids loading the entire session into memory.
-fn migrate_session_messages(
-    store: &memory::UnifiedSessionStore,
-    session_id: &str,
-    jsonl_path: &Path,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    use std::io::{BufRead, BufReader};
-
-    let file = std::fs::File::open(jsonl_path)?;
-    let reader = BufReader::new(file);
-    let mut batch = Vec::with_capacity(100);
-    let mut total = 0usize;
-    let mut sequence = 0usize;
-
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        // Skip metadata/compaction records (not message records)
-        if line.contains(r#""type":"session_meta""#)
-            || line.contains(r#""type":"compaction""#)
-        {
-            continue;
-        }
-
-        // Parse as JSONL message record {"type":"message","message":{...}}
-        if let Ok(value) = JsonValue::parse(&line) {
-            if let Some(message_val) = value.as_object().and_then(|obj| obj.get("message")) {
-                if let Ok(msg) = ConversationMessage::from_json(message_val) {
-                    let record = msg.to_session_message(session_id, sequence);
-                    batch.push(record);
-                    sequence += 1;
-                    total += 1;
-                }
-            }
-        }
-
-        // Batch insert every 100 messages
-        if batch.len() >= 100 {
-            SHARED_RT.block_on(store.insert_messages_batch(&batch))?;
-            batch.clear();
-        }
-    }
-
-    // Final flush
-    if !batch.is_empty() {
-        SHARED_RT.block_on(store.insert_messages_batch(&batch))?;
-    }
-
-    tracing::info!(session_id, count = total, "migrated session messages to SQLite");
-    Ok(total)
-}
-
-/// CLI handler for `cowd migrate-sessions`.
-///
-/// Scans legacy `~/.cowd/sessions/projects/*/` and `global/` directories for
-/// .jsonl / .json files and imports them into the UnifiedSessionStore SQLite
-/// database.  Sessions that already exist in the store are counted as skipped.
-/// Build a [`memory::SessionRecord`] from a loaded `Session` + its file path.
-fn session_to_record(
-    session: &Session,
-    path: &Path,
-) -> memory::store::session::SessionRecord {
-    use memory::store::session::SessionRecord;
-
-    let id = session.session_id.clone();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    let metadata = serde_json::json!({
-        "workspace_root": session.workspace_root().map(|p| p.display().to_string()),
-        "parent_session_id": session.fork.as_ref().map(|f| f.parent_session_id.clone()),
-        "branch_name": session.fork.as_ref().and_then(|f| f.branch_name.clone()),
-        "legacy_path": path.display().to_string(),
-    });
-
-    SessionRecord {
-        session_id: id,
-        platform: "cli".to_string(),
-        chat_id: path.display().to_string(),
-        user_id: None,
-        model: session.model.clone(),
-        created_at: now.clone(),
-        last_activity: now,
-        message_count: session.messages.len() as i64,
-        reset_policy: "none".to_string(),
-        metadata_json: Some(metadata.to_string()),
-        input_tokens: 0,
-        output_tokens: 0,
-        estimated_cost_usd: 0.0,
-    }
-}
-
 fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(jsonl_sessions_dir())
+    Ok(runtime::cowd_dirs::config_home_dir().join("sessions"))
 }
 
 pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
@@ -5266,7 +5102,7 @@ pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
 fn create_managed_session_handle(
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let dir = jsonl_sessions_dir();
+    let dir = runtime::cowd_dirs::config_home_dir().join("sessions");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{session_id}.jsonl"));
 
@@ -5318,7 +5154,7 @@ fn resolve_session_reference(
             .ok_or_else(|| -> Box<dyn std::error::Error> {
                 "no managed sessions found".into()
             })?;
-        let path = jsonl_sessions_dir().join(format!("{}.jsonl", record.session_id));
+        let path = runtime::cowd_dirs::config_home_dir().join("sessions").join(format!("{}.jsonl", record.session_id));
         return Ok(SessionHandle {
             id: record.session_id,
             path,
@@ -5361,7 +5197,7 @@ fn resolve_session_reference(
 fn resolve_managed_session_path(
     session_id: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let dir = jsonl_sessions_dir();
+    let dir = runtime::cowd_dirs::config_home_dir().join("sessions");
 
     // Check if the session is registered in SQLite.
     if let Ok(store) = get_unified_store() {
@@ -5403,7 +5239,7 @@ fn list_managed_sessions(
 fn record_to_summary(
     record: memory::store::session::SessionRecord,
 ) -> ManagedSessionSummary {
-    let dir = jsonl_sessions_dir();
+    let dir = runtime::cowd_dirs::config_home_dir().join("sessions");
     let path = dir.join(format!("{}.jsonl", record.session_id));
 
     // Parse last_activity from ISO 8601 → epoch millis for sorting.
