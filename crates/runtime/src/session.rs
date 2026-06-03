@@ -200,7 +200,7 @@ struct SessionPersistence {
 /// lanes can race and report success while writes land in the wrong CWD. See
 /// ROADMAP.md item 41 (Phantom completions root cause) for the full
 /// background.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Session {
     pub version: u32,
     pub session_id: String,
@@ -216,10 +216,32 @@ pub struct Session {
     /// Timestamp of last successful health check (ROADMAP #38)
     pub last_health_check_ms: Option<u64>,
     pub model: Option<String>,
-    persistence: Option<SessionPersistence>,
+    jsonl_persistence: Option<SessionPersistence>,
+    persistence: Option<std::sync::Arc<dyn crate::persistence::PersistenceProtocol>>,
     #[doc(hidden)]
     pub appended_since_snapshot: Arc<AtomicUsize>,
     pub closed: bool,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("version", &self.version)
+            .field("session_id", &self.session_id)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .field("messages", &self.messages)
+            .field("compaction", &self.compaction)
+            .field("fork", &self.fork)
+            .field("workspace_root", &self.workspace_root)
+            .field("prompt_history", &self.prompt_history)
+            .field("last_health_check_ms", &self.last_health_check_ms)
+            .field("model", &self.model)
+            .field("jsonl_persistence", &self.jsonl_persistence)
+            .field("appended_since_snapshot", &self.appended_since_snapshot)
+            .field("closed", &self.closed)
+            .finish()
+    }
 }
 
 impl PartialEq for Session {
@@ -287,6 +309,7 @@ impl Session {
             prompt_history: Vec::new(),
             last_health_check_ms: None,
             model: None,
+            jsonl_persistence: None,
             persistence: None,
             appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
             closed: false,
@@ -295,7 +318,13 @@ impl Session {
 
     #[must_use]
     pub fn with_persistence_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.persistence = Some(SessionPersistence { path: path.into() });
+        self.jsonl_persistence = Some(SessionPersistence { path: path.into() });
+        self
+    }
+
+    /// Attach a [`PersistenceProtocol`] backend for fire-and-forget message persistence.
+    pub fn with_persistence(mut self, p: std::sync::Arc<dyn crate::persistence::PersistenceProtocol>) -> Self {
+        self.persistence = Some(p);
         self
     }
 
@@ -319,7 +348,7 @@ impl Session {
     #[must_use]
     pub fn without_persistence(&self) -> Self {
         let mut clone = self.clone();
-        clone.persistence = None;
+        clone.jsonl_persistence = None;
         clone
     }
 
@@ -330,7 +359,7 @@ impl Session {
 
     #[must_use]
     pub fn persistence_path(&self) -> Option<&Path> {
-        self.persistence.as_ref().map(|value| value.path.as_path())
+        self.jsonl_persistence.as_ref().map(|value| value.path.as_path())
     }
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
@@ -370,6 +399,7 @@ impl Session {
 
     pub fn push_message(&mut self, message: ConversationMessage) -> Result<(), SessionError> {
         self.touch();
+        let msg_clone = message.clone();
         self.messages.push(message);
         let persist_result = {
             let message_ref = self.messages.last().ok_or_else(|| {
@@ -382,6 +412,17 @@ impl Session {
             return Err(error);
         }
         self.appended_since_snapshot.fetch_add(1, Ordering::Relaxed);
+        // Async fire-and-forget persistence via PersistenceProtocol
+        if let Some(ref p) = self.persistence {
+            let sid = self.session_id.clone();
+            let msg = msg_clone;
+            let p = p.clone();
+            tokio::runtime::Handle::try_current().ok().map(|h| {
+                h.spawn(async move {
+                    let _ = p.append_message(&sid, &msg).await;
+                });
+            });
+        }
         Ok(())
     }
 
@@ -417,6 +458,7 @@ impl Session {
             prompt_history: self.prompt_history.clone(),
             last_health_check_ms: self.last_health_check_ms,
             model: self.model.clone(),
+            jsonl_persistence: None,
             persistence: None,
             appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
             closed: false,
@@ -543,6 +585,7 @@ impl Session {
             prompt_history,
             last_health_check_ms: None,
             model,
+            jsonl_persistence: None,
             persistence: None,
             appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
             closed: false,
@@ -646,6 +689,7 @@ impl Session {
             prompt_history,
             last_health_check_ms: None,
             model,
+            jsonl_persistence: None,
             persistence: None,
             appended_since_snapshot: Arc::new(AtomicUsize::new(0)),
             closed: false,

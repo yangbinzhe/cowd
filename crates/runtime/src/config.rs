@@ -2555,6 +2555,42 @@ fn deep_merge_objects(
     }
 }
 
+use crate::persistence::CleanupConfig;
+
+fn parse_cleanup_config(root: &JsonValue) -> CleanupConfig {
+    let persistence = match root.as_object().and_then(|o| o.get("persistence")) {
+        Some(v) if v.as_object().is_some() => v,
+        _ => return CleanupConfig::default(),
+    };
+    let cleanup = match persistence.as_object().and_then(|o| o.get("cleanup")) {
+        Some(v) if v.as_object().is_some() => v,
+        _ => return CleanupConfig::default(),
+    };
+    let cleanup_obj = cleanup.as_object().unwrap();
+    let max_sessions = cleanup_obj.get("max_sessions")
+        .and_then(|v| v.as_i64())
+        .and_then(|n| if n == 0 { None } else { Some(n as usize) });
+    let max_days = cleanup_obj.get("max_days")
+        .and_then(|v| v.as_i64())
+        .and_then(|n| if n == 0 { None } else { Some(n as u32) });
+    CleanupConfig { max_sessions, max_days }
+}
+
+/// Load cleanup config from the merged configuration
+pub fn load_cleanup_config() -> CleanupConfig {
+    // Use the default ConfigLoader to read config, then parse cleanup
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let loader = crate::config::ConfigLoader::default_for(&cwd);
+    match loader.load() {
+        Ok(config) => {
+            // Re-serialize to JSON Value for parsing consistency
+            let json = config.as_json();
+            parse_cleanup_config(&json)
+        }
+        Err(_) => CleanupConfig::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
