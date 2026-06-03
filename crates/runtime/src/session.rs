@@ -94,6 +94,20 @@ pub struct SessionPromptEntry {
     pub text: String,
 }
 
+/// Lightweight session metadata record used by [`PersistenceProtocol`][crate::persistence::PersistenceProtocol].
+///
+/// This is a storage-oriented representation — distinct from the in-memory
+/// [`Session`] struct which carries full message data and internal bookkeeping.
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub model: Option<String>,
+    pub message_count: usize,
+    pub created_at_ms: u64,
+    pub last_activity: u64,
+}
+
 /// Mutations that can be applied to the message list of a session.
 ///
 /// These are recorded in a [`SessionEventLog`] so the full message state

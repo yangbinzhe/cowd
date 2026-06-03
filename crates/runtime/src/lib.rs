@@ -222,7 +222,7 @@ pub use sandbox::{
 };
 pub use session::{
     ContentBlock, ConversationMessage, MessageEvent, MessageRole, Session, SessionCompaction,
-    SessionError, SessionEventLog, SessionFork, SessionPromptEntry,
+    SessionError, SessionEventLog, SessionFork, SessionPromptEntry, SessionRecord,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use profile::{Profile, ProfileManager, ProfileMeta};
@@ -251,6 +251,7 @@ pub use worker_boot::{
 };
 
 pub mod cached_prompt;
+pub mod persistence;
 pub mod prompt_cache;
 
 pub use cached_prompt::CachedSystemPrompt;
