@@ -5,6 +5,8 @@
 //! concrete backends. This enables pluggable storage (SQLite, in-memory,
 //! cached decorator) without changing any business code.
 
+pub mod sqlite;
+
 use std::sync::Arc;
 use async_trait::async_trait;
 use crate::session::{ConversationMessage, SessionRecord};

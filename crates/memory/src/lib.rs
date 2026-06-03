@@ -69,6 +69,7 @@ pub mod performance_monitor;
 pub mod tool_sandbox;
 pub mod tiered_store;
 pub mod transaction;
+pub mod sqlite_persistence;
 
 // --- Convenience re-exports ---
 
