@@ -909,7 +909,7 @@ impl ChatView {
                         } else {
                             String::new()
                         },
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     ));
                     lines.push(Line::from(tool_line));
 
@@ -918,13 +918,13 @@ impl ChatView {
                     for line in &display_lines {
                         lines.push(Line::from(Span::styled(
                             format!("│ {line}"),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(Color::Gray),
                         )));
                     }
                     if total_lines > 100 {
                         lines.push(Line::from(Span::styled(
                             format!("│ ... ({} more lines)", total_lines - 100),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(Color::Gray),
                         )));
                     }
                     lines.push(Line::from(Span::styled(
@@ -946,7 +946,7 @@ impl ChatView {
                         ),
                         Span::styled(
                             format!(": {short_preview}{more}"),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(Color::Gray),
                         ),
                         Span::styled(
                             format!(" [{status_icon} {status_text}]"),
@@ -971,7 +971,7 @@ impl ChatView {
                         } else {
                             String::new()
                         },
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     ));
                     lines.push(Line::from(tool_line));
                 }
