@@ -509,6 +509,7 @@ fn init_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error + Send
             metadata_json TEXT DEFAULT '{}',
             message_count INTEGER DEFAULT 0,
             status        TEXT DEFAULT 'active',
+            reset_policy  TEXT NOT NULL DEFAULT '',
             created_at    TEXT NOT NULL DEFAULT '',
             last_activity TEXT NOT NULL DEFAULT '',
             created_at_ms INTEGER NOT NULL,
