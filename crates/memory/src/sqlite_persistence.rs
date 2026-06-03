@@ -494,11 +494,11 @@ impl SqlitePersistence {
 // ---------------------------------------------------------------------------
 
 fn init_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    conn.execute_batch("PRAGMA journal_mode=WAL")?;
-    conn.execute_batch("PRAGMA foreign_keys=ON")?;
-    conn.execute_batch("PRAGMA busy_timeout=5000")?;
+    exec_ddl(conn, "PRAGMA journal_mode=WAL")?;
+    exec_ddl(conn, "PRAGMA foreign_keys=ON")?;
+    exec_ddl(conn, "PRAGMA busy_timeout=5000")?;
 
-    conn.execute_batch(
+    exec_ddl(conn,
         "CREATE TABLE IF NOT EXISTS sessions (
             session_id    TEXT PRIMARY KEY,
             title         TEXT,
@@ -513,8 +513,10 @@ fn init_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error + Send
             last_activity TEXT NOT NULL DEFAULT '',
             created_at_ms INTEGER NOT NULL,
             updated_at_ms INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS messages (
+        )",
+    )?;
+    exec_ddl(conn,
+        "CREATE TABLE IF NOT EXISTS messages (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
             sequence      INTEGER NOT NULL,
@@ -523,9 +525,13 @@ fn init_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error + Send
             usage_output  INTEGER DEFAULT 0,
             created_at_ms INTEGER NOT NULL,
             UNIQUE(session_id, sequence)
-        );
-        CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, sequence);
-        CREATE TABLE IF NOT EXISTS message_blocks (
+        )",
+    )?;
+    exec_ddl(conn,
+        "CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, sequence)",
+    )?;
+    exec_ddl(conn,
+        "CREATE TABLE IF NOT EXISTS message_blocks (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             message_id    INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
             session_id    TEXT NOT NULL,
@@ -539,25 +545,39 @@ fn init_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error + Send
             tool_output   TEXT,
             is_error      INTEGER DEFAULT 0,
             created_at_ms INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_blocks_msg ON message_blocks(message_id);
-        CREATE INDEX IF NOT EXISTS idx_blocks_session_order ON message_blocks(session_id, block_order);
-        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-            session_id, role, content_text, tool_name,
-            content=message_blocks, content_rowid=id
-        );
-        CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON message_blocks BEGIN
+        )",
+    )?;
+    exec_ddl(conn,
+        "CREATE INDEX IF NOT EXISTS idx_blocks_msg ON message_blocks(message_id)",
+    )?;
+    exec_ddl(conn,
+        "CREATE INDEX IF NOT EXISTS idx_blocks_session_order ON message_blocks(session_id, block_order)",
+    )?;
+
+    exec_ddl(conn,
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(\
+            session_id, role, content_text, tool_name,\
+            content=message_blocks, content_rowid=id\
+        )",
+    )?;
+
+    exec_ddl(conn,
+        "CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON message_blocks BEGIN
             INSERT INTO messages_fts(rowid, session_id, role, content_text, tool_name)
             VALUES (new.id, new.session_id,
                     (SELECT role FROM messages WHERE id=new.message_id),
                     COALESCE(new.text, new.tool_output, ''),
                     COALESCE(new.tool_name, ''));
-        END;
-        CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON message_blocks BEGIN
+        END",
+    )?;
+    exec_ddl(conn,
+        "CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON message_blocks BEGIN
             INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content_text, tool_name)
             VALUES ('delete', old.id, old.session_id, '', '', '');
-        END;
-        CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON message_blocks BEGIN
+        END",
+    )?;
+    exec_ddl(conn,
+        "CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON message_blocks BEGIN
             INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content_text, tool_name)
             VALUES ('delete', old.id, old.session_id, '', '', '');
             INSERT INTO messages_fts(rowid, session_id, role, content_text, tool_name)
@@ -565,9 +585,22 @@ fn init_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error + Send
                     (SELECT role FROM messages WHERE id=new.message_id),
                     COALESCE(new.text, new.tool_output, ''),
                     COALESCE(new.tool_name, ''));
-        END;",
+        END",
     )?;
     Ok(())
+}
+
+fn exec_ddl(conn: &Connection, sql: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match conn.execute_batch(sql) {
+        Ok(()) => Ok(()),
+        Err(rusqlite::Error::ExecuteReturnedResults) => {
+            let mut stmt = conn.prepare(sql)?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ---------------------------------------------------------------------------
