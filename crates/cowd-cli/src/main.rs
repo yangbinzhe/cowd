@@ -4339,7 +4339,7 @@ impl LiveCli {
             };
             // Fire-and-forget
             let record = record.clone();
-            tokio::spawn(async move { let _ = p.create_session(&record).await; });
+            let _ = SHARED_RT.handle().spawn(async move { let _ = p.create_session(&record).await; });
         }
         Ok(())
     }
