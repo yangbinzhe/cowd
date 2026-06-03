@@ -5,9 +5,11 @@
 //! concrete backends. This enables pluggable storage (SQLite, in-memory,
 //! cached decorator) without changing any business code.
 
+pub mod cache;
 pub mod sqlite;
 
 use std::sync::Arc;
+pub use cache::CachedPersistence;
 use async_trait::async_trait;
 use crate::session::{ConversationMessage, SessionRecord};
 
@@ -94,6 +96,11 @@ pub fn init_persistence(backend: Arc<dyn PersistenceProtocol>) {
 /// Get the global persistence backend. Panics if not initialized.
 pub fn persistence() -> &'static Arc<dyn PersistenceProtocol> {
     PERSISTENCE.get().expect("persistence not initialized — call init_persistence() at startup")
+}
+
+/// Get the global persistence backend, returning `None` if not initialized.
+pub fn persistence_opt() -> Option<&'static Arc<dyn PersistenceProtocol>> {
+    PERSISTENCE.get()
 }
 
 // ── Error type alias ────────────────────────────────────────────
