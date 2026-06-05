@@ -92,6 +92,37 @@ describe('API module', () => {
     expect(typeof window.Api.toggleSkill).toBe('function');
   });
 
+  it('has durable task endpoints', () => {
+    expect(typeof window.Api.taskStatus).toBe('function');
+    expect(typeof window.Api.startTask).toBe('function');
+    expect(typeof window.Api.cancelTask).toBe('function');
+    expect(typeof window.Api.completeTask).toBe('function');
+    expect(typeof window.Api.recordTaskFailure).toBe('function');
+  });
+
+  it('task endpoints use stable route contracts', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ id: 'task-1', status: 'running' })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.taskStatus();
+    await window.Api.startTask('ship', true);
+    await window.Api.cancelTask('task-1');
+    await window.Api.completeTask('task-1');
+    await window.Api.recordTaskFailure('task-1', 'blocked');
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/tasks');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/tasks/start');
+    expect(JSON.parse(mockF.mock.calls[1][1].body)).toEqual({ objective: 'ship', yolo_mode: true });
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/tasks/task-1/cancel');
+    expect(String(mockF.mock.calls[3][0])).toBe('/api/tasks/task-1/complete');
+    expect(String(mockF.mock.calls[4][0])).toBe('/api/tasks/task-1/failure');
+  });
+
   it('has all cron endpoints', () => {
     expect(typeof window.Api.listCrons).toBe('function');
     expect(typeof window.Api.createCron).toBe('function');

@@ -182,6 +182,13 @@ window.Api = (()=>{
     async registerFacts(facts){return req('POST','/api/memory/facts/register',{facts})},
     async auditFacts(){return req('GET','/api/memory/facts/audit')},
 
+    // ── Tasks ──
+    async taskStatus(){return req('GET','/api/tasks')},
+    async startTask(objective,yoloMode){return req('POST','/api/tasks/start',{objective,yolo_mode:!!yoloMode})},
+    async cancelTask(id){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/cancel')},
+    async completeTask(id){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/complete')},
+    async recordTaskFailure(id,reason){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/failure',{reason})},
+
     // ── Skills ──
     async listSkills(){return req('GET','/v1/skills')},
     async installSkill(name,src){return req('POST','/v1/skills/install',{name,source:src})},

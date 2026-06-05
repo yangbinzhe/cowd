@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::{header, HeaderValue};
+use axum::http::{HeaderValue, header};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tower_http::cors::CorsLayer;
@@ -18,9 +18,9 @@ use crate::api_routes;
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use crate::session_kernel::SessionKernel;
-use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use memory::UnifiedSessionStore;
+use memory::cognitive::CognitiveContextManager;
 use runtime::mirror::MessageMirror;
 use runtime::platform::config::PlatformRuntimeConfig;
 use runtime::platform::{PlatformConfig, PlatformRuntime};
@@ -188,6 +188,10 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         }
     }
     let profile_id = profile_manager.active_id();
+    let task_kernel = Arc::new(
+        crate::task_kernel::TaskKernel::open(approval_dir.join("tasks.json"))
+            .map_err(|e| format!("failed to initialize task kernel: {e}"))?,
+    );
 
     // Spawn background session cleanup (idle/expired session reaper)
     let lifecycle_config = SessionLifecycleConfig {
@@ -219,6 +223,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         config_home: approval_dir.clone(),
         profile_id,
         profile_manager,
+        task_kernel,
     });
 
     // 2. Build HTTP router (reuse api_routes + SSE)

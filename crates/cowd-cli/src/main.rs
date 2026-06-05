@@ -19,6 +19,7 @@ mod render;
 mod server;
 mod session_kernel;
 mod suggestions;
+mod task_kernel;
 mod tui;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,30 +37,30 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, resolve_startup_auth_source, AuthSource, CachedProviderClient,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    AuthSource, CachedProviderClient, ContentBlockDelta, InputContentBlock, InputMessage,
+    MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock, detect_provider_kind, resolve_startup_auth_source,
 };
 
 use commands::{
-    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
-    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json,
+    SkillSlashDispatch, SlashCommand, classify_skills_slash_command, handle_agents_slash_command,
+    handle_agents_slash_command_json, handle_mcp_slash_command, handle_mcp_slash_command_json,
+    handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
     render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, SkillSlashDispatch, SlashCommand,
+    slash_command_specs,
 };
-use compat_harness::{extract_manifest, UpstreamPaths};
+use compat_harness::{UpstreamPaths, extract_manifest};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
-    resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, JsonValue,
-    McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy, ProjectContext,
-    PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError,
-    ToolExecutor, UsageTracker,
+    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
+    ContentBlock, ConversationMessage, ConversationRuntime, JsonValue, McpServerManager, McpTool,
+    MessageRole, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
+    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker, check_base_commit, format_stale_base_warning, load_system_prompt,
+    resolve_expected_base, resolve_sandbox_status,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -298,7 +299,7 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn init_logging() {
     use tracing_appender::rolling;
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let log_dir = runtime::cowd_dirs::config_home_dir().join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
@@ -420,8 +421,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // Auto-start daemon if not already running
             let sock = std::path::Path::new("/tmp/cowd.sock");
-            let daemon_autostart_disabled =
-                std::env::var("COWD_DISABLE_DAEMON_AUTOSTART").is_ok();
+            let daemon_autostart_disabled = std::env::var("COWD_DISABLE_DAEMON_AUTOSTART").is_ok();
             if !sock.exists() && !daemon_autostart_disabled {
                 tracing::info!("daemon not running, auto-starting...");
                 setup_sigchld_handler();
@@ -1922,11 +1922,7 @@ struct ResumeCommandOutcome {
 }
 
 impl ResumeCommandOutcome {
-    fn new(
-        session: Session,
-        message: Option<String>,
-        json: Option<serde_json::Value>,
-    ) -> Self {
+    fn new(session: Session, message: Option<String>, json: Option<serde_json::Value>) -> Self {
         Self {
             session,
             session_path: None,
@@ -2294,7 +2290,7 @@ fn run_resume_command(
             result.compacted_session.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
-                    session_path: None,
+                session_path: None,
                 message: Some(format_compact_report(removed, kept, skipped)),
                 json: Some(serde_json::json!({
                     "kind": "compact",
@@ -2308,7 +2304,7 @@ fn run_resume_command(
             if !confirm {
                 return Ok(ResumeCommandOutcome {
                     session: session.clone(),
-            session_path: None,
+                    session_path: None,
                     message: Some(
                         "clear: confirmation required; rerun with /clear --confirm".to_string(),
                     ),
@@ -2326,7 +2322,7 @@ fn run_resume_command(
             cleared.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: cleared,
-            session_path: None,
+                session_path: None,
                 message: Some(format!(
                     "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  cowd --resume {}\n  New session      {new_session_id}\n  Session file     {}",
                     backup_path.display(),
@@ -2431,7 +2427,7 @@ fn run_resume_command(
         }
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
             session: session.clone(),
-                session_path: None,
+            session_path: None,
             message: Some(render_memory_report()?),
             json: Some(render_memory_json()?),
         }),
@@ -2457,7 +2453,7 @@ fn run_resume_command(
         }
         SlashCommand::Version => Ok(ResumeCommandOutcome {
             session: session.clone(),
-                session_path: None,
+            session_path: None,
             message: Some(render_version_report()),
             json: Some(version_json_value()),
         }),
@@ -2672,11 +2668,7 @@ fn detect_broad_cwd() -> Option<PathBuf> {
         .or_else(|| env::var_os("USERPROFILE"))
         .is_some_and(|h| Path::new(&h) == cwd);
     let is_root = cwd.parent().is_none();
-    if is_home || is_root {
-        Some(cwd)
-    } else {
-        None
-    }
+    if is_home || is_root { Some(cwd) } else { None }
 }
 
 /// Enforce the broad-CWD policy: when running from home or root, either
@@ -2769,7 +2761,13 @@ fn run_repl(
     tracing::debug!("run_repl: resolving model");
     let resolved_model = resolve_repl_model(model);
     tracing::debug!(model = %resolved_model, "run_repl: creating LiveCli");
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, yolo_mode)?;
+    let mut cli = LiveCli::new(
+        resolved_model,
+        true,
+        allowed_tools,
+        permission_mode,
+        yolo_mode,
+    )?;
     tracing::debug!("run_repl: applying reasoning effort");
     cli.set_reasoning_effort(reasoning_effort);
 
@@ -2979,10 +2977,10 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     use crossterm::{
         event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
         execute,
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     };
-    use ratatui::backend::CrosstermBackend;
     use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
     use std::io;
     use std::time::Duration;
     use tui::error_recovery;
@@ -3298,7 +3296,9 @@ fn consume_session_sidebar_actions(state: &mut TuiState, cli: &mut LiveCli, work
                 let _ = cli.persist_session();
                 match switch_live_cli_session(cli, &target_id) {
                     Ok(report) => {
-                        state.session_sidebar.set_current_session(&report.session_id);
+                        state
+                            .session_sidebar
+                            .set_current_session(&report.session_id);
                         state.session_id = report.session_id.clone();
                         state.app.session_id = report.session_id.clone();
                         load_session_history(&mut state.app, &cli.runtime.session());
@@ -3377,7 +3377,9 @@ fn consume_session_sidebar_actions(state: &mut TuiState, cli: &mut LiveCli, work
         })();
         match result {
             Ok(report) => {
-                state.session_sidebar.set_current_session(&report.session_id);
+                state
+                    .session_sidebar
+                    .set_current_session(&report.session_id);
                 state.session_id = report.session_id.clone();
                 state.app.session_id = report.session_id.clone();
                 state.app.timeline_pages.clear();
@@ -3419,7 +3421,9 @@ fn consume_session_sidebar_actions(state: &mut TuiState, cli: &mut LiveCli, work
         })();
         match result {
             Ok(report) => {
-                state.session_sidebar.set_current_session(&report.session_id);
+                state
+                    .session_sidebar
+                    .set_current_session(&report.session_id);
                 state.session_id = report.session_id.clone();
                 state.app.session_id = report.session_id.clone();
                 load_session_history(&mut state.app, &cli.runtime.session());
@@ -5483,8 +5487,9 @@ fn sync_cli_session_to_unified_store(
         }
 
         for (sequence, message) in session.messages.iter().enumerate() {
-            let message_json = serde_json::from_str::<serde_json::Value>(&message.to_json().render())
-                .unwrap_or(serde_json::Value::Null);
+            let message_json =
+                serde_json::from_str::<serde_json::Value>(&message.to_json().render())
+                    .unwrap_or(serde_json::Value::Null);
             let event = memory::SessionEvent {
                 session_id: session.session_id.clone(),
                 event_type: "message_appended".to_string(),
@@ -9624,40 +9629,39 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     #![allow(unused_imports)]
     use super::{
+        CliAction, CliOutputFormat, CliToolExecutor, DEFAULT_MODEL, GitWorkspaceSummary,
+        LATEST_SESSION_REFERENCE, LiveCli, LocalHelpTopic, PromptHistoryEntry, SHARED_RT,
+        STUB_COMMANDS, SessionHandle, SlashCommand, StatusUsage, activate_live_cli_session,
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_startup_banner, format_ultraplan_report, format_unknown_slash_command_message,
-        format_user_visible_api_error, gateway_auth_token_from_platform, merge_prompt_with_stdin,
-        activate_live_cli_session, build_system_prompt_for_mode, hydrate_session_from_unified_store,
-        normalize_permission_mode, parse_args,
-        parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        build_system_prompt_for_mode, collect_session_prompt_history,
+        create_managed_session_handle, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp, format_issue_report,
+        format_model_report, format_model_switch_report, format_permissions_report,
+        format_permissions_switch_report, format_pr_report, format_resume_report,
+        format_startup_banner, format_status_report, format_tool_call_start, format_tool_result,
+        format_ultraplan_report, format_unknown_slash_command_message,
+        format_user_visible_api_error, gateway_auth_token_from_platform,
+        hydrate_session_from_unified_store, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
         parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
         push_output_block, render_config_report, render_diff_report, render_diff_report_for,
-        render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias_with_config, resolve_repl_model,
         resolve_session_reference, response_to_events, resume_supported_slash_commands,
         run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
         status_context, suggestions::format_unknown_slash_command,
-        sync_cli_session_to_unified_store,
-        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        LiveCli, LocalHelpTopic, PromptHistoryEntry, SessionHandle, SlashCommand, StatusUsage,
-        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT, STUB_COMMANDS,
+        summarize_tool_payload_for_markdown, sync_cli_session_to_unified_store,
+        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
-        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
-        ConversationMessage, GatewayPlatformConfig, JsonValue, MessageRole, OAuthConfig,
-        PermissionMode, Session, ToolExecutor,
+        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, GatewayPlatformConfig,
+        JsonValue, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
+        load_oauth_credentials, save_oauth_credentials,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -11531,16 +11535,22 @@ mod tests {
         assert!(preflight.contains("Result           ready"));
         assert!(preflight.contains("Branch           feature/ux"));
         assert!(preflight.contains("Workspace        dirty · 2 files · 1 staged, 1 unstaged"));
-        assert!(preflight
-            .contains("Action           create a git commit from the current workspace changes"));
+        assert!(
+            preflight.contains(
+                "Action           create a git commit from the current workspace changes"
+            )
+        );
     }
 
     #[test]
     fn commit_skipped_report_points_to_next_steps() {
         let report = format_commit_skipped_report();
         assert!(report.contains("Reason           no workspace changes"));
-        assert!(report
-            .contains("Action           create a git commit from the current workspace changes"));
+        assert!(
+            report.contains(
+                "Action           create a git commit from the current workspace changes"
+            )
+        );
         assert!(report.contains("/status to inspect context"));
         assert!(report.contains("/diff to inspect repo changes"));
     }
@@ -11789,13 +11799,17 @@ UU conflicted.rs",
                 .expect("switch should update session path")
                 .canonicalize()
                 .expect("outcome path should exist"),
-            target_path.canonicalize().expect("target path should exist")
+            target_path
+                .canonicalize()
+                .expect("target path should exist")
         );
-        assert!(outcome
-            .message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Session switched"));
+        assert!(
+            outcome
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Session switched")
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -12067,8 +12081,8 @@ UU conflicted.rs",
         .expect("cli should initialize");
         let original_id = cli.runtime.session().session_id.clone();
 
-        let target_handle = create_managed_session_handle("session-target")
-            .expect("target handle should create");
+        let target_handle =
+            create_managed_session_handle("session-target").expect("target handle should create");
         let target_session = Session::new()
             .with_workspace_root(workspace.clone())
             .with_persistence_path(target_handle.path.clone());
@@ -13132,7 +13146,7 @@ fn write_mcp_server_fixture(script_path: &Path) {
 #[cfg(test)]
 mod sandbox_report_tests {
     #![allow(unused_imports)]
-    use super::{format_sandbox_report, HookAbortMonitor};
+    use super::{HookAbortMonitor, format_sandbox_report};
     use runtime::HookAbortSignal;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -13189,7 +13203,7 @@ mod sandbox_report_tests {
 #[cfg(test)]
 mod dump_manifests_tests {
     #![allow(unused_imports)]
-    use super::{dump_manifests_at_path, CliOutputFormat};
+    use super::{CliOutputFormat, dump_manifests_at_path};
     use std::fs;
 
     #[test]

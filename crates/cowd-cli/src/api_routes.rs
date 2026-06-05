@@ -39,6 +39,7 @@ use tools::GlobalToolRegistry;
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use crate::session_kernel::SessionKernel;
+use crate::task_kernel::{TaskKernel, TaskStatus};
 use memory::MemoryScope;
 use memory::RotAlert;
 use memory::cognitive::CognitiveContextManager;
@@ -64,6 +65,7 @@ pub struct AppState {
     pub config_home: PathBuf,
     pub profile_id: String,
     pub profile_manager: Arc<ProfileManager>,
+    pub task_kernel: Arc<TaskKernel>,
 }
 
 type RuntimeEntry = Arc<tokio::sync::Mutex<crate::BuiltRuntime>>;
@@ -156,6 +158,11 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/:id/stream", get(sse_stream_handler))
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
+        .route("/api/tasks", get(tasks_status_handler))
+        .route("/api/tasks/start", post(start_task_handler))
+        .route("/api/tasks/:id/cancel", post(cancel_task_handler))
+        .route("/api/tasks/:id/complete", post(complete_task_handler))
+        .route("/api/tasks/:id/failure", post(record_task_failure_handler))
         .route("/api/memory", get(memory_handler))
         .route("/api/memory/status", get(memory_status_handler))
         .route("/api/memory/search", get(memory_search_handler))
@@ -667,10 +674,74 @@ struct ApprovalRespondRequest {
     reason: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct StartTaskRequest {
+    objective: String,
+    #[serde(default)]
+    yolo_mode: bool,
+}
+
+#[derive(Deserialize)]
+struct TaskFailureRequest {
+    reason: String,
+}
+
 // ── Handlers ───────────────────────────────────────────────────
 
 async fn health_handler() -> &'static str {
     "OK"
+}
+
+async fn tasks_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "tasks": state.task_kernel.list(),
+        "current": state.task_kernel.current(),
+    }))
+}
+
+async fn start_task_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<StartTaskRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let task = state
+        .task_kernel
+        .start_goal(body.objective, body.yolo_mode)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    Ok((StatusCode::CREATED, Json(task)))
+}
+
+async fn cancel_task_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let task = state
+        .task_kernel
+        .transition(&id, TaskStatus::Cancelled, None, "cancelled by user")
+        .map_err(|e| api_error(StatusCode::NOT_FOUND, e))?;
+    Ok(Json(task))
+}
+
+async fn complete_task_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let task = state
+        .task_kernel
+        .transition(&id, TaskStatus::Completed, None, "accepted")
+        .map_err(|e| api_error(StatusCode::NOT_FOUND, e))?;
+    Ok(Json(task))
+}
+
+async fn record_task_failure_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<TaskFailureRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let task = state
+        .task_kernel
+        .record_failure(&id, body.reason)
+        .map_err(|e| api_error(StatusCode::NOT_FOUND, e))?;
+    Ok(Json(task))
 }
 
 async fn list_sessions(
@@ -2662,6 +2733,12 @@ mod tests {
         Arc::new(SessionKernel::new(sessions, store, event_bus))
     }
 
+    fn test_task_kernel() -> Arc<TaskKernel> {
+        let path =
+            std::env::temp_dir().join(format!("cowd-api-task-{}.json", uuid::Uuid::new_v4()));
+        Arc::new(TaskKernel::open(path).expect("task kernel should open"))
+    }
+
     fn test_state() -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
@@ -2680,6 +2757,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
         })
     }
 
@@ -2705,6 +2783,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
         })
     }
 
@@ -2743,6 +2822,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
         })
     }
 
@@ -2772,6 +2852,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
         })
     }
 
@@ -2793,6 +2874,7 @@ mod tests {
             config_home,
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
         })
     }
 
@@ -3627,6 +3709,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_api_starts_reports_and_blocks_after_repeated_failures() {
+        let app = api_router(test_state());
+        let start_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "objective": "finish v0.8.10",
+                            "yolo_mode": true,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start_response.status(), StatusCode::CREATED);
+        let start_body = to_bytes(start_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let started: serde_json::Value = serde_json::from_slice(&start_body).unwrap();
+        let task_id = started["id"].as_str().expect("task id").to_string();
+        assert_eq!(started["status"], "running");
+        assert_eq!(started["yolo_mode"], true);
+
+        for reason in ["first", "second", "external input required"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/tasks/{task_id}/failure"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({ "reason": reason }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let status_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+        assert_eq!(status_json["tasks"][0]["status"], "blocked");
+        assert_eq!(
+            status_json["tasks"][0]["blocker_reason"],
+            "external input required"
+        );
+    }
+
+    #[tokio::test]
     async fn memory_without_config_returns_disabled() {
         let state = test_state();
         let app = api_router(state);
@@ -3997,6 +4148,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
         });
         let app = api_router(state);
 
@@ -4031,6 +4183,7 @@ mod tests {
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
         });
         let app = api_router(state);
 
