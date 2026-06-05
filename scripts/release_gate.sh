@@ -51,6 +51,7 @@ main() {
   run cargo test -p cowd-cli session_kernel -- --nocapture
   run cargo test -p cowd-cli task -- --nocapture
   run scripts/task_phase_scenario.sh
+  run scripts/memory_degraded_scenario.sh
   run cargo test -p cowd-cli --test resume_slash_commands resume_latest_restores_the_most_recent_managed_session -- --nocapture
   run cargo test -p cowd-cli yolo -- --nocapture
   run cargo test -p cowd-cli cli_session_sync_replaces_store_messages_and_events -- --nocapture
