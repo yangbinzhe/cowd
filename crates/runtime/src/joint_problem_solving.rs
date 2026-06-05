@@ -18,6 +18,7 @@ use crate::agent::{SubAgentConfig, SubAgentExecutor, SubAgentResult};
 use crate::agent_collaboration::{CollaborationOrchestrator, CollaborationTask};
 
 use memory::agent_directory::AgentDirectory;
+use memory::{MemoryKernel, MemoryTurnContext};
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
@@ -260,7 +261,10 @@ impl<E: SubAgentExecutor> AgentDiscussion<E> {
 
         // Persist discussion to L4 if configured.
         if let Some(ref mem) = self.parent_memory {
+            let kernel = MemoryKernel::new(Arc::clone(mem));
             for turn in &turns {
+                let memory_ctx =
+                    MemoryTurnContext::new("joint-problem-solving-discussion", turn.agent_id.clone());
                 let entry = MemoryEntry {
                     id: MemoryId::new_v4(),
                     layer: MemoryLayer::L4,
@@ -292,10 +296,10 @@ impl<E: SubAgentExecutor> AgentDiscussion<E> {
                     last_accessed_at: None,
                     scope: MemoryScope::Global,
                     session_id: None,
-                    source_agent: Some(turn.agent_id.clone()),
+                    source_agent: None,
                     visibility: AgentVisibility::Shared,
                 };
-                let _ = mem.remember(entry).await;
+                let _ = kernel.remember(&memory_ctx, entry).await;
             }
         }
 
@@ -385,6 +389,9 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
     async fn phase1_framing(&self, problem: &ProblemStatement) -> FramingResult {
         let perspectives = if let Some(ref mem) = self.parent_memory {
             // Write problem to L4 for all agents to discover.
+            let memory_ctx =
+                MemoryTurnContext::new("joint-problem-solving", "problem-solving-pipeline");
+            let kernel = MemoryKernel::new(Arc::clone(mem));
             let problem_entry = MemoryEntry {
                 id: MemoryId::new_v4(),
                 layer: MemoryLayer::L4,
@@ -410,10 +417,10 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
                 last_accessed_at: None,
                 scope: MemoryScope::Global,
                 session_id: None,
-                source_agent: Some("problem-solving-pipeline".to_string()),
+                source_agent: None,
                 visibility: AgentVisibility::Shared,
             };
-            if let Err(e) = mem.remember(problem_entry).await {
+            if let Err(e) = kernel.remember(&memory_ctx, problem_entry).await {
                 tracing::warn!("Failed to persist problem to L4: {e}");
             }
 
@@ -848,6 +855,9 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
                 .join("\n"),
         );
 
+        let memory_ctx =
+            MemoryTurnContext::new("joint-problem-solving", "problem-solving-pipeline");
+        let kernel = MemoryKernel::new(Arc::clone(mem));
         let entry = MemoryEntry {
             id: MemoryId::new_v4(),
             layer: MemoryLayer::L4,
@@ -872,11 +882,11 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
             last_accessed_at: None,
             scope: MemoryScope::Global,
             session_id: None,
-            source_agent: Some("problem-solving-pipeline".to_string()),
+            source_agent: None,
             visibility: AgentVisibility::Shared,
         };
 
-        if let Err(e) = mem.remember(entry).await {
+        if let Err(e) = kernel.remember(&memory_ctx, entry).await {
             tracing::warn!("Failed to persist pipeline result to L4: {e}");
         }
     }
@@ -1562,4 +1572,3 @@ mod tests {
         assert!(!result.phase_statuses.is_empty());
     }
 }
-

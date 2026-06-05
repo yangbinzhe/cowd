@@ -22,6 +22,7 @@ use crate::cowd_event::{CowdEvent, CowdEventBus};
 use memory::agent_directory::AgentInfo;
 use memory::cognitive::CognitiveContextManager;
 use memory::fact_checker::FactChecker;
+use memory::{MemoryKernel, MemoryTurnContext};
 use memory::project_scope::MemoryScope;
 use memory::temporal_graph::Triple;
 use memory::types::{
@@ -654,6 +655,9 @@ impl DiscussionEngine {
         }
 
         // Write final decision to L4.
+        let memory_ctx =
+            MemoryTurnContext::new(format!("discussion:{}", discussion.topic), leader_id.clone());
+        let kernel = MemoryKernel::new(Arc::clone(&self.memory));
         let entry = MemoryEntry {
             id: MemoryId::new_v4(),
             layer: MemoryLayer::L4,
@@ -677,12 +681,12 @@ impl DiscussionEngine {
             last_accessed_at: None,
             scope: MemoryScope::Global,
             session_id: None,
-            source_agent: Some(leader_id),
+            source_agent: None,
             visibility: AgentVisibility::Shared,
         };
 
-        self.memory
-            .remember(entry)
+        kernel
+            .remember(&memory_ctx, entry)
             .await
             .map_err(|e| format!("Failed to write final decision to L4: {e}"))?;
 
@@ -712,6 +716,17 @@ impl DiscussionEngine {
         round: u32,
         content: &str,
     ) -> Result<(), String> {
+        let memory_ctx = MemoryTurnContext::new(
+            format!(
+                "discussion:{}",
+                self.discussion
+                    .as_ref()
+                    .map(|discussion| discussion.topic.as_str())
+                    .unwrap_or("active")
+            ),
+            agent.agent_id.clone(),
+        );
+        let kernel = MemoryKernel::new(Arc::clone(&self.memory));
         let entry = MemoryEntry {
             id: MemoryId::new_v4(),
             layer: MemoryLayer::L4,
@@ -738,12 +753,12 @@ impl DiscussionEngine {
             last_accessed_at: None,
             scope: MemoryScope::Global,
             session_id: None,
-            source_agent: Some(agent.agent_id.clone()),
+            source_agent: None,
             visibility: AgentVisibility::Shared,
         };
 
-        self.memory
-            .remember(entry)
+        kernel
+            .remember(&memory_ctx, entry)
             .await
             .map_err(|e| format!("Failed to write contribution to L4: {e}"))?;
 

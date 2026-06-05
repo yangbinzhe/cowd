@@ -1770,6 +1770,11 @@ where
                             "Collaboration synthesis complete"
                         );
                         if let Some(mem) = memory {
+                            let memory_ctx = MemoryTurnContext::new(
+                                self.session().session_id,
+                                "collaboration-orchestrator",
+                            );
+                            let kernel = MemoryKernel::new(Arc::clone(&mem));
                             let entry = memory::types::MemoryEntry {
                                 id: memory::types::MemoryId::new_v4(),
                                 layer: memory::types::MemoryLayer::L4,
@@ -1792,10 +1797,10 @@ where
                                 last_accessed_at: None,
                                 scope: memory::project_scope::MemoryScope::Global,
                                 session_id: None,
-                                source_agent: Some("collaboration-orchestrator".to_string()),
+                                source_agent: None,
                                 visibility: memory::types::AgentVisibility::Shared,
                             };
-                            let _ = mem.remember(entry).await;
+                            let _ = kernel.remember(&memory_ctx, entry).await;
                         }
                     }
                 }

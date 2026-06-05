@@ -13,6 +13,7 @@ use crate::wave::{TaskId, WaveConfig, WaveOrchestrator, WaveTask};
 
 use memory::agent_directory::{AgentDirectory, AgentInfo};
 use memory::fact_checker::{FactCheckResult, FactChecker};
+use memory::{MemoryKernel, MemoryTurnContext};
 use memory::project_scope::MemoryScope;
 use memory::temporal_graph::Triple;
 use memory::types::{
@@ -326,6 +327,8 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
             tracing::debug!("no parent memory configured — skipping L4 finalize");
             return;
         };
+        let memory_ctx = MemoryTurnContext::new("collaboration-orchestrator", "collaboration-orchestrator");
+        let kernel = MemoryKernel::new(Arc::clone(mem));
 
         let entry = MemoryEntry {
             id: MemoryId::new_v4(),
@@ -350,11 +353,11 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
             last_accessed_at: None,
             scope: MemoryScope::Global,
             session_id: None,
-            source_agent: Some("collaboration-orchestrator".to_string()),
+            source_agent: None,
             visibility: AgentVisibility::Shared,
         };
 
-        if let Err(e) = mem.remember(entry).await {
+        if let Err(e) = kernel.remember(&memory_ctx, entry).await {
             tracing::warn!("failed to persist collaboration synthesis to L4: {e}");
         } else {
             tracing::info!("collaboration synthesis persisted to L4 shared memory");
