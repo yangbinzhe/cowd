@@ -165,6 +165,48 @@ async fn memory_kernel_health_is_visible_and_non_degraded_on_empty_store() {
 }
 
 #[tokio::test]
+async fn memory_kernel_layer_views_project_atoms_read_only() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("views.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    manager
+        .remember(entry(
+            MemoryLayer::L2,
+            MemorySource::UserExplicit,
+            "project invariant",
+        ))
+        .await
+        .unwrap();
+
+    let l2 = kernel
+        .layer_view(MemoryLayer::L2, MemoryInformationState::Orientation)
+        .await
+        .unwrap();
+    let all = kernel
+        .layer_views(MemoryInformationState::Orientation)
+        .await
+        .unwrap();
+
+    assert!(l2.read_only);
+    assert_eq!(l2.layer, MemoryLayer::L2);
+    assert_eq!(l2.atoms.len(), 1);
+    assert!(l2.atoms[0].is_explainable_orientation());
+    assert_eq!(all.len(), 5);
+    assert_eq!(
+        all.iter()
+            .find(|view| view.layer == MemoryLayer::L2)
+            .unwrap()
+            .atoms
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn memory_kernel_post_turn_preserves_turn_success() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(

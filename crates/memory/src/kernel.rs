@@ -302,6 +302,47 @@ impl MemoryKernel {
         ))
     }
 
+    /// Build a read-only projection for one governance layer.
+    pub async fn layer_view(
+        &self,
+        layer: MemoryLayer,
+        information_state: MemoryInformationState,
+    ) -> MemoryKernelResult<MemoryLayerView> {
+        let entries = self.manager.list_all_entries().await?;
+        let atoms = entries
+            .iter()
+            .filter(|entry| entry.layer == layer)
+            .map(|entry| MemoryAtomView::from_entry(entry, information_state))
+            .collect();
+        Ok(MemoryLayerView::new(layer, atoms))
+    }
+
+    /// Build read-only projections for all governance layers.
+    pub async fn layer_views(
+        &self,
+        information_state: MemoryInformationState,
+    ) -> MemoryKernelResult<Vec<MemoryLayerView>> {
+        let entries = self.manager.list_all_entries().await?;
+        let layers = [
+            MemoryLayer::L0,
+            MemoryLayer::L1,
+            MemoryLayer::L2,
+            MemoryLayer::L3,
+            MemoryLayer::L4,
+        ];
+        Ok(layers
+            .into_iter()
+            .map(|layer| {
+                let atoms = entries
+                    .iter()
+                    .filter(|entry| entry.layer == layer)
+                    .map(|entry| MemoryAtomView::from_entry(entry, information_state))
+                    .collect();
+                MemoryLayerView::new(layer, atoms)
+            })
+            .collect())
+    }
+
     fn empty_degraded_context() -> PreparedContext {
         PreparedContext {
             entries: Vec::new(),
