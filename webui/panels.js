@@ -20,8 +20,15 @@ window.Panels = (()=>{
     const stats=UI.el('div','panel-section');
     c.appendChild(stats);
     try{
+      const status=await Api.memoryStatus();
       const s=await Api.memoryStats();
-      stats.innerHTML='Entries: '+(s.total_entries||s.count||0)+' | Entities: '+(s.entity_count||s.entities||0)+' | Triples: '+(s.triple_count||s.triples||0);
+      const label=status.status||((status.enabled)?'ready':'disabled');
+      const reason=status.degraded_reason||status.message||'';
+      stats.innerHTML='Status: '+UI.esc(label)
+        +' | Entries: '+(s.total_entries||s.count||0)
+        +' | Entities: '+(s.entity_count||s.entities||0)
+        +' | Triples: '+(s.triple_count||s.triples||0)
+        +(reason?' | '+UI.esc(reason):'');
     }catch(e){stats.textContent='Stats unavailable'}
 
     const entitySec=UI.el('div','panel-section');

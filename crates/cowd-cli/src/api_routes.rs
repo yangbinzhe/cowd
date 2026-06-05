@@ -40,6 +40,7 @@ use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use crate::session_kernel::SessionKernel;
 use memory::MemoryScope;
+use memory::RotAlert;
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
 use memory::store::session::{SessionListOptions, SessionRecord};
@@ -156,6 +157,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
         .route("/api/memory", get(memory_handler))
+        .route("/api/memory/status", get(memory_status_handler))
         .route("/api/memory/search", get(memory_search_handler))
         .route("/api/memory/stats", get(memory_stats_handler))
         .route("/api/memory/layers", get(memory_layers_handler))
@@ -1184,7 +1186,24 @@ async fn send_message(
 
 // ── Memory / Tools / Config handlers ───────────────────────────
 
-async fn memory_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+fn context_health_json(alert: RotAlert) -> serde_json::Value {
+    match alert {
+        RotAlert::None => serde_json::json!({
+            "level": "healthy",
+            "message": null,
+        }),
+        RotAlert::Warning(message) => serde_json::json!({
+            "level": "warning",
+            "message": message,
+        }),
+        RotAlert::Critical(message) => serde_json::json!({
+            "level": "critical",
+            "message": message,
+        }),
+    }
+}
+
+async fn memory_status_value(state: &AppState) -> serde_json::Value {
     if let Some(ref mgr) = state.memory_manager {
         let layers = mgr.list_layers().await;
         let vector_count = mgr.vector_index_count();
@@ -1193,23 +1212,43 @@ async fn memory_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl Into
             .filter_map(|layer| layer.get("entry_count").and_then(|v| v.as_u64()))
             .map(|count| count as usize)
             .sum();
-        Json(serde_json::json!({
+        serde_json::json!({
             "enabled": true,
+            "status": "ready",
+            "degraded": false,
+            "degraded_reason": null,
             "layers": layers,
             "total_entries": total_entries,
             "vector_count": vector_count,
             "session_store": true,
-        }))
+            "context_health": context_health_json(mgr.ctx_health()),
+            "performance": mgr.performance_report(),
+        })
     } else {
-        Json(serde_json::json!({
+        serde_json::json!({
             "enabled": false,
+            "status": "disabled",
+            "degraded": false,
+            "degraded_reason": "memory not configured",
             "layers": empty_memory_layers(),
             "total_entries": 0,
             "vector_count": 0,
             "session_store": false,
+            "context_health": {
+                "level": "unavailable",
+                "message": "memory not configured",
+            },
             "message": "memory not configured"
-        }))
+        })
     }
+}
+
+async fn memory_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    Json(memory_status_value(&state).await)
+}
+
+async fn memory_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    Json(memory_status_value(&state).await)
 }
 
 async fn memory_stats_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
@@ -3594,13 +3633,18 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/memory")
+                    .uri("/api/memory/status")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["status"], "disabled");
+        assert_eq!(json["context_health"]["level"], "unavailable");
     }
 
     #[tokio::test]
@@ -3626,6 +3670,25 @@ mod tests {
             .unwrap();
 
         let app = api_router(test_state_with_memory(manager));
+        let status_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_response.status(), StatusCode::OK);
+        let status_body = to_bytes(status_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+        assert_eq!(status_json["enabled"], true);
+        assert_eq!(status_json["status"], "ready");
+        assert_eq!(status_json["context_health"]["level"], "healthy");
+
         let layers_response = app
             .clone()
             .oneshot(

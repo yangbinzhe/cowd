@@ -147,7 +147,7 @@ window.Api = (()=>{
     async deleteProfile(id){return req('DELETE','/api/profiles/'+encodeURIComponent(id))},
 
     // ── Memory ──
-    async memoryStatus(){return req('GET','/api/memory')},
+    async memoryStatus(){return req('GET','/api/memory/status')},
     async memoryStats(){return req('GET','/api/memory/stats')},
     async listMemoryLayers(){return req('GET','/api/memory/layers')},
     async searchMemory(q){return req('GET','/api/memory/search?q='+encodeURIComponent(q))},

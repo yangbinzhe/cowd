@@ -68,6 +68,21 @@ describe('API module', () => {
     expect(typeof window.Api.registerFacts).toBe('function');
   });
 
+  it('memoryStatus uses the stable status endpoint', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ enabled: true, status: 'ready' })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const status = await window.Api.memoryStatus();
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/memory/status');
+    expect(status.status).toBe('ready');
+  });
+
   it('has all skill endpoints', () => {
     expect(typeof window.Api.listSkills).toBe('function');
     expect(typeof window.Api.installSkill).toBe('function');
