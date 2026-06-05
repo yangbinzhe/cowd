@@ -2770,6 +2770,12 @@ fn run_repl(
     )?;
     tracing::debug!("run_repl: applying reasoning effort");
     cli.set_reasoning_effort(reasoning_effort);
+    if let Err(error) = ensure_yolo_task(
+        yolo_mode,
+        format!("Interactive YOLO session {}", cli.session.id),
+    ) {
+        tracing::warn!(%error, "failed to initialize yolo task state");
+    }
 
     let workspace = std::env::current_dir().unwrap_or_default();
     tracing::debug!(workspace = %workspace.display(), "run_repl: entering TUI");
@@ -7446,6 +7452,21 @@ Use the full tool surface allowed by danger-full-access, but keep edits scoped, 
 After each major phase, self-review against correctness, stability, interaction quality, and performance; then continue to the next highest-impact gap."
 }
 
+pub(crate) fn ensure_yolo_task(
+    yolo_mode: bool,
+    objective: impl Into<String>,
+) -> Result<Option<task_kernel::TaskRecord>, String> {
+    if !yolo_mode {
+        return Ok(None);
+    }
+    let kernel =
+        task_kernel::TaskKernel::open(runtime::cowd_dirs::config_home_dir().join("tasks.json"))?;
+    if let Some(current) = kernel.current() {
+        return Ok(Some(current));
+    }
+    kernel.start_goal(objective, true).map(Some)
+}
+
 fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
@@ -9634,13 +9655,13 @@ mod tests {
         STUB_COMMANDS, SessionHandle, SlashCommand, StatusUsage, activate_live_cli_session,
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         build_system_prompt_for_mode, collect_session_prompt_history,
-        create_managed_session_handle, filter_tool_specs, format_bughunter_report,
-        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
-        format_connected_line, format_cost_report, format_history_timestamp, format_issue_report,
-        format_model_report, format_model_switch_report, format_permissions_report,
-        format_permissions_switch_report, format_pr_report, format_resume_report,
-        format_startup_banner, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command_message,
+        create_managed_session_handle, ensure_yolo_task, filter_tool_specs,
+        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
+        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
+        format_issue_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_pr_report,
+        format_resume_report, format_startup_banner, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command_message,
         format_user_visible_api_error, gateway_auth_token_from_platform,
         hydrate_session_from_unified_store, merge_prompt_with_stdin, normalize_permission_mode,
         parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
@@ -10345,6 +10366,33 @@ mod tests {
                 yolo_mode: true,
             }
         );
+    }
+
+    #[test]
+    fn yolo_mode_creates_and_reuses_durable_task() {
+        let _guard = env_lock();
+        let config_home = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        let original = std::env::var("COWD_CONFIG_HOME").ok();
+        std::env::set_var("COWD_CONFIG_HOME", &config_home);
+
+        assert!(ensure_yolo_task(false, "ignored").unwrap().is_none());
+        let first = ensure_yolo_task(true, "ship v0.8.10")
+            .unwrap()
+            .expect("yolo task should create");
+        let second = ensure_yolo_task(true, "different objective")
+            .unwrap()
+            .expect("existing yolo task should restore");
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.objective, "ship v0.8.10");
+        assert!(config_home.join("tasks.json").is_file());
+
+        match original {
+            Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),
+            None => std::env::remove_var("COWD_CONFIG_HOME"),
+        }
+        let _ = fs::remove_dir_all(config_home);
     }
 
     #[test]
