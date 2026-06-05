@@ -167,6 +167,36 @@ pub struct MemoryPath {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum MemoryPacketRole {
+    Orientation,
+    Supporting,
+    Warning,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryPacketItem {
+    pub atom: MemoryAtomView,
+    pub role: MemoryPacketRole,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OmittedMemory {
+    pub id: MemoryId,
+    pub title: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryContextPacket {
+    pub selected: Vec<MemoryPacketItem>,
+    pub omitted: Vec<OmittedMemory>,
+    pub token_estimate: u64,
+    pub truncated: bool,
+}
+
 impl MemoryLayerView {
     #[must_use]
     pub fn new(layer: MemoryLayer, atoms: Vec<MemoryAtomView>) -> Self {
@@ -409,6 +439,60 @@ impl MemoryKernel {
         active
     }
 
+    pub async fn context_packet(
+        &self,
+        ctx: &MemoryTurnContext,
+        query: &str,
+        messages: &[Message],
+        max_items: usize,
+        max_tokens: u64,
+    ) -> MemoryKernelResult<MemoryContextPacket> {
+        let prepared = self.prepare(ctx, query, messages).await?;
+        self.context_packet_from_entries(prepared.entries, max_items, max_tokens)
+            .await
+    }
+
+    pub async fn context_packet_from_entries(
+        &self,
+        entries: Vec<MemoryEntry>,
+        max_items: usize,
+        max_tokens: u64,
+    ) -> MemoryKernelResult<MemoryContextPacket> {
+        let mut selected = Vec::new();
+        let mut omitted = Vec::new();
+        let mut token_estimate = 0_u64;
+        let mut truncated = false;
+
+        for entry in entries {
+            let atom = self
+                .atom_with_lifecycle_state(&entry, MemoryInformationState::Orientation)
+                .await;
+            let item_tokens = (entry.content.len() as u64 / 4).max(1);
+            if selected.len() >= max_items
+                || token_estimate.saturating_add(item_tokens) > max_tokens
+            {
+                truncated = true;
+                omitted.push(OmittedMemory {
+                    id: entry.id,
+                    title: entry.title,
+                    reason: "packet budget exhausted".to_string(),
+                });
+                continue;
+            }
+
+            let (role, reason) = packet_role_and_reason(&atom);
+            selected.push(MemoryPacketItem { atom, role, reason });
+            token_estimate = token_estimate.saturating_add(item_tokens);
+        }
+
+        Ok(MemoryContextPacket {
+            selected,
+            omitted,
+            token_estimate,
+            truncated,
+        })
+    }
+
     pub async fn links(&self) -> MemoryKernelResult<Vec<MemoryLink>> {
         let entries = self.manager.list_all_entries().await?;
         Ok(build_links(&entries))
@@ -549,13 +633,24 @@ impl MemoryKernel {
     ) -> Vec<MemoryAtomView> {
         let mut atoms = Vec::new();
         for entry in entries {
-            let mut atom = MemoryAtomView::from_entry(entry, information_state);
-            if let Ok(Some(state)) = self.latest_state(entry.id).await {
-                atom.state = state;
-            }
-            atoms.push(atom);
+            atoms.push(
+                self.atom_with_lifecycle_state(entry, information_state)
+                    .await,
+            );
         }
         atoms
+    }
+
+    async fn atom_with_lifecycle_state(
+        &self,
+        entry: &MemoryEntry,
+        information_state: MemoryInformationState,
+    ) -> MemoryAtomView {
+        let mut atom = MemoryAtomView::from_entry(entry, information_state);
+        if let Ok(Some(state)) = self.latest_state(entry.id).await {
+            atom.state = state;
+        }
+        atom
     }
 
     fn empty_degraded_context() -> PreparedContext {
@@ -707,6 +802,35 @@ fn relation_kind_to_link_kind(kind: crate::types::RelationKind) -> MemoryLinkKin
         crate::types::RelationKind::Supersedes => MemoryLinkKind::Supersedes,
         crate::types::RelationKind::Summarizes => MemoryLinkKind::Summarizes,
         _ => MemoryLinkKind::Related,
+    }
+}
+
+fn packet_role_and_reason(atom: &MemoryAtomView) -> (MemoryPacketRole, String) {
+    match atom.state {
+        MemoryState::Conflicted => (
+            MemoryPacketRole::Conflict,
+            "memory has low confidence and needs review".to_string(),
+        ),
+        MemoryState::Stale => (
+            MemoryPacketRole::Warning,
+            "memory is stale and should be treated cautiously".to_string(),
+        ),
+        MemoryState::Candidate => (
+            MemoryPacketRole::Supporting,
+            "candidate memory can support reasoning but is not authoritative".to_string(),
+        ),
+        MemoryState::Active if atom.is_explainable_orientation() => (
+            MemoryPacketRole::Orientation,
+            "active explainable orientation memory".to_string(),
+        ),
+        MemoryState::Active => (
+            MemoryPacketRole::Supporting,
+            "active memory lacks explicit orientation evidence".to_string(),
+        ),
+        MemoryState::Superseded | MemoryState::Archived => (
+            MemoryPacketRole::Warning,
+            "inactive memory should not be used as current orientation".to_string(),
+        ),
     }
 }
 

@@ -5,8 +5,8 @@ use cowd_memory::config::{BudgetConfig, StoreConfig};
 use cowd_memory::{
     AgentVisibility, CognitiveContextManager, MemoryAtomView, MemoryCategory, MemoryConfig,
     MemoryHealth, MemoryInformationState, MemoryKernel, MemoryLayer, MemoryLayerView,
-    MemoryLinkKind, MemoryPrimitive, MemoryScope, MemorySource, MemoryState, MemoryTurnContext,
-    Priority,
+    MemoryLinkKind, MemoryPacketRole, MemoryPrimitive, MemoryScope, MemorySource, MemoryState,
+    MemoryTurnContext, Priority,
 };
 
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
@@ -502,6 +502,72 @@ async fn path_recall_caps_expansion_on_dense_graph() {
 
     assert!(path.entries.len() <= 5);
     assert!(path.truncated);
+}
+
+#[tokio::test]
+async fn memory_context_packet_prefers_explainable_orientation() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("packet.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-packet", "agent-packet");
+    let mut orientation = entry(
+        MemoryLayer::L2,
+        MemorySource::UserExplicit,
+        "PACKET_ORIENTATION_ALPHA",
+    );
+    orientation.content = "PACKET_ORIENTATION_ALPHA is the active project direction.".to_string();
+    orientation.scope = MemoryScope::Session(ctx.session_id.clone());
+    orientation.session_id = Some(ctx.session_id.clone());
+    manager.remember(orientation).await.unwrap();
+
+    let packet = kernel
+        .context_packet(&ctx, "PACKET_ORIENTATION_ALPHA", &[], 8, 1_000)
+        .await
+        .unwrap();
+
+    assert!(packet
+        .selected
+        .iter()
+        .any(|item| item.role == MemoryPacketRole::Orientation));
+    assert!(!packet.truncated);
+}
+
+#[tokio::test]
+async fn memory_context_packet_stays_bounded_on_large_candidate_set() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("packet-bounded.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-packet-bounded", "agent-packet");
+    let mut candidates = Vec::new();
+    for idx in 0..12 {
+        let mut candidate = entry(
+            MemoryLayer::L3,
+            MemorySource::UserExplicit,
+            &format!("PACKET_BOUNDED_ALPHA {idx}"),
+        );
+        candidate.content = format!("PACKET_BOUNDED_ALPHA candidate {idx}");
+        candidate.scope = MemoryScope::Session(ctx.session_id.clone());
+        candidate.session_id = Some(ctx.session_id.clone());
+        candidates.push(candidate.clone());
+        manager.remember(candidate).await.unwrap();
+    }
+
+    let packet = kernel
+        .context_packet_from_entries(candidates, 3, 10_000)
+        .await
+        .unwrap();
+
+    assert!(packet.selected.len() <= 3);
+    assert!(packet.truncated);
+    assert!(!packet.omitted.is_empty());
 }
 
 #[tokio::test]

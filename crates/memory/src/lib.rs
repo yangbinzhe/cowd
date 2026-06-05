@@ -77,8 +77,9 @@ pub use layers::shared::{L4Event, L4EventBus, L4Operation};
 pub use cognitive::{CognitiveContextManager, SessionRestoreStats, VectorIndexStats};
 pub use kernel::{
     MemoryAtomView, MemoryDegradation, MemoryHealth, MemoryInformationState, MemoryKernel,
-    MemoryKernelError, MemoryKernelResult, MemoryLayerView, MemoryLifecycleEvent,
-    MemoryLink, MemoryLinkKind, MemoryPath, MemoryPrimitive, MemoryState, MemoryTurnContext,
+    MemoryKernelError, MemoryKernelResult, MemoryLayerView, MemoryLifecycleEvent, MemoryLink,
+    MemoryLinkKind, MemoryPacketItem, MemoryPacketRole, MemoryPath, MemoryPrimitive, MemoryState,
+    MemoryContextPacket, MemoryTurnContext, OmittedMemory,
 };
 pub use config::{MemoryConfig, TuningConfig, VectorConfig};
 pub use fresh_context::{
