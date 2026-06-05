@@ -571,6 +571,31 @@ describe('API module', () => {
     expect(document.getElementById('memory-symbol-results').textContent).toContain('Auth impact note');
   });
 
+  it('renders durable task status in the agents panel', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    vi.stubGlobal('fetch', vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          current: {
+            id: 'task-1',
+            objective: 'Finish v0.8.10',
+            status: 'blocked',
+            blocker_reason: 'external input required'
+          },
+          tasks: []
+        })
+      })
+    ));
+
+    await window.Panels.renderAgents();
+
+    const text = document.getElementById('panel-content').textContent;
+    expect(text).toContain('blocked');
+    expect(text).toContain('Finish v0.8.10');
+    expect(text).toContain('external input required');
+  });
+
   it('renders approval queue and posts approval decisions', async () => {
     document.body.innerHTML = '<div id="toast"></div><div id="cc-content"></div>';
     const mockF = vi.fn((url, opts) => {

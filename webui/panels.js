@@ -411,13 +411,30 @@ window.Panels = (()=>{
   async function renderAgents(){
     const c=cont();c.innerHTML='<h3>Agent Tasks</h3>';
     try{
-      const cfg=await Api.getConfig();
+      const tasks=await Api.taskStatus();
       const sec=UI.el('div','panel-section');
       sec.innerHTML='<h3>Task Registry</h3>';
-      const pre=UI.el('pre');
-      pre.style.cssText='background:var(--bg);padding:12px;border-radius:var(--radius);font-size:12px;max-height:300px;overflow:auto';
-      pre.textContent='Task registry active.\nSub-agent delegation via task/agent tools.\nCron scheduler manages periodic tasks.';
-      sec.appendChild(pre);
+      const current=tasks.current;
+      if(current){
+        const item=UI.el('div','panel-item');
+        const body=UI.el('span','pi-name');
+        body.textContent=(current.status||'running')+' · '+(current.objective||current.id);
+        item.appendChild(body);
+        sec.appendChild(item);
+        if(current.blocker_reason){
+          sec.appendChild(UI.el('div','panel-empty',current.blocker_reason));
+        }
+      }else{
+        sec.appendChild(UI.el('div','panel-empty','No active task'));
+      }
+      (tasks.tasks||[]).slice(-8).reverse().forEach(function(task){
+        if(current&&task.id===current.id)return;
+        const row=UI.el('div','panel-item');
+        const name=UI.el('span','pi-name');
+        name.textContent=(task.status||'unknown')+' · '+(task.objective||task.id);
+        row.appendChild(name);
+        sec.appendChild(row);
+      });
       c.appendChild(sec);
     }catch(e){c.appendChild(UI.el('div','panel-empty','Agents info unavailable'))}
   }
