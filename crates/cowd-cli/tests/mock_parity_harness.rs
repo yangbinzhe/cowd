@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -185,7 +185,7 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             continue;
         }
         let workspace = HarnessWorkspace::new(unique_temp_dir(case.name));
-        workspace.create().expect("workspace should exist");
+        workspace.create(&base_url).expect("workspace should exist");
         (case.prepare)(&workspace);
 
         let run = run_case(case, &workspace, &base_url);
@@ -257,9 +257,7 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             .or_insert(0_usize) += 1;
     }
     for report in &mut scenario_reports {
-        report.request_count = *request_counts
-            .get(report.name.as_str())
-            .unwrap_or(&0);
+        report.request_count = *request_counts.get(report.name.as_str()).unwrap_or(&0);
     }
 
     maybe_write_report(&scenario_reports);
@@ -292,18 +290,28 @@ impl HarnessWorkspace {
         }
     }
 
-    fn create(&self) -> std::io::Result<()> {
+    fn create(&self, base_url: &str) -> std::io::Result<()> {
         fs::create_dir_all(&self.root)?;
         fs::create_dir_all(&self.config_home)?;
-        fs::create_dir_all(&self.home)?;
-        let config_content = "model: \"sonnet\"\n\
-            providers:\n  anthropic:\n    base_url: \"https://api.anthropic.com/v1\"\n    \
-            api_key: \"test-key\"\n    models: [\"sonnet\"]\n    protocol: \"anthropic\"\n\
-            permissions:\n  defaultMode: \"acceptEdits\"\n  allow: []\n  deny: []\n  ask: []\n\
-            memory:\n  enabled: false\n\
-            gateway:\n  enabled: false\n";
-        fs::write(self.config_home.join("config.yaml"), config_content)?;
+        let home_config = self.home.join(".cowd");
+        fs::create_dir_all(&home_config)?;
+        let config_content = format!(
+            "model: \"sonnet\"\n\
+providers:\n  anthropic:\n    base_url: \"{base_url}\"\n    api_key: \"test-key\"\n    models: [\"sonnet\"]\n    protocol: \"anthropic\"\n\
+permissions:\n  defaultMode: \"acceptEdits\"\n  allow: []\n  deny: []\n  ask: []\n\
+memory:\n  enabled: false\n\
+gateway:\n  enabled: false\n"
+        );
+        fs::write(self.config_home.join("config.yaml"), &config_content)?;
+        fs::write(home_config.join("config.yaml"), config_content)?;
         Ok(())
+    }
+
+    fn write_config(&self, config: &str) {
+        fs::write(self.config_home.join("config.yaml"), config)
+            .expect("config-home config should write");
+        fs::write(self.home.join(".cowd").join("config.yaml"), config)
+            .expect("home config should write");
     }
 }
 
@@ -350,6 +358,7 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
             "--permission-mode",
             case.permission_mode,
             "--output-format=json",
+            "prompt",
         ]);
 
     if let Some(allowed_tools) = case.allowed_tools {
@@ -383,7 +392,7 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         command.output().expect("cowd should launch")
     };
 
-    assert_success(&output);
+    assert_success(case.name, &output);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     ScenarioRun {
         response: parse_json_output(&stdout),
@@ -484,19 +493,13 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
     )
     .expect("plugin manifest should write");
 
-    fs::write(
-        workspace.config_home.join("config.yaml"),
-        json!({
-            "enabledPlugins": {
-                "parity-plugin@external": true
-            },
-            "plugins": {
-                "externalDirectories": [plugin_root.parent().expect("plugin parent").display().to_string()]
-            }
-        })
-        .to_string(),
-    )
-    .expect("plugin settings should write");
+    let mut config = fs::read_to_string(workspace.config_home.join("config.yaml"))
+        .expect("base config should exist");
+    config.push_str(&format!(
+        "enabledPlugins:\n  parity-plugin@external: true\nplugins:\n  externalDirectories:\n    - \"{}\"\n",
+        plugin_root.parent().expect("plugin parent").display()
+    ));
+    workspace.write_config(&config);
 }
 
 fn assert_streaming_text(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -519,10 +522,12 @@ fn assert_read_file_roundtrip(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_uses"][0]["input"],
         Value::String(r#"{"path":"fixture.txt"}"#.to_string())
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("alpha parity line"));
+    assert!(
+        run.response["message"]
+            .as_str()
+            .expect("message text")
+            .contains("alpha parity line")
+    );
     let output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
@@ -542,10 +547,12 @@ fn assert_grep_chunk_assembly(_: &HarnessWorkspace, run: &ScenarioRun) {
             r#"{"pattern":"parity","path":"fixture.txt","output_mode":"count"}"#.to_string()
         )
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("2 occurrences"));
+    assert!(
+        run.response["message"]
+            .as_str()
+            .expect("message text")
+            .contains("2 occurrences")
+    );
     assert_eq!(
         run.response["tool_results"][0]["is_error"],
         Value::Bool(false)
@@ -558,10 +565,12 @@ fn assert_write_file_allowed(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_uses"][0]["name"],
         Value::String("write_file".to_string())
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("generated/output.txt"));
+    assert!(
+        run.response["message"]
+            .as_str()
+            .expect("message text")
+            .contains("generated/output.txt")
+    );
     let generated = workspace.root.join("generated").join("output.txt");
     let contents = fs::read_to_string(&generated).expect("generated file should exist");
     assert_eq!(contents, "created by mock service\n");
@@ -585,10 +594,12 @@ fn assert_write_file_denied(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_results"][0]["is_error"],
         Value::Bool(true)
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("denied as expected"));
+    assert!(
+        run.response["message"]
+            .as_str()
+            .expect("message text")
+            .contains("denied as expected")
+    );
     assert!(!workspace.root.join("generated").join("denied.txt").exists());
 }
 
@@ -615,14 +626,18 @@ fn assert_multi_tool_turn_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
         2,
         "expected two tool results in a single turn"
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("alpha parity line"));
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("2 occurrences"));
+    assert!(
+        run.response["message"]
+            .as_str()
+            .expect("message text")
+            .contains("alpha parity line")
+    );
+    assert!(
+        run.response["message"]
+            .as_str()
+            .expect("message text")
+            .contains("2 occurrences")
+    );
 }
 
 fn assert_bash_stdout_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -634,7 +649,8 @@ fn assert_bash_stdout_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
     let tool_output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    let parsed: Value = serde_json::from_str(tool_output).expect("bash output json");
+    let parsed: Value = serde_json::from_str(tool_output)
+        .unwrap_or_else(|error| panic!("bash output json: {error}; output={tool_output:?}"));
     assert_eq!(
         parsed["stdout"],
         Value::String("alpha from bash".to_string())
@@ -643,10 +659,12 @@ fn assert_bash_stdout_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_results"][0]["is_error"],
         Value::Bool(false)
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("alpha from bash"));
+    assert!(
+        run.response["message"]
+            .as_str()
+            .expect("message text")
+            .contains("alpha from bash")
+    );
 }
 
 fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -665,10 +683,12 @@ fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRu
         parsed["stdout"],
         Value::String("approved via prompt".to_string())
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("approved and executed"));
+    assert!(
+        run.response["message"]
+            .as_str()
+            .expect("message text")
+            .contains("approved and executed")
+    );
 }
 
 fn assert_bash_permission_prompt_denied(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -683,10 +703,12 @@ fn assert_bash_permission_prompt_denied(_: &HarnessWorkspace, run: &ScenarioRun)
         run.response["tool_results"][0]["is_error"],
         Value::Bool(true)
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("denied as expected"));
+    assert!(
+        run.response["message"]
+            .as_str()
+            .expect("message text")
+            .contains("denied as expected")
+    );
 }
 
 fn assert_plugin_tool_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -708,10 +730,12 @@ fn assert_plugin_tool_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
         parsed["input"]["message"],
         Value::String("hello from plugin parity".to_string())
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("hello from plugin parity"));
+    assert!(
+        run.response["message"]
+            .as_str()
+            .expect("message text")
+            .contains("hello from plugin parity")
+    );
 }
 
 fn assert_auto_compact_triggered(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -746,10 +770,12 @@ fn assert_auto_compact_triggered(_: &HarnessWorkspace, run: &ScenarioRun) {
 
 fn assert_token_cost_reporting(_: &HarnessWorkspace, run: &ScenarioRun) {
     assert_eq!(run.response["iterations"], Value::from(1));
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("token cost reporting parity complete."),);
+    assert!(
+        run.response["message"]
+            .as_str()
+            .expect("message text")
+            .contains("token cost reporting parity complete."),
+    );
     let usage = &run.response["usage"];
     assert!(
         usage["input_tokens"].as_u64().unwrap_or(0) > 0,
@@ -774,18 +800,12 @@ fn parse_json_output(stdout: &str) -> Value {
         });
     }
 
-    stdout
-        .lines()
+    let trimmed = stdout.trim();
+    trimmed
+        .match_indices('{')
         .rev()
-        .find_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with('{') && trimmed.ends_with('}') {
-                serde_json::from_str(trimmed).ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| panic!("no JSON response line found in stdout:\n{stdout}"))
+        .find_map(|(index, _)| serde_json::from_str(&trimmed[index..]).ok())
+        .unwrap_or_else(|| panic!("no JSON response object found in stdout:\n{stdout}"))
 }
 
 fn build_scenario_report(
@@ -887,10 +907,10 @@ fn scenario_report_json(report: &ScenarioReport) -> Value {
     })
 }
 
-fn assert_success(output: &Output) {
+fn assert_success(case_name: &str, output: &Output) {
     assert!(
         output.status.success(),
-        "stdout:\n{}\n\nstderr:\n{}",
+        "case: {case_name}\nstdout:\n{}\n\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

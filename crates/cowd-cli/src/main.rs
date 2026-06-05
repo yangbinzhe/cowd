@@ -101,12 +101,15 @@ fn adopt_daemon_child(child: Child) -> u32 {
     pid
 }
 
-/// Set up SIGCHLD handler to auto-reap child processes (prevent zombies).
+/// Keep daemon-child setup local to tracked child handles.
+///
+/// Do not install `SIGCHLD = SIG_IGN`: that makes unrelated tool subprocesses
+/// impossible to `wait` reliably and breaks bash/tool execution in one-shot
+/// runs. Zombie prevention is handled by retaining daemon handles and calling
+/// `reap_daemon_children`.
 #[cfg(unix)]
 fn setup_sigchld_handler() {
-    unsafe {
-        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
-    }
+    tracing::debug!("daemon child reaping uses retained child handles");
 }
 
 /// Try to reap any exited daemon children. Called periodically.
@@ -7213,7 +7216,7 @@ fn run_prompt(
     match loader.load() {
         Ok(cfg) => {
             let providers = cfg.providers().clone();
-            println!(
+            tracing::debug!(
                 "[init] merged providers count: {}",
                 providers.providers.len()
             );
@@ -7265,8 +7268,25 @@ fn run_prompt(
             }
         }
         CliOutputFormat::Json => {
+            let cost = summary.usage.estimate_cost_usd().total_cost_usd();
             let response = serde_json::json!({
+                "message": final_text,
                 "text": final_text,
+                "iterations": summary.iterations,
+                "tool_uses": collect_tool_uses(&summary),
+                "tool_results": collect_tool_results(&summary),
+                "prompt_cache_events": collect_prompt_cache_events(&summary),
+                "auto_compaction": summary.auto_compaction.as_ref().map(|event| json!({
+                    "removed_message_count": event.removed_message_count,
+                })),
+                "usage": {
+                    "input_tokens": summary.usage.input_tokens,
+                    "output_tokens": summary.usage.output_tokens,
+                    "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+                    "total_tokens": summary.usage.total_tokens(),
+                },
+                "estimated_cost": runtime::format_usd(cost),
                 "compact": compact,
             });
             println!("{}", serde_json::to_string_pretty(&response)?);
