@@ -12,38 +12,38 @@ use std::{
 };
 
 use axum::{
+    Router,
     body::Body,
     extract::{Path, Query, State as AxumState},
-    http::{header, Request, StatusCode},
+    http::{Request, StatusCode, header},
     middleware::{self, Next},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Json,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
-    Router,
 };
-use futures::stream::Stream;
 use futures::StreamExt;
+use futures::stream::Stream;
+use runtime::ApprovalConfig;
 use runtime::approval_gate::SmartApprovalGate;
 use runtime::permission_enforcer::{ApprovalPersistence, ApprovalVerdict};
-use runtime::ApprovalConfig;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use tokio_stream::wrappers::ReceiverStream;
 
-use tools::GlobalToolRegistry;
 use runtime::ProfileManager;
+use tools::GlobalToolRegistry;
 
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use crate::session_kernel::SessionKernel;
+use memory::MemoryScope;
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
 use memory::store::session::{SessionListOptions, SessionRecord};
 use memory::types::{MemoryCategory, MemoryLayer, Priority};
-use memory::MemoryScope;
 
 // ── Shared application state ───────────────────────────────────
 
@@ -65,9 +65,35 @@ pub struct AppState {
     pub profile_manager: Arc<ProfileManager>,
 }
 
+type RuntimeEntry = Arc<tokio::sync::Mutex<crate::BuiltRuntime>>;
+
 impl AppState {
+    fn unified_store(&self) -> Option<Arc<UnifiedSessionStore>> {
+        self.session_kernel.unified_store()
+    }
+
     fn event_bus(&self) -> Arc<SessionEventBus> {
         self.session_kernel.event_bus()
+    }
+
+    fn list_active_session_ids(&self) -> Vec<String> {
+        self.session_kernel.list_active_session_ids()
+    }
+
+    fn active_runtime(&self, session_id: &str) -> Option<RuntimeEntry> {
+        self.session_kernel.active_runtime(session_id)
+    }
+
+    fn register_runtime(
+        &self,
+        session_id: String,
+        runtime: crate::BuiltRuntime,
+    ) -> Result<Option<RuntimeEntry>, String> {
+        self.session_kernel.register_runtime(session_id, runtime)
+    }
+
+    fn remove_active_runtime(&self, session_id: &str) -> Option<RuntimeEntry> {
+        self.session_kernel.remove_active_runtime(session_id)
     }
 }
 
@@ -150,7 +176,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/tools", get(tools_handler))
         .route("/api/config", get(config_handler))
-        .route("/api/profiles", get(profiles_handler).post(create_profile_handler))
+        .route(
+            "/api/profiles",
+            get(profiles_handler).post(create_profile_handler),
+        )
         .route("/api/profiles/switch", post(switch_profile_handler))
         .route(
             "/api/profiles/:id",
@@ -364,12 +393,9 @@ fn default_config_home() -> PathBuf {
 
 fn path_has_safe_relative_components(path: &FsPath) -> bool {
     !path.is_absolute()
-        && path.components().all(|component| {
-            matches!(
-                component,
-                Component::Normal(_) | Component::CurDir
-            )
-        })
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 fn workspace_root_canonical(workspace_root: &FsPath) -> Result<PathBuf, String> {
@@ -649,7 +675,7 @@ async fn list_sessions(
     let offset = params.offset.unwrap_or(0);
 
     // Try unified store first for DB-backed listing
-    if let Some(ref store) = state.unified_store {
+    if let Some(store) = state.unified_store() {
         let page = store
             .list_sessions_page(&SessionListOptions {
                 query: params.q.as_deref(),
@@ -683,8 +709,7 @@ async fn list_sessions(
 
     // Fallback: in-memory active sessions
     let mut sessions: Vec<SessionInfo> = state
-        .sessions
-        .list()
+        .list_active_session_ids()
         .into_iter()
         .map(active_session_info)
         .collect();
@@ -740,7 +765,7 @@ async fn create_session(
     let model = body
         .model
         .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-    let runtime = if let Some(ref store) = state.unified_store {
+    let runtime = if let Some(store) = state.unified_store() {
         crate::build_runtime_with_session_store(
             store.clone(),
             session,
@@ -777,7 +802,7 @@ async fn create_session(
         )
     })?;
 
-    if let Err(e) = state.sessions.register(session_id.clone(), runtime) {
+    if let Err(e) = state.register_runtime(session_id.clone(), runtime) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -787,7 +812,7 @@ async fn create_session(
     }
 
     let mut info = active_session_info(session_id.clone());
-    if let Some(ref store) = state.unified_store {
+    if let Some(store) = state.unified_store() {
         let record = new_api_session_record(&session_id, Some(model));
         store.upsert_session(&record).await.map_err(|e| {
             (
@@ -807,7 +832,7 @@ async fn get_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if let Some(ref store) = state.unified_store {
+    if let Some(store) = state.unified_store() {
         match store.get_session(&id).await {
             Ok(Some(record)) => return Ok(Json(session_info_from_record(record))),
             Ok(None) => {}
@@ -822,7 +847,7 @@ async fn get_session(
         }
     }
 
-    if state.sessions.get(&id).is_some() {
+    if state.active_runtime(&id).is_some() {
         Ok(Json(active_session_info(id)))
     } else {
         Err((
@@ -838,9 +863,9 @@ async fn delete_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let removed_active = state.sessions.remove(&id).is_some();
+    let removed_active = state.remove_active_runtime(&id).is_some();
     let mut removed_stored = false;
-    if let Some(ref store) = state.unified_store {
+    if let Some(store) = state.unified_store() {
         match store.get_session(&id).await {
             Ok(Some(_)) => {
                 store.delete_session(&id).await.map_err(|e| {
@@ -911,7 +936,7 @@ async fn send_message(
     Path(id): Path<String>,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_entry = state.sessions.get(&id).ok_or_else(|| {
+    let runtime_entry = state.active_runtime(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -923,7 +948,7 @@ async fn send_message(
     tracing::info!(%id, content_len = body.content.len(), "API message received");
 
     let session_id = id.clone();
-    let event_bus = Arc::clone(&state.event_bus);
+    let event_bus = state.event_bus();
 
     // Phase 1b: Subscribe CowdEventBus → forward text/thinking/tool events to SessionEventBus
     {
@@ -932,7 +957,7 @@ async fn send_message(
             let mut rx = cowd_bus.subscribe();
             let eb = event_bus.clone();
             let sid = session_id.clone();
-            let store = state.unified_store.clone();
+            let store = state.unified_store();
             tokio::spawn(async move {
                 while let Ok(event) = rx.recv().await {
                     match event {
@@ -960,11 +985,7 @@ async fn send_message(
                                 .await;
                             }
                         }
-                        runtime::CowdEvent::ToolStart {
-                            id,
-                            name,
-                            preview,
-                        } => {
+                        runtime::CowdEvent::ToolStart { id, name, preview } => {
                             eb.tool_start(&sid, &id, &name).await;
                             if let Some(store) = store.as_ref() {
                                 append_session_timeline_event(
@@ -1013,13 +1034,8 @@ async fn send_message(
                             let json = serde_json::json!({"type":"TurnComplete","text":assistant_text,"iterations":iterations});
                             eb.broadcast(&sid, &json.to_string()).await;
                             if let Some(store) = store.as_ref() {
-                                append_session_timeline_event(
-                                    store,
-                                    &sid,
-                                    "TurnComplete",
-                                    json,
-                                )
-                                .await;
+                                append_session_timeline_event(store, &sid, "TurnComplete", json)
+                                    .await;
                             }
                         }
                         runtime::CowdEvent::TurnStarted => {
@@ -1034,11 +1050,10 @@ async fn send_message(
                             let json = serde_json::json!({"type":"TurnError","error":error});
                             eb.broadcast(&sid, &json.to_string()).await;
                             if let Some(store) = store.as_ref() {
-                                append_session_timeline_event(store, &sid, "TurnError", json)
-                                    .await;
+                                append_session_timeline_event(store, &sid, "TurnError", json).await;
                             }
                         }
-                        | runtime::CowdEvent::TokenUsage { .. }
+                        runtime::CowdEvent::TokenUsage { .. }
                         | runtime::CowdEvent::Warning { .. }
                         | runtime::CowdEvent::CompactionNotice { .. }
                         | _ => {}
@@ -1087,13 +1102,13 @@ async fn send_message(
                 })
                 .unwrap_or_default();
 
-            if let Some(ref store) = state.unified_store {
+            if let Some(store) = state.unified_store() {
                 let session_snapshot = {
                     let runtime_guard = runtime_entry.lock().await;
                     runtime_guard.session().clone()
                 };
                 if let Err(e) =
-                    sync_runtime_session_metadata_to_store(store, &session_id, &session_snapshot)
+                    sync_runtime_session_metadata_to_store(&store, &session_id, &session_snapshot)
                         .await
                 {
                     tracing::warn!(%session_id, error = %e, "failed to sync API session to SQLite");
@@ -1369,10 +1384,7 @@ async fn update_memory_entry_handler(
         .content
         .map(|content| content.trim().to_string())
         .filter(|content| !content.is_empty());
-    let priority = body
-        .priority
-        .as_deref()
-        .and_then(parse_memory_priority);
+    let priority = body.priority.as_deref().and_then(parse_memory_priority);
 
     if content.is_none() && body.tags.is_none() && priority.is_none() {
         return Err(api_error(
@@ -1615,7 +1627,10 @@ async fn create_profile_handler(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let name = body.name.trim();
     if name.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "profile name is required"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "profile name is required",
+        ));
     }
     let profile = state
         .profile_manager
@@ -1710,7 +1725,10 @@ async fn workspace_files_handler(
     let dir = resolve_existing_workspace_path(&state.workspace_root, params.dir.as_deref())
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
     if !dir.is_dir() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "path is not a directory"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "path is not a directory",
+        ));
     }
 
     let mut files = fs::read_dir(&dir)
@@ -1763,8 +1781,8 @@ async fn raw_workspace_file_handler(
     if !file.is_file() {
         return Err(api_error(StatusCode::BAD_REQUEST, "path is not a file"));
     }
-    let bytes = fs::read(&file)
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let bytes =
+        fs::read(&file).map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/octet-stream")],
@@ -1962,7 +1980,7 @@ async fn get_session_messages(
     let limit = params.limit.unwrap_or(50).min(500);
 
     // Try unified store for DB-backed pagination
-    if let Some(ref store) = state.unified_store {
+    if let Some(store) = state.unified_store() {
         let total = store.get_message_count(&id).await.unwrap_or(0);
         let db_messages = if let Some(seq) = from_seq {
             store
@@ -2018,7 +2036,7 @@ async fn get_session_messages(
     }
 
     // Fallback: in-memory session
-    let runtime_entry = state.sessions.get(&id).ok_or_else(|| {
+    let runtime_entry = state.active_runtime(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -2100,7 +2118,7 @@ async fn get_session_events(
     Path(id): Path<String>,
     Query(params): Query<GetEventsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = state.unified_store.as_ref().ok_or_else(|| {
+    let store = state.unified_store().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -2161,7 +2179,7 @@ async fn search_messages_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(params): Query<SearchMessagesParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = state.unified_store.as_ref().ok_or_else(|| {
+    let store = state.unified_store().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse {
@@ -2224,7 +2242,7 @@ async fn compact_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_entry = state.sessions.get(&id).ok_or_else(|| {
+    let runtime_entry = state.active_runtime(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -2243,8 +2261,8 @@ async fn compact_session_handler(
     let session_snapshot = runtime_guard.session().clone();
     drop(runtime_guard);
 
-    if let Some(store) = state.unified_store.as_ref() {
-        sync_runtime_session_metadata_to_store(store, &id, &session_snapshot)
+    if let Some(store) = state.unified_store() {
+        sync_runtime_session_metadata_to_store(&store, &id, &session_snapshot)
             .await
             .map_err(|e| {
                 tracing::error!(session_id = %id, error = %e, "failed to sync compacted session to unified store");
@@ -2273,7 +2291,7 @@ async fn get_session_stats_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_entry = state.sessions.get(&id).ok_or_else(|| {
+    let runtime_entry = state.active_runtime(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -2351,7 +2369,7 @@ async fn update_session_handler(
     let mut found = false;
 
     // Update active runtime if this session is currently loaded.
-    if let Some(runtime_entry) = state.sessions.get(&id) {
+    if let Some(runtime_entry) = state.active_runtime(&id) {
         found = true;
         let mut runtime_guard = runtime_entry.lock().await;
         let mut session = runtime_guard.session_mut_async().await;
@@ -2361,7 +2379,7 @@ async fn update_session_handler(
     }
 
     // Persist to UnifiedSessionStore if available (read-modify-write)
-    if let Some(ref store) = state.unified_store {
+    if let Some(store) = state.unified_store() {
         match store.get_session(&id).await {
             Ok(Some(mut record)) => {
                 found = true;
@@ -2570,8 +2588,8 @@ async fn sse_stream_handler(
 mod tests {
     use super::*;
     use axum::{
-        body::to_bytes,
         body::Body,
+        body::to_bytes,
         http::{Request, StatusCode},
     };
     use memory::config::{BudgetConfig, StoreConfig};
@@ -2580,10 +2598,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_profile_manager() -> Arc<ProfileManager> {
-        let dir = std::env::temp_dir().join(format!(
-            "cowd-api-profiles-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("cowd-api-profiles-{}", uuid::Uuid::new_v4()));
         let manager = Arc::new(ProfileManager::new_with_profiles_dir(dir));
         manager.initialize().unwrap();
         manager
@@ -2739,13 +2754,19 @@ mod tests {
             &state.session_kernel.active_sessions(),
             &state.sessions
         ));
-        assert!(Arc::ptr_eq(&state.session_kernel.event_bus(), &state.event_bus));
+        assert!(Arc::ptr_eq(
+            &state.session_kernel.event_bus(),
+            &state.event_bus
+        ));
         assert!(Arc::ptr_eq(
             &state
                 .session_kernel
                 .unified_store()
                 .expect("kernel store should exist"),
-            state.unified_store.as_ref().expect("compat store should exist")
+            state
+                .unified_store
+                .as_ref()
+                .expect("compat store should exist")
         ));
     }
 
@@ -2798,10 +2819,7 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["profile_id"], "enterprise");
-        assert_eq!(
-            json["workspace_root"],
-            workspace.display().to_string()
-        );
+        assert_eq!(json["workspace_root"], workspace.display().to_string());
 
         let files_response = app
             .oneshot(
@@ -3154,11 +3172,13 @@ mod tests {
             .unwrap()
             .expect("stored session");
         assert_eq!(record.model.as_deref(), Some("patched-model"));
-        assert!(record
-            .metadata_json
-            .as_deref()
-            .unwrap_or("")
-            .contains("Patch Session Title"));
+        assert!(
+            record
+                .metadata_json
+                .as_deref()
+                .unwrap_or("")
+                .contains("Patch Session Title")
+        );
     }
 
     #[tokio::test]
@@ -3447,10 +3467,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         let request_id = pending_json[0]["id"].as_str().unwrap().to_string();
-        assert!(pending_json[0]["command"]
-            .as_str()
-            .unwrap()
-            .contains("rm -rf"));
+        assert!(
+            pending_json[0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("rm -rf")
+        );
 
         let response = app
             .clone()
@@ -3637,7 +3659,8 @@ mod tests {
 
     #[tokio::test]
     async fn memory_entry_update_route_updates_real_store() {
-        let tmp = std::env::temp_dir().join(format!("cowd-api-memory-update-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("cowd-api-memory-update-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
             CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
