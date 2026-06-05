@@ -3,6 +3,7 @@ import { defineConfig } from '@playwright/test';
 export default defineConfig({
   testDir: '.',
   testMatch: ['*.e2e.spec.js'],
+  testIgnore: ['*.live.e2e.spec.js'],
   use: {
     baseURL: 'http://127.0.0.1:9241',
     serviceWorkers: 'block',
