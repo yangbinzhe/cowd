@@ -218,7 +218,12 @@ impl SessionSidebar {
         items.push("⬡ Full session".to_string());
 
         for entry in timeline.iter() {
-            if let TimelineEntry::Message { role, content, timestamp } = entry {
+            if let TimelineEntry::Message {
+                role,
+                content,
+                timestamp,
+            } = entry
+            {
                 if role == "user" {
                     let preview: String = content.chars().take(80).collect();
                     let preview = if content.len() > 80 {
@@ -302,12 +307,9 @@ impl Component for SessionSidebar {
                 }
             } else {
                 // Normal display
-                let ts = chrono::DateTime::from_timestamp(
-                    (session.updated_at_ms / 1000) as i64,
-                    0,
-                )
-                .map(|d| d.format("%m-%d %H:%M").to_string())
-                .unwrap_or_default();
+                let ts = chrono::DateTime::from_timestamp((session.updated_at_ms / 1000) as i64, 0)
+                    .map(|d| d.format("%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
 
                 let marker = if is_current { "*" } else { " " };
                 let prefix = if is_selected { "▸" } else { " " };
@@ -325,14 +327,10 @@ impl Component for SessionSidebar {
                         .bg(accent)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
                 }
             } else if is_current {
-                Style::default()
-                    .fg(accent)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(accent).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -349,8 +347,7 @@ impl Component for SessionSidebar {
             );
         } else {
             items.push(
-                ListItem::from(" j/k↓↑ Enter r d n f ")
-                    .style(Style::default().fg(Color::DarkGray)),
+                ListItem::from(" j/k↓↑ Enter r d n f ").style(Style::default().fg(Color::DarkGray)),
             );
         }
 
@@ -970,7 +967,11 @@ mod tests {
 
         let current = dm.current().unwrap();
         match &current.kind {
-            DialogKind::Select { title, items, selected } => {
+            DialogKind::Select {
+                title,
+                items,
+                selected,
+            } => {
                 assert_eq!(*selected, 0, "should start at index 0");
                 assert_eq!(title, " Fork session at… ", "dialog title");
 
@@ -1005,7 +1006,10 @@ mod tests {
         let result = sidebar.take_fork_result(&mut dm);
         assert_eq!(result, Some(None), "Full session → Some(None)");
         assert!(sidebar.pending_fork, "pending_fork should be true");
-        assert_eq!(sidebar.pending_fork_at, None, "pending_fork_at = None for full session");
+        assert_eq!(
+            sidebar.pending_fork_at, None,
+            "pending_fork_at = None for full session"
+        );
     }
 
     #[test]
@@ -1086,7 +1090,10 @@ mod tests {
         let result = sidebar.take_fork_result(&mut dm);
         assert_eq!(result, None, "cancel should return None");
         // pending_fork remains false since we cancelled
-        assert!(!sidebar.pending_fork, "cancelled fork should not set pending_fork");
+        assert!(
+            !sidebar.pending_fork,
+            "cancelled fork should not set pending_fork"
+        );
     }
 
     #[test]
@@ -1110,6 +1117,9 @@ mod tests {
         sidebar.load(sessions);
 
         assert!(!sidebar.pending_fork, "load should reset pending_fork");
-        assert_eq!(sidebar.pending_fork_at, None, "load should reset pending_fork_at");
+        assert_eq!(
+            sidebar.pending_fork_at, None,
+            "load should reset pending_fork_at"
+        );
     }
 }

@@ -263,11 +263,7 @@ impl TieredSessionStore {
     ///
     /// Pages are 0-indexed. Each page contains at most `page_size` messages.
     /// Returns an empty vector when past the last page.
-    pub async fn load_page(
-        &self,
-        session_id: &str,
-        page: usize,
-    ) -> Result<Vec<SessionMessage>> {
+    pub async fn load_page(&self, session_id: &str, page: usize) -> Result<Vec<SessionMessage>> {
         let offset = page * self.config.page_size;
         tracing::debug!(
             session_id,
@@ -338,17 +334,14 @@ impl TieredSessionStore {
             .map_err(|e| store_err(format!("cannot flush archive: {e}")))?;
 
         // 6. Delete all messages from SQLite (keep metadata)
-        self.store
-            .delete_messages_from(session_id, 0)
-            .await?;
+        self.store.delete_messages_from(session_id, 0).await?;
 
         // 7. Update session metadata — set message_count to 0 (we still
         //    have the metadata row) and record that it's archived.
-        let mut record = self
-            .store
-            .get_session(session_id)
-            .await?
-            .ok_or_else(|| store_err(format!("session vanished during archive: {session_id}")))?;
+        let mut record =
+            self.store.get_session(session_id).await?.ok_or_else(|| {
+                store_err(format!("session vanished during archive: {session_id}"))
+            })?;
 
         record.message_count = 0;
         let meta = serde_json::to_string(&serde_json::json!({
@@ -373,7 +366,10 @@ impl TieredSessionStore {
     /// Restore a cold-tier session by decompressing the archive and
     /// re-inserting messages into SQLite.
     pub async fn restore_session(&self, session_id: &str) -> Result<()> {
-        tracing::info!(session_id, "restore_session: decompressing from cold storage");
+        tracing::info!(
+            session_id,
+            "restore_session: decompressing from cold storage"
+        );
 
         let archive_file = self.archive_file_path(session_id);
 
@@ -418,9 +414,7 @@ impl TieredSessionStore {
             .store
             .get_session(session_id)
             .await?
-            .unwrap_or_else(|| {
-                unreachable!("session must exist if we were able to archive it")
-            });
+            .unwrap_or_else(|| unreachable!("session must exist if we were able to archive it"));
 
         record.message_count = message_count as i64;
         record.metadata_json = None; // clear archive metadata
@@ -429,11 +423,7 @@ impl TieredSessionStore {
         // 6. Remove archive file after successful restore
         let _ = fs::remove_file(&archive_file);
 
-        tracing::info!(
-            session_id,
-            message_count,
-            "restore_session: complete"
-        );
+        tracing::info!(session_id, message_count, "restore_session: complete");
         Ok(())
     }
 
@@ -443,9 +433,7 @@ impl TieredSessionStore {
 
     /// Build the path to a session's archive file.
     fn archive_file_path(&self, session_id: &str) -> PathBuf {
-        self.config
-            .archive_path
-            .join(format!("{session_id}.lz4"))
+        self.config.archive_path.join(format!("{session_id}.lz4"))
     }
 
     /// Compress bytes with lz4.
@@ -490,7 +478,11 @@ mod tests {
         }
     }
 
-    fn make_record(session_id: &str, message_count: i64, last_activity: &str) -> crate::store::session::SessionRecord {
+    fn make_record(
+        session_id: &str,
+        message_count: i64,
+        last_activity: &str,
+    ) -> crate::store::session::SessionRecord {
         crate::store::session::SessionRecord {
             session_id: session_id.to_string(),
             platform: "test".to_string(),
@@ -505,6 +497,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             estimated_cost_usd: 0.0,
+            status: "active".to_string(),
         }
     }
 
@@ -605,8 +598,14 @@ mod tests {
         // Verify content integrity
         let restored = store.get_all_messages("s-archive").await.unwrap();
         assert_eq!(restored.len(), 10);
-        assert_eq!(restored[0].content_json, r#"[{"type":"text","text":"message-0"}]"#);
-        assert_eq!(restored[9].content_json, r#"[{"type":"text","text":"message-9"}]"#);
+        assert_eq!(
+            restored[0].content_json,
+            r#"[{"type":"text","text":"message-0"}]"#
+        );
+        assert_eq!(
+            restored[9].content_json,
+            r#"[{"type":"text","text":"message-9"}]"#
+        );
     }
 
     #[tokio::test]

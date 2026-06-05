@@ -135,9 +135,7 @@ impl Default for GatewayPanel {
 impl Component for GatewayPanel {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         let title = self.build_title();
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL);
+        let block = Block::default().title(title).borders(Borders::ALL);
 
         let _inner_width = area.width.saturating_sub(2) as usize;
         let _inner_height = area.height.saturating_sub(2) as usize;
@@ -198,16 +196,16 @@ impl Component for GatewayPanel {
         lines.push(Line::from(""));
 
         let endpoints: [(&str, &str); 10] = [
-            ("GET  /health",                "Server health check"),
-            ("GET  /api/sessions",          "List sessions"),
-            ("POST /api/sessions",          "Create session"),
+            ("GET  /health", "Server health check"),
+            ("GET  /api/sessions", "List sessions"),
+            ("POST /api/sessions", "Create session"),
             ("POST /api/sessions/:id/msgs", "Send message"),
-            ("GET  /api/memory",            "Memory status"),
-            ("GET  /api/memory/stats",      "Memory statistics"),
-            ("GET  /api/memory/search",     "Search memory"),
-            ("GET  /api/config",            "View config"),
-            ("PUT  /api/config",            "Update config"),
-            ("GET  /api/platforms",         "List platforms"),
+            ("GET  /api/memory", "Memory status"),
+            ("GET  /api/memory/stats", "Memory statistics"),
+            ("GET  /api/memory/search", "Search memory"),
+            ("GET  /api/config", "View config"),
+            ("PUT  /api/config", "Update config"),
+            ("GET  /api/platforms", "List platforms"),
         ];
 
         for (endpoint, desc) in &endpoints {
@@ -229,10 +227,7 @@ impl Component for GatewayPanel {
 
             lines.push(Line::from(vec![
                 Span::styled(format!("{:4}", method), Style::default().fg(method_color)),
-                Span::styled(
-                    format!("{:25}", path),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(format!("{:25}", path), Style::default().fg(Color::White)),
                 Span::styled(format!(" — {desc}"), Style::default().fg(Color::DarkGray)),
             ]));
         }
@@ -360,7 +355,10 @@ mod tests {
         });
         let lines = terminal.buffer_lines();
         let joined = lines.join("\n");
-        assert!(joined.contains("STOPPED"), "Stopped state must show STOPPED, got: {joined}");
+        assert!(
+            joined.contains("STOPPED"),
+            "Stopped state must show STOPPED, got: {joined}"
+        );
     }
 
     #[test]
@@ -381,10 +379,22 @@ mod tests {
         });
         let lines = terminal.buffer_lines();
         let joined = lines.join("\n");
-        assert!(joined.contains("RUNNING"), "Running state must show RUNNING, got: {joined}");
-        assert!(joined.contains("Healthy"), "Should show health status, got: {joined}");
-        assert!(joined.contains("Uptime"), "Should show uptime, got: {joined}");
-        assert!(joined.contains("Sessions"), "Should show sessions, got: {joined}");
+        assert!(
+            joined.contains("RUNNING"),
+            "Running state must show RUNNING, got: {joined}"
+        );
+        assert!(
+            joined.contains("Healthy"),
+            "Should show health status, got: {joined}"
+        );
+        assert!(
+            joined.contains("Uptime"),
+            "Should show uptime, got: {joined}"
+        );
+        assert!(
+            joined.contains("Sessions"),
+            "Should show sessions, got: {joined}"
+        );
     }
 
     #[test]
@@ -401,11 +411,26 @@ mod tests {
         });
         let lines = terminal.buffer_lines();
         let joined = lines.join("\n");
-        assert!(joined.contains("/health"), "Should show /health endpoint, got: {joined}");
-        assert!(joined.contains("/api/sessions"), "Should show sessions endpoint, got: {joined}");
-        assert!(joined.contains("/api/memory"), "Should show memory endpoint, got: {joined}");
-        assert!(joined.contains("/api/config"), "Should show config endpoint, got: {joined}");
-        assert!(joined.contains("/api/platforms"), "Should show platforms endpoint, got: {joined}");
+        assert!(
+            joined.contains("/health"),
+            "Should show /health endpoint, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/sessions"),
+            "Should show sessions endpoint, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/memory"),
+            "Should show memory endpoint, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/config"),
+            "Should show config endpoint, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/platforms"),
+            "Should show platforms endpoint, got: {joined}"
+        );
     }
 
     #[test]
@@ -422,22 +447,40 @@ mod tests {
         });
         let lines = terminal.buffer_lines();
         let joined = lines.join("\n");
-        assert!(joined.contains("r refresh"), "Should show 'r refresh' hint, got: {joined}");
-        assert!(joined.contains("h health"), "Should show 'h health' hint, got: {joined}");
-        assert!(joined.contains("s start/stop"), "Should show 's start/stop' hint, got: {joined}");
+        assert!(
+            joined.contains("r refresh"),
+            "Should show 'r refresh' hint, got: {joined}"
+        );
+        assert!(
+            joined.contains("h health"),
+            "Should show 'h health' hint, got: {joined}"
+        );
+        assert!(
+            joined.contains("s start/stop"),
+            "Should show 's start/stop' hint, got: {joined}"
+        );
     }
 
     #[test]
     fn handle_event_consumes_known_keys() {
         let mut panel = GatewayPanel::new();
 
-        let press_r = Event::Key(KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE));
+        let press_r = Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         assert_eq!(panel.handle_event(&press_r), EventResult::Consumed);
 
-        let press_h = Event::Key(KeyEvent::new(KeyCode::Char('h'), crossterm::event::KeyModifiers::NONE));
+        let press_h = Event::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         assert_eq!(panel.handle_event(&press_h), EventResult::Consumed);
 
-        let press_s = Event::Key(KeyEvent::new(KeyCode::Char('s'), crossterm::event::KeyModifiers::NONE));
+        let press_s = Event::Key(KeyEvent::new(
+            KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         assert_eq!(panel.handle_event(&press_s), EventResult::Consumed);
     }
 
@@ -445,10 +488,16 @@ mod tests {
     fn handle_event_ignores_unknown_keys() {
         let mut panel = GatewayPanel::new();
 
-        let press_x = Event::Key(KeyEvent::new(KeyCode::Char('x'), crossterm::event::KeyModifiers::NONE));
+        let press_x = Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         assert_eq!(panel.handle_event(&press_x), EventResult::NotConsumed);
 
-        let press_tab = Event::Key(KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE));
+        let press_tab = Event::Key(KeyEvent::new(
+            KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         assert_eq!(panel.handle_event(&press_tab), EventResult::NotConsumed);
     }
 
@@ -456,7 +505,10 @@ mod tests {
     fn handle_event_ignores_release_events() {
         let mut panel = GatewayPanel::new();
 
-        let release_r = Event::Key(KeyEvent::new(KeyCode::Char('r'), crossterm::event::KeyModifiers::NONE));
+        let release_r = Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         // We can't easily create a KeyEventKind::Release with crossterm's new(),
         // so test the pattern via the press guard — already covered above.
         // This test validates the guard is present:

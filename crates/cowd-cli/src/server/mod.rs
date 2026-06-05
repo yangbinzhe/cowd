@@ -33,8 +33,12 @@ impl From<std::num::ParseIntError> for ServerError {
 // ── Service management ───────────────────────────────────────────
 
 pub fn pid_file() -> PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/tmp/cowd-{}", std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())));
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+        format!(
+            "/tmp/cowd-{}",
+            std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())
+        )
+    });
     let dir = PathBuf::from(runtime_dir);
     let _ = std::fs::create_dir_all(&dir);
     dir.join("cowd-serve.pid")
@@ -56,9 +60,7 @@ pub fn get_server_status() -> Result<Option<ServerInfo>, ServerError> {
         return Ok(None);
     }
 
-    let pid: u32 = fs::read_to_string(&pid_path)?
-        .trim()
-        .parse()?;
+    let pid: u32 = fs::read_to_string(&pid_path)?.trim().parse()?;
 
     if pid == 0 || !process_exists(pid) {
         fs::remove_file(&pid_path).ok();
@@ -68,10 +70,7 @@ pub fn get_server_status() -> Result<Option<ServerInfo>, ServerError> {
     let address = std::fs::read_to_string(addr_file())
         .unwrap_or_else(|_| "http://127.0.0.1:8642".to_string());
 
-    Ok(Some(ServerInfo {
-        pid,
-        address,
-    }))
+    Ok(Some(ServerInfo { pid, address }))
 }
 
 #[cfg(unix)]
@@ -103,5 +102,3 @@ pub fn stop_server() -> Result<(), ServerError> {
     }
     Ok(())
 }
-
-

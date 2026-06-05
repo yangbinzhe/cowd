@@ -404,7 +404,10 @@ diff --git a/a.rs b/a.rs
 
         let taken = rd.take_pending_revert();
         assert_eq!(taken, Some(3));
-        assert!(rd.pending_revert_to.is_none(), "Flag should be consumed after take");
+        assert!(
+            rd.pending_revert_to.is_none(),
+            "Flag should be consumed after take"
+        );
     }
 
     #[test]

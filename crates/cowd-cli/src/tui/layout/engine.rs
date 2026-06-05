@@ -59,7 +59,12 @@ impl TabBar {
             }
 
             let label_width = label.len() as u16;
-            let label_area = Rect::new(x, area.y, label_width.min(area.width.saturating_sub(x - area.x)), area.height);
+            let label_area = Rect::new(
+                x,
+                area.y,
+                label_width.min(area.width.saturating_sub(x - area.x)),
+                area.height,
+            );
 
             let style = if i == active {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
@@ -415,10 +420,10 @@ fn collect_focusable(node: &LayoutNode, chain: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::{Split, TabDef};
     use super::*;
     use crate::tui::components::{Component, EventResult, RenderContext};
     use crate::tui::test_utils::MockTerminal;
-    use super::super::types::{Split, TabDef};
     use ratatui::layout::Rect as RtRect;
 
     // ── Mock Component for Tests ──────────────────────────────────
@@ -661,9 +666,7 @@ mod tests {
         let lines = term.buffer_lines();
         let first_line = &lines[0];
         assert!(
-            first_line.contains('┌')
-                || first_line.contains('─')
-                || first_line.contains('┏'),
+            first_line.contains('┌') || first_line.contains('─') || first_line.contains('┏'),
             "Expected border chars in first line, got: {first_line:?}"
         );
     }
@@ -700,10 +703,7 @@ mod tests {
 
     #[test]
     fn focus_manager_cycles() {
-        let ids: Vec<String> = ["a", "b", "c", "d"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let ids: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
         let mut fm = FocusManager::new(ids);
 
         // Start at index 0 ("a")

@@ -19,10 +19,7 @@ use crate::tui::components::RenderContext;
 #[derive(Debug, Clone)]
 pub enum DialogKind {
     /// A simple alert that is dismissed by any key.
-    Alert {
-        title: String,
-        message: String,
-    },
+    Alert { title: String, message: String },
     /// A yes/no confirmation dialog with a configurable default.
     Confirm {
         title: String,
@@ -219,7 +216,9 @@ impl DialogManager {
                 _ => consumed = false,
             },
 
-            DialogKind::Select { items, selected, .. } => match event.code {
+            DialogKind::Select {
+                items, selected, ..
+            } => match event.code {
                 KeyCode::Up => {
                     *selected = selected.saturating_sub(1);
                 }
@@ -305,7 +304,8 @@ impl DialogManager {
                     match event.code {
                         KeyCode::Char('a' | 'A') => {
                             *action = "allow_once".to_string();
-                            self.stack[idx].result = Some(DialogResult::Ok("__approval_approved__".into()));
+                            self.stack[idx].result =
+                                Some(DialogResult::Ok("__approval_approved__".into()));
                             dismiss = true;
                         }
                         KeyCode::Char('l' | 'L') => {
@@ -318,7 +318,8 @@ impl DialogManager {
                             *showing_reject_input = true;
                         }
                         KeyCode::Esc => {
-                            self.stack[idx].result = Some(DialogResult::Ok("__approval_denied__".into()));
+                            self.stack[idx].result =
+                                Some(DialogResult::Ok("__approval_denied__".into()));
                             dismiss = true;
                         }
                         _ => consumed = false,
@@ -408,14 +409,15 @@ impl DialogManager {
         };
 
         let content_w = match &dialog.kind {
-            DialogKind::Alert { message, .. }
-            | DialogKind::Confirm { message, .. } => {
+            DialogKind::Alert { message, .. } | DialogKind::Confirm { message, .. } => {
                 message.lines().map(|l| l.len() as u16).max().unwrap_or(0)
             }
             DialogKind::Select { items, .. } => {
                 items.iter().map(|i| i.len() as u16).max().unwrap_or(0)
             }
-            DialogKind::Prompt { placeholder, input, .. } => {
+            DialogKind::Prompt {
+                placeholder, input, ..
+            } => {
                 // Prompt displays: "  <input>▊" or "  <placeholder>"
                 let visible = if input.is_empty() {
                     placeholder.len()
@@ -424,13 +426,13 @@ impl DialogManager {
                 };
                 (visible + 2) as u16 // +2 for "  " prefix
             }
-            DialogKind::Permission { input_preview, .. } => {
-                input_preview.len().max(50) as u16
-            }
+            DialogKind::Permission { input_preview, .. } => input_preview.len().max(50) as u16,
             DialogKind::RevertConfirm { files, .. } => {
                 let max_file_len = files
                     .iter()
-                    .map(|(fname, adds, dels)| fname.len() + 3 + format!("{adds}").len() + format!("{dels}").len())
+                    .map(|(fname, adds, dels)| {
+                        fname.len() + 3 + format!("{adds}").len() + format!("{dels}").len()
+                    })
                     .max()
                     .unwrap_or(0);
                 max_file_len.max(20) as u16
@@ -459,28 +461,19 @@ impl DialogManager {
             // Confirm: border(2) + title line + blank + message + blank + buttons
             DialogKind::Confirm { .. } => 7,
             // Select: border(2) + title + items + blank + hint
-            DialogKind::Select { items, .. } => {
-                (items.len() as u16 + 5).max(6)
-            }
+            DialogKind::Select { items, .. } => (items.len() as u16 + 5).max(6),
             // Prompt: border(2) + title + blank + input + blank + hint
             DialogKind::Prompt { .. } => 7,
             // Permission: border(2) + title + preview + blank + 3 buttons + hint + spare
             DialogKind::Permission { .. } => 10,
             // RevertConfirm: border(2) + title + blank + "Files changed:" + blank + file lines + blank + buttons
-            DialogKind::RevertConfirm { files, .. } => {
-                (files.len() as u16 + 8).max(7)
-            }
+            DialogKind::RevertConfirm { files, .. } => (files.len() as u16 + 8).max(7),
         }
     }
 
     // ── per-kind render helpers ────────────────────────────────────
 
-    fn render_kind(
-        frame: &mut Frame,
-        rect: Rect,
-        dialog: &DialogState,
-        accent: Color,
-    ) {
+    fn render_kind(frame: &mut Frame, rect: Rect, dialog: &DialogState, accent: Color) {
         match &dialog.kind {
             DialogKind::Alert { title, message } => {
                 let block = Block::default()
@@ -500,9 +493,7 @@ impl DialogManager {
                     Line::from(hint),
                 ]);
 
-                let p = Paragraph::new(text)
-                    .block(block)
-                    .centered();
+                let p = Paragraph::new(text).block(block).centered();
 
                 frame.render_widget(p, rect);
             }
@@ -541,9 +532,7 @@ impl DialogManager {
                     buttons,
                 ]);
 
-                let p = Paragraph::new(text)
-                    .block(block)
-                    .centered();
+                let p = Paragraph::new(text).block(block).centered();
 
                 frame.render_widget(p, rect);
             }
@@ -605,10 +594,7 @@ impl DialogManager {
                         Style::default().fg(Color::DarkGray),
                     )
                 } else {
-                    Span::styled(
-                        format!("  {}▊", input),
-                        Style::default(),
-                    )
+                    Span::styled(format!("  {}▊", input), Style::default())
                 };
 
                 let hint = Span::styled(
@@ -648,15 +634,9 @@ impl DialogManager {
                         Span::raw("  "),
                         Span::styled(filename.to_string(), Style::default()),
                         Span::raw("  "),
-                        Span::styled(
-                            format!("+{adds}"),
-                            Style::default().fg(Color::Green),
-                        ),
+                        Span::styled(format!("+{adds}"), Style::default().fg(Color::Green)),
                         Span::raw(" "),
-                        Span::styled(
-                            format!("-{dels}"),
-                            Style::default().fg(Color::Red),
-                        ),
+                        Span::styled(format!("-{dels}"), Style::default().fg(Color::Red)),
                     ]);
                     text_lines.push(line);
                 }
@@ -703,10 +683,7 @@ impl DialogManager {
                             Style::default().fg(Color::DarkGray),
                         )
                     } else {
-                        Span::styled(
-                            format!("  {}▊", reject_input_buffer),
-                            Style::default(),
-                        )
+                        Span::styled(format!("  {}▊", reject_input_buffer), Style::default())
                     };
 
                     let hint = Span::styled(
@@ -752,10 +729,7 @@ impl DialogManager {
                             Style::default().fg(Color::Black).bg(Color::Green),
                         ),
                         Span::raw("  "),
-                        Span::styled(
-                            " [L] Always ",
-                            Style::default().fg(Color::Black).bg(accent),
-                        ),
+                        Span::styled(" [L] Always ", Style::default().fg(Color::Black).bg(accent)),
                         Span::raw("  "),
                         Span::styled(
                             " [R] Reject ",
@@ -779,9 +753,7 @@ impl DialogManager {
                         Line::from(hint),
                     ]);
 
-                    let p = Paragraph::new(text)
-                        .block(block)
-                        .centered();
+                    let p = Paragraph::new(text).block(block).centered();
                     frame.render_widget(p, rect);
                 }
             }
@@ -793,7 +765,10 @@ impl DialogManager {
 
 /// Create a `ratatui::Terminal<TestBackend>` for render tests.
 #[cfg(test)]
-pub(crate) fn test_terminal(width: u16, height: u16) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+pub(crate) fn test_terminal(
+    width: u16,
+    height: u16,
+) -> ratatui::Terminal<ratatui::backend::TestBackend> {
     let backend = ratatui::backend::TestBackend::new(width, height);
     ratatui::Terminal::new(backend).expect("TestBackend terminal creation never fails")
 }
@@ -809,10 +784,10 @@ pub(crate) fn test_theme() -> crate::tui::skin::SkinConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
     use crate::tui::components::RenderContext;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
+    use crossterm::event::KeyModifiers;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -939,7 +914,10 @@ mod tests {
 
         // Start at 0, press Down → 1
         assert!(mgr.handle_key(&key(KeyCode::Down)));
-        let current = match mgr.current() { Some(c) => c, None => { return } };
+        let current = match mgr.current() {
+            Some(c) => c,
+            None => return,
+        };
         assert_eq!(
             match &current.kind {
                 DialogKind::Select { selected, .. } => *selected,
@@ -950,7 +928,10 @@ mod tests {
 
         // Press Down → 2
         assert!(mgr.handle_key(&key(KeyCode::Down)));
-        let current = match mgr.current() { Some(c) => c, None => { return } };
+        let current = match mgr.current() {
+            Some(c) => c,
+            None => return,
+        };
         assert_eq!(
             match &current.kind {
                 DialogKind::Select { selected, .. } => *selected,
@@ -961,7 +942,10 @@ mod tests {
 
         // Press Down again → stays at 2 (clamped)
         assert!(mgr.handle_key(&key(KeyCode::Down)));
-        let current = match mgr.current() { Some(c) => c, None => { return } };
+        let current = match mgr.current() {
+            Some(c) => c,
+            None => return,
+        };
         assert_eq!(
             match &current.kind {
                 DialogKind::Select { selected, .. } => *selected,
@@ -972,7 +956,10 @@ mod tests {
 
         // Press Up → 1
         assert!(mgr.handle_key(&key(KeyCode::Up)));
-        let current = match mgr.current() { Some(c) => c, None => { return } };
+        let current = match mgr.current() {
+            Some(c) => c,
+            None => return,
+        };
         assert_eq!(
             match &current.kind {
                 DialogKind::Select { selected, .. } => *selected,
@@ -1067,7 +1054,10 @@ mod tests {
         mgr.handle_key(&key(KeyCode::Char('i')));
 
         // Verify input was accumulated
-        let current = match mgr.current() { Some(c) => c, None => { return } };
+        let current = match mgr.current() {
+            Some(c) => c,
+            None => return,
+        };
         match &current.kind {
             DialogKind::Prompt { input, .. } => assert_eq!(input, "hi"),
             _ => unreachable!(),
@@ -1109,7 +1099,10 @@ mod tests {
         mgr.handle_key(&key(KeyCode::Char('a')));
         mgr.handle_key(&key(KeyCode::Char('b')));
         mgr.handle_key(&key(KeyCode::Char('c')));
-        let current = match mgr.current() { Some(c) => c, None => { return } };
+        let current = match mgr.current() {
+            Some(c) => c,
+            None => return,
+        };
         assert_eq!(
             match &current.kind {
                 DialogKind::Prompt { input, .. } => input.as_str(),
@@ -1119,7 +1112,10 @@ mod tests {
         );
 
         mgr.handle_key(&key(KeyCode::Backspace));
-        let current = match mgr.current() { Some(c) => c, None => { return } };
+        let current = match mgr.current() {
+            Some(c) => c,
+            None => return,
+        };
         assert_eq!(
             match &current.kind {
                 DialogKind::Prompt { input, .. } => input.as_str(),
@@ -1178,7 +1174,10 @@ mod tests {
             state.height = 20;
         }
 
-        let current = match mgr.current() { Some(c) => c, None => { return } };
+        let current = match mgr.current() {
+            Some(c) => c,
+            None => return,
+        };
         assert_eq!(current.width, 80);
         assert_eq!(current.height, 20);
     }
@@ -1240,7 +1239,10 @@ mod tests {
 
         terminal.assert_line_contains("Test");
         let lines = terminal.buffer_lines();
-        assert!(!lines.iter().all(|l| l.is_empty()), "Backdrop should render content");
+        assert!(
+            !lines.iter().all(|l| l.is_empty()),
+            "Backdrop should render content"
+        );
     }
 
     #[test]
@@ -1283,10 +1285,16 @@ mod tests {
         });
 
         let lines = terminal.buffer_lines();
-        let border_line = lines.iter().position(|l| l.contains("Wide Dialog Test")).unwrap_or(8);
+        let border_line = lines
+            .iter()
+            .position(|l| l.contains("Wide Dialog Test"))
+            .unwrap_or(8);
         let line = &lines[border_line];
         let left_border = line.find('┌').expect("Should find '┌' border");
-        assert!(left_border > 0, "Dialog not centered, left_border={left_border}");
+        assert!(
+            left_border > 0,
+            "Dialog not centered, left_border={left_border}"
+        );
 
         // Find '┐' within reasonable bounds: scan chars up to left + max_allowed + margin
         let chars: Vec<char> = line.chars().collect();
@@ -1338,7 +1346,10 @@ mod tests {
 
         let lines = terminal.buffer_lines();
         let has_selected_marker = lines.iter().any(|l| l.contains("▶ Beta"));
-        assert!(has_selected_marker, "Selected item 'Beta' should have ▶ prefix");
+        assert!(
+            has_selected_marker,
+            "Selected item 'Beta' should have ▶ prefix"
+        );
     }
 
     #[test]
@@ -1440,7 +1451,10 @@ mod tests {
         let mut terminal = MockTerminal::new(80, 24);
         let theme = SkinConfig::default();
         let mut mgr = DialogManager::new();
-        mgr.push(make_permission("edit", "diff --git a/src/main.rs b/src/main.rs"));
+        mgr.push(make_permission(
+            "edit",
+            "diff --git a/src/main.rs b/src/main.rs",
+        ));
 
         terminal.draw(|f: &mut Frame| {
             let area = f.area();
@@ -1465,7 +1479,10 @@ mod tests {
         assert!(mgr.is_empty(), "Dialog should be dismissed");
 
         let result = mgr.take_last_dismissed_result();
-        assert_eq!(result, Some(DialogResult::Ok("__approval_approved__".into())));
+        assert_eq!(
+            result,
+            Some(DialogResult::Ok("__approval_approved__".into()))
+        );
     }
 
     #[test]
@@ -1493,9 +1510,15 @@ mod tests {
         assert!(!mgr.is_empty(), "Dialog should stay open for reason input");
 
         // Verify we're in reject-input mode
-        let current = match mgr.current() { Some(c) => c, None => { return } };
+        let current = match mgr.current() {
+            Some(c) => c,
+            None => return,
+        };
         match &current.kind {
-            DialogKind::Permission { showing_reject_input, .. } => {
+            DialogKind::Permission {
+                showing_reject_input,
+                ..
+            } => {
                 assert!(*showing_reject_input, "Should be in reject-input mode");
             }
             _ => panic!("expected Permission"),
@@ -1512,7 +1535,10 @@ mod tests {
         // Submit
         let consumed2 = mgr.handle_key(&key(KeyCode::Enter));
         assert!(consumed2, "Submit reason should be consumed");
-        assert!(mgr.is_empty(), "Dialog should be dismissed after reason submit");
+        assert!(
+            mgr.is_empty(),
+            "Dialog should be dismissed after reason submit"
+        );
 
         let result = mgr.take_last_dismissed_result();
         assert_eq!(
@@ -1543,9 +1569,15 @@ mod tests {
 
         // Enter reject mode
         mgr.handle_key(&key(KeyCode::Char('r')));
-        let current = match mgr.current() { Some(c) => c, None => { return } };
+        let current = match mgr.current() {
+            Some(c) => c,
+            None => return,
+        };
         match &current.kind {
-            DialogKind::Permission { showing_reject_input, .. } => {
+            DialogKind::Permission {
+                showing_reject_input,
+                ..
+            } => {
                 assert!(*showing_reject_input);
             }
             _ => panic!("expected Permission"),
@@ -1559,9 +1591,16 @@ mod tests {
         assert!(consumed);
         assert!(!mgr.is_empty(), "Dialog should still be open");
 
-        let current = match mgr.current() { Some(c) => c, None => { return } };
+        let current = match mgr.current() {
+            Some(c) => c,
+            None => return,
+        };
         match &current.kind {
-            DialogKind::Permission { showing_reject_input, reject_input_buffer, .. } => {
+            DialogKind::Permission {
+                showing_reject_input,
+                reject_input_buffer,
+                ..
+            } => {
                 assert!(!*showing_reject_input, "Should be back in main view");
                 assert!(reject_input_buffer.is_empty(), "Buffer should be cleared");
             }

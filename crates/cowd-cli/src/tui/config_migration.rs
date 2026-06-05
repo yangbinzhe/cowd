@@ -24,14 +24,9 @@ pub enum MigrationResult {
         backup_path: PathBuf,
     },
     /// No skin.yaml found (fresh install or already migrated).
-    NothingToMigrate {
-        skin_path: PathBuf,
-    },
+    NothingToMigrate { skin_path: PathBuf },
     /// Migration failed with an error message.
-    Failed {
-        skin_path: PathBuf,
-        error: String,
-    },
+    Failed { skin_path: PathBuf, error: String },
 }
 
 /// A human-readable migration report.
@@ -45,7 +40,11 @@ impl MigrationReport {
     /// Format a console-friendly migration summary.
     pub fn format(&self) -> String {
         match &self.result {
-            MigrationResult::Migrated { skin_path, theme_path, backup_path } => {
+            MigrationResult::Migrated {
+                skin_path,
+                theme_path,
+                backup_path,
+            } => {
                 format!(
                     "╔══ Config Migration ═══════════════════════════╗\n\
                      ║ TUI config upgraded to v{version}\n\
@@ -151,8 +150,8 @@ impl ConfigMigrator {
             .map_err(|e| format!("cannot read {}: {e}", skin_path.display()))?;
 
         // 2. Parse skin config
-        let skin: crate::tui::skin::SkinConfig = serde_yaml::from_str(&yaml_content)
-            .map_err(|e| format!("invalid skin.yaml: {e}"))?;
+        let skin: crate::tui::skin::SkinConfig =
+            serde_yaml::from_str(&yaml_content).map_err(|e| format!("invalid skin.yaml: {e}"))?;
 
         // 3. Convert to theme format
         let theme_yaml = Self::skin_to_theme_yaml(&skin);
@@ -217,8 +216,7 @@ mod tests {
 
     #[test]
     fn nothing_to_migrate_when_no_skin_yaml() {
-        let tmp = std::env::temp_dir()
-            .join(format!("cowd-migrate-empty-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("cowd-migrate-empty-{}", std::process::id()));
         let _ = fs::create_dir_all(&tmp);
 
         // Create a fake .cowd dir in tmp without skin.yaml

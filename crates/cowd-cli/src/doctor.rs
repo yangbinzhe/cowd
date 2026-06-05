@@ -1,10 +1,10 @@
-use std::env;
-use serde_json::{json, Map, Value};
-use runtime::{ConfigLoader, ProjectContext};
-use crate::{CliOutputFormat, StatusContext, DEFAULT_DATE,
-    parse_git_status_metadata, parse_git_workspace_summary, resolve_sandbox_status,
-    checks,
+use crate::{
+    checks, parse_git_status_metadata, parse_git_workspace_summary, resolve_sandbox_status,
+    CliOutputFormat, StatusContext, DEFAULT_DATE,
 };
+use runtime::{ConfigLoader, ProjectContext};
+use serde_json::{json, Map, Value};
+use std::env;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiagnosticLevel {
@@ -37,7 +37,11 @@ pub(crate) struct DiagnosticCheck {
 }
 
 impl DiagnosticCheck {
-    pub(crate) fn new(name: &'static str, level: DiagnosticLevel, summary: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        name: &'static str,
+        level: DiagnosticLevel,
+        summary: impl Into<String>,
+    ) -> Self {
         Self {
             name,
             level,
@@ -193,6 +197,7 @@ pub(crate) fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error:
             checks::check_workspace_health(&context),
             checks::check_sandbox_health(&context.sandbox_status),
             checks::check_system_health(&cwd, config.as_ref().ok()),
+            checks::check_enterprise_readiness(&cwd, config.as_ref()),
         ],
     })
 }

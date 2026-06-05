@@ -146,12 +146,7 @@ impl KeyMap {
     }
 
     /// Add a keybinding without a modal scope.
-    pub fn add(
-        &mut self,
-        chord: KeyChord,
-        action: Action,
-        description: &'static str,
-    ) {
+    pub fn add(&mut self, chord: KeyChord, action: Action, description: &'static str) {
         self.bindings.push(KeyBinding {
             chord,
             action,

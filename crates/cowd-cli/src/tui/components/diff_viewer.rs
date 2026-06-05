@@ -195,9 +195,18 @@ impl DiffViewer {
 
         // Only load if we found diff content and it's different from current
         if !diff_text.is_empty() {
-            let current_text = self.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
+            let current_text = self
+                .files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
             let parsed = parse_unified_diff(&diff_text);
-            let new_text = parsed.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(",");
+            let new_text = parsed
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
             if current_text != new_text {
                 self.files = parsed;
                 self.selected_file = 0;
@@ -256,10 +265,7 @@ impl DiffViewer {
 
     /// Toggle reviewed state for the currently selected file.
     pub fn toggle_reviewed_selected(&mut self) {
-        let path = self
-            .files
-            .get(self.selected_file)
-            .map(|f| f.path.clone());
+        let path = self.files.get(self.selected_file).map(|f| f.path.clone());
         if let Some(p) = path {
             self.toggle_reviewed(&p);
         }
@@ -422,7 +428,12 @@ impl DiffViewer {
                         )
                     }
                 } else if is_reviewed {
-                    Line::styled(label, Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM))
+                    Line::styled(
+                        label,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    )
                 } else {
                     Line::styled(label, Style::default().fg(Color::Gray))
                 }
@@ -491,7 +502,8 @@ impl DiffViewer {
 
         let content_height = lines.len() as u16;
         let max_scroll = content_height.saturating_sub(area.height);
-        self.render_scroll_indicator(ctx, area, content_height); let _ = max_scroll;
+        self.render_scroll_indicator(ctx, area, content_height);
+        let _ = max_scroll;
 
         let paragraph = Paragraph::new(Text::from(display));
         ctx.frame_mut().render_widget(paragraph, area);
@@ -546,7 +558,10 @@ impl DiffViewer {
                 // Prepend the "+" prefix in white on green
                 let mut spans = vec![Span::styled(
                     "+".to_string(),
-                    Style::default().fg(Color::Green).bg(bg).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
                 )];
                 spans.extend(highlight_spans);
                 Line::from(spans)
@@ -556,7 +571,10 @@ impl DiffViewer {
                 let highlight_spans = highlight_code_line(&hl.content, lang, bg);
                 let mut spans = vec![Span::styled(
                     "-".to_string(),
-                    Style::default().fg(Color::Red).bg(bg).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Red)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
                 )];
                 spans.extend(highlight_spans);
                 Line::from(spans)
@@ -570,7 +588,9 @@ impl DiffViewer {
             }
             LineKind::Header => Line::styled(
                 truncate_to_width(&display, 200),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
         }
     }
@@ -702,7 +722,10 @@ impl DiffViewer {
                     LineKind::Header => {
                         // Should not normally see Header inside a hunk
                         let display = truncate_to_width(&hl.content, 80);
-                        old_lines.push(Line::styled(display.clone(), Style::default().fg(Color::Cyan)));
+                        old_lines.push(Line::styled(
+                            display.clone(),
+                            Style::default().fg(Color::Cyan),
+                        ));
                         new_lines.push(Line::styled(display, Style::default().fg(Color::Cyan)));
                     }
                 }
@@ -730,10 +753,9 @@ impl DiffViewer {
         }
 
         // Thumb position
-        let thumb_size = (bar_height as f64 * area.height as f64 / content_height as f64)
-            .max(1.0) as u16;
-        let thumb_start =
-            (scroll_pct * (bar_height - thumb_size) as f64) as u16;
+        let thumb_size =
+            (bar_height as f64 * area.height as f64 / content_height as f64).max(1.0) as u16;
+        let thumb_start = (scroll_pct * (bar_height - thumb_size) as f64) as u16;
 
         for i in 0..bar_height {
             let ch = if i >= thumb_start && i < thumb_start + thumb_size {
@@ -754,9 +776,7 @@ impl DiffViewer {
         };
         let span = Span::styled(
             help_text,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray),
+            Style::default().fg(Color::Black).bg(Color::DarkGray),
         );
         let block = Block::default().style(Style::default().bg(Color::DarkGray));
         let paragraph = Paragraph::new(Line::from(span)).block(block);
@@ -792,9 +812,7 @@ impl Component for DiffViewer {
 
     fn handle_event(&mut self, event: &Event) -> EventResult {
         match event {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                self.handle_key(key)
-            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
             _ => EventResult::NotConsumed,
         }
     }
@@ -1176,7 +1194,8 @@ fn truncate_middle(path: &str, max_width: usize) -> String {
     let keep_back = max_width.saturating_sub(keep_front + 1);
     let front: String = path.chars().take(keep_front).collect();
     let back_len = path.chars().count();
-    let back: String = path.chars()
+    let back: String = path
+        .chars()
         .skip(back_len.saturating_sub(keep_back))
         .take(keep_back)
         .collect();
@@ -1507,7 +1526,10 @@ mod tests {
         let mut viewer = DiffViewer::new("Test");
         viewer.load(simple_diff());
 
-        let event = Event::Key(KeyEvent::new(KeyCode::Char('t'), crossterm::event::KeyModifiers::NONE));
+        let event = Event::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         let result = viewer.handle_event(&event);
         assert!(result.is_consumed());
         assert_eq!(viewer.mode(), DiffMode::Split);
@@ -1524,7 +1546,10 @@ mod tests {
         viewer.load(simple_diff());
         viewer.select_next_file(); // already at 0, file count=1
 
-        let event = Event::Key(KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE));
+        let event = Event::Key(KeyEvent::new(
+            KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         let result = viewer.handle_event(&event);
         assert!(result.is_consumed());
         // With single hunk, wraps to 0
@@ -1536,8 +1561,14 @@ mod tests {
         let mut viewer = DiffViewer::new("Test");
         viewer.load(multi_file_diff());
 
-        let j = Event::Key(KeyEvent::new(KeyCode::Char('j'), crossterm::event::KeyModifiers::NONE));
-        let k = Event::Key(KeyEvent::new(KeyCode::Char('k'), crossterm::event::KeyModifiers::NONE));
+        let j = Event::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let k = Event::Key(KeyEvent::new(
+            KeyCode::Char('k'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
 
         assert_eq!(viewer.selected_file_index(), 0);
         viewer.handle_event(&j);
@@ -1704,7 +1735,10 @@ mod tests {
         viewer.load(simple_diff());
 
         // Press 'm' to mark currently selected file as reviewed
-        let event = Event::Key(KeyEvent::new(KeyCode::Char('m'), crossterm::event::KeyModifiers::NONE));
+        let event = Event::Key(KeyEvent::new(
+            KeyCode::Char('m'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         let result = viewer.handle_event(&event);
         assert!(result.is_consumed(), "'m' key should be consumed");
         assert!(viewer.is_reviewed("src/main.rs"));

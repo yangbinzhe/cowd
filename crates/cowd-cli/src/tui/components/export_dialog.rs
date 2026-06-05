@@ -83,11 +83,7 @@ impl ExportDialog {
     }
 
     fn prev_focus(&mut self) {
-        self.focus = if self.focus == 0 {
-            3
-        } else {
-            self.focus - 1
-        };
+        self.focus = if self.focus == 0 { 3 } else { self.focus - 1 };
     }
 
     fn toggle_current(&mut self) {
@@ -130,7 +126,8 @@ impl Component for ExportDialog {
         // Backdrop
         ctx.frame_mut().render_widget(Clear, area);
         let dim_bg = Style::default().bg(Color::Rgb(20, 20, 20));
-        ctx.frame_mut().render_widget(Paragraph::new("").style(dim_bg), area);
+        ctx.frame_mut()
+            .render_widget(Paragraph::new("").style(dim_bg), area);
 
         // Compute dialog rect (centered)
         let w = 50u16.min(area.width.saturating_sub(4));
@@ -150,7 +147,10 @@ impl Component for ExportDialog {
 
         // Filename row
         let filename_label = if self.focus == 0 {
-            Span::styled(" Filename: ", Style::default().fg(accent).add_modifier(Modifier::BOLD))
+            Span::styled(
+                " Filename: ",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            )
         } else {
             Span::styled(" Filename: ", Style::default().fg(Color::Gray))
         };
@@ -176,9 +176,10 @@ impl Component for ExportDialog {
             } else {
                 Style::default().fg(Color::Gray)
             };
-            Line::from(vec![
-                Span::styled(format!("{}{} {}", prefix, checkbox, label), style),
-            ])
+            Line::from(vec![Span::styled(
+                format!("{}{} {}", prefix, checkbox, label),
+                style,
+            )])
         };
 
         let items = vec![
@@ -297,10 +298,19 @@ mod tests {
 
         assert!(joined.contains("Export Options"), "Should show title");
         assert!(joined.contains("Filename"), "Should show filename label");
-        assert!(joined.contains("session.md"), "Should show default filename");
-        assert!(joined.contains("Include thinking"), "Should show thinking option");
+        assert!(
+            joined.contains("session.md"),
+            "Should show default filename"
+        );
+        assert!(
+            joined.contains("Include thinking"),
+            "Should show thinking option"
+        );
         assert!(joined.contains("Include tools"), "Should show tools option");
-        assert!(joined.contains("Include metadata"), "Should show metadata option");
+        assert!(
+            joined.contains("Include metadata"),
+            "Should show metadata option"
+        );
     }
 
     // ── Test: toggle_changes_state ────────────────────────────────────

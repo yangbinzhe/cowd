@@ -251,13 +251,28 @@ mod tests {
     fn compute_style_all_known_contexts_return_some_style() {
         let engine = ThemeEngine::new_dark();
         let contexts = [
-            "heading1", "heading2", "heading3", "heading4", "heading5", "heading6",
-            "code_block", "inline_code",
-            "tool_status_running", "tool_status_done", "tool_status_error",
-            "diff_add", "diff_del",
-            "search_highlight", "border_focused", "border_unfocused",
-            "agent_planner", "agent_executor", "agent_reviewer",
-            "agent_idle", "agent_busy", "agent_offline",
+            "heading1",
+            "heading2",
+            "heading3",
+            "heading4",
+            "heading5",
+            "heading6",
+            "code_block",
+            "inline_code",
+            "tool_status_running",
+            "tool_status_done",
+            "tool_status_error",
+            "diff_add",
+            "diff_del",
+            "search_highlight",
+            "border_focused",
+            "border_unfocused",
+            "agent_planner",
+            "agent_executor",
+            "agent_reviewer",
+            "agent_idle",
+            "agent_busy",
+            "agent_offline",
         ];
         for ctx in &contexts {
             let style = engine.compute_style(ctx);
@@ -302,8 +317,7 @@ mod tests {
 
     #[test]
     fn load_from_yaml() {
-        let tmp = std::env::temp_dir()
-            .join(format!("cowd-engine-load-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("cowd-engine-load-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let path = tmp.join("theme.yaml");
 
@@ -337,8 +351,7 @@ colors:
 
     #[test]
     fn hot_reload_detects_change() {
-        let tmp = std::env::temp_dir()
-            .join(format!("cowd-engine-hot-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("cowd-engine-hot-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let path = tmp.join("theme.yaml");
 
@@ -387,17 +400,11 @@ colors:
         }
 
         // hot_reload should detect the change
-        assert!(
-            engine.hot_reload(),
-            "should detect file modification"
-        );
+        assert!(engine.hot_reload(), "should detect file modification");
         assert_eq!(engine.theme.name, "updated");
 
         // Second call with no change should return false
-        assert!(
-            !engine.hot_reload(),
-            "should not reload on unchanged file"
-        );
+        assert!(!engine.hot_reload(), "should not reload on unchanged file");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -410,8 +417,7 @@ colors:
 
     #[test]
     fn hot_reload_preserves_old_theme_on_bad_yaml() {
-        let tmp = std::env::temp_dir()
-            .join(format!("cowd-engine-bad-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("cowd-engine-bad-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let path = tmp.join("theme.yaml");
 

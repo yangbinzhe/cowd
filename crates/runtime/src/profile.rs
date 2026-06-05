@@ -8,10 +8,14 @@
 //! Profiles are stored under `~/.cowd/profiles/{id}/`.
 //! A "default" profile is always present.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
+
+const ACTIVE_PROFILE_FILE: &str = "active_profile";
+const PROFILE_META_FILE: &str = "profile.json";
 
 /// Metadata for a single profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,12 +81,21 @@ pub struct ProfileManager {
 impl ProfileManager {
     /// Create a new ProfileManager rooted at `~/.cowd/profiles/`.
     pub fn new(home_dir: &Path) -> Self {
-        let profiles_dir = home_dir.join(".cowd").join("profiles");
-        let active = if profiles_dir.join("default").exists() {
-            "default".to_string()
-        } else {
-            "default".to_string()
-        };
+        Self::new_with_profiles_dir(home_dir.join(".cowd").join("profiles"))
+    }
+
+    /// Create a manager rooted at an already-resolved config home.
+    ///
+    /// This is the preferred constructor for daemons/tests that already use
+    /// `COWD_CONFIG_HOME`, because `new(home)` assumes a user home and appends
+    /// `.cowd/profiles`.
+    pub fn from_config_home(config_home: &Path) -> Self {
+        Self::new_with_profiles_dir(config_home.join("profiles"))
+    }
+
+    /// Create a manager rooted at an explicit profiles directory.
+    pub fn new_with_profiles_dir(profiles_dir: PathBuf) -> Self {
+        let active = read_active_profile_id(&profiles_dir).unwrap_or_else(|| "default".to_string());
         Self {
             profiles_dir,
             active_profile: RwLock::new(active),
@@ -97,12 +110,16 @@ impl ProfileManager {
             self.create_profile("default")
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         }
+        if read_active_profile_id(&self.profiles_dir).is_none() {
+            self.persist_active_profile("default")
+                .map_err(std::io::Error::other)?;
+        }
         Ok(())
     }
 
     /// Create a new profile with the given name.
     pub fn create_profile(&self, name: &str) -> Result<Profile, String> {
-        let id = name.to_lowercase().replace(' ', "_");
+        let id = sanitize_profile_id(name);
         let profile = Profile {
             id: id.clone(),
             name: name.to_string(),
@@ -128,6 +145,14 @@ impl ProfileManager {
         let perms_content = "# Default permissions for this profile\npermission_mode: workspace_write\n";
         std::fs::write(profile.permissions_path(), perms_content)
             .map_err(|e| format!("Failed to write permissions: {}", e))?;
+
+        let meta = ProfileMeta {
+            id: id.clone(),
+            name: name.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            is_active: false,
+        };
+        write_profile_meta(&profile, &meta)?;
 
         Ok(profile)
     }
@@ -160,13 +185,20 @@ impl ProfileManager {
                         .unwrap_or_default();
 
                     let is_active = id == active;
-
-                    result.push(ProfileMeta {
+                    let profile = Profile {
                         id: id.clone(),
-                        name: id, // Simplified; could read from config.yaml
+                        name: id.clone(),
+                        base_dir: path,
+                    };
+                    let mut meta = read_profile_meta(&profile).unwrap_or(ProfileMeta {
+                        id: id.clone(),
+                        name: id.clone(),
                         created_at,
                         is_active,
                     });
+                    meta.id = id;
+                    meta.is_active = is_active;
+                    result.push(meta);
                 }
             }
         }
@@ -185,14 +217,18 @@ impl ProfileManager {
 
     /// Get a specific profile by name.
     pub fn get_profile(&self, name: &str) -> Option<Profile> {
-        let id = name.to_lowercase().replace(' ', "_");
+        let id = sanitize_profile_id(name);
         let base_dir = self.profiles_dir.join(&id);
         if base_dir.exists() {
-            Some(Profile {
+            let profile = Profile {
                 id,
                 name: name.to_string(),
                 base_dir,
-            })
+            };
+            let name = read_profile_meta(&profile)
+                .map(|meta| meta.name)
+                .unwrap_or_else(|| profile.name.clone());
+            Some(Profile { name, ..profile })
         } else {
             None
         }
@@ -220,12 +256,13 @@ impl ProfileManager {
             poisoned.into_inner()
         });
         *active = profile.id.clone();
+        self.persist_active_profile(&profile.id)?;
         Ok(())
     }
 
     /// Delete a profile (cannot delete the default or active profile).
     pub fn delete_profile(&self, name: &str) -> Result<(), String> {
-        let id = name.to_lowercase().replace(' ', "_");
+        let id = sanitize_profile_id(name);
 
         if id == "default" {
             return Err("Cannot delete the default profile".to_string());
@@ -264,6 +301,57 @@ impl ProfileManager {
             poisoned.into_inner()
         }).clone()
     }
+
+    /// Return the underlying profiles directory.
+    pub fn profiles_dir(&self) -> &Path {
+        &self.profiles_dir
+    }
+
+    fn persist_active_profile(&self, id: &str) -> Result<(), String> {
+        fs::create_dir_all(&self.profiles_dir)
+            .map_err(|e| format!("Failed to create profiles dir: {e}"))?;
+        fs::write(self.profiles_dir.join(ACTIVE_PROFILE_FILE), id)
+            .map_err(|e| format!("Failed to persist active profile: {e}"))
+    }
+}
+
+fn sanitize_profile_id(name: &str) -> String {
+    let mut id = String::new();
+    let mut last_was_sep = false;
+    for ch in name.trim().to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            id.push(ch);
+            last_was_sep = false;
+        } else if matches!(ch, '-' | '_' | ' ') && !last_was_sep {
+            id.push('_');
+            last_was_sep = true;
+        }
+    }
+    let id = id.trim_matches('_').to_string();
+    if id.is_empty() {
+        "profile".to_string()
+    } else {
+        id
+    }
+}
+
+fn read_active_profile_id(profiles_dir: &Path) -> Option<String> {
+    fs::read_to_string(profiles_dir.join(ACTIVE_PROFILE_FILE))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_profile_meta(profile: &Profile) -> Option<ProfileMeta> {
+    let raw = fs::read_to_string(profile.base_dir.join(PROFILE_META_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_profile_meta(profile: &Profile, meta: &ProfileMeta) -> Result<(), String> {
+    let raw = serde_json::to_string_pretty(meta)
+        .map_err(|e| format!("Failed to serialize profile metadata: {e}"))?;
+    fs::write(profile.base_dir.join(PROFILE_META_FILE), raw)
+        .map_err(|e| format!("Failed to write profile metadata: {e}"))
 }
 
 #[cfg(test)]
@@ -301,6 +389,22 @@ mod tests {
 
         mgr.switch_profile("personal").unwrap();
         assert_eq!(mgr.active_profile().id, "personal");
+    }
+
+    #[test]
+    fn active_profile_persists_across_managers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = ProfileManager::from_config_home(tmp.path());
+        mgr.initialize().unwrap();
+        mgr.create_profile("Enterprise Ops").unwrap();
+        mgr.switch_profile("enterprise_ops").unwrap();
+
+        let reopened = ProfileManager::from_config_home(tmp.path());
+        reopened.initialize().unwrap();
+
+        assert_eq!(reopened.active_id(), "enterprise_ops");
+        let profiles = reopened.list_profiles();
+        assert!(profiles.iter().any(|p| p.id == "enterprise_ops" && p.name == "Enterprise Ops" && p.is_active));
     }
 
     #[test]

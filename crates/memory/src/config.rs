@@ -31,11 +31,21 @@ pub struct BudgetConfig {
     pub critical_threshold: f32,
 }
 
-fn default_context_window() -> u64 { 200_000 }
-fn default_reserved_system() -> u64 { 10_000 }
-fn default_reserved_response() -> u64 { 8_000 }
-fn default_warning_threshold() -> f32 { 0.70 }
-fn default_critical_threshold() -> f32 { 0.90 }
+fn default_context_window() -> u64 {
+    200_000
+}
+fn default_reserved_system() -> u64 {
+    10_000
+}
+fn default_reserved_response() -> u64 {
+    8_000
+}
+fn default_warning_threshold() -> f32 {
+    0.70
+}
+fn default_critical_threshold() -> f32 {
+    0.90
+}
 
 impl Default for BudgetConfig {
     fn default() -> Self {
@@ -101,11 +111,21 @@ pub struct DriftConfig {
     pub low_priority_prune_threshold: f32,
 }
 
-fn default_decay() -> f32 { 0.02 }
-fn default_review_threshold() -> f32 { 0.7 }
-fn default_prune_threshold() -> f32 { 0.95 }
-fn default_jaccard_threshold() -> f32 { 0.6 }
-fn default_low_priority_prune_threshold() -> f32 { 0.8 }
+fn default_decay() -> f32 {
+    0.02
+}
+fn default_review_threshold() -> f32 {
+    0.7
+}
+fn default_prune_threshold() -> f32 {
+    0.95
+}
+fn default_jaccard_threshold() -> f32 {
+    0.6
+}
+fn default_low_priority_prune_threshold() -> f32 {
+    0.8
+}
 
 impl Default for DriftConfig {
     fn default() -> Self {
@@ -130,13 +150,23 @@ pub struct PerfBudget {
     pub warn_threshold_pct: f64,
 }
 
-fn default_hook_max_ms() -> u64 { 500 }
-fn default_inject_max_ms() -> u64 { 100 }
-fn default_warn_threshold_pct() -> f64 { 0.8 }
+fn default_hook_max_ms() -> u64 {
+    500
+}
+fn default_inject_max_ms() -> u64 {
+    100
+}
+fn default_warn_threshold_pct() -> f64 {
+    0.8
+}
 
 impl Default for PerfBudget {
     fn default() -> Self {
-        Self { hook_max_ms: 500, inject_max_ms: 100, warn_threshold_pct: 0.8 }
+        Self {
+            hook_max_ms: 500,
+            inject_max_ms: 100,
+            warn_threshold_pct: 0.8,
+        }
     }
 }
 
@@ -172,65 +202,99 @@ impl ModelProfile {
     /// Find or create a profile for a given model name.
     pub fn for_model(model_name: &str) -> Self {
         let name_lower = model_name.to_lowercase();
-        if name_lower.contains("haiku") || name_lower.contains("flash")
-            || name_lower.contains("04-mini") || name_lower.contains("gpt-3.5-turbo")
+        if name_lower.contains("haiku")
+            || name_lower.contains("flash")
+            || name_lower.contains("04-mini")
+            || name_lower.contains("gpt-3.5-turbo")
         {
             if name_lower.contains("gpt-3.5-turbo") {
                 Self {
-                    model_name: model_name.to_string(), context_window: 16_385,
-                    memory_budget_ratio: 0.15, warning_threshold: 0.50,
-                    critical_threshold: 0.75, micro_threshold: 20,
-                    session_threshold: 4, compression_aggressiveness: 0.75,
+                    model_name: model_name.to_string(),
+                    context_window: 16_385,
+                    memory_budget_ratio: 0.15,
+                    warning_threshold: 0.50,
+                    critical_threshold: 0.75,
+                    micro_threshold: 20,
+                    session_threshold: 4,
+                    compression_aggressiveness: 0.75,
                 }
             } else {
                 Self {
-                    model_name: model_name.to_string(), context_window: 8_192,
-                    memory_budget_ratio: 0.10, warning_threshold: 0.40,
-                    critical_threshold: 0.65, micro_threshold: 10,
-                    session_threshold: 2, compression_aggressiveness: 0.85,
+                    model_name: model_name.to_string(),
+                    context_window: 8_192,
+                    memory_budget_ratio: 0.10,
+                    warning_threshold: 0.40,
+                    critical_threshold: 0.65,
+                    micro_threshold: 10,
+                    session_threshold: 2,
+                    compression_aggressiveness: 0.85,
                 }
             }
         } else if name_lower.contains("claude-3-5-sonnet") || name_lower.contains("claude-3.5") {
             Self {
-                model_name: model_name.to_string(), context_window: 200_000,
-                memory_budget_ratio: 0.35, warning_threshold: 0.70,
-                critical_threshold: 0.90, micro_threshold: 50,
-                session_threshold: 10, compression_aggressiveness: 0.5,
+                model_name: model_name.to_string(),
+                context_window: 200_000,
+                memory_budget_ratio: 0.35,
+                warning_threshold: 0.70,
+                critical_threshold: 0.90,
+                micro_threshold: 50,
+                session_threshold: 10,
+                compression_aggressiveness: 0.5,
             }
         } else if name_lower.contains("claude-3-opus") {
             Self {
-                model_name: model_name.to_string(), context_window: 200_000,
-                memory_budget_ratio: 0.35, warning_threshold: 0.70,
-                critical_threshold: 0.90, micro_threshold: 50,
-                session_threshold: 10, compression_aggressiveness: 0.5,
+                model_name: model_name.to_string(),
+                context_window: 200_000,
+                memory_budget_ratio: 0.35,
+                warning_threshold: 0.70,
+                critical_threshold: 0.90,
+                micro_threshold: 50,
+                session_threshold: 10,
+                compression_aggressiveness: 0.5,
             }
         } else if name_lower.contains("claude") {
             Self {
-                model_name: model_name.to_string(), context_window: 200_000,
-                memory_budget_ratio: 0.35, warning_threshold: 0.70,
-                critical_threshold: 0.90, micro_threshold: 50,
-                session_threshold: 10, compression_aggressiveness: 0.5,
+                model_name: model_name.to_string(),
+                context_window: 200_000,
+                memory_budget_ratio: 0.35,
+                warning_threshold: 0.70,
+                critical_threshold: 0.90,
+                micro_threshold: 50,
+                session_threshold: 10,
+                compression_aggressiveness: 0.5,
             }
         } else if name_lower.contains("gpt-4o") {
             Self {
-                model_name: model_name.to_string(), context_window: 128_000,
-                memory_budget_ratio: 0.30, warning_threshold: 0.70,
-                critical_threshold: 0.88, micro_threshold: 45,
-                session_threshold: 9, compression_aggressiveness: 0.55,
+                model_name: model_name.to_string(),
+                context_window: 128_000,
+                memory_budget_ratio: 0.30,
+                warning_threshold: 0.70,
+                critical_threshold: 0.88,
+                micro_threshold: 45,
+                session_threshold: 9,
+                compression_aggressiveness: 0.55,
             }
         } else if name_lower.contains("o1-preview") || name_lower.contains("o1-mini") {
             Self {
-                model_name: model_name.to_string(), context_window: 128_000,
-                memory_budget_ratio: 0.20, warning_threshold: 0.60,
-                critical_threshold: 0.80, micro_threshold: 30,
-                session_threshold: 6, compression_aggressiveness: 0.7,
+                model_name: model_name.to_string(),
+                context_window: 128_000,
+                memory_budget_ratio: 0.20,
+                warning_threshold: 0.60,
+                critical_threshold: 0.80,
+                micro_threshold: 30,
+                session_threshold: 6,
+                compression_aggressiveness: 0.7,
             }
         } else if name_lower.contains("gpt-4") {
             Self {
-                model_name: model_name.to_string(), context_window: 128_000,
-                memory_budget_ratio: 0.25, warning_threshold: 0.65,
-                critical_threshold: 0.85, micro_threshold: 40,
-                session_threshold: 8, compression_aggressiveness: 0.6,
+                model_name: model_name.to_string(),
+                context_window: 128_000,
+                memory_budget_ratio: 0.25,
+                warning_threshold: 0.65,
+                critical_threshold: 0.85,
+                micro_threshold: 40,
+                session_threshold: 8,
+                compression_aggressiveness: 0.6,
             }
         } else {
             let mut profile = Self::default();
@@ -278,7 +342,9 @@ impl LlmSummarizerConfig {
     }
 }
 
-fn default_llm_model() -> String { "gpt-4o-mini".to_string() }
+fn default_llm_model() -> String {
+    "gpt-4o-mini".to_string()
+}
 
 impl Eq for LlmSummarizerConfig {}
 
@@ -335,21 +401,47 @@ pub struct TuningConfig {
     /// TTL in seconds for the L2 (project) layer cache (default: 300 = 5min).
     #[serde(default = "default_l2_cache_ttl")]
     pub l2_cache_ttl_secs: u64,
+    /// TTL in milliseconds for the whole `prepare_context` request cache.
+    #[serde(default = "default_prepare_context_cache_ttl_ms")]
+    pub prepare_context_cache_ttl_ms: u64,
     /// Whether L4 push (session → permanent) is enabled.
     #[serde(default = "default_true")]
     pub l4_push_enabled: bool,
 }
 
-fn default_sandbox_min_lines() -> usize { 2000 }
-fn default_rebuild_confidence() -> f32 { 0.3 }
-fn default_freshness_trigger() -> f32 { 0.8 }
-fn default_closet_rebuild_ticks() -> u32 { 10 }
-fn default_audit_truncate_len() -> usize { 120 }
-fn default_prefetch_hot_topics() -> usize { 5 }
-fn default_l0_cache_ttl() -> u64 { 86400 }
-fn default_l1_cache_ttl() -> u64 { 3600 }
-fn default_l2_cache_ttl() -> u64 { 300 }
-fn default_true() -> bool { true }
+fn default_sandbox_min_lines() -> usize {
+    2000
+}
+fn default_rebuild_confidence() -> f32 {
+    0.3
+}
+fn default_freshness_trigger() -> f32 {
+    0.8
+}
+fn default_closet_rebuild_ticks() -> u32 {
+    10
+}
+fn default_audit_truncate_len() -> usize {
+    120
+}
+fn default_prefetch_hot_topics() -> usize {
+    5
+}
+fn default_l0_cache_ttl() -> u64 {
+    86400
+}
+fn default_l1_cache_ttl() -> u64 {
+    3600
+}
+fn default_l2_cache_ttl() -> u64 {
+    300
+}
+fn default_prepare_context_cache_ttl_ms() -> u64 {
+    500
+}
+fn default_true() -> bool {
+    true
+}
 
 impl Default for TuningConfig {
     fn default() -> Self {
@@ -363,6 +455,7 @@ impl Default for TuningConfig {
             l0_cache_ttl_secs: 86400,
             l1_cache_ttl_secs: 3600,
             l2_cache_ttl_secs: 300,
+            prepare_context_cache_ttl_ms: 500,
             l4_push_enabled: true,
         }
     }
@@ -544,11 +637,15 @@ pub struct BudgetCalculator {
 impl BudgetCalculator {
     pub fn new(config: BudgetConfig) -> Self {
         let profile = ModelProfile::for_model(&config.context_window.to_string());
-        Self { config, model_profile: profile }
+        Self {
+            config,
+            model_profile: profile,
+        }
     }
 
     pub fn base_available(&self) -> u64 {
-        self.config.context_window
+        self.config
+            .context_window
             .saturating_sub(self.config.reserved_system)
             .saturating_sub(self.config.reserved_response)
     }
@@ -721,8 +818,7 @@ mod tests {
 
     #[test]
     fn test_memory_config_with_model() {
-        let config = MemoryConfig::default()
-            .with_model_profile("gpt-4o");
+        let config = MemoryConfig::default().with_model_profile("gpt-4o");
 
         assert_eq!(config.budget.context_window, 128_000);
         assert_eq!(config.compression.micro_threshold, 45);
@@ -730,8 +826,7 @@ mod tests {
 
     #[test]
     fn test_recommended_memory_budget() {
-        let config = MemoryConfig::default()
-            .with_model_profile("claude-3-5-sonnet-20241022");
+        let config = MemoryConfig::default().with_model_profile("claude-3-5-sonnet-20241022");
 
         let budget = config.recommended_memory_budget();
         assert!(budget > 60000 && budget < 65000);
@@ -791,6 +886,10 @@ mod tests {
         let calc = BudgetCalculator::new(BudgetConfig::default());
         let base = calc.base_available();
         let _ = calc.memory_budget();
-        assert_eq!(calc.base_available(), base, "base_available must not change");
+        assert_eq!(
+            calc.base_available(),
+            base,
+            "base_available must not change"
+        );
     }
 }

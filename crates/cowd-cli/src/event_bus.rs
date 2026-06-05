@@ -37,11 +37,15 @@ impl SessionEventBus {
     /// Uses channel identity (same_channel) to match senders, since the
     /// sender passed to `subscribe` is moved into the subscriber list.
     pub async fn unsubscribe(&self, session_id: &str, tx: &EventSender) {
-        if let Some(txs) = self.listeners.write().await.get_mut(session_id) {
+        let mut listeners = self.listeners.write().await;
+        let should_remove = if let Some(txs) = listeners.get_mut(session_id) {
             txs.retain(|t| !t.same_channel(tx));
-            if txs.is_empty() {
-                self.listeners.write().await.remove(session_id);
-            }
+            txs.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            listeners.remove(session_id);
         }
     }
 
@@ -58,7 +62,11 @@ impl SessionEventBus {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // Skip slow consumer — don't block the producer
-                        tracing::warn!(session_id, consumer_index = i, "SSE consumer slow, skipping event");
+                        tracing::warn!(
+                            session_id,
+                            consumer_index = i,
+                            "SSE consumer slow, skipping event"
+                        );
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         dead_indices.push(i);
@@ -68,13 +76,17 @@ impl SessionEventBus {
             // Clean up dead connections
             if !dead_indices.is_empty() {
                 drop(listeners);
-                if let Some(txs) = self.listeners.write().await.get_mut(session_id) {
+                let mut listeners = self.listeners.write().await;
+                let should_remove = if let Some(txs) = listeners.get_mut(session_id) {
                     for &i in dead_indices.iter().rev() {
                         txs.remove(i);
                     }
-                    if txs.is_empty() {
-                        self.listeners.write().await.remove(session_id);
-                    }
+                    txs.is_empty()
+                } else {
+                    false
+                };
+                if should_remove {
+                    listeners.remove(session_id);
                 }
             }
         }
@@ -138,5 +150,42 @@ impl SessionEventBus {
             "exit_code": exit_code,
         });
         self.broadcast(session_id, &json.to_string()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionEventBus;
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn unsubscribe_removes_empty_session_without_deadlock() {
+        let bus = SessionEventBus::new();
+        let (tx, _rx) = mpsc::channel(1);
+        bus.subscribe("session-a", tx.clone()).await;
+
+        timeout(
+            Duration::from_millis(200),
+            bus.unsubscribe("session-a", &tx),
+        )
+        .await
+        .expect("unsubscribe should not deadlock");
+
+        assert!(!bus.listeners.read().await.contains_key("session-a"));
+    }
+
+    #[tokio::test]
+    async fn broadcast_cleans_closed_listener_without_deadlock() {
+        let bus = SessionEventBus::new();
+        let (tx, rx) = mpsc::channel(1);
+        bus.subscribe("session-a", tx).await;
+        drop(rx);
+
+        timeout(Duration::from_millis(200), bus.broadcast("session-a", "{}"))
+            .await
+            .expect("broadcast cleanup should not deadlock");
+
+        assert!(!bus.listeners.read().await.contains_key("session-a"));
     }
 }

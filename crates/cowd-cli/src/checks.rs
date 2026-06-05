@@ -1,13 +1,15 @@
 use std::env;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
-use runtime::{ConfigLoader, load_oauth_credentials};
-use crate::{StatusContext,
-    VERSION, BUILD_TARGET, GIT_SHA,
-    OFFICIAL_REPO_URL, OFFICIAL_REPO_SLUG, DEPRECATED_INSTALL_COMMAND,
+use runtime::{load_oauth_credentials, ConfigLoader};
+
+use crate::{
     doctor::{DiagnosticCheck, DiagnosticLevel},
+    StatusContext, BUILD_TARGET, DEPRECATED_INSTALL_COMMAND, GIT_SHA, OFFICIAL_REPO_SLUG,
+    OFFICIAL_REPO_URL, VERSION,
 };
 #[allow(clippy::too_many_lines)]
 pub(crate) fn check_auth_health() -> DiagnosticCheck {
@@ -373,7 +375,10 @@ pub(crate) fn check_sandbox_health(status: &runtime::SandboxStatus) -> Diagnosti
     ]))
 }
 
-pub(crate) fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
+pub(crate) fn check_system_health(
+    cwd: &Path,
+    config: Option<&runtime::RuntimeConfig>,
+) -> DiagnosticCheck {
     let default_model = config.and_then(runtime::RuntimeConfig::model);
     let mut details = vec![
         format!("OS               {} {}", env::consts::OS, env::consts::ARCH),
@@ -399,5 +404,216 @@ pub(crate) fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeCo
         ("build_target".to_string(), json!(BUILD_TARGET)),
         ("git_sha".to_string(), json!(GIT_SHA)),
         ("default_model".to_string(), json!(default_model)),
+    ]))
+}
+
+pub(crate) fn check_enterprise_readiness(
+    cwd: &Path,
+    config: Result<&runtime::RuntimeConfig, &runtime::ConfigError>,
+) -> DiagnosticCheck {
+    let mut details = Vec::new();
+    let mut components = Map::new();
+    let mut warn_count = 0usize;
+    let mut fail_count = 0usize;
+
+    let mut push_component =
+        |name: &'static str, status: DiagnosticLevel, summary: String, data: Map<String, Value>| {
+            if status == DiagnosticLevel::Warn {
+                warn_count += 1;
+            } else if status == DiagnosticLevel::Fail {
+                fail_count += 1;
+            }
+            details.push(format!("{:<16} {:<5} {}", name, status.label(), summary));
+            let mut value = Map::from_iter([
+                ("status".to_string(), json!(status.label())),
+                ("summary".to_string(), json!(summary)),
+            ]);
+            value.extend(data);
+            components.insert(name.to_string(), Value::Object(value));
+        };
+
+    match config {
+        Ok(runtime_config) => {
+            let webui_index = cwd.join("webui").join("index.html");
+            let webui_modules = [
+                "api.js",
+                "boot.js",
+                "commands.js",
+                "messages.js",
+                "panels.js",
+                "sessions.js",
+                "state.js",
+                "ui.js",
+                "workspace.js",
+            ];
+            let missing_webui_modules = webui_modules
+                .iter()
+                .filter(|name| !cwd.join("webui").join(name).exists())
+                .copied()
+                .collect::<Vec<_>>();
+            let webui_ok = webui_index.exists() && missing_webui_modules.is_empty();
+            push_component(
+                "webui",
+                if webui_ok {
+                    DiagnosticLevel::Ok
+                } else {
+                    DiagnosticLevel::Warn
+                },
+                if webui_ok {
+                    "static WebUI assets are present".to_string()
+                } else {
+                    "static WebUI assets are incomplete from this cwd".to_string()
+                },
+                Map::from_iter([
+                    ("index_present".to_string(), json!(webui_index.exists())),
+                    ("missing_modules".to_string(), json!(missing_webui_modules)),
+                ]),
+            );
+
+            push_component(
+                "tui",
+                DiagnosticLevel::Ok,
+                "TUI command path is compiled into the CLI".to_string(),
+                Map::from_iter([
+                    ("compiled".to_string(), json!(true)),
+                    (
+                        "terminal_detected".to_string(),
+                        json!(std::io::stdout().is_terminal()),
+                    ),
+                ]),
+            );
+
+            let config_home = runtime::cowd_dirs::config_home_dir();
+            let session_db = config_home.join("sessions.db");
+            let session_parent = session_db
+                .parent()
+                .map(|path| path.exists())
+                .unwrap_or(false);
+            push_component(
+                "session",
+                if session_parent {
+                    DiagnosticLevel::Ok
+                } else {
+                    DiagnosticLevel::Warn
+                },
+                if session_parent {
+                    "session store parent directory is available".to_string()
+                } else {
+                    "session store parent directory does not exist yet".to_string()
+                },
+                Map::from_iter([
+                    (
+                        "config_home".to_string(),
+                        json!(config_home.display().to_string()),
+                    ),
+                    (
+                        "session_db".to_string(),
+                        json!(session_db.display().to_string()),
+                    ),
+                    ("session_db_exists".to_string(), json!(session_db.exists())),
+                ]),
+            );
+
+            let memory = runtime_config.memory();
+            let memory_store_path = memory
+                .store_path
+                .clone()
+                .unwrap_or_else(|| config_home.join("memory"));
+            push_component(
+                "memory",
+                if memory.enabled {
+                    DiagnosticLevel::Ok
+                } else {
+                    DiagnosticLevel::Warn
+                },
+                if memory.enabled {
+                    "memory framework is enabled".to_string()
+                } else {
+                    "memory framework is disabled".to_string()
+                },
+                Map::from_iter([
+                    ("enabled".to_string(), json!(memory.enabled)),
+                    (
+                        "store_path".to_string(),
+                        json!(memory_store_path.display().to_string()),
+                    ),
+                    ("vector_enabled".to_string(), json!(memory.vector.enabled)),
+                    (
+                        "aaak_index_enabled".to_string(),
+                        json!(memory.aaak_index_enabled),
+                    ),
+                ]),
+            );
+
+            let provider_env = env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty())
+                || env::var("ANTHROPIC_AUTH_TOKEN")
+                    .ok()
+                    .is_some_and(|v| !v.trim().is_empty())
+                || env::var("OPENAI_API_KEY")
+                    .ok()
+                    .is_some_and(|v| !v.trim().is_empty());
+            let providers = runtime_config.providers();
+            let resolved_model = runtime_config.model();
+            let model_provider = resolved_model.and_then(|model| providers.resolve_full(model));
+            let provider_ready = provider_env || model_provider.is_some() || !providers.is_empty();
+            push_component(
+                "provider",
+                if provider_ready {
+                    DiagnosticLevel::Ok
+                } else {
+                    DiagnosticLevel::Warn
+                },
+                if provider_ready {
+                    "provider credentials or provider mappings are configured".to_string()
+                } else {
+                    "no provider credentials or provider mappings detected".to_string()
+                },
+                Map::from_iter([
+                    ("env_credentials_present".to_string(), json!(provider_env)),
+                    (
+                        "configured_providers".to_string(),
+                        json!(providers.providers.len()),
+                    ),
+                    ("resolved_model".to_string(), json!(resolved_model)),
+                    (
+                        "resolved_provider".to_string(),
+                        json!(model_provider.map(|provider| provider.name.clone())),
+                    ),
+                ]),
+            );
+        }
+        Err(error) => {
+            push_component(
+                "config",
+                DiagnosticLevel::Fail,
+                format!("runtime config failed to load: {error}"),
+                Map::from_iter([("load_error".to_string(), json!(error.to_string()))]),
+            );
+        }
+    }
+
+    let level = if fail_count > 0 {
+        DiagnosticLevel::Fail
+    } else if warn_count > 0 {
+        DiagnosticLevel::Warn
+    } else {
+        DiagnosticLevel::Ok
+    };
+    DiagnosticCheck::new(
+        "Enterprise readiness",
+        level,
+        match level {
+            DiagnosticLevel::Ok => "all enterprise entrypoints have local readiness signals",
+            DiagnosticLevel::Warn => "enterprise readiness has non-blocking gaps",
+            DiagnosticLevel::Fail => "enterprise readiness has blocking failures",
+        },
+    )
+    .with_details(details)
+    .with_data(Map::from_iter([
+        ("components".to_string(), Value::Object(components)),
+        ("component_warnings".to_string(), json!(warn_count)),
+        ("component_failures".to_string(), json!(fail_count)),
     ]))
 }

@@ -119,21 +119,85 @@ fn default_entries() -> Vec<CommandEntry> {
 
     // ── Slash commands (agents/solve/discuss/perf use register() in new()) ──
     let slash_cmds: &[&str] = &[
-        "add-dir", "advisor", "allowed-tools", "api-key",
-        "approve", "branch", "brief", "bughunter", "clear", "color",
-        "commit", "compact", "config", "context", "copy", "cost",
-        "debug-tool-call", "deny", "desktop", "diff", "doctor",
-        "effort", "exit", "export", "fast", "feedback", "files",
-        "handoff", "help", "hooks", "ide", "image", "init",
-        "insights", "issue", "keybindings", "listen", "mcp",
-        "memory", "model", "output-style", "paste", "permissions",
-        "plan", "plugin", "pr", "privacy-settings", "release-notes",
-        "rename", "resume", "retry", "review", "rewind", "sandbox",
-        "screenshot", "search", "security-review", "session",
-        "share", "skills", "speak", "stats", "status", "stickers",
-        "stop", "summary", "tag", "tasks", "teleport",
-        "terminal-setup", "theme", "thinkback", "ultraplan",
-        "undo", "upgrade", "usage", "version", "vim", "voice",
+        "add-dir",
+        "advisor",
+        "allowed-tools",
+        "api-key",
+        "approve",
+        "branch",
+        "brief",
+        "bughunter",
+        "clear",
+        "color",
+        "commit",
+        "compact",
+        "config",
+        "context",
+        "copy",
+        "cost",
+        "debug-tool-call",
+        "deny",
+        "desktop",
+        "diff",
+        "doctor",
+        "effort",
+        "exit",
+        "export",
+        "fast",
+        "feedback",
+        "files",
+        "handoff",
+        "help",
+        "hooks",
+        "ide",
+        "image",
+        "init",
+        "insights",
+        "issue",
+        "keybindings",
+        "listen",
+        "mcp",
+        "memory",
+        "model",
+        "output-style",
+        "paste",
+        "permissions",
+        "plan",
+        "plugin",
+        "pr",
+        "privacy-settings",
+        "release-notes",
+        "rename",
+        "resume",
+        "retry",
+        "review",
+        "rewind",
+        "sandbox",
+        "screenshot",
+        "search",
+        "security-review",
+        "session",
+        "share",
+        "skills",
+        "speak",
+        "stats",
+        "status",
+        "stickers",
+        "stop",
+        "summary",
+        "tag",
+        "tasks",
+        "teleport",
+        "terminal-setup",
+        "theme",
+        "thinkback",
+        "ultraplan",
+        "undo",
+        "upgrade",
+        "usage",
+        "version",
+        "vim",
+        "voice",
     ];
 
     // Simple description generator from kebab-case names
@@ -269,8 +333,14 @@ impl CommandPalette {
     // ── Registration ────────────────────────────────────────────
 
     /// Register a new command in the palette.
-    pub fn register(&mut self, name: impl Into<String>, description: impl Into<String>, action: Action) {
-        self.all_commands.push(CommandEntry::new(name, description, action));
+    pub fn register(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        action: Action,
+    ) {
+        self.all_commands
+            .push(CommandEntry::new(name, description, action));
     }
 
     /// Return the number of registered commands.
@@ -330,7 +400,11 @@ impl CommandPalette {
                 .enumerate()
                 .filter_map(|(i, entry)| {
                     let score = score_entry(query, entry);
-                    if score > 0 { Some((i, score)) } else { None }
+                    if score > 0 {
+                        Some((i, score))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
 
@@ -603,7 +677,10 @@ impl CommandPalette {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(accent))
-            .title(Span::styled(" Command Palette ", Style::default().fg(accent)));
+            .title(Span::styled(
+                " Command Palette ",
+                Style::default().fg(accent),
+            ));
         let inner = block.inner(rect);
         frame.render_widget(Clear, rect);
         frame.render_widget(block, rect);
@@ -612,9 +689,9 @@ impl CommandPalette {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),    // search input row
-                Constraint::Min(1),       // results list
-                Constraint::Length(1),    // hint
+                Constraint::Length(3), // search input row
+                Constraint::Min(1),    // results list
+                Constraint::Length(1), // hint
             ])
             .split(inner);
 
@@ -663,24 +740,13 @@ impl CommandPalette {
 
             Line::from(vec![
                 Span::raw(" "),
-                Span::styled(
-                    format!("> {}", before_cursor),
-                    Style::default(),
-                ),
-                Span::styled(
-                    "▊",
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::DarkGray),
-                ),
+                Span::styled(format!("> {}", before_cursor), Style::default()),
+                Span::styled("▊", Style::default().fg(Color::White).bg(Color::DarkGray)),
                 Span::styled(after_cursor, Style::default()),
             ])
         };
 
-        frame.render_widget(
-            Paragraph::new(Text::from(search_line)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(Text::from(search_line)), area);
     }
 
     /// Render the scored results list, highlighting the selected entry.
@@ -740,10 +806,7 @@ impl CommandPalette {
                             .add_modifier(Modifier::BOLD),
                     ))
                 } else {
-                    ListItem::new(Line::styled(
-                        full_line,
-                        Style::default().fg(Color::White),
-                    ))
+                    ListItem::new(Line::styled(full_line, Style::default().fg(Color::White)))
                 }
             })
             .collect();
@@ -825,7 +888,11 @@ mod tests {
     fn new_has_default_commands() {
         let p = setup_palette();
         // Should have all slash commands + keybind entries
-        assert!(p.command_count() >= 80, "expected >=80 default commands, got {}", p.command_count());
+        assert!(
+            p.command_count() >= 80,
+            "expected >=80 default commands, got {}",
+            p.command_count()
+        );
     }
 
     #[test]
@@ -898,7 +965,10 @@ mod tests {
             p.insert_char(c);
         }
 
-        assert!(p.results.is_empty(), "should return empty for gibberish query");
+        assert!(
+            p.results.is_empty(),
+            "should return empty for gibberish query"
+        );
     }
 
     #[test]
@@ -907,7 +977,11 @@ mod tests {
         p.open();
 
         // Empty search — should show all
-        assert_eq!(p.results.len(), p.command_count(), "empty query should show all commands");
+        assert_eq!(
+            p.results.len(),
+            p.command_count(),
+            "empty query should show all commands"
+        );
     }
 
     // ── Result ordering ──────────────────────────────────────────
@@ -1242,7 +1316,11 @@ mod tests {
         assert!(!p.is_open());
 
         let result = p.handle_event(&event_char('a'));
-        assert_eq!(result, EventResult::NotConsumed, "hidden palette should not consume");
+        assert_eq!(
+            result,
+            EventResult::NotConsumed,
+            "hidden palette should not consume"
+        );
     }
 
     #[test]
@@ -1252,6 +1330,10 @@ mod tests {
 
         let resize = Event::Resize(100, 100);
         let result = p.handle_event(&resize);
-        assert_eq!(result, EventResult::Consumed, "visible palette consumes all events");
+        assert_eq!(
+            result,
+            EventResult::Consumed,
+            "visible palette consumes all events"
+        );
     }
 }

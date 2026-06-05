@@ -2,7 +2,7 @@
 // Displays team-shared L4 memory entries from the MemoryOrchestrator.
 //
 // Features:
-//   - Sync from MemoryOrchestrator::team_query() (async, block_on)
+//   - Sync from MemoryOrchestrator::team_query()
 //   - Priority-based status icons with color coding
 //   - Agent source and tag display
 //   - Filter by source agent or tag
@@ -22,9 +22,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use memory::{
-    L4Event, L4EventBus, MemoryEntry, MemoryOrchestrator, MemoryScope,
-};
+use memory::{L4Event, L4EventBus, MemoryEntry, MemoryOrchestrator, MemoryScope};
 
 use crate::tui::components::{Component, EventResult, RenderContext};
 
@@ -144,24 +142,13 @@ impl L4KnowledgeView {
 
     /// Sync entries from the MemoryOrchestrator via team_query.
     ///
-    /// Uses `block_on` on the current tokio runtime to call the
-    /// async `team_query` method.  Gracefully handles the case where
-    /// no runtime is available (e.g. during testing).
     pub fn sync(&mut self) {
         let Some(ref orch) = self.orchestrator else {
             self.set_status("No orchestrator attached");
             return;
         };
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => {
-                self.set_status("No tokio runtime");
-                return;
-            }
-        };
 
-        let scope: Option<&MemoryScope> = None; // global scope
-        match handle.block_on(orch.team_query("knowledge", scope, 40)) {
+        match team_query_l4_blocking(Arc::clone(orch)) {
             Ok(entries) => {
                 let count = entries.len();
                 self.entries = entries;
@@ -367,7 +354,9 @@ impl L4KnowledgeView {
                 let (cursor_style, title_style, meta_style, tag_style) = if is_selected {
                     (
                         Style::default().fg(Color::Green),
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                         Style::default().fg(Color::Gray),
                         Style::default().fg(Color::Cyan),
                     )
@@ -404,7 +393,8 @@ impl L4KnowledgeView {
                 let tag_text = if entry.tags.is_empty() {
                     String::new()
                 } else {
-                    let tags: Vec<String> = entry.tags.iter().take(3).map(|t| format!("#{t}")).collect();
+                    let tags: Vec<String> =
+                        entry.tags.iter().take(3).map(|t| format!("#{t}")).collect();
                     let mut t = tags.join(" ");
                     if entry.tags.len() > 3 {
                         t.push_str(" …");
@@ -414,7 +404,15 @@ impl L4KnowledgeView {
 
                 // Confidence badge
                 let conf = entry.confidence;
-                let conf_str = if conf >= 0.9 { "★★★" } else if conf >= 0.7 { "★★" } else if conf >= 0.5 { "★" } else { "·" };
+                let conf_str = if conf >= 0.9 {
+                    "★★★"
+                } else if conf >= 0.7 {
+                    "★★"
+                } else if conf >= 0.5 {
+                    "★"
+                } else {
+                    "·"
+                };
 
                 lines.push(Line::from(vec![
                     Span::styled(cursor, cursor_style),
@@ -479,21 +477,32 @@ impl L4KnowledgeView {
             Span::styled(format!("{icon} "), Style::default().fg(pcolor)),
             Span::styled(
                 &entry.title,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::raw(""));
 
         // Metadata block
         lines.push(Line::from(Span::styled(
-            format!(" ID: {}  |  Layer: {:?}  |  Category: {:?}  |  Confidence: {:.0}%",
-                entry.id, entry.layer, entry.category, entry.confidence * 100.0),
+            format!(
+                " ID: {}  |  Layer: {:?}  |  Category: {:?}  |  Confidence: {:.0}%",
+                entry.id,
+                entry.layer,
+                entry.category,
+                entry.confidence * 100.0
+            ),
             Style::default().fg(Color::DarkGray),
         )));
         let agent = entry.source_agent.as_deref().unwrap_or("?");
         lines.push(Line::from(Span::styled(
-            format!(" Source: {:?}  |  Agent: {agent}  |  Priority: {:?}  |  Scope: {}",
-                entry.source, entry.priority, entry.scope.scope_key()),
+            format!(
+                " Source: {:?}  |  Agent: {agent}  |  Priority: {:?}  |  Scope: {}",
+                entry.source,
+                entry.priority,
+                entry.scope.scope_key()
+            ),
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -514,8 +523,8 @@ impl L4KnowledgeView {
         let content_lines: Vec<&str> = entry.content.lines().collect();
         let offset = self.scroll_offset as usize;
         let max_content = inner_height.saturating_sub(lines.len() + 3);
-        let visible = &content_lines[offset.min(content_lines.len())
-            ..(offset + max_content).min(content_lines.len())];
+        let visible = &content_lines
+            [offset.min(content_lines.len())..(offset + max_content).min(content_lines.len())];
 
         for line in visible {
             if line.len() > inner_width {
@@ -538,7 +547,10 @@ impl L4KnowledgeView {
 
         if offset + max_content < content_lines.len() {
             lines.push(Line::styled(
-                format!("... {} more lines (j/k to scroll)", content_lines.len() - offset - max_content),
+                format!(
+                    "... {} more lines (j/k to scroll)",
+                    content_lines.len() - offset - max_content
+                ),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -576,10 +588,16 @@ impl L4KnowledgeView {
             Some(FilterKind::Tag) => "Tag",
             None => "Free-text",
         };
-        let cursor = if self.search_query.is_empty() { "▌" } else { "" };
+        let cursor = if self.search_query.is_empty() {
+            "▌"
+        } else {
+            ""
+        };
         lines.push(Line::from(Span::styled(
             format!(" Filter by {kind_label}: {}{}", self.search_query, cursor),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
@@ -719,6 +737,29 @@ impl L4KnowledgeView {
     }
 }
 
+fn team_query_l4_blocking(
+    orchestrator: Arc<MemoryOrchestrator>,
+) -> Result<Vec<MemoryEntry>, String> {
+    let query = move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("build runtime: {err}"))?;
+        let scope: Option<&MemoryScope> = None;
+        runtime
+            .block_on(orchestrator.team_query("knowledge", scope, 40))
+            .map_err(|err| err.to_string())
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(query)
+            .join()
+            .map_err(|_| "L4 sync worker panicked".to_string())?
+    } else {
+        query()
+    }
+}
+
 // ── Default impl ────────────────────────────────────────────────────
 
 impl Default for L4KnowledgeView {
@@ -777,12 +818,25 @@ impl Component for L4KnowledgeView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::test_utils::MockTerminal;
     use crate::tui::skin::SkinConfig;
+    use crate::tui::test_utils::MockTerminal;
+
+    fn test_memory_config(path: &std::path::Path) -> memory::MemoryConfig {
+        let mut config = memory::MemoryConfig::default();
+        config.store.sqlite_path = path.to_path_buf();
+        config.store.blob_dir = path.parent().unwrap().join("blobs");
+        config
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn make_entry(id: &str, title: &str, agent: &str) -> MemoryEntry {
-        use memory::{MemoryCategory, MemoryLayer, MemorySource, Priority, AgentVisibility};
         use chrono::Utc;
+        use memory::{AgentVisibility, MemoryCategory, MemoryLayer, MemorySource, Priority};
         use uuid::Uuid;
 
         MemoryEntry {
@@ -834,15 +888,29 @@ mod tests {
     fn shows_entries_with_agent_and_title() {
         let mut view = L4KnowledgeView::new();
         view.entries = vec![
-            make_entry("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "Team Convention: Use Rust", "orchestrator"),
-            make_entry("b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e", "Decision: SQLite for storage", "architect"),
+            make_entry(
+                "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+                "Team Convention: Use Rust",
+                "orchestrator",
+            ),
+            make_entry(
+                "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e",
+                "Decision: SQLite for storage",
+                "architect",
+            ),
         ];
         view.apply_filter();
 
         let lines = render_panel(&mut view, 100, 10);
         let joined = lines.join("\n");
-        assert!(joined.contains("Team Convention"), "Should show title, got: {joined}");
-        assert!(joined.contains("orchestrator") || joined.contains("orchest.."), "Should show agent, got: {joined}");
+        assert!(
+            joined.contains("Team Convention"),
+            "Should show title, got: {joined}"
+        );
+        assert!(
+            joined.contains("orchestrator") || joined.contains("orchest.."),
+            "Should show agent, got: {joined}"
+        );
     }
 
     #[test]
@@ -900,6 +968,40 @@ mod tests {
         assert_eq!(view.id(), "l4_knowledge_view");
     }
 
+    #[tokio::test]
+    async fn sync_reads_l4_entries_inside_tokio_runtime() {
+        let dir = unique_temp_dir("cowd-l4-component");
+        let manager = memory::CognitiveContextManager::new(test_memory_config(
+            &dir.join("memory.db"),
+        ))
+        .await
+        .unwrap();
+        manager
+            .create_entry(
+                memory::MemoryLayer::L4,
+                memory::MemoryCategory::Shared,
+                "Team Knowledge Runtime Safe",
+                "knowledge shared with the L4 component while Tokio is active",
+                memory::Priority::High,
+                vec!["knowledge".into(), "l4".into()],
+                memory::MemoryScope::Global,
+            )
+            .await
+            .unwrap();
+
+        let mut view = L4KnowledgeView::new();
+        view.set_orchestrator(manager.orchestrator());
+
+        view.sync();
+
+        assert!(
+            view.entries
+                .iter()
+                .any(|entry| entry.title == "Team Knowledge Runtime Safe"),
+            "L4 component should sync real L4 entries inside an active Tokio runtime"
+        );
+    }
+
     #[test]
     fn keyboard_navigation_bounds() {
         let mut view = L4KnowledgeView::new();
@@ -910,7 +1012,10 @@ mod tests {
         view.apply_filter();
 
         // j moves down
-        let key_j = crossterm::event::KeyEvent::new(KeyCode::Char('j'), crossterm::event::KeyModifiers::NONE);
+        let key_j = crossterm::event::KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        );
         view.handle_list_key(&key_j);
         assert_eq!(view.selected_idx, 1);
 
@@ -919,7 +1024,10 @@ mod tests {
         assert_eq!(view.selected_idx, 1);
 
         // k moves up
-        let key_k = crossterm::event::KeyEvent::new(KeyCode::Char('k'), crossterm::event::KeyModifiers::NONE);
+        let key_k = crossterm::event::KeyEvent::new(
+            KeyCode::Char('k'),
+            crossterm::event::KeyModifiers::NONE,
+        );
         view.handle_list_key(&key_k);
         assert_eq!(view.selected_idx, 0);
 
@@ -942,10 +1050,15 @@ mod tests {
     #[test]
     fn detail_view_on_enter() {
         let mut view = L4KnowledgeView::new();
-        view.entries = vec![make_entry("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "Test", "agent")];
+        view.entries = vec![make_entry(
+            "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+            "Test",
+            "agent",
+        )];
         view.apply_filter();
 
-        let key_enter = crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        let key_enter =
+            crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
         let result = view.handle_list_key(&key_enter);
         assert!(result.is_consumed());
         assert_eq!(view.view_mode, ViewMode::Detail);
@@ -979,12 +1092,17 @@ mod tests {
     #[test]
     fn esc_from_detail_returns_to_list() {
         let mut view = L4KnowledgeView::new();
-        view.entries = vec![make_entry("a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "Test", "agent")];
+        view.entries = vec![make_entry(
+            "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+            "Test",
+            "agent",
+        )];
         view.apply_filter();
         view.expanded_entry = Some(0);
         view.view_mode = ViewMode::Detail;
 
-        let key_esc = crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE);
+        let key_esc =
+            crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE);
         let result = view.handle_detail_key(&key_esc);
         assert!(result.is_consumed());
         assert_eq!(view.view_mode, ViewMode::List);
@@ -1001,13 +1119,32 @@ mod tests {
         view.apply_filter();
         view.begin_search(FilterKind::Agent);
         // Simulate typing "agent1" and pressing Enter
-        let key_a = crossterm::event::KeyEvent::new(KeyCode::Char('a'), crossterm::event::KeyModifiers::NONE);
-        let key_g = crossterm::event::KeyEvent::new(KeyCode::Char('g'), crossterm::event::KeyModifiers::NONE);
-        let key_e = crossterm::event::KeyEvent::new(KeyCode::Char('e'), crossterm::event::KeyModifiers::NONE);
-        let key_n = crossterm::event::KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE);
-        let key_t = crossterm::event::KeyEvent::new(KeyCode::Char('t'), crossterm::event::KeyModifiers::NONE);
-        let key_1 = crossterm::event::KeyEvent::new(KeyCode::Char('1'), crossterm::event::KeyModifiers::NONE);
-        let key_enter = crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        let key_a = crossterm::event::KeyEvent::new(
+            KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let key_g = crossterm::event::KeyEvent::new(
+            KeyCode::Char('g'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let key_e = crossterm::event::KeyEvent::new(
+            KeyCode::Char('e'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let key_n = crossterm::event::KeyEvent::new(
+            KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let key_t = crossterm::event::KeyEvent::new(
+            KeyCode::Char('t'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let key_1 = crossterm::event::KeyEvent::new(
+            KeyCode::Char('1'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let key_enter =
+            crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
 
         view.handle_search_key(&key_a);
         view.handle_search_key(&key_g);

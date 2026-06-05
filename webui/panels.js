@@ -1,0 +1,576 @@
+window.Panels = (()=>{
+  const cont=()=>UI.$('panel-content');
+
+  async function renderMemory(){
+    const c=cont();c.innerHTML='';
+    const hdr=UI.el('div','panel-section');
+    hdr.innerHTML='<h3>Memory</h3>';
+    // P2-09: Spatial memory toggle — Wing/Room/Drawer visualization
+    const spatialBtn=UI.el('button');
+    spatialBtn.textContent='Spatial View';
+    spatialBtn.style.cssText='font-size:11px;margin-left:8px;padding:2px 6px;';
+    spatialBtn.onclick=()=>renderMemorySpatial();
+    hdr.appendChild(spatialBtn);
+    const search=UI.el('input');
+    search.placeholder='Search memory...';
+    search.oninput=function(){const q=this.value;if(q.length>1)doMemorySearch(q)};
+    hdr.appendChild(search);
+    c.appendChild(hdr);
+
+    const stats=UI.el('div','panel-section');
+    c.appendChild(stats);
+    try{
+      const s=await Api.memoryStats();
+      stats.innerHTML='Entries: '+(s.total_entries||s.count||0)+' | Entities: '+(s.entity_count||s.entities||0)+' | Triples: '+(s.triple_count||s.triples||0);
+    }catch(e){stats.textContent='Stats unavailable'}
+
+    const entitySec=UI.el('div','panel-section');
+    entitySec.innerHTML='<h3>Entities</h3>';
+    c.appendChild(entitySec);
+    try{
+      const entities=await Api.listEntities();
+      (entities||[]).slice(0,10).forEach(function(e){
+        var item=UI.el('div','panel-item');
+        item.textContent=(e.name||e.entity||e);
+        entitySec.appendChild(item);
+      });
+    }catch(e){entitySec.appendChild(UI.el('div','panel-empty','No entities'))}
+
+    var tripleSec=UI.el('div','panel-section');
+    tripleSec.innerHTML='<h3>Knowledge Triples</h3>';
+    c.appendChild(tripleSec);
+    try{
+      var triples=await Api.listTriples();
+      (triples||[]).slice(0,10).forEach(function(t){
+        var item=UI.el('div','panel-item');
+        item.textContent=(t.subject||t.s||'')+' → '+(t.predicate||t.p||'')+' → '+(t.object||t.o||'');
+        tripleSec.appendChild(item);
+      });
+    }catch(e){tripleSec.appendChild(UI.el('div','panel-empty','No triples'))}
+
+    const symbolSec=UI.el('div','panel-section');
+    symbolSec.innerHTML='<h3>Symbol Links</h3>';
+    const symbolInput=UI.el('input');
+    symbolInput.id='memory-symbol-search';
+    symbolInput.placeholder='Find by symbol...';
+    const symbolResults=UI.el('div');
+    symbolResults.id='memory-symbol-results';
+    symbolInput.oninput=function(){renderMemorySymbolResults(this.value,symbolResults)};
+    symbolSec.appendChild(symbolInput);
+    symbolSec.appendChild(symbolResults);
+    c.appendChild(symbolSec);
+
+    const layers=UI.el('div','panel-section');
+    layers.innerHTML='<h3>Layers</h3>';
+    c.appendChild(layers);
+    try{
+      const ls=await Api.listMemoryLayers();
+      (ls.layers||ls||[]).forEach(l=>{
+        const layerName = l.name || l.layer || l.id || l;
+        const item=UI.el('div','panel-item');
+        const name=UI.el('span','pi-name');
+        name.textContent=layerName;
+        item.appendChild(name);
+        item.onclick=()=>renderMemoryLayer(layerName);
+        layers.appendChild(item);
+      });
+    }catch(e){layers.appendChild(UI.el('div','panel-empty','No layers'))}
+  }
+
+  async function renderMemoryLayer(layer){
+    const c=cont();c.innerHTML='';
+    c.appendChild(UI.el('div','panel-section','<h3>'+UI.esc(layer)+'</h3>'));
+    const btn=UI.el('button','btn-primary');
+    btn.textContent='+ Add Entry';
+    btn.onclick=()=>showMemoryEntryForm(layer);
+    c.appendChild(btn);
+    try{
+      const data=await Api.getMemoryLayer(layer);
+      (data.entries||data||[]).slice(0,30).forEach(e=>{
+        const item=UI.el('div','panel-item');
+        const name=UI.el('span','pi-name');
+        name.textContent=(e.content||e.text||e.name||'').slice(0,80);
+        item.appendChild(name);
+        item.onclick=()=>{UI.showToast(e.content||e.text||JSON.stringify(e))};
+        c.appendChild(item);
+      });
+    }catch(e){c.appendChild(UI.el('div','panel-empty','Error: '+e.message))}
+  }
+
+  async function renderMemorySymbolResults(symbol,target){
+    if(!target)return;
+    target.innerHTML='';
+    const q=(symbol||'').trim();
+    if(q.length<2)return;
+    try{
+      const entries=await Api.findMemoriesBySymbol(q);
+      if(!entries.length){
+        target.appendChild(UI.el('div','panel-empty','No linked memories'));
+        return;
+      }
+      entries.slice(0,12).forEach(function(e){
+        const item=UI.el('div','panel-item memory-symbol-result');
+        const name=UI.el('span','pi-name');
+        const label=e.title||e.name||e.content||e.text||e.id||'Memory entry';
+        name.textContent=String(label).slice(0,90);
+        item.appendChild(name);
+        item.onclick=function(){UI.showToast(e.content||e.text||e.title||JSON.stringify(e))};
+        target.appendChild(item);
+      });
+    }catch(e){
+      target.appendChild(UI.el('div','panel-empty','Error: '+e.message));
+    }
+  }
+
+  function showMemoryEntryForm(layer){
+    const c=cont();
+    const sec=UI.el('div','panel-section');
+    sec.innerHTML='<h3>New Entry ('+UI.esc(layer)+')</h3>';
+    const ta=UI.el('textarea');
+    ta.rows=4;ta.placeholder='Entry content...';
+    const btn=UI.el('button','btn-primary');
+    btn.textContent='Save';
+    btn.onclick=async()=>{
+      try{await Api.createMemoryEntry(layer,{content:ta.value});UI.showToast('Saved','success');renderMemoryLayer(layer)}catch(e){UI.showToast(e.message,'error')}
+    };
+    sec.appendChild(ta);sec.appendChild(btn);
+    c.insertBefore(sec,c.firstChild);
+  }
+
+  async function doMemorySearch(q){
+    const c=cont();
+    const sec=c.querySelector('.panel-section:last-child');
+    if(!sec)return;
+    try{
+      const r=await Api.searchMemory(q);
+      const results=r.results||r||[];
+      const list=UI.el('div');
+      list.innerHTML='<h3>Search Results</h3>';
+      results.slice(0,20).forEach(e=>{
+        const item=UI.el('div','panel-item');
+        item.textContent=(e.content||e.text||'').slice(0,100);
+        list.appendChild(item);
+      });
+      const old=c.querySelector('.search-results');
+      if(old)old.remove();
+      list.className='search-results panel-section';
+      c.appendChild(list);
+    }catch(e){}
+  }
+
+  async function renderSkills(){
+    const c=cont();c.innerHTML='<h3>Skills</h3>';
+    try{
+      const data=await Api.listSkills();
+      (data.skills||data||[]).forEach(s=>{
+        const item=UI.el('div','panel-item');
+        const name=UI.el('span','pi-name');
+        name.textContent=s.name||s;
+        item.appendChild(name);
+        const acts=UI.el('span','pi-actions');
+        if(!s.installed){
+          const installBtn=UI.el('button');
+          installBtn.textContent='Install';
+          installBtn.onclick=async()=>{try{await Api.installSkill(s.name||s);UI.showToast('Installed','success');renderSkills()}catch(e){UI.showToast(e.message,'error')}};
+          acts.appendChild(installBtn);
+        }else{
+          const uninstallBtn=UI.el('button');
+          uninstallBtn.textContent='Remove';
+          uninstallBtn.style.color='var(--error)';
+          uninstallBtn.onclick=async()=>{try{await Api.uninstallSkill(s.name||s);UI.showToast('Removed','success');renderSkills()}catch(e){UI.showToast(e.message,'error')}};
+          acts.appendChild(uninstallBtn);
+        }
+        item.appendChild(acts);
+        c.appendChild(item);
+      });
+    }catch(e){c.appendChild(UI.el('div','panel-empty','No skills loaded'))}
+  }
+
+  async function renderCrons(){
+    const c=cont();c.innerHTML='<h3>Crond Jobs</h3>';
+    const btn=UI.el('button','btn-primary');
+    btn.textContent='+ New Crond';
+    btn.onclick=showCronForm;
+    c.appendChild(btn);
+    try{
+      const data=await Api.listCrons();
+      (data.crons||data||[]).forEach(cr=>{
+        const item=UI.el('div','panel-item');
+        const name=UI.el('span','pi-name');
+        name.textContent=(cr.name||cr.id||'')+(cr.schedule?' ['+cr.schedule+']':'');
+        item.appendChild(name);
+        const acts=UI.el('span','pi-actions');
+        const runBtn=UI.el('button');
+        runBtn.textContent='Run';
+        runBtn.onclick=async()=>{try{await Api.runCron(cr.id||cr.name);UI.showToast('Running','success')}catch(e){UI.showToast(e.message,'error')}};
+        const delBtn=UI.el('button');
+        delBtn.textContent='Del';
+        delBtn.style.color='var(--error)';
+        delBtn.onclick=async()=>{if(confirm('Delete this cron?')){try{await Api.deleteCron(cr.id||cr.name);renderCrons()}catch(e){UI.showToast(e.message,'error')}}};
+        acts.appendChild(runBtn);acts.appendChild(delBtn);
+        item.appendChild(acts);
+        c.appendChild(item);
+      });
+    }catch(e){c.appendChild(UI.el('div','panel-empty','No crons'))}
+  }
+
+  function showCronForm(){
+    const c=cont();
+    const sec=UI.el('div','panel-section');
+    sec.innerHTML='<h3>New Crond</h3>';
+    const form=UI.el('div','panel-form');
+    form.innerHTML='<input id="cron-name" placeholder="Name">';
+    form.innerHTML+='<input id="cron-schedule" placeholder="Schedule (e.g. */5 * * * *)">';
+    form.innerHTML+='<input id="cron-prompt" placeholder="Prompt to run">';
+    form.innerHTML+='<select id="cron-model"><option>claude-sonnet-4-6</option><option>claude-haiku-4-5</option></select>';
+    const btn=UI.el('button','btn-primary');
+    btn.textContent='Create';
+    btn.onclick=async()=>{
+      const nm=UI.$('cron-name').value;
+      const sch=UI.$('cron-schedule').value;
+      const pr=UI.$('cron-prompt').value;
+      const mod=UI.$('cron-model').value;
+      try{await Api.createCron({name:nm,schedule:sch,prompt:pr,model:mod});UI.showToast('Crond created','success');renderCrons()}catch(e){UI.showToast(e.message,'error')}
+    };
+    sec.appendChild(form);sec.appendChild(btn);
+    c.insertBefore(sec,c.firstChild);
+  }
+
+  async function renderSettings(){
+    const c=cont();c.innerHTML='<h3>Settings</h3>';
+    const themeSec=UI.el('div','panel-section');
+    themeSec.innerHTML='<h3>Theme</h3>';
+    const themeSel=UI.el('select');
+    themeSel.innerHTML='<option value="dark">Dark</option><option value="light">Light</option><option value="system">System</option>';
+    themeSel.value=localStorage.getItem('cowd-theme')||'dark';
+    themeSel.onchange=function(){
+      localStorage.setItem('cowd-theme',this.value);
+      document.documentElement.dataset.theme=this.value;
+      if(this.value==='system'){
+        const pref=window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';
+        document.documentElement.dataset.theme=pref;
+      }
+    };
+    themeSec.appendChild(themeSel);
+    c.appendChild(themeSec);
+
+    const modelSec=UI.el('div','panel-section');
+    modelSec.innerHTML='<h3>Default Model</h3>';
+    try{
+      const cfg=await Api.getConfig();
+      modelSec.innerHTML+='<p style="font-size:12px;color:var(--text2)">Current: '+(cfg.model||'unknown')+'</p>';
+    }catch(e){}
+    c.appendChild(modelSec);
+
+    const profileSec=UI.el('div','panel-section');
+    profileSec.innerHTML='<h3>Profiles</h3>';
+    const createRow=UI.el('div','profile-create-row');
+    const input=UI.el('input');
+    input.placeholder='New profile name';
+    const createBtn=UI.el('button','btn-secondary');
+    createBtn.textContent='Create';
+    createBtn.onclick=async function(){
+      const name=input.value.trim();
+      if(!name)return;
+      try{
+        await Api.createProfile(name);
+        UI.showToast('Profile created','success');
+        renderSettings();
+      }catch(e){UI.showToast(e.message,'error')}
+    };
+    createRow.appendChild(input);
+    createRow.appendChild(createBtn);
+    profileSec.appendChild(createRow);
+    c.appendChild(profileSec);
+    try{
+      const data=await Api.listProfiles();
+      const profiles=data.profiles||[];
+      const runtime=data.runtime_profile||data.active_profile||'default';
+      profiles.forEach(function(profile){
+        const item=UI.el('div','panel-item profile-item');
+        const name=UI.el('span','pi-name');
+        name.textContent=(profile.name||profile.id)+(profile.id===runtime?' (runtime)':'');
+        const actions=UI.el('span','pi-actions');
+        if(profile.is_active){
+          const active=UI.el('span','profile-active');
+          active.textContent='active';
+          actions.appendChild(active);
+        }else{
+          const switchBtn=UI.el('button');
+          switchBtn.textContent='Switch';
+          switchBtn.onclick=async function(){
+            try{
+              const r=await Api.switchProfile(profile.id);
+              UI.showToast(r.restart_required?'Profile switch saved. Restart required.':'Profile switched','success');
+              renderSettings();
+            }catch(e){UI.showToast(e.message,'error')}
+          };
+          actions.appendChild(switchBtn);
+        }
+        if(profile.id!=='default'&&!profile.is_active){
+          const deleteBtn=UI.el('button');
+          deleteBtn.textContent='Delete';
+          deleteBtn.style.color='var(--error)';
+          deleteBtn.onclick=async function(){
+            if(!confirm('Delete profile '+profile.id+'?'))return;
+            try{await Api.deleteProfile(profile.id);renderSettings()}catch(e){UI.showToast(e.message,'error')}
+          };
+          actions.appendChild(deleteBtn);
+        }
+        item.appendChild(name);
+        item.appendChild(actions);
+        profileSec.appendChild(item);
+      });
+      if(data.active_profile&&data.active_profile!==runtime){
+        const restart=UI.el('div','panel-empty');
+        restart.textContent='Restart required to activate '+data.active_profile+' for memory and sessions.';
+        profileSec.appendChild(restart);
+      }
+    }catch(e){
+      profileSec.appendChild(UI.el('div','panel-empty','Profiles unavailable'));
+    }
+  }
+
+  async function renderCCConfig(){
+    const cc=UI.$('cc-content');cc.innerHTML='';
+    try{
+      const cfg=await Api.getConfig();
+      const pre=UI.el('pre');
+      pre.style.cssText='background:var(--bg);padding:12px;border-radius:var(--radius);font-size:12px;max-height:400px;overflow:auto';
+      pre.textContent=JSON.stringify(cfg,null,2);
+      cc.appendChild(pre);
+    }catch(e){cc.textContent='Error: '+e.message}
+  }
+
+  async function renderCCProviders(){
+    const cc=UI.$('cc-content');cc.innerHTML='';
+    try{
+      const providers=await Api.getProviders();
+      const pre=UI.el('pre');
+      pre.style.cssText='background:var(--bg);padding:12px;border-radius:var(--radius);font-size:12px;max-height:400px;overflow:auto';
+      pre.textContent=JSON.stringify(providers,null,2);
+      cc.appendChild(pre);
+    }catch(e){cc.textContent='Error: '+e.message}
+  }
+
+  async function renderCCApproval(){
+    const cc=UI.$('cc-content');cc.innerHTML='';
+    try{
+      const pend=await Api.pendingApprovals();
+      cc.innerHTML='<div class="panel-section"><h3>Pending Approvals</h3></div>';
+      (pend||[]).forEach(a=>{
+        const item=UI.el('div','panel-item');
+        item.innerHTML='<span class="pi-name">'+UI.esc(a.tool||a.action||a.id)+'</span>';
+        const acts=UI.el('span','pi-actions');
+        const approve=UI.el('button');
+        approve.textContent='Approve';
+        approve.style.color='var(--success)';
+        approve.onclick=async()=>{try{await Api.respondApproval(a.id,true);renderCCApproval()}catch(e){}};
+        const deny=UI.el('button');
+        deny.textContent='Deny';
+        deny.style.color='var(--error)';
+        deny.onclick=async()=>{try{await Api.respondApproval(a.id,false);renderCCApproval()}catch(e){}};
+        acts.appendChild(approve);acts.appendChild(deny);
+        item.appendChild(acts);
+        cc.appendChild(item);
+      });
+    }catch(e){cc.textContent='No pending approvals'}
+  }
+
+  async function renderCCHistory(){
+    const cc=UI.$('cc-content');cc.innerHTML='';
+    try{
+      const hist=await Api.approvalHistory();
+      cc.innerHTML='<div class="panel-section"><h3>Approval History</h3></div>';
+      (hist||[]).slice(0,20).forEach(function(a){
+        var item=UI.el('div','panel-item');
+        item.innerHTML='<span class="pi-name">'+UI.esc(a.tool||a.action||a.id)+'</span><span style="font-size:11px;color:var(--text3)"> '+UI.esc(a.decision||a.status||'')+'</span>';
+        cc.appendChild(item);
+      });
+    }catch(e){cc.textContent='No history'}
+  }
+
+  async function renderCCUsage(){
+    const cc=UI.$('cc-content');cc.innerHTML='';
+    try{
+      const usage=await Api.getUsage();
+      const pre=UI.el('pre');
+      pre.style.cssText='background:var(--bg);padding:12px;border-radius:var(--radius);font-size:12px;max-height:400px;overflow:auto';
+      pre.textContent=JSON.stringify(usage,null,2);
+      cc.appendChild(pre);
+    }catch(e){cc.textContent='Error: '+e.message}
+  }
+
+  async function renderAgents(){
+    const c=cont();c.innerHTML='<h3>Agent Tasks</h3>';
+    try{
+      const cfg=await Api.getConfig();
+      const sec=UI.el('div','panel-section');
+      sec.innerHTML='<h3>Task Registry</h3>';
+      const pre=UI.el('pre');
+      pre.style.cssText='background:var(--bg);padding:12px;border-radius:var(--radius);font-size:12px;max-height:300px;overflow:auto';
+      pre.textContent='Task registry active.\nSub-agent delegation via task/agent tools.\nCron scheduler manages periodic tasks.';
+      sec.appendChild(pre);
+      c.appendChild(sec);
+    }catch(e){c.appendChild(UI.el('div','panel-empty','Agents info unavailable'))}
+  }
+
+  async function renderTools(){
+    const c=cont();c.innerHTML='<h3>Tool Execution</h3>';
+    try{
+      const cfg=await Api.getConfig();
+      const sec=UI.el('div','panel-section');
+      sec.innerHTML='<h3>Available Tools</h3>';
+      const pre=UI.el('pre');
+      pre.style.cssText='background:var(--bg);padding:12px;border-radius:var(--radius);font-size:12px;max-height:300px;overflow:auto';
+      const toolNames=['bash','read','write','edit','glob','grep','lsp','webfetch','memory','skills','approval','files'];
+      pre.textContent=toolNames.map(t=>'• '+t).join('\n');
+      sec.appendChild(pre);
+      c.appendChild(sec);
+      const histSec=UI.el('div','panel-section');
+      histSec.innerHTML='<h3>Execution History</h3>';
+      histSec.appendChild(UI.el('div','panel-empty','Tool executions appear in the SSE stream.\nEach tool_start/tool_complete event is rendered inline in chat as a ToolCard.\nThis panel shows the tool registry and configuration.'));
+      c.appendChild(histSec);
+    }catch(e){c.appendChild(UI.el('div','panel-empty','Tools info unavailable'))}
+  }
+
+  async function renderGateway(){
+    const c=cont();c.innerHTML='<h3>Gateway Platforms</h3>';
+    try{
+      const platforms=await Api.listPlatforms();
+      if(!platforms||!platforms.length){
+        c.appendChild(UI.el('div','panel-empty','No platforms configured.\nEnable feishu/wechat/email in config.yaml'));
+        return;
+      }
+      platforms.forEach(async function(p){
+        const sec=UI.el('div','panel-section');
+        sec.innerHTML='<h3>'+UI.esc(p.name||p)+'</h3>';
+        c.appendChild(sec);
+        try{
+          const sessions=await Api.getPlatform(p.name||p);
+          if(sessions&&sessions.sessions){
+            sessions.sessions.forEach(function(s){
+              const item=UI.el('div','panel-item');
+              item.innerHTML='<span class="pi-name">'+UI.esc(s.id||'').slice(0,12)+'...</span><span style="font-size:11px;color:var(--text3)"> '+UI.esc(s.title||'')+'</span>';
+              sec.appendChild(item);
+            });
+          }
+        }catch(e){sec.appendChild(UI.el('div','panel-empty','Sessions unavailable'))}
+      });
+    }catch(e){c.appendChild(UI.el('div','panel-empty','Gateway info unavailable'))}
+  }
+
+  function auditRecordSummary(record){
+    const r=record||{};
+    const raw=r.record||{};
+    return r.summary || raw.summary || raw.operation || raw.action || raw.tool || raw.id || r.id || 'Audit record';
+  }
+
+  function auditRecordTime(record){
+    const value=(record&&record.timestamp)||(record&&record.record&&record.record.timestamp);
+    if(!value)return '';
+    try{
+      return new Date(value).toLocaleString();
+    }catch(e){
+      return String(value);
+    }
+  }
+
+  async function renderAudit(source){
+    const c=cont();c.innerHTML='<h3>Enterprise Audit</h3>';
+    const controls=UI.el('div','panel-section audit-controls');
+    const select=UI.el('select');
+    select.id='audit-source';
+    select.innerHTML='<option value="all">All Sources</option><option value="memory">Memory</option><option value="approval">Approval</option>';
+    select.value=source||'all';
+    const refresh=UI.el('button','btn-secondary');
+    refresh.textContent='Refresh';
+    refresh.onclick=function(){renderAudit(select.value)};
+    select.onchange=function(){renderAudit(this.value)};
+    controls.appendChild(select);
+    controls.appendChild(refresh);
+    c.appendChild(controls);
+
+    const summary=UI.el('div','panel-section audit-summary');
+    summary.textContent='Loading audit records...';
+    c.appendChild(summary);
+
+    const list=UI.el('div','panel-section audit-records');
+    c.appendChild(list);
+    try{
+      const data=await Api.exportAudit({source:select.value,limit:50,offset:0});
+      const totals=data.totals||{};
+      summary.innerHTML='<div class="audit-metrics">'
+        +'<span><b>'+UI.esc(data.total??0)+'</b><small>shown</small></span>'
+        +'<span><b>'+UI.esc(totals.memory??0)+'</b><small>memory</small></span>'
+        +'<span><b>'+UI.esc(totals.approval??0)+'</b><small>approval</small></span>'
+        +'</div>';
+
+      const records=data.records||[];
+      if(!records.length){
+        list.appendChild(UI.el('div','panel-empty','No audit records'));
+        return;
+      }
+      records.forEach(function(record){
+        const item=UI.el('div','panel-item audit-record');
+        const sourceLabel=UI.el('span','audit-source');
+        sourceLabel.textContent=record.source||select.value;
+        const body=UI.el('span','pi-name audit-body');
+        const title=UI.el('span','audit-title');
+        title.textContent=auditRecordSummary(record);
+        const meta=UI.el('span','audit-meta');
+        meta.textContent=auditRecordTime(record);
+        body.appendChild(title);
+        body.appendChild(meta);
+        item.appendChild(sourceLabel);
+        item.appendChild(body);
+        item.onclick=function(){UI.showToast(JSON.stringify(record.record||record,null,2))};
+        list.appendChild(item);
+      });
+    }catch(e){
+      summary.textContent='Audit unavailable';
+      list.appendChild(UI.el('div','panel-empty','Error: '+e.message));
+    }
+  }
+
+  async function renderMemorySpatial(){
+    const c=cont();c.innerHTML='<h3>Memory Palace (Spatial)</h3>';
+    c.appendChild(UI.el('div','panel-section','<p style="font-size:12px;color:var(--text2)">Wing (project) → Room (date) → Drawer (exact text)</p>'));
+    const tree=UI.el('div','panel-section');
+    tree.style.cssText='font-family:monospace;font-size:12px;line-height:1.6';
+    tree.innerHTML='<b>WING: cowd</b><br>';
+    try{
+      const layers=await Api.listMemoryLayers();
+      for(const l of (layers.layers||layers||[])){
+        tree.innerHTML+='&nbsp;&nbsp;<b>ROOM:</b> '+UI.esc(l.name||'layer'+l.index)+'<br>';
+        try{
+          const data=await Api.getMemoryLayer(l.name||l);
+          const entries=data.entries||data||[];
+          if(entries.length){
+            entries.slice(0,8).forEach(e=>{
+              const title=UI.esc((e.title||e.content||'').substring(0,60));
+              tree.innerHTML+='&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--text3)">DRAWER:</span> '+title+'<br>';
+            });
+            if(entries.length>8) tree.innerHTML+='&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--text3)">... +'+(entries.length-8)+' more</span><br>';
+          }
+        }catch(ex){tree.innerHTML+='&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:var(--text3)">DRAWER:</span> unavailable<br>';}
+      }
+    }catch(e){tree.innerHTML+='&nbsp;&nbsp;unavailable'}
+    c.appendChild(tree);
+    c.appendChild(UI.el('div','panel-section','<button onclick="Panels.renderMemory()">← List View</button>'));
+  }
+
+  async function renderProgress(){
+    const c=cont();c.innerHTML='<h3>Workflow Progress</h3>';
+    try{
+      const p=await Api.getProgress();
+      const pct=Math.round((p.completed/p.total)*100)||0;
+      const bar='█'.repeat(Math.floor(pct/5))+'░'.repeat(20-Math.floor(pct/5));
+      c.appendChild(UI.el('div','panel-section',
+        `<div style="font-family:monospace;font-size:14px">${bar} ${pct}%</div>
+         <div style="font-size:12px;color:var(--text2);margin-top:4px">${p.current_phase||'idle'}</div>`));
+    }catch(e){c.appendChild(UI.el('div','panel-section','Progress unavailable'))}
+  }
+
+  return{renderMemory,renderMemoryLayer,renderMemorySymbolResults,showMemoryEntryForm,renderMemorySpatial,renderProgress,renderSkills,renderCrons,renderSettings,renderAgents,renderTools,renderGateway,renderAudit,renderCCConfig,renderCCProviders,renderCCApproval,renderCCHistory,renderCCUsage};
+})();

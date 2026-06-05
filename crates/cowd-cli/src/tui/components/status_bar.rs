@@ -272,12 +272,7 @@ impl StatusBar {
     ///
     /// The notification is shown for `ttl` ticks then auto-dismisses.
     /// Call [`tick`](Self::tick) each frame to count down.
-    pub fn set_notification(
-        &mut self,
-        text: impl Into<String>,
-        style: Style,
-        ttl: u32,
-    ) {
+    pub fn set_notification(&mut self, text: impl Into<String>, style: Style, ttl: u32) {
         self.notification = Some((text.into(), style));
         self.notification_ttl = ttl;
     }
@@ -329,11 +324,7 @@ impl StatusBar {
                 "reputation" => {
                     app.selected_agent_reputation.map(|r| {
                         // Gold/Yellow for >=4.0, Silver/Gray for >=2.0
-                        let style = if r >= 4.0 {
-                            Color::Yellow
-                        } else {
-                            Color::Gray
-                        };
+                        let style = if r >= 4.0 { Color::Yellow } else { Color::Gray };
                         // Override the section's style with dynamic color
                         section.style = section.style.fg(style);
                         format!("⭐{r:.1}")
@@ -352,8 +343,7 @@ impl StatusBar {
                     }
                 }
                 "turn_token" => {
-                    if app.turn_active
-                        && (app.turn_input_tokens > 0 || app.turn_output_tokens > 0)
+                    if app.turn_active && (app.turn_input_tokens > 0 || app.turn_output_tokens > 0)
                     {
                         Some(format!(
                             "turn:in:{} out:{}",
@@ -392,9 +382,7 @@ impl StatusBar {
                         None
                     }
                 }
-                "history" => {
-                    app.history_idx.map(|hidx| format!("hist:{}", hidx + 1))
-                }
+                "history" => app.history_idx.map(|hidx| format!("hist:{}", hidx + 1)),
                 "wave" => {
                     let ws = &app.wave_state;
                     if ws.total > 0 {
@@ -407,15 +395,9 @@ impl StatusBar {
                         None
                     }
                 }
-                "mcp_status" => {
-                    Some(format!("● MCP:{}", app.mcp_count))
-                }
-                "lsp_status" => {
-                    Some(format!("● LSP:{}", app.lsp_available))
-                }
-                "permission_status" => {
-                    Some("△ 2".to_string())
-                }
+                "mcp_status" => Some(format!("● MCP:{}", app.mcp_count)),
+                "lsp_status" => Some(format!("● LSP:{}", app.lsp_available)),
+                "permission_status" => Some("△ 2".to_string()),
                 _ => None,
             };
         }
@@ -485,8 +467,7 @@ impl Component for StatusBar {
 
         // Render the status line
         let bg = ctx.theme().bg_color();
-        let par = Paragraph::new(Line::from(spans))
-            .style(Style::default().bg(bg));
+        let par = Paragraph::new(Line::from(spans)).style(Style::default().bg(bg));
         ctx.frame_mut().render_widget(par, area);
 
         // ── Notification overlay ──────────────────────────────────
@@ -808,9 +789,18 @@ mod tests {
     fn with_default_sections_includes_footer_sections() {
         let bar = StatusBar::with_default_sections();
         let ids: Vec<&str> = bar.sections().iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"mcp_status"), "Should have mcp_status section");
-        assert!(ids.contains(&"lsp_status"), "Should have lsp_status section");
-        assert!(ids.contains(&"permission_status"), "Should have permission_status section");
+        assert!(
+            ids.contains(&"mcp_status"),
+            "Should have mcp_status section"
+        );
+        assert!(
+            ids.contains(&"lsp_status"),
+            "Should have lsp_status section"
+        );
+        assert!(
+            ids.contains(&"permission_status"),
+            "Should have permission_status section"
+        );
     }
 
     #[test]
@@ -846,7 +836,10 @@ mod tests {
         app.context_window = 200_000;
         app.token_count = 50_000;
         let bar = token_bar(&app);
-        assert!(bar.is_some(), "token_bar should return Some when context_window > 0");
+        assert!(
+            bar.is_some(),
+            "token_bar should return Some when context_window > 0"
+        );
         assert!(bar.unwrap().contains("25%"), "should show 25% usage");
     }
 
@@ -854,6 +847,9 @@ mod tests {
     fn token_bar_returns_none_when_window_zero() {
         use crate::tui::app::App;
         let app = App::new("test", "test-session");
-        assert!(token_bar(&app).is_none(), "token_bar should return None when context_window == 0");
+        assert!(
+            token_bar(&app).is_none(),
+            "token_bar should return None when context_window == 0"
+        );
     }
 }

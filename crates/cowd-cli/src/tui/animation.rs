@@ -294,7 +294,10 @@ mod tests {
         let c1 = AnimationEngine::spinner_char(1);
         assert_ne!(c0, c1, "spinner should change each frame");
         // Full rotation returns to same character
-        assert_eq!(AnimationEngine::spinner_char(0), AnimationEngine::spinner_char(10));
+        assert_eq!(
+            AnimationEngine::spinner_char(0),
+            AnimationEngine::spinner_char(10)
+        );
     }
 
     #[test]

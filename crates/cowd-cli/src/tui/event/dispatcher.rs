@@ -93,7 +93,10 @@ impl EventBus {
     pub fn drain(&self) -> Vec<RoutedEvent> {
         let mut heap = BinaryHeap::new();
         // Lock receiver and drain all buffered messages.
-        let receiver = self.receiver.lock().expect("EventBus receiver lock poisoned");
+        let receiver = self
+            .receiver
+            .lock()
+            .expect("EventBus receiver lock poisoned");
         while let Ok(event) = receiver.try_recv() {
             heap.push(event);
         }
@@ -217,7 +220,12 @@ mod dispatcher_tests {
 
     impl SpyComponent {
         fn new(id: &'static str, log: Rc<RefCell<SpyLog>>) -> Self {
-            SpyComponent { id, log, focused: true, handler: None }
+            SpyComponent {
+                id,
+                log,
+                focused: true,
+                handler: None,
+            }
         }
 
         fn with_focus(mut self, focused: bool) -> Self {
@@ -225,10 +233,7 @@ mod dispatcher_tests {
             self
         }
 
-        fn with_handler(
-            mut self,
-            handler: impl FnMut(&Event) -> EventResult + 'static,
-        ) -> Self {
+        fn with_handler(mut self, handler: impl FnMut(&Event) -> EventResult + 'static) -> Self {
             self.handler = Some(Box::new(handler));
             self
         }
@@ -239,10 +244,14 @@ mod dispatcher_tests {
             &mut self,
             _ctx: &mut crate::tui::components::RenderContext,
             _area: ratatui::layout::Rect,
-        ) {}
+        ) {
+        }
 
         fn handle_event(&mut self, event: &Event) -> EventResult {
-            self.log.borrow_mut().events.push((self.id.to_string(), event.clone()));
+            self.log
+                .borrow_mut()
+                .events
+                .push((self.id.to_string(), event.clone()));
             if let Some(ref mut handler) = self.handler {
                 handler(event)
             } else {
@@ -250,8 +259,12 @@ mod dispatcher_tests {
             }
         }
 
-        fn focusable(&self) -> bool { self.focused }
-        fn id(&self) -> &str { self.id }
+        fn focusable(&self) -> bool {
+            self.focused
+        }
+        fn id(&self) -> &str {
+            self.id
+        }
     }
 
     // ── helpers ────────────────────────────────────────────────
@@ -260,7 +273,11 @@ mod dispatcher_tests {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
-    fn make_spy(dispatcher: &mut EventDispatcher, id: &'static str, log: Rc<RefCell<SpyLog>>) -> ComponentId {
+    fn make_spy(
+        dispatcher: &mut EventDispatcher,
+        id: &'static str,
+        log: Rc<RefCell<SpyLog>>,
+    ) -> ComponentId {
         let cid = ComponentId(id.to_string());
         dispatcher.register(cid.clone(), Box::new(SpyComponent::new(id, log)));
         cid
@@ -271,7 +288,11 @@ mod dispatcher_tests {
     }
 
     fn received_by<'a>(log: &'a SpyLog, component_id: &str) -> Vec<&'a Event> {
-        log.events.iter().filter(|(id, _)| id == component_id).map(|(_, e)| e).collect()
+        log.events
+            .iter()
+            .filter(|(id, _)| id == component_id)
+            .map(|(_, e)| e)
+            .collect()
     }
 
     // ── priority_order_dispatch ────────────────────────────────
@@ -293,7 +314,11 @@ mod dispatcher_tests {
         // All three events broadcast to spy. Priority order is verified by
         // EventBus::drain() (tested in mod.rs). Dispatcher processes them in
         // drain order, so spy receives h → n → l.
-        assert_eq!(log.borrow().events.len(), 3, "spy should receive all 3 broadcast events");
+        assert_eq!(
+            log.borrow().events.len(),
+            3,
+            "spy should receive all 3 broadcast events"
+        );
         assert!(bus.drain().is_empty(), "bus should be empty after dispatch");
     }
 
@@ -340,9 +365,21 @@ mod dispatcher_tests {
         // comp_a receives first (targeted), then both via broadcast.
         // HashMap iteration order is non-deterministic, so exact order varies.
         let log = log.borrow();
-        assert_eq!(received_by(&log, "comp_a").len(), 2, "comp_a: targeted + broadcast");
-        assert_eq!(received_by(&log, "comp_b").len(), 1, "comp_b: broadcast only");
-        assert_eq!(log.events.first().map(|(id, _)| id.as_str()), Some("comp_a"), "targeted dispatch first");
+        assert_eq!(
+            received_by(&log, "comp_a").len(),
+            2,
+            "comp_a: targeted + broadcast"
+        );
+        assert_eq!(
+            received_by(&log, "comp_b").len(),
+            1,
+            "comp_b: broadcast only"
+        );
+        assert_eq!(
+            log.events.first().map(|(id, _)| id.as_str()),
+            Some("comp_a"),
+            "targeted dispatch first"
+        );
         assert_eq!(log.events.len(), 3);
     }
 
@@ -361,7 +398,11 @@ mod dispatcher_tests {
 
         dispatcher.dispatch(&bus);
 
-        assert_eq!(received(&log.borrow()), vec!["existing"], "unknown target → broadcast to existing");
+        assert_eq!(
+            received(&log.borrow()),
+            vec!["existing"],
+            "unknown target → broadcast to existing"
+        );
         assert!(bus.drain().is_empty());
     }
 
@@ -377,7 +418,10 @@ mod dispatcher_tests {
 
         dispatcher.dispatch(&bus);
 
-        assert!(log.borrow().events.is_empty(), "empty queue → no events dispatched");
+        assert!(
+            log.borrow().events.is_empty(),
+            "empty queue → no events dispatched"
+        );
     }
 
     // ── broadcast_skips_non_focusable ──────────────────────────
@@ -397,7 +441,11 @@ mod dispatcher_tests {
         bus.send(key_event(KeyCode::Esc), EventPriority::Normal);
         dispatcher.dispatch(&bus);
 
-        assert_eq!(received(&log.borrow()), vec!["focused"], "unfocused skipped");
+        assert_eq!(
+            received(&log.borrow()),
+            vec!["focused"],
+            "unfocused skipped"
+        );
     }
 
     // ── drain_post_dispatch_empty ──────────────────────────────
@@ -416,7 +464,10 @@ mod dispatcher_tests {
         dispatcher.dispatch(&bus);
 
         let remaining = bus.drain();
-        assert!(remaining.is_empty(), "EventBus should be empty after dispatch");
+        assert!(
+            remaining.is_empty(),
+            "EventBus should be empty after dispatch"
+        );
         assert_eq!(log.borrow().events.len(), 2, "both events dispatched");
     }
 }

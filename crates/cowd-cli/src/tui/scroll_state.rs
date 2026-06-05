@@ -88,35 +88,33 @@ impl ScrollState {
     /// Mouse `ScrollDown` and `ScrollUp` map to `scroll_down()`/`scroll_up()`.
     pub fn handle_event(&mut self, event: &Event) -> bool {
         match event {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        self.scroll_up();
-                        true
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        self.scroll_down();
-                        true
-                    }
-                    KeyCode::PageUp => {
-                        self.scroll_page_up();
-                        true
-                    }
-                    KeyCode::PageDown => {
-                        self.scroll_page_down();
-                        true
-                    }
-                    KeyCode::Home => {
-                        self.scroll_to_top();
-                        true
-                    }
-                    KeyCode::End => {
-                        self.scroll_to_bottom();
-                        true
-                    }
-                    _ => false,
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.scroll_up();
+                    true
                 }
-            }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll_down();
+                    true
+                }
+                KeyCode::PageUp => {
+                    self.scroll_page_up();
+                    true
+                }
+                KeyCode::PageDown => {
+                    self.scroll_page_down();
+                    true
+                }
+                KeyCode::Home => {
+                    self.scroll_to_top();
+                    true
+                }
+                KeyCode::End => {
+                    self.scroll_to_bottom();
+                    true
+                }
+                _ => false,
+            },
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollDown => {
                     self.scroll_down();
@@ -157,9 +155,7 @@ impl ScrollState {
                 self.offset = 0;
             }
         } else {
-            let max_offset = self
-                .content_height
-                .saturating_sub(self.viewport_height);
+            let max_offset = self.content_height.saturating_sub(self.viewport_height);
             if self.offset > max_offset {
                 self.offset = max_offset;
             }
@@ -172,7 +168,9 @@ impl ScrollState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    };
 
     // ── test_scroll_state_up ─────────────────────────────────────
     #[test]
@@ -292,7 +290,10 @@ mod tests {
         s.auto_scroll = false;
 
         s.clamp();
-        assert_eq!(s.offset, 40, "offset should be clamped to max(0, content - viewport)");
+        assert_eq!(
+            s.offset, 40,
+            "offset should be clamped to max(0, content - viewport)"
+        );
 
         // auto_scroll = true → snap to bottom
         s.auto_scroll = true;

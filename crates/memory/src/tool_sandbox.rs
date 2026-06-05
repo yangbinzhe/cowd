@@ -64,7 +64,7 @@ impl ToolOutputSandbox {
 
     /// Index a tool output.
     ///
-    /// If the estimated token count of `output` is below `threshold_tokens`,
+    /// If the line count of `output` is below `threshold_min_lines`,
     /// returns `None` (the output is small enough to keep in context).
     /// Otherwise the output is chunked (50 lines per chunk) and inserted into
     /// the FTS5 index, and a [`ToolOutputSummary`] is returned.
@@ -76,15 +76,13 @@ impl ToolOutputSandbox {
         tool_call_id: &str,
         _tool_name: &str,
         output: &str,
-        threshold_tokens: usize,
+        threshold_min_lines: usize,
     ) -> Option<ToolOutputSummary> {
-        // Rough token estimate: 1 token ≈ 4 characters.
-        let token_estimate = output.len() / 4;
-        if token_estimate < threshold_tokens {
+        let lines: Vec<&str> = output.lines().collect();
+        if lines.len() < threshold_min_lines {
             return None;
         }
 
-        let lines: Vec<&str> = output.lines().collect();
         let total_lines = lines.len();
         let full_size_bytes = output.len();
 
@@ -129,12 +127,7 @@ impl ToolOutputSandbox {
     ///
     /// Returns up to `limit` [`SearchSnippet`]s ordered by FTS5 relevance.
     #[must_use]
-    pub fn search(
-        &self,
-        tool_call_id: &str,
-        query: &str,
-        limit: usize,
-    ) -> Vec<SearchSnippet> {
+    pub fn search(&self, tool_call_id: &str, query: &str, limit: usize) -> Vec<SearchSnippet> {
         let sql = "SELECT line_range, content FROM tool_output_fts \
                    WHERE call_id = ?1 AND content MATCH ?2 \
                    LIMIT ?3";
@@ -196,7 +189,9 @@ impl ToolOutputSandbox {
     #[must_use]
     pub fn entry_count(&self) -> usize {
         self.conn
-            .query_row("SELECT count(*) FROM tool_output_fts", [], |row| row.get::<_, i64>(0))
+            .query_row("SELECT count(*) FROM tool_output_fts", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .map(|n| n as usize)
             .unwrap_or(0)
     }
@@ -216,7 +211,14 @@ impl ToolOutputSandbox {
 
     /// Delete oldest entries when count exceeds limit (LRU).
     pub fn clear_oldest(&self, max_entries: usize) {
-        let count: i64 = self.conn.query_row("SELECT COUNT(DISTINCT call_id) FROM tool_output_fts", [], |r| r.get(0)).unwrap_or(0);
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT call_id) FROM tool_output_fts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
         if count as usize > max_entries {
             let excess = count as usize - max_entries;
             let _ = self.conn.execute(
@@ -233,16 +235,14 @@ impl ToolOutputSandbox {
 /// common English stop words and short tokens.
 fn extract_keywords(text: &str, top_n: usize) -> Vec<String> {
     let stop_words: &[&str] = &[
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "as", "into", "through", "during",
-        "before", "after", "above", "below", "between", "out", "off", "over",
-        "under", "again", "further", "then", "once", "and", "but", "or", "nor",
-        "not", "so", "yet", "both", "either", "neither", "each", "every",
-        "all", "any", "few", "more", "most", "other", "some", "such", "no",
-        "only", "own", "same", "than", "too", "very", "just", "because",
-        "this", "that", "these", "those", "it", "its",
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through",
+        "during", "before", "after", "above", "below", "between", "out", "off", "over", "under",
+        "again", "further", "then", "once", "and", "but", "or", "nor", "not", "so", "yet", "both",
+        "either", "neither", "each", "every", "all", "any", "few", "more", "most", "other", "some",
+        "such", "no", "only", "own", "same", "than", "too", "very", "just", "because", "this",
+        "that", "these", "those", "it", "its",
     ];
 
     let mut freq: HashMap<&str, usize> = HashMap::new();
@@ -295,10 +295,13 @@ mod tests {
                       info: config loaded successfully\n\
                       warning: deprecated_option at line 200\n\
                       error: timeout at line 300";
-        sandbox.index_tool_output("call_x", "bash", output, 10);
-        
+        let _ = sandbox.index_tool_output("call_x", "bash", output, 1);
+
         let results = sandbox.search("call_x", "error", 5);
-        assert!(!results.is_empty(), "should find 'error' in indexed content");
+        assert!(
+            !results.is_empty(),
+            "should find 'error' in indexed content"
+        );
     }
 
     #[test]
@@ -330,7 +333,9 @@ mod tests {
         assert!(!kws.contains(&"is".to_string()));
         // "quick" and "fox" should appear.
         let joined = kws.join(" ");
-        assert!(joined.contains("quick") || joined.contains("fox"),
-            "expected 'quick' or 'fox' in keywords: {joined}");
+        assert!(
+            joined.contains("quick") || joined.contains("fox"),
+            "expected 'quick' or 'fox' in keywords: {joined}"
+        );
     }
 }

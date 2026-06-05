@@ -1,8 +1,8 @@
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use runtime::CowdEvent;
 use memory::MemoryOrchestrator;
+use runtime::CowdEvent;
 use runtime::{MemoryCallback, ToolCallback};
 
 pub struct TuiToolCallback {
@@ -11,7 +11,10 @@ pub struct TuiToolCallback {
 }
 
 impl TuiToolCallback {
-    pub fn new(tx: mpsc::SyncSender<CowdEvent>, orchestrator: Option<Arc<MemoryOrchestrator>>) -> Self {
+    pub fn new(
+        tx: mpsc::SyncSender<CowdEvent>,
+        orchestrator: Option<Arc<MemoryOrchestrator>>,
+    ) -> Self {
         Self { tx, orchestrator }
     }
 }
@@ -122,7 +125,13 @@ mod tests {
         let cb = TuiToolCallback::new(tx, None);
         cb.on_tool_complete("t1", "bash", "files listed", Some(0));
         let event = rx.recv().unwrap();
-        if let CowdEvent::ToolComplete { id, name, summary, exit_code } = event {
+        if let CowdEvent::ToolComplete {
+            id,
+            name,
+            summary,
+            exit_code,
+        } = event
+        {
             assert_eq!(id, "t1");
             assert_eq!(name, "bash");
             assert_eq!(summary, "files listed");
@@ -150,9 +159,7 @@ mod tests {
         let (tx, rx) = crate::tui::cowd_event_channel();
         let cb = TuiToolCallback::new(tx, None);
         // Spawn a drainer that matches the producer rate
-        let _drainer = std::thread::spawn(move || {
-            while rx.recv().is_ok() {}
-        });
+        let _drainer = std::thread::spawn(move || while rx.recv().is_ok() {});
         // With backpressure, send blocks — drainer keeps channel flowing
         for _ in 0..300 {
             cb.on_tool_start("x", "y", "z");

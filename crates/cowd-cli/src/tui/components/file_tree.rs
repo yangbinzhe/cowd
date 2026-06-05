@@ -143,12 +143,10 @@ pub fn build_tree(entries: &[FileEntry]) -> Vec<FileNode> {
 }
 
 fn sort_tree_recursive(nodes: &mut [FileNode]) {
-    nodes.sort_by(|a, b| {
-        match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.cmp(&b.name),
-        }
+    nodes.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.cmp(&b.name),
     });
     for node in nodes.iter_mut() {
         sort_tree_recursive(&mut node.children);
@@ -218,11 +216,7 @@ struct VisibleNode {
 }
 
 /// Walk the tree depth-first, collecting only expanded-visible nodes.
-fn collect_visible(
-    nodes: &[FileNode],
-    ancestors_last: &[bool],
-    result: &mut Vec<VisibleNode>,
-) {
+fn collect_visible(nodes: &[FileNode], ancestors_last: &[bool], result: &mut Vec<VisibleNode>) {
     let len = nodes.len();
     for (i, node) in nodes.iter().enumerate() {
         let is_last = i == len - 1;
@@ -361,7 +355,7 @@ impl FileTree {
 
     /// Return a flattened list of visible nodes (depth-first, expanded-only).
     fn visible_nodes(&self) -> Vec<VisibleNode> {
- let mut result = Vec::new();
+        let mut result = Vec::new();
         collect_visible(&self.root_nodes, &[], &mut result);
         result
     }
@@ -456,7 +450,7 @@ impl FileTree {
         for node in nodes.iter_mut() {
             if node.path == target && node.is_dir {
                 node.is_expanded = !node.is_expanded;
- return;
+                return;
             }
             Self::toggle_path(&mut node.children, target);
         }
@@ -548,13 +542,7 @@ impl Component for FileTree {
 
 impl FileTree {
     /// Render the tree portion (left panel or full area).
-    fn render_tree(
-        &self,
-        ctx: &mut RenderContext,
-        area: Rect,
-        vis: &[VisibleNode],
-        accent: Color,
-    ) {
+    fn render_tree(&self, ctx: &mut RenderContext, area: Rect, vis: &[VisibleNode], accent: Color) {
         let mut lines: Vec<Line> = Vec::new();
 
         if vis.is_empty() {
@@ -579,7 +567,10 @@ impl FileTree {
                 let indent_len = node.indent.len().saturating_sub(4);
                 if indent_len > 0 {
                     let prefix = &node.indent[..indent_len];
-                    spans.push(Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)));
+                    spans.push(Span::styled(
+                        prefix.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
                 }
                 // Connector (last 4 chars of indent: "├── " or "└── ").
                 let connector_start = indent_len.max(0);
@@ -623,18 +614,12 @@ impl FileTree {
                         GitStatus::Renamed => Style::default().fg(Color::Magenta),
                         GitStatus::Untracked => Style::default().fg(Color::DarkGray),
                     };
-                    spans.push(Span::styled(
-                        format!(" [{}]", status.symbol()),
-                        gs_style,
-                    ));
+                    spans.push(Span::styled(format!(" [{}]", status.symbol()), gs_style));
                 }
 
                 // Expanded marker for directories.
                 if node.is_dir && node.is_expanded {
-                    spans.push(Span::styled(
-                        " [+]",
-                        Style::default().fg(Color::DarkGray),
-                    ));
+                    spans.push(Span::styled(" [+]", Style::default().fg(Color::DarkGray)));
                 }
 
                 lines.push(Line::from(spans));
@@ -658,25 +643,14 @@ impl FileTree {
     }
 
     /// Render the file preview (right panel).
-    fn render_preview(
-        &self,
-        ctx: &mut RenderContext,
-        area: Rect,
-        accent: Color,
-    ) {
-        let title = self
-            .preview_path
-            .as_deref()
-            .unwrap_or("Preview");
+    fn render_preview(&self, ctx: &mut RenderContext, area: Rect, accent: Color) {
+        let title = self.preview_path.as_deref().unwrap_or("Preview");
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} ", title))
             .border_style(Style::default().fg(accent));
 
-        let content = self
-            .preview
-            .as_deref()
-            .unwrap_or("");
+        let content = self.preview.as_deref().unwrap_or("");
         let paragraph = Paragraph::new(content)
             .block(block)
             .style(Style::default().fg(Color::White));
@@ -759,10 +733,7 @@ mod tests {
 
     #[test]
     fn build_tree_single_dir_with_files() {
-        let entries = vec![
-            f("src/main.rs", false, 256),
-            f("src/lib.rs", false, 128),
-        ];
+        let entries = vec![f("src/main.rs", false, 256), f("src/lib.rs", false, 128)];
         let tree = build_tree(&entries);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].name, "src");
@@ -896,10 +867,7 @@ mod tests {
     #[test]
     fn filetree_rebuild_populates_tree() {
         let mut ft = FileTree::new();
-        ft.rebuild(&[
-            f("a.txt", false, 10),
-            f("b.txt", false, 20),
-        ]);
+        ft.rebuild(&[f("a.txt", false, 10), f("b.txt", false, 20)]);
         assert_eq!(ft.visible_count(), 2);
     }
 
@@ -911,7 +879,7 @@ mod tests {
             f("b.txt", false, 20),
             f("c.txt", false, 30),
         ]);
- assert_eq!(ft.cursor, 0);
+        assert_eq!(ft.cursor, 0);
         ft.move_down();
         assert_eq!(ft.cursor, 1);
         ft.move_down();
@@ -929,10 +897,7 @@ mod tests {
     #[test]
     fn filetree_toggle_expand() {
         let mut ft = FileTree::new();
-        ft.rebuild(&[
-            f("src/main.rs", false, 100),
-            f("src/lib.rs", false, 80),
-        ]);
+        ft.rebuild(&[f("src/main.rs", false, 100), f("src/lib.rs", false, 80)]);
         // Initially: src (collapsed) — only 1 visible node.
         assert_eq!(ft.visible_count(), 1);
         assert_eq!(ft.visible_nodes()[0].name, "src");
@@ -949,9 +914,7 @@ mod tests {
     #[test]
     fn filetree_expand_collapse_with_l_h() {
         let mut ft = FileTree::new();
-        ft.rebuild(&[
-            f("src/main.rs", false, 100),
-        ]);
+        ft.rebuild(&[f("src/main.rs", false, 100)]);
         assert_eq!(ft.visible_count(), 1);
 
         // l expands.
@@ -969,10 +932,7 @@ mod tests {
     #[test]
     fn filetree_handle_j_k_keys() {
         let mut ft = FileTree::new();
-        ft.rebuild(&[
-            f("a.txt", false, 10),
-            f("b.txt", false, 20),
-        ]);
+        ft.rebuild(&[f("a.txt", false, 10), f("b.txt", false, 20)]);
 
         use crossterm::event::{KeyEvent, KeyModifiers};
         let j_event = Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -989,10 +949,7 @@ mod tests {
     #[test]
     fn render_file_tree_basic() {
         let mut ft = FileTree::new();
-        ft.rebuild(&[
-            f("Cargo.toml", false, 500),
-            f("README.md", false, 1024),
-        ]);
+        ft.rebuild(&[f("Cargo.toml", false, 500), f("README.md", false, 1024)]);
 
         let mut terminal = MockTerminal::new(80, 24);
         let theme = SkinConfig::default();
@@ -1009,10 +966,7 @@ mod tests {
     #[test]
     fn render_file_tree_with_nested_dirs() {
         let mut ft = FileTree::new();
-        ft.rebuild(&[
-            f("src/main.rs", false, 256),
-            f("src/lib.rs", false, 128),
-        ]);
+        ft.rebuild(&[f("src/main.rs", false, 256), f("src/lib.rs", false, 128)]);
         ft.toggle_expand();
 
         let mut terminal = MockTerminal::new(80, 24);
@@ -1045,12 +999,11 @@ mod tests {
     #[test]
     fn render_file_tree_with_git_status() {
         let mut ft = FileTree::new();
-        ft.rebuild(&[
-            f("modified.rs", false, 100),
-            f("added.rs", false, 200),
-        ]);
-        ft.git_statuses.insert("modified.rs".to_string(), GitStatus::Modified);
-        ft.git_statuses.insert("added.rs".to_string(), GitStatus::Added);
+        ft.rebuild(&[f("modified.rs", false, 100), f("added.rs", false, 200)]);
+        ft.git_statuses
+            .insert("modified.rs".to_string(), GitStatus::Modified);
+        ft.git_statuses
+            .insert("added.rs".to_string(), GitStatus::Added);
         let statuses = &ft.git_statuses;
         for node in &mut ft.root_nodes {
             apply_git_status_recursive(std::slice::from_mut(node), statuses);
@@ -1070,10 +1023,7 @@ mod tests {
     #[test]
     fn render_file_tree_selected_highlight() {
         let mut ft = FileTree::new();
-        ft.rebuild(&[
-            f("file_a.rs", false, 100),
-            f("file_b.rs", false, 200),
-        ]);
+        ft.rebuild(&[f("file_a.rs", false, 100), f("file_b.rs", false, 200)]);
         ft.move_down();
 
         let mut terminal = MockTerminal::new(80, 24);
@@ -1144,13 +1094,23 @@ mod tests {
         };
         assert_eq!(node.format_size(), "500B");
 
-        let kb_node = FileNode { size: 2048, ..node.clone() };
+        let kb_node = FileNode {
+            size: 2048,
+            ..node.clone()
+        };
         assert_eq!(kb_node.format_size(), "2KB");
 
-        let mb_node = FileNode { size: 2_097_152, ..node.clone() };
+        let mb_node = FileNode {
+            size: 2_097_152,
+            ..node.clone()
+        };
         assert!(mb_node.format_size().contains("MB"));
 
-        let dir_node = FileNode { is_dir: true, size: 0, ..node.clone() };
+        let dir_node = FileNode {
+            is_dir: true,
+            size: 0,
+            ..node.clone()
+        };
         assert_eq!(dir_node.format_size(), "");
     }
 }

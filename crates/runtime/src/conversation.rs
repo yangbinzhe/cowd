@@ -27,9 +27,9 @@ impl CancellationToken {
 
 use futures::stream::Stream;
 use memory::cognitive::CognitiveContextManager;
+use memory::coherence;
 use memory::config::MemoryConfig as CcMemoryConfig;
 use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
-use memory::coherence;
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 use tracing;
@@ -37,18 +37,14 @@ use tracing;
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
 use crate::agent_collaboration::CollaborationOps;
 use crate::agent_discussion::DiscussionEngine;
-use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
-use crate::permissions::{
-    PermissionContext, PermissionOutcome, PermissionPolicy,
-};
-use crate::session::{
-    ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog,
-};
+use crate::joint_problem_solving::{JpsOps, ProblemStatement};
+use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
+use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
 
@@ -124,9 +120,14 @@ pub trait ApiClient {
     /// Convenience: collect all events synchronously (backward compat).
     fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let stream = self.stream(request);
-        let handle = tokio::runtime::Handle::try_current()
-            .unwrap_or_else(|_| tokio::runtime::Builder::new_current_thread()
-                .enable_all().build().expect("stream_collect rt").handle().clone());
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("stream_collect rt")
+                .handle()
+                .clone()
+        });
         handle.block_on(async {
             use futures::StreamExt;
             let mut events = Vec::new();
@@ -239,7 +240,9 @@ pub struct TurnCallback {
 }
 impl TurnCallback {
     pub fn new<F: Fn(&str, &str) -> Option<String> + Send + Sync + 'static>(f: F) -> Self {
-        Self { on_tool_result: Box::new(f) }
+        Self {
+            on_tool_result: Box::new(f),
+        }
     }
 }
 
@@ -368,7 +371,9 @@ where
                         Ok(mgr) => {
                             mgr.set_active_agent("primary".to_string());
                             let mgr = mgr.init_memory_sync();
-                            tracing::debug!("memory: CognitiveContextManager initialised, active_agent=primary");
+                            tracing::debug!(
+                                "memory: CognitiveContextManager initialised, active_agent=primary"
+                            );
                             (Some(Arc::new(mgr)), None)
                         }
                         Err(err) => {
@@ -424,8 +429,11 @@ where
             coherence_threshold: feature_config.memory().coherence_threshold_bp as f32 / 10000.0,
             auto_compaction_input_tokens_threshold: {
                 let env_val = auto_compaction_threshold_from_env();
-                if env_val > 0 { env_val }
-                else { feature_config.compression().session.threshold_tokens }
+                if env_val > 0 {
+                    env_val
+                } else {
+                    feature_config.compression().session.threshold_tokens
+                }
             },
             model_context_window: 0,
             cached_prompt: crate::cached_prompt::CachedSystemPrompt::new(
@@ -450,7 +458,9 @@ where
             inject_peer_context: true,
             effect_handler: None,
             project_phase: "Discovery".to_string(),
-            gate_evaluator: Some(Arc::new(crate::gates::GateEvaluator::new().with_default_gates())),
+            gate_evaluator: Some(Arc::new(
+                crate::gates::GateEvaluator::new().with_default_gates(),
+            )),
             model: feature_config.model().map(str::to_string),
             fallbacks: feature_config.fallbacks().to_vec(),
             cancellation_token: CancellationToken::new(),
@@ -507,8 +517,13 @@ where
         self
     }
 
-    pub fn with_cached_prompt(mut self, config_path: std::path::PathBuf, identity_path: std::path::PathBuf) -> Self {
-        self.cached_prompt = crate::cached_prompt::CachedSystemPrompt::new(config_path, identity_path);
+    pub fn with_cached_prompt(
+        mut self,
+        config_path: std::path::PathBuf,
+        identity_path: std::path::PathBuf,
+    ) -> Self {
+        self.cached_prompt =
+            crate::cached_prompt::CachedSystemPrompt::new(config_path, identity_path);
         self
     }
 
@@ -547,7 +562,10 @@ where
     }
 
     #[must_use]
-    pub fn with_session_store(mut self, store: Arc<memory::session_store::UnifiedSessionStore>) -> Self {
+    pub fn with_session_store(
+        mut self,
+        store: Arc<memory::session_store::UnifiedSessionStore>,
+    ) -> Self {
         self.session_store = Some(store);
         self
     }
@@ -576,7 +594,10 @@ where
 
     /// Set the smart approval gate for intelligent command approval (P0-1).
     #[must_use]
-    pub fn with_approval_gate(mut self, gate: Arc<crate::approval_gate::SmartApprovalGate>) -> Self {
+    pub fn with_approval_gate(
+        mut self,
+        gate: Arc<crate::approval_gate::SmartApprovalGate>,
+    ) -> Self {
         self.approval_gate = Some(gate);
         self
     }
@@ -678,7 +699,10 @@ where
         self,
         hook_progress_reporter: Box<dyn HookProgressReporter + Send>,
     ) -> Self {
-        *self.hook_progress_reporter.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook_progress_reporter);
+        *self
+            .hook_progress_reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook_progress_reporter);
         self
     }
 
@@ -704,23 +728,23 @@ where
     }
 
     /// Run all commit quality gates against the current state.
-    pub fn check_commit_gates(&self, context: crate::gates::GateContext) -> Option<(bool, Vec<crate::gates::GateResult>)> {
-        self.gate_evaluator.as_ref().map(|evaluator| evaluator.evaluate_all(&context))
+    pub fn check_commit_gates(
+        &self,
+        context: crate::gates::GateContext,
+    ) -> Option<(bool, Vec<crate::gates::GateResult>)> {
+        self.gate_evaluator
+            .as_ref()
+            .map(|evaluator| evaluator.evaluate_all(&context))
     }
 
     /// Create a sub-agent runtime with independent LLM reasoning capabilities.
-    pub fn create_subagent_runtime(
-        &self,
-        config: &SubAgentConfig,
-    ) -> SubAgentRuntime<C, T>
+    pub fn create_subagent_runtime(&self, config: &SubAgentConfig) -> SubAgentRuntime<C, T>
     where
         C: Clone,
     {
         let model = config.model.clone().or_else(|| self.model.clone());
-        let filtered_prompt = filter_system_prompt_for_role(
-            &self.system_prompt,
-            &config.task_description,
-        );
+        let filtered_prompt =
+            filter_system_prompt_for_role(&self.system_prompt, &config.task_description);
         let mut sub_rt = ConversationRuntime::new_with_features(
             crate::session::Session::new(),
             self.api_client.clone(),
@@ -764,9 +788,18 @@ where
     /// Uses a simple keyword heuristic; can be upgraded to LLM-based classification.
     fn should_use_collaboration(&self, user_message: &str) -> bool {
         let multi_step_keywords = [
-            "multi-step", "parallel", "refactor", "重构",
-            "migrate", "迁移", "deploy", "部署",
-            "analyze", "分析", "implement", "实现",
+            "multi-step",
+            "parallel",
+            "refactor",
+            "重构",
+            "migrate",
+            "迁移",
+            "deploy",
+            "部署",
+            "analyze",
+            "分析",
+            "implement",
+            "实现",
         ];
         let lower = user_message.to_lowercase();
         multi_step_keywords.iter().any(|k| lower.contains(k))
@@ -782,15 +815,39 @@ where
         let lower = user_message.to_lowercase();
         let keyword_map: &[(&str, &[&str])] = &[
             ("rust", &["rust", "cargo", "borrow checker", "lifetime"]),
-            ("testing", &["test", "assert", "mock", "coverage", "fixture"]),
-            ("refactoring", &["refactor", "extract", "rename", "restructure", "clean"]),
-            ("review", &["review", "audit", "inspect", "examine", "check"]),
-            ("documentation", &["document", "doc", "readme", "explain", "describe"]),
-            ("planning", &["plan", "design", "architect", "spec", "outline"]),
-            ("execution", &["execute", "run", "build", "compile", "deploy"]),
+            (
+                "testing",
+                &["test", "assert", "mock", "coverage", "fixture"],
+            ),
+            (
+                "refactoring",
+                &["refactor", "extract", "rename", "restructure", "clean"],
+            ),
+            (
+                "review",
+                &["review", "audit", "inspect", "examine", "check"],
+            ),
+            (
+                "documentation",
+                &["document", "doc", "readme", "explain", "describe"],
+            ),
+            (
+                "planning",
+                &["plan", "design", "architect", "spec", "outline"],
+            ),
+            (
+                "execution",
+                &["execute", "run", "build", "compile", "deploy"],
+            ),
             ("debugging", &["debug", "fix", "bug", "error", "crash"]),
-            ("security", &["security", "vuln", "exploit", "injection", "xss"]),
-            ("performance", &["perf", "benchmark", "optimize", "slow", "latency"]),
+            (
+                "security",
+                &["security", "vuln", "exploit", "injection", "xss"],
+            ),
+            (
+                "performance",
+                &["perf", "benchmark", "optimize", "slow", "latency"],
+            ),
         ];
         let mut skills = Vec::new();
         for (skill, keywords) in keyword_map {
@@ -841,7 +898,13 @@ where
         }
     }
 
-    fn record_context_event(&mut self, event_type: &str, category: &str, summary: &str, priority: u8) {
+    fn record_context_event(
+        &mut self,
+        event_type: &str,
+        category: &str,
+        summary: &str,
+        priority: u8,
+    ) {
         let project_dir = std::env::current_dir()
             .ok()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
@@ -849,20 +912,24 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        self.profiler.record_dedup(crate::context_profiler::SessionEvent {
-            event_type: event_type.into(),
-            category: category.into(),
-            data_summary: summary.into(),
-            priority,
-            data_hash: 0,     // computed by record_dedup
-            timestamp,
-            project_dir,
-            attribution_confidence: 0.9,
-        });
+        self.profiler
+            .record_dedup(crate::context_profiler::SessionEvent {
+                event_type: event_type.into(),
+                category: category.into(),
+                data_summary: summary.into(),
+                priority,
+                data_hash: 0, // computed by record_dedup
+                timestamp,
+                project_dir,
+                attribution_confidence: 0.9,
+            });
     }
 
     fn run_pre_tool_use_hook(&self, tool_name: &str, input: &str) -> HookRunResult {
-        let mut reporter_guard = self.hook_progress_reporter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reporter_guard = self
+            .hook_progress_reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(reporter) = reporter_guard.as_mut() {
             self.hook_runner.run_pre_tool_use_with_context(
                 tool_name,
@@ -887,7 +954,10 @@ where
         output: &str,
         is_error: bool,
     ) -> HookRunResult {
-        let mut reporter_guard = self.hook_progress_reporter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reporter_guard = self
+            .hook_progress_reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(reporter) = reporter_guard.as_mut() {
             self.hook_runner.run_post_tool_use_with_context(
                 tool_name,
@@ -915,7 +985,10 @@ where
         input: &str,
         output: &str,
     ) -> HookRunResult {
-        let mut reporter_guard = self.hook_progress_reporter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reporter_guard = self
+            .hook_progress_reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(reporter) = reporter_guard.as_mut() {
             self.hook_runner.run_post_tool_use_failure_with_context(
                 tool_name,
@@ -939,7 +1012,9 @@ where
     /// Returns Ok(()) if healthy, Err if the session appears broken.
     fn run_session_health_probe(&mut self) -> Result<(), String> {
         // Check if we have basic session integrity
-        if self.session.blocking_read().messages.is_empty() && self.session.blocking_read().compaction.is_some() {
+        if self.session.blocking_read().messages.is_empty()
+            && self.session.blocking_read().compaction.is_some()
+        {
             // Freshly compacted with no messages - this is normal
             return Ok(());
         }
@@ -954,7 +1029,7 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-pub async fn run_turn_async(
+    pub async fn run_turn_async(
         &mut self,
         user_input: impl Into<String>,
         prompter: &crate::permissions::SharedPrompter,
@@ -964,30 +1039,45 @@ pub async fn run_turn_async(
 
         if self.session.read().await.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
-                return Err(RuntimeError::new(format!("Session health probe failed: {error}")));
+                return Err(RuntimeError::new(format!(
+                    "Session health probe failed: {error}"
+                )));
             }
         }
 
         self.record_turn_started(&user_input);
-        self.record_context_event("user_input", "user",
-            &user_input[..user_input.len().min(200)], 8);
-        self.session.write().await
+        self.record_context_event(
+            "user_input",
+            "user",
+            &user_input[..user_input.len().min(200)],
+            8,
+        );
+        self.session
+            .write()
+            .await
             .push_user_text(user_input.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-        self.dual_write_message(&ConversationMessage::user_text(user_input.clone()), self.session().messages.len().wrapping_sub(1));
+        self.dual_write_message(
+            &ConversationMessage::user_text(user_input.clone()),
+            self.session().messages.len().wrapping_sub(1),
+        );
 
         let mut effective_system_prompt = self.prepare_memory_context(&user_input).await;
 
         // A2: Inject available peer agents from AgentDirectory into the system prompt.
         if self.inject_peer_context {
-            let active_agents = memory::agent_directory::AgentDirectory::global()
-                .list_active();
-            let peers: Vec<String> = active_agents.iter()
+            let active_agents = memory::agent_directory::AgentDirectory::global().list_active();
+            let peers: Vec<String> = active_agents
+                .iter()
                 .filter(|a| a.agent_id != self.session().session_id)
-                .map(|a| format!("  - {} (role: {}, capabilities: {:?})",
-                    &a.agent_id[..std::cmp::min(8, a.agent_id.len())],
-                    a.role,
-                    a.capabilities))
+                .map(|a| {
+                    format!(
+                        "  - {} (role: {}, capabilities: {:?})",
+                        &a.agent_id[..std::cmp::min(8, a.agent_id.len())],
+                        a.role,
+                        a.capabilities
+                    )
+                })
                 .collect();
             if !peers.is_empty() {
                 effective_system_prompt.push(format!(
@@ -1016,9 +1106,11 @@ pub async fn run_turn_async(
             }
 
             if self.auto_compaction_input_tokens_threshold > 0
-                && estimate_session_tokens(&*self.session.read().await) > self.auto_compaction_input_tokens_threshold as usize
+                && estimate_session_tokens(&*self.session.read().await)
+                    > self.auto_compaction_input_tokens_threshold as usize
             {
-                let result = compact_session(&*self.session.read().await, CompactionConfig::default());
+                let result =
+                    compact_session(&*self.session.read().await, CompactionConfig::default());
                 if result.removed_message_count > 0 {
                     let compacted_len = result.compacted_session.messages.len();
                     *self.session.write().await = result.compacted_session;
@@ -1046,11 +1138,10 @@ pub async fn run_turn_async(
                 model: String::new(), // filled by fallback loop below
             };
 
-            let mut model_list: Vec<String> = std::iter::once(
-                self.model.as_deref().unwrap_or("").to_string(),
-            )
-            .chain(self.fallbacks.clone())
-            .collect();
+            let mut model_list: Vec<String> =
+                std::iter::once(self.model.as_deref().unwrap_or("").to_string())
+                    .chain(self.fallbacks.clone())
+                    .collect();
             // dedup in case primary also appears in fallbacks
             model_list.dedup();
 
@@ -1086,27 +1177,32 @@ pub async fn run_turn_async(
                                 return Err(RuntimeError::new("conversation cancelled"));
                             }
                             // T31: Enforce a 120-second timeout on each stream chunk.
-                            let next_event = match tokio::time::timeout(
-                                Duration::from_secs(120),
-                                stream.next(),
-                            )
-                            .await
-                            {
-                                Ok(Some(event)) => event,
-                                Ok(None) => break,
-                                Err(_) => {
-                                    return Err(RuntimeError::new(
-                                        "stream timed out after 120s",
-                                    ));
-                                }
-                            };
+                            let next_event =
+                                match tokio::time::timeout(Duration::from_secs(120), stream.next())
+                                    .await
+                                {
+                                    Ok(Some(event)) => event,
+                                    Ok(None) => break,
+                                    Err(_) => {
+                                        return Err(RuntimeError::new(
+                                            "stream timed out after 120s",
+                                        ));
+                                    }
+                                };
                             match next_event {
                                 Ok(AssistantEvent::TextDelta(text)) => {
                                     model_current_text.push_str(&text);
                                     if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::TextDelta { text: text.clone() });
+                                        cowd.emit(crate::cowd_event::CowdEvent::TextDelta {
+                                            text: text.clone(),
+                                        });
                                     }
-                                    model_stream_events.push(("text_delta".into(), "assistant".into(), text[..text.len().min(80)].to_string(), 3));
+                                    model_stream_events.push((
+                                        "text_delta".into(),
+                                        "assistant".into(),
+                                        text[..text.len().min(80)].to_string(),
+                                        3,
+                                    ));
                                     if let Some(ref cb) = self.sse_callback {
                                         let json = serde_json::json!({
                                             "type": "TextDelta",
@@ -1117,7 +1213,12 @@ pub async fn run_turn_async(
                                 }
                                 Ok(AssistantEvent::ThinkingDelta(thinking)) => {
                                     model_thinking_text.push_str(&thinking);
-                                    model_stream_events.push(("thinking".into(), "reasoning".into(), thinking[..thinking.len().min(80)].to_string(), 2));
+                                    model_stream_events.push((
+                                        "thinking".into(),
+                                        "reasoning".into(),
+                                        thinking[..thinking.len().min(80)].to_string(),
+                                        2,
+                                    ));
                                     if let Some(ref cb) = self.sse_callback {
                                         let json = serde_json::json!({
                                             "type": "ThinkingDelta",
@@ -1126,7 +1227,9 @@ pub async fn run_turn_async(
                                         cb(json.to_string());
                                     }
                                     if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ThinkingDelta { thinking: thinking.clone() });
+                                        cowd.emit(crate::cowd_event::CowdEvent::ThinkingDelta {
+                                            thinking: thinking.clone(),
+                                        });
                                     }
                                 }
                                 Ok(AssistantEvent::SignatureDelta(signature)) => {
@@ -1153,7 +1256,11 @@ pub async fn run_turn_async(
                                         cb(json.to_string());
                                     }
                                     if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ToolStart { id: id.clone(), name: name.clone(), preview: preview.clone() });
+                                        cowd.emit(crate::cowd_event::CowdEvent::ToolStart {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            preview: preview.clone(),
+                                        });
                                     }
                                 }
                                 Ok(AssistantEvent::ToolProgress { id, name, progress }) => {
@@ -1170,15 +1277,29 @@ pub async fn run_turn_async(
                                         cb(json.to_string());
                                     }
                                     if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ToolProgress { id: id.clone(), name: name.clone(), progress: progress.clone() });
+                                        cowd.emit(crate::cowd_event::CowdEvent::ToolProgress {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            progress: progress.clone(),
+                                        });
                                     }
                                 }
                                 Ok(AssistantEvent::PromptCache(event)) => {
                                     prompt_cache_events.push(event);
                                 }
-                                Ok(AssistantEvent::ToolComplete { id, name, result_summary, exit_code }) => {
+                                Ok(AssistantEvent::ToolComplete {
+                                    id,
+                                    name,
+                                    result_summary,
+                                    exit_code,
+                                }) => {
                                     if let Some(callback) = &self.tool_callback {
-                                        callback.on_tool_complete(&id, &name, &result_summary, exit_code);
+                                        callback.on_tool_complete(
+                                            &id,
+                                            &name,
+                                            &result_summary,
+                                            exit_code,
+                                        );
                                     }
                                     if let Some(ref cb) = self.sse_callback {
                                         let json = serde_json::json!({
@@ -1191,7 +1312,12 @@ pub async fn run_turn_async(
                                         cb(json.to_string());
                                     }
                                     if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ToolComplete { id: id.clone(), name: name.clone(), summary: result_summary.clone(), exit_code });
+                                        cowd.emit(crate::cowd_event::CowdEvent::ToolComplete {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            summary: result_summary.clone(),
+                                            exit_code,
+                                        });
                                     }
                                 }
                                 Ok(_) => {}
@@ -1205,7 +1331,10 @@ pub async fn run_turn_async(
                                         ))
                                         .await;
                                         if attempt == max_retries - 1 {
-                                            tracing::warn!(model, "exhausted retries, switching fallback");
+                                            tracing::warn!(
+                                                model,
+                                                "exhausted retries, switching fallback"
+                                            );
                                         }
                                         failed = true;
                                         stream_error = Some(e);
@@ -1237,7 +1366,8 @@ pub async fn run_turn_async(
             };
 
             if !stream_success {
-                return Err(stream_error.unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")));
+                return Err(stream_error
+                    .unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")));
             }
 
             // Flush buffered stream events into context profiler
@@ -1255,8 +1385,15 @@ pub async fn run_turn_async(
             // Build assistant message with text + tool_use blocks
             let mut blocks = Vec::new();
             if !thinking_text.is_empty() {
-                blocks.push(ContentBlock::Thinking { thinking: thinking_text.clone(), signature: thinking_signature.clone() });
-                tracing::debug!(thinking_len = thinking_text.len(), has_signature = thinking_signature.is_some(), "thinking block stored");
+                blocks.push(ContentBlock::Thinking {
+                    thinking: thinking_text.clone(),
+                    signature: thinking_signature.clone(),
+                });
+                tracing::debug!(
+                    thinking_len = thinking_text.len(),
+                    has_signature = thinking_signature.is_some(),
+                    "thinking block stored"
+                );
             }
             blocks.push(ContentBlock::Text { text: current_text });
             for (id, name, input) in &pending_tool_uses {
@@ -1267,10 +1404,20 @@ pub async fn run_turn_async(
                 });
             }
             let role = crate::session::MessageRole::Assistant;
-            let assistant_msg = ConversationMessage { role, blocks, usage: turn_usage };
-            self.session.write().await.push_message(assistant_msg.clone())
+            let assistant_msg = ConversationMessage {
+                role,
+                blocks,
+                usage: turn_usage,
+            };
+            self.session
+                .write()
+                .await
+                .push_message(assistant_msg.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            self.dual_write_message(&assistant_msg, self.session().messages.len().wrapping_sub(1));
+            self.dual_write_message(
+                &assistant_msg,
+                self.session().messages.len().wrapping_sub(1),
+            );
             self.record_assistant_iteration(iterations, &assistant_msg, pending_tool_uses.len());
             assistant_messages.push(assistant_msg);
 
@@ -1281,26 +1428,38 @@ pub async fn run_turn_async(
             // Phase 2: Parallel+serial tool dispatch based on safety categories
             let mut callback_inject = None;
             {
+                use crate::tool_dispatch::{categorize, ToolRequest};
                 use futures::stream::{FuturesUnordered, StreamExt};
-                use crate::tool_dispatch::{ToolRequest, categorize};
 
-                let requests: Vec<ToolRequest> = pending_tool_uses.iter().map(|(id, name, input)| {
-                    ToolRequest { tool_use_id: id.clone(), tool_name: name.clone(), input: input.clone(), depends_on: Vec::new() }
-                }).collect();
-                let ordered_ids: Vec<String> = requests.iter().map(|r| r.tool_use_id.clone()).collect();
+                let requests: Vec<ToolRequest> = pending_tool_uses
+                    .iter()
+                    .map(|(id, name, input)| ToolRequest {
+                        tool_use_id: id.clone(),
+                        tool_name: name.clone(),
+                        input: input.clone(),
+                        depends_on: Vec::new(),
+                    })
+                    .collect();
+                let ordered_ids: Vec<String> =
+                    requests.iter().map(|r| r.tool_use_id.clone()).collect();
                 let (read_indices, rest_indices) = categorize(&requests);
 
-                let mut result_map: std::collections::HashMap<String, (ConversationMessage, Option<String>)> =
-                    std::collections::HashMap::new();
+                let mut result_map: std::collections::HashMap<
+                    String,
+                    (ConversationMessage, Option<String>),
+                > = std::collections::HashMap::new();
 
                 // T7: Wave-based execution for tools with dependency relationships
-                let wave_task_indices: Vec<usize> = requests.iter().enumerate()
+                let wave_task_indices: Vec<usize> = requests
+                    .iter()
+                    .enumerate()
                     .filter(|(_, req)| !req.depends_on.is_empty())
                     .map(|(i, _)| i)
                     .collect();
 
                 let (read_indices, rest_indices) = if !wave_task_indices.is_empty() {
-                    let wave_set: std::collections::HashSet<usize> = wave_task_indices.iter().cloned().collect();
+                    let wave_set: std::collections::HashSet<usize> =
+                        wave_task_indices.iter().cloned().collect();
                     let mut wave = crate::wave::WaveOrchestrator::new()
                         .with_config(crate::wave::WaveConfig::default().with_max_parallel(8));
 
@@ -1308,26 +1467,41 @@ pub async fn run_turn_async(
                         let task = self.detect_wave_task(&requests[idx]).unwrap();
                         wave.add_task(task);
                     }
-                    wave.build_waves().map_err(|e: crate::wave::WaveError| RuntimeError::new(e.to_string()))?;
+                    wave.build_waves()
+                        .map_err(|e: crate::wave::WaveError| RuntimeError::new(e.to_string()))?;
 
                     let wave_exec = ToolWaveExecutor::new(Arc::clone(&self.tool_executor));
-                    let wave_results = wave.execute(wave_exec).await
+                    let wave_results = wave
+                        .execute(wave_exec)
+                        .await
                         .map_err(|e: crate::wave::WaveError| RuntimeError::new(e.to_string()))?;
 
                     for wresult in wave_results {
                         for tres in wresult.task_results {
                             let tid = tres.task_id.0.clone();
                             let req = requests.iter().find(|r| r.tool_use_id == tid);
-                            let tool_name_str = req.map_or("unknown", |r| r.tool_name.as_str()).to_string();
-                            let output = tres.output.clone().unwrap_or_else(|| tres.error.clone().unwrap_or_default());
+                            let tool_name_str =
+                                req.map_or("unknown", |r| r.tool_name.as_str()).to_string();
+                            let output = tres
+                                .output
+                                .clone()
+                                .unwrap_or_else(|| tres.error.clone().unwrap_or_default());
                             let is_error = !tres.success;
                             let msg = ConversationMessage::tool_result(
-                                tid.clone(), tool_name_str.clone(), output, is_error,
+                                tid.clone(),
+                                tool_name_str.clone(),
+                                output,
+                                is_error,
                             );
-                            self.session.write().await
+                            self.session
+                                .write()
+                                .await
                                 .push_message(msg.clone())
                                 .map_err(|e| RuntimeError::new(e.to_string()))?;
-                            self.dual_write_message(&msg, self.session().messages.len().wrapping_sub(1));
+                            self.dual_write_message(
+                                &msg,
+                                self.session().messages.len().wrapping_sub(1),
+                            );
                             let inject = self.turn_callback.as_ref().and_then(|cb| {
                                 let out = tres.output.as_deref().unwrap_or("");
                                 (cb.on_tool_result)(&tool_name_str, out)
@@ -1337,8 +1511,14 @@ pub async fn run_turn_async(
                     }
 
                     // Filter wave tasks out of read/rest indices for remaining dispatch
-                    let read: Vec<usize> = read_indices.into_iter().filter(|i| !wave_set.contains(i)).collect();
-                    let rest: Vec<usize> = rest_indices.into_iter().filter(|i| !wave_set.contains(i)).collect();
+                    let read: Vec<usize> = read_indices
+                        .into_iter()
+                        .filter(|i| !wave_set.contains(i))
+                        .collect();
+                    let rest: Vec<usize> = rest_indices
+                        .into_iter()
+                        .filter(|i| !wave_set.contains(i))
+                        .collect();
                     (read, rest)
                 } else {
                     (read_indices, rest_indices)
@@ -1348,19 +1528,24 @@ pub async fn run_turn_async(
                     let mut futs = FuturesUnordered::new();
                     for &idx in &read_indices {
                         let (ref tid, ref tname, ref tinput) = pending_tool_uses[idx];
-                        futs.push(self.execute_single_tool(
-                            tid, tname, tinput,
-                            prompter, iterations,
-                        ));
+                        futs.push(
+                            self.execute_single_tool(tid, tname, tinput, prompter, iterations),
+                        );
                     }
                     while let Some(result) = futs.next().await {
                         let msg = result?;
                         let (msg_id, tool_name_str) = extract_tool_info(&msg);
                         let inject = if let Some(ref cb) = self.turn_callback {
-                            let output = msg.blocks.first().and_then(|b| match b {
-                                ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
-                                _ => None,
-                            }).unwrap_or("");
+                            let output = msg
+                                .blocks
+                                .first()
+                                .and_then(|b| match b {
+                                    ContentBlock::ToolResult { output, .. } => {
+                                        Some(output.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or("");
                             (cb.on_tool_result)(&tool_name_str, output)
                         } else {
                             None
@@ -1372,22 +1557,31 @@ pub async fn run_turn_async(
                 for &idx in &rest_indices {
                     let (ref tool_use_id, ref tool_name, ref input) = pending_tool_uses[idx];
                     let sem = match self.tool_orchestrator.classify(tool_name) {
-                        crate::tool_orchestrator::ToolSafetyCategory::WriteLocal => &self.write_semaphore,
-                        crate::tool_orchestrator::ToolSafetyCategory::Network => &self.network_semaphore,
-                        crate::tool_orchestrator::ToolSafetyCategory::Destructive => &self.destructive_semaphore,
+                        crate::tool_orchestrator::ToolSafetyCategory::WriteLocal => {
+                            &self.write_semaphore
+                        }
+                        crate::tool_orchestrator::ToolSafetyCategory::Network => {
+                            &self.network_semaphore
+                        }
+                        crate::tool_orchestrator::ToolSafetyCategory::Destructive => {
+                            &self.destructive_semaphore
+                        }
                         _ => &self.default_semaphore,
                     };
                     let _permit = sem.acquire().await.unwrap();
-                    let result_msg = self.execute_single_tool(
-                        tool_use_id, tool_name, input,
-                        prompter, iterations,
-                    ).await?;
+                    let result_msg = self
+                        .execute_single_tool(tool_use_id, tool_name, input, prompter, iterations)
+                        .await?;
                     drop(_permit);
                     let inject = if let Some(ref cb) = self.turn_callback {
-                        let output = result_msg.blocks.first().and_then(|b| match b {
-                            ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
-                            _ => None,
-                        }).unwrap_or("");
+                        let output = result_msg
+                            .blocks
+                            .first()
+                            .and_then(|b| match b {
+                                ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or("");
                         (cb.on_tool_result)(tool_name, output)
                     } else {
                         None
@@ -1398,12 +1592,22 @@ pub async fn run_turn_async(
 
                 for id in &ordered_ids {
                     if let Some((msg, inject)) = result_map.remove(id) {
-                        let tool_name_str = msg.blocks.first().and_then(|b| match b {
-                            ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
-                            _ => None,
-                        }).unwrap_or("unknown");
-                        self.record_context_event("tool_use", "tool",
-                            &format!("{}: {}", tool_name_str, ""), 5);
+                        let tool_name_str = msg
+                            .blocks
+                            .first()
+                            .and_then(|b| match b {
+                                ContentBlock::ToolResult { tool_name, .. } => {
+                                    Some(tool_name.as_str())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or("unknown");
+                        self.record_context_event(
+                            "tool_use",
+                            "tool",
+                            &format!("{}: {}", tool_name_str, ""),
+                            5,
+                        );
                         if let Some(new_input) = inject {
                             callback_inject = Some(new_input);
                         }
@@ -1413,8 +1617,15 @@ pub async fn run_turn_async(
             }
             if let Some(inject) = callback_inject {
                 let inject_text = inject.clone();
-                self.session.write().await.push_user_text(inject).map_err(|e| RuntimeError::new(e.to_string()))?;
-                self.dual_write_message(&ConversationMessage::user_text(inject_text), self.session().messages.len().wrapping_sub(1));
+                self.session
+                    .write()
+                    .await
+                    .push_user_text(inject)
+                    .map_err(|e| RuntimeError::new(e.to_string()))?;
+                self.dual_write_message(
+                    &ConversationMessage::user_text(inject_text),
+                    self.session().messages.len().wrapping_sub(1),
+                );
                 continue; // continue loop with injected input
             }
         }
@@ -1443,20 +1654,15 @@ pub async fn run_turn_async(
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    let participants = vec![
-                        memory::agent_directory::AgentInfo {
-                            agent_id: "primary".to_string(),
-                            role: "Resolver".to_string(),
-                            capabilities: vec![
-                                "conflict-resolution".to_string(),
-                                "memory".to_string(),
-                            ],
-                            status: memory::agent_directory::AgentStatus::Active,
-                            registered_at_ms: now_ms,
-                            last_heartbeat_ms: 0,
-                            reputation: None,
-                        },
-                    ];
+                    let participants = vec![memory::agent_directory::AgentInfo {
+                        agent_id: "primary".to_string(),
+                        role: "Resolver".to_string(),
+                        capabilities: vec!["conflict-resolution".to_string(), "memory".to_string()],
+                        status: memory::agent_directory::AgentStatus::Active,
+                        registered_at_ms: now_ms,
+                        last_heartbeat_ms: 0,
+                        reputation: None,
+                    }];
 
                     // Drop the lock before async operations
                     drop(engine);
@@ -1531,11 +1737,15 @@ pub async fn run_turn_async(
 
         // A4: Trigger multi-agent collaboration for complex tasks.
         if let Some(ref collab) = self.collaboration {
-            let last_user_msg = self.session().messages.iter()
+            let last_user_msg = self
+                .session()
+                .messages
+                .iter()
                 .rev()
                 .find(|m| matches!(m.role, crate::session::MessageRole::User))
                 .map(|m| {
-                    m.blocks.iter()
+                    m.blocks
+                        .iter()
                         .filter_map(|b| match b {
                             ContentBlock::Text { text } => Some(text.as_str()),
                             _ => None,
@@ -1553,9 +1763,7 @@ pub async fn run_turn_async(
                     let skills_clone = skills.clone();
                     let memory = self.memory_manager().cloned();
 
-                    if let Some(synthesis) = collab_clone
-                        .run_boxed(&task, &skills_clone).await
-                    {
+                    if let Some(synthesis) = collab_clone.run_boxed(&task, &skills_clone).await {
                         tracing::info!(
                             synthesis_len = synthesis.len(),
                             skills = ?skills_clone,
@@ -1568,8 +1776,10 @@ pub async fn run_turn_async(
                                 category: memory::types::MemoryCategory::Shared,
                                 priority: memory::types::Priority::Normal,
                                 source: memory::types::MemorySource::Import,
-                                title: format!("collaboration-synthesis: {}",
-                                    &task[..task.len().min(80)]),
+                                title: format!(
+                                    "collaboration-synthesis: {}",
+                                    &task[..task.len().min(80)]
+                                ),
                                 content: synthesis,
                                 embedding: None,
                                 tags: vec!["collaboration".to_string(), "synthesis".to_string()],
@@ -1604,7 +1814,10 @@ pub async fn run_turn_async(
                     let problem = ProblemStatement::new(last_user_msg);
                     match jps.run_boxed(problem).await {
                         Some(result) => {
-                            tracing::info!(solutions_count = result.solutions.len(), "JPS pipeline completed");
+                            tracing::info!(
+                                solutions_count = result.solutions.len(),
+                                "JPS pipeline completed"
+                            );
                         }
                         None => {
                             tracing::info!("JPS pipeline returned no solution");
@@ -1622,10 +1835,11 @@ pub async fn run_turn_async(
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
         };
-self.record_turn_completed(&summary);
+        self.record_turn_completed(&summary);
         tracing::info!(iterations = %summary.iterations, tokens = %summary.usage.total_tokens(), "turn completed");
         if let Some(ref cowd) = self.cowd_bus {
-            let assistant_text = summary.assistant_messages
+            let assistant_text = summary
+                .assistant_messages
                 .iter()
                 .flat_map(|m| m.blocks.iter())
                 .filter_map(|b| match b {
@@ -1679,11 +1893,17 @@ self.record_turn_completed(&summary);
             }
         } else if let Some(prompt) = prompter.lock().as_mut() {
             self.permission_policy.authorize_with_context(
-                tool_name, &effective_input, &permission_context, Some(prompt.as_mut()),
+                tool_name,
+                &effective_input,
+                &permission_context,
+                Some(prompt.as_mut()),
             )
         } else {
             self.permission_policy.authorize_with_context(
-                tool_name, &effective_input, &permission_context, None,
+                tool_name,
+                &effective_input,
+                &permission_context,
+                None,
             )
         };
 
@@ -1692,13 +1912,23 @@ self.record_turn_completed(&summary);
                 // Smart approval gate check
                 if let Some(gate) = &self.approval_gate {
                     let gate_result = gate.evaluate(tool_name, &effective_input).await;
-                    if let crate::approval_gate::ApprovalGateResult::Denied { reason } = gate_result {
+                    if let crate::approval_gate::ApprovalGateResult::Denied { reason } = gate_result
+                    {
                         let denied = ConversationMessage::tool_result(
-                            tool_use_id.to_string(), tool_name.to_string(), reason, true,
+                            tool_use_id.to_string(),
+                            tool_name.to_string(),
+                            reason,
+                            true,
                         );
-                        self.session.write().await.push_message(denied.clone())
+                        self.session
+                            .write()
+                            .await
+                            .push_message(denied.clone())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        self.dual_write_message(&denied, self.session().messages.len().wrapping_sub(1));
+                        self.dual_write_message(
+                            &denied,
+                            self.session().messages.len().wrapping_sub(1),
+                        );
                         return Ok(denied);
                     }
                 }
@@ -1728,7 +1958,10 @@ self.record_turn_completed(&summary);
                             .map(|r| {
                                 let mut msg = format!("[{}] {}", r.gate_name, r.message);
                                 if !r.suggestions.is_empty() {
-                                    msg.push_str(&format!(" Suggestions: {}", r.suggestions.join(", ")));
+                                    msg.push_str(&format!(
+                                        " Suggestions: {}",
+                                        r.suggestions.join(", ")
+                                    ));
                                 }
                                 msg
                             })
@@ -1739,9 +1972,15 @@ self.record_turn_completed(&summary);
                             format!("Gate check failed: {}", reasons.join("; ")),
                             true,
                         );
-                        self.session.write().await.push_message(denied.clone())
+                        self.session
+                            .write()
+                            .await
+                            .push_message(denied.clone())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        self.dual_write_message(&denied, self.session().messages.len().wrapping_sub(1));
+                        self.dual_write_message(
+                            &denied,
+                            self.session().messages.len().wrapping_sub(1),
+                        );
                         return Ok(denied);
                     }
                 }
@@ -1755,10 +1994,15 @@ self.record_turn_completed(&summary);
 
                 // P2-10: EffectHandler interceptor — use mock result if available
                 let effect_mock = self.effect_handler.as_ref().and_then(|handler| {
-                    let r = handler.handle(
-                        crate::effect::Effect::ExecuteTool(tool_name.to_string(), effective_input.clone())
-                    );
-                    if r.success { Some(r.data) } else { None }
+                    let r = handler.handle(crate::effect::Effect::ExecuteTool(
+                        tool_name.to_string(),
+                        effective_input.clone(),
+                    ));
+                    if r.success {
+                        Some(r.data)
+                    } else {
+                        None
+                    }
                 });
 
                 let start = Instant::now();
@@ -1772,24 +2016,35 @@ self.record_turn_completed(&summary);
                     // Per-tool timeout: check registry for per-tool override or category default,
                     // then cap with the global self.tool_timeout if set.
                     let registry_timeout = Duration::from_secs(
-                        crate::tool_orchestrator::ToolSafetyRegistry::global().get_timeout_secs(tool_name)
+                        crate::tool_orchestrator::ToolSafetyRegistry::global()
+                            .get_timeout_secs(tool_name),
                     );
-                    let tool_timeout = self.tool_timeout
+                    let tool_timeout = self
+                        .tool_timeout
                         .map_or(registry_timeout, |t| t.min(registry_timeout));
-                    match tokio::time::timeout(tool_timeout, tokio::task::spawn_blocking(move || {
-                        tool_exec.execute(&tname, &tinput)
-                    })).await {
+                    match tokio::time::timeout(
+                        tool_timeout,
+                        tokio::task::spawn_blocking(move || tool_exec.execute(&tname, &tinput)),
+                    )
+                    .await
+                    {
                         Ok(Ok(Ok(output))) => (output, false),
                         Ok(Ok(Err(error))) => (error.to_string(), true),
-                        Ok(Err(join_error)) => (format!("tool execution panicked: {join_error}"), true),
+                        Ok(Err(join_error)) => {
+                            (format!("tool execution panicked: {join_error}"), true)
+                        }
                         Err(_elapsed) => {
                             tracing::warn!(tool = %tname_for_err, timeout_secs = tool_timeout.as_secs(), "tool execution timed out, returning partial result");
-                            (format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"), true)
-                        },
+                            (
+                                format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"),
+                                true,
+                            )
+                        }
                     }
                 };
                 let elapsed_ms = start.elapsed().as_millis() as u64;
-                self.hook_runner.fire_post_tool(tool_name, &output, is_error, elapsed_ms);
+                self.hook_runner
+                    .fire_post_tool(tool_name, &output, is_error, elapsed_ms);
 
                 if let Some(callback) = &self.tool_callback {
                     let summary: String = output.chars().take(500).collect();
@@ -1802,13 +2057,19 @@ self.record_turn_completed(&summary);
                 } else {
                     self.run_post_tool_use_hook(tool_name, &effective_input, &output, false)
                 };
-                if post_hook_result.is_denied() || post_hook_result.is_failed() || post_hook_result.is_cancelled() {
+                if post_hook_result.is_denied()
+                    || post_hook_result.is_failed()
+                    || post_hook_result.is_cancelled()
+                {
                     is_error = true;
                 }
 
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 if let Some(ref cowd) = self.cowd_bus {
-                    cowd.emit(crate::cowd_event::CowdEvent::ToolExecuted { name: tool_name.to_string(), duration_ms: elapsed_ms });
+                    cowd.emit(crate::cowd_event::CowdEvent::ToolExecuted {
+                        name: tool_name.to_string(),
+                        duration_ms: elapsed_ms,
+                    });
                 }
 
                 // T36: Truncate oversized tool results before storing.
@@ -1824,9 +2085,15 @@ self.record_turn_completed(&summary);
                 }
                 let truncated = self.tool_orchestrator.truncate_result(&combined);
                 let result = ConversationMessage::tool_result(
-                    tool_use_id.to_string(), tool_name.to_string(), truncated, is_error,
+                    tool_use_id.to_string(),
+                    tool_name.to_string(),
+                    truncated,
+                    is_error,
                 );
-                self.session.write().await.push_message(result.clone())
+                self.session
+                    .write()
+                    .await
+                    .push_message(result.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.dual_write_message(&result, self.session().messages.len().wrapping_sub(1));
                 self.record_tool_finished(iterations, &result);
@@ -1834,9 +2101,15 @@ self.record_turn_completed(&summary);
             }
             PermissionOutcome::Deny { reason } => {
                 let denied = ConversationMessage::tool_result(
-                    tool_use_id.to_string(), tool_name.to_string(), reason, true,
+                    tool_use_id.to_string(),
+                    tool_name.to_string(),
+                    reason,
+                    true,
                 );
-                self.session.write().await.push_message(denied.clone())
+                self.session
+                    .write()
+                    .await
+                    .push_message(denied.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.dual_write_message(&denied, self.session().messages.len().wrapping_sub(1));
                 Ok(denied)
@@ -1884,9 +2157,7 @@ self.record_turn_completed(&summary);
 
     #[must_use]
     pub fn session(&self) -> Session {
-        tokio::task::block_in_place(|| {
-            self.session.blocking_read().clone()
-        })
+        tokio::task::block_in_place(|| self.session.blocking_read().clone())
     }
 
     pub fn api_client_mut(&mut self) -> &mut C {
@@ -1908,7 +2179,9 @@ self.record_turn_completed(&summary);
 
     #[must_use]
     pub fn into_session(self) -> Session {
-        Arc::try_unwrap(self.session).map(|lock| lock.into_inner()).unwrap_or_else(|arc| arc.blocking_read().clone())
+        Arc::try_unwrap(self.session)
+            .map(|lock| lock.into_inner())
+            .unwrap_or_else(|arc| arc.blocking_read().clone())
     }
 
     async fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
@@ -1924,7 +2197,9 @@ self.record_turn_completed(&summary);
         let result = compact_session(
             &*self.session.read().await,
             CompactionConfig {
-                max_estimated_tokens: 0, priority_threshold: 3, keep_high_priority: true,
+                max_estimated_tokens: 0,
+                priority_threshold: 3,
+                keep_high_priority: true,
                 ..CompactionConfig::default()
             },
         );
@@ -2088,7 +2363,9 @@ self.record_turn_completed(&summary);
         // Tool execution results are machine-optimised data, not knowledge worth retaining
         // in long-term memory (they can be re-derived by re-running the tool).
         let mem_messages: Vec<MemMessage> = self
-            .session.read().await
+            .session
+            .read()
+            .await
             .messages
             .iter()
             .enumerate()
@@ -2115,11 +2392,15 @@ self.record_turn_completed(&summary);
                 let (tool_use_id, tool_name) = match msg.role {
                     crate::session::MessageRole::Tool => {
                         let tid = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                            ContentBlock::ToolResult { tool_use_id, .. } => {
+                                Some(tool_use_id.clone())
+                            }
                             _ => None,
                         });
                         let tname = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => Some(tool_name.clone()),
+                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => {
+                                Some(tool_name.clone())
+                            }
                             _ => None,
                         });
                         (tid, tname)
@@ -2139,7 +2420,10 @@ self.record_turn_completed(&summary);
 
         let session_id = self.session().session_id;
         mgr.set_active_session(session_id.clone());
-        match mgr.prepare_context(user_input, &mem_messages, Some(&session_id)).await {
+        match mgr
+            .prepare_context(user_input, &mem_messages, Some(&session_id))
+            .await
+        {
             Ok(mut prepared) => {
                 if prepared.entries.is_empty() {
                     tracing::debug!(entries = 0, "memory context prepared");
@@ -2158,19 +2442,35 @@ self.record_turn_completed(&summary);
                 use memory::types::MemoryLayer;
                 // P1-1: Coherence filtering — Jaccard similarity against current query
                 let threshold = self.coherence_threshold;
-                let relevant: Vec<_> = prepared.entries.iter()
-                    .filter(|e| coherence::is_relevant(&e.content, user_input, threshold, matches!(e.layer, MemoryLayer::L0)))
+                let relevant: Vec<_> = prepared
+                    .entries
+                    .iter()
+                    .filter(|e| {
+                        coherence::is_relevant(
+                            &e.content,
+                            user_input,
+                            threshold,
+                            matches!(e.layer, MemoryLayer::L0),
+                        )
+                    })
                     .cloned()
                     .collect();
-                if !relevant.is_empty() { prepared.entries = relevant; }
+                if !relevant.is_empty() {
+                    prepared.entries = relevant;
+                }
                 prepared.entries.sort_by(|a, b| {
                     let layer_rank = |l: MemoryLayer| match l {
-                        MemoryLayer::L0 => 5, MemoryLayer::L1 => 4,
-                        MemoryLayer::L2 => 3, MemoryLayer::L3 => 2, MemoryLayer::L4 => 1,
+                        MemoryLayer::L0 => 5,
+                        MemoryLayer::L1 => 4,
+                        MemoryLayer::L2 => 3,
+                        MemoryLayer::L3 => 2,
+                        MemoryLayer::L4 => 1,
                     };
-                    layer_rank(b.layer)
-                        .cmp(&layer_rank(a.layer))
-                        .then(b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
+                    layer_rank(b.layer).cmp(&layer_rank(a.layer)).then(
+                        b.confidence
+                            .partial_cmp(&a.confidence)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
                 });
 
                 let budget = prepared.budget.available.min(8000);
@@ -2180,9 +2480,14 @@ self.record_turn_completed(&summary);
 
                 // P5.2: Build per-layer entry fragments with per-layer staleness checks.
                 use crate::cached_prompt::CacheLayer;
-                let mut entries_by_layer: std::collections::HashMap<CacheLayer, Vec<&memory::types::MemoryEntry>> = std::collections::HashMap::new();
+                let mut entries_by_layer: std::collections::HashMap<
+                    CacheLayer,
+                    Vec<&memory::types::MemoryEntry>,
+                > = std::collections::HashMap::new();
                 for entry in &prepared.entries {
-                    if used >= budget { break; }
+                    if used >= budget {
+                        break;
+                    }
                     let tokens = (entry.title.len() + entry.content.len()) as u64 / 4;
                     used += tokens;
                     let cl = match entry.layer {
@@ -2203,15 +2508,19 @@ self.record_turn_completed(&summary);
                         let mut layer_text = String::new();
                         for entry in &entries {
                             let layer_tag = match entry.layer {
-                                MemoryLayer::L0 => "identity", MemoryLayer::L1 => "working",
-                                MemoryLayer::L2 => "project", MemoryLayer::L3 => "recall", MemoryLayer::L4 => "raw",
+                                MemoryLayer::L0 => "identity",
+                                MemoryLayer::L1 => "working",
+                                MemoryLayer::L2 => "project",
+                                MemoryLayer::L3 => "recall",
+                                MemoryLayer::L4 => "raw",
                             };
                             layer_text.push_str(&format!(
                                 "  <entry layer=\"{}\" confidence=\"{:.2}\">\n    <title>{}</title>\n    <content>{}</content>\n  </entry>\n",
                                 layer_tag, entry.confidence, entry.title, entry.content
                             ));
                         }
-                        self.cached_prompt.rebuild_layer(cache_layer, vec![layer_text], count);
+                        self.cached_prompt
+                            .rebuild_layer(cache_layer, vec![layer_text], count);
                     }
                 }
 
@@ -2229,36 +2538,56 @@ self.record_turn_completed(&summary);
                 let mut rel_count = 0;
                 for entry in &prepared.entries {
                     for rel in &entry.relations {
-                        if rel_count == 0 { context.push_str("\n<knowledge_graph>\n"); }
+                        if rel_count == 0 {
+                            context.push_str("\n<knowledge_graph>\n");
+                        }
                         rel_count += 1;
-                        if rel_count > 15 { break; }
+                        if rel_count > 15 {
+                            break;
+                        }
                         // 09: skip expired or not-yet-valid temporal relations
                         if let Some(ref tm) = rel.temporal {
                             if let Some(from) = tm.valid_from {
-                                if from > chrono::Utc::now() { continue; }
+                                if from > chrono::Utc::now() {
+                                    continue;
+                                }
                             }
                             if let Some(until) = tm.valid_until {
-                                if until < chrono::Utc::now() { continue; }
+                                if until < chrono::Utc::now() {
+                                    continue;
+                                }
                             }
                         }
-                        let mut attrs = format!("subject=\"{}\" kind=\"{:?}\" strength=\"{:.2}\"",
-                            entry.title, rel.kind, rel.strength);
+                        let mut attrs = format!(
+                            "subject=\"{}\" kind=\"{:?}\" strength=\"{:.2}\"",
+                            entry.title, rel.kind, rel.strength
+                        );
                         if let Some(ref entity_name) = rel.entity {
                             attrs.push_str(&format!(" entity=\"{}\"", entity_name));
                         }
                         if let Some(ref tm) = rel.temporal {
                             if let Some(from) = tm.valid_from {
-                                attrs.push_str(&format!(" valid_from=\"{}\"", from.format("%Y-%m-%d")));
+                                attrs.push_str(&format!(
+                                    " valid_from=\"{}\"",
+                                    from.format("%Y-%m-%d")
+                                ));
                             }
                             if let Some(until) = tm.valid_until {
-                                attrs.push_str(&format!(" valid_until=\"{}\"", until.format("%Y-%m-%d")));
+                                attrs.push_str(&format!(
+                                    " valid_until=\"{}\"",
+                                    until.format("%Y-%m-%d")
+                                ));
                             }
                         }
                         context.push_str(&format!("  <relation {}/>\n", attrs));
                     }
-                    if rel_count > 15 { break; }
+                    if rel_count > 15 {
+                        break;
+                    }
                 }
-                if rel_count > 0 { context.push_str("</knowledge_graph>\n"); }
+                if rel_count > 0 {
+                    context.push_str("</knowledge_graph>\n");
+                }
 
                 // P1: Inject code symbols from tree-sitter code indexer
                 if let Some(ref cc) = prepared.code_context {
@@ -2270,8 +2599,16 @@ self.record_turn_completed(&summary);
                 }
 
                 if let Some(cb) = &self.memory_callback {
-                    let entries: Vec<(String, String, f64)> = prepared.entries.iter()
-                        .map(|e| (format!("{:?}", e.layer), e.content.clone(), e.confidence as f64))
+                    let entries: Vec<(String, String, f64)> = prepared
+                        .entries
+                        .iter()
+                        .map(|e| {
+                            (
+                                format!("{:?}", e.layer),
+                                e.content.clone(),
+                                e.confidence as f64,
+                            )
+                        })
                         .collect();
                     let status = format!("{} memory entries loaded", entries.len());
                     cb.on_memory_update(entries, &status);
@@ -2306,7 +2643,9 @@ self.record_turn_completed(&summary);
         // Convert session messages to memory's Message type for post-turn extraction.
         // DESIGN: Tool blocks are excluded (same rationale as prepare_memory_context).
         let mem_messages: Vec<MemMessage> = self
-            .session.read().await
+            .session
+            .read()
+            .await
             .messages
             .iter()
             .enumerate()
@@ -2318,26 +2657,44 @@ self.record_turn_completed(&summary);
                     crate::session::MessageRole::System => MemMessageRole::User,
                 };
                 // Extract only Text blocks; tool blocks are deliberately omitted.
-                let content: String = msg.blocks.iter()
-                    .filter_map(|b| match b { ContentBlock::Text { text } => Some(text.as_str()), _ => None })
-                    .collect::<Vec<_>>().join(" ");
+                let content: String = msg
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 // Pass tool identity for tool result messages.
                 let (tool_use_id, tool_name) = match msg.role {
                     crate::session::MessageRole::Tool => {
                         let tid = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                            ContentBlock::ToolResult { tool_use_id, .. } => {
+                                Some(tool_use_id.clone())
+                            }
                             _ => None,
                         });
                         let tname = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => Some(tool_name.clone()),
+                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => {
+                                Some(tool_name.clone())
+                            }
                             _ => None,
                         });
                         (tid, tname)
                     }
                     _ => (None, None),
                 };
-                MemMessage { turn_index: idx, role, content, tool_use_id, tool_name, pinned: false }
-            }).collect();
+                MemMessage {
+                    turn_index: idx,
+                    role,
+                    content,
+                    tool_use_id,
+                    tool_name,
+                    pinned: false,
+                }
+            })
+            .collect();
 
         let mgr_clone = Arc::clone(&mgr);
 
@@ -2366,11 +2723,21 @@ self.record_turn_completed(&summary);
 
         if let Some(cb) = &self.memory_callback {
             let layers_data = mgr.list_layers().await;
-            let total_entries: usize = layers_data.iter()
-                .filter_map(|l| l.get("entry_count").and_then(|c| c.as_u64()).map(|c| c as usize))
+            let total_entries: usize = layers_data
+                .iter()
+                .filter_map(|l| {
+                    l.get("entry_count")
+                        .and_then(|c| c.as_u64())
+                        .map(|c| c as usize)
+                })
                 .sum();
-            let layer_names: Vec<String> = layers_data.iter()
-                .filter_map(|l| l.get("layer").and_then(|n| n.as_str()).map(|s| s.to_string()))
+            let layer_names: Vec<String> = layers_data
+                .iter()
+                .filter_map(|l| {
+                    l.get("layer")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
                 .collect();
             let vector_count = mgr.vector_index_count();
             cb.on_memory_stats(total_entries, vector_count, layer_names);
@@ -2393,14 +2760,45 @@ self.record_turn_completed(&summary);
         if let Some(ref store) = self.session_store {
             let session_id = self.session().session_id;
             let record = msg.to_session_message(&session_id, sequence);
+            let event =
+                message_appended_session_event(msg, &session_id, sequence, record.created_at_ms);
             let store = Arc::clone(store);
             tokio::spawn(async move {
                 if let Err(e) = store.insert_message(&record).await {
                     tracing::warn!(%e, session_id, sequence, "dual_write: SQLite insert failed, retrying");
-                    let _ = store.insert_message(&record).await;
+                    if let Err(retry_error) = store.insert_message(&record).await {
+                        tracing::warn!(%retry_error, session_id, sequence, "dual_write: SQLite retry failed");
+                        return;
+                    }
+                }
+                if let Err(e) = store.append_event(&event).await {
+                    tracing::warn!(%e, session_id, sequence, "dual_write: session event append failed");
                 }
             });
         }
+    }
+}
+
+fn message_appended_session_event(
+    msg: &crate::session::ConversationMessage,
+    session_id: &str,
+    sequence: usize,
+    created_at_ms: u64,
+) -> memory::SessionEvent {
+    let message = serde_json::from_str::<serde_json::Value>(&msg.to_json().render())
+        .unwrap_or(serde_json::Value::Null);
+    memory::SessionEvent {
+        session_id: session_id.to_string(),
+        event_type: "message_appended".to_string(),
+        event_json: serde_json::json!({
+            "type": "message_appended",
+            "sequence": sequence,
+            "role": msg.role.role_str(),
+            "message": message,
+        })
+        .to_string(),
+        sequence,
+        created_at_ms,
     }
 }
 
@@ -2415,7 +2813,9 @@ pub fn auto_compaction_threshold_from_env() -> u32 {
 
 fn resolve_compact_threshold(model_ctx_window: u32) -> u32 {
     let env_val = auto_compaction_threshold_from_env();
-    if env_val > 0 { return env_val; }
+    if env_val > 0 {
+        return env_val;
+    }
     if let Ok(pct_str) = std::env::var("COWD_COMPACT_THRESHOLD_PERCENT") {
         if let Ok(pct) = pct_str.parse::<u32>() {
             return (model_ctx_window * pct / 100).min(model_ctx_window.saturating_sub(8_000));
@@ -2424,10 +2824,7 @@ fn resolve_compact_threshold(model_ctx_window: u32) -> u32 {
     (model_ctx_window * 80 / 100).min(model_ctx_window.saturating_sub(8_000))
 }
 
-fn filter_system_prompt_for_role(
-    system_prompt: &[String],
-    task_description: &str,
-) -> Vec<String> {
+fn filter_system_prompt_for_role(system_prompt: &[String], task_description: &str) -> Vec<String> {
     let mut filtered = vec![format!(
         "You are a sub-agent with the following task:\n\n{}\n\
          Complete this task faithfully and report your results.\n\
@@ -2443,7 +2840,9 @@ fn filter_system_prompt_for_role(
 #[doc(alias = "memory")]
 #[doc(alias = "CognitiveContextManager")]
 pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemoryConfig {
-    use memory::config::{BudgetConfig, CompressionConfig, DriftConfig, ExtractorConfig, StoreConfig};
+    use memory::config::{
+        BudgetConfig, CompressionConfig, DriftConfig, ExtractorConfig, StoreConfig,
+    };
     use std::path::PathBuf;
 
     let mem = feature_config.memory();
@@ -2512,7 +2911,12 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
 }
 
 fn extract_tool_info(msg: &ConversationMessage) -> (String, String) {
-    if let Some(ContentBlock::ToolResult { tool_use_id, tool_name, .. }) = msg.blocks.first() {
+    if let Some(ContentBlock::ToolResult {
+        tool_use_id,
+        tool_name,
+        ..
+    }) = msg.blocks.first()
+    {
         (tool_use_id.clone(), tool_name.clone())
     } else {
         (String::new(), String::new())
@@ -2570,7 +2974,8 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
         self: Arc<Self>,
         task: WaveTask,
         _context: crate::wave::TaskContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult, WaveError>> + Send>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult, WaveError>> + Send>>
+    {
         let tool_exec = Arc::clone(&self.tool_exec);
         let task_id = task.id.clone();
         let tool_name = task
@@ -2588,13 +2993,14 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
 
         let tname = tool_name.clone();
         let tool_timeout = Duration::from_secs(
-            crate::tool_orchestrator::ToolSafetyRegistry::global().get_timeout_secs(&tname)
+            crate::tool_orchestrator::ToolSafetyRegistry::global().get_timeout_secs(&tname),
         );
         Box::pin(async move {
             let start = std::time::Instant::now();
-            let raw = tokio::time::timeout(tool_timeout, tokio::task::spawn_blocking(move || {
-                tool_exec.execute(&tool_name, &input)
-            }))
+            let raw = tokio::time::timeout(
+                tool_timeout,
+                tokio::task::spawn_blocking(move || tool_exec.execute(&tool_name, &input)),
+            )
             .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             match raw {
@@ -2628,7 +3034,7 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
                         error: Some(format!("tool timed out after {:?}", tool_timeout)),
                         duration_ms: 0,
                     })
-                },
+                }
             }
         })
     }
@@ -2645,12 +3051,9 @@ fn is_retryable_error(err_str: &str) -> bool {
 mod tests {
 
     use super::{
-        ApiClient, ApiRequest,
-        AssistantEvent, CognitiveContextManager, ConversationRuntime, PromptCacheEvent,
-        RuntimeError, StaticToolExecutor,
+        ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, StaticToolExecutor,
     };
-    use std::pin::Pin;
-    use futures::stream::Stream;
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::permissions::{
@@ -2661,14 +3064,18 @@ mod tests {
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
+    use futures::stream::Stream;
     use std::fs;
     use std::path::PathBuf;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
     // M1 helper: convert Vec<AssistantEvent> into a Stream for test mocks
-    fn to_stream(events: Vec<AssistantEvent>) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>> {
+    fn to_stream(
+        events: Vec<AssistantEvent>,
+    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>> {
         Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
     }
 
@@ -2677,21 +3084,65 @@ mod tests {
     }
 
     impl ApiClient for ScriptedApiClient {
-        fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             use futures::stream;
-            fn wrap(v: Vec<AssistantEvent>) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>> {
+            fn wrap(
+                v: Vec<AssistantEvent>,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>>
+            {
                 Box::pin(stream::iter(v.into_iter().map(Ok)))
             }
             self.call_count += 1;
             let events = match self.call_count {
                 1 => {
-                    assert!(request.messages.iter().any(|message| message.role == MessageRole::User));
-                    vec![AssistantEvent::TextDelta("Let me calculate that.".to_string()), AssistantEvent::ToolUse { id: "tool-1".to_string(), name: "add".to_string(), input: "2,2".to_string() }, AssistantEvent::Usage(TokenUsage { input_tokens: 20, output_tokens: 6, cache_creation_input_tokens: 1, cache_read_input_tokens: 2 }), AssistantEvent::MessageStop]
+                    assert!(request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == MessageRole::User));
+                    vec![
+                        AssistantEvent::TextDelta("Let me calculate that.".to_string()),
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "add".to_string(),
+                            input: "2,2".to_string(),
+                        },
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 20,
+                            output_tokens: 6,
+                            cache_creation_input_tokens: 1,
+                            cache_read_input_tokens: 2,
+                        }),
+                        AssistantEvent::MessageStop,
+                    ]
                 }
                 2 => {
-                    let last_message = request.messages.last().expect("tool result should be present");
+                    let last_message = request
+                        .messages
+                        .last()
+                        .expect("tool result should be present");
                     assert_eq!(last_message.role, MessageRole::Tool);
-                    vec![AssistantEvent::TextDelta("The answer is 4.".to_string()), AssistantEvent::Usage(TokenUsage { input_tokens: 24, output_tokens: 4, cache_creation_input_tokens: 1, cache_read_input_tokens: 3 }), AssistantEvent::PromptCache(PromptCacheEvent { unexpected: true, reason: "cache read tokens dropped while prompt fingerprint remained stable".to_string(), previous_cache_read_input_tokens: 6_000, current_cache_read_input_tokens: 1_000, token_drop: 5_000 }), AssistantEvent::MessageStop]
+                    vec![
+                        AssistantEvent::TextDelta("The answer is 4.".to_string()),
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 24,
+                            output_tokens: 4,
+                            cache_creation_input_tokens: 1,
+                            cache_read_input_tokens: 3,
+                        }),
+                        AssistantEvent::PromptCache(PromptCacheEvent {
+                            unexpected: true,
+                            reason:
+                                "cache read tokens dropped while prompt fingerprint remained stable"
+                                    .to_string(),
+                            previous_cache_read_input_tokens: 6_000,
+                            current_cache_read_input_tokens: 1_000,
+                            token_drop: 5_000,
+                        }),
+                        AssistantEvent::MessageStop,
+                    ]
                 }
                 _ => unreachable!("extra API call"),
             };
@@ -2779,8 +3230,7 @@ mod tests {
 
         let prompter = SharedPrompter::new(Box::new(PromptAllowOnce));
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt
-            .block_on(runtime.run_turn_async("what is 2 + 2?", &prompter))
+        rt.block_on(runtime.run_turn_async("what is 2 + 2?", &prompter))
             .expect("conversation loop should succeed");
 
         let events = sink.events();
@@ -2812,7 +3262,11 @@ mod tests {
 
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 if request
                     .messages
                     .iter()
@@ -2843,9 +3297,8 @@ mod tests {
         );
 
         let prompter = SharedPrompter::new(Box::new(RejectPrompter));
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
         let summary = handle
             .block_on(runtime.run_turn_async("use the tool", &prompter))
             .expect("conversation should continue after denied tool");
@@ -2861,7 +3314,11 @@ mod tests {
     fn denies_tool_use_when_pre_tool_hook_blocks() {
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 if request
                     .messages
                     .iter()
@@ -2899,9 +3356,8 @@ mod tests {
         );
 
         let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
         let summary = handle
             .block_on(runtime.run_turn_async("use the tool", &prompter))
             .expect("conversation should continue after hook denial");
@@ -2927,7 +3383,11 @@ mod tests {
     fn denies_tool_use_when_pre_tool_hook_fails() {
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 if request
                     .messages
                     .iter()
@@ -2997,7 +3457,11 @@ mod tests {
         }
 
         impl ApiClient for TwoCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 self.calls += 1;
                 match self.calls {
                     1 => to_stream(vec![
@@ -3074,7 +3538,11 @@ mod tests {
         }
 
         impl ApiClient for TwoCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 self.calls += 1;
                 match self.calls {
                     1 => to_stream(vec![
@@ -3104,8 +3572,10 @@ mod tests {
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),
             TwoCallApiClient { calls: 0 },
-            Arc::new(StaticToolExecutor::new()
-                .register("fail", |_input| Err(ToolError::new("tool exploded")))),
+            Arc::new(
+                StaticToolExecutor::new()
+                    .register("fail", |_input| Err(ToolError::new("tool exploded"))),
+            ),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
@@ -3155,7 +3625,8 @@ mod tests {
             fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 Box::pin(futures::stream::iter(vec![
                     Ok(AssistantEvent::TextDelta("done".to_string())),
                     Ok(AssistantEvent::MessageStop),
@@ -3197,7 +3668,8 @@ mod tests {
             fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 Box::pin(futures::stream::iter(vec![
                     Ok(AssistantEvent::TextDelta("done".to_string())),
                     Ok(AssistantEvent::MessageStop),
@@ -3213,16 +3685,23 @@ mod tests {
             vec!["system".to_string()],
         );
         let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
-        handle.block_on(runtime.run_turn_async("a", &prompter)).expect("turn a");
-        handle.block_on(runtime.run_turn_async("b", &prompter)).expect("turn b");
-        handle.block_on(runtime.run_turn_async("c", &prompter)).expect("turn c");
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
+        handle
+            .block_on(runtime.run_turn_async("a", &prompter))
+            .expect("turn a");
+        handle
+            .block_on(runtime.run_turn_async("b", &prompter))
+            .expect("turn b");
+        handle
+            .block_on(runtime.run_turn_async("c", &prompter))
+            .expect("turn c");
 
         let result = runtime.compact(CompactionConfig {
             preserve_recent_messages: 2,
-            max_estimated_tokens: 1, priority_threshold: 3, keep_high_priority: true,
+            max_estimated_tokens: 1,
+            priority_threshold: 3,
+            keep_high_priority: true,
         });
         assert!(result.summary.contains("Conversation summary"));
         assert_eq!(
@@ -3243,7 +3722,8 @@ mod tests {
             fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 Box::pin(futures::stream::iter(vec![
                     Ok(AssistantEvent::TextDelta("done".to_string())),
                     Ok(AssistantEvent::MessageStop),
@@ -3262,9 +3742,8 @@ mod tests {
         );
 
         let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
         handle
             .block_on(runtime.run_turn_async("persist this turn", &prompter))
             .expect("turn should succeed");
@@ -3278,6 +3757,86 @@ mod tests {
         assert_eq!(restored.messages[1].role, MessageRole::Assistant);
 
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn dual_write_persists_messages_and_session_events() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
+                Box::pin(futures::stream::iter(vec![
+                    Ok(AssistantEvent::TextDelta("stored".to_string())),
+                    Ok(AssistantEvent::MessageStop),
+                ]))
+            }
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+            let session = Session::new();
+            let session_id = session.session_id.clone();
+            let now = "2026-06-04T00:00:00Z".to_string();
+            store
+                .create_session(&memory::SessionRecord {
+                    session_id: session_id.clone(),
+                    platform: "test".to_string(),
+                    chat_id: session_id.clone(),
+                    user_id: None,
+                    model: Some("test-model".to_string()),
+                    created_at: now.clone(),
+                    last_activity: now,
+                    message_count: 0,
+                    reset_policy: "none".to_string(),
+                    metadata_json: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    estimated_cost_usd: 0.0,
+                    status: "active".to_string(),
+                })
+                .await
+                .unwrap();
+
+            let mut runtime = ConversationRuntime::new(
+                session,
+                SimpleApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            )
+            .with_session_store(Arc::clone(&store));
+
+            runtime
+                .run_turn_async("persist events", &SharedPrompter::none())
+                .await
+                .expect("turn should succeed");
+
+            for _ in 0..20 {
+                if store.get_events(&session_id, 0).await.unwrap().len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+
+            let messages = store.get_messages(&session_id, 0, 10).await.unwrap();
+            let events = store.get_events(&session_id, 0).await.unwrap();
+
+            assert_eq!(messages.len(), 2);
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "message_appended");
+            assert_eq!(events[0].sequence, 0);
+            assert_eq!(events[1].sequence, 1);
+
+            let event_json: serde_json::Value =
+                serde_json::from_str(&events[0].event_json).expect("event json");
+            assert_eq!(event_json["role"], "user");
+            assert_eq!(event_json["message"]["role"], "user");
+            assert_eq!(event_json["message"]["blocks"][0]["text"], "persist events");
+        });
     }
 
     fn temp_session_path(suffix: &str) -> PathBuf {
@@ -3297,7 +3856,10 @@ mod tests {
 
     struct MockApi;
     impl ApiClient for MockApi {
-        fn stream(&mut self, _request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             Box::pin(futures::stream::iter(vec![Ok(AssistantEvent::MessageStop)]))
         }
     }
@@ -3305,8 +3867,17 @@ mod tests {
     #[test]
     fn m2_layer_priority_l0_before_l3() {
         use memory::types::MemoryLayer;
-        let rank = |l: MemoryLayer| match l { MemoryLayer::L0=>5,MemoryLayer::L1=>4,MemoryLayer::L2=>3,MemoryLayer::L3=>2,MemoryLayer::L4=>1 };
-        assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L3), "L0 must rank higher than L3");
+        let rank = |l: MemoryLayer| match l {
+            MemoryLayer::L0 => 5,
+            MemoryLayer::L1 => 4,
+            MemoryLayer::L2 => 3,
+            MemoryLayer::L3 => 2,
+            MemoryLayer::L4 => 1,
+        };
+        assert!(
+            rank(MemoryLayer::L0) > rank(MemoryLayer::L3),
+            "L0 must rank higher than L3"
+        );
         assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L1));
         assert!(rank(MemoryLayer::L1) > rank(MemoryLayer::L2));
     }
@@ -3315,7 +3886,8 @@ mod tests {
     async fn m2_empty_session_no_memory_crash() {
         let session = Session::new();
         let rt = ConversationRuntime::new(
-            session, MockApi,
+            session,
+            MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
@@ -3328,20 +3900,26 @@ mod tests {
     async fn m2_budget_cap_without_memory_returns_system_prompt() {
         let session = Session::new();
         let rt = ConversationRuntime::new(
-            session, MockApi,
+            session,
+            MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["test prompt".to_string()],
         );
         let result = rt.prepare_memory_context("test").await;
-        assert_eq!(result.len(), 1, "without memory manager, returns base system prompt only");
+        assert_eq!(
+            result.len(),
+            1,
+            "without memory manager, returns base system prompt only"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_structured_xml_format_present() {
         let session = Session::new();
         let rt = ConversationRuntime::new(
-            session, MockApi,
+            session,
+            MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["base prompt".to_string()],
@@ -3353,20 +3931,38 @@ mod tests {
     #[test]
     fn m2_error_propagation_returns_result() {
         let session = Session::new();
-        let rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["sys".to_string()]);
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["sys".to_string()],
+        );
         let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().handle().clone()
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .handle()
+                .clone()
         });
         let r = handle.block_on(rt.run_memory_post_turn());
-        assert!(r.is_ok(), "run_memory_post_turn should return Ok when no memory manager");
+        assert!(
+            r.is_ok(),
+            "run_memory_post_turn should return Ok when no memory manager"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_structured_injection_has_memory_context_tag() {
         let session = Session::new();
-        let rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["system".to_string()]);
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
         let prompt = rt.prepare_memory_context("test").await;
         assert!(prompt.len() >= 1);
         // Without memory manager, should still return system prompt
@@ -3376,7 +3972,13 @@ mod tests {
     #[test]
     fn m2_layer_ranking_verification() {
         use memory::types::MemoryLayer;
-        let rank = |l: MemoryLayer| match l { MemoryLayer::L0=>5,MemoryLayer::L1=>4,MemoryLayer::L2=>3,MemoryLayer::L3=>2,MemoryLayer::L4=>1 };
+        let rank = |l: MemoryLayer| match l {
+            MemoryLayer::L0 => 5,
+            MemoryLayer::L1 => 4,
+            MemoryLayer::L2 => 3,
+            MemoryLayer::L3 => 2,
+            MemoryLayer::L4 => 1,
+        };
         assert_eq!(rank(MemoryLayer::L0), 5);
         assert_eq!(rank(MemoryLayer::L4), 1);
         assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L3));
@@ -3385,11 +3987,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_budget_cap_applied_on_prepare() {
         let session = Session::new();
-        let rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["base".to_string()]);
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["base".to_string()],
+        );
         // Verify that prepare_memory_context doesn't panic with empty session
         let result = rt.prepare_memory_context("any query").await;
-        assert!(!result.is_empty(), "should return at least the system prompt");
+        assert!(
+            !result.is_empty(),
+            "should return at least the system prompt"
+        );
     }
 
     // ── M2-L2: integration-level memory tests ──────────────────────
@@ -3398,22 +4008,34 @@ mod tests {
     async fn m2_l2_budget_enforcement_limits_system_prompt() {
         // M2-L2-2: verify memory context doesn't exceed budget proportions
         let session = Session::new();
-        let rt = ConversationRuntime::new(session, MockApi,
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system prompt".to_string()]);
+            vec!["system prompt".to_string()],
+        );
         let prompt = rt.prepare_memory_context("test query").await;
         // Without memory manager, only system prompt is returned
         assert_eq!(prompt.len(), 1);
         // System prompt should be reasonably sized
-        assert!(prompt[0].len() < 10000, "system prompt should not be oversized");
+        assert!(
+            prompt[0].len() < 10000,
+            "system prompt should not be oversized"
+        );
     }
 
     #[test]
     fn m2_l2_layer_priority_preserves_l0_l1() {
         // M2-L2-3: L0/L1 should be ranked before L3 in sorted entries
         use memory::types::MemoryLayer;
-        let rank = |l: MemoryLayer| match l { MemoryLayer::L0=>5,MemoryLayer::L1=>4,MemoryLayer::L2=>3,MemoryLayer::L3=>2,MemoryLayer::L4=>1 };
+        let rank = |l: MemoryLayer| match l {
+            MemoryLayer::L0 => 5,
+            MemoryLayer::L1 => 4,
+            MemoryLayer::L2 => 3,
+            MemoryLayer::L3 => 2,
+            MemoryLayer::L4 => 1,
+        };
         // L0 > L1 > L2 > L3 > L4
         assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L1));
         assert!(rank(MemoryLayer::L1) > rank(MemoryLayer::L2));
@@ -3425,15 +4047,20 @@ mod tests {
     async fn m2_l2_handoff_roundtrip_preserves_data() {
         // M2-L2-1: cross-session handoff creates/restores handoff data
         let session = Session::new();
-        let rt = ConversationRuntime::new(session, MockApi,
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()]);
+            vec!["system".to_string()],
+        );
         // Handoff should succeed even without memory manager (returns None)
         let handoff = rt.create_memory_handoff().await;
         // Without memory manager, this is None — which is correct behavior
-        assert!(handoff.is_none() || handoff.is_some(),
-            "handoff API should be callable without crashing");
+        assert!(
+            handoff.is_none() || handoff.is_some(),
+            "handoff API should be callable without crashing"
+        );
         // restore_memory_handoff should also not crash
         if let Some(h) = handoff {
             rt.restore_memory_handoff(h);
@@ -3490,5 +4117,4 @@ mod tests {
             "active_session should be set after prepare_memory_context"
         );
     }
-
 }

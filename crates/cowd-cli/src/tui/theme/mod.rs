@@ -17,8 +17,8 @@ pub use palette::{parse_hex, Palette};
 mod engine;
 pub use engine::ThemeEngine;
 
-use std::path::{Path, PathBuf};
 use ratatui::style::{Color, Modifier, Style};
+use std::path::{Path, PathBuf};
 
 // ── ThemeSource ─────────────────────────────────────────────────
 
@@ -83,13 +83,9 @@ impl StyleSheet {
             code_block: Style::default().fg(p.fg).bg(code_bg),
             inline_code: Style::default().fg(p.accent).bg(p.muted),
 
-            tool_status_running: Style::default()
-                .fg(p.warn)
-                .add_modifier(Modifier::BOLD),
+            tool_status_running: Style::default().fg(p.warn).add_modifier(Modifier::BOLD),
             tool_status_done: Style::default().fg(p.success),
-            tool_status_error: Style::default()
-                .fg(p.error)
-                .add_modifier(Modifier::BOLD),
+            tool_status_error: Style::default().fg(p.error).add_modifier(Modifier::BOLD),
 
             diff_add: Style::default().fg(p.success),
             diff_del: Style::default().fg(p.error),
@@ -157,8 +153,8 @@ impl ThemeLoader {
             .get("colors")
             .ok_or_else(|| "missing 'colors' key".to_string())?;
 
-        let palette: Palette = serde_yaml::from_value(palette_value.clone())
-            .map_err(|e| format!("palette: {e}"))?;
+        let palette: Palette =
+            serde_yaml::from_value(palette_value.clone()).map_err(|e| format!("palette: {e}"))?;
 
         let stylesheet = StyleSheet::from_palette(&palette);
 
@@ -216,10 +212,8 @@ impl ThemeLoader {
     /// agent_offline = "#FF0000"
     /// ```
     pub fn load_toml(path: &Path) -> Result<Theme, String> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
-        let value: toml::Value =
-            content.parse().map_err(|e| format!("parse: {e}"))?;
+        let content = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+        let value: toml::Value = content.parse().map_err(|e| format!("parse: {e}"))?;
 
         let name = value
             .get("name")
@@ -233,20 +227,90 @@ impl ThemeLoader {
             .ok_or_else(|| "missing [colors] table".to_string())?;
 
         let palette = Palette {
-            accent: parse_hex(colors.get("accent").and_then(|v| v.as_str()).unwrap_or("#00FFFF")),
-            bg: parse_hex(colors.get("bg").and_then(|v| v.as_str()).unwrap_or("#000000")),
-            fg: parse_hex(colors.get("fg").and_then(|v| v.as_str()).unwrap_or("#FFFFFF")),
-            user_color: parse_hex(colors.get("user_color").and_then(|v| v.as_str()).unwrap_or("#00FF00")),
-            warn: parse_hex(colors.get("warn").and_then(|v| v.as_str()).unwrap_or("#FFFF00")),
-            error: parse_hex(colors.get("error").and_then(|v| v.as_str()).unwrap_or("#FF0000")),
-            success: parse_hex(colors.get("success").and_then(|v| v.as_str()).unwrap_or("#00FF00")),
-            muted: parse_hex(colors.get("muted").and_then(|v| v.as_str()).unwrap_or("#808080")),
-            agent_planner: parse_hex(colors.get("agent_planner").and_then(|v| v.as_str()).unwrap_or("#0000FF")),
-            agent_executor: parse_hex(colors.get("agent_executor").and_then(|v| v.as_str()).unwrap_or("#00FF00")),
-            agent_reviewer: parse_hex(colors.get("agent_reviewer").and_then(|v| v.as_str()).unwrap_or("#FF00FF")),
-            agent_idle: parse_hex(colors.get("agent_idle").and_then(|v| v.as_str()).unwrap_or("#808080")),
-            agent_busy: parse_hex(colors.get("agent_busy").and_then(|v| v.as_str()).unwrap_or("#FFFF00")),
-            agent_offline: parse_hex(colors.get("agent_offline").and_then(|v| v.as_str()).unwrap_or("#FF0000")),
+            accent: parse_hex(
+                colors
+                    .get("accent")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#00FFFF"),
+            ),
+            bg: parse_hex(
+                colors
+                    .get("bg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#000000"),
+            ),
+            fg: parse_hex(
+                colors
+                    .get("fg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#FFFFFF"),
+            ),
+            user_color: parse_hex(
+                colors
+                    .get("user_color")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#00FF00"),
+            ),
+            warn: parse_hex(
+                colors
+                    .get("warn")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#FFFF00"),
+            ),
+            error: parse_hex(
+                colors
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#FF0000"),
+            ),
+            success: parse_hex(
+                colors
+                    .get("success")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#00FF00"),
+            ),
+            muted: parse_hex(
+                colors
+                    .get("muted")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#808080"),
+            ),
+            agent_planner: parse_hex(
+                colors
+                    .get("agent_planner")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#0000FF"),
+            ),
+            agent_executor: parse_hex(
+                colors
+                    .get("agent_executor")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#00FF00"),
+            ),
+            agent_reviewer: parse_hex(
+                colors
+                    .get("agent_reviewer")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#FF00FF"),
+            ),
+            agent_idle: parse_hex(
+                colors
+                    .get("agent_idle")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#808080"),
+            ),
+            agent_busy: parse_hex(
+                colors
+                    .get("agent_busy")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#FFFF00"),
+            ),
+            agent_offline: parse_hex(
+                colors
+                    .get("agent_offline")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("#FF0000"),
+            ),
         };
 
         let stylesheet = StyleSheet::from_palette(&palette);
@@ -372,8 +436,7 @@ mod tests {
     #[test]
     fn skin_migration() {
         // Write a temporary skin.yaml in SkinConfig format
-        let tmp = std::env::temp_dir()
-            .join(format!("cowd-skin-migration-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("cowd-skin-migration-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let path = tmp.join("skin.yaml");
         let content = r###"

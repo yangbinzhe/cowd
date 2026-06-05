@@ -2,6 +2,10 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import './api.js';
 import './ui.js';
 import './panels.js';
+import './sessions.js';
+import './messages.js';
+import './workspace.js';
+import './boot.js';
 
 describe('API module', () => {
   beforeEach(() => { vi.restoreAllMocks(); });
@@ -14,6 +18,7 @@ describe('API module', () => {
     expect(typeof window.Api.getStreamUrl).toBe('function');
     expect(typeof window.Api.compactSession).toBe('function');
     expect(typeof window.Api.getMessages).toBe('function');
+    expect(typeof window.Api.getEvents).toBe('function');
   });
 
   it('has all memory endpoints', () => {
@@ -23,6 +28,8 @@ describe('API module', () => {
     expect(typeof window.Api.createMemoryEntry).toBe('function');
     expect(typeof window.Api.updateMemoryEntry).toBe('function');
     expect(typeof window.Api.deleteMemoryEntry).toBe('function');
+    expect(typeof window.Api.linkSymbolToMemory).toBe('function');
+    expect(typeof window.Api.findMemoriesBySymbol).toBe('function');
     expect(typeof window.Api.listEntities).toBe('function');
     expect(typeof window.Api.detectEntities).toBe('function');
     expect(typeof window.Api.listTriples).toBe('function');
@@ -64,12 +71,85 @@ describe('API module', () => {
     expect(typeof window.Api.updateApprovalConfig).toBe('function');
     expect(typeof window.Api.toggleSolo).toBe('function');
     expect(typeof window.Api.approvalHistory).toBe('function');
+    expect(typeof window.Api.exportAudit).toBe('function');
+  });
+
+  it('approval endpoints use the gateway route contract', async () => {
+    const mockF = vi.fn((url, opts) => {
+      const path = String(url);
+      if (path.includes('/api/approval/respond')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ resolved: true }) });
+      }
+      if (path.includes('/api/approval/history')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve([{ id: 'a-1', decision: 'approved' }]) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.pendingApprovals();
+    await window.Api.respondApproval('a-1', true, 'session');
+    const history = await window.Api.approvalHistory();
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/approval/pending');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/approval/respond');
+    expect(JSON.parse(mockF.mock.calls[1][1].body)).toEqual({ id: 'a-1', approved: true, persistence: 'session' });
+    expect(history).toEqual([{ id: 'a-1', decision: 'approved' }]);
+  });
+
+  it('audit export endpoint sends enterprise audit query params', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ kind: 'audit_export', total: 1, records: [{ source: 'memory' }] })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const data = await window.Api.exportAudit({ source: 'memory', limit: 25, offset: 50 });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/audit/export?source=memory&limit=25&offset=50');
+    expect(data.kind).toBe('audit_export');
+    expect(data.records[0].source).toBe('memory');
+  });
+
+  it('profile endpoints use the enterprise profile route contract', async () => {
+    const mockF = vi.fn((url, opts) => {
+      const path = String(url);
+      if (path === '/api/profiles' && opts.method === 'POST') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ profile: { id: 'enterprise_ops' } }) });
+      }
+      if (path === '/api/profiles/switch') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ active_profile: 'enterprise_ops', restart_required: true }) });
+      }
+      if (path === '/api/profiles/enterprise_ops') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ deleted: 'enterprise_ops' }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ profiles: [{ id: 'default', is_active: true }] }) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.listProfiles();
+    await window.Api.createProfile('Enterprise Ops');
+    await window.Api.switchProfile('enterprise_ops');
+    await window.Api.deleteProfile('enterprise_ops');
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/profiles');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/profiles');
+    expect(JSON.parse(mockF.mock.calls[1][1].body)).toEqual({ name: 'Enterprise Ops' });
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/profiles/switch');
+    expect(JSON.parse(mockF.mock.calls[2][1].body)).toEqual({ profile: 'enterprise_ops' });
+    expect(String(mockF.mock.calls[3][0])).toBe('/api/profiles/enterprise_ops');
   });
 
   it('has config and usage endpoints', () => {
     expect(typeof window.Api.getConfig).toBe('function');
     expect(typeof window.Api.updateConfig).toBe('function');
     expect(typeof window.Api.getProviders).toBe('function');
+    expect(typeof window.Api.listProfiles).toBe('function');
+    expect(typeof window.Api.createProfile).toBe('function');
+    expect(typeof window.Api.switchProfile).toBe('function');
+    expect(typeof window.Api.deleteProfile).toBe('function');
     expect(typeof window.Api.getUsage).toBe('function');
   });
 
@@ -95,6 +175,31 @@ describe('API module', () => {
     expect(sessions[0].started_at).toBe(1);
   });
 
+  it('listSessions sends paging and filter query params', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({ ok: true, json: () => Promise.resolve({ sessions: [], total: 0, offset: 20, limit: 20 }) })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const data = await window.Api.listSessions({
+      q: 'Auth',
+      model: 'claude-sonnet-4-6',
+      status: 'active',
+      sort: 'updated_at',
+      order: 'desc',
+      limit: 20,
+      offset: 20
+    });
+
+    const url = String(mockF.mock.calls[0][0]);
+    expect(url).toContain('/api/sessions?');
+    expect(url).toContain('q=Auth');
+    expect(url).toContain('model=claude-sonnet-4-6');
+    expect(url).toContain('status=active');
+    expect(url).toContain('offset=20');
+    expect(data.total).toBe(0);
+  });
+
   it('createSession uses default model', async () => {
     const mockF = vi.fn(() =>
       Promise.resolve({ ok: true, json: () => Promise.resolve({ id: 'new-s' }) })
@@ -103,6 +208,50 @@ describe('API module', () => {
     await window.Api.createSession();
     const body = JSON.parse(mockF.mock.calls[0][1].body);
     expect(body.model).toBe('claude-sonnet-4-6');
+  });
+
+  it('getEvents normalizes event responses and query params', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          events: [{
+            event_type: 'message_appended',
+            payload: { type: 'message_appended', sequence: 3, role: 'user' }
+          }]
+        })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const events = await window.Api.getEvents('session-a', { from_seq: 3, limit: 20 });
+
+    expect(String(mockF.mock.calls[0][0])).toContain('/api/sessions/session-a/events?from_seq=3&limit=20');
+    expect(events[0].type).toBe('message_appended');
+    expect(events[0].sequence).toBe(3);
+    expect(events[0].payload.role).toBe('user');
+  });
+
+  it('getMessages sends sequence paging params and normalizes content', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          messages: [{
+            sequence: 99950,
+            role: 'assistant',
+            blocks: [{ type: 'text', text: 'message 99950' }]
+          }]
+        })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const messages = await window.Api.getMessages('message-100k', { from_seq: 99950, limit: 50 });
+
+    expect(String(mockF.mock.calls[0][0])).toContain('/api/sessions/message-100k/messages?from_seq=99950&limit=50');
+    expect(messages[0].sequence).toBe(99950);
+    expect(messages[0].content).toBe('message 99950');
   });
 
   it('platform API endpoints are defined', () => {
@@ -118,6 +267,65 @@ describe('API module', () => {
     expect(typeof window.Api.listTriples).toBe('function');
   });
 
+  it('updates memory entries through the backend PATCH route', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({ ok: true, json: () => Promise.resolve({ id: 'm1', updated: true }) })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const result = await window.Api.updateMemoryEntry('m1', {
+      content: 'updated content',
+      tags: ['after'],
+      priority: 'High'
+    });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/memory/entry/m1');
+    expect(mockF.mock.calls[0][1].method).toBe('PATCH');
+    expect(JSON.parse(mockF.mock.calls[0][1].body)).toEqual({
+      content: 'updated content',
+      tags: ['after'],
+      priority: 'High'
+    });
+    expect(result.updated).toBe(true);
+  });
+
+  it('normalizes memory entity and triple responses', async () => {
+    vi.stubGlobal('fetch', vi.fn((url) => {
+      if (String(url).includes('/api/memory/entities')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ entities: [{ name: 'SessionKernel' }] }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ triples: [{ subject: 'SessionKernel', predicate: 'owns', object: 'sessions' }] }) });
+    }));
+
+    const entities = await window.Api.listEntities();
+    const triples = await window.Api.listTriples();
+
+    expect(entities).toEqual([{ name: 'SessionKernel' }]);
+    expect(triples).toEqual([{ subject: 'SessionKernel', predicate: 'owns', object: 'sessions' }]);
+  });
+
+  it('symbol-memory link endpoints are normalized', async () => {
+    const mockF = vi.fn((url, opts) => {
+      const path = String(url);
+      if (path.includes('/api/memory/symbol-links?symbol=')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ entries: [{ title: 'Auth impact note' }] }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ symbol_id: 'authenticate_user', memory_id: 'm1' }) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.linkSymbolToMemory('authenticate_user', 'm1', { turn_index: 2, reference_type: 'impact' });
+    const body = JSON.parse(mockF.mock.calls[0][1].body);
+    expect(body.symbol_id).toBe('authenticate_user');
+    expect(body.memory_id).toBe('m1');
+    expect(body.turn_index).toBe(2);
+    expect(body.reference_type).toBe('impact');
+
+    const entries = await window.Api.findMemoriesBySymbol('authenticate_user');
+    expect(String(mockF.mock.calls[1][0])).toContain('/api/memory/symbol-links?symbol=authenticate_user');
+    expect(entries).toEqual([{ title: 'Auth impact note' }]);
+  });
+
   it('gateway and skills endpoints are defined', () => {
     expect(typeof window.Api.getUsage).toBe('function');
     expect(typeof window.Api.toggleSolo).toBe('function');
@@ -128,15 +336,297 @@ describe('API module', () => {
     expect(typeof window.Panels.renderMemory).toBe('function');
     expect(typeof window.Panels.renderSkills).toBe('function');
     expect(typeof window.Panels.renderCrons).toBe('function');
+    expect(typeof window.Panels.renderMemorySymbolResults).toBe('function');
     expect(typeof window.Panels.renderAgents).toBe('function');
     expect(typeof window.Panels.renderGateway).toBe('function');
     expect(typeof window.Panels.renderTools).toBe('function');
+    expect(typeof window.Panels.renderAudit).toBe('function');
     expect(typeof window.Panels.renderSettings).toBe('function');
     expect(typeof window.Panels.renderCCConfig).toBe('function');
     expect(typeof window.Panels.renderCCProviders).toBe('function');
     expect(typeof window.Panels.renderCCApproval).toBe('function');
     expect(typeof window.Panels.renderCCHistory).toBe('function');
     expect(typeof window.Panels.renderCCUsage).toBe('function');
+  });
+
+  it('Sessions search uses backend query and renders returned sessions', async () => {
+    document.body.innerHTML = '<div id="toast"></div><ul id="session-list"></ul>';
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          sessions: [{ id: 'auth-a', title: 'Auth Audit A', model: 'claude-sonnet-4-6', status: 'active' }],
+          total: 1,
+          offset: 0,
+          limit: 20
+        })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Sessions.searchSessions('Auth');
+
+    expect(String(mockF.mock.calls[0][0])).toContain('/api/sessions?q=Auth');
+    expect(document.getElementById('session-list').textContent).toContain('Auth Audit A');
+    expect(window.Sessions.total()).toBe(1);
+  });
+
+  it('Sessions ignores stale list responses after a newer search', async () => {
+    document.body.innerHTML = '<div id="toast"></div><ul id="session-list"></ul>';
+    const pending = [];
+    vi.stubGlobal('fetch', vi.fn((url) => new Promise(resolve => pending.push({ url, resolve }))));
+
+    const firstLoad = window.Sessions.load();
+    const searchLoad = window.Sessions.searchSessions('Auth');
+    expect(pending.length).toBe(2);
+
+    pending[1].resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        sessions: [{ id: 'auth-a', title: 'Auth Audit A', model: 'claude-sonnet-4-6', status: 'active' }],
+        total: 1,
+        offset: 0,
+        limit: 20
+      })
+    });
+    await searchLoad;
+    expect(document.getElementById('session-list').textContent).toContain('Auth Audit A');
+
+    pending[0].resolve({
+      ok: true,
+      json: () => Promise.resolve({
+        sessions: [{ id: 'old-a', title: 'Old Full List', model: 'claude-sonnet-4-6', status: 'active' }],
+        total: 1,
+        offset: 0,
+        limit: 20
+      })
+    });
+    await firstLoad;
+    expect(document.getElementById('session-list').textContent).toContain('Auth Audit A');
+    expect(document.getElementById('session-list').textContent).not.toContain('Old Full List');
+  });
+
+  it('Messages renders SSE tool lifecycle with progress and error status', () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="connection-status"></div><div id="chat-messages"></div>';
+
+    window.Messages._dispatch({ type: 'ToolStart', id: 'tool-1', name: 'bash', preview: 'starting bash' });
+    expect(document.querySelector('#tool-tool-1 .tool-status').textContent).toBe('running');
+    expect(document.querySelector('#tool-tool-1').textContent).toContain('starting bash');
+
+    window.Messages._dispatch({ type: 'ToolProgress', id: 'tool-1', progress: 'running command' });
+    expect(document.querySelector('#tool-tool-1').textContent).toContain('running command');
+
+    window.Messages._dispatch({ type: 'ToolComplete', id: 'tool-1', summary: 'command failed', exit_code: 1 });
+    expect(document.querySelector('#tool-tool-1 .tool-status').textContent).toBe('error');
+    expect(document.querySelector('#tool-tool-1').classList.contains('error')).toBe(true);
+  });
+
+  it('Messages normalizes Anthropic tool_use blocks and connected events', () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="connection-status"></div><div id="chat-messages"></div>';
+
+    window.Messages._dispatch({ type: 'Connected' });
+    expect(document.getElementById('connection-status').textContent).toBe('Connected');
+
+    window.Messages._dispatch({
+      type: 'content_block_start',
+      content_block: { type: 'tool_use', id: 'anth-tool', name: 'read', input: { path: 'README.md' } }
+    });
+    expect(document.querySelector('#tool-anth-tool .tool-name').textContent).toContain('read');
+  });
+
+  it('renders memory layer DTO labels', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    vi.stubGlobal('fetch', vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/memory/stats')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ total_entries: 2, entity_count: 0, triple_count: 0 }) });
+      }
+      if (path.includes('/api/memory/entities')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ entities: [] }) });
+      }
+      if (path.includes('/api/memory/triples')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ triples: [] }) });
+      }
+      if (path.includes('/api/memory/layers')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ layers: [{ layer: 'L4', entry_count: 2 }] }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    }));
+
+    await window.Panels.renderMemory();
+
+    const text = document.getElementById('panel-content').textContent;
+    expect(text).toContain('L4');
+    expect(text).not.toContain('[object Object]');
+  });
+
+  it('renders symbol-memory search results in the memory panel', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    const mockF = vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/memory/stats')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ total_entries: 1, entity_count: 0, triple_count: 0 }) });
+      }
+      if (path.includes('/api/memory/entities')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ entities: [] }) });
+      }
+      if (path.includes('/api/memory/triples')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ triples: [] }) });
+      }
+      if (path.includes('/api/memory/symbol-links?symbol=')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ entries: [{ title: 'Auth impact note', content: 'authenticate_user controls auth policy' }] }) });
+      }
+      if (path.includes('/api/memory/layers')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ layers: [] }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderMemory();
+    const input = document.getElementById('memory-symbol-search');
+    expect(input).toBeTruthy();
+
+    input.value = 'authenticate_user';
+    input.dispatchEvent(new Event('input'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(String(mockF.mock.calls.at(-1)[0])).toContain('/api/memory/symbol-links?symbol=authenticate_user');
+    expect(document.getElementById('memory-symbol-results').textContent).toContain('Auth impact note');
+  });
+
+  it('renders approval queue and posts approval decisions', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="cc-content"></div>';
+    const mockF = vi.fn((url, opts) => {
+      const path = String(url);
+      if (path.includes('/api/approval/respond')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ resolved: true }) });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve([{ id: 'approval-1', tool: 'bash', action: 'rm -rf /tmp/build' }])
+      });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderCCApproval();
+
+    const cc = document.getElementById('cc-content');
+    expect(cc.textContent).toContain('Pending Approvals');
+    expect(cc.textContent).toContain('bash');
+
+    const approve = [...cc.querySelectorAll('button')].find(btn => btn.textContent === 'Approve');
+    await approve.onclick();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/approval/respond');
+    expect(JSON.parse(mockF.mock.calls[1][1].body)).toEqual({ id: 'approval-1', approved: true });
+    expect(mockF.mock.calls.filter(call => String(call[0]).includes('/api/approval/pending')).length).toBe(2);
+  });
+
+  it('renders unified audit export records in the enterprise audit panel', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    const mockF = vi.fn((url) =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          kind: 'audit_export',
+          source: 'all',
+          total: 2,
+          totals: { memory: 1, approval: 1 },
+          records: [
+            {
+              source: 'memory',
+              timestamp: '2026-06-05T01:00:00Z',
+              summary: 'Create L3 enterprise memory',
+              record: { operation: 'Create', layer: 'L3' }
+            },
+            {
+              source: 'approval',
+              timestamp: '2026-06-05T01:01:00Z',
+              summary: 'Approved bash command',
+              record: { decision: 'approved', tool: 'bash' }
+            }
+          ]
+        })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderAudit();
+
+    const text = document.getElementById('panel-content').textContent;
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/audit/export?source=all&limit=50&offset=0');
+    expect(text).toContain('Enterprise Audit');
+    expect(text).toContain('Create L3 enterprise memory');
+    expect(text).toContain('Approved bash command');
+    expect(text).toContain('memory');
+    expect(text).toContain('approval');
+  });
+
+  it('Workspace render opens the right panel without toggling it closed', async () => {
+    document.body.innerHTML = `
+      <div id="toast"></div>
+      <aside id="right-panel" class="hidden"></aside>
+      <div id="panel-tabs">
+        <button data-panel="workspace"></button>
+        <button data-panel="memory"></button>
+      </div>
+      <div id="panel-content"></div>
+    `;
+    vi.stubGlobal('fetch', vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          files: [{ name: 'crates', path: 'crates', is_dir: true, type: 'dir' }]
+        })
+      })
+    ));
+
+    await window.Workspace.render();
+
+    expect(document.getElementById('right-panel').classList.contains('hidden')).toBe(false);
+    expect(document.querySelector('[data-panel="workspace"]').classList.contains('tab-active')).toBe(true);
+    expect(document.getElementById('panel-content').textContent).toContain('crates');
+  });
+
+  it('Settings renders profiles and persists profile switches', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    const mockF = vi.fn((url, opts) => {
+      const path = String(url);
+      if (path === '/api/config') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ model: 'claude-sonnet-4-6' }) });
+      }
+      if (path === '/api/profiles/switch') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ active_profile: 'enterprise_ops', runtime_profile: 'default', restart_required: true }) });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          profiles: [
+            { id: 'default', name: 'default', is_active: true },
+            { id: 'enterprise_ops', name: 'Enterprise Ops', is_active: false }
+          ],
+          active_profile: 'default',
+          runtime_profile: 'default'
+        })
+      });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderSettings();
+
+    const panel = document.getElementById('panel-content');
+    expect(panel.textContent).toContain('Profiles');
+    expect(panel.textContent).toContain('Enterprise Ops');
+
+    const switchBtn = [...panel.querySelectorAll('button')].find(btn => btn.textContent === 'Switch');
+    await switchBtn.onclick();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const switchCall = mockF.mock.calls.find(call => String(call[0]) === '/api/profiles/switch');
+    expect(switchCall).toBeTruthy();
+    expect(JSON.parse(switchCall[1].body)).toEqual({ profile: 'enterprise_ops' });
   });
 
   it('command and fact endpoints are defined', () => {
@@ -149,5 +639,52 @@ describe('API module', () => {
   it('cron log endpoints are defined', () => {
     expect(typeof window.Api.listCronLogs).toBe('function');
     expect(typeof window.Api.listAllCronLogs).toBe('function');
+  });
+
+  it('binds main UI controls before auth login completes', async () => {
+    document.body.innerHTML = `
+      <div id="toast"></div>
+      <button id="btn-new-session"></button>
+      <button id="btn-send"></button>
+      <button id="btn-slash"></button>
+      <textarea id="chat-input"></textarea>
+      <div id="slash-dropdown" class="hidden"></div>
+      <input id="session-search">
+      <select id="model-selector"></select>
+      <aside id="right-panel" class="hidden"></aside>
+      <button id="btn-toggle-panel"></button>
+      <button id="btn-control-center"></button>
+      <div id="panel-tabs">
+        <button data-panel="workspace"></button>
+        <button data-panel="close"></button>
+      </div>
+      <div id="control-center" class="modal-overlay hidden">
+        <div class="modal-tabs"><button data-cc="config"></button></div>
+      </div>
+      <div id="login-modal" class="modal-overlay hidden">
+        <input id="login-token" value="test-token">
+        <div id="login-error"></div>
+        <button id="btn-login"></button>
+      </div>
+    `;
+
+    window.Api.verifyAuth = vi.fn(() => Promise.reject(new Error('unauthorized')));
+    window.Api.login = vi.fn(() => Promise.resolve({ success: true, token: 'ok' }));
+    window.Api.getConfig = vi.fn(() => Promise.resolve({ model: 'claude-sonnet-4-6' }));
+    window.Sessions.load = vi.fn(() => Promise.resolve());
+    window.Sessions.createSession = vi.fn();
+
+    window.dispatchEvent(new Event('DOMContentLoaded'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(document.getElementById('login-modal').classList.contains('hidden')).toBe(false);
+
+    document.getElementById('btn-login').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    document.getElementById('btn-new-session').click();
+
+    expect(window.Api.login).toHaveBeenCalledWith('test-token');
+    expect(window.Sessions.createSession).toHaveBeenCalled();
   });
 });

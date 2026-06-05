@@ -20,7 +20,7 @@
 
 use crate::tui::app::App;
 use crate::tui::state::{ProcessedKey, TuiState};
-use crate::tui::test_utils::{MockTerminal, app_with_messages};
+use crate::tui::test_utils::{app_with_messages, MockTerminal};
 use runtime::CowdEvent;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -89,7 +89,10 @@ fn integration_panel_switch() {
     // Tab cycles through 9 sidebar tabs: 0→1→2→3→4→5→6→7→8→0
     for expected in 1..9 {
         state.handle_input(key(KeyCode::Tab));
-        assert_eq!(state.sidebar_active_tab, expected, "Tab cycle step to tab {expected}");
+        assert_eq!(
+            state.sidebar_active_tab, expected,
+            "Tab cycle step to tab {expected}"
+        );
     }
     // 9th Tab wraps back to 0
     state.handle_input(key(KeyCode::Tab));
@@ -206,13 +209,11 @@ fn integration_command_palette() {
     assert!(!state.dialog_manager.is_empty());
 
     let current = state.dialog_manager.current().unwrap();
-    assert!(
-        matches!(
-            &current.kind,
-            crate::tui::components::dialog::DialogKind::Select { title, .. }
-            if title == "Command Palette"
-        )
-    );
+    assert!(matches!(
+        &current.kind,
+        crate::tui::components::dialog::DialogKind::Select { title, .. }
+        if title == "Command Palette"
+    ));
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     state.handle_input(esc);
@@ -224,10 +225,12 @@ fn integration_dialog_focus_trap_multiple() {
     let mut state = TuiState::new("test-model", "test-session");
 
     use crate::tui::components::dialog::{DialogKind, DialogState};
-    state.dialog_manager.push(DialogState::new(DialogKind::Alert {
-        title: "Error".into(),
-        message: "Something went wrong".into(),
-    }));
+    state
+        .dialog_manager
+        .push(DialogState::new(DialogKind::Alert {
+            title: "Error".into(),
+            message: "Something went wrong".into(),
+        }));
 
     let a_key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
     let handled = state.handle_input(a_key);
@@ -293,9 +296,9 @@ fn integration_timeline_entry_lifecycle() {
         preview: "ls -la".into(),
     });
 
-    let has_tool = state.timeline_iter().any(|(_, e)| {
-        matches!(e, crate::tui::app::TimelineEntry::ToolCall { id, .. } if id == "tool-1")
-    });
+    let has_tool = state.timeline_iter().any(
+        |(_, e)| matches!(e, crate::tui::app::TimelineEntry::ToolCall { id, .. } if id == "tool-1"),
+    );
     assert!(has_tool);
 
     state.apply_event(CowdEvent::ToolComplete {
@@ -306,8 +309,15 @@ fn integration_timeline_entry_lifecycle() {
     });
 
     let tool = state.timeline_iter().find_map(|(_, e)| {
-        if let crate::tui::app::TimelineEntry::ToolCall { id, done, expanded, .. } = e {
-            if id == "tool-1" { Some((*done, *expanded)) } else { None }
+        if let crate::tui::app::TimelineEntry::ToolCall {
+            id, done, expanded, ..
+        } = e
+        {
+            if id == "tool-1" {
+                Some((*done, *expanded))
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -340,7 +350,10 @@ fn integration_search_flow() {
     // Use handle_input to route / through keybind engine
     let handled = state.handle_input(key(KeyCode::Char('/')));
     // / is bound to Action::Search
-    assert!(handled || state.search_active, "search should be activated by /");
+    assert!(
+        handled || state.search_active,
+        "search should be activated by /"
+    );
 
     // If search wasn't activated by keybind, activate directly
     if !state.search_active {
@@ -365,9 +378,7 @@ fn integration_search_flow() {
     if state.search_matches.len() > 1 {
         let before = state.search_current;
         state.search_next();
-        assert!(
-            state.search_current != before || state.search_matches.len() == 1
-        );
+        assert!(state.search_current != before || state.search_matches.len() == 1);
     }
 
     state.cancel_search();
@@ -468,7 +479,9 @@ fn integration_config_migration_format() {
 
 #[test]
 fn integration_high_contrast_wcag_audit() {
-    use crate::tui::accessibility::{high_contrast_dark_palette, audit_palette_contrast, contrast_ratio};
+    use crate::tui::accessibility::{
+        audit_palette_contrast, contrast_ratio, high_contrast_dark_palette,
+    };
     use ratatui::style::Color;
 
     let palette = high_contrast_dark_palette();
@@ -484,15 +497,19 @@ fn integration_high_contrast_wcag_audit() {
 fn integration_spinner_rotation() {
     use crate::tui::animation::AnimationEngine;
 
-    let chars: Vec<&str> = (0..10)
-        .map(|i| AnimationEngine::spinner_char(i))
-        .collect();
+    let chars: Vec<&str> = (0..10).map(|i| AnimationEngine::spinner_char(i)).collect();
 
     for c in &chars {
         assert!(!c.is_empty());
         assert!(c.chars().count() == 1);
     }
 
-    assert_eq!(AnimationEngine::spinner_char(0), AnimationEngine::spinner_char(10));
-    assert_eq!(AnimationEngine::spinner_char(1), AnimationEngine::spinner_char(11));
+    assert_eq!(
+        AnimationEngine::spinner_char(0),
+        AnimationEngine::spinner_char(10)
+    );
+    assert_eq!(
+        AnimationEngine::spinner_char(1),
+        AnimationEngine::spinner_char(11)
+    );
 }

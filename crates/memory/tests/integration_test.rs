@@ -5,14 +5,14 @@
 
 use std::io::Write;
 
-
-use cowd_memory::{
-    CodeIndexer, CodeSymbol, CognitiveContextManager, ImpactReport, MemoryConfig,
-    SymbolEdge, SymbolEdgeType, SymbolKind, TokenBudget,
-};
 use cowd_memory::config::{BudgetConfig, StoreConfig};
 use cowd_memory::store::sqlite::SqliteStore;
 use cowd_memory::store::MemoryStore;
+use cowd_memory::types::Message;
+use cowd_memory::{
+    CodeIndexer, CodeSymbol, CognitiveContextManager, ImpactReport, MemoryConfig, SymbolEdge,
+    SymbolEdgeType, SymbolKind, TokenBudget, TuningConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -32,6 +32,16 @@ fn test_config(db_path: &std::path::Path) -> MemoryConfig {
             ..Default::default()
         },
         ..Default::default()
+    }
+}
+
+fn test_config_with_sandbox(db_path: &std::path::Path) -> MemoryConfig {
+    MemoryConfig {
+        tuning: TuningConfig {
+            sandbox_min_lines: 1,
+            ..Default::default()
+        },
+        ..test_config(db_path)
     }
 }
 
@@ -118,7 +128,46 @@ async fn test_integration_no_injection_on_non_code_query() {
     let query = "tell me about the weather";
     let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
 
-    assert!(ctx.code_context.is_none(), "non-code query should not inject symbols");
+    assert!(
+        ctx.code_context.is_none(),
+        "non-code query should not inject symbols"
+    );
+}
+
+#[tokio::test]
+async fn test_integration_tool_sandbox_recall_in_prepare_context() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("e2e_sandbox.db");
+
+    let cfg = test_config_with_sandbox(&db_path);
+    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+    let needle = "COWD_SANDBOX_NEEDLE_ALPHA";
+    let large_tool_output = (0..80)
+        .map(|i| format!("line {i}: build log detail {needle} component-{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut messages = vec![
+        Message::user("run diagnostics"),
+        Message::assistant("I will inspect the diagnostic output."),
+        Message::tool_result("tool-call-1", "diagnostics", large_tool_output),
+    ];
+
+    mgr.on_turn_end(&mut messages).await.unwrap();
+
+    let ctx = mgr
+        .prepare_context(needle, &messages, Some("session-sandbox"))
+        .await
+        .unwrap();
+
+    assert!(
+        ctx.entries.iter().any(|entry| {
+            entry.tags.iter().any(|tag| tag == "tool_output")
+                && entry.content.contains(needle)
+                && entry.content.contains("[TOOL OUTPUT]")
+        }),
+        "prepare_context should recall matching chunks from ToolOutputSandbox"
+    );
 }
 
 #[tokio::test]
@@ -129,7 +178,10 @@ async fn test_integration_build_context_with_code_wraps_prepare() {
     let cfg = test_config(&db_path);
     let mgr = CognitiveContextManager::new(cfg).await.unwrap();
 
-    let ctx = mgr.build_context_with_code("refactor the auth module", &[]).await.unwrap();
+    let ctx = mgr
+        .build_context_with_code("refactor the auth module", &[])
+        .await
+        .unwrap();
 
     assert!(ctx.total_tokens <= ctx.budget.total);
 }
@@ -169,16 +221,16 @@ async fn test_integration_impact_analysis_with_store() {
         edge_type: SymbolEdgeType::Calls,
         file_path: "handlers.rs".into(),
     };
-    sqlite.index_file_symbols(
-        "handlers.rs",
-        &[authenticate.clone(), login_handler.clone()],
-        &[edge],
-    ).unwrap();
+    sqlite
+        .index_file_symbols(
+            "handlers.rs",
+            &[authenticate.clone(), login_handler.clone()],
+            &[edge],
+        )
+        .unwrap();
 
     let store: std::sync::Arc<dyn MemoryStore> = std::sync::Arc::new(sqlite);
-    let indexer = CodeIndexer::new(tmp.path())
-        .unwrap()
-        .with_store(store);
+    let indexer = CodeIndexer::new(tmp.path()).unwrap().with_store(store);
 
     let report = indexer.get_impact("authenticate", 1).await;
     assert!(!report.direct_callers.is_empty());
@@ -193,7 +245,10 @@ async fn test_integration_prepared_context_has_code_field() {
 
     let cfg = test_config(&db_path);
     let mgr = CognitiveContextManager::new(cfg).await.unwrap();
-    let ctx = mgr.prepare_context("fix the authenticate function bug", &[], None).await.unwrap();
+    let ctx = mgr
+        .prepare_context("fix the authenticate function bug", &[], None)
+        .await
+        .unwrap();
 
     let _has_field = ctx.code_context;
 }

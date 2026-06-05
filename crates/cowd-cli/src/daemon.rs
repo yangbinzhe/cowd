@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{header, HeaderValue};
-use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
@@ -20,12 +20,14 @@ use crate::gateway::ActiveSessions;
 use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use memory::UnifiedSessionStore;
-use runtime::platform::{PlatformConfig, PlatformRuntime};
-use runtime::platform::config::PlatformRuntimeConfig;
 use runtime::mirror::MessageMirror;
+use runtime::platform::config::PlatformRuntimeConfig;
+use runtime::platform::{PlatformConfig, PlatformRuntime};
 use tools::GlobalToolRegistry;
 
-use runtime::session_lifecycle::{EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus};
+use runtime::session_lifecycle::{
+    EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus,
+};
 
 // ── Background session cleanup task ────────────────────────────
 
@@ -50,7 +52,10 @@ fn spawn_session_cleanup_task(
             let ids = active_sessions.list();
             for id in &ids {
                 if let Some(status) = lifecycle.check_session(id).await {
-                    if matches!(status, SessionStatus::Expired | SessionStatus::Idle | SessionStatus::Evicted) {
+                    if matches!(
+                        status,
+                        SessionStatus::Expired | SessionStatus::Idle | SessionStatus::Evicted
+                    ) {
                         tracing::info!(session_id=%id, ?status, "cleanup: closing session");
                         if let Some(entry) = active_sessions.get(id) {
                             let entry = entry.clone();
@@ -125,9 +130,7 @@ impl Drop for PidFileGuard {
 
 // ── Daemon entry point ─────────────────────────────────────────
 
-pub async fn run_daemon(
-    config: DaemonConfig,
-) -> Result<(), String> {
+pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     // 0. Write PID file (removed on drop via guard)
     let _pid_guard = PidFileGuard::new()?;
 
@@ -148,9 +151,37 @@ pub async fn run_daemon(
 
     let event_bus = SessionEventBus::new();
 
-    let unified_store = crate::get_unified_store()
-        .ok()
-        .map(|s| Arc::new(s.clone()));
+    let unified_store = crate::get_unified_store().ok().map(|s| Arc::new(s.clone()));
+    let approval_dir = std::env::var_os("COWD_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".cowd"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
+    let approval_gate = Arc::new(runtime::approval_gate::SmartApprovalGate::new(
+        Arc::new(
+            runtime::permission_enforcer::DestructivePatternDetector::new(approval_dir.clone()),
+        ),
+        runtime::ApprovalConfig::default(),
+        Some(approval_dir.join("approval_history.json")),
+    ));
+    let profile_manager = Arc::new(runtime::ProfileManager::from_config_home(&approval_dir));
+    if let Err(e) = profile_manager.initialize() {
+        tracing::warn!("failed to initialize profile manager: {e}");
+    }
+    if let Ok(requested_profile) = std::env::var("COWD_PROFILE") {
+        if profile_manager.get_profile(&requested_profile).is_none() {
+            if let Err(e) = profile_manager.create_profile(&requested_profile) {
+                tracing::warn!("failed to create requested profile {requested_profile}: {e}");
+            }
+        }
+        if let Err(e) = profile_manager.switch_profile(&requested_profile) {
+            tracing::warn!("failed to activate requested profile {requested_profile}: {e}");
+        }
+    }
+    let profile_id = profile_manager.active_id();
 
     // Spawn background session cleanup (idle/expired session reaper)
     let lifecycle_config = SessionLifecycleConfig {
@@ -171,11 +202,16 @@ pub async fn run_daemon(
     let app_state = Arc::new(api_routes::AppState {
         sessions: sessions.clone(),
         memory_manager: cognitive.clone(),
-        unified_store,
+        unified_store: unified_store.clone(),
         tool_registry: tools.clone(),
         config: config.runtime_config.clone(),
         event_bus: event_bus.clone(),
+        approval_gate: Some(approval_gate),
         auth_token: config.auth_token.clone(),
+        workspace_root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        config_home: approval_dir.clone(),
+        profile_id,
+        profile_manager,
     });
 
     // 2. Build HTTP router (reuse api_routes + SSE)
@@ -218,14 +254,21 @@ pub async fn run_daemon(
         .map_err(|e| format!("failed to bind HTTP {}: {}", config.http_addr, e))?;
     tracing::info!("HTTP + SSE on {}", config.http_addr);
 
-    if let Err(e) = std::fs::write(crate::server::addr_file(), format!("http://{}", config.http_addr)) {
+    if let Err(e) = std::fs::write(
+        crate::server::addr_file(),
+        format!("http://{}", config.http_addr),
+    ) {
         tracing::warn!("failed to write addr file: {e}");
     }
 
     // 4. Unix socket
     let _ = std::fs::remove_file(&config.unix_sock_path);
-    let unix_listener = UnixListener::bind(&config.unix_sock_path)
-        .map_err(|e| format!("failed to bind unix socket {}: {}", config.unix_sock_path, e))?;
+    let unix_listener = UnixListener::bind(&config.unix_sock_path).map_err(|e| {
+        format!(
+            "failed to bind unix socket {}: {}",
+            config.unix_sock_path, e
+        )
+    })?;
     tracing::info!("Unix socket on {}", config.unix_sock_path);
 
     // 5. Platform adapters via PlatformRuntime
@@ -262,9 +305,7 @@ pub async fn run_daemon(
                 }
             }
             "wechat_ilink" | "wechat" => {
-                match runtime::platform::wechat_ilink::create_wechat_ilink_adapter(
-                    &settings_json,
-                ) {
+                match runtime::platform::wechat_ilink::create_wechat_ilink_adapter(&settings_json) {
                     Ok(adapter) => {
                         tracing::info!("wechat_ilink adapter created");
                         if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
@@ -285,18 +326,18 @@ pub async fn run_daemon(
                     Err(e) => tracing::error!("failed to create email adapter: {e}"),
                 }
             }
-            "wecom" => {
-                match runtime::platform::wecom::create_wecom_adapter(&settings_json) {
-                    Ok(adapter) => {
-                        if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
-                            tracing::error!("failed to register wecom adapter: {e}");
-                        } else {
-                            tracing::info!("wecom adapter created and registered");
-                        }
+            "wecom" => match runtime::platform::wecom::create_wecom_adapter(&settings_json) {
+                Ok(adapter) => {
+                    if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
+                        tracing::error!("failed to register wecom adapter: {e}");
+                    } else {
+                        tracing::info!("wecom adapter created and registered");
                     }
-                    Err(e) => { tracing::error!("wecom adapter init failed: {e}"); }
                 }
-            }
+                Err(e) => {
+                    tracing::error!("wecom adapter init failed: {e}");
+                }
+            },
             other => {
                 tracing::warn!("unknown platform type: {other}");
             }
@@ -314,6 +355,7 @@ pub async fn run_daemon(
     {
         let sessions = sessions.clone();
         let event_bus = event_bus.clone();
+        let unified_store = unified_store.clone();
         tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async move {
@@ -322,7 +364,8 @@ pub async fn run_daemon(
                         Ok((stream, _addr)) => {
                             let sessions = sessions.clone();
                             let event_bus = event_bus.clone();
-                            handle_unix_client(stream, sessions, event_bus).await;
+                            let unified_store = unified_store.clone();
+                            handle_unix_client(stream, sessions, event_bus, unified_store).await;
                         }
                         Err(e) => {
                             tracing::warn!("unix socket accept error: {e}");
@@ -337,12 +380,12 @@ pub async fn run_daemon(
     let shutdown_signal = async {
         #[cfg(unix)]
         {
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate()
-            ).expect("failed to install SIGTERM handler");
-            let mut sigint = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::interrupt()
-            ).expect("failed to install SIGINT handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .expect("failed to install SIGINT handler");
             tokio::select! {
                 _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
                 _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
@@ -350,7 +393,9 @@ pub async fn run_daemon(
         }
         #[cfg(not(unix))]
         {
-            tokio::signal::ctrl_c().await.expect("failed to install ctrl_c handler");
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install ctrl_c handler");
             tracing::info!("shutdown signal received");
         }
     };
@@ -388,6 +433,7 @@ async fn handle_unix_client(
     stream: UnixStream,
     sessions: Arc<ActiveSessions>,
     event_bus: Arc<SessionEventBus>,
+    unified_store: Option<Arc<UnifiedSessionStore>>,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
@@ -407,16 +453,17 @@ async fn handle_unix_client(
                 }
 
                 let response = match serde_json::from_str::<serde_json::Value>(trimmed) {
-                    Ok(cmd) => {
-                        match cmd.get("cmd").and_then(|c| c.as_str()) {
-                            Some("create_session") => {
-                                let model = cmd
-                                    .get("model")
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("claude-sonnet-4-6");
-                                let session_id = uuid::Uuid::new_v4().to_string();
-                                let session = runtime::Session::new();
-                                match crate::build_runtime(
+                    Ok(cmd) => match cmd.get("cmd").and_then(|c| c.as_str()) {
+                        Some("create_session") => {
+                            let model = cmd
+                                .get("model")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("claude-sonnet-4-6");
+                            let session_id = uuid::Uuid::new_v4().to_string();
+                            let session = runtime::Session::new();
+                            let runtime_result = if let Some(ref store) = unified_store {
+                                crate::build_runtime_with_session_store(
+                                    store.clone(),
                                     session,
                                     &session_id,
                                     model.to_string(),
@@ -427,123 +474,159 @@ async fn handle_unix_client(
                                     runtime::PermissionMode::WorkspaceWrite,
                                     None,
                                     None,
-                                ) {
-                                    Ok(runtime) => {
-                                        let _ = sessions.register(session_id.clone(), runtime);
-                                        serde_json::json!({
-                                            "ok": true,
-                                            "session_id": session_id,
-                                        })
+                                )
+                            } else {
+                                crate::build_runtime(
+                                    session,
+                                    &session_id,
+                                    model.to_string(),
+                                    vec![],
+                                    true,
+                                    true,
+                                    None,
+                                    runtime::PermissionMode::WorkspaceWrite,
+                                    None,
+                                    None,
+                                )
+                            };
+                            match runtime_result {
+                                Ok(runtime) => {
+                                    if let Some(ref store) = unified_store {
+                                        let record = crate::api_routes::new_api_session_record(
+                                            &session_id,
+                                            Some(model.to_string()),
+                                        );
+                                        if let Err(e) = store.upsert_session(&record).await {
+                                            tracing::warn!(session_id = %session_id, error = %e, "failed to persist daemon session");
+                                        }
                                     }
-                                    Err(e) => {
-                                        serde_json::json!({
-                                            "ok": false,
-                                            "error": format!("failed to build runtime: {e}"),
-                                        })
-                                    }
+                                    let _ = sessions.register(session_id.clone(), runtime);
+                                    serde_json::json!({
+                                        "ok": true,
+                                        "session_id": session_id,
+                                    })
                                 }
-                            }
-                            Some("chat") => {
-                                let session_id = cmd
-                                    .get("session_id")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or_default();
-                                let content = cmd
-                                    .get("content")
-                                    .and_then(|c| c.as_str())
-                                    .unwrap_or_default();
-
-                                if session_id.is_empty() || content.is_empty() {
+                                Err(e) => {
                                     serde_json::json!({
                                         "ok": false,
-                                        "error": "session_id and content are required",
+                                        "error": format!("failed to build runtime: {e}"),
                                     })
-                                } else {
-                                    match sessions.get(session_id) {
-                                        Some(entry) => {
-                                            let mut guard = entry.lock().await;
-                                            match guard
-                                                .run_turn_async(content, &runtime::permissions::SharedPrompter::none())
-                                                .await
-                                            {
-                                                Ok(summary) => {
-                                                    let final_text = summary
-                                                        .assistant_messages
-                                                        .last()
-                                                        .map(|msg| {
-                                                            msg.blocks
-                                                                .iter()
-                                                                .filter_map(|block| match block {
-                                                                    runtime::ContentBlock::Text { text } => {
-                                                                        Some(text.as_str())
-                                                                    }
-                                                                    _ => None,
-                                                                })
-                                                                .collect::<Vec<_>>()
-                                                                .join("")
-                                                        })
-                                                        .unwrap_or_default();
+                                }
+                            }
+                        }
+                        Some("chat") => {
+                            let session_id = cmd
+                                .get("session_id")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or_default();
+                            let content = cmd
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or_default();
 
-                                                    let sse_data = serde_json::json!({
-                                                        "type": "TurnComplete",
-                                                        "session_id": session_id,
-                                                        "response": final_text,
-                                                        "iterations": summary.iterations,
-                                                    });
-                                                    event_bus
-                                                        .broadcast(session_id, &sse_data.to_string())
-                                                        .await;
+                            if session_id.is_empty() || content.is_empty() {
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error": "session_id and content are required",
+                                })
+                            } else {
+                                match sessions.get(session_id) {
+                                    Some(entry) => {
+                                        let mut guard = entry.lock().await;
+                                        match guard
+                                            .run_turn_async(
+                                                content,
+                                                &runtime::permissions::SharedPrompter::none(),
+                                            )
+                                            .await
+                                        {
+                                            Ok(summary) => {
+                                                if let Some(ref store) = unified_store {
+                                                    let session_snapshot = guard.session().clone();
+                                                    if let Err(e) = crate::api_routes::sync_runtime_session_metadata_to_store(
+                                                            store,
+                                                            session_id,
+                                                            &session_snapshot,
+                                                        ).await {
+                                                            tracing::warn!(session_id = %session_id, error = %e, "failed to sync daemon session metadata");
+                                                        }
+                                                }
+                                                let final_text = summary
+                                                    .assistant_messages
+                                                    .last()
+                                                    .map(|msg| {
+                                                        msg.blocks
+                                                            .iter()
+                                                            .filter_map(|block| match block {
+                                                                runtime::ContentBlock::Text {
+                                                                    text,
+                                                                } => Some(text.as_str()),
+                                                                _ => None,
+                                                            })
+                                                            .collect::<Vec<_>>()
+                                                            .join("")
+                                                    })
+                                                    .unwrap_or_default();
 
-                                                    serde_json::json!({
-                                                        "ok": true,
-                                                        "response": final_text,
-                                                        "iterations": summary.iterations,
-                                                    })
-                                                }
-                                                Err(e) => {
-                                                    let err_msg = e.to_string();
-                                                    let sse_data = serde_json::json!({
-                                                        "type": "TurnError",
-                                                        "session_id": session_id,
-                                                        "error": err_msg,
-                                                    });
-                                                    event_bus
-                                                        .broadcast(session_id, &sse_data.to_string())
-                                                        .await;
-                                                    serde_json::json!({
-                                                        "ok": false,
-                                                        "error": err_msg,
-                                                    })
-                                                }
+                                                let sse_data = serde_json::json!({
+                                                    "type": "TurnComplete",
+                                                    "session_id": session_id,
+                                                    "response": final_text,
+                                                    "iterations": summary.iterations,
+                                                });
+                                                event_bus
+                                                    .broadcast(session_id, &sse_data.to_string())
+                                                    .await;
+
+                                                serde_json::json!({
+                                                    "ok": true,
+                                                    "response": final_text,
+                                                    "iterations": summary.iterations,
+                                                })
+                                            }
+                                            Err(e) => {
+                                                let err_msg = e.to_string();
+                                                let sse_data = serde_json::json!({
+                                                    "type": "TurnError",
+                                                    "session_id": session_id,
+                                                    "error": err_msg,
+                                                });
+                                                event_bus
+                                                    .broadcast(session_id, &sse_data.to_string())
+                                                    .await;
+                                                serde_json::json!({
+                                                    "ok": false,
+                                                    "error": err_msg,
+                                                })
                                             }
                                         }
-                                        None => {
-                                            serde_json::json!({
-                                                "ok": false,
-                                                "error": format!("session {session_id} not found"),
-                                            })
-                                        }
+                                    }
+                                    None => {
+                                        serde_json::json!({
+                                            "ok": false,
+                                            "error": format!("session {session_id} not found"),
+                                        })
                                     }
                                 }
                             }
-                            Some("list_sessions") => {
-                                let ids = sessions.list();
-                                serde_json::json!({ "ok": true, "sessions": ids })
-                            }
-                            Some(other) => {
-                                serde_json::json!({
-                                    "ok": false,
-                                    "error": format!("unknown command: {other}"),
-                                })
-                            }
-                            None => {
-                                serde_json::json!({
-                                    "ok": false,
-                                    "error": "missing 'cmd' field",
-                                })
-                            }
                         }
-                    }
+                        Some("list_sessions") => {
+                            let ids = sessions.list();
+                            serde_json::json!({ "ok": true, "sessions": ids })
+                        }
+                        Some(other) => {
+                            serde_json::json!({
+                                "ok": false,
+                                "error": format!("unknown command: {other}"),
+                            })
+                        }
+                        None => {
+                            serde_json::json!({
+                                "ok": false,
+                                "error": "missing 'cmd' field",
+                            })
+                        }
+                    },
                     Err(e) => {
                         serde_json::json!({
                             "ok": false,

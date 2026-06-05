@@ -8,8 +8,8 @@
 
 #![cfg(test)]
 
-use ratatui::layout::Rect;
 use ratatui::backend::TestBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use crate::tui::components::base::*;
@@ -72,7 +72,10 @@ fn component_trait_render_called() {
         })
         .unwrap();
 
-    assert!(comp.render_called, "render() should set render_called to true");
+    assert!(
+        comp.render_called,
+        "render() should set render_called to true"
+    );
     assert_eq!(
         comp.last_area,
         Some(area),
@@ -141,7 +144,10 @@ fn component_handle_event_consumed() {
     ));
 
     let result = comp.handle_event(&event);
-    assert!(result.is_consumed(), "TestComponent should consume all events");
+    assert!(
+        result.is_consumed(),
+        "TestComponent should consume all events"
+    );
 }
 
 #[test]
@@ -211,7 +217,11 @@ fn component_id_newtype() {
     let mut set = HashSet::new();
     set.insert(ComponentId("a"));
     set.insert(ComponentId("a")); // duplicate
-    assert_eq!(set.len(), 1, "duplicate ComponentIds should be deduplicated");
+    assert_eq!(
+        set.len(),
+        1,
+        "duplicate ComponentIds should be deduplicated"
+    );
 }
 
 #[test]

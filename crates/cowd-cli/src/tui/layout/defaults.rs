@@ -7,6 +7,8 @@ use crate::tui::components::chat_view::ChatView;
 
 use ratatui::layout::Rect;
 
+use super::types::{LayoutNode, PanelDef, Split, SplitDirection, TabDef, TabGroup};
+use super::LayoutTree;
 use crate::tui::components::agent_team_panel::AgentTeamPanel;
 use crate::tui::components::agents_overlay::AgentsOverlay;
 use crate::tui::components::context_panel::ContextPanel;
@@ -19,8 +21,6 @@ use crate::tui::components::memory_panel::MemoryPanel;
 use crate::tui::components::skills_panel::SkillsPanel;
 use crate::tui::components::todo_panel::TodoPanel;
 use crate::tui::components::{Component, EventResult, RenderContext};
-use super::LayoutTree;
-use super::types::{LayoutNode, PanelDef, Split, SplitDirection, TabDef, TabGroup};
 
 // ── Placeholder Component ──────────────────────────────────────────
 
@@ -148,53 +148,49 @@ impl LayoutTree {
     pub fn apply_preset(&mut self, preset: LayoutPreset) {
         self.root = match preset {
             LayoutPreset::Coding => build_default_layout().root,
-            LayoutPreset::Review => {
-                LayoutNode::Split(Split {
-                    direction: SplitDirection::Horizontal,
-                    ratio: 0.5,
-                    children: vec![
-                        LayoutNode::Panel(PanelDef {
-                            id: "chat".into(),
-                            component: Box::new(ChatView::new()),
-                            bounds: None,
-                        }),
-                        LayoutNode::Panel(PanelDef {
-                            id: "diff".into(),
-                            component: Box::new(DiffViewer::new("Diff")),
-                            bounds: None,
-                        }),
-                    ],
-                })
-            }
-            LayoutPreset::Collaboration => {
-                LayoutNode::Split(Split {
-                    direction: SplitDirection::Horizontal,
-                    ratio: 0.3,
-                    children: vec![
-                        LayoutNode::Panel(PanelDef {
-                            id: "agent_team".into(),
-                            component: Box::new(AgentTeamPanel::new()),
-                            bounds: None,
-                        }),
-                        LayoutNode::Split(Split {
-                            direction: SplitDirection::Horizontal,
-                            ratio: 3.0 / 7.0,
-                            children: vec![
-                                LayoutNode::Panel(PanelDef {
-                                    id: "chat".into(),
-                                    component: Box::new(ChatView::new()),
-                                    bounds: None,
-                                }),
-                                LayoutNode::Panel(PanelDef {
-                                    id: "discussion".into(),
-                                    component: Box::new(DiscussionThreadView::new()),
-                                    bounds: None,
-                                }),
-                            ],
-                        }),
-                    ],
-                })
-            }
+            LayoutPreset::Review => LayoutNode::Split(Split {
+                direction: SplitDirection::Horizontal,
+                ratio: 0.5,
+                children: vec![
+                    LayoutNode::Panel(PanelDef {
+                        id: "chat".into(),
+                        component: Box::new(ChatView::new()),
+                        bounds: None,
+                    }),
+                    LayoutNode::Panel(PanelDef {
+                        id: "diff".into(),
+                        component: Box::new(DiffViewer::new("Diff")),
+                        bounds: None,
+                    }),
+                ],
+            }),
+            LayoutPreset::Collaboration => LayoutNode::Split(Split {
+                direction: SplitDirection::Horizontal,
+                ratio: 0.3,
+                children: vec![
+                    LayoutNode::Panel(PanelDef {
+                        id: "agent_team".into(),
+                        component: Box::new(AgentTeamPanel::new()),
+                        bounds: None,
+                    }),
+                    LayoutNode::Split(Split {
+                        direction: SplitDirection::Horizontal,
+                        ratio: 3.0 / 7.0,
+                        children: vec![
+                            LayoutNode::Panel(PanelDef {
+                                id: "chat".into(),
+                                component: Box::new(ChatView::new()),
+                                bounds: None,
+                            }),
+                            LayoutNode::Panel(PanelDef {
+                                id: "discussion".into(),
+                                component: Box::new(DiscussionThreadView::new()),
+                                bounds: None,
+                            }),
+                        ],
+                    }),
+                ],
+            }),
         };
     }
 }
@@ -347,7 +343,10 @@ mod tests {
                     split.ratio
                 );
             }
-            other => panic!("expected Split root, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected Split root, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
     }
 
@@ -361,7 +360,11 @@ mod tests {
 
         match &tree.root {
             LayoutNode::Split(split) => {
-                assert_eq!(split.children.len(), 2, "expected 2 children: chat + sidebar");
+                assert_eq!(
+                    split.children.len(),
+                    2,
+                    "expected 2 children: chat + sidebar"
+                );
 
                 // First child: chat view (Leaf)
                 assert!(
@@ -693,21 +696,19 @@ mod tests {
     fn sidebar_tabs_have_icons() {
         let tree = build_default_layout();
         match &tree.root {
-            LayoutNode::Split(split) => {
-                match &split.children[1] {
-                    LayoutNode::TabGroup(tg) => {
-                        assert_eq!(tg.tabs[0].icon.as_deref(), Some("🌐"));
-                        assert_eq!(tg.tabs[1].icon.as_deref(), Some("📁"));
-                        assert_eq!(tg.tabs[2].icon.as_deref(), Some("🧠"));
-                        assert_eq!(tg.tabs[3].icon.as_deref(), Some("⚙️"));
-                        assert_eq!(tg.tabs[4].icon.as_deref(), Some("📋"));
-                        assert_eq!(tg.tabs[5].icon.as_deref(), Some("📊"));
-                        assert_eq!(tg.tabs[6].icon.as_deref(), Some("📄"));
-                        assert_eq!(tg.tabs[7].icon.as_deref(), Some("☑"));
-                    }
-                    _ => panic!("expected TabGroup as second child"),
+            LayoutNode::Split(split) => match &split.children[1] {
+                LayoutNode::TabGroup(tg) => {
+                    assert_eq!(tg.tabs[0].icon.as_deref(), Some("🌐"));
+                    assert_eq!(tg.tabs[1].icon.as_deref(), Some("📁"));
+                    assert_eq!(tg.tabs[2].icon.as_deref(), Some("🧠"));
+                    assert_eq!(tg.tabs[3].icon.as_deref(), Some("⚙️"));
+                    assert_eq!(tg.tabs[4].icon.as_deref(), Some("📋"));
+                    assert_eq!(tg.tabs[5].icon.as_deref(), Some("📊"));
+                    assert_eq!(tg.tabs[6].icon.as_deref(), Some("📄"));
+                    assert_eq!(tg.tabs[7].icon.as_deref(), Some("☑"));
                 }
-            }
+                _ => panic!("expected TabGroup as second child"),
+            },
             _ => panic!("expected Split root"),
         }
     }
@@ -758,14 +759,12 @@ mod tests {
 
         // Switch to tab 2 (memory)
         match &mut tree.root {
-            LayoutNode::Split(split) => {
-                match &mut split.children[1] {
-                    LayoutNode::TabGroup(ref mut tg) => {
-                        tg.active = 2;
-                    }
-                    _ => {}
+            LayoutNode::Split(split) => match &mut split.children[1] {
+                LayoutNode::TabGroup(ref mut tg) => {
+                    tg.active = 2;
                 }
-            }
+                _ => {}
+            },
             _ => {}
         }
 
@@ -773,14 +772,12 @@ mod tests {
         state.toggle_sidebar(&mut tree); // show → restore
 
         match &tree.root {
-            LayoutNode::Split(split) => {
-                match &split.children[1] {
-                    LayoutNode::TabGroup(tg) => {
-                        assert_eq!(tg.active, 2, "active tab index should be preserved");
-                    }
-                    _ => panic!("expected TabGroup"),
+            LayoutNode::Split(split) => match &split.children[1] {
+                LayoutNode::TabGroup(tg) => {
+                    assert_eq!(tg.active, 2, "active tab index should be preserved");
                 }
-            }
+                _ => panic!("expected TabGroup"),
+            },
             _ => panic!("expected Split root"),
         }
     }

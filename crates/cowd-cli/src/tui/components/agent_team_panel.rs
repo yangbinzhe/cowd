@@ -110,8 +110,7 @@ impl AgentTeamPanel {
                 }
                 let max_visible = 10usize;
                 if self.selected_idx >= self.scroll_offset as usize + max_visible {
-                    self.scroll_offset =
-                        (self.selected_idx.saturating_sub(max_visible - 1)) as u16;
+                    self.scroll_offset = (self.selected_idx.saturating_sub(max_visible - 1)) as u16;
                 }
                 true
             }
@@ -176,9 +175,11 @@ impl AgentTeamPanel {
         let lower = role.to_lowercase();
         if lower.contains("planner") || lower.contains("plan") {
             "📋"
-        } else if lower.contains("executor") || lower.contains("execute") || lower.contains("build") {
+        } else if lower.contains("executor") || lower.contains("execute") || lower.contains("build")
+        {
             "🔧"
-        } else if lower.contains("reviewer") || lower.contains("review") || lower.contains("audit") {
+        } else if lower.contains("reviewer") || lower.contains("review") || lower.contains("audit")
+        {
             "🔍"
         } else {
             "🤖"
@@ -187,7 +188,11 @@ impl AgentTeamPanel {
 
     /// Build the title string for the bordered block.
     fn build_title(&self) -> String {
-        let base = if self.visible { " Agent Team " } else { " Agent Team (hidden) " };
+        let base = if self.visible {
+            " Agent Team "
+        } else {
+            " Agent Team (hidden) "
+        };
         if !self.agents.is_empty() {
             format!("{base}[{}]", self.agents.len())
         } else {
@@ -212,9 +217,7 @@ impl AgentTeamPanel {
     fn render_capability_tag(cap: &str) -> Span<'static> {
         Span::styled(
             format!("[{cap}]"),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
         )
     }
 
@@ -256,9 +259,10 @@ impl AgentTeamPanel {
 
         // Capabilities
         if !agent.capabilities.is_empty() {
-            let mut cap_spans: Vec<Span<'static>> = vec![
-                Span::styled("   Caps:     ", Style::default().fg(Color::DarkGray)),
-            ];
+            let mut cap_spans: Vec<Span<'static>> = vec![Span::styled(
+                "   Caps:     ",
+                Style::default().fg(Color::DarkGray),
+            )];
             for (i, cap) in agent.capabilities.iter().enumerate() {
                 if i > 0 {
                     cap_spans.push(Span::raw(" "));
@@ -323,9 +327,7 @@ impl Default for AgentTeamPanel {
 impl Component for AgentTeamPanel {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         let title = self.build_title();
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL);
+        let block = Block::default().title(title).borders(Borders::ALL);
 
         let _inner_width = area.width.saturating_sub(2) as usize;
         let inner_height = area.height.saturating_sub(2) as usize;
@@ -384,7 +386,9 @@ impl Component for AgentTeamPanel {
                 let emoji = Self::role_emoji(&agent.role);
 
                 let name_style = if is_selected {
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -403,9 +407,7 @@ impl Component for AgentTeamPanel {
 
                 // Second line: capability tags (indented)
                 if !agent.capabilities.is_empty() {
-                    let mut cap_spans: Vec<Span> = vec![
-                        Span::styled("      ", Style::default()),
-                    ];
+                    let mut cap_spans: Vec<Span> = vec![Span::styled("      ", Style::default())];
                     for (j, cap) in agent.capabilities.iter().enumerate() {
                         if j > 0 {
                             cap_spans.push(Span::raw(" "));
@@ -418,7 +420,11 @@ impl Component for AgentTeamPanel {
                 // Reputation score (compact inline)
                 if let Some(ref rep) = agent.reputation {
                     let composite = rep.composite();
-                    let rep_color = if composite >= 5.0 { Color::Magenta } else { Color::DarkGray };
+                    let rep_color = if composite >= 5.0 {
+                        Color::Magenta
+                    } else {
+                        Color::DarkGray
+                    };
                     lines.push(Line::from(vec![
                         Span::styled("      rep: ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
@@ -485,8 +491,7 @@ impl Component for AgentTeamPanel {
                 // Auto-scroll
                 let max_visible = 10usize;
                 if self.selected_idx >= self.scroll_offset as usize + max_visible {
-                    self.scroll_offset =
-                        (self.selected_idx.saturating_sub(max_visible - 1)) as u16;
+                    self.scroll_offset = (self.selected_idx.saturating_sub(max_visible - 1)) as u16;
                 }
                 EventResult::Consumed
             }
@@ -540,9 +545,9 @@ impl Component for AgentTeamPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyEvent;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
+    use crossterm::event::KeyEvent;
 
     fn dummy_agent(id: &str, role: &str, status: AgentStatus, caps: Vec<&str>) -> AgentInfo {
         AgentInfo {
@@ -588,7 +593,12 @@ mod tests {
     fn sync_populates_agents() {
         let dir = AgentDirectory::global();
         dir.clear_all();
-        dir.register(dummy_agent("test-1", "Executor", AgentStatus::Active, vec!["rust"]));
+        dir.register(dummy_agent(
+            "test-1",
+            "Executor",
+            AgentStatus::Active,
+            vec!["rust"],
+        ));
 
         let mut panel = AgentTeamPanel::new();
         panel.sync();
@@ -602,8 +612,18 @@ mod tests {
     fn selected_agent_returns_correct_entry() {
         let dir = AgentDirectory::global();
         dir.clear_all();
-        dir.register(dummy_agent("alpha", "Planner", AgentStatus::Active, vec!["plan"]));
-        dir.register(dummy_agent("beta", "Executor", AgentStatus::Busy, vec!["rust"]));
+        dir.register(dummy_agent(
+            "alpha",
+            "Planner",
+            AgentStatus::Active,
+            vec!["plan"],
+        ));
+        dir.register(dummy_agent(
+            "beta",
+            "Executor",
+            AgentStatus::Busy,
+            vec!["rust"],
+        ));
 
         let mut panel = AgentTeamPanel::new();
         panel.sync();
@@ -641,10 +661,22 @@ mod tests {
 
     #[test]
     fn status_color_mapping() {
-        assert_eq!(AgentTeamPanel::status_color(AgentStatus::Active), Color::Green);
-        assert_eq!(AgentTeamPanel::status_color(AgentStatus::Busy), Color::Yellow);
-        assert_eq!(AgentTeamPanel::status_color(AgentStatus::Idle), Color::DarkGray);
-        assert_eq!(AgentTeamPanel::status_color(AgentStatus::Offline), Color::Red);
+        assert_eq!(
+            AgentTeamPanel::status_color(AgentStatus::Active),
+            Color::Green
+        );
+        assert_eq!(
+            AgentTeamPanel::status_color(AgentStatus::Busy),
+            Color::Yellow
+        );
+        assert_eq!(
+            AgentTeamPanel::status_color(AgentStatus::Idle),
+            Color::DarkGray
+        );
+        assert_eq!(
+            AgentTeamPanel::status_color(AgentStatus::Offline),
+            Color::Red
+        );
     }
 
     #[test]
@@ -681,7 +713,12 @@ mod tests {
     fn render_with_agents() {
         let dir = AgentDirectory::global();
         dir.clear_all();
-        dir.register(dummy_agent("agent-1", "Executor", AgentStatus::Active, vec!["rust", "tui"]));
+        dir.register(dummy_agent(
+            "agent-1",
+            "Executor",
+            AgentStatus::Active,
+            vec!["rust", "tui"],
+        ));
 
         let mut panel = AgentTeamPanel::new();
         panel.sync();
@@ -689,9 +726,18 @@ mod tests {
 
         let lines = render_panel(&mut panel, 60, 15);
         let joined = lines.join("\n");
-        assert!(joined.contains("agent-1"), "Should show agent ID, got: {joined}");
-        assert!(joined.contains("Executor"), "Should show role, got: {joined}");
-        assert!(joined.contains("●"), "Should show Active status icon, got: {joined}");
+        assert!(
+            joined.contains("agent-1"),
+            "Should show agent ID, got: {joined}"
+        );
+        assert!(
+            joined.contains("Executor"),
+            "Should show role, got: {joined}"
+        );
+        assert!(
+            joined.contains("●"),
+            "Should show Active status icon, got: {joined}"
+        );
 
         dir.clear_all();
     }
@@ -712,24 +758,38 @@ mod tests {
 
         assert_eq!(panel.selected_idx, 0);
 
-        let press_j = Event::Key(KeyEvent::new(KeyCode::Char('j'), crossterm::event::KeyModifiers::NONE));
+        let press_j = Event::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         panel.handle_event(&press_j);
         assert_eq!(panel.selected_idx, 1);
 
-        let press_down = Event::Key(KeyEvent::new(KeyCode::Down, crossterm::event::KeyModifiers::NONE));
+        let press_down = Event::Key(KeyEvent::new(
+            KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         panel.handle_event(&press_down);
         assert_eq!(panel.selected_idx, 2);
 
         // Should not overflow past agent_count-1
         panel.handle_event(&press_j);
-        assert!(panel.selected_idx < agent_count,
-            "selected_idx should not exceed agent_count-1");
+        assert!(
+            panel.selected_idx < agent_count,
+            "selected_idx should not exceed agent_count-1"
+        );
 
-        let press_k = Event::Key(KeyEvent::new(KeyCode::Char('k'), crossterm::event::KeyModifiers::NONE));
+        let press_k = Event::Key(KeyEvent::new(
+            KeyCode::Char('k'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         panel.handle_event(&press_k);
         assert_eq!(panel.selected_idx, 1);
 
-        let press_up = Event::Key(KeyEvent::new(KeyCode::Up, crossterm::event::KeyModifiers::NONE));
+        let press_up = Event::Key(KeyEvent::new(
+            KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         panel.handle_event(&press_up);
         assert_eq!(panel.selected_idx, 0);
 
@@ -753,12 +813,18 @@ mod tests {
         panel.visible = true;
 
         // Jump to bottom
-        let press_g = Event::Key(KeyEvent::new(KeyCode::Char('G'), crossterm::event::KeyModifiers::NONE));
+        let press_g = Event::Key(KeyEvent::new(
+            KeyCode::Char('G'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         panel.handle_event(&press_g);
         assert_eq!(panel.selected_idx, 2);
 
         // Jump to top
-        let press_gg = Event::Key(KeyEvent::new(KeyCode::Char('g'), crossterm::event::KeyModifiers::NONE));
+        let press_gg = Event::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         panel.handle_event(&press_gg);
         assert_eq!(panel.selected_idx, 0);
 
@@ -769,14 +835,22 @@ mod tests {
     fn enter_toggles_detail() {
         let dir = AgentDirectory::global();
         dir.clear_all();
-        dir.register(dummy_agent("det", "Executor", AgentStatus::Active, vec!["rust"]));
+        dir.register(dummy_agent(
+            "det",
+            "Executor",
+            AgentStatus::Active,
+            vec!["rust"],
+        ));
 
         let mut panel = AgentTeamPanel::new();
         panel.sync();
         panel.visible = true;
         assert!(panel.detail_idx.is_none());
 
-        let press_enter = Event::Key(KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE));
+        let press_enter = Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         panel.handle_event(&press_enter);
         assert_eq!(panel.detail_idx, Some(0));
 
@@ -798,10 +872,19 @@ mod tests {
         panel.visible = true;
         panel.detail_idx = Some(0);
 
-        let press_esc = Event::Key(KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE));
+        let press_esc = Event::Key(KeyEvent::new(
+            KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         panel.handle_event(&press_esc);
-        assert!(panel.detail_idx.is_none(), "First Esc should collapse detail");
-        assert!(panel.visible, "Panel should still be visible after collapsing detail");
+        assert!(
+            panel.detail_idx.is_none(),
+            "First Esc should collapse detail"
+        );
+        assert!(
+            panel.visible,
+            "Panel should still be visible after collapsing detail"
+        );
 
         panel.handle_event(&press_esc);
         assert!(!panel.visible, "Second Esc should hide panel");
@@ -813,7 +896,10 @@ mod tests {
     fn tab_toggles_visibility() {
         let mut panel = AgentTeamPanel::new();
 
-        let press_tab = Event::Key(KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE));
+        let press_tab = Event::Key(KeyEvent::new(
+            KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         panel.handle_event(&press_tab);
         assert!(panel.visible);
 
@@ -839,7 +925,12 @@ mod tests {
     fn sync_from_app_delegates_to_sync() {
         let dir = AgentDirectory::global();
         dir.clear_all();
-        dir.register(dummy_agent("via-app", "Planner", AgentStatus::Active, vec![]));
+        dir.register(dummy_agent(
+            "via-app",
+            "Planner",
+            AgentStatus::Active,
+            vec![],
+        ));
 
         let app = App::new("m", "s");
         let mut panel = AgentTeamPanel::new();
@@ -875,7 +966,10 @@ mod tests {
         let mut panel = AgentTeamPanel::new();
         assert!(panel.agents.is_empty());
         // Call toggle_detail via Enter event
-        let press_enter = Event::Key(KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE));
+        let press_enter = Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         panel.handle_event(&press_enter);
         assert!(panel.detail_idx.is_none());
     }
@@ -920,17 +1014,29 @@ mod tests {
         panel.scroll_offset = 0;
 
         let agent_count = panel.agents.len();
-        assert!(agent_count >= 10, "Expected at least 10 agents, got {agent_count}");
+        assert!(
+            agent_count >= 10,
+            "Expected at least 10 agents, got {agent_count}"
+        );
 
-        let press_j = Event::Key(KeyEvent::new(KeyCode::Char('j'), crossterm::event::KeyModifiers::NONE));
+        let press_j = Event::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         for _ in 0..12 {
             panel.handle_event(&press_j);
         }
         // selected_idx should be at the clamped maximum
         assert!(panel.selected_idx > 0, "selection should advance");
-        assert!(panel.selected_idx < agent_count, "selection should be clamped");
+        assert!(
+            panel.selected_idx < agent_count,
+            "selection should be clamped"
+        );
         if agent_count >= 10 {
-            assert!(panel.scroll_offset > 0, "scroll should track selection for long lists");
+            assert!(
+                panel.scroll_offset > 0,
+                "scroll should track selection for long lists"
+            );
         }
 
         dir.clear_all();

@@ -14,17 +14,17 @@ pub fn needs_bootstrap() -> bool {
         config_home.join("config.yml"),
         config_home.join("config.json"),
     ];
-    
+
     // 同时检查 ~/.cc 目录（兼容 CC 配置）
     let cc_path = PathBuf::from(&std::env::var("HOME").unwrap_or_default())
         .join(".cc")
         .join("config.yaml");
-    
+
     // 如果 ~/.cc/config.yaml 存在，直接复用
     if cc_path.exists() {
         return false;
     }
-    
+
     !config_paths.iter().any(|p| p.exists())
 }
 
@@ -32,9 +32,7 @@ pub fn needs_bootstrap() -> bool {
 fn default_config_home() -> PathBuf {
     std::env::var_os("COWD_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cowd"))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cowd")))
         .unwrap_or_else(|| PathBuf::from(".cowd"))
 }
 
@@ -42,36 +40,37 @@ fn default_config_home() -> PathBuf {
 pub fn run_bootstrap() -> Result<(), Box<dyn std::error::Error>> {
     let config_home = default_config_home();
     let config_file = config_home.join("config.yaml");
-    
+
     // 创建配置目录
     if !config_home.exists() {
         fs::create_dir_all(&config_home)?;
     }
-    
+
     println!("\n╔══════════════════════════════════════════════════════════════════╗");
     println!("║                    Cowd 首次启动引导                              ║");
     println!("╚══════════════════════════════════════════════════════════════════╝\n");
-    
+
     println!("检测到您是首次使用 Cowd，让我们进行一些基本配置...\n");
-    
+
     // 引导配置
     let api_key = prompt_user("请输入您的 OpenAI API Key (sk-...): ");
-    let gateway_enabled = prompt_yes_no("是否启用 Gateway 服务? (用于 HTTP API 和 WebSocket 接口) [y/N]: ");
+    let gateway_enabled =
+        prompt_yes_no("是否启用 Gateway 服务? (用于 HTTP API 和 WebSocket 接口) [y/N]: ");
     let gateway_port: u16 = if gateway_enabled {
         prompt_port("请输入 Gateway 端口 (默认 8642): ")
     } else {
         8642
     };
-    
+
     let gateway_token = if gateway_enabled {
         generate_token()
     } else {
         String::new()
     };
-    
+
     // 生成配置
     let config_content = generate_config(&api_key, gateway_enabled, gateway_port, &gateway_token);
-    
+
     // 写入配置文件 (0o600 — only owner can read the API key)
     fs::write(&config_file, config_content)?;
     #[cfg(unix)]
@@ -87,7 +86,7 @@ pub fn run_bootstrap() -> Result<(), Box<dyn std::error::Error>> {
     println!("  1. 编辑配置文件添加更多 Provider 配置");
     println!("  2. 运行 'cowd --help' 查看使用说明");
     println!("  3. 运行 'cowd' 启动交互式 REPL\n");
-    
+
     Ok(())
 }
 
@@ -128,8 +127,9 @@ fn generate_token() -> String {
 fn generate_config(api_key: &str, gateway_enabled: bool, port: u16, token: &str) -> String {
     let gateway_enabled_str = if gateway_enabled { "true" } else { "false" };
     let auth_enabled_str = if gateway_enabled { "true" } else { "false" };
-    
-    format!(r#"# =============================================================================
+
+    format!(
+        r#"# =============================================================================
 # Cowd 用户全局配置
 # =============================================================================
 #
@@ -286,5 +286,6 @@ plugins:
   registryPath: null
   bundledRoot: null
   maxOutputTokens: null
-"#)
+"#
+    )
 }

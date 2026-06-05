@@ -100,7 +100,9 @@ impl Component for ContextPanel {
         let mut lines = Vec::new();
         lines.push(Line::from(Span::styled(
             "Context Usage",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::raw(""));
 
@@ -116,7 +118,9 @@ impl Component for ContextPanel {
             Span::styled(bar, Style::default().fg(bar_color)),
             Span::styled(
                 format!(" {:.0}%", pct),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::raw(""));
@@ -155,10 +159,7 @@ impl Component for ContextPanel {
         // Cost
         lines.push(Line::from(vec![
             Span::styled("Cost:     ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("${:.4}", cost),
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(format!("${:.4}", cost), Style::default().fg(Color::Yellow)),
         ]));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
@@ -204,8 +205,8 @@ fn fmt_tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::test_utils::MockTerminal;
     use crate::tui::skin::SkinConfig;
+    use crate::tui::test_utils::MockTerminal;
 
     fn render_panel(panel: &mut ContextPanel, width: u16, height: u16) -> Vec<String> {
         let mut terminal = MockTerminal::new(width, height);
@@ -225,8 +226,14 @@ mod tests {
 
         let lines = render_panel(&mut panel, 40, 12);
         let joined = lines.join("\n");
-        assert!(joined.contains("1k") || joined.contains("1500"), "Should show token count");
-        assert!(joined.contains("128") || joined.contains("128k"), "Should show context window");
+        assert!(
+            joined.contains("1k") || joined.contains("1500"),
+            "Should show token count"
+        );
+        assert!(
+            joined.contains("128") || joined.contains("128k"),
+            "Should show context window"
+        );
     }
 
     #[test]

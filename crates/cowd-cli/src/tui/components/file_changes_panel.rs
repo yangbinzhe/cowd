@@ -230,10 +230,7 @@ impl Component for FileChangesPanel {
             let prefix = if is_selected { "▸" } else { " " };
             let label = format!(
                 " {} 📄 {} [+{} -{}]",
-                prefix,
-                file.path,
-                file.added,
-                file.removed
+                prefix, file.path, file.added, file.removed
             );
 
             let style = if is_selected {
@@ -271,7 +268,9 @@ impl Component for FileChangesPanel {
             } else {
                 Line::styled(
                     format!("  ▼ {} more files — press 'c' to expand", hidden),
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
                 )
             };
             items.push(indicator);
@@ -505,7 +504,9 @@ mod tests {
                 id: "tc1".to_string(),
                 name: "edit_file".to_string(),
                 preview: "editing main.rs".to_string(),
-                output: "Updated file: src/main.rs\n+fn new_func() {}\n-old_func();\n context line\n".to_string(),
+                output:
+                    "Updated file: src/main.rs\n+fn new_func() {}\n-old_func();\n context line\n"
+                        .to_string(),
                 done: true,
                 expanded: false,
                 exit_code: Some(0),

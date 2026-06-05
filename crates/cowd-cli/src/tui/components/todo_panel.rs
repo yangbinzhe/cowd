@@ -102,10 +102,7 @@ impl TodoPanel {
     pub fn extract_from_timeline(&mut self, timeline: &[crate::tui::app::TimelineEntry]) {
         self.items.clear();
         for entry in timeline {
-            if let crate::tui::app::TimelineEntry::ToolCall {
-                name, output, ..
-            } = entry
-            {
+            if let crate::tui::app::TimelineEntry::ToolCall { name, output, .. } = entry {
                 if name == "TodoWrite" && !output.is_empty() {
                     self.parse_todo_json(output);
                 }
@@ -219,7 +216,9 @@ impl Component for TodoPanel {
             let hidden = self.items.len() - self.collapse_limit;
             items.push(Line::styled(
                 format!("  ▼ {} more items — press 'c' to expand", hidden),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             ));
         }
 
@@ -263,10 +262,10 @@ impl Component for TodoPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::TimelineEntry;
     use crate::tui::components::RenderContext;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
-    use crate::tui::app::TimelineEntry;
 
     fn render_panel(panel: &mut TodoPanel, width: u16, height: u16) -> Vec<String> {
         let mut terminal = MockTerminal::new(width, height);
@@ -301,7 +300,10 @@ mod tests {
 
         let lines = render_panel(&mut panel, 60, 10);
         let joined = lines.join("\n");
-        assert!(joined.contains("Refactor auth module"), "Should show task 1");
+        assert!(
+            joined.contains("Refactor auth module"),
+            "Should show task 1"
+        );
         assert!(joined.contains("Add tests for API"), "Should show task 2");
     }
 
@@ -357,7 +359,10 @@ mod tests {
 
         let lines = render_panel(&mut panel, 60, 10);
         let joined = lines.join("\n");
-        assert!(joined.contains("more items"), "Should show collapse indicator");
+        assert!(
+            joined.contains("more items"),
+            "Should show collapse indicator"
+        );
         assert!(joined.contains("A"), "Should show first item");
         // "C" might not be shown if collapsed
     }
@@ -430,17 +435,15 @@ mod tests {
             {"content": "Fix bug", "status": "in_progress", "priority": "high"},
             {"content": "Write docs", "status": "pending", "priority": "medium"}
         ]"#;
-        let timeline = vec![
-            crate::tui::app::TimelineEntry::ToolCall {
-                id: "tc1".to_string(),
-                name: "TodoWrite".to_string(),
-                preview: "todo".to_string(),
-                output: json.to_string(),
-                done: true,
-                expanded: false,
-                exit_code: Some(0),
-            },
-        ];
+        let timeline = vec![crate::tui::app::TimelineEntry::ToolCall {
+            id: "tc1".to_string(),
+            name: "TodoWrite".to_string(),
+            preview: "todo".to_string(),
+            output: json.to_string(),
+            done: true,
+            expanded: false,
+            exit_code: Some(0),
+        }];
 
         panel.sync_from_timeline(&timeline);
         assert_eq!(panel.len(), 2);
