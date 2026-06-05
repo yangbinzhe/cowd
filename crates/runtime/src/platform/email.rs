@@ -180,16 +180,9 @@ impl EmailAdapter {
 
         // IMAP is blocking, run in spawn_blocking
         let result = tokio::task::spawn_blocking(move || -> PlatformResult<Vec<InboundMessage>> {
-            let tls = native_tls::TlsConnector::builder()
-                .build()
-                .map_err(|e| PlatformError::ReceiveFailed(format!("TLS error: {}", e)))?;
-
-            let client = imap::connect(
-                (&*imap_host, imap_port),
-                &imap_host,
-                &tls,
-            )
-            .map_err(|e| PlatformError::ReceiveFailed(format!("IMAP connect error: {}", e)))?;
+            let client = imap::ClientBuilder::new(&imap_host, imap_port)
+                .connect()
+                .map_err(|e| PlatformError::ReceiveFailed(format!("IMAP connect error: {}", e)))?;
 
             let mut session = client
                 .login(&imap_user, &imap_pass)
