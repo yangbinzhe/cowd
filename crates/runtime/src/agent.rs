@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::tool_orchestrator::ToolResultBudget;
 
 use memory::cognitive::CognitiveContextManager;
+use memory::{MemoryKernel, MemoryTurnContext};
 use memory::types::{MemoryLayer, MemoryCategory, MemorySource, Priority};
 use memory::project_scope::MemoryScope;
 use memory::types::AgentVisibility;
@@ -437,6 +438,10 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
         self.progress_callback = Some(cb);
     }
 
+    fn memory_turn_context(&self) -> MemoryTurnContext {
+        MemoryTurnContext::new(self.runtime.session().session_id, self.agent_id.clone())
+    }
+
     /// Check if a tool is allowed for this sub-agent.
     pub fn is_tool_allowed(&self, tool_name: &str) -> bool {
         // If no allowed_tools specified, all tools are allowed
@@ -577,7 +582,9 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
         // P7.4: Inject parent agent memory into the system prompt before the main loop.
         if self.config.inject_memory {
             if let Some(ref mem) = self.parent_memory {
-                match mem.prepare_context(initial_prompt, &[], None).await {
+                let kernel = MemoryKernel::new(Arc::clone(mem));
+                let memory_ctx = self.memory_turn_context();
+                match kernel.prepare(&memory_ctx, initial_prompt, &[]).await {
                     Ok(prepared) => {
                         let mem_section = format_prepared_context(&prepared);
                         current_prompt = format!("{mem_section}\n\n{current_prompt}");
@@ -1067,6 +1074,17 @@ mod tests {
         assert!(config.inject_peer_context);
         assert!(config.inject_memory);
         assert!(config.retain_reasoning);
+    }
+
+    #[test]
+    fn sub_agent_memory_turn_context_uses_runtime_session_and_agent() {
+        let runtime = SubAgentRuntime::new(SubAgentConfig::default(), make_dummy_runtime());
+        let expected_session = runtime.runtime.session().session_id;
+
+        let ctx = runtime.memory_turn_context();
+
+        assert_eq!(ctx.session_id, expected_session);
+        assert_eq!(ctx.agent_id, runtime.agent_id);
     }
 
     #[test]
