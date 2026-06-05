@@ -21,7 +21,8 @@ use ratatui::{
 };
 
 use memory::cognitive::CognitiveContextManager;
-use memory::types::{MemoryLayer, MemoryMeta};
+use memory::{MemoryInformationState, MemoryKernel};
+use memory::types::MemoryLayer;
 
 use crate::tui::app::{App, MemoryEntry};
 use crate::tui::components::{Component, EventResult, RenderContext};
@@ -183,15 +184,11 @@ impl MemoryPanel {
 
         let fresh: Vec<MemoryEntry> = if let Some(layer) = self.active_layer {
             let mlayer = layer_to_memory_layer(layer);
-            match list_layer_entries_blocking(Arc::clone(mm), mlayer) {
-                Ok(metas) => metas
+            match memory_layer_view_blocking(Arc::clone(mm), mlayer) {
+                Ok(view) => view
+                    .atoms
                     .into_iter()
-                    .map(|m| MemoryEntry {
-                        id: Some(m.id.to_string()),
-                        layer: format!("{:?}", m.layer),
-                        content: m.title,
-                        priority: format!("{:?}", m.priority),
-                    })
+                    .map(memory_atom_to_tui_entry)
                     .collect(),
                 Err(err) => {
                     self.set_status(&format!("Refresh failed: {err}"));
@@ -199,33 +196,16 @@ impl MemoryPanel {
                 }
             }
         } else {
-            // Fetch across all layers: combine L0-L4
-            let mut all = Vec::new();
-            for l in &[
-                MemoryLayer::L0,
-                MemoryLayer::L1,
-                MemoryLayer::L2,
-                MemoryLayer::L3,
-                MemoryLayer::L4,
-            ] {
-                match list_layer_entries_blocking(Arc::clone(mm), *l) {
-                    Ok(metas) => {
-                        for m in metas {
-                            all.push(MemoryEntry {
-                                id: Some(m.id.to_string()),
-                                layer: format!("{:?}", m.layer),
-                                content: m.title,
-                                priority: format!("{:?}", m.priority),
-                            });
-                        }
-                    }
-                    Err(err) => {
-                        self.set_status(&format!("Refresh failed: {err}"));
-                        return;
-                    }
+            match memory_layer_views_blocking(Arc::clone(mm)) {
+                Ok(views) => views
+                    .into_iter()
+                    .flat_map(|view| view.atoms.into_iter().map(memory_atom_to_tui_entry))
+                    .collect(),
+                Err(err) => {
+                    self.set_status(&format!("Refresh failed: {err}"));
+                    return;
                 }
             }
-            all
         };
 
         self.entries = fresh;
@@ -852,11 +832,34 @@ fn layer_to_memory_layer(layer: Layer) -> MemoryLayer {
     }
 }
 
-fn list_layer_entries_blocking(
+fn memory_atom_to_tui_entry(atom: memory::MemoryAtomView) -> MemoryEntry {
+    MemoryEntry {
+        id: Some(atom.id.to_string()),
+        layer: format!("{:?}", atom.layer),
+        content: atom.title,
+        priority: format!("{:?}", atom.state),
+    }
+}
+
+fn memory_layer_view_blocking(
     manager: Arc<CognitiveContextManager>,
     layer: MemoryLayer,
-) -> Result<Vec<MemoryMeta>, String> {
-    run_memory_operation_blocking(move || async move { manager.list_layer_entries(layer).await })
+) -> Result<memory::MemoryLayerView, String> {
+    run_memory_operation_blocking(move || async move {
+        MemoryKernel::new(manager)
+            .layer_view(layer, MemoryInformationState::Orientation)
+            .await
+    })
+}
+
+fn memory_layer_views_blocking(
+    manager: Arc<CognitiveContextManager>,
+) -> Result<Vec<memory::MemoryLayerView>, String> {
+    run_memory_operation_blocking(move || async move {
+        MemoryKernel::new(manager)
+            .layer_views(MemoryInformationState::Orientation)
+            .await
+    })
 }
 
 fn search_memory_blocking(
@@ -873,11 +876,12 @@ fn delete_memory_entry_blocking(
     run_memory_operation_blocking(move || async move { manager.delete_entry(&id).await })
 }
 
-fn run_memory_operation_blocking<F, Fut, T>(operation: F) -> Result<T, String>
+fn run_memory_operation_blocking<F, Fut, T, E>(operation: F) -> Result<T, String>
 where
     F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<T, memory::error::MemoryError>> + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, E>> + Send + 'static,
     T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
 {
     let run = move || {
         let rt = tokio::runtime::Builder::new_current_thread()
