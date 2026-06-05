@@ -55,6 +55,7 @@ describe('API module', () => {
     expect(typeof window.Api.memoryStatus).toBe('function');
     expect(typeof window.Api.listMemoryLayers).toBe('function');
     expect(typeof window.Api.searchMemory).toBe('function');
+    expect(typeof window.Api.recallExplain).toBe('function');
     expect(typeof window.Api.createMemoryEntry).toBe('function');
     expect(typeof window.Api.updateMemoryEntry).toBe('function');
     expect(typeof window.Api.deleteMemoryEntry).toBe('function');
@@ -81,6 +82,21 @@ describe('API module', () => {
 
     expect(String(mockF.mock.calls[0][0])).toBe('/api/memory/status');
     expect(status.status).toBe('ready');
+  });
+
+  it('recallExplain uses the stable explain endpoint', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ enabled: true, mode: 'keyword', results: [] })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const explain = await window.Api.recallExplain('SessionKernel', 7);
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/memory/recall/explain?q=SessionKernel&limit=7');
+    expect(explain.mode).toBe('keyword');
   });
 
   it('has all skill endpoints', () => {
@@ -543,6 +559,54 @@ describe('API module', () => {
     const text = document.getElementById('panel-content').textContent;
     expect(text).toContain('L4');
     expect(text).not.toContain('[object Object]');
+  });
+
+  it('renders recall explain metadata in the memory panel', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    const mockF = vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/memory/stats')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ total_entries: 1, entity_count: 0, triple_count: 0 }) });
+      }
+      if (path.includes('/api/memory/entities')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ entities: [] }) });
+      }
+      if (path.includes('/api/memory/triples')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ triples: [] }) });
+      }
+      if (path.includes('/api/memory/recall/explain')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          mode: 'keyword',
+          degraded: false,
+          results: [{
+            source_layer: 'L3',
+            category: 'ProjectKnowledge',
+            mode: 'keyword',
+            score: 0.87,
+            snippet: 'SessionKernel owns durable sessions',
+          }]
+        }) });
+      }
+      if (path.includes('/api/memory/layers')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ layers: [] }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderMemory();
+    const input = Array.from(document.querySelectorAll('input')).find(el => el.placeholder === 'Search memory...');
+    input.value = 'SessionKernel';
+    input.dispatchEvent(new Event('input'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const text = document.getElementById('panel-content').textContent;
+    expect(String(mockF.mock.calls.at(-1)[0])).toContain('/api/memory/recall/explain?q=SessionKernel&limit=20');
+    expect(text).toContain('Recall Explain');
+    expect(text).toContain('Mode: keyword');
+    expect(text).toContain('L3');
+    expect(text).toContain('score 0.87');
+    expect(text).toContain('SessionKernel owns durable sessions');
   });
 
   it('renders symbol-memory search results in the memory panel', async () => {

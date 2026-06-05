@@ -40,7 +40,7 @@ use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use crate::session_kernel::SessionKernel;
 use crate::task_kernel::{TaskKernel, TaskStatus};
-use memory::MemoryScope;
+use memory::{MemoryScope, SearchMemoriesRequest};
 use memory::RotAlert;
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
@@ -175,6 +175,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/memory", get(memory_handler))
         .route("/api/memory/status", get(memory_status_handler))
         .route("/api/memory/search", get(memory_search_handler))
+        .route("/api/memory/recall/explain", get(memory_recall_explain_handler))
         .route("/api/memory/stats", get(memory_stats_handler))
         .route("/api/memory/layers", get(memory_layers_handler))
         .route("/api/memory/entities", get(memory_entities_handler))
@@ -1718,6 +1719,93 @@ async fn memory_search_handler(
         }
     } else {
         Json(serde_json::json!({ "results": [] }))
+    }
+}
+
+async fn memory_recall_explain_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let query = params.get("q").cloned().unwrap_or_default();
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10)
+        .clamp(1, 50);
+
+    let Some(ref mgr) = state.memory_manager else {
+        return Json(serde_json::json!({
+            "enabled": false,
+            "query": query,
+            "mode": "disabled",
+            "degraded": true,
+            "degraded_reason": "memory not configured",
+            "total": 0,
+            "results": [],
+            "keywords": [],
+            "categories": [],
+        }));
+    };
+
+    let request = SearchMemoriesRequest {
+        query: query.clone(),
+        limit,
+        with_snippets: true,
+        with_keywords: true,
+        ..Default::default()
+    };
+
+    match mgr.search_memories(request).await {
+        Ok(result) => {
+            let mode = result.search_mode.clone();
+            let results: Vec<_> = result
+                .entries
+                .into_iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let snippet = result
+                        .snippets
+                        .get(index)
+                        .and_then(|snippet| snippet.as_ref())
+                        .map(|snippet| snippet.text.clone());
+                    serde_json::json!({
+                        "id": entry.id,
+                        "title": entry.title,
+                        "content": entry.content,
+                        "source_layer": format!("{:?}", entry.layer),
+                        "category": format!("{:?}", entry.category),
+                        "priority": format!("{:?}", entry.priority),
+                        "scope": entry.scope.to_string(),
+                        "score": entry.confidence,
+                        "mode": mode,
+                        "snippet": snippet,
+                        "tags": entry.tags,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({
+                "enabled": true,
+                "query": result.query,
+                "mode": mode,
+                "degraded": false,
+                "degraded_reason": null,
+                "total": result.total_matches,
+                "results": results,
+                "keywords": result.keywords,
+                "categories": result.categories_found,
+            }))
+        }
+        Err(e) => Json(serde_json::json!({
+            "enabled": true,
+            "query": query,
+            "mode": mgr.search_mode_label(),
+            "degraded": true,
+            "degraded_reason": e.to_string(),
+            "total": 0,
+            "results": [],
+            "keywords": [],
+            "categories": [],
+        })),
     }
 }
 
@@ -3993,6 +4081,58 @@ mod tests {
         assert_eq!(json["enabled"], false);
         assert_eq!(json["status"], "disabled");
         assert_eq!(json["context_health"]["level"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn memory_recall_explain_reports_source_mode_and_score() {
+        let tmp = std::env::temp_dir().join(format!("cowd-api-memory-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manager = Arc::new(
+            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+                .await
+                .unwrap(),
+        );
+        manager
+            .create_entry(
+                MemoryLayer::L3,
+                MemoryCategory::ProjectKnowledge,
+                "SessionKernel migration",
+                "SessionKernel owns durable sessions and task phase review evidence.",
+                Priority::High,
+                vec!["session".into(), "task".into()],
+                MemoryScope::Project("api-test".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let app = api_router(test_state_with_memory(manager));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/recall/explain?q=SessionKernel&limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["query"], "SessionKernel");
+        assert_eq!(json["degraded"], false);
+        assert_eq!(json["results"][0]["source_layer"], "L3");
+        assert_eq!(json["results"][0]["category"], "ProjectKnowledge");
+        assert!(json["results"][0]["score"].as_f64().is_some());
+        assert!(json["results"][0]["mode"].as_str().is_some());
+        assert!(
+            json["results"][0]["snippet"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("SessionKernel")
+        );
+
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[tokio::test]

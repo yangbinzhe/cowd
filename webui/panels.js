@@ -149,13 +149,20 @@ window.Panels = (()=>{
     const sec=c.querySelector('.panel-section:last-child');
     if(!sec)return;
     try{
-      const r=await Api.searchMemory(q);
+      const r=await Api.recallExplain(q,20);
       const results=r.results||r||[];
       const list=UI.el('div');
-      list.innerHTML='<h3>Search Results</h3>';
+      list.innerHTML='<h3>Recall Explain</h3>';
+      if(r.mode||r.degraded_reason){
+        const meta=UI.el('div','panel-item');
+        meta.textContent='Mode: '+(r.mode||'unknown')+(r.degraded_reason?' · '+r.degraded_reason:'');
+        list.appendChild(meta);
+      }
       results.slice(0,20).forEach(e=>{
         const item=UI.el('div','panel-item');
-        item.textContent=(e.content||e.text||'').slice(0,100);
+        const source=[e.source_layer,e.category,e.mode].filter(Boolean).join(' · ');
+        const score=typeof e.score==='number'?' · score '+e.score.toFixed(2):'';
+        item.textContent=(source?source+score+' — ':'')+(e.snippet||e.content||e.text||'').slice(0,140);
         list.appendChild(item);
       });
       const old=c.querySelector('.search-results');

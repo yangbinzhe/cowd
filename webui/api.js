@@ -151,6 +151,7 @@ window.Api = (()=>{
     async memoryStats(){return req('GET','/api/memory/stats')},
     async listMemoryLayers(){return req('GET','/api/memory/layers')},
     async searchMemory(q){return req('GET','/api/memory/search?q='+encodeURIComponent(q))},
+    async recallExplain(q,limit){return req('GET','/api/memory/recall/explain?q='+encodeURIComponent(q)+'&limit='+(limit||10))},
     async getMemoryLayer(layer){return req('GET','/api/memory/'+layer)},
     async createMemoryEntry(layer,entry){return req('POST','/api/memory/'+layer,entry)},
     async updateMemoryEntry(id,entry){return req('PATCH','/api/memory/entry/'+id,entry)},
