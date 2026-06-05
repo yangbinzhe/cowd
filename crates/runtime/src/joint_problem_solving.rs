@@ -1203,7 +1203,7 @@ mod tests {
             &self,
             _config: SubAgentConfig,
             _task: &str,
-        ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
+        ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
             async move {
                 Ok(SubAgentResult {
                     output: "test output".to_string(),
@@ -1441,7 +1441,7 @@ mod tests {
                 &self,
                 _config: SubAgentConfig,
                 _task: &str,
-            ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
+            ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
                 async move {
                     Ok(SubAgentResult {
                         output: String::new(),
@@ -1507,7 +1507,7 @@ mod tests {
     // ── Integration: full pipeline with test executor ───────────────────
 
     struct IntegrationTestExecutor {
-        responses: Vec<String>,
+        _responses: Vec<String>,
     }
 
     impl SubAgentExecutor for IntegrationTestExecutor {
@@ -1515,7 +1515,7 @@ mod tests {
             &self,
             config: SubAgentConfig,
             task: &str,
-        ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
+        ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
             // Return a response based on the agent role.
             let output = if config.agent_role.contains("Brainstormer") || task.contains("brainstorm") {
                 "## Solution 1: Quick Fix\nJust fix it quickly.\n\n## Solution 2: Refactor\nRefactor the whole thing.".to_string()
@@ -1544,7 +1544,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_pipeline_brainstorm_and_merge() {
-        let pipeline = ProblemSolvingPipeline::<IntegrationTestExecutor>::new(Arc::new(IntegrationTestExecutor { responses: vec![] }));
+        let pipeline = ProblemSolvingPipeline::<IntegrationTestExecutor>::new(Arc::new(IntegrationTestExecutor { _responses: vec![] }));
 
         let problem = ProblemStatement::new("build system is slow")
             .with_constraints(vec!["must not break CI".to_string()])
@@ -1562,5 +1562,4 @@ mod tests {
         assert!(!result.phase_statuses.is_empty());
     }
 }
-
 

@@ -567,7 +567,7 @@ mod tests {
             &self,
             _config: SubAgentConfig,
             task: &str,
-        ) -> impl std::future::Future<Output = Result<SubAgentResult, crate::agent::SubAgentError>> + Send {
+        ) -> impl std::future::Future<Output = Result<SubAgentResult, crate::agent::SubAgentError>> {
             let task = task.to_string();
             async move {
                 Ok(SubAgentResult {

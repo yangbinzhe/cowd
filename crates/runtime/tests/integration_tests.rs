@@ -465,7 +465,7 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
             &self,
             _config: SubAgentConfig,
             _task: &str,
-        ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> + Send {
+        ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
             async { Ok(SubAgentResult::default()) }
         }
     }
