@@ -78,7 +78,7 @@ pub enum MemoryState {
 /// Read-side atom projection used by kernel/UI/tests.
 ///
 /// This is a view over existing [`MemoryEntry`] data. It is not a new store.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryAtomView {
     pub id: MemoryId,
     pub layer: MemoryLayer,
@@ -138,6 +138,33 @@ pub struct MemoryLayerView {
     pub layer: MemoryLayer,
     pub atoms: Vec<MemoryAtomView>,
     pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum MemoryLinkKind {
+    Related,
+    Supersedes,
+    Summarizes,
+    DependsOn,
+    ProducedBy,
+    BelongsTo,
+    Mentions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryLink {
+    pub from: MemoryId,
+    pub to: MemoryId,
+    pub kind: MemoryLinkKind,
+    pub weight: f32,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryPath {
+    pub entries: Vec<MemoryAtomView>,
+    pub links: Vec<MemoryLink>,
+    pub truncated: bool,
 }
 
 impl MemoryLayerView {
@@ -382,6 +409,79 @@ impl MemoryKernel {
         active
     }
 
+    pub async fn links(&self) -> MemoryKernelResult<Vec<MemoryLink>> {
+        let entries = self.manager.list_all_entries().await?;
+        Ok(build_links(&entries))
+    }
+
+    pub async fn path_recall(
+        &self,
+        start: MemoryId,
+        max_hops: usize,
+        max_nodes: usize,
+    ) -> MemoryKernelResult<MemoryPath> {
+        let entries = self.manager.list_all_entries().await?;
+        let links = build_links(&entries);
+        let entry_by_id: std::collections::HashMap<MemoryId, &MemoryEntry> =
+            entries.iter().map(|entry| (entry.id, entry)).collect();
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([(start, 0usize)]);
+        let mut path_entries = Vec::new();
+        let mut path_links = Vec::new();
+        let mut truncated = false;
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(entry) = entry_by_id.get(&current) {
+                let mut atom = MemoryAtomView::from_entry(entry, MemoryInformationState::Trace);
+                if let Ok(Some(state)) = self.latest_state(entry.id).await {
+                    atom.state = state;
+                }
+                path_entries.push(atom);
+            }
+            if path_entries.len() >= max_nodes {
+                truncated = queue.front().is_some()
+                    || links
+                        .iter()
+                        .any(|link| link.from == current || link.to == current);
+                break;
+            }
+            if depth >= max_hops {
+                continue;
+            }
+
+            for link in links
+                .iter()
+                .filter(|link| link.from == current || link.to == current)
+            {
+                let next = if link.from == current {
+                    link.to
+                } else {
+                    link.from
+                };
+                if !visited.contains(&next) {
+                    path_links.push(link.clone());
+                    queue.push_back((next, depth + 1));
+                }
+                if path_entries.len() + queue.len() >= max_nodes {
+                    truncated = true;
+                    break;
+                }
+            }
+            if truncated {
+                break;
+            }
+        }
+
+        Ok(MemoryPath {
+            entries: path_entries,
+            links: path_links,
+            truncated,
+        })
+    }
+
     pub async fn health(&self, _ctx: &MemoryTurnContext) -> MemoryKernelResult<MemoryHealth> {
         let started = Instant::now();
         let entries = match self.manager.list_all_entries().await {
@@ -544,6 +644,70 @@ impl MemoryKernel {
 
 fn lifecycle_key(memory_id: MemoryId) -> String {
     format!("memory_lifecycle:{memory_id}")
+}
+
+fn build_links(entries: &[MemoryEntry]) -> Vec<MemoryLink> {
+    let mut links = Vec::new();
+    let mut by_session: std::collections::HashMap<&str, Vec<MemoryId>> =
+        std::collections::HashMap::new();
+    let mut by_agent: std::collections::HashMap<&str, Vec<MemoryId>> =
+        std::collections::HashMap::new();
+    let mut by_tag: std::collections::HashMap<&str, Vec<MemoryId>> =
+        std::collections::HashMap::new();
+
+    for entry in entries {
+        for relation in &entry.relations {
+            links.push(MemoryLink {
+                from: entry.id,
+                to: relation.target_id,
+                kind: relation_kind_to_link_kind(relation.kind),
+                weight: relation.strength.clamp(0.0, 1.0),
+                evidence: format!("relation:{:?}", relation.kind),
+            });
+        }
+        if let Some(session_id) = entry.session_id.as_deref() {
+            by_session.entry(session_id).or_default().push(entry.id);
+        }
+        if let Some(agent_id) = entry.source_agent.as_deref() {
+            by_agent.entry(agent_id).or_default().push(entry.id);
+        }
+        for tag in &entry.tags {
+            by_tag.entry(tag.as_str()).or_default().push(entry.id);
+        }
+    }
+
+    add_group_links(&mut links, by_session, MemoryLinkKind::BelongsTo, "session");
+    add_group_links(&mut links, by_agent, MemoryLinkKind::ProducedBy, "agent");
+    add_group_links(&mut links, by_tag, MemoryLinkKind::Mentions, "tag");
+    links
+}
+
+fn add_group_links(
+    links: &mut Vec<MemoryLink>,
+    groups: std::collections::HashMap<&str, Vec<MemoryId>>,
+    kind: MemoryLinkKind,
+    evidence_prefix: &str,
+) {
+    for (key, ids) in groups {
+        for pair in ids.windows(2) {
+            links.push(MemoryLink {
+                from: pair[0],
+                to: pair[1],
+                kind,
+                weight: 0.5,
+                evidence: format!("{evidence_prefix}:{key}"),
+            });
+        }
+    }
+}
+
+fn relation_kind_to_link_kind(kind: crate::types::RelationKind) -> MemoryLinkKind {
+    match kind {
+        crate::types::RelationKind::DependsOn => MemoryLinkKind::DependsOn,
+        crate::types::RelationKind::Supersedes => MemoryLinkKind::Supersedes,
+        crate::types::RelationKind::Summarizes => MemoryLinkKind::Summarizes,
+        _ => MemoryLinkKind::Related,
+    }
 }
 
 fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemoryScope {

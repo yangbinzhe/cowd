@@ -5,7 +5,8 @@ use cowd_memory::config::{BudgetConfig, StoreConfig};
 use cowd_memory::{
     AgentVisibility, CognitiveContextManager, MemoryAtomView, MemoryCategory, MemoryConfig,
     MemoryHealth, MemoryInformationState, MemoryKernel, MemoryLayer, MemoryLayerView,
-    MemoryPrimitive, MemoryScope, MemorySource, MemoryState, MemoryTurnContext, Priority,
+    MemoryLinkKind, MemoryPrimitive, MemoryScope, MemorySource, MemoryState, MemoryTurnContext,
+    Priority,
 };
 
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
@@ -379,6 +380,128 @@ async fn superseded_atom_is_hidden_from_active_kernel_entries() {
     assert!(!active_entries
         .iter()
         .any(|entry| entry.title == "old recall marker"));
+}
+
+#[tokio::test]
+async fn memory_links_unify_relation_session_agent_and_tag_edges() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("links.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-links", "agent-links");
+    let target = entry(
+        MemoryLayer::L3,
+        MemorySource::UserExplicit,
+        "target decision",
+    );
+    let target_id = target.id;
+    let mut source = entry(
+        MemoryLayer::L3,
+        MemorySource::UserExplicit,
+        "source summary",
+    );
+    source.relations.push(cowd_memory::types::Relation {
+        target_id,
+        kind: cowd_memory::types::RelationKind::Summarizes,
+        strength: 0.9,
+        temporal: None,
+        entity: None,
+    });
+    source.tags.push("linked-topic".to_string());
+    let mut peer = entry(MemoryLayer::L3, MemorySource::UserExplicit, "tag peer");
+    peer.tags.push("linked-topic".to_string());
+
+    kernel.remember(&ctx, target).await.unwrap();
+    kernel.remember(&ctx, source).await.unwrap();
+    kernel.remember(&ctx, peer).await.unwrap();
+
+    let links = kernel.links().await.unwrap();
+
+    assert!(links
+        .iter()
+        .any(|link| link.kind == MemoryLinkKind::Summarizes));
+    assert!(links
+        .iter()
+        .any(|link| link.kind == MemoryLinkKind::BelongsTo));
+    assert!(links
+        .iter()
+        .any(|link| link.kind == MemoryLinkKind::ProducedBy));
+    assert!(links
+        .iter()
+        .any(|link| link.kind == MemoryLinkKind::Mentions));
+}
+
+#[tokio::test]
+async fn path_recall_finds_related_decision() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("path.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-path", "agent-path");
+    let decision = entry(
+        MemoryLayer::L2,
+        MemorySource::UserExplicit,
+        "linked decision",
+    );
+    let decision_id = decision.id;
+    let mut evidence = entry(MemoryLayer::L3, MemorySource::Import, "linked evidence");
+    evidence.relations.push(cowd_memory::types::Relation {
+        target_id: decision_id,
+        kind: cowd_memory::types::RelationKind::DependsOn,
+        strength: 0.8,
+        temporal: None,
+        entity: None,
+    });
+    let evidence_id = evidence.id;
+
+    kernel.remember(&ctx, decision).await.unwrap();
+    kernel.remember(&ctx, evidence).await.unwrap();
+
+    let path = kernel.path_recall(evidence_id, 2, 8).await.unwrap();
+
+    assert!(path
+        .entries
+        .iter()
+        .any(|atom| atom.title == "linked decision"));
+    assert!(path
+        .links
+        .iter()
+        .any(|link| link.kind == MemoryLinkKind::DependsOn));
+    assert!(!path.truncated);
+}
+
+#[tokio::test]
+async fn path_recall_caps_expansion_on_dense_graph() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("dense-path.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-dense", "agent-dense");
+    let mut first_id = None;
+    for idx in 0..20 {
+        let mut dense = entry(
+            MemoryLayer::L3,
+            MemorySource::UserExplicit,
+            &format!("dense {idx}"),
+        );
+        dense.tags.push("dense-topic".to_string());
+        first_id.get_or_insert(dense.id);
+        kernel.remember(&ctx, dense).await.unwrap();
+    }
+
+    let path = kernel.path_recall(first_id.unwrap(), 4, 5).await.unwrap();
+
+    assert!(path.entries.len() <= 5);
+    assert!(path.truncated);
 }
 
 #[tokio::test]

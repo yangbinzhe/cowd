@@ -78,7 +78,7 @@ pub use cognitive::{CognitiveContextManager, SessionRestoreStats, VectorIndexSta
 pub use kernel::{
     MemoryAtomView, MemoryDegradation, MemoryHealth, MemoryInformationState, MemoryKernel,
     MemoryKernelError, MemoryKernelResult, MemoryLayerView, MemoryLifecycleEvent,
-    MemoryPrimitive, MemoryState, MemoryTurnContext,
+    MemoryLink, MemoryLinkKind, MemoryPath, MemoryPrimitive, MemoryState, MemoryTurnContext,
 };
 pub use config::{MemoryConfig, TuningConfig, VectorConfig};
 pub use fresh_context::{
