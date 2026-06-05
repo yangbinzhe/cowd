@@ -319,7 +319,8 @@ impl StatusBar {
                         }
                         None => "未配置".to_string(),
                     };
-                    Some(format!("{label} │ {status} │ {}", app.model))
+                    let mode = if app.yolo_mode { "YOLO" } else { "STD" };
+                    Some(format!("{label} │ {status} │ {mode} │ {}", app.model))
                 }
                 "reputation" => {
                     app.selected_agent_reputation.map(|r| {
@@ -648,6 +649,19 @@ mod tests {
         let content = section.content.as_deref().unwrap();
         assert!(content.contains("✓ Ready"));
         assert!(content.contains("claude-sonnet-4"));
+    }
+
+    #[test]
+    fn sync_from_app_shows_yolo_mode() {
+        let mut app = App::new("claude-sonnet-4", "test-session");
+        app.yolo_mode = true;
+        let mut bar = StatusBar::with_default_sections();
+
+        bar.sync_from_app(&app);
+
+        let section = bar.section_mut("panel_model_status").unwrap();
+        let content = section.content.as_ref().unwrap();
+        assert!(content.contains("YOLO"));
     }
 
     // ── Render tests ─────────────────────────────────────────────

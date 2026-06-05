@@ -415,6 +415,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            yolo_mode,
         } => {
             // Auto-start daemon if not already running
             let sock = std::path::Path::new("/tmp/cowd.sock");
@@ -454,6 +455,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 base_commit,
                 reasoning_effort,
                 allow_broad_cwd,
+                yolo_mode,
             )?;
         }
         CliAction::Gateway {
@@ -469,6 +471,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            yolo_mode,
             compact,
             output_format,
         } => run_prompt(
@@ -479,6 +482,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            yolo_mode,
             compact,
             output_format,
         )?,
@@ -797,6 +801,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
+    let mut yolo_mode = false;
     let mut compact = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
@@ -869,6 +874,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--dangerously-skip-permissions" | "--solo" => {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
+                index += 1;
+            }
+            "--yolo" => {
+                permission_mode_override = Some(PermissionMode::DangerFullAccess);
+                yolo_mode = true;
                 index += 1;
             }
             "--base-commit" => {
@@ -988,6 +998,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
+            yolo_mode,
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
@@ -1025,6 +1036,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
+                    yolo_mode,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -1051,6 +1063,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 base_commit,
                 reasoning_effort: reasoning_effort.clone(),
                 allow_broad_cwd,
+                yolo_mode,
                 compact,
                 output_format,
             })
@@ -1065,6 +1078,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            yolo_mode,
         ),
         _other => Ok(CliAction::Repl {
             model,
@@ -1073,6 +1087,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
+            yolo_mode,
         }),
     }
 }
@@ -1188,6 +1203,7 @@ fn parse_direct_slash_cli_action(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
+    yolo_mode: bool,
 ) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
@@ -1214,6 +1230,7 @@ fn parse_direct_slash_cli_action(
                     base_commit,
                     reasoning_effort: reasoning_effort.clone(),
                     allow_broad_cwd,
+                    yolo_mode,
                 }),
                 SkillSlashDispatch::Local => Ok(CliAction::Skills {
                     args,
@@ -2336,6 +2353,7 @@ fn run_resume_command(
                         estimated_tokens: 0,
                     },
                     default_permission_mode().as_str(),
+                    "standard",
                     &context,
                 )),
                 json: Some(status_json_value(
@@ -2736,11 +2754,12 @@ fn run_repl(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
+    yolo_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, yolo_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
 
     let workspace = std::env::current_dir().unwrap_or_default();
@@ -2977,6 +2996,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
 
     let session_id = cli.session.id.clone();
     let mut state = TuiState::new(&cli.model, &session_id);
+    state.app.yolo_mode = cli.yolo_mode;
     if let Some(mgr) = cli.runtime.memory_manager() {
         state.set_memory_manager(std::sync::Arc::clone(mgr));
     }
@@ -3540,6 +3560,7 @@ pub(crate) struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    yolo_mode: bool,
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
@@ -4028,14 +4049,41 @@ impl HookAbortMonitor {
     }
 }
 
+fn format_startup_banner(model: &str, yolo_mode: bool, session_id: &str) -> String {
+    let status = status_context(None).ok();
+    let git_branch = status
+        .as_ref()
+        .and_then(|context| context.git_branch.as_deref())
+        .unwrap_or("unknown");
+    let workspace = status.as_ref().map_or_else(
+        || "unknown".to_string(),
+        |context| context.git_summary.headline(),
+    );
+    format!(
+        "============================\n\x1b[1;31m          COWD v{VERSION}\x1b[0m\n============================\n\
+   \x1b[2mModel\x1b[0m       {}\n\
+   \x1b[2mWorkspace\x1b[0m    {}\n\
+   \x1b[2mBranch\x1b[0m       {}\n\
+   \x1b[2mMode\x1b[0m         {}\n\
+   \x1b[2mSession\x1b[0m      {}\n\n\
+   \x1b[1m/help\x1b[0m · \x1b[1m/status\x1b[0m · \x1b[2mTab\x1b[0m sidebar · \x1b[2mSpace\x1b[0m shortcuts · \x1b[2mShift+Enter\x1b[0m newline",
+        model,
+        workspace,
+        git_branch,
+        if yolo_mode { "yolo" } else { "standard" },
+        session_id,
+    )
+}
+
 impl LiveCli {
     fn new(
         model: String,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        yolo_mode: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let system_prompt = build_system_prompt()?;
+        let system_prompt = build_system_prompt_for_mode(yolo_mode)?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
@@ -4054,6 +4102,7 @@ impl LiveCli {
             model,
             allowed_tools,
             permission_mode,
+            yolo_mode,
             system_prompt,
             runtime,
             session,
@@ -4079,24 +4128,7 @@ impl LiveCli {
     }
 
     fn startup_banner(&self) -> String {
-        let status = status_context(None).ok();
-        let git_branch = status
-            .as_ref()
-            .and_then(|context| context.git_branch.as_deref())
-            .unwrap_or("unknown");
-        let workspace = status.as_ref().map_or_else(
-            || "unknown".to_string(),
-            |context| context.git_summary.headline(),
-        );
-        format!(
-            "============================\n\x1b[1;31m          COWD v{VERSION}\x1b[0m\n============================\n\
-   \x1b[2mModel\x1b[0m       {}\n\
-   \x1b[2mWorkspace\x1b[0m    {}\n\
-   \x1b[2mBranch\x1b[0m       {}\n\
-   \x1b[2mSession\x1b[0m      {}\n\n\
-   \x1b[1m/help\x1b[0m · \x1b[1m/status\x1b[0m · \x1b[2mTab\x1b[0m sidebar · \x1b[2mSpace\x1b[0m shortcuts · \x1b[2mShift+Enter\x1b[0m newline",
-            self.model, workspace, git_branch, self.session.id,
-        )
+        format_startup_banner(&self.model, self.yolo_mode, &self.session.id)
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -4500,6 +4532,7 @@ impl LiveCli {
                     estimated_tokens: self.runtime.estimated_tokens(),
                 },
                 self.permission_mode.as_str(),
+                if self.yolo_mode { "yolo" } else { "standard" },
                 &status_context(Some(&self.session.path)).expect("status context should load"),
             )
         );
@@ -5871,7 +5904,7 @@ fn print_status_snapshot(
     match output_format {
         CliOutputFormat::Text => println!(
             "{}",
-            format_status_report(model, usage, permission_mode.as_str(), &context)
+            format_status_report(model, usage, permission_mode.as_str(), "standard", &context)
         ),
         CliOutputFormat::Json => println!(
             "{}",
@@ -5971,6 +6004,7 @@ fn format_status_report(
     model: &str,
     usage: StatusUsage,
     permission_mode: &str,
+    execution_mode: &str,
     context: &StatusContext,
 ) -> String {
     [
@@ -5978,6 +6012,7 @@ fn format_status_report(
             "Status
   Model            {model}
   Permission mode  {permission_mode}
+  Execution mode   {execution_mode}
   Messages         {}
   Turns            {}
   Estimated tokens {}",
@@ -7044,13 +7079,14 @@ fn run_prompt(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
+    yolo_mode: bool,
     compact: bool,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, output_format)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
-    let system_prompt = build_system_prompt()?;
+    let system_prompt = build_system_prompt_for_mode(yolo_mode)?;
     let session_state = new_cli_session()?;
     let session = create_managed_session_handle(&session_state.session_id)?;
     // Initialize global provider registry so resolve_global_provider works
@@ -7344,12 +7380,29 @@ fn short_tool_id(id: &str) -> String {
 }
 
 pub(crate) fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
+    build_system_prompt_for_mode(false)
+}
+
+pub(crate) fn build_system_prompt_for_mode(
+    yolo_mode: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut sections = load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
-    )?)
+    )?;
+    if yolo_mode {
+        sections.push(yolo_mode_system_instruction().to_string());
+    }
+    Ok(sections)
+}
+
+fn yolo_mode_system_instruction() -> &'static str {
+    "YOLO continuous execution mode is active.\n\
+Treat the user's objective as a persistent goal: decompose it, implement it, verify it, review it, and continue without waiting for extra confirmation until the goal is complete or a concrete external blocker makes further progress impossible.\n\
+Use the full tool surface allowed by danger-full-access, but keep edits scoped, preserve user changes, avoid destructive git operations, run relevant automated and scenario tests, monitor logs or services when needed, and clean up temporary services/tmux sessions before reporting.\n\
+After each major phase, self-review against correctness, stability, interaction quality, and performance; then continue to the next highest-impact gap."
 }
 
 fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
@@ -9446,6 +9499,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  --yolo                       Continuous autonomous mode: danger-full-access plus persistent goal execution"
+    )?;
+    writeln!(
+        out,
         "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)"
     )?;
     writeln!(
@@ -9538,9 +9595,10 @@ mod tests {
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command_message,
+        format_startup_banner, format_ultraplan_report, format_unknown_slash_command_message,
         format_user_visible_api_error, gateway_auth_token_from_platform, merge_prompt_with_stdin,
-        activate_live_cli_session, hydrate_session_from_unified_store, normalize_permission_mode, parse_args,
+        activate_live_cli_session, build_system_prompt_for_mode, hydrate_session_from_unified_store,
+        normalize_permission_mode, parse_args,
         parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
         parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
         push_output_block, render_config_report, render_diff_report, render_diff_report_for,
@@ -9922,6 +9980,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                yolo_mode: false,
             }
         );
     }
@@ -10197,6 +10256,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                yolo_mode: false,
             }
         );
     }
@@ -10219,7 +10279,49 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                yolo_mode: false,
             }
+        );
+    }
+
+    #[test]
+    fn yolo_flag_forces_danger_full_access_and_marks_repl_mode() {
+        let _guard = env_lock();
+        let _cfg_guard = ConfigHomeGuard::new();
+        std::env::set_var("COWD_PERMISSION_MODE", "read-only");
+        let args = vec!["--yolo".to_string()];
+        let parsed = parse_args(&args).expect("args should parse");
+        std::env::remove_var("COWD_PERMISSION_MODE");
+
+        assert_eq!(
+            parsed,
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+                yolo_mode: true,
+            }
+        );
+    }
+
+    #[test]
+    fn yolo_system_prompt_adds_continuous_execution_instruction() {
+        let _guard = env_lock();
+        let _cfg_guard = ConfigHomeGuard::new();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+
+        let prompt = with_current_dir(&root, || {
+            build_system_prompt_for_mode(true).expect("system prompt should build")
+        });
+
+        assert!(
+            prompt
+                .iter()
+                .any(|section| section.contains("YOLO continuous execution mode is active"))
         );
     }
 
@@ -10247,6 +10349,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                yolo_mode: false,
             }
         );
     }
@@ -10348,6 +10451,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                yolo_mode: false,
             }
         );
         assert_eq!(
@@ -10803,6 +10907,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                yolo_mode: false,
             }
         );
         assert_eq!(
@@ -10827,6 +10932,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                yolo_mode: false,
             }
         );
         let error = parse_args(&["/status".to_string()])
@@ -11111,28 +11217,26 @@ mod tests {
 
     #[test]
     fn startup_banner_mentions_workflow_completions() {
-        let _guard = env_lock();
-        // Inject dummy credentials so LiveCli can construct without real Anthropic key
-        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-banner-test");
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
 
         let banner = with_current_dir(&root, || {
-            LiveCli::new(
-                "claude-sonnet-4-6".to_string(),
-                true,
-                None,
-                PermissionMode::DangerFullAccess,
-            )
-            .expect("cli should initialize")
-            .startup_banner()
+            format_startup_banner("claude-sonnet-4-6", false, "session-banner-test")
         });
 
         assert!(banner.contains("Tab"));
         assert!(banner.contains("sidebar"));
+        assert!(banner.contains("standard"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
-        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn startup_banner_marks_yolo_mode() {
+        let banner = format_startup_banner("claude-sonnet-4-6", true, "session-yolo-test");
+
+        assert!(banner.contains("yolo"));
+        assert!(banner.contains("session-yolo-test"));
     }
 
     #[test]
@@ -11335,6 +11439,7 @@ mod tests {
                 estimated_tokens: 128,
             },
             "workspace-write",
+            "yolo",
             &super::StatusContext {
                 cwd: PathBuf::from("/tmp/project"),
                 session_path: Some(PathBuf::from("session.jsonl")),
@@ -11356,6 +11461,7 @@ mod tests {
         assert!(status.contains("Status"));
         assert!(status.contains("Model            claude-sonnet"));
         assert!(status.contains("Permission mode  workspace-write"));
+        assert!(status.contains("Execution mode   yolo"));
         assert!(status.contains("Messages         7"));
         assert!(status.contains("Latest total     10"));
         assert!(status.contains("Cumulative total 31"));
@@ -11920,6 +12026,7 @@ UU conflicted.rs",
             true,
             None,
             PermissionMode::DangerFullAccess,
+            false,
         )
         .expect("cli should initialize");
         let original_id = cli.runtime.session().session_id.clone();

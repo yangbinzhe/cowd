@@ -140,6 +140,7 @@ pub struct SessionSummary {
 pub struct App {
     pub model: String,
     pub session_id: String,
+    pub yolo_mode: bool,
     pub input: TextArea<'static>,
     pub is_loading: bool,
     pub spinner_idx: usize,
@@ -331,6 +332,7 @@ impl App {
         Self {
             model: model.to_string(),
             session_id: session_id.to_string(),
+            yolo_mode: false,
             input,
             is_loading: false,
             spinner_idx: 0,
