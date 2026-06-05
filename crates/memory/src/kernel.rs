@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cognitive::CognitiveContextManager,
     error::MemoryError,
-    types::{MemoryEntry, MemoryId, MemoryLayer, Message, PreparedContext, TokenBudget},
+    project_scope::MemoryScope,
+    types::{
+        AgentVisibility, MemoryEntry, MemoryId, MemoryLayer, Message, PreparedContext, TokenBudget,
+    },
 };
 
 /// Result alias for the MemoryKernel boundary.
@@ -284,6 +287,37 @@ impl MemoryKernel {
         Ok(())
     }
 
+    /// Write one memory atom through the kernel governance boundary.
+    ///
+    /// The caller supplies the semantic entry. The kernel supplies runtime
+    /// ownership metadata so agent/session writes remain auditable and scoped.
+    pub async fn remember(
+        &self,
+        ctx: &MemoryTurnContext,
+        mut entry: MemoryEntry,
+    ) -> MemoryKernelResult<()> {
+        self.manager.set_active_session(ctx.session_id.clone());
+        self.manager.set_active_agent(ctx.agent_id.clone());
+
+        entry
+            .session_id
+            .get_or_insert_with(|| ctx.session_id.clone());
+        entry
+            .source_agent
+            .get_or_insert_with(|| ctx.agent_id.clone());
+        entry.scope = scoped_entry_scope(ctx, &entry);
+
+        if let Err(error) = self.manager.remember(entry).await {
+            tracing::warn!(
+                session_id = %ctx.session_id,
+                agent_id = %ctx.agent_id,
+                %error,
+                "memory kernel remember degraded"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn health(&self, _ctx: &MemoryTurnContext) -> MemoryKernelResult<MemoryHealth> {
         let started = Instant::now();
         let entries = match self.manager.list_all_entries().await {
@@ -359,6 +393,29 @@ impl MemoryKernel {
             prepared_at: Utc::now(),
             code_context: None,
         }
+    }
+}
+
+fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemoryScope {
+    match &entry.scope {
+        MemoryScope::Global => {
+            if matches!(entry.visibility, AgentVisibility::Private) {
+                return MemoryScope::Agent(ctx.agent_id.clone());
+            }
+            if let Some(team_id) = &ctx.team_id {
+                return MemoryScope::Project(team_id.clone());
+            }
+            if let Some(project_id) = &ctx.project_id {
+                return MemoryScope::Project(project_id.clone());
+            }
+            MemoryScope::Session(ctx.session_id.clone())
+        }
+        MemoryScope::Project(project) if project == "default" => ctx
+            .project_id
+            .as_ref()
+            .map(|project_id| MemoryScope::Project(project_id.clone()))
+            .unwrap_or_else(|| MemoryScope::Session(ctx.session_id.clone())),
+        other => other.clone(),
     }
 }
 

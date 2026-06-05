@@ -207,6 +207,73 @@ async fn memory_kernel_layer_views_project_atoms_read_only() {
 }
 
 #[tokio::test]
+async fn memory_kernel_remember_binds_session_agent_and_scope() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("remember.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let mut ctx = MemoryTurnContext::new("session-write", "agent-writer");
+    ctx.project_id = Some("project-alpha".to_string());
+
+    let mut private_entry = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "private observation",
+    );
+    private_entry.scope = MemoryScope::Global;
+    private_entry.visibility = AgentVisibility::Private;
+    let private_id = private_entry.id;
+
+    kernel.remember(&ctx, private_entry).await.unwrap();
+
+    let stored_private = manager
+        .get_entry(&private_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_private.session_id.as_deref(), Some("session-write"));
+    assert_eq!(stored_private.source_agent.as_deref(), Some("agent-writer"));
+    assert_eq!(
+        stored_private.scope,
+        MemoryScope::Agent("agent-writer".to_string())
+    );
+}
+
+#[tokio::test]
+async fn memory_kernel_remember_replaces_default_project_scope() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("default-scope.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let mut ctx = MemoryTurnContext::new("session-project", "agent-shared");
+    ctx.project_id = Some("project-beta".to_string());
+
+    let mut shared_entry = entry(MemoryLayer::L4, MemorySource::Import, "shared decision");
+    shared_entry.scope = MemoryScope::Project("default".to_string());
+    shared_entry.visibility = AgentVisibility::Shared;
+    let shared_id = shared_entry.id;
+
+    kernel.remember(&ctx, shared_entry).await.unwrap();
+
+    let stored_shared = manager
+        .get_entry(&shared_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored_shared.scope,
+        MemoryScope::Project("project-beta".to_string())
+    );
+    assert_eq!(stored_shared.source_agent.as_deref(), Some("agent-shared"));
+}
+
+#[tokio::test]
 async fn memory_kernel_post_turn_preserves_turn_success() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(

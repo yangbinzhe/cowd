@@ -720,12 +720,12 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
         if let Some(ref mem) = self.parent_memory {
             let task_desc = self.config.task_description.clone();
             let output_snippet = truncate_str(&final_output, 2000);
-            let parent_agent = "primary".to_string();
+            let memory_ctx = self.memory_turn_context();
             let _ = team_remember_result(
                 mem,
+                &memory_ctx,
                 &task_desc,
                 &output_snippet,
-                &parent_agent,
             ).await;
         }
 
@@ -839,10 +839,10 @@ fn format_prepared_context(prepared: &memory::types::PreparedContext) -> String 
 
 /// Share sub-agent results with the parent agent via L4 `team_remember`.
 async fn team_remember_result(
-    memory: &CognitiveContextManager,
+    memory: &Arc<CognitiveContextManager>,
+    memory_ctx: &MemoryTurnContext,
     task_description: &str,
     result_output: &str,
-    parent_agent: &str,
 ) {
     use memory::types::{MemoryEntry, MemoryId};
     use chrono::Utc;
@@ -869,11 +869,12 @@ async fn team_remember_result(
         last_accessed_at: None,
         scope: MemoryScope::Project("default".to_string()),
         session_id: None,
-        source_agent: Some(parent_agent.to_string()),
+        source_agent: None,
         visibility: AgentVisibility::Shared,
     };
 
-    if let Err(e) = memory.remember(entry).await {
+    let kernel = MemoryKernel::new(Arc::clone(memory));
+    if let Err(e) = kernel.remember(memory_ctx, entry).await {
         tracing::warn!("failed to share sub-agent result via L4: {}", e);
     } else {
         tracing::debug!("sub-agent result shared to L4 team memory");
@@ -1085,6 +1086,27 @@ mod tests {
 
         assert_eq!(ctx.session_id, expected_session);
         assert_eq!(ctx.agent_id, runtime.agent_id);
+    }
+
+    #[tokio::test]
+    async fn team_remember_result_uses_memory_kernel_context() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = memory::MemoryConfig::default();
+        config.store.sqlite_path = dir.path().join("agent-memory.db");
+        config.store.blob_dir = dir.path().join("blobs");
+        config.store.enable_vector_index = false;
+        let manager = Arc::new(CognitiveContextManager::new(config).await.unwrap());
+        let ctx = MemoryTurnContext::new("session-agent-share", "agent-share");
+
+        team_remember_result(&manager, &ctx, "inspect memory", "shared finding").await;
+
+        let entries = manager.list_all_entries().await.unwrap();
+        let shared = entries
+            .iter()
+            .find(|entry| entry.title.contains("inspect memory"))
+            .expect("shared sub-agent memory should be persisted");
+        assert_eq!(shared.session_id.as_deref(), Some("session-agent-share"));
+        assert_eq!(shared.source_agent.as_deref(), Some("agent-share"));
     }
 
     #[test]
