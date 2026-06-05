@@ -1633,7 +1633,12 @@ async fn delete_memory_entry_handler(
             "memory not configured",
         ));
     };
-    mgr.delete_entry(&id)
+    let memory_id = MemoryId::try_parse(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid memory id"))?;
+    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    let memory_ctx = MemoryTurnContext::new("api-memory-delete", "api");
+    kernel
+        .archive(&memory_ctx, memory_id, "archived by API delete request")
         .await
         .map(|_| StatusCode::NO_CONTENT)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))

@@ -571,6 +571,65 @@ async fn memory_context_packet_stays_bounded_on_large_candidate_set() {
 }
 
 #[tokio::test]
+async fn l0_requires_user_or_system_write() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("l0-guard.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-l0", "agent-inference");
+    let forbidden = entry(
+        MemoryLayer::L0,
+        MemorySource::AutoExtracted,
+        "forbidden identity",
+    );
+    let id = forbidden.id;
+
+    kernel.remember(&ctx, forbidden).await.unwrap();
+
+    assert!(manager.get_entry(&id.to_string()).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn archive_hides_memory_without_deleting_evidence() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("archive.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-archive", "agent-archive");
+    let archived = entry(MemoryLayer::L3, MemorySource::UserExplicit, "archive me");
+    let id = archived.id;
+    let candidate = archived.clone();
+
+    kernel.remember(&ctx, archived).await.unwrap();
+    kernel
+        .archive(&ctx, id, "user removed from active context")
+        .await
+        .unwrap();
+
+    assert!(manager.get_entry(&id.to_string()).await.unwrap().is_some());
+    assert!(kernel
+        .filter_active_entries(vec![candidate])
+        .await
+        .is_empty());
+    assert_eq!(
+        kernel
+            .lifecycle_events(id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        MemoryState::Archived
+    );
+}
+
+#[tokio::test]
 async fn memory_kernel_post_turn_preserves_turn_success() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(

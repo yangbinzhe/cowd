@@ -383,6 +383,18 @@ impl MemoryKernel {
             .get_or_insert_with(|| ctx.agent_id.clone());
         entry.scope = scoped_entry_scope(ctx, &entry);
 
+        if entry.layer == MemoryLayer::L0
+            && !matches!(entry.source, crate::types::MemorySource::UserExplicit)
+            && ctx.agent_id != "system"
+        {
+            tracing::warn!(
+                session_id = %ctx.session_id,
+                agent_id = %ctx.agent_id,
+                "memory kernel denied non-authoritative L0 write"
+            );
+            return Ok(());
+        }
+
         let memory_id = entry.id;
         if let Err(error) = self.manager.remember(entry).await {
             tracing::warn!(
@@ -402,6 +414,16 @@ impl MemoryKernel {
             .await;
         }
         Ok(())
+    }
+
+    pub async fn archive(
+        &self,
+        ctx: &MemoryTurnContext,
+        memory_id: MemoryId,
+        reason: impl Into<String>,
+    ) -> MemoryKernelResult<()> {
+        self.transition_state(ctx, memory_id, MemoryState::Archived, reason)
+            .await
     }
 
     /// Append a lifecycle transition. Evidence is not mutated.
