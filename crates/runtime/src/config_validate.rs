@@ -93,6 +93,7 @@ enum FieldType {
     Object,
     StringArray,
     Number,
+    #[allow(dead_code)]
     ObjectOrObjectArray,
 }
 

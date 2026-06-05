@@ -1320,7 +1320,6 @@ where
                                         });
                                     }
                                 }
-                                Ok(_) => {}
                                 Err(e) => {
                                     let err_str = e.to_string();
                                     if is_retryable_error(&err_str) {

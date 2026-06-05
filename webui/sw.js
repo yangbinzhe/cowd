@@ -1,4 +1,4 @@
-const CACHE = 'cowd-v3';
+const CACHE = 'cowd-v4';
 const ASSETS = [
   '/',
   'index.html',

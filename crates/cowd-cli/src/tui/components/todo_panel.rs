@@ -262,7 +262,6 @@ impl Component for TodoPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::TimelineEntry;
     use crate::tui::components::RenderContext;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;

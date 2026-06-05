@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import fs from 'node:fs';
 import './api.js';
 import './ui.js';
 import './panels.js';
@@ -6,6 +7,35 @@ import './sessions.js';
 import './messages.js';
 import './workspace.js';
 import './boot.js';
+
+describe('WebUI single implementation boundary', () => {
+  it('index loads only the canonical root modules', () => {
+    const html = fs.readFileSync('index.html', 'utf8');
+    const scripts = [...html.matchAll(/<script\s+src="([^"]+)"/g)].map(match => match[1]);
+    const localScripts = scripts.filter(src => !src.startsWith('http://') && !src.startsWith('https://'));
+
+    expect(localScripts).toEqual([
+      'api.js',
+      'state.js',
+      'ui.js',
+      'sessions.js',
+      'messages.js',
+      'workspace.js',
+      'panels.js',
+      'commands.js',
+      'boot.js',
+    ]);
+    expect(html).not.toContain('assets/js/');
+  });
+
+  it('service worker caches only canonical root modules and static assets', () => {
+    const sw = fs.readFileSync('sw.js', 'utf8');
+
+    expect(sw).toContain("const CACHE = 'cowd-v4'");
+    expect(sw).not.toContain('assets/js/');
+    expect(sw).not.toContain('assets/style.css');
+  });
+});
 
 describe('API module', () => {
   beforeEach(() => { vi.restoreAllMocks(); });

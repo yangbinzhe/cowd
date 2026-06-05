@@ -419,7 +419,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // Auto-start daemon if not already running
             let sock = std::path::Path::new("/tmp/cowd.sock");
-            if !sock.exists() {
+            let daemon_autostart_disabled =
+                std::env::var("COWD_DISABLE_DAEMON_AUTOSTART").is_ok();
+            if !sock.exists() && !daemon_autostart_disabled {
                 tracing::info!("daemon not running, auto-starting...");
                 setup_sigchld_handler();
                 if let Ok(exe) = std::env::current_exe() {
@@ -447,7 +449,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                 }
+            } else if daemon_autostart_disabled {
+                tracing::debug!("daemon auto-start disabled by COWD_DISABLE_DAEMON_AUTOSTART");
             }
+            tracing::debug!("starting TUI REPL");
             run_repl(
                 model,
                 allowed_tools,
@@ -2756,13 +2761,19 @@ fn run_repl(
     allow_broad_cwd: bool,
     yolo_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::debug!("run_repl: enforcing cwd policy");
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
+    tracing::debug!("run_repl: checking base preflight");
     run_stale_base_preflight(base_commit.as_deref());
+    tracing::debug!("run_repl: resolving model");
     let resolved_model = resolve_repl_model(model);
+    tracing::debug!(model = %resolved_model, "run_repl: creating LiveCli");
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, yolo_mode)?;
+    tracing::debug!("run_repl: applying reasoning effort");
     cli.set_reasoning_effort(reasoning_effort);
 
     let workspace = std::env::current_dir().unwrap_or_default();
+    tracing::debug!(workspace = %workspace.display(), "run_repl: entering TUI");
     run_tui_repl(cli, workspace)
 }
 
@@ -2963,6 +2974,7 @@ fn refresh_panels(app: &mut tui::App, workspace: &PathBuf, runtime: &BuiltRuntim
 }
 
 fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::debug!("run_tui_repl: start");
     use crossterm::{
         event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
         execute,
@@ -2976,37 +2988,57 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     use tui::state::{ProcessedKey, TuiState};
 
     // ── Install custom panic hook for crash recovery ──
+    tracing::debug!("run_tui_repl: installing panic hook");
     error_recovery::install_tui_panic_hook();
 
     // ── Run config migration (skin.yaml → theme.yaml) ──
+    tracing::debug!("run_tui_repl: running config migration");
     let migration_report = tui::config_migration::run_startup_migration();
 
     // ── Check for accessibility flag ──
+    tracing::debug!("run_tui_repl: checking accessibility");
     let accessibility_enabled = std::env::var("COWD_TUI_ACCESSIBILITY")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
 
-    enable_raw_mode()?;
+    let raw_mode_enabled = std::env::var("COWD_TUI_SKIP_RAW_MODE").is_err();
+    if raw_mode_enabled {
+        tracing::debug!("run_tui_repl: enabling raw mode");
+        enable_raw_mode()?;
+    } else {
+        tracing::debug!("run_tui_repl: raw mode skipped by COWD_TUI_SKIP_RAW_MODE");
+    }
     let mut stdout = io::stdout();
+    tracing::debug!("run_tui_repl: entering alternate screen");
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
+    tracing::debug!("run_tui_repl: creating terminal");
     let mut terminal = Terminal::new(backend)?;
 
+    tracing::debug!("run_tui_repl: creating event channel");
     let (tui_tx, tui_rx) = tui::cowd_event_channel();
 
+    tracing::debug!("run_tui_repl: creating state");
     let session_id = cli.session.id.clone();
     let mut state = TuiState::new(&cli.model, &session_id);
     state.app.yolo_mode = cli.yolo_mode;
+    state.add_message("system", &cli.startup_banner());
+    state.add_message("system", &format_connected_line(&cli.model));
+    terminal.draw(|f| state.render(f))?;
+
+    tracing::debug!("tui init: wiring memory manager");
     if let Some(mgr) = cli.runtime.memory_manager() {
         state.set_memory_manager(std::sync::Arc::clone(mgr));
     }
 
     // ── Wire tool registry to SkillsPanel (T27) ──
+    tracing::debug!("tui init: loading tool registry");
     if let Ok(registry) = current_tool_registry() {
         state.set_tool_registry(std::sync::Arc::new(registry));
     }
 
     // ── Wire TUI into ActiveSessions (T6) ──
+    tracing::debug!("tui init: wiring active sessions");
     use crate::gateway::ActiveSessions;
     let active_sessions = Arc::new(ActiveSessions::new());
     {
@@ -3039,13 +3071,13 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
         state.theme_engine = tui::theme::ThemeEngine::new(hc_theme);
     }
 
-    state.add_message("system", &cli.startup_banner());
-    state.add_message("system", &format_connected_line(&cli.model));
     // Show migration report if anything was migrated
     if !migration_report.contains("nothing to migrate") {
         state.add_message("system", &migration_report);
     }
+    tracing::debug!("tui init: loading session history");
     load_session_history(&mut state, &cli.runtime.session());
+    tracing::debug!("tui init: refreshing panels");
     refresh_panels(&mut state, &workspace, &cli.runtime);
 
     // ── Populate TUI session list from the unified SQLite store ──
@@ -3072,6 +3104,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     // If init <500ms the overlay never shows. If init >500ms,
     // "Loading..." → "Finishing..." → Done (min 3s display).
     let startup_ready = true;
+    tracing::debug!("tui init: entering event loop");
 
     let mut turn_handle: Option<std::thread::JoinHandle<()>> = None;
     let mut abort_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
@@ -3224,7 +3257,9 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     });
 
     cli.persist_session()?;
-    disable_raw_mode()?;
+    if raw_mode_enabled {
+        disable_raw_mode()?;
+    }
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
@@ -12751,7 +12786,7 @@ UU conflicted.rs",
         assert!(allowed.contains("mcp__alpha__echo"));
         assert!(allowed.contains("MCPTool"));
 
-        let mut executor = CliToolExecutor::new(
+        let executor = CliToolExecutor::new(
             None,
             false,
             state.tool_registry.clone(),

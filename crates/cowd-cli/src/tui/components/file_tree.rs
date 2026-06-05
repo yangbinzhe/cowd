@@ -1043,7 +1043,6 @@ mod tests {
         let tmp = std::env::temp_dir().join("cowd_test_preview.txt");
         std::fs::write(&tmp, "line1\nline2\nline3\nline4\nline5\n").unwrap();
 
-        let filename = tmp.to_string_lossy().to_string();
         let mut ft = FileTree::new();
         ft.cwd = tmp.parent().unwrap().to_path_buf();
         let entry_name = tmp.file_name().unwrap().to_string_lossy().to_string();

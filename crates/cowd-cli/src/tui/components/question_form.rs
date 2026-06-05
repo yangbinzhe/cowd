@@ -1823,7 +1823,7 @@ mod tests {
 
     #[test]
     fn is_active_returns_true_while_editing() {
-        let mut form = make_single_q();
+        let form = make_single_q();
         assert!(form.is_active());
     }
 }

@@ -505,7 +505,7 @@ mod tests {
     fn handle_event_ignores_release_events() {
         let mut panel = GatewayPanel::new();
 
-        let release_r = Event::Key(KeyEvent::new(
+        let _release_r = Event::Key(KeyEvent::new(
             KeyCode::Char('r'),
             crossterm::event::KeyModifiers::NONE,
         ));

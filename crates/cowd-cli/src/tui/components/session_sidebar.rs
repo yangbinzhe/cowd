@@ -480,7 +480,7 @@ impl SessionSidebar {
 mod tests {
     use super::*;
     use crate::tui::app::TimelineEntry;
-    use crate::tui::components::dialog::{DialogKind, DialogManager, DialogResult, DialogState};
+    use crate::tui::components::dialog::{DialogKind, DialogManager};
     use crate::tui::components::RenderContext;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;

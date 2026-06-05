@@ -20,7 +20,7 @@
 
 use crate::tui::app::App;
 use crate::tui::state::{ProcessedKey, TuiState};
-use crate::tui::test_utils::{app_with_messages, MockTerminal};
+use crate::tui::test_utils::MockTerminal;
 use runtime::CowdEvent;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
