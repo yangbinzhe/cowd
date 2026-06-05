@@ -629,6 +629,14 @@ impl CognitiveContextManager {
         self.orchestrator.active_session_id()
     }
 
+    pub(crate) async fn kernel_kv_put(&self, key: &str, value: &str) -> Result<()> {
+        self.orchestrator.store().kv_put(key, value).await
+    }
+
+    pub(crate) async fn kernel_kv_get(&self, key: &str) -> Result<Option<String>> {
+        self.orchestrator.store().kv_get(key).await
+    }
+
     /// Attach a [`ProjectScopeManager`] for KG staleness detection on turn end.
     ///
     /// When set, [`on_turn_end`] will check whether any indexed source files

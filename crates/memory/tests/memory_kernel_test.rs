@@ -274,6 +274,114 @@ async fn memory_kernel_remember_replaces_default_project_scope() {
 }
 
 #[tokio::test]
+async fn memory_kernel_records_lifecycle_events() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("lifecycle.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-life", "agent-life");
+    let lifecycle_entry = entry(
+        MemoryLayer::L3,
+        MemorySource::AutoExtracted,
+        "lifecycle evidence",
+    );
+    let id = lifecycle_entry.id;
+
+    kernel.remember(&ctx, lifecycle_entry).await.unwrap();
+    kernel
+        .transition_state(&ctx, id, MemoryState::Superseded, "newer evidence won")
+        .await
+        .unwrap();
+
+    let events = kernel.lifecycle_events(id).await.unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].to, MemoryState::Active);
+    assert_eq!(events[1].from, Some(MemoryState::Active));
+    assert_eq!(events[1].to, MemoryState::Superseded);
+    assert_eq!(events[1].agent_id, "agent-life");
+}
+
+#[tokio::test]
+async fn memory_kernel_layer_view_reflects_lifecycle_state() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("state-view.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-state", "agent-state");
+    let state_entry = entry(MemoryLayer::L2, MemorySource::UserExplicit, "stateful rule");
+    let id = state_entry.id;
+
+    kernel.remember(&ctx, state_entry).await.unwrap();
+    kernel
+        .transition_state(&ctx, id, MemoryState::Archived, "retired decision")
+        .await
+        .unwrap();
+
+    let view = kernel
+        .layer_view(MemoryLayer::L2, MemoryInformationState::Orientation)
+        .await
+        .unwrap();
+
+    assert_eq!(view.atoms[0].state, MemoryState::Archived);
+}
+
+#[tokio::test]
+async fn superseded_atom_is_hidden_from_active_kernel_entries() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("prepare-state.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-prepare-state", "agent-prepare");
+    let mut active_entry = entry(
+        MemoryLayer::L3,
+        MemorySource::UserExplicit,
+        "current recall marker",
+    );
+    active_entry.scope = MemoryScope::Session(ctx.session_id.clone());
+    active_entry.session_id = Some(ctx.session_id.clone());
+    let mut superseded_entry = entry(
+        MemoryLayer::L3,
+        MemorySource::UserExplicit,
+        "old recall marker",
+    );
+    superseded_entry.scope = MemoryScope::Session(ctx.session_id.clone());
+    superseded_entry.session_id = Some(ctx.session_id.clone());
+    let superseded_id = superseded_entry.id;
+
+    let active = active_entry.clone();
+    let superseded = superseded_entry.clone();
+    manager.remember(active_entry).await.unwrap();
+    manager.remember(superseded_entry).await.unwrap();
+    kernel
+        .transition_state(
+            &ctx,
+            superseded_id,
+            MemoryState::Superseded,
+            "covered by current marker",
+        )
+        .await
+        .unwrap();
+
+    let active_entries = kernel.filter_active_entries(vec![active, superseded]).await;
+
+    assert!(active_entries
+        .iter()
+        .any(|entry| entry.title == "current recall marker"));
+    assert!(!active_entries
+        .iter()
+        .any(|entry| entry.title == "old recall marker"));
+}
+
+#[tokio::test]
 async fn memory_kernel_post_turn_preserves_turn_success() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(

@@ -151,6 +151,17 @@ impl MemoryLayerView {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryLifecycleEvent {
+    pub memory_id: MemoryId,
+    pub from: Option<MemoryState>,
+    pub to: MemoryState,
+    pub reason: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub occurred_at: chrono::DateTime<Utc>,
+}
+
 /// Kernel-scoped session/agent/task binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryTurnContext {
@@ -254,7 +265,15 @@ impl MemoryKernel {
             .prepare_context(query, messages, Some(&ctx.session_id))
             .await
         {
-            Ok(prepared) => Ok(prepared),
+            Ok(mut prepared) => {
+                prepared.entries = self.filter_active_entries(prepared.entries).await;
+                prepared.total_tokens = prepared
+                    .entries
+                    .iter()
+                    .map(|entry| entry.content.len() as u64 / 4)
+                    .sum();
+                Ok(prepared)
+            }
             Err(error) => {
                 tracing::warn!(
                     session_id = %ctx.session_id,
@@ -307,6 +326,7 @@ impl MemoryKernel {
             .get_or_insert_with(|| ctx.agent_id.clone());
         entry.scope = scoped_entry_scope(ctx, &entry);
 
+        let memory_id = entry.id;
         if let Err(error) = self.manager.remember(entry).await {
             tracing::warn!(
                 session_id = %ctx.session_id,
@@ -314,8 +334,52 @@ impl MemoryKernel {
                 %error,
                 "memory kernel remember degraded"
             );
+        } else {
+            self.record_lifecycle_event(
+                ctx,
+                memory_id,
+                None,
+                MemoryState::Active,
+                "remembered through memory kernel",
+            )
+            .await;
         }
         Ok(())
+    }
+
+    /// Append a lifecycle transition. Evidence is not mutated.
+    pub async fn transition_state(
+        &self,
+        ctx: &MemoryTurnContext,
+        memory_id: MemoryId,
+        to: MemoryState,
+        reason: impl Into<String>,
+    ) -> MemoryKernelResult<()> {
+        let from = self.latest_state(memory_id).await.unwrap_or(None);
+        self.record_lifecycle_event(ctx, memory_id, from, to, reason)
+            .await;
+        Ok(())
+    }
+
+    pub async fn lifecycle_events(
+        &self,
+        memory_id: MemoryId,
+    ) -> MemoryKernelResult<Vec<MemoryLifecycleEvent>> {
+        Ok(self
+            .load_lifecycle_events(memory_id)
+            .await
+            .unwrap_or_default())
+    }
+
+    pub async fn filter_active_entries(&self, entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+        let mut active = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let state = self.latest_state(entry.id).await.ok().flatten();
+            if !matches!(state, Some(MemoryState::Superseded | MemoryState::Archived)) {
+                active.push(entry);
+            }
+        }
+        active
     }
 
     pub async fn health(&self, _ctx: &MemoryTurnContext) -> MemoryKernelResult<MemoryHealth> {
@@ -343,11 +407,12 @@ impl MemoryKernel {
         information_state: MemoryInformationState,
     ) -> MemoryKernelResult<MemoryLayerView> {
         let entries = self.manager.list_all_entries().await?;
-        let atoms = entries
-            .iter()
-            .filter(|entry| entry.layer == layer)
-            .map(|entry| MemoryAtomView::from_entry(entry, information_state))
-            .collect();
+        let atoms = self
+            .atoms_with_lifecycle_state(
+                entries.iter().filter(|entry| entry.layer == layer),
+                information_state,
+            )
+            .await;
         Ok(MemoryLayerView::new(layer, atoms))
     }
 
@@ -364,17 +429,33 @@ impl MemoryKernel {
             MemoryLayer::L3,
             MemoryLayer::L4,
         ];
-        Ok(layers
-            .into_iter()
-            .map(|layer| {
-                let atoms = entries
-                    .iter()
-                    .filter(|entry| entry.layer == layer)
-                    .map(|entry| MemoryAtomView::from_entry(entry, information_state))
-                    .collect();
-                MemoryLayerView::new(layer, atoms)
-            })
-            .collect())
+        let mut views = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let atoms = self
+                .atoms_with_lifecycle_state(
+                    entries.iter().filter(|entry| entry.layer == layer),
+                    information_state,
+                )
+                .await;
+            views.push(MemoryLayerView::new(layer, atoms));
+        }
+        Ok(views)
+    }
+
+    async fn atoms_with_lifecycle_state<'a>(
+        &self,
+        entries: impl Iterator<Item = &'a MemoryEntry>,
+        information_state: MemoryInformationState,
+    ) -> Vec<MemoryAtomView> {
+        let mut atoms = Vec::new();
+        for entry in entries {
+            let mut atom = MemoryAtomView::from_entry(entry, information_state);
+            if let Ok(Some(state)) = self.latest_state(entry.id).await {
+                atom.state = state;
+            }
+            atoms.push(atom);
+        }
+        atoms
     }
 
     fn empty_degraded_context() -> PreparedContext {
@@ -394,6 +475,75 @@ impl MemoryKernel {
             code_context: None,
         }
     }
+
+    async fn record_lifecycle_event(
+        &self,
+        ctx: &MemoryTurnContext,
+        memory_id: MemoryId,
+        from: Option<MemoryState>,
+        to: MemoryState,
+        reason: impl Into<String>,
+    ) {
+        let mut events = self
+            .load_lifecycle_events(memory_id)
+            .await
+            .unwrap_or_default();
+        events.push(MemoryLifecycleEvent {
+            memory_id,
+            from,
+            to,
+            reason: reason.into(),
+            session_id: ctx.session_id.clone(),
+            agent_id: ctx.agent_id.clone(),
+            occurred_at: Utc::now(),
+        });
+
+        match serde_json::to_string(&events) {
+            Ok(raw) => {
+                if let Err(error) = self
+                    .manager
+                    .kernel_kv_put(&lifecycle_key(memory_id), &raw)
+                    .await
+                {
+                    tracing::warn!(%memory_id, %error, "memory lifecycle persist degraded");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%memory_id, %error, "memory lifecycle serialize failed");
+            }
+        }
+    }
+
+    async fn latest_state(&self, memory_id: MemoryId) -> MemoryKernelResult<Option<MemoryState>> {
+        Ok(self
+            .load_lifecycle_events(memory_id)
+            .await?
+            .last()
+            .map(|event| event.to))
+    }
+
+    async fn load_lifecycle_events(
+        &self,
+        memory_id: MemoryId,
+    ) -> MemoryKernelResult<Vec<MemoryLifecycleEvent>> {
+        let raw = self
+            .manager
+            .kernel_kv_get(&lifecycle_key(memory_id))
+            .await?;
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
+
+        serde_json::from_str(&raw).map_err(|error| {
+            MemoryKernelError::Backend(MemoryError::Store(format!(
+                "decode lifecycle events for {memory_id}: {error}"
+            )))
+        })
+    }
+}
+
+fn lifecycle_key(memory_id: MemoryId) -> String {
+    format!("memory_lifecycle:{memory_id}")
 }
 
 fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemoryScope {
