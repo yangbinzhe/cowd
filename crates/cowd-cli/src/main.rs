@@ -413,6 +413,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_path,
             output_format,
         } => run_export(&session_reference, output_path.as_deref(), output_format)?,
+        CliAction::ImportSession {
+            path,
+            output_format,
+        } => run_import_session(&path, output_format)?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -606,8 +610,7 @@ fn run_gateway_action(
             let auth_token: Option<String> =
                 api_server_platform.and_then(gateway_auth_token_from_platform);
             // Ensure the unified session store is initialised before the
-            // daemon starts so that the OnceLock is populated and the JSONL
-            // migration has already run.
+            // daemon starts so that the OnceLock is populated.
             let _ = get_unified_store();
 
             let daemon_config = daemon::DaemonConfig {
@@ -736,6 +739,10 @@ pub(crate) enum CliAction {
     Export {
         session_reference: String,
         output_path: Option<PathBuf>,
+        output_format: CliOutputFormat,
+    },
+    ImportSession {
+        path: PathBuf,
         output_format: CliOutputFormat,
     },
     Repl {
@@ -1057,6 +1064,23 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
+        "import-session" => {
+            let path = rest
+                .get(1)
+                .ok_or_else(|| {
+                    "missing session file. Usage: cowd import-session <path>".to_string()
+                })?;
+            if rest.len() > 2 {
+                return Err(
+                    "unexpected arguments for import-session. Usage: cowd import-session <path>"
+                        .to_string(),
+                );
+            }
+            Ok(CliAction::ImportSession {
+                path: PathBuf::from(path),
+                output_format,
+            })
+        }
         "install" => parse_install_args(&rest[1..], output_format),
         "gateway" => parse_gateway_args(&rest[1..], output_format),
         "prompt" => {
@@ -1164,7 +1188,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         .find(|spec| spec.name == command_name)?;
     let guidance = if slash_command.resume_supported {
         format!(
-            "`cowd {command_name}` is a slash command. Use `cowd --resume SESSION.jsonl /{command_name}` or start `cowd` and run `/{command_name}`."
+            "`cowd {command_name}` is a slash command. Use `cowd --resume <session-id|latest> /{command_name}` or start `cowd` and run `/{command_name}`."
         )
     } else {
         format!(
@@ -1253,7 +1277,7 @@ fn parse_direct_slash_cli_action(
         Ok(Some(command)) => Err({
             let _ = command;
             format!(
-                "slash command {command_name} is interactive-only. Start `cowd` and run it there, or use `cowd --resume SESSION.jsonl {command_name}` / `cowd --resume {latest} {command_name}` when the command is marked [resume] in /help.",
+                "slash command {command_name} is interactive-only. Start `cowd` and run it there, or use `cowd --resume <session-id|latest> {command_name}` / `cowd --resume {latest} {command_name}` when the command is marked [resume] in /help.",
                 command_name = rest[0],
                 latest = LATEST_SESSION_REFERENCE,
             )
@@ -1883,6 +1907,16 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 if let Some(path) = session_path {
                     resolved_path = path;
                 }
+                if let Ok(store) = get_unified_store() {
+                    if let Err(error) = sync_cli_session_to_unified_store(
+                        store,
+                        &handle,
+                        session.model.as_deref(),
+                        &session,
+                    ) {
+                        tracing::warn!(%error, "failed to sync resumed session to SQLite");
+                    }
+                }
                 if output_format == CliOutputFormat::Json {
                     if let Some(value) = json {
                         println!(
@@ -2115,7 +2149,7 @@ fn format_cost_report(usage: TokenUsage) -> String {
 fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Session resumed
-  Session file     {session_path}
+  Session          {session_path}
   Messages         {message_count}
   Turns            {turns}"
     )
@@ -2124,9 +2158,10 @@ fn format_resume_report(session_path: &str, message_count: usize, turns: u32) ->
 fn render_resume_usage() -> String {
     format!(
         "Resume
-  Usage            /resume <session-path|session-id|{LATEST_SESSION_REFERENCE}>
-  Auto-save        .cowd/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}
-  Tip              use /session list to inspect saved sessions"
+  Usage            /resume <session-id|{LATEST_SESSION_REFERENCE}>
+  Store            SQLite session store
+  Import           cowd import-session <local.jsonl>
+  Tip              use /session list to inspect saved sessions and local import candidates"
     )
 }
 
@@ -2290,7 +2325,6 @@ fn run_resume_command(
             let removed = result.removed_message_count;
             let kept = result.compacted_session.messages.len();
             let skipped = removed == 0;
-            result.compacted_session.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
                 session_path: None,
@@ -2322,22 +2356,20 @@ fn run_resume_command(
             let previous_session_id = session.session_id.clone();
             let cleared = new_cli_session()?;
             let new_session_id = cleared.session_id.clone();
-            cleared.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: cleared,
                 session_path: None,
                 message: Some(format!(
-                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup           {}\n  Resume previous  cowd --resume {}\n  New session      {new_session_id}\n  Session file     {}",
+                    "Session cleared\n  Mode             resumed session reset\n  Previous session {previous_session_id}\n  Backup export    {}\n  Resume previous  cowd import-session {}\n  New session      {new_session_id}\n  Store            SQLite session store",
                     backup_path.display(),
                     backup_path.display(),
-                    session_path.display()
                 )),
                 json: Some(serde_json::json!({
                     "kind": "clear",
                     "previous_session_id": previous_session_id,
                     "new_session_id": new_session_id,
                     "backup": backup_path.display().to_string(),
-                    "session_file": session_path.display().to_string(),
+                    "store": session_db_path(),
                 })),
             })
         }
@@ -3494,7 +3526,6 @@ fn activate_live_cli_session(
     session: Session,
     action: &str,
 ) -> Result<SessionSwitchReport, Box<dyn std::error::Error>> {
-    let session = session.with_persistence_path(handle.path.clone());
     let message_count = session.messages.len();
     let session_id = session.session_id.clone();
     let registry_session = session.clone();
@@ -4201,7 +4232,7 @@ impl LiveCli {
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
-            session_state.with_persistence_path(session.path.clone()),
+            session_state,
             &session.id,
             model.clone(),
             system_prompt.clone(),
@@ -4625,7 +4656,6 @@ impl LiveCli {
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
         let session = self.runtime.session();
-        session.save_to_path(&self.session.path)?;
         if let Ok(store) = get_unified_store() {
             sync_cli_session_to_unified_store(
                 store,
@@ -4819,7 +4849,7 @@ impl LiveCli {
         let session_state = new_cli_session()?;
         self.session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
-            session_state.with_persistence_path(self.session.path.clone()),
+            session_state,
             &self.session.id,
             self.model.clone(),
             self.system_prompt.clone(),
@@ -4833,13 +4863,12 @@ impl LiveCli {
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!(
-            "Session cleared\n  Mode             fresh session\n  Previous session {}\n  Resume previous  /resume {}\n  Preserved model  {}\n  Permission mode  {}\n  New session      {}\n  Session file     {}",
+            "Session cleared\n  Mode             fresh session\n  Previous session {}\n  Resume previous  /resume {}\n  Preserved model  {}\n  Permission mode  {}\n  New session      {}\n  Store            SQLite session store",
             previous_session.id,
             previous_session.id,
             self.model,
             self.permission_mode.as_str(),
             self.session.id,
-            self.session.path.display(),
         );
         Ok(true)
     }
@@ -5110,11 +5139,11 @@ impl LiveCli {
                     println!("delete: cancelled.");
                     return Ok(false);
                 }
-                delete_managed_session(&handle.path)?;
+                delete_managed_session(&handle.id)?;
                 println!(
-                    "Session deleted\n  Deleted session  {}\n  File             {}",
+                    "Session deleted\n  Deleted session  {}\n  Store            {}",
                     handle.id,
-                    handle.path.display(),
+                    session_db_path().display(),
                 );
                 Ok(false)
             }
@@ -5131,11 +5160,11 @@ impl LiveCli {
                     );
                     return Ok(false);
                 }
-                delete_managed_session(&handle.path)?;
+                delete_managed_session(&handle.id)?;
                 println!(
-                    "Session deleted\n  Deleted session  {}\n  File             {}",
+                    "Session deleted\n  Deleted session  {}\n  Store            {}",
                     handle.id,
-                    handle.path.display(),
+                    session_db_path().display(),
                 );
                 Ok(false)
             }
@@ -5295,9 +5324,9 @@ impl LiveCli {
 
 // ── Unified Session Store (replaces runtime::SessionStore) ────────────────────
 //
-// TUI sessions now use the same SQLite-backed `UnifiedSessionStore` as the
-// HTTP server.  Metadata lives at `~/.cowd/sessions.db`; JSONL content files
-// are stored flat under `~/.cowd/sessions/<id>.jsonl`.
+// TUI sessions use the same SQLite-backed `UnifiedSessionStore` as the HTTP
+// server. SQLite is the canonical session store; JSONL is only an explicit
+// import/export format.
 
 static UNIFIED_STORE: std::sync::OnceLock<memory::UnifiedSessionStore> = std::sync::OnceLock::new();
 
@@ -5316,10 +5345,6 @@ fn get_unified_store() -> Result<&'static memory::UnifiedSessionStore, Box<dyn s
         Box::<dyn std::error::Error>::from(msg)
     })?;
 
-    if let Err(e) = migrate_jsonl_sessions(&store) {
-        tracing::warn!("JSONL session migration error (non-fatal): {e}");
-    }
-
     // set() fails if another thread already initialised — either way get() works.
     UNIFIED_STORE.set(store).unwrap_or_else(|_| {});
     Ok(UNIFIED_STORE.get().unwrap())
@@ -5330,60 +5355,75 @@ fn jsonl_sessions_dir() -> PathBuf {
     runtime::cowd_dirs::config_home_dir().join("sessions")
 }
 
-/// Scan legacy `~/.cowd/sessions/projects/*/` and `global/` for `.jsonl`/`.json`
-/// files and import their metadata into the SQLite store.
+fn session_db_path() -> PathBuf {
+    runtime::cowd_dirs::config_home_dir().join("sessions.db")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalSessionImportCandidate {
+    path: PathBuf,
+    session_id: String,
+}
+
+/// Discover local legacy session files without importing them.
+///
+/// JSONL is no longer part of the automatic session lifecycle. Discovery is
+/// passive so startup remains deterministic and users can choose whether a
+/// local file should be imported.
+fn discover_local_session_import_candidates() -> Vec<LocalSessionImportCandidate> {
+    let base = jsonl_sessions_dir();
+    let mut roots = vec![base.clone(), base.join("global"), base.join("projects")];
+    let mut candidates = Vec::new();
+
+    while let Some(root) = roots.pop() {
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                roots.push(path);
+                continue;
+            }
+            let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+            if ext != "jsonl" && ext != "json" {
+                continue;
+            }
+            let Some(session_id) = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(std::string::ToString::to_string)
+            else {
+                continue;
+            };
+            candidates.push(LocalSessionImportCandidate { path, session_id });
+        }
+    }
+    candidates.sort_by(|a, b| a.path.cmp(&b.path));
+    candidates
+}
+
+/// Explicitly import legacy `.jsonl`/`.json` files into the SQLite store.
+///
+/// This must never run automatically during startup.
 fn migrate_jsonl_sessions(
     store: &memory::UnifiedSessionStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let base = jsonl_sessions_dir();
     let mut count: u64 = 0;
 
-    for sub in &["projects", "global"] {
-        let dir = base.join(sub);
-        if !dir.is_dir() {
-            continue;
-        }
-        let hash_dirs = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(Box::new(err)),
+    for candidate in discover_local_session_import_candidates() {
+        let path = candidate.path;
+        let session = match Session::load_from_path(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
         };
-        for entry in hash_dirs {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let hash_dir = entry.path();
-            if !hash_dir.is_dir() {
-                continue;
-            }
-            let files = match std::fs::read_dir(&hash_dir) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            for file in files {
-                let file = match file {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                let path = file.path();
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if ext != "jsonl" && ext != "json" {
-                    continue;
-                }
-                let session = match Session::load_from_path(&path) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let record = session_to_record(&session, &path);
-                if SHARED_RT.block_on(store.create_session(&record)).is_ok() {
-                    count += 1;
-                }
-                // Migrate messages from the JSONL file
-                if let Err(e) = migrate_session_messages(store, &record.session_id, &path) {
-                    tracing::warn!(%e, path=%path.display(), "failed to migrate messages, continuing");
-                }
-            }
+        let record = session_to_record(&session, &path);
+        if SHARED_RT.block_on(store.create_session(&record)).is_ok() {
+            count += 1;
+        }
+        if let Err(e) = migrate_session_messages(store, &record.session_id, &path) {
+            tracing::warn!(%e, path=%path.display(), "failed to import local session messages, continuing");
         }
     }
 
@@ -5450,6 +5490,69 @@ fn migrate_session_messages(
         "migrated session messages to SQLite"
     );
     Ok(total)
+}
+
+fn import_local_session_file(
+    store: &memory::UnifiedSessionStore,
+    path: &Path,
+) -> Result<(String, usize), Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Err(format!("session file not found: {}", path.display()).into());
+    }
+    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    if ext != "jsonl" && ext != "json" {
+        return Err(format!(
+            "unsupported session import format: {} (expected .jsonl or .json)",
+            path.display()
+        )
+        .into());
+    }
+
+    let session = Session::load_from_path(path)?;
+    let record = session_to_record(&session, path);
+    let session_id = record.session_id.clone();
+    SHARED_RT.block_on(async {
+        if store.get_session(&session_id).await?.is_some() {
+            store.update_session(&record).await?;
+            store.delete_messages_from(&session_id, 0).await?;
+            store
+                .delete_events_by_type_from(&session_id, "message_appended", 0)
+                .await?;
+        } else {
+            store.create_session(&record).await?;
+        }
+        Ok::<(), memory::MemoryError>(())
+    })?;
+    let imported_messages = migrate_session_messages(store, &session_id, path)?;
+    Ok((session_id, imported_messages))
+}
+
+fn run_import_session(
+    path: &Path,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = get_unified_store()?;
+    let (session_id, imported_messages) = import_local_session_file(store, path)?;
+    match output_format {
+        CliOutputFormat::Text => {
+            println!(
+                "Session imported\n  Session          {session_id}\n  Messages         {imported_messages}\n  Store            {}",
+                session_db_path().display()
+            );
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "session-import",
+                    "session_id": session_id,
+                    "messages": imported_messages,
+                    "store": session_db_path(),
+                }))?
+            );
+        }
+    }
+    Ok(())
 }
 
 /// CLI handler for `cowd migrate-sessions`.
@@ -5636,7 +5739,7 @@ fn hydrate_session_from_unified_store(
         .and_then(serde_json::Value::as_str)
         .map(std::string::ToString::to_string);
 
-    let mut session = Session::new().with_persistence_path(handle.path.clone());
+    let mut session = Session::new();
     session.session_id = record.session_id;
     session.model = record.model;
     session.messages = messages;
@@ -5651,7 +5754,7 @@ fn hydrate_session_from_unified_store(
 }
 
 fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(jsonl_sessions_dir())
+    Ok(session_db_path())
 }
 
 pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
@@ -5662,9 +5765,7 @@ pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
 fn create_managed_session_handle(
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let dir = jsonl_sessions_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{session_id}.jsonl"));
+    let path = session_db_path();
 
     // Register metadata in SQLite (idempotent via INSERT OR IGNORE).
     if let Ok(store) = get_unified_store() {
@@ -5710,10 +5811,9 @@ fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn s
             .into_iter()
             .next()
             .ok_or_else(|| -> Box<dyn std::error::Error> { "no managed sessions found".into() })?;
-        let path = jsonl_sessions_dir().join(format!("{}.jsonl", record.session_id));
         return Ok(SessionHandle {
             id: record.session_id,
-            path,
+            path: session_db_path(),
         });
     }
 
@@ -5742,39 +5842,24 @@ fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn s
         return Err(format!("session file not found: {reference}").into());
     }
 
-    // 3. Session-ID → SQLite lookup, compute JSONL path.
+    // 3. Session-ID → SQLite lookup, return a DB-backed handle.
     let path = resolve_managed_session_path(reference)?;
-    let id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(reference)
-        .to_string();
+    let id = if path == session_db_path() {
+        reference.to_string()
+    } else {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(reference)
+            .to_string()
+    };
     Ok(SessionHandle { id, path })
 }
 
 fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let dir = jsonl_sessions_dir();
-
     // Check if the session is registered in SQLite.
     if let Ok(store) = get_unified_store() {
         if let Ok(Some(_record)) = SHARED_RT.block_on(store.get_session(session_id)) {
-            // Try existing .jsonl / .json first.
-            for ext in &["jsonl", "json"] {
-                let path = dir.join(format!("{session_id}.{ext}"));
-                if path.exists() {
-                    return Ok(path);
-                }
-            }
-            // Session is registered but file hasn't been persisted yet.
-            return Ok(dir.join(format!("{session_id}.jsonl")));
-        }
-    }
-
-    // Fallback: check for orphan JSONL files (e.g. legacy paths).
-    for ext in &["jsonl", "json"] {
-        let path = dir.join(format!("{session_id}.{ext}"));
-        if path.exists() {
-            return Ok(path);
+            return Ok(session_db_path());
         }
     }
 
@@ -5794,8 +5879,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
 
 /// Convert a SQLite [`memory::SessionRecord`] into the TUI's summary struct.
 fn record_to_summary(record: memory::store::session::SessionRecord) -> ManagedSessionSummary {
-    let dir = jsonl_sessions_dir();
-    let path = dir.join(format!("{}.jsonl", record.session_id));
+    let path = session_db_path();
 
     // Parse last_activity from ISO 8601 → epoch millis for sorting.
     let last_activity_ms = chrono::DateTime::parse_from_rfc3339(&record.last_activity)
@@ -5806,14 +5890,6 @@ fn record_to_summary(record: memory::store::session::SessionRecord) -> ManagedSe
                 .ok()
                 .map(|dt| dt.and_utc().timestamp_millis().max(0) as u64)
         })
-        .unwrap_or(0);
-
-    let file_mtime = path
-        .metadata()
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis())
         .unwrap_or(0);
 
     let (parent_session_id, branch_name) = record
@@ -5836,7 +5912,7 @@ fn record_to_summary(record: memory::store::session::SessionRecord) -> ManagedSe
         id: record.session_id,
         path,
         updated_at_ms: last_activity_ms,
-        modified_epoch_millis: file_mtime,
+        modified_epoch_millis: u128::from(last_activity_ms),
         message_count: record.message_count.max(0) as usize,
         parent_session_id,
         branch_name,
@@ -5854,19 +5930,26 @@ fn load_session_reference(
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
     let handle = resolve_session_reference(reference)?;
-    let session = if handle.path.exists() {
-        Session::load_from_path(&handle.path)?
-    } else if let Ok(store) = get_unified_store() {
-        let Some(hydrated) = hydrate_session_from_unified_store(store, &handle)? else {
-            return Err(format!("session file not found: {}", handle.path.display()).into());
-        };
-        if let Some(parent) = handle.path.parent() {
-            fs::create_dir_all(parent)?;
+    let session = if let Ok(store) = get_unified_store() {
+        if let Some(hydrated) = hydrate_session_from_unified_store(store, &handle)? {
+            hydrated
+        } else if handle.path.exists() {
+            return Err(format!(
+                "local session file is not imported: {}. Import it explicitly before resume.",
+                handle.path.display()
+            )
+            .into());
+        } else {
+            return Err(format!("session not found: {}", handle.id).into());
         }
-        hydrated.save_to_path(&handle.path)?;
-        hydrated
+    } else if handle.path.exists() {
+        return Err(format!(
+            "local session file is not imported: {}. Import it explicitly before resume.",
+            handle.path.display()
+        )
+        .into());
     } else {
-        return Err(format!("session file not found: {}", handle.path.display()).into());
+        return Err(format!("session not found: {}", handle.id).into());
     };
 
     // Check workspace mismatch
@@ -5884,17 +5967,9 @@ fn load_session_reference(
     Ok((handle, session))
 }
 
-fn delete_managed_session(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if !path.exists() {
-        return Err(format!("session file does not exist: {}", path.display()).into());
-    }
-    // Remove from SQLite as well (extract session_id from filename stem).
-    if let Ok(store) = get_unified_store() {
-        if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
-            let _ = SHARED_RT.block_on(store.delete_session(id));
-        }
-    }
-    fs::remove_file(path)?;
+fn delete_managed_session(session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = get_unified_store()?;
+    SHARED_RT.block_on(store.delete_session(session_id))?;
     Ok(())
 }
 
@@ -5910,10 +5985,17 @@ fn confirm_session_deletion(session_id: &str) -> bool {
 
 fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
     let sessions = list_managed_sessions()?;
+    let import_candidates = discover_local_session_import_candidates();
     let mut lines = vec![
         "Sessions".to_string(),
-        format!("  Directory         {}", sessions_dir()?.display()),
+        format!("  Store             {}", session_db_path().display()),
     ];
+    if !import_candidates.is_empty() {
+        lines.push(format!(
+            "  Local imports     {} legacy session file(s) available; import explicitly to use them.",
+            import_candidates.len()
+        ));
+    }
     if sessions.is_empty() {
         lines.push("  No managed sessions saved yet.".to_string());
         return Ok(lines.join("\n"));
@@ -5936,7 +6018,7 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
             (None, None) => String::new(),
         };
         lines.push(format!(
-            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified}{lineage} path={path}",
+            "  {id:<20} {marker:<10} msgs={msgs:<4} updated={modified}{lineage} store={path}",
             id = session.id,
             msgs = session.message_count,
             modified = format_session_modified_age(session.modified_epoch_millis),
@@ -5996,7 +6078,7 @@ fn render_repl_help() -> String {
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
-        "  Auto-save            .cowd/sessions/<session-id>.jsonl".to_string(),
+        "  Auto-save            SQLite session store".to_string(),
         "  Resume latest        /resume latest".to_string(),
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
@@ -6070,9 +6152,11 @@ fn status_json_value(
             "untracked_files": context.git_summary.untracked_files,
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
             "session_id": context.session_path.as_ref().and_then(|path| {
-                // Session files are named <session-id>.jsonl directly under
-                // .cowd/sessions/. Extract the stem (drop the .jsonl extension).
-                path.file_stem().map(|n| n.to_string_lossy().into_owned())
+                if path.file_name().and_then(|n| n.to_str()) == Some("sessions.db") {
+                    None
+                } else {
+                    path.file_stem().map(|n| n.to_string_lossy().into_owned())
+                }
             }),
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
@@ -7233,7 +7317,7 @@ fn run_prompt(
         }
     }
     let mut runtime = build_runtime(
-        session_state.with_persistence_path(session.path.clone()),
+        session_state,
         &session.id,
         resolved_model,
         system_prompt,
@@ -9582,7 +9666,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
         out,
-        "  cowd --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
+        "  cowd --resume [session-id|latest] [/status] [/compact] [...]"
     )?;
     writeln!(
         out,
@@ -9623,6 +9707,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "      Dump the latest (or named) session as markdown; writes to PATH or stdout"
+    )?;
+    writeln!(out, "  cowd import-session PATH")?;
+    writeln!(
+        out,
+        "      Import a local legacy .jsonl/.json session file into the SQLite store"
     )?;
     writeln!(out)?;
     writeln!(out, "Flags:")?;
@@ -9679,7 +9768,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Session shortcuts:")?;
     writeln!(
         out,
-        "  REPL turns auto-save to .cowd/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
+        "  REPL turns auto-save to the SQLite session store"
     )?;
     writeln!(
         out,
@@ -9688,6 +9777,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  Use /session list in the REPL to browse managed sessions"
+    )?;
+    writeln!(
+        out,
+        "  Local .jsonl/.json files are never imported automatically; use cowd import-session PATH"
     )?;
     writeln!(out, "Examples:")?;
     writeln!(out, "  cowd --model claude-opus \"summarize this repo\"")?;
@@ -9746,7 +9839,8 @@ mod tests {
         STUB_COMMANDS, SessionHandle, SlashCommand, StatusUsage, activate_live_cli_session,
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         build_system_prompt_for_mode, collect_session_prompt_history,
-        create_managed_session_handle, ensure_yolo_task, filter_tool_specs,
+        create_managed_session_handle, current_task_summary_from_record,
+        discover_local_session_import_candidates, ensure_yolo_task, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
         format_issue_report, format_model_report, format_model_switch_report,
@@ -9754,19 +9848,20 @@ mod tests {
         format_resume_report, format_startup_banner, format_startup_banner_with_task,
         format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        gateway_auth_token_from_platform, hydrate_session_from_unified_store,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        gateway_auth_token_from_platform, get_unified_store, hydrate_session_from_unified_store,
+        import_local_session_file, jsonl_sessions_dir, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_memory_report,
         render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias_with_config, resolve_repl_model,
         resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
-        status_context, suggestions::format_unknown_slash_command,
-        summarize_tool_payload_for_markdown, sync_cli_session_to_unified_store,
-        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture,
-        current_task_summary_from_record,
+        run_resume_command, session_db_path, short_tool_id,
+        slash_command_completion_candidates_with_sessions, status_context,
+        suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
+        sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
+        write_mcp_server_fixture,
     };
     use crate::task_kernel::{
         TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
@@ -11122,7 +11217,7 @@ mod tests {
         let error = parse_args(&["/status".to_string()])
             .expect_err("/status should remain REPL-only when invoked directly");
         assert!(error.contains("interactive-only"));
-        assert!(error.contains("cowd --resume SESSION.jsonl /status"));
+        assert!(error.contains("cowd --resume <session-id|latest> /status"));
     }
 
     #[test]
@@ -11140,6 +11235,26 @@ mod tests {
         .expect_err("invalid /plugins list shape should be rejected");
         assert!(plugins_error.contains("Usage: /plugin list"));
         assert!(plugins_error.contains("Aliases          /plugins, /marketplace"));
+    }
+
+    #[test]
+    fn parses_import_session_subcommand_and_rejects_extra_args() {
+        assert_eq!(
+            parse_args(&["import-session".to_string(), "legacy.jsonl".to_string()])
+                .expect("import-session should parse"),
+            CliAction::ImportSession {
+                path: PathBuf::from("legacy.jsonl"),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+
+        let error = parse_args(&[
+            "import-session".to_string(),
+            "legacy.jsonl".to_string(),
+            "extra".to_string(),
+        ])
+        .expect_err("extra import-session arguments should fail");
+        assert!(error.contains("unexpected arguments for import-session"));
     }
 
     #[test]
@@ -11164,13 +11279,13 @@ mod tests {
     fn parses_resume_flag_with_slash_command() {
         let args = vec![
             "--resume".to_string(),
-            "session.jsonl".to_string(),
+            "session-123".to_string(),
             "/compact".to_string(),
         ];
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::ResumeSession {
-                session_path: PathBuf::from("session.jsonl"),
+                session_path: PathBuf::from("session-123"),
                 commands: vec!["/compact".to_string()],
                 output_format: CliOutputFormat::Text,
             }
@@ -11202,7 +11317,7 @@ mod tests {
     fn parses_resume_flag_with_multiple_slash_commands() {
         let args = vec![
             "--resume".to_string(),
-            "session.jsonl".to_string(),
+            "session-123".to_string(),
             "/status".to_string(),
             "/compact".to_string(),
             "/cost".to_string(),
@@ -11210,7 +11325,7 @@ mod tests {
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::ResumeSession {
-                session_path: PathBuf::from("session.jsonl"),
+                session_path: PathBuf::from("session-123"),
                 commands: vec![
                     "/status".to_string(),
                     "/compact".to_string(),
@@ -11233,7 +11348,7 @@ mod tests {
     fn parses_resume_flag_with_slash_command_arguments() {
         let args = vec![
             "--resume".to_string(),
-            "session.jsonl".to_string(),
+            "session-123".to_string(),
             "/export".to_string(),
             "notes.txt".to_string(),
             "/clear".to_string(),
@@ -11242,7 +11357,7 @@ mod tests {
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::ResumeSession {
-                session_path: PathBuf::from("session.jsonl"),
+                session_path: PathBuf::from("session-123"),
                 commands: vec![
                     "/export notes.txt".to_string(),
                     "/clear --confirm".to_string(),
@@ -11256,7 +11371,7 @@ mod tests {
     fn parses_resume_flag_with_absolute_export_path() {
         let args = vec![
             "--resume".to_string(),
-            "session.jsonl".to_string(),
+            "session-123".to_string(),
             "/export".to_string(),
             "/tmp/notes.txt".to_string(),
             "/status".to_string(),
@@ -11264,7 +11379,7 @@ mod tests {
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::ResumeSession {
-                session_path: PathBuf::from("session.jsonl"),
+                session_path: PathBuf::from("session-123"),
                 commands: vec!["/export /tmp/notes.txt".to_string(), "/status".to_string()],
                 output_format: CliOutputFormat::Text,
             }
@@ -11313,7 +11428,7 @@ mod tests {
     fn shared_help_uses_resume_annotation_copy() {
         let help = commands::render_slash_command_help();
         assert!(help.contains("Slash commands"));
-        assert!(help.contains("works with --resume SESSION.jsonl"));
+        assert!(help.contains("works with --resume <session-id|latest>"));
     }
 
     #[test]
@@ -11360,7 +11475,7 @@ mod tests {
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
-        assert!(help.contains("/resume <session-path>"));
+        assert!(help.contains("/resume <session-id|latest>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains("/mcp [list|show <server>|help]"));
         assert!(help.contains("/memory"));
@@ -11378,7 +11493,7 @@ mod tests {
         assert!(help.contains("/agents"));
         assert!(help.contains("/skills"));
         assert!(help.contains("/exit"));
-        assert!(help.contains("Auto-save            .cowd/sessions/<session-id>.jsonl"));
+        assert!(help.contains("Auto-save            SQLite session store"));
         assert!(help.contains("Resume latest        /resume latest"));
     }
 
@@ -11605,9 +11720,9 @@ mod tests {
 
     #[test]
     fn resume_report_uses_sectioned_layout() {
-        let report = format_resume_report("session.jsonl", 14, 6);
+        let report = format_resume_report("session-123", 14, 6);
         assert!(report.contains("Session resumed"));
-        assert!(report.contains("Session file     session.jsonl"));
+        assert!(report.contains("Session          session-123"));
         assert!(report.contains("Messages         14"));
         assert!(report.contains("Turns            6"));
     }
@@ -12007,39 +12122,43 @@ UU conflicted.rs",
     fn resume_session_switch_updates_outcome_session_and_path() {
         let _guard = env_lock();
         let root = temp_dir();
+        let config_home_original = std::env::var("COWD_CONFIG_HOME").ok();
+        let config_home = temp_dir();
+        std::env::set_var("COWD_CONFIG_HOME", &config_home);
         fs::create_dir_all(&root).expect("root dir");
-        let active_path = root.join("active.jsonl");
+        let active_handle =
+            create_managed_session_handle("resume-switch-active").expect("active handle");
+        let active_path = active_handle.path.clone();
         let active = Session::new()
             .with_workspace_root(root.clone())
             .with_persistence_path(active_path.clone());
-        active
-            .save_to_path(&active_path)
-            .expect("active session should save");
 
-        let target_path = root.join("target.jsonl");
-        let target = Session::new()
-            .with_workspace_root(root.clone())
-            .with_persistence_path(target_path.clone());
-        let target_id = target.session_id.clone();
-        target
-            .save_to_path(&target_path)
-            .expect("target session should save");
+        let target_handle =
+            create_managed_session_handle("resume-switch-target").expect("target handle");
+        let target = Session::new().with_workspace_root(root.clone());
+        sync_cli_session_to_unified_store(
+            get_unified_store().expect("store should open"),
+            &target_handle,
+            None,
+            &target,
+        )
+            .expect("target session should sync");
 
-        let command = SlashCommand::parse(&format!("/session switch {}", target_path.display()))
+        let command = SlashCommand::parse(&format!("/session switch {}", target_handle.id))
             .expect("parse should succeed")
             .expect("command should exist");
         let outcome = with_current_dir(&root, || {
             run_resume_command(&active_path, &active, &command).expect("switch should succeed")
         });
 
-        assert_eq!(outcome.session.session_id, target_id);
+        assert_eq!(outcome.session.session_id, target_handle.id);
         assert_eq!(
             outcome
                 .session_path
                 .expect("switch should update session path")
                 .canonicalize()
                 .expect("outcome path should exist"),
-            target_path
+            session_db_path()
                 .canonicalize()
                 .expect("target path should exist")
         );
@@ -12052,6 +12171,12 @@ UU conflicted.rs",
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+        fs::remove_dir_all(config_home).expect("cleanup config home");
+        if let Some(v) = config_home_original {
+            std::env::set_var("COWD_CONFIG_HOME", v);
+        } else {
+            std::env::remove_var("COWD_CONFIG_HOME");
+        }
     }
 
     #[test]
@@ -12193,9 +12318,9 @@ UU conflicted.rs",
     #[test]
     fn parses_resume_and_config_slash_commands() {
         assert_eq!(
-            SlashCommand::parse("/resume saved-session.jsonl"),
+            SlashCommand::parse("/resume session-123"),
             Ok(Some(SlashCommand::Resume {
-                session_path: Some("saved-session.jsonl".to_string())
+                session_path: Some("session-123".to_string())
             }))
         );
         assert_eq!(
@@ -12227,60 +12352,63 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn help_mentions_jsonl_resume_examples() {
+    fn help_mentions_db_resume_and_explicit_import() {
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("cowd --resume [SESSION.jsonl|session-id|latest]"));
+        assert!(help.contains("cowd --resume [session-id|latest]"));
+        assert!(help.contains("cowd import-session PATH"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
         assert!(help.contains("cowd --resume latest"));
         assert!(help.contains("cowd --resume latest /status /diff /export notes.txt"));
     }
 
     #[test]
-    fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
+    fn managed_sessions_default_to_sqlite_and_detect_legacy_imports() {
         let _guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
         let config_home_original = std::env::var("COWD_CONFIG_HOME").ok();
-        std::env::remove_var("COWD_CONFIG_HOME");
         let workspace = temp_workspace("session-resolution");
+        let config_home = temp_workspace("session-resolution-config");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
+        std::fs::create_dir_all(&config_home).expect("config home should create");
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace).expect("switch cwd");
+        std::env::set_var("COWD_CONFIG_HOME", &config_home);
 
-        let handle = create_managed_session_handle("session-alpha").expect("jsonl handle");
-        assert!(handle.path.ends_with("session-alpha.jsonl"));
-
-        // Place a legacy session in the managed sessions dir to test resolution
-        let sessions_root = handle
-            .path
-            .parent()
-            .expect("handle path should have parent");
-        let legacy_path = sessions_root.join("legacy.json");
+        let legacy_root = jsonl_sessions_dir().join("global");
+        std::fs::create_dir_all(&legacy_root).expect("legacy root should create");
+        let legacy_path = legacy_root.join("legacy.json");
         Session::new()
             .with_workspace_root(workspace.clone())
             .with_persistence_path(legacy_path.clone())
             .save_to_path(&legacy_path)
             .expect("legacy session should save");
 
-        let resolved = resolve_session_reference("legacy").expect("legacy session should resolve");
-        assert_eq!(
-            resolved
-                .path
-                .canonicalize()
-                .expect("resolved path should exist"),
-            legacy_path
-                .canonicalize()
-                .expect("legacy path should exist")
+        let candidates = discover_local_session_import_candidates();
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.path == legacy_path));
+        assert!(
+            resolve_session_reference("legacy").is_err(),
+            "legacy files must not resolve until explicitly imported"
         );
 
-        // Clean up created session files
-        let _ = std::fs::remove_file(&handle.path);
-        let _ = std::fs::remove_file(&legacy_path);
+        let store = memory::UnifiedSessionStore::open_in_memory().expect("store should open");
+        let (imported_id, _messages) =
+            import_local_session_file(&store, &legacy_path).expect("legacy import should succeed");
+        assert!(!imported_id.is_empty());
+        assert!(SHARED_RT
+            .block_on(store.get_session(&imported_id))
+            .expect("session lookup should succeed")
+            .is_some());
 
         std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        std::fs::remove_dir_all(config_home).expect("config home should clean up");
         if let Some(v) = config_home_original {
             std::env::set_var("COWD_CONFIG_HOME", v);
+        } else {
+            std::env::remove_var("COWD_CONFIG_HOME");
         }
     }
 
@@ -12323,17 +12451,20 @@ UU conflicted.rs",
 
         let target_handle =
             create_managed_session_handle("session-target").expect("target handle should create");
-        let target_session = Session::new()
-            .with_workspace_root(workspace.clone())
-            .with_persistence_path(target_handle.path.clone());
+        let target_session = Session::new().with_workspace_root(workspace.clone());
         let target_session_id = target_session.session_id.clone();
-        target_session
-            .save_to_path(&target_handle.path)
-            .expect("target session should save");
+        let store = get_unified_store().expect("store should open");
+        sync_cli_session_to_unified_store(
+            store,
+            &target_handle,
+            Some("claude-sonnet-4-6"),
+            &target_session,
+        )
+        .expect("target session should sync");
 
         let report = crate::switch_live_cli_session(
             &mut cli,
-            target_handle.path.to_str().expect("path should be utf8"),
+            &target_session_id,
         )
         .expect("switch should succeed");
 
@@ -12341,10 +12472,7 @@ UU conflicted.rs",
         assert_eq!(report.session_id, target_session_id);
         assert_eq!(cli.session.id, target_session_id);
         assert_eq!(cli.runtime.session().session_id, target_session_id);
-        assert_eq!(
-            cli.session.path.canonicalize().expect("cli path"),
-            target_handle.path.canonicalize().expect("target path")
-        );
+        assert!(cli.session.path.ends_with("sessions.db"));
 
         std::env::remove_var("COWD_CONFIG_HOME");
         if let Some(v) = config_home_original {
@@ -12363,45 +12491,32 @@ UU conflicted.rs",
     fn latest_session_alias_resolves_most_recent_managed_session() {
         let _guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
         let config_home_original = std::env::var("COWD_CONFIG_HOME").ok();
-        std::env::remove_var("COWD_CONFIG_HOME");
         let workspace = temp_workspace("latest-session-alias");
+        let config_home = temp_workspace("latest-session-alias-config");
+        std::env::set_var("COWD_CONFIG_HOME", &config_home);
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace).expect("switch cwd");
 
-        let older = create_managed_session_handle("session-older").expect("older handle");
-        Session::new()
-            .with_persistence_path(older.path.clone())
-            .save_to_path(&older.path)
-            .expect("older session should save");
+        let _older = create_managed_session_handle("session-older").expect("older handle");
         std::thread::sleep(Duration::from_millis(20));
         let newer = create_managed_session_handle("session-newer").expect("newer handle");
-        Session::new()
-            .with_persistence_path(newer.path.clone())
-            .save_to_path(&newer.path)
-            .expect("newer session should save");
 
         let resolved = resolve_session_reference("latest").expect("latest session should resolve");
-        assert_eq!(
-            resolved
-                .path
-                .canonicalize()
-                .expect("resolved path should exist"),
-            newer.path.canonicalize().expect("newer path should exist")
-        );
-
-        let _ = std::fs::remove_file(&older.path);
-        let _ = std::fs::remove_file(&newer.path);
+        assert_eq!(resolved.id, newer.id);
 
         std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        std::fs::remove_dir_all(config_home).expect("config home should clean up");
         if let Some(v) = config_home_original {
             std::env::set_var("COWD_CONFIG_HOME", v);
+        } else {
+            std::env::remove_var("COWD_CONFIG_HOME");
         }
     }
 
     #[test]
-    fn load_session_reference_rejects_workspace_mismatch() {
+    fn load_session_reference_rejects_unimported_local_session_file() {
         let _guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
         let workspace_a = temp_workspace("session-mismatch-a");
         let workspace_b = temp_workspace("session-mismatch-b");
@@ -12424,22 +12539,16 @@ UU conflicted.rs",
             .expect("session should save");
 
         let error = crate::load_session_reference(&session_path.display().to_string())
-            .expect_err("mismatched workspace should fail");
+            .expect_err("unimported local session file should fail");
         assert!(
-            error.to_string().contains("session workspace mismatch"),
+            error.to_string().contains("local session file is not imported"),
             "unexpected error: {error}"
         );
         assert!(
             error
                 .to_string()
-                .contains(&workspace_b.display().to_string()),
-            "expected current workspace in error: {error}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains(&workspace_a.display().to_string()),
-            "expected originating workspace in error: {error}"
+                .contains("Import it explicitly before resume"),
+            "expected import guidance in error: {error}"
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
@@ -12466,8 +12575,9 @@ UU conflicted.rs",
     #[test]
     fn resume_usage_mentions_latest_shortcut() {
         let usage = render_resume_usage();
-        assert!(usage.contains("/resume <session-path|session-id|latest>"));
-        assert!(usage.contains(".cowd/sessions/<session-id>.jsonl"));
+        assert!(usage.contains("/resume <session-id|latest>"));
+        assert!(usage.contains("SQLite session store"));
+        assert!(usage.contains("cowd import-session <local.jsonl>"));
         assert!(usage.contains("/session list"));
     }
 

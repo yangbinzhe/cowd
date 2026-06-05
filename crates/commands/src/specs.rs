@@ -107,7 +107,7 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "resume",
         aliases: &[],
         summary: "Load a saved session into the REPL",
-        argument_hint: Some("<session-path>"),
+        argument_hint: Some("<session-id|latest>"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1237,4 +1237,3 @@ impl fmt::Display for SlashCommandParseError {
 }
 
 impl std::error::Error for SlashCommandParseError {}
-

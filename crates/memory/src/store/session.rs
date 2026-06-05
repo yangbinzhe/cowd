@@ -241,23 +241,41 @@ fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(stmt).map_err(sql_err)?;
     }
 
-    let has_status = {
+    let existing_session_columns = {
         let mut stmt = conn
             .prepare("PRAGMA table_info(sessions)")
             .map_err(sql_err)?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(1))
             .map_err(sql_err)?;
-        let mut found = false;
+        let mut columns = std::collections::BTreeSet::new();
         for row in rows {
-            if row.map_err(sql_err)? == "status" {
-                found = true;
-                break;
-            }
+            columns.insert(row.map_err(sql_err)?);
         }
-        found
+        columns
     };
-    if !has_status {
+    if !existing_session_columns.contains("input_tokens") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    if !existing_session_columns.contains("output_tokens") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    if !existing_session_columns.contains("estimated_cost_usd") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN estimated_cost_usd REAL NOT NULL DEFAULT 0.0",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    if !existing_session_columns.contains("status") {
         conn.execute(
             "ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
             [],
