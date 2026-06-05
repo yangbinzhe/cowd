@@ -421,6 +421,29 @@ window.Panels = (()=>{
         body.textContent=(current.status||'running')+' · '+(current.objective||current.id);
         item.appendChild(body);
         sec.appendChild(item);
+        const phase=current.phases&&current.phases.length
+          ? current.phases[current.phases.length-1]
+          : null;
+        if(phase){
+          const phaseBox=UI.el('div','panel-section');
+          phaseBox.innerHTML='<h3>Current Phase</h3>';
+          const title=UI.el('div','panel-item');
+          title.textContent=(phase.status||'running')+' · '+(phase.name||phase.id)+' · '+(phase.objective||'');
+          phaseBox.appendChild(title);
+          (phase.acceptance||[]).slice(0,5).forEach(function(line){
+            phaseBox.appendChild(UI.el('div','panel-empty','acceptance: '+line));
+          });
+          (phase.test_commands||[]).slice(0,5).forEach(function(cmd){
+            phaseBox.appendChild(UI.el('div','panel-empty','test: '+cmd));
+          });
+          (phase.artifacts||[]).slice(-5).forEach(function(artifact){
+            phaseBox.appendChild(UI.el('div','panel-empty',(artifact.kind||'artifact')+': '+(artifact.label||'')+' '+(artifact.value||'')));
+          });
+          if(phase.review_result){
+            phaseBox.appendChild(UI.el('div','panel-empty','review: '+phase.review_result));
+          }
+          sec.appendChild(phaseBox);
+        }
         if(current.blocker_reason){
           sec.appendChild(UI.el('div','panel-empty',current.blocker_reason));
         }

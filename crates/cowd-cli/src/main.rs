@@ -11388,6 +11388,7 @@ mod tests {
             objective: "complete v0.8.10 enterprise AI framework".to_string(),
             status: TaskStatus::Running,
             current_phase: Some("tui-cockpit".to_string()),
+            phases: Vec::new(),
             yolo_mode: true,
             failure_count: 0,
             blocker_reason: None,

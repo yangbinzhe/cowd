@@ -160,6 +160,15 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
         .route("/api/tasks", get(tasks_status_handler))
         .route("/api/tasks/start", post(start_task_handler))
+        .route("/api/tasks/:id/phases", post(start_task_phase_handler))
+        .route(
+            "/api/tasks/:id/phases/:phase_id/artifacts",
+            post(record_task_phase_artifact_handler),
+        )
+        .route(
+            "/api/tasks/:id/phases/:phase_id/review",
+            post(review_task_phase_handler),
+        )
         .route("/api/tasks/:id/cancel", post(cancel_task_handler))
         .route("/api/tasks/:id/complete", post(complete_task_handler))
         .route("/api/tasks/:id/failure", post(record_task_failure_handler))
@@ -686,6 +695,37 @@ struct TaskFailureRequest {
     reason: String,
 }
 
+#[derive(Deserialize)]
+struct StartTaskPhaseRequest {
+    name: String,
+    objective: String,
+    #[serde(default)]
+    plan: Vec<String>,
+    #[serde(default)]
+    acceptance: Vec<String>,
+    #[serde(default)]
+    test_commands: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct TaskPhaseArtifactRequest {
+    #[serde(default = "default_task_artifact_kind")]
+    kind: String,
+    label: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct TaskPhaseReviewRequest {
+    result: String,
+    #[serde(default)]
+    completed: bool,
+}
+
+fn default_task_artifact_kind() -> String {
+    "note".to_string()
+}
+
 // ── Handlers ───────────────────────────────────────────────────
 
 async fn health_handler() -> &'static str {
@@ -708,6 +748,49 @@ async fn start_task_handler(
         .start_goal(body.objective, body.yolo_mode)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
     Ok((StatusCode::CREATED, Json(task)))
+}
+
+async fn start_task_phase_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<StartTaskPhaseRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let task = state
+        .task_kernel
+        .start_phase(
+            &id,
+            body.name,
+            body.objective,
+            body.plan,
+            body.acceptance,
+            body.test_commands,
+        )
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    Ok((StatusCode::CREATED, Json(task)))
+}
+
+async fn record_task_phase_artifact_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, phase_id)): Path<(String, String)>,
+    Json(body): Json<TaskPhaseArtifactRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let task = state
+        .task_kernel
+        .record_phase_artifact(&id, &phase_id, body.kind, body.label, body.value)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(task))
+}
+
+async fn review_task_phase_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path((id, phase_id)): Path<(String, String)>,
+    Json(body): Json<TaskPhaseReviewRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let task = state
+        .task_kernel
+        .review_phase(&id, &phase_id, body.result, body.completed)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(task))
 }
 
 async fn cancel_task_handler(
@@ -3775,6 +3858,120 @@ mod tests {
             status_json["tasks"][0]["blocker_reason"],
             "external input required"
         );
+    }
+
+    #[tokio::test]
+    async fn task_api_records_phase_artifacts_and_review() {
+        let app = api_router(test_state());
+        let start_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "objective": "ship task phase",
+                            "yolo_mode": true,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start_response.status(), StatusCode::CREATED);
+        let start_body = to_bytes(start_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let started: serde_json::Value = serde_json::from_slice(&start_body).unwrap();
+        let task_id = started["id"].as_str().unwrap().to_string();
+
+        let phase_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/phases"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "browser-e2e",
+                            "objective": "cover WebUI task panel",
+                            "plan": ["add playwright spec"],
+                            "acceptance": ["2 e2e tests pass"],
+                            "test_commands": ["cd webui && npm run test:e2e"],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(phase_response.status(), StatusCode::CREATED);
+        let phase_body = to_bytes(phase_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let phase_json: serde_json::Value = serde_json::from_slice(&phase_body).unwrap();
+        let phase_id = phase_json["phases"].as_array().unwrap().last().unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(phase_json["current_phase"], "browser-e2e");
+
+        let artifact_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/phases/{phase_id}/artifacts"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "kind": "test",
+                            "label": "playwright",
+                            "value": "2 passed",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artifact_response.status(), StatusCode::OK);
+
+        let review_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/phases/{phase_id}/review"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "result": "accepted",
+                            "completed": true,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(review_response.status(), StatusCode::OK);
+        let review_body = to_bytes(review_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let review_json: serde_json::Value = serde_json::from_slice(&review_body).unwrap();
+        let reviewed_phase = review_json["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|phase| phase["id"] == phase_id)
+            .unwrap();
+        assert_eq!(reviewed_phase["status"], "completed");
+        assert_eq!(reviewed_phase["review_result"], "accepted");
+        assert_eq!(reviewed_phase["artifacts"][0]["label"], "playwright");
     }
 
     #[tokio::test]

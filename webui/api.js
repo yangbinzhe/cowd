@@ -185,6 +185,9 @@ window.Api = (()=>{
     // ── Tasks ──
     async taskStatus(){return req('GET','/api/tasks')},
     async startTask(objective,yoloMode){return req('POST','/api/tasks/start',{objective,yolo_mode:!!yoloMode})},
+    async startTaskPhase(id,phase){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/phases',phase)},
+    async recordTaskPhaseArtifact(id,phaseId,artifact){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/phases/'+encodeURIComponent(phaseId)+'/artifacts',artifact)},
+    async reviewTaskPhase(id,phaseId,result,completed){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/phases/'+encodeURIComponent(phaseId)+'/review',{result,completed:!!completed})},
     async cancelTask(id){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/cancel')},
     async completeTask(id){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/complete')},
     async recordTaskFailure(id,reason){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/failure',{reason})},

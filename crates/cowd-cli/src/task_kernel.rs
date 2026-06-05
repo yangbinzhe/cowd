@@ -41,12 +41,58 @@ pub(crate) struct TaskAuditEvent {
     pub created_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskPhaseStatus {
+    Running,
+    Reviewing,
+    Completed,
+    Failed,
+}
+
+impl TaskPhaseStatus {
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Reviewing => "reviewing",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TaskPhaseArtifact {
+    pub kind: String,
+    pub label: String,
+    pub value: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TaskPhaseRecord {
+    pub id: String,
+    pub name: String,
+    pub objective: String,
+    pub plan: Vec<String>,
+    pub acceptance: Vec<String>,
+    pub test_commands: Vec<String>,
+    pub artifacts: Vec<TaskPhaseArtifact>,
+    pub review_result: Option<String>,
+    pub status: TaskPhaseStatus,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TaskRecord {
     pub id: String,
     pub objective: String,
     pub status: TaskStatus,
     pub current_phase: Option<String>,
+    #[serde(default)]
+    pub phases: Vec<TaskPhaseRecord>,
     pub yolo_mode: bool,
     pub failure_count: u32,
     pub blocker_reason: Option<String>,
@@ -109,11 +155,25 @@ impl TaskKernel {
         if objective.trim().is_empty() {
             return Err("task objective is required".to_string());
         }
+        let initial_phase = TaskPhaseRecord {
+            id: format!("phase-{}", uuid::Uuid::new_v4()),
+            name: "implementation".to_string(),
+            objective: objective.clone(),
+            plan: Vec::new(),
+            acceptance: Vec::new(),
+            test_commands: Vec::new(),
+            artifacts: Vec::new(),
+            review_result: None,
+            status: TaskPhaseStatus::Running,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
         let mut task = TaskRecord {
             id: format!("task-{}", uuid::Uuid::new_v4()),
             objective,
             status: TaskStatus::Running,
             current_phase: Some("implementation".to_string()),
+            phases: vec![initial_phase],
             yolo_mode,
             failure_count: 0,
             blocker_reason: None,
@@ -158,6 +218,166 @@ impl TaskKernel {
         task.audit.push(TaskAuditEvent {
             event_type: format!("{:?}", status).to_lowercase(),
             message: message.into(),
+            created_at_ms: now,
+        });
+        let updated = task.clone();
+        drop(store);
+        self.persist()?;
+        Ok(updated)
+    }
+
+    pub(crate) fn start_phase(
+        &self,
+        task_id: &str,
+        name: impl Into<String>,
+        objective: impl Into<String>,
+        plan: Vec<String>,
+        acceptance: Vec<String>,
+        test_commands: Vec<String>,
+    ) -> Result<TaskRecord, String> {
+        let now = now_ms();
+        let name = name.into();
+        let objective = objective.into();
+        if name.trim().is_empty() {
+            return Err("phase name is required".to_string());
+        }
+        if objective.trim().is_empty() {
+            return Err("phase objective is required".to_string());
+        }
+
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let task = store
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| format!("task {task_id} not found"))?;
+        let phase = TaskPhaseRecord {
+            id: format!("phase-{}", uuid::Uuid::new_v4()),
+            name: name.clone(),
+            objective,
+            plan,
+            acceptance,
+            test_commands,
+            artifacts: Vec::new(),
+            review_result: None,
+            status: TaskPhaseStatus::Running,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        task.status = TaskStatus::Running;
+        task.current_phase = Some(name.clone());
+        task.updated_at_ms = now;
+        task.phases.push(phase);
+        task.audit.push(TaskAuditEvent {
+            event_type: "phase_started".to_string(),
+            message: format!("phase started: {name}"),
+            created_at_ms: now,
+        });
+        let updated = task.clone();
+        drop(store);
+        self.persist()?;
+        Ok(updated)
+    }
+
+    pub(crate) fn record_phase_artifact(
+        &self,
+        task_id: &str,
+        phase_id: &str,
+        kind: impl Into<String>,
+        label: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<TaskRecord, String> {
+        let now = now_ms();
+        let kind = kind.into();
+        let label = label.into();
+        let value = value.into();
+        if label.trim().is_empty() {
+            return Err("artifact label is required".to_string());
+        }
+        if value.trim().is_empty() {
+            return Err("artifact value is required".to_string());
+        }
+
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let task = store
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| format!("task {task_id} not found"))?;
+        let phase = task
+            .phases
+            .iter_mut()
+            .find(|phase| phase.id == phase_id)
+            .ok_or_else(|| format!("phase {phase_id} not found"))?;
+        phase.artifacts.push(TaskPhaseArtifact {
+            kind,
+            label: label.clone(),
+            value,
+            created_at_ms: now,
+        });
+        phase.updated_at_ms = now;
+        task.updated_at_ms = now;
+        task.audit.push(TaskAuditEvent {
+            event_type: "phase_artifact".to_string(),
+            message: format!("phase artifact recorded: {label}"),
+            created_at_ms: now,
+        });
+        let updated = task.clone();
+        drop(store);
+        self.persist()?;
+        Ok(updated)
+    }
+
+    pub(crate) fn review_phase(
+        &self,
+        task_id: &str,
+        phase_id: &str,
+        result: impl Into<String>,
+        completed: bool,
+    ) -> Result<TaskRecord, String> {
+        let now = now_ms();
+        let result = result.into();
+        if result.trim().is_empty() {
+            return Err("review result is required".to_string());
+        }
+
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let task = store
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| format!("task {task_id} not found"))?;
+        let phase = task
+            .phases
+            .iter_mut()
+            .find(|phase| phase.id == phase_id)
+            .ok_or_else(|| format!("phase {phase_id} not found"))?;
+        phase.review_result = Some(result.clone());
+        phase.status = if completed {
+            TaskPhaseStatus::Completed
+        } else {
+            TaskPhaseStatus::Reviewing
+        };
+        phase.updated_at_ms = now;
+        task.status = if completed {
+            TaskStatus::Reviewing
+        } else {
+            TaskStatus::Running
+        };
+        task.current_phase = Some(phase.name.clone());
+        task.updated_at_ms = now;
+        task.audit.push(TaskAuditEvent {
+            event_type: "phase_reviewed".to_string(),
+            message: result,
             created_at_ms: now,
         });
         let updated = task.clone();
@@ -287,6 +507,73 @@ mod tests {
             .unwrap();
         assert_eq!(completed.status, TaskStatus::Completed);
         assert!(kernel.current().is_none());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn task_kernel_records_phase_artifacts_and_review() {
+        let path = temp_path("phase");
+        let kernel = TaskKernel::open(path.clone()).unwrap();
+        let task = kernel.start_goal("Ship enterprise workflow", true).unwrap();
+
+        let with_phase = kernel
+            .start_phase(
+                &task.id,
+                "webui-e2e",
+                "Cover task workbench browser scenario",
+                vec!["Add Playwright fixture".to_string()],
+                vec!["E2E passes".to_string()],
+                vec!["cd webui && npm run test:e2e".to_string()],
+            )
+            .unwrap();
+        let phase = with_phase
+            .phases
+            .last()
+            .expect("phase should exist")
+            .clone();
+        assert_eq!(phase.name, "webui-e2e");
+        assert_eq!(phase.status.as_str(), "running");
+        assert_eq!(with_phase.current_phase.as_deref(), Some("webui-e2e"));
+
+        let with_artifact = kernel
+            .record_phase_artifact(&task.id, &phase.id, "test", "playwright", "2 passed")
+            .unwrap();
+        let phase = with_artifact
+            .phases
+            .iter()
+            .find(|candidate| candidate.id == phase.id)
+            .unwrap()
+            .clone();
+        assert_eq!(phase.artifacts[0].label, "playwright");
+
+        let reviewed = kernel
+            .review_phase(&task.id, &phase.id, "accepted after gate", true)
+            .unwrap();
+        let reviewed_phase = reviewed
+            .phases
+            .iter()
+            .find(|candidate| candidate.id == phase.id)
+            .unwrap();
+        assert_eq!(reviewed_phase.status.as_str(), "completed");
+        assert_eq!(
+            reviewed_phase.review_result.as_deref(),
+            Some("accepted after gate")
+        );
+        assert!(
+            reviewed
+                .audit
+                .iter()
+                .any(|event| event.event_type == "phase_reviewed")
+        );
+
+        let restored = TaskKernel::open(path.clone()).unwrap();
+        let restored_task = restored
+            .list()
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .unwrap();
+        assert!(restored_task.phases.iter().any(|p| p.id == phase.id));
 
         let _ = std::fs::remove_file(path);
     }

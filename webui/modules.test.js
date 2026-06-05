@@ -95,6 +95,9 @@ describe('API module', () => {
   it('has durable task endpoints', () => {
     expect(typeof window.Api.taskStatus).toBe('function');
     expect(typeof window.Api.startTask).toBe('function');
+    expect(typeof window.Api.startTaskPhase).toBe('function');
+    expect(typeof window.Api.recordTaskPhaseArtifact).toBe('function');
+    expect(typeof window.Api.reviewTaskPhase).toBe('function');
     expect(typeof window.Api.cancelTask).toBe('function');
     expect(typeof window.Api.completeTask).toBe('function');
     expect(typeof window.Api.recordTaskFailure).toBe('function');
@@ -111,6 +114,9 @@ describe('API module', () => {
 
     await window.Api.taskStatus();
     await window.Api.startTask('ship', true);
+    await window.Api.startTaskPhase('task-1', { name: 'phase', objective: 'do it' });
+    await window.Api.recordTaskPhaseArtifact('task-1', 'phase-1', { kind: 'test', label: 'unit', value: 'passed' });
+    await window.Api.reviewTaskPhase('task-1', 'phase-1', 'accepted', true);
     await window.Api.cancelTask('task-1');
     await window.Api.completeTask('task-1');
     await window.Api.recordTaskFailure('task-1', 'blocked');
@@ -118,9 +124,12 @@ describe('API module', () => {
     expect(String(mockF.mock.calls[0][0])).toBe('/api/tasks');
     expect(String(mockF.mock.calls[1][0])).toBe('/api/tasks/start');
     expect(JSON.parse(mockF.mock.calls[1][1].body)).toEqual({ objective: 'ship', yolo_mode: true });
-    expect(String(mockF.mock.calls[2][0])).toBe('/api/tasks/task-1/cancel');
-    expect(String(mockF.mock.calls[3][0])).toBe('/api/tasks/task-1/complete');
-    expect(String(mockF.mock.calls[4][0])).toBe('/api/tasks/task-1/failure');
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/tasks/task-1/phases');
+    expect(String(mockF.mock.calls[3][0])).toBe('/api/tasks/task-1/phases/phase-1/artifacts');
+    expect(String(mockF.mock.calls[4][0])).toBe('/api/tasks/task-1/phases/phase-1/review');
+    expect(String(mockF.mock.calls[5][0])).toBe('/api/tasks/task-1/cancel');
+    expect(String(mockF.mock.calls[6][0])).toBe('/api/tasks/task-1/complete');
+    expect(String(mockF.mock.calls[7][0])).toBe('/api/tasks/task-1/failure');
   });
 
   it('has all cron endpoints', () => {
@@ -581,7 +590,17 @@ describe('API module', () => {
             id: 'task-1',
             objective: 'Finish v0.8.10',
             status: 'blocked',
-            blocker_reason: 'external input required'
+            blocker_reason: 'external input required',
+            phases: [{
+              id: 'phase-1',
+              name: 'browser-e2e',
+              objective: 'Cover task workbench',
+              status: 'completed',
+              acceptance: ['E2E passes'],
+              test_commands: ['npm run test:e2e'],
+              artifacts: [{ kind: 'test', label: 'playwright', value: '2 passed' }],
+              review_result: 'accepted'
+            }]
           },
           tasks: []
         })
@@ -593,6 +612,11 @@ describe('API module', () => {
     const text = document.getElementById('panel-content').textContent;
     expect(text).toContain('blocked');
     expect(text).toContain('Finish v0.8.10');
+    expect(text).toContain('browser-e2e');
+    expect(text).toContain('E2E passes');
+    expect(text).toContain('npm run test:e2e');
+    expect(text).toContain('playwright');
+    expect(text).toContain('accepted');
     expect(text).toContain('external input required');
   });
 

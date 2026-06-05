@@ -47,6 +47,16 @@ test('workbench panels render durable task and memory status', async ({ page }) 
         objective: 'Complete v0.8.10 enterprise AI capability framework',
         status: 'running',
         blocker_reason: null,
+        phases: [{
+          id: 'phase-browser-1',
+          name: 'browser-e2e',
+          objective: 'Validate task workbench panel',
+          status: 'completed',
+          acceptance: ['Task phase is visible'],
+          test_commands: ['npm run test:e2e'],
+          artifacts: [{ kind: 'test', label: 'playwright', value: '2 passed' }],
+          review_result: 'accepted',
+        }],
       };
       return json({
         current,
@@ -88,6 +98,10 @@ test('workbench panels render durable task and memory status', async ({ page }) 
   await expect(page.locator('#panel-content')).toContainText('Task Registry');
   await expect(page.locator('#panel-content')).toContainText('running');
   await expect(page.locator('#panel-content')).toContainText('Complete v0.8.10 enterprise AI capability framework');
+  await expect(page.locator('#panel-content')).toContainText('browser-e2e');
+  await expect(page.locator('#panel-content')).toContainText('Task phase is visible');
+  await expect(page.locator('#panel-content')).toContainText('playwright');
+  await expect(page.locator('#panel-content')).toContainText('accepted');
   await expect(page.locator('#panel-content')).toContainText('Session kernel migration');
 
   await page.click('[data-panel="memory"]');
