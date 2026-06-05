@@ -1903,11 +1903,8 @@ impl CognitiveContextManager {
 
     /// Run the full post-turn sequence.
     ///
-    /// Convenience wrapper that calls [`extract_and_remember`],
-    /// [`run_drift_and_seeds`], and [`run_memory_maintenance`] sequentially.
-    ///
-    /// For callers who want parallelism, combine the first two with
-    /// `tokio::join!` and still call [`run_memory_maintenance`] after.
+    /// Convenience wrapper that preserves full post-turn behavior while
+    /// running extraction and drift/seed checks in parallel.
     pub async fn on_turn_end(&self, messages: &mut Vec<Message>) -> Result<()> {
         // ── Delegation observation ────────────────────────────────────────────
         {
@@ -1953,9 +1950,17 @@ impl CognitiveContextManager {
             let _ = sync.import_from_l4("memory_update", &agent_id).await;
         }
 
-        // ── Extract ── Drift+Seeds ── Maintenance ──────────────────────
-        let _ = self.extract_and_remember(messages).await;
-        let _ = self.run_drift_and_seeds(messages).await;
+        // ── Extract ∥ Drift+Seeds ── Maintenance ──────────────────────
+        let (extract_result, drift_result) = tokio::join!(
+            async { self.extract_and_remember(messages).await },
+            async { self.run_drift_and_seeds(messages).await },
+        );
+        if let Err(error) = extract_result {
+            tracing::warn!(%error, "on_turn_end: extraction failed");
+        }
+        if let Err(error) = drift_result {
+            tracing::warn!(%error, "on_turn_end: drift and seeds failed");
+        }
         let result = self.run_memory_maintenance(messages).await;
 
         // ── Auto-tune evaluation ──────────────────────────────────────────
