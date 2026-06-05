@@ -72,6 +72,10 @@ impl AppState {
         self.session_kernel.unified_store()
     }
 
+    fn has_unified_store(&self) -> bool {
+        self.session_kernel.has_unified_store()
+    }
+
     fn event_bus(&self) -> Arc<SessionEventBus> {
         self.session_kernel.event_bus()
     }
@@ -675,22 +679,19 @@ async fn list_sessions(
     let offset = params.offset.unwrap_or(0);
 
     // Try unified store first for DB-backed listing
-    if let Some(store) = state.unified_store() {
-        let page = store
-            .list_sessions_page(&SessionListOptions {
-                query: params.q.as_deref(),
-                model: params.model.as_deref(),
-                status: params.status.as_deref(),
-                sort: &params.sort,
-                order: &params.order,
-                limit,
-                offset,
-            })
-            .await
-            .unwrap_or(memory::store::session::SessionListPage {
-                records: Vec::new(),
-                total: 0,
-            });
+    if let Ok(Some(page)) = state
+        .session_kernel
+        .list_stored_sessions_page(&SessionListOptions {
+            query: params.q.as_deref(),
+            model: params.model.as_deref(),
+            status: params.status.as_deref(),
+            sort: &params.sort,
+            order: &params.order,
+            limit,
+            offset,
+        })
+        .await
+    {
         let total = page.total;
         let sessions: Vec<SessionInfo> = page
             .records
@@ -812,16 +813,20 @@ async fn create_session(
     }
 
     let mut info = active_session_info(session_id.clone());
-    if let Some(store) = state.unified_store() {
+    if state.has_unified_store() {
         let record = new_api_session_record(&session_id, Some(model));
-        store.upsert_session(&record).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to persist session: {e}"),
-                }),
-            )
-        })?;
+        state
+            .session_kernel
+            .upsert_stored_session(&record)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to persist session: {e}"),
+                    }),
+                )
+            })?;
         info = session_info_from_record(record);
     }
 
@@ -832,8 +837,8 @@ async fn get_session(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if let Some(store) = state.unified_store() {
-        match store.get_session(&id).await {
+    if state.has_unified_store() {
+        match state.session_kernel.stored_session(&id).await {
             Ok(Some(record)) => return Ok(Json(session_info_from_record(record))),
             Ok(None) => {}
             Err(e) => {
@@ -864,31 +869,18 @@ async fn delete_session(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let removed_active = state.remove_active_runtime(&id).is_some();
-    let mut removed_stored = false;
-    if let Some(store) = state.unified_store() {
-        match store.get_session(&id).await {
-            Ok(Some(_)) => {
-                store.delete_session(&id).await.map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: format!("failed to delete session: {e}"),
-                        }),
-                    )
-                })?;
-                removed_stored = true;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to load session: {e}"),
-                    }),
-                ));
-            }
-        }
-    }
+    let removed_stored = state
+        .session_kernel
+        .delete_stored_session(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to delete session: {e}"),
+                }),
+            )
+        })?;
 
     if removed_active || removed_stored {
         Ok(StatusCode::NO_CONTENT)
@@ -931,6 +923,20 @@ async fn append_session_timeline_event(
     }
 }
 
+async fn append_session_timeline_event_to_kernel(
+    kernel: &SessionKernel,
+    session_id: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) {
+    if let Err(error) = kernel
+        .append_timeline_event(session_id, event_type, payload)
+        .await
+    {
+        tracing::warn!(%session_id, %event_type, error = %error, "failed to append session event");
+    }
+}
+
 async fn send_message(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
@@ -957,57 +963,49 @@ async fn send_message(
             let mut rx = cowd_bus.subscribe();
             let eb = event_bus.clone();
             let sid = session_id.clone();
-            let store = state.unified_store();
+            let kernel = state.session_kernel.clone();
             tokio::spawn(async move {
                 while let Ok(event) = rx.recv().await {
                     match event {
                         runtime::CowdEvent::TextDelta { text } => {
                             eb.text_delta(&sid, &text).await;
-                            if let Some(store) = store.as_ref() {
-                                append_session_timeline_event(
-                                    store,
-                                    &sid,
-                                    "TextDelta",
-                                    serde_json::json!({"type":"TextDelta","content":text}),
-                                )
-                                .await;
-                            }
+                            append_session_timeline_event_to_kernel(
+                                &kernel,
+                                &sid,
+                                "TextDelta",
+                                serde_json::json!({"type":"TextDelta","content":text}),
+                            )
+                            .await;
                         }
                         runtime::CowdEvent::ThinkingDelta { thinking } => {
                             eb.thinking_delta(&sid, &thinking).await;
-                            if let Some(store) = store.as_ref() {
-                                append_session_timeline_event(
-                                    store,
-                                    &sid,
-                                    "ThinkingDelta",
-                                    serde_json::json!({"type":"ThinkingDelta","content":thinking}),
-                                )
-                                .await;
-                            }
+                            append_session_timeline_event_to_kernel(
+                                &kernel,
+                                &sid,
+                                "ThinkingDelta",
+                                serde_json::json!({"type":"ThinkingDelta","content":thinking}),
+                            )
+                            .await;
                         }
                         runtime::CowdEvent::ToolStart { id, name, preview } => {
                             eb.tool_start(&sid, &id, &name).await;
-                            if let Some(store) = store.as_ref() {
-                                append_session_timeline_event(
-                                    store,
-                                    &sid,
-                                    "ToolStart",
-                                    serde_json::json!({"type":"ToolStart","id":id,"name":name,"preview":preview}),
-                                )
-                                .await;
-                            }
+                            append_session_timeline_event_to_kernel(
+                                &kernel,
+                                &sid,
+                                "ToolStart",
+                                serde_json::json!({"type":"ToolStart","id":id,"name":name,"preview":preview}),
+                            )
+                            .await;
                         }
                         runtime::CowdEvent::ToolProgress { id, name, progress } => {
                             eb.tool_progress(&sid, &id, &name, &progress).await;
-                            if let Some(store) = store.as_ref() {
-                                append_session_timeline_event(
-                                    store,
-                                    &sid,
-                                    "ToolProgress",
-                                    serde_json::json!({"type":"ToolProgress","id":id,"name":name,"progress":progress}),
-                                )
-                                .await;
-                            }
+                            append_session_timeline_event_to_kernel(
+                                &kernel,
+                                &sid,
+                                "ToolProgress",
+                                serde_json::json!({"type":"ToolProgress","id":id,"name":name,"progress":progress}),
+                            )
+                            .await;
                         }
                         runtime::CowdEvent::ToolComplete {
                             id,
@@ -1017,15 +1015,13 @@ async fn send_message(
                         } => {
                             eb.tool_complete(&sid, &id, &name, &summary, exit_code)
                                 .await;
-                            if let Some(store) = store.as_ref() {
-                                append_session_timeline_event(
-                                    store,
-                                    &sid,
-                                    "ToolComplete",
-                                    serde_json::json!({"type":"ToolComplete","id":id,"name":name,"summary":summary,"exit_code":exit_code}),
-                                )
-                                .await;
-                            }
+                            append_session_timeline_event_to_kernel(
+                                &kernel,
+                                &sid,
+                                "ToolComplete",
+                                serde_json::json!({"type":"ToolComplete","id":id,"name":name,"summary":summary,"exit_code":exit_code}),
+                            )
+                            .await;
                         }
                         runtime::CowdEvent::TurnComplete {
                             assistant_text,
@@ -1033,25 +1029,35 @@ async fn send_message(
                         } => {
                             let json = serde_json::json!({"type":"TurnComplete","text":assistant_text,"iterations":iterations});
                             eb.broadcast(&sid, &json.to_string()).await;
-                            if let Some(store) = store.as_ref() {
-                                append_session_timeline_event(store, &sid, "TurnComplete", json)
-                                    .await;
-                            }
+                            append_session_timeline_event_to_kernel(
+                                &kernel,
+                                &sid,
+                                "TurnComplete",
+                                json,
+                            )
+                            .await;
                         }
                         runtime::CowdEvent::TurnStarted => {
                             let json = serde_json::json!({"type":"TurnStarted"});
                             eb.broadcast(&sid, &json.to_string()).await;
-                            if let Some(store) = store.as_ref() {
-                                append_session_timeline_event(store, &sid, "TurnStarted", json)
-                                    .await;
-                            }
+                            append_session_timeline_event_to_kernel(
+                                &kernel,
+                                &sid,
+                                "TurnStarted",
+                                json,
+                            )
+                            .await;
                         }
                         runtime::CowdEvent::TurnError { error } => {
                             let json = serde_json::json!({"type":"TurnError","error":error});
                             eb.broadcast(&sid, &json.to_string()).await;
-                            if let Some(store) = store.as_ref() {
-                                append_session_timeline_event(store, &sid, "TurnError", json).await;
-                            }
+                            append_session_timeline_event_to_kernel(
+                                &kernel,
+                                &sid,
+                                "TurnError",
+                                json,
+                            )
+                            .await;
                         }
                         runtime::CowdEvent::TokenUsage { .. }
                         | runtime::CowdEvent::Warning { .. }
@@ -1102,17 +1108,16 @@ async fn send_message(
                 })
                 .unwrap_or_default();
 
-            if let Some(store) = state.unified_store() {
-                let session_snapshot = {
-                    let runtime_guard = runtime_entry.lock().await;
-                    runtime_guard.session().clone()
-                };
-                if let Err(e) =
-                    sync_runtime_session_metadata_to_store(&store, &session_id, &session_snapshot)
-                        .await
-                {
-                    tracing::warn!(%session_id, error = %e, "failed to sync API session to SQLite");
-                }
+            let session_snapshot = {
+                let runtime_guard = runtime_entry.lock().await;
+                runtime_guard.session().clone()
+            };
+            if let Err(e) = state
+                .session_kernel
+                .sync_runtime_session_snapshot(&session_id, &session_snapshot)
+                .await
+            {
+                tracing::warn!(%session_id, error = %e, "failed to sync API session to SQLite");
             }
 
             let response = serde_json::json!({
@@ -1980,17 +1985,26 @@ async fn get_session_messages(
     let limit = params.limit.unwrap_or(50).min(500);
 
     // Try unified store for DB-backed pagination
-    if let Some(store) = state.unified_store() {
-        let total = store.get_message_count(&id).await.unwrap_or(0);
+    if state.has_unified_store() {
+        let total = state
+            .session_kernel
+            .stored_message_count(&id)
+            .await
+            .unwrap_or(Some(0))
+            .unwrap_or(0);
         let db_messages = if let Some(seq) = from_seq {
-            store
-                .get_messages_from_sequence(&id, seq, limit)
+            state
+                .session_kernel
+                .stored_messages_from_sequence(&id, seq, limit)
                 .await
+                .unwrap_or(Some(Vec::new()))
                 .unwrap_or_default()
         } else {
-            store
-                .get_messages(&id, offset, limit)
+            state
+                .session_kernel
+                .stored_messages(&id, offset, limit)
                 .await
+                .unwrap_or(Some(Vec::new()))
                 .unwrap_or_default()
         };
         let messages: Vec<serde_json::Value> = db_messages
@@ -2118,26 +2132,11 @@ async fn get_session_events(
     Path(id): Path<String>,
     Query(params): Query<GetEventsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = state.unified_store().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "session store not available".to_string(),
-            }),
-        )
-    })?;
     let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(100).min(500);
-    let total = store.count_events_from(&id, from_seq).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("failed to count session events: {e}"),
-            }),
-        )
-    })?;
-    let stored_events = store
-        .get_events_limited(&id, from_seq, limit)
+    let Some((total, stored_events)) = state
+        .session_kernel
+        .stored_events_page(&id, from_seq, limit)
         .await
         .map_err(|e| {
             (
@@ -2146,7 +2145,15 @@ async fn get_session_events(
                     error: format!("failed to load session events: {e}"),
                 }),
             )
-        })?;
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
     let events: Vec<serde_json::Value> = stored_events
         .into_iter()
         .map(|event| {
@@ -2179,17 +2186,9 @@ async fn search_messages_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(params): Query<SearchMessagesParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let store = state.unified_store().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "session store not available".to_string(),
-            }),
-        )
-    })?;
-
-    let db_messages = store
-        .search_messages(&params.q, None, params.limit)
+    let Some(db_messages) = state
+        .session_kernel
+        .search_stored_messages(&params.q, params.limit)
         .await
         .map_err(|e| {
             (
@@ -2198,7 +2197,15 @@ async fn search_messages_handler(
                     error: format!("search failed: {e}"),
                 }),
             )
-        })?;
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
 
     let results: Vec<SearchMessagesItem> = db_messages
         .into_iter()
@@ -2261,19 +2268,19 @@ async fn compact_session_handler(
     let session_snapshot = runtime_guard.session().clone();
     drop(runtime_guard);
 
-    if let Some(store) = state.unified_store() {
-        sync_runtime_session_metadata_to_store(&store, &id, &session_snapshot)
-            .await
-            .map_err(|e| {
-                tracing::error!(session_id = %id, error = %e, "failed to sync compacted session to unified store");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to sync compacted session: {e}"),
-                    }),
-                )
-            })?;
-    }
+    state
+        .session_kernel
+        .sync_runtime_session_snapshot(&id, &session_snapshot)
+        .await
+        .map_err(|e| {
+            tracing::error!(session_id = %id, error = %e, "failed to sync compacted session to unified store");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to sync compacted session: {e}"),
+                }),
+            )
+        })?;
 
     tracing::info!(%id, removed = result.removed_message_count, "API session compacted");
 
@@ -2379,8 +2386,8 @@ async fn update_session_handler(
     }
 
     // Persist to UnifiedSessionStore if available (read-modify-write)
-    if let Some(store) = state.unified_store() {
-        match store.get_session(&id).await {
+    if state.has_unified_store() {
+        match state.session_kernel.stored_session(&id).await {
             Ok(Some(mut record)) => {
                 found = true;
                 if let Some(ref model) = body.model {
@@ -2410,14 +2417,18 @@ async fn update_session_handler(
                     }
                     record.metadata_json = Some(serde_json::to_string(&meta).unwrap_or_default());
                 }
-                store.update_session(&record).await.map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: format!("failed to update session: {e}"),
-                        }),
-                    )
-                })?;
+                state
+                    .session_kernel
+                    .update_stored_session(&record)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("failed to update session: {e}"),
+                            }),
+                        )
+                    })?;
             }
             Ok(None) => {}
             Err(e) => {
