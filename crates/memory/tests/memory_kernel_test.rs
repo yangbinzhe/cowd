@@ -630,6 +630,37 @@ async fn archive_hides_memory_without_deleting_evidence() {
 }
 
 #[tokio::test]
+async fn large_memory_context_packet_stays_bounded() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("large-packet.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(manager);
+    let mut candidates = Vec::new();
+    for idx in 0..500 {
+        let mut candidate = entry(
+            MemoryLayer::L3,
+            MemorySource::UserExplicit,
+            &format!("large candidate {idx}"),
+        );
+        candidate.content = "large packet content ".repeat(20);
+        candidates.push(candidate);
+    }
+
+    let packet = kernel
+        .context_packet_from_entries(candidates, 24, 512)
+        .await
+        .unwrap();
+
+    assert!(packet.selected.len() <= 24);
+    assert!(packet.token_estimate <= 512);
+    assert!(packet.truncated);
+    assert!(!packet.omitted.is_empty());
+}
+
+#[tokio::test]
 async fn memory_kernel_post_turn_preserves_turn_success() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(
