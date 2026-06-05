@@ -178,6 +178,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/memory/status", get(memory_status_handler))
         .route("/api/memory/search", get(memory_search_handler))
         .route("/api/memory/recall/explain", get(memory_recall_explain_handler))
+        .route("/api/memory/packet", get(memory_packet_handler))
+        .route("/api/memory/links", get(memory_links_handler))
         .route("/api/memory/stats", get(memory_stats_handler))
         .route("/api/memory/layers", get(memory_layers_handler))
         .route("/api/memory/entities", get(memory_entities_handler))
@@ -1882,6 +1884,98 @@ async fn memory_recall_explain_handler(
             "results": [],
             "keywords": [],
             "categories": [],
+        })),
+    }
+}
+
+async fn memory_packet_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let query = params.get("q").cloned().unwrap_or_default();
+    let max_items = params
+        .get("max_items")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(12)
+        .clamp(1, 64);
+    let max_tokens = params
+        .get("max_tokens")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2_000)
+        .clamp(64, 32_000);
+
+    let Some(ref mgr) = state.memory_manager else {
+        return Json(serde_json::json!({
+            "enabled": false,
+            "query": query,
+            "packet": null,
+            "degraded": true,
+            "degraded_reason": "memory not configured",
+        }));
+    };
+
+    let mgr = Arc::clone(mgr);
+    let query_for_packet = query.clone();
+    let packet_result = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())?;
+        rt.block_on(async move {
+            let kernel = MemoryKernel::new(mgr);
+            let ctx = MemoryTurnContext::new("api-memory-packet", "api");
+            kernel
+                .context_packet(&ctx, &query_for_packet, &[], max_items, max_tokens)
+                .await
+                .map_err(|err| err.to_string())
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())
+    .and_then(|result| result);
+
+    match packet_result {
+        Ok(packet) => Json(serde_json::json!({
+            "enabled": true,
+            "query": query,
+            "packet": packet,
+            "degraded": false,
+            "degraded_reason": null,
+        })),
+        Err(error) => Json(serde_json::json!({
+            "enabled": true,
+            "query": query,
+            "packet": null,
+            "degraded": true,
+            "degraded_reason": error,
+        })),
+    }
+}
+
+async fn memory_links_handler(AxumState(state): AxumState<Arc<AppState>>) -> Json<serde_json::Value> {
+    let Some(ref mgr) = state.memory_manager else {
+        return Json(serde_json::json!({
+            "enabled": false,
+            "links": [],
+            "degraded": true,
+            "degraded_reason": "memory not configured",
+        }));
+    };
+    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    match kernel.links().await {
+        Ok(links) => Json(serde_json::json!({
+            "enabled": true,
+            "links": links,
+            "total": links.len(),
+            "degraded": false,
+            "degraded_reason": null,
+        })),
+        Err(error) => Json(serde_json::json!({
+            "enabled": true,
+            "links": [],
+            "total": 0,
+            "degraded": true,
+            "degraded_reason": error.to_string(),
         })),
     }
 }
@@ -4213,6 +4307,127 @@ mod tests {
                 .unwrap_or_default()
                 .contains("SessionKernel")
         );
+
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_packet_returns_explainable_packet() {
+        let tmp = std::env::temp_dir().join(format!("cowd-api-memory-packet-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manager = Arc::new(
+            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+                .await
+                .unwrap(),
+        );
+        let entry = MemoryEntry {
+            id: MemoryId::new_v4(),
+            layer: MemoryLayer::L2,
+            category: MemoryCategory::ProjectKnowledge,
+            priority: Priority::High,
+            source: MemorySource::UserExplicit,
+            title: "PACKET_API_ALPHA".to_string(),
+            content: "PACKET_API_ALPHA should appear in an explainable packet.".to_string(),
+            embedding: None,
+            tags: vec!["packet".to_string()],
+            relations: vec![],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed_at: None,
+            scope: MemoryScope::Session("api-memory-packet".to_string()),
+            session_id: Some("api-memory-packet".to_string()),
+            source_agent: Some("api".to_string()),
+            visibility: AgentVisibility::Shared,
+        };
+        manager.remember(entry).await.unwrap();
+
+        let app = api_router(test_state_with_memory(manager));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/packet?q=PACKET_API_ALPHA&max_items=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], true);
+        assert!(json["packet"]["selected"].as_array().unwrap().len() <= 5);
+
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_links_returns_kernel_links() {
+        let tmp = std::env::temp_dir().join(format!("cowd-api-memory-links-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manager = Arc::new(
+            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+                .await
+                .unwrap(),
+        );
+        let target_id = manager
+            .create_entry(
+                MemoryLayer::L3,
+                MemoryCategory::Reference,
+                "Link Target",
+                "target",
+                Priority::Normal,
+                vec!["api-link".to_string()],
+                MemoryScope::Global,
+            )
+            .await
+            .unwrap();
+        let source = MemoryEntry {
+            id: MemoryId::new_v4(),
+            layer: MemoryLayer::L3,
+            category: MemoryCategory::Reference,
+            priority: Priority::Normal,
+            source: MemorySource::UserExplicit,
+            title: "Link Source".to_string(),
+            content: "source".to_string(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![memory::Relation {
+                target_id,
+                kind: memory::RelationKind::DependsOn,
+                strength: 0.8,
+                temporal: None,
+                entity: None,
+            }],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed_at: None,
+            scope: MemoryScope::Global,
+            session_id: None,
+            source_agent: None,
+            visibility: AgentVisibility::Shared,
+        };
+        manager.remember(source).await.unwrap();
+
+        let app = api_router(test_state_with_memory(manager));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/links")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["total"].as_u64().unwrap() >= 1);
 
         std::fs::remove_dir_all(tmp).unwrap();
     }
