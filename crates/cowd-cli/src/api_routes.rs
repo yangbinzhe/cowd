@@ -45,7 +45,9 @@ use memory::RotAlert;
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
 use memory::store::session::{SessionListOptions, SessionRecord};
-use memory::types::{MemoryCategory, MemoryLayer, Priority};
+use memory::types::{
+    AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
+};
 
 // ── Shared application state ───────────────────────────────────
 
@@ -1582,11 +1584,34 @@ async fn create_memory_entry_handler(
             }
         });
 
-    match mgr
-        .create_entry(layer, category, &title, content, priority, body.tags, scope)
-        .await
-    {
-        Ok(id) => Ok((
+    let id = MemoryId::new_v4();
+    let entry = MemoryEntry {
+        id,
+        layer,
+        category,
+        priority,
+        source: MemorySource::UserExplicit,
+        title: title.clone(),
+        content: content.to_string(),
+        embedding: None,
+        tags: body.tags,
+        relations: vec![],
+        confidence: 1.0,
+        access_count: 0,
+        staleness: 0.0,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        last_accessed_at: None,
+        scope,
+        session_id: None,
+        source_agent: None,
+        visibility: AgentVisibility::Shared,
+    };
+    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    let memory_ctx = MemoryTurnContext::new("api-memory-create", "api");
+
+    match kernel.remember(&memory_ctx, entry).await {
+        Ok(()) => Ok((
             StatusCode::CREATED,
             Json(serde_json::json!({
                 "id": id,
