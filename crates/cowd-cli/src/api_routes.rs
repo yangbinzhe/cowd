@@ -40,7 +40,7 @@ use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use crate::session_kernel::SessionKernel;
 use crate::task_kernel::{TaskKernel, TaskStatus};
-use memory::{MemoryScope, SearchMemoriesRequest};
+use memory::{MemoryKernel, MemoryScope, MemoryTurnContext, SearchMemoriesRequest};
 use memory::RotAlert;
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
@@ -1358,9 +1358,45 @@ fn context_health_json(alert: RotAlert) -> serde_json::Value {
     }
 }
 
+fn memory_kernel_health_json(health: memory::MemoryHealth) -> serde_json::Value {
+    let degraded_reasons: Vec<String> = health
+        .degraded
+        .iter()
+        .map(|reason| format!("{reason:?}"))
+        .collect();
+    serde_json::json!({
+        "degraded": health.is_degraded(),
+        "degraded_reasons": degraded_reasons,
+        "orientation_pressure": health.orientation_pressure,
+        "conflict_pressure": health.conflict_pressure,
+        "stale_pressure": health.stale_pressure,
+        "evidence_coverage": health.evidence_coverage,
+        "link_coverage": health.link_coverage,
+        "background_lag_ms": health.background_lag_ms,
+    })
+}
+
 async fn memory_status_value(state: &AppState) -> serde_json::Value {
     if let Some(ref mgr) = state.memory_manager {
         let layers = mgr.list_layers().await;
+        let kernel = MemoryKernel::new(Arc::clone(mgr));
+        let kernel_ctx = MemoryTurnContext::new("api-memory-status", "api");
+        let kernel_health = kernel
+            .health(&kernel_ctx)
+            .await
+            .map(memory_kernel_health_json)
+            .unwrap_or_else(|error| {
+                serde_json::json!({
+                    "degraded": true,
+                    "degraded_reasons": [format!("health failed: {error}")],
+                    "orientation_pressure": 0.0,
+                    "conflict_pressure": 0.0,
+                    "stale_pressure": 0.0,
+                    "evidence_coverage": 0.0,
+                    "link_coverage": 0.0,
+                    "background_lag_ms": null,
+                })
+            });
         let vector_count = mgr.vector_index_count();
         let total_entries: usize = layers
             .iter()
@@ -1377,6 +1413,7 @@ async fn memory_status_value(state: &AppState) -> serde_json::Value {
             "vector_count": vector_count,
             "session_store": true,
             "context_health": context_health_json(mgr.ctx_health()),
+            "kernel_health": kernel_health,
             "performance": mgr.performance_report(),
         })
     } else {
@@ -1392,6 +1429,16 @@ async fn memory_status_value(state: &AppState) -> serde_json::Value {
             "context_health": {
                 "level": "unavailable",
                 "message": "memory not configured",
+            },
+            "kernel_health": {
+                "degraded": true,
+                "degraded_reasons": ["memory not configured"],
+                "orientation_pressure": 0.0,
+                "conflict_pressure": 0.0,
+                "stale_pressure": 0.0,
+                "evidence_coverage": 0.0,
+                "link_coverage": 0.0,
+                "background_lag_ms": null,
             },
             "message": "memory not configured"
         })
@@ -4081,6 +4128,11 @@ mod tests {
         assert_eq!(json["enabled"], false);
         assert_eq!(json["status"], "disabled");
         assert_eq!(json["context_health"]["level"], "unavailable");
+        assert_eq!(json["kernel_health"]["degraded"], true);
+        assert_eq!(
+            json["kernel_health"]["degraded_reasons"][0],
+            "memory not configured"
+        );
     }
 
     #[tokio::test]
@@ -4176,6 +4228,13 @@ mod tests {
         assert_eq!(status_json["enabled"], true);
         assert_eq!(status_json["status"], "ready");
         assert_eq!(status_json["context_health"]["level"], "healthy");
+        assert_eq!(status_json["kernel_health"]["degraded"], false);
+        assert_eq!(status_json["kernel_health"]["stale_pressure"], 0.0);
+        assert!(
+            status_json["kernel_health"]["evidence_coverage"]
+                .as_f64()
+                .is_some()
+        );
 
         let layers_response = app
             .clone()
