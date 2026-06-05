@@ -17,6 +17,7 @@ use tower_http::services::ServeDir;
 use crate::api_routes;
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
+use crate::session_kernel::SessionKernel;
 use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use memory::UnifiedSessionStore;
@@ -152,6 +153,11 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     let event_bus = SessionEventBus::new();
 
     let unified_store = crate::get_unified_store().ok().map(|s| Arc::new(s.clone()));
+    let session_kernel = Arc::new(SessionKernel::new(
+        sessions.clone(),
+        unified_store.clone(),
+        event_bus.clone(),
+    ));
     let approval_dir = std::env::var_os("COWD_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -200,6 +206,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     );
 
     let app_state = Arc::new(api_routes::AppState {
+        session_kernel: session_kernel.clone(),
         sessions: sessions.clone(),
         memory_manager: cognitive.clone(),
         unified_store: unified_store.clone(),

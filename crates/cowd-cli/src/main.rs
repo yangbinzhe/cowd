@@ -17,6 +17,7 @@ mod init;
 mod mcp_serve;
 mod render;
 mod server;
+mod session_kernel;
 mod suggestions;
 mod tui;
 

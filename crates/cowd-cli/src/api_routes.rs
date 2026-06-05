@@ -38,6 +38,7 @@ use runtime::ProfileManager;
 
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
+use crate::session_kernel::SessionKernel;
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
 use memory::store::session::{SessionListOptions, SessionRecord};
@@ -47,6 +48,9 @@ use memory::MemoryScope;
 // ── Shared application state ───────────────────────────────────
 
 pub struct AppState {
+    pub session_kernel: Arc<SessionKernel>,
+    /// Compatibility fields retained while API/TUI callers migrate to
+    /// `session_kernel`.
     pub sessions: Arc<ActiveSessions>,
     pub memory_manager: Option<Arc<CognitiveContextManager>>,
     pub unified_store: Option<Arc<UnifiedSessionStore>>,
@@ -59,6 +63,12 @@ pub struct AppState {
     pub config_home: PathBuf,
     pub profile_id: String,
     pub profile_manager: Arc<ProfileManager>,
+}
+
+impl AppState {
+    fn event_bus(&self) -> Arc<SessionEventBus> {
+        self.session_kernel.event_bus()
+    }
 }
 
 // ── Auth middleware ────────────────────────────────────────────
@@ -2528,7 +2538,8 @@ async fn sse_stream_handler(
     // Clone tx before subscribing — one copy moves into the event bus,
     // the other stays with SseStream for cleanup on drop.
     let bus_tx = tx.clone();
-    state.event_bus.subscribe(&session_id, bus_tx).await;
+    let event_bus = state.event_bus();
+    event_bus.subscribe(&session_id, bus_tx).await;
     let _ = tx
         .send(
             serde_json::json!({
@@ -2542,7 +2553,7 @@ async fn sse_stream_handler(
     let stream = SseStream {
         rx: ReceiverStream::new(rx),
         session_id,
-        event_bus: state.event_bus.clone(),
+        event_bus,
         tx,
     };
 
@@ -2578,11 +2589,20 @@ mod tests {
         manager
     }
 
+    fn test_session_kernel(
+        sessions: Arc<ActiveSessions>,
+        store: Option<Arc<UnifiedSessionStore>>,
+        event_bus: Arc<SessionEventBus>,
+    ) -> Arc<SessionKernel> {
+        Arc::new(SessionKernel::new(sessions, store, event_bus))
+    }
+
     fn test_state() -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new(); // returns Arc<Self>
         Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             sessions,
             memory_manager: None,
             unified_store: None,
@@ -2603,6 +2623,11 @@ mod tests {
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
         Arc::new(AppState {
+            session_kernel: test_session_kernel(
+                sessions.clone(),
+                Some(store.clone()),
+                event_bus.clone(),
+            ),
             sessions,
             memory_manager: None,
             unified_store: Some(store),
@@ -2640,6 +2665,7 @@ mod tests {
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
         Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             sessions,
             memory_manager: Some(memory_manager),
             unified_store: None,
@@ -2668,6 +2694,7 @@ mod tests {
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
         Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             sessions,
             memory_manager: None,
             unified_store: None,
@@ -2688,6 +2715,7 @@ mod tests {
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
         Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             sessions,
             memory_manager: None,
             unified_store: None,
@@ -2701,6 +2729,24 @@ mod tests {
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
         })
+    }
+
+    #[test]
+    fn app_state_compat_fields_share_session_kernel_handles() {
+        let state = test_state_with_store(Arc::new(UnifiedSessionStore::open_in_memory().unwrap()));
+
+        assert!(Arc::ptr_eq(
+            &state.session_kernel.active_sessions(),
+            &state.sessions
+        ));
+        assert!(Arc::ptr_eq(&state.session_kernel.event_bus(), &state.event_bus));
+        assert!(Arc::ptr_eq(
+            &state
+                .session_kernel
+                .unified_store()
+                .expect("kernel store should exist"),
+            state.unified_store.as_ref().expect("compat store should exist")
+        ));
     }
 
     fn test_temp_dir(label: &str) -> PathBuf {
@@ -3538,7 +3584,7 @@ mod tests {
                 MemoryLayer::L4,
                 MemoryCategory::Shared,
                 "Team Decision",
-                "Use SessionKernel as the source of truth for v0.8.9.",
+                "Use SessionKernel as the source of truth for v0.8.10.",
                 Priority::High,
                 vec!["team_relevant".into()],
                 MemoryScope::Global,
@@ -3841,6 +3887,7 @@ mod tests {
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
         let state = Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             sessions,
             memory_manager: None,
             unified_store: None,
@@ -3874,6 +3921,7 @@ mod tests {
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
         let state = Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
             sessions,
             memory_manager: None,
             unified_store: None,
