@@ -86,6 +86,18 @@ if rg -qi "panic|backtrace|thread .* panicked|failed to initialize terminal|æ²¡æ
   exit 1
 fi
 
+if [[ ! -f "$CONFIG_HOME/tasks.json" ]]; then
+  echo "TUI smoke test did not create durable YOLO task state" >&2
+  sed -n '1,160p' "$CAPTURE" >&2
+  exit 1
+fi
+
+if ! rg -q "Interactive YOLO session|running" "$CONFIG_HOME/tasks.json"; then
+  echo "TUI smoke test created unexpected task state" >&2
+  cat "$CONFIG_HOME/tasks.json" >&2
+  exit 1
+fi
+
 tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
 echo "TUI smoke test passed"
 exit 0
