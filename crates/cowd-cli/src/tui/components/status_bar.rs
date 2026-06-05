@@ -103,6 +103,7 @@ impl StatusBar {
         sb.add_section(Self::cache_section());
         sb.add_section(Self::search_section());
         sb.add_section(Self::history_section());
+        sb.add_section(Self::task_section());
         sb.add_section(Self::wave_section());
         // Task 12: Footer status sections (right-aligned)
         sb.add_section(Self::mcp_status_section());
@@ -191,6 +192,15 @@ impl StatusBar {
             content: None,
             style: Style::default().fg(Color::DarkGray),
             width: SectionWidth::Fixed(10),
+        }
+    }
+
+    fn task_section() -> StatusSection {
+        StatusSection {
+            id: "task".into(),
+            content: None,
+            style: Style::default().fg(Color::Magenta),
+            width: SectionWidth::Fixed(28),
         }
     }
 
@@ -384,6 +394,10 @@ impl StatusBar {
                     }
                 }
                 "history" => app.history_idx.map(|hidx| format!("hist:{}", hidx + 1)),
+                "task" => app.current_task.as_ref().map(|task| {
+                    let short_id: String = task.id.chars().take(8).collect();
+                    format!("Task {} {}", task.status, short_id)
+                }),
                 "wave" => {
                     let ws = &app.wave_state;
                     if ws.total > 0 {
@@ -543,6 +557,7 @@ pub fn token_bar(app: &App) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::CurrentTaskSummary;
     use crate::tui::components::RenderContext;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
@@ -588,6 +603,7 @@ mod tests {
         assert!(ids.contains(&"cache"));
         assert!(ids.contains(&"search"));
         assert!(ids.contains(&"history"));
+        assert!(ids.contains(&"task"));
     }
 
     // ── Notification ─────────────────────────────────────────────
@@ -662,6 +678,25 @@ mod tests {
         let section = bar.section_mut("panel_model_status").unwrap();
         let content = section.content.as_ref().unwrap();
         assert!(content.contains("YOLO"));
+    }
+
+    #[test]
+    fn sync_from_app_shows_current_task() {
+        let mut app = App::new("claude-sonnet-4", "test-session");
+        app.current_task = Some(CurrentTaskSummary {
+            id: "task-123456789".to_string(),
+            objective: "ship v0.8.10".to_string(),
+            status: "running".to_string(),
+            blocker_reason: None,
+        });
+        let mut bar = StatusBar::with_default_sections();
+
+        bar.sync_from_app(&app);
+
+        let section = bar.section_mut("task").unwrap();
+        let content = section.content.as_ref().unwrap();
+        assert!(content.contains("Task running"));
+        assert!(content.contains("task-123"));
     }
 
     // ── Render tests ─────────────────────────────────────────────

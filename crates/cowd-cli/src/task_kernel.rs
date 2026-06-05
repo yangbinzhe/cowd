@@ -19,6 +19,21 @@ pub(crate) enum TaskStatus {
     Failed,
 }
 
+impl TaskStatus {
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Reviewing => "reviewing",
+            Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TaskAuditEvent {
     pub event_type: String,

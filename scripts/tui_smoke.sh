@@ -80,6 +80,12 @@ if ! rg -q "YOLO|continuous|Cowd|COWD" "$CAPTURE"; then
   exit 1
 fi
 
+if ! rg -q "Task[[:space:]]+running" "$CAPTURE"; then
+  echo "TUI smoke test did not observe durable task status in the startup UI" >&2
+  sed -n '1,160p' "$CAPTURE" >&2
+  exit 1
+fi
+
 if rg -qi "panic|backtrace|thread .* panicked|failed to initialize terminal|没有为模型|Run cowd --help" "$CAPTURE"; then
   echo "TUI smoke test observed a startup failure" >&2
   sed -n '1,160p' "$CAPTURE" >&2

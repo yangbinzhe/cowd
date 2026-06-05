@@ -2770,11 +2770,16 @@ fn run_repl(
     )?;
     tracing::debug!("run_repl: applying reasoning effort");
     cli.set_reasoning_effort(reasoning_effort);
-    if let Err(error) = ensure_yolo_task(
+    match ensure_yolo_task(
         yolo_mode,
         format!("Interactive YOLO session {}", cli.session.id),
     ) {
-        tracing::warn!(%error, "failed to initialize yolo task state");
+        Ok(task) => {
+            cli.yolo_task = task;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to initialize yolo task state");
+        }
     }
 
     let workspace = std::env::current_dir().unwrap_or_default();
@@ -3027,6 +3032,15 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     let session_id = cli.session.id.clone();
     let mut state = TuiState::new(&cli.model, &session_id);
     state.app.yolo_mode = cli.yolo_mode;
+    state.app.current_task =
+        cli.yolo_task
+            .as_ref()
+            .map(|task| tui::app::CurrentTaskSummary {
+                id: task.id.clone(),
+                objective: task.objective.clone(),
+                status: task.status.as_str().to_string(),
+                blocker_reason: task.blocker_reason.clone(),
+            });
     state.add_message("system", &cli.startup_banner());
     state.add_message("system", &format_connected_line(&cli.model));
     terminal.draw(|f| state.render(f))?;
@@ -3607,6 +3621,7 @@ pub(crate) struct LiveCli {
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     yolo_mode: bool,
+    yolo_task: Option<task_kernel::TaskRecord>,
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
@@ -4096,6 +4111,15 @@ impl HookAbortMonitor {
 }
 
 fn format_startup_banner(model: &str, yolo_mode: bool, session_id: &str) -> String {
+    format_startup_banner_with_task(model, yolo_mode, session_id, None)
+}
+
+fn format_startup_banner_with_task(
+    model: &str,
+    yolo_mode: bool,
+    session_id: &str,
+    task: Option<&task_kernel::TaskRecord>,
+) -> String {
     let status = status_context(None).ok();
     let git_branch = status
         .as_ref()
@@ -4105,20 +4129,42 @@ fn format_startup_banner(model: &str, yolo_mode: bool, session_id: &str) -> Stri
         || "unknown".to_string(),
         |context| context.git_summary.headline(),
     );
+    let task_line = task.map_or_else(String::new, |task| {
+        let short_id: String = task.id.chars().take(8).collect();
+        let objective = truncate_for_banner(&task.objective, 72);
+        format!(
+            "   \x1b[2mTask\x1b[0m        {} {} · {}\n",
+            task.status.as_str(),
+            short_id,
+            objective
+        )
+    });
     format!(
         "============================\n\x1b[1;31m          COWD v{VERSION}\x1b[0m\n============================\n\
    \x1b[2mModel\x1b[0m       {}\n\
    \x1b[2mWorkspace\x1b[0m    {}\n\
    \x1b[2mBranch\x1b[0m       {}\n\
    \x1b[2mMode\x1b[0m         {}\n\
-   \x1b[2mSession\x1b[0m      {}\n\n\
+   \x1b[2mSession\x1b[0m      {}\n{}\
+\n\
    \x1b[1m/help\x1b[0m · \x1b[1m/status\x1b[0m · \x1b[2mTab\x1b[0m sidebar · \x1b[2mSpace\x1b[0m shortcuts · \x1b[2mShift+Enter\x1b[0m newline",
         model,
         workspace,
         git_branch,
         if yolo_mode { "yolo" } else { "standard" },
         session_id,
+        task_line,
     )
+}
+
+fn truncate_for_banner(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 impl LiveCli {
@@ -4149,6 +4195,7 @@ impl LiveCli {
             allowed_tools,
             permission_mode,
             yolo_mode,
+            yolo_task: None,
             system_prompt,
             runtime,
             session,
@@ -4174,7 +4221,12 @@ impl LiveCli {
     }
 
     fn startup_banner(&self) -> String {
-        format_startup_banner(&self.model, self.yolo_mode, &self.session.id)
+        format_startup_banner_with_task(
+            &self.model,
+            self.yolo_mode,
+            &self.session.id,
+            self.yolo_task.as_ref(),
+        )
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -9660,14 +9712,15 @@ mod tests {
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_startup_banner, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command_message,
-        format_user_visible_api_error, gateway_auth_token_from_platform,
-        hydrate_session_from_unified_store, merge_prompt_with_stdin, normalize_permission_mode,
-        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
-        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
-        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
+        format_resume_report, format_startup_banner, format_startup_banner_with_task,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command_message, format_user_visible_api_error,
+        gateway_auth_token_from_platform, hydrate_session_from_unified_store,
+        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
+        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        parse_history_count, permission_policy, print_help_to, push_output_block,
+        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias_with_config, resolve_repl_model,
         resolve_session_reference, response_to_events, resume_supported_slash_commands,
         run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
@@ -9675,6 +9728,7 @@ mod tests {
         summarize_tool_payload_for_markdown, sync_cli_session_to_unified_store,
         try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture,
     };
+    use crate::task_kernel::{TaskRecord, TaskStatus};
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
@@ -11325,6 +11379,34 @@ mod tests {
 
         assert!(banner.contains("yolo"));
         assert!(banner.contains("session-yolo-test"));
+    }
+
+    #[test]
+    fn startup_banner_shows_yolo_task_summary() {
+        let task = TaskRecord {
+            id: "task-abcdef123456".to_string(),
+            objective: "complete v0.8.10 enterprise AI framework".to_string(),
+            status: TaskStatus::Running,
+            current_phase: Some("tui-cockpit".to_string()),
+            yolo_mode: true,
+            failure_count: 0,
+            blocker_reason: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            audit: Vec::new(),
+        };
+
+        let banner = format_startup_banner_with_task(
+            "claude-sonnet-4-6",
+            true,
+            "session-yolo-test",
+            Some(&task),
+        );
+
+        assert!(banner.contains("Task"));
+        assert!(banner.contains("running"));
+        assert!(banner.contains("task-abc"));
+        assert!(banner.contains("complete v0.8.10"));
     }
 
     #[test]

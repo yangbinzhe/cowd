@@ -141,6 +141,7 @@ pub struct App {
     pub model: String,
     pub session_id: String,
     pub yolo_mode: bool,
+    pub current_task: Option<CurrentTaskSummary>,
     pub input: TextArea<'static>,
     pub is_loading: bool,
     pub spinner_idx: usize,
@@ -273,6 +274,14 @@ pub struct DelegateTask {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentTaskSummary {
+    pub id: String,
+    pub objective: String,
+    pub status: String,
+    pub blocker_reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
     pub tool_name: String,
@@ -333,6 +342,7 @@ impl App {
             model: model.to_string(),
             session_id: session_id.to_string(),
             yolo_mode: false,
+            current_task: None,
             input,
             is_loading: false,
             spinner_idx: 0,
