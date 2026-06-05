@@ -30,6 +30,7 @@ use memory::cognitive::CognitiveContextManager;
 use memory::coherence;
 use memory::config::MemoryConfig as CcMemoryConfig;
 use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
+use memory::{MemoryKernel, MemoryTurnContext};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 use tracing;
@@ -2418,11 +2419,9 @@ where
             .collect();
 
         let session_id = self.session().session_id;
-        mgr.set_active_session(session_id.clone());
-        match mgr
-            .prepare_context(user_input, &mem_messages, Some(&session_id))
-            .await
-        {
+        let memory_ctx = MemoryTurnContext::new(session_id.clone(), "primary");
+        let kernel = MemoryKernel::new(Arc::clone(mgr));
+        match kernel.prepare(&memory_ctx, user_input, &mem_messages).await {
             Ok(mut prepared) => {
                 if prepared.entries.is_empty() {
                     tracing::debug!(entries = 0, "memory context prepared");
@@ -2636,8 +2635,8 @@ where
             return Ok(());
         };
         let session_id = self.session().session_id;
-        mgr.set_active_session(session_id.clone());
-        let mgr = Arc::clone(mgr);
+        let memory_ctx = MemoryTurnContext::new(session_id.clone(), "primary");
+        let kernel = MemoryKernel::new(Arc::clone(mgr));
 
         // Convert session messages to memory's Message type for post-turn extraction.
         // DESIGN: Tool blocks are excluded (same rationale as prepare_memory_context).
@@ -2695,30 +2694,20 @@ where
             })
             .collect();
 
-        let mgr_clone = Arc::clone(&mgr);
-
-        // P5.3: Run Extractor and Drift+Seeds in PARALLEL — they're independent.
         let start = Instant::now();
-        let (extract_result, drift_result) = tokio::join!(
-            async { mgr.extract_and_remember(&mem_messages).await },
-            async { mgr_clone.run_drift_and_seeds(&mem_messages).await },
-        );
+        let mut maintenance_messages = mem_messages;
+        let post_turn_result = kernel
+            .post_turn(&memory_ctx, &mut maintenance_messages)
+            .await;
         let elapsed = start.elapsed();
         tracing::info!(
             elapsed_ms = elapsed.as_millis(),
-            "post_turn: extract ∥ drift+seeds completed"
+            "post_turn: memory kernel completed"
         );
 
-        if let Err(ref e) = extract_result {
-            tracing::warn!(%e, "post_turn: extraction failed");
+        if let Err(ref e) = post_turn_result {
+            tracing::warn!(%e, "post_turn: memory kernel failed");
         }
-        if let Err(ref e) = drift_result {
-            tracing::warn!(%e, "post_turn: drift failed");
-        }
-
-        // ── Remaining sequential maintenance ──────────────────────────────────
-        let mut maintenance_messages = mem_messages;
-        let _ = mgr.run_memory_maintenance(&mut maintenance_messages).await;
 
         if let Some(cb) = &self.memory_callback {
             let layers_data = mgr.list_layers().await;

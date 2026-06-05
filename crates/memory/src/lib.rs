@@ -38,6 +38,7 @@ pub mod error;
 pub mod extractor;
 pub mod handoff;
 pub mod hot_reload;
+pub mod kernel;
 pub mod layers;
 pub mod memory_sync;
 pub mod orchestrator;
@@ -74,6 +75,11 @@ pub mod transaction;
 
 pub use layers::shared::{L4Event, L4EventBus, L4Operation};
 pub use cognitive::{CognitiveContextManager, SessionRestoreStats, VectorIndexStats};
+pub use kernel::{
+    MemoryAtomView, MemoryDegradation, MemoryHealth, MemoryInformationState, MemoryKernel,
+    MemoryKernelError, MemoryKernelResult, MemoryLayerView, MemoryPrimitive, MemoryState,
+    MemoryTurnContext,
+};
 pub use config::{MemoryConfig, TuningConfig, VectorConfig};
 pub use fresh_context::{
     FreshContextManager, FreshEntry, SessionTokenBudget, SessionBudgetStatus,
