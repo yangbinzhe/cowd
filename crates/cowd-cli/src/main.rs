@@ -3032,15 +3032,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     let session_id = cli.session.id.clone();
     let mut state = TuiState::new(&cli.model, &session_id);
     state.app.yolo_mode = cli.yolo_mode;
-    state.app.current_task =
-        cli.yolo_task
-            .as_ref()
-            .map(|task| tui::app::CurrentTaskSummary {
-                id: task.id.clone(),
-                objective: task.objective.clone(),
-                status: task.status.as_str().to_string(),
-                blocker_reason: task.blocker_reason.clone(),
-            });
+    state.app.current_task = cli.yolo_task.as_ref().map(current_task_summary_from_record);
     state.add_message("system", &cli.startup_banner());
     state.add_message("system", &format_connected_line(&cli.model));
     terminal.draw(|f| state.render(f))?;
@@ -4132,10 +4124,14 @@ fn format_startup_banner_with_task(
     let task_line = task.map_or_else(String::new, |task| {
         let short_id: String = task.id.chars().take(8).collect();
         let objective = truncate_for_banner(&task.objective, 72);
+        let phase = current_task_phase_for_display(task)
+            .map(|phase| format!(" · phase {}:{}", phase.name, phase.status.as_str()))
+            .unwrap_or_default();
         format!(
-            "   \x1b[2mTask\x1b[0m        {} {} · {}\n",
+            "   \x1b[2mTask\x1b[0m        {} {}{} · {}\n",
             task.status.as_str(),
             short_id,
+            phase,
             objective
         )
     });
@@ -4164,6 +4160,29 @@ fn truncate_for_banner(value: &str, max_chars: usize) -> String {
         format!("{truncated}...")
     } else {
         truncated
+    }
+}
+
+fn current_task_phase_for_display(
+    task: &task_kernel::TaskRecord,
+) -> Option<&task_kernel::TaskPhaseRecord> {
+    task.current_phase
+        .as_deref()
+        .and_then(|phase| task.phases.iter().rev().find(|candidate| candidate.name == phase))
+        .or_else(|| task.phases.last())
+}
+
+fn current_task_summary_from_record(task: &task_kernel::TaskRecord) -> tui::app::CurrentTaskSummary {
+    let phase = current_task_phase_for_display(task);
+    tui::app::CurrentTaskSummary {
+        id: task.id.clone(),
+        objective: task.objective.clone(),
+        status: task.status.as_str().to_string(),
+        current_phase: phase.map(|phase| phase.name.clone()),
+        phase_status: phase.map(|phase| phase.status.as_str().to_string()),
+        review_result: phase.and_then(|phase| phase.review_result.clone()),
+        artifact_count: phase.map_or(0, |phase| phase.artifacts.len()),
+        blocker_reason: task.blocker_reason.clone(),
     }
 }
 
@@ -9727,8 +9746,11 @@ mod tests {
         status_context, suggestions::format_unknown_slash_command,
         summarize_tool_payload_for_markdown, sync_cli_session_to_unified_store,
         try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture,
+        current_task_summary_from_record,
     };
-    use crate::task_kernel::{TaskRecord, TaskStatus};
+    use crate::task_kernel::{
+        TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
+    };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
@@ -11388,7 +11410,24 @@ mod tests {
             objective: "complete v0.8.10 enterprise AI framework".to_string(),
             status: TaskStatus::Running,
             current_phase: Some("tui-cockpit".to_string()),
-            phases: Vec::new(),
+            phases: vec![TaskPhaseRecord {
+                id: "phase-1".to_string(),
+                name: "tui-cockpit".to_string(),
+                objective: "surface durable task state in TUI".to_string(),
+                plan: Vec::new(),
+                acceptance: Vec::new(),
+                test_commands: Vec::new(),
+                artifacts: vec![TaskPhaseArtifact {
+                    kind: "test".to_string(),
+                    label: "status-bar".to_string(),
+                    value: "passed".to_string(),
+                    created_at_ms: 1,
+                }],
+                review_result: Some("accepted".to_string()),
+                status: TaskPhaseStatus::Completed,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            }],
             yolo_mode: true,
             failure_count: 0,
             blocker_reason: None,
@@ -11407,7 +11446,57 @@ mod tests {
         assert!(banner.contains("Task"));
         assert!(banner.contains("running"));
         assert!(banner.contains("task-abc"));
+        assert!(banner.contains("phase tui-cockpit:completed"));
         assert!(banner.contains("complete v0.8.10"));
+    }
+
+    #[test]
+    fn current_task_summary_includes_phase_review_and_artifacts() {
+        let task = TaskRecord {
+            id: "task-abcdef123456".to_string(),
+            objective: "complete v0.8.10 enterprise AI framework".to_string(),
+            status: TaskStatus::Running,
+            current_phase: Some("tui-cockpit".to_string()),
+            phases: vec![TaskPhaseRecord {
+                id: "phase-1".to_string(),
+                name: "tui-cockpit".to_string(),
+                objective: "surface durable task state in TUI".to_string(),
+                plan: Vec::new(),
+                acceptance: Vec::new(),
+                test_commands: Vec::new(),
+                artifacts: vec![
+                    TaskPhaseArtifact {
+                        kind: "test".to_string(),
+                        label: "unit".to_string(),
+                        value: "passed".to_string(),
+                        created_at_ms: 1,
+                    },
+                    TaskPhaseArtifact {
+                        kind: "smoke".to_string(),
+                        label: "tmux".to_string(),
+                        value: "passed".to_string(),
+                        created_at_ms: 2,
+                    },
+                ],
+                review_result: Some("accepted".to_string()),
+                status: TaskPhaseStatus::Completed,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }],
+            yolo_mode: true,
+            failure_count: 0,
+            blocker_reason: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            audit: Vec::new(),
+        };
+
+        let summary = current_task_summary_from_record(&task);
+
+        assert_eq!(summary.current_phase.as_deref(), Some("tui-cockpit"));
+        assert_eq!(summary.phase_status.as_deref(), Some("completed"));
+        assert_eq!(summary.review_result.as_deref(), Some("accepted"));
+        assert_eq!(summary.artifact_count, 2);
     }
 
     #[test]

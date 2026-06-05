@@ -279,6 +279,10 @@ pub struct CurrentTaskSummary {
     pub id: String,
     pub objective: String,
     pub status: String,
+    pub current_phase: Option<String>,
+    pub phase_status: Option<String>,
+    pub review_result: Option<String>,
+    pub artifact_count: usize,
     pub blocker_reason: Option<String>,
 }
 

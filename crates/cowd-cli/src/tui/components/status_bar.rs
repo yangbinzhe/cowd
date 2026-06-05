@@ -396,7 +396,28 @@ impl StatusBar {
                 "history" => app.history_idx.map(|hidx| format!("hist:{}", hidx + 1)),
                 "task" => app.current_task.as_ref().map(|task| {
                     let short_id: String = task.id.chars().take(8).collect();
-                    format!("Task {} {}", task.status, short_id)
+                    let phase = task
+                        .current_phase
+                        .as_deref()
+                        .map(|phase| {
+                            let phase_status = task.phase_status.as_deref().unwrap_or("active");
+                            format!(" · {phase}:{phase_status}")
+                        })
+                        .unwrap_or_default();
+                    let review = task
+                        .review_result
+                        .as_deref()
+                        .map(|result| format!(" · review:{result}"))
+                        .unwrap_or_default();
+                    let artifacts = if task.artifact_count > 0 {
+                        format!(" · art:{}", task.artifact_count)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "Task {} {}{}{}{}",
+                        task.status, short_id, phase, artifacts, review
+                    )
                 }),
                 "wave" => {
                     let ws = &app.wave_state;
@@ -687,6 +708,10 @@ mod tests {
             id: "task-123456789".to_string(),
             objective: "ship v0.8.10".to_string(),
             status: "running".to_string(),
+            current_phase: None,
+            phase_status: None,
+            review_result: None,
+            artifact_count: 0,
             blocker_reason: None,
         });
         let mut bar = StatusBar::with_default_sections();
@@ -697,6 +722,30 @@ mod tests {
         let content = section.content.as_ref().unwrap();
         assert!(content.contains("Task running"));
         assert!(content.contains("task-123"));
+    }
+
+    #[test]
+    fn sync_from_app_shows_current_task_phase_review_and_artifacts() {
+        let mut app = App::new("claude-sonnet-4", "test-session");
+        app.current_task = Some(CurrentTaskSummary {
+            id: "task-123456789".to_string(),
+            objective: "ship v0.8.10".to_string(),
+            status: "running".to_string(),
+            current_phase: Some("tui-cockpit".to_string()),
+            phase_status: Some("completed".to_string()),
+            review_result: Some("accepted".to_string()),
+            artifact_count: 2,
+            blocker_reason: None,
+        });
+        let mut bar = StatusBar::with_default_sections();
+
+        bar.sync_from_app(&app);
+
+        let section = bar.section_mut("task").unwrap();
+        let content = section.content.as_ref().unwrap();
+        assert!(content.contains("tui-cockpit:completed"));
+        assert!(content.contains("art:2"));
+        assert!(content.contains("review:accepted"));
     }
 
     // ── Render tests ─────────────────────────────────────────────
