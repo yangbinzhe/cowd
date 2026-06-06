@@ -58,9 +58,9 @@ use runtime::{
     ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
     ContentBlock, ConversationMessage, ConversationRuntime, JsonValue, McpServerManager, McpTool,
     MessageRole, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker, check_base_commit, format_stale_base_warning, load_system_prompt,
-    resolve_expected_base, resolve_sandbox_status,
+    ResolvedPermissionMode, ResumeContextPacket, ResumeContextSource, RuntimeError, Session,
+    TokenUsage, ToolError, ToolExecutor, UsageTracker, check_base_commit,
+    format_stale_base_warning, load_system_prompt, resolve_expected_base, resolve_sandbox_status,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -7733,6 +7733,154 @@ fn runtime_hook_config_from_plugin_hooks(hooks: PluginHooks) -> runtime::Runtime
     )
 }
 
+fn compact_message_text(message: &ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+            ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+            ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn session_db_resume_context_packet(session: &Session) -> Option<ResumeContextPacket> {
+    if session.messages.is_empty()
+        && session.compaction.is_none()
+        && session.fork.is_none()
+        && session.prompt_history.is_empty()
+    {
+        return None;
+    }
+
+    let recent_turns = session
+        .messages
+        .iter()
+        .rev()
+        .take(4)
+        .filter_map(|message| {
+            let text = compact_message_text(message);
+            (!text.is_empty()).then(|| {
+                format!(
+                    "{}: {}",
+                    message.role.role_str(),
+                    text.chars().take(240).collect::<String>()
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut recent_decisions = Vec::new();
+    if let Some(compaction) = &session.compaction {
+        recent_decisions.push(format!(
+            "compaction#{} removed {} messages: {}",
+            compaction.count, compaction.removed_message_count, compaction.summary
+        ));
+    }
+    if let Some(fork) = &session.fork {
+        recent_decisions.push(format!(
+            "forked from {}{}",
+            fork.parent_session_id,
+            fork.branch_name
+                .as_ref()
+                .map(|name| format!(" branch={name}"))
+                .unwrap_or_default()
+        ));
+    }
+    if let Some(last_prompt) = session.prompt_history.last() {
+        recent_decisions.push(format!(
+            "last prompt: {}",
+            last_prompt.text.split_whitespace().collect::<Vec<_>>().join(" ")
+        ));
+    }
+
+    Some(ResumeContextPacket {
+        session_id: session.session_id.clone(),
+        handoff_summary: session
+            .compaction
+            .as_ref()
+            .map(|compaction| compaction.summary.clone()),
+        active_task: (!recent_turns.is_empty()).then(|| recent_turns.join("\n")),
+        recent_decisions,
+        blockers: Vec::new(),
+        source: ResumeContextSource::SessionDb,
+    })
+}
+
+fn handoff_resume_context_packet(handoff: &memory::HandoffData) -> ResumeContextPacket {
+    let active_task = handoff.task_states.first().map(|task| {
+        format!(
+            "task={} progress={} checkpoint={} context={}",
+            task.task_id, task.progress_percent, task.last_checkpoint, task.context
+        )
+    });
+    let mut recent_decisions = handoff
+        .decisions
+        .iter()
+        .take(6)
+        .map(|decision| format!("{}: {}", decision.summary, decision.rationale))
+        .collect::<Vec<_>>();
+    recent_decisions.extend(handoff.work_items.iter().take(4).map(|item| {
+        format!(
+            "work {:?}: {} - {}",
+            item.status, item.title, item.description
+        )
+    }));
+    let blockers = handoff
+        .blockers
+        .iter()
+        .take(6)
+        .map(|blocker| {
+            blocker
+                .resolution_hint
+                .as_ref()
+                .map(|hint| format!("{}; hint: {hint}", blocker.description))
+                .unwrap_or_else(|| blocker.description.clone())
+        })
+        .collect::<Vec<_>>();
+
+    ResumeContextPacket {
+        session_id: handoff.session_id.clone(),
+        handoff_summary: (!handoff.summary.is_empty()).then(|| handoff.summary.clone()),
+        active_task,
+        recent_decisions,
+        blockers,
+        source: ResumeContextSource::Handoff,
+    }
+}
+
+fn inject_auto_resume_context(
+    runtime: &ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+    session_packet: Option<ResumeContextPacket>,
+    session_id: &str,
+) {
+    if let Some(packet) = session_packet {
+        runtime.inject_resume_context(packet);
+    }
+    let manager = memory::HandoffManager::new();
+    let handoff = manager
+        .load(session_id)
+        .unwrap_or_else(|err| {
+            tracing::debug!(%session_id, error = %err, "failed to load exact handoff");
+            None
+        })
+        .or_else(|| {
+            manager.load_latest().unwrap_or_else(|err| {
+                tracing::debug!(%session_id, error = %err, "failed to load latest handoff");
+                None
+            })
+        });
+    if let Some(handoff) = handoff {
+        runtime.inject_resume_context(handoff_resume_context_packet(&handoff));
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_runtime(
@@ -7818,6 +7966,7 @@ fn build_runtime_with_plugin_state(
     if session.model.is_none() {
         session.model = Some(model.clone());
     }
+    let session_resume_packet = session_db_resume_context_packet(&session);
     let RuntimePluginState {
         feature_config,
         tool_registry,
@@ -7869,6 +8018,7 @@ fn build_runtime_with_plugin_state(
     }
     let cowd_bus = runtime::CowdEventBus::new();
     runtime = runtime.with_cowd_event_bus(cowd_bus);
+    inject_auto_resume_context(&runtime, session_resume_packet, session_id);
     // Wire the production sub-agent executor so the collaboration pipeline
     // can delegate real work to sub-agents.
     {
@@ -9848,8 +9998,9 @@ mod tests {
         format_resume_report, format_startup_banner, format_startup_banner_with_task,
         format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        gateway_auth_token_from_platform, get_unified_store, hydrate_session_from_unified_store,
-        import_local_session_file, jsonl_sessions_dir, merge_prompt_with_stdin,
+        gateway_auth_token_from_platform, get_unified_store, handoff_resume_context_packet,
+        hydrate_session_from_unified_store, import_local_session_file, jsonl_sessions_dir,
+        merge_prompt_with_stdin,
         normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
         permission_policy, print_help_to, push_output_block, render_config_report,
@@ -9857,7 +10008,7 @@ mod tests {
         render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias_with_config, resolve_repl_model,
         resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, session_db_path, short_tool_id,
+        run_resume_command, session_db_path, session_db_resume_context_packet, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
         sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
@@ -11725,6 +11876,105 @@ mod tests {
         assert!(report.contains("Session          session-123"));
         assert!(report.contains("Messages         14"));
         assert!(report.contains("Turns            6"));
+    }
+
+    #[test]
+    fn session_db_resume_packet_summarizes_recent_session_state() {
+        let mut session = runtime::Session::new();
+        session.session_id = "session-resume-packet".to_string();
+        session.messages.push(runtime::ConversationMessage {
+            role: runtime::MessageRole::User,
+            blocks: vec![runtime::ContentBlock::Text {
+                text: "continue the context runtime work".to_string(),
+            }],
+            usage: None,
+        });
+        session.messages.push(runtime::ConversationMessage {
+            role: runtime::MessageRole::Assistant,
+            blocks: vec![runtime::ContentBlock::Text {
+                text: "context timeline is persisted".to_string(),
+            }],
+            usage: None,
+        });
+        session.compaction = Some(runtime::SessionCompaction {
+            count: 2,
+            removed_message_count: 8,
+            summary: "older context summarized".to_string(),
+        });
+
+        let packet = session_db_resume_context_packet(&session).expect("resume packet");
+
+        assert_eq!(packet.session_id, "session-resume-packet");
+        assert_eq!(packet.source, runtime::ResumeContextSource::SessionDb);
+        assert!(
+            packet
+                .active_task
+                .as_deref()
+                .is_some_and(|task| task.contains("context timeline is persisted"))
+        );
+        assert!(
+            packet
+                .recent_decisions
+                .iter()
+                .any(|decision| decision.contains("compaction#2"))
+        );
+    }
+
+    #[test]
+    fn handoff_resume_packet_summarizes_handoff_state() {
+        let handoff = memory::HandoffData {
+            session_id: "handoff-session".to_string(),
+            timestamp: chrono::Utc::now(),
+            work_items: vec![memory::WorkItem {
+                id: "work-1".to_string(),
+                title: "Finish context resume".to_string(),
+                description: "Wire handoff into runtime context".to_string(),
+                status: memory::WorkItemStatus::Pending,
+                priority: memory::Priority::High,
+            }],
+            decisions: vec![memory::Decision {
+                id: "decision-1".to_string(),
+                summary: "Use typed packets".to_string(),
+                rationale: "Keep runtime prompt deterministic".to_string(),
+                status: memory::DecisionStatus::Implemented,
+                made_at: chrono::Utc::now(),
+            }],
+            blockers: vec![memory::Blocker {
+                id: "blocker-1".to_string(),
+                description: "Need exact handoff lookup".to_string(),
+                resolution_hint: Some("fallback to latest".to_string()),
+            }],
+            task_states: vec![memory::TaskState {
+                task_id: "task-1".to_string(),
+                progress_percent: 70,
+                last_checkpoint: "timeline complete".to_string(),
+                context: serde_json::json!({"phase":"resume"}),
+            }],
+            summary: "resume from handoff".to_string(),
+        };
+
+        let packet = handoff_resume_context_packet(&handoff);
+
+        assert_eq!(packet.session_id, "handoff-session");
+        assert_eq!(packet.source, runtime::ResumeContextSource::Handoff);
+        assert!(
+            packet
+                .active_task
+                .as_deref()
+                .is_some_and(|task| task.contains("timeline complete"))
+        );
+        assert!(
+            packet
+                .recent_decisions
+                .iter()
+                .any(|decision| decision.contains("Use typed packets"))
+        );
+        assert!(
+            packet
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("fallback to latest"))
+        );
     }
 
     #[test]
