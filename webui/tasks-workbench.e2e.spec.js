@@ -72,6 +72,11 @@ test('workbench panels render durable task and memory status', async ({ page }) 
         status: 'degraded',
         degraded: true,
         degraded_reason: 'vector store unavailable; lexical recall active',
+        kernel_health: {
+          evidence_coverage: 0.75,
+          link_coverage: 0.5,
+          background_lag_ms: 12,
+        },
         total_entries: 42,
       });
     }
@@ -81,6 +86,49 @@ test('workbench panels render durable task and memory status', async ({ page }) 
     if (path === '/api/memory/entities') return json({ entities: [{ name: 'SessionKernel' }] });
     if (path === '/api/memory/triples') {
       return json({ triples: [{ subject: 'TaskKernel', predicate: 'persists', object: 'tasks' }] });
+    }
+    if (path === '/api/memory/links') {
+      return json({
+        links: [{
+          from: '11111111-1111-1111-1111-111111111111',
+          to: '22222222-2222-2222-2222-222222222222',
+          kind: 'Supports',
+          weight: 0.86,
+          evidence: 'TaskKernel supports SessionKernel decisions',
+        }],
+      });
+    }
+    if (path === '/api/memory/packet') {
+      return json({
+        packet: {
+          selected: [{
+            role: 'Orientation',
+            reason: 'query match',
+            atom: {
+              title: 'SessionKernel owns durable sessions',
+              layer: 'L3',
+              category: 'ProjectKnowledge',
+              state: 'Active',
+            },
+          }],
+          omitted: [],
+          token_estimate: 44,
+          truncated: false,
+        },
+      });
+    }
+    if (path === '/api/memory/recall/explain') {
+      return json({
+        mode: 'keyword',
+        degraded: false,
+        results: [{
+          source_layer: 'L3',
+          category: 'ProjectKnowledge',
+          mode: 'keyword',
+          score: 0.91,
+          snippet: 'SessionKernel owns durable sessions',
+        }],
+      });
     }
     if (path === '/api/memory/layers') return json({ layers: [{ name: 'L3' }, { name: 'L4' }] });
 
@@ -105,10 +153,17 @@ test('workbench panels render durable task and memory status', async ({ page }) 
   await expect(page.locator('#panel-content')).toContainText('Session kernel migration');
 
   await page.click('[data-panel="memory"]');
-  await expect(page.locator('#panel-content')).toContainText('Status: degraded');
+  await expect(page.locator('#panel-content')).toContainText('degraded');
   await expect(page.locator('#panel-content')).toContainText('vector store unavailable');
+  await expect(page.locator('#panel-content')).toContainText('Memory Links');
+  await expect(page.locator('#panel-content')).toContainText('Supports 1');
   await expect(page.locator('#panel-content')).toContainText('SessionKernel');
   await expect(page.locator('#panel-content')).toContainText('TaskKernel');
+  await page.fill('input[placeholder="Search memory..."]', 'SessionKernel');
+  await expect(page.locator('#panel-content')).toContainText('Context Packet');
+  await expect(page.locator('#panel-content')).toContainText('Orientation');
+  await expect(page.locator('#panel-content')).toContainText('Recall Explain');
+  await expect(page.locator('#panel-content')).toContainText('score 0.91');
 
   expect(errors).toEqual([]);
 });

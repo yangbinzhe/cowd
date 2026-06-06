@@ -1,6 +1,87 @@
 window.Panels = (()=>{
   const cont=()=>UI.$('panel-content');
 
+  function fmtPct(value){
+    return typeof value === 'number' ? Math.round(value * 100) + '%' : 'n/a';
+  }
+
+  function fmtNumber(value){
+    return value === undefined || value === null ? 0 : value;
+  }
+
+  function memoryHealthClass(status){
+    if(!status)return 'memory-badge';
+    if(status.degraded || status.status === 'degraded')return 'memory-badge warn';
+    if(status.enabled === false || status.status === 'disabled')return 'memory-badge danger';
+    return 'memory-badge ok';
+  }
+
+  function renderMemoryMetric(label,value,sub){
+    const item=UI.el('div','memory-metric');
+    item.innerHTML='<b>'+UI.esc(String(value))+'</b><small>'+UI.esc(label)+'</small>'+(sub?'<em>'+UI.esc(sub)+'</em>':'');
+    return item;
+  }
+
+  function renderMemoryPacket(packetResponse,target){
+    target.innerHTML='';
+    const packet=packetResponse && packetResponse.packet;
+    const card=UI.el('div','memory-card memory-packet');
+    card.innerHTML='<h3>Context Packet</h3>';
+    if(!packet || !Array.isArray(packet.selected) || packet.selected.length===0){
+      card.appendChild(UI.el('div','panel-empty','No active packet'));
+      target.appendChild(card);
+      return;
+    }
+    const meta=UI.el('div','memory-card-meta');
+    meta.textContent='tokens '+(packet.token_estimate||0)+(packet.truncated?' · truncated':'')+' · selected '+packet.selected.length+' · omitted '+((packet.omitted||[]).length);
+    card.appendChild(meta);
+    packet.selected.slice(0,10).forEach(function(item){
+      const atom=item.atom||{};
+      const row=UI.el('div','memory-packet-row');
+      const role=UI.el('span','memory-role '+String(item.role||'').toLowerCase());
+      role.textContent=item.role||'Memory';
+      const body=UI.el('div','memory-packet-body');
+      const title=atom.title||atom.content||atom.id||'Memory';
+      body.innerHTML='<b>'+UI.esc(String(title).slice(0,120))+'</b><small>'+UI.esc([atom.layer,atom.category,atom.state].filter(Boolean).join(' · '))+'</small><em>'+UI.esc(item.reason||'selected')+'</em>';
+      row.appendChild(role);
+      row.appendChild(body);
+      card.appendChild(row);
+    });
+    if((packet.omitted||[]).length){
+      const omitted=UI.el('div','memory-omitted');
+      omitted.textContent='Omitted: '+packet.omitted.slice(0,3).map(o=>(o.title||o.id||'memory')+' ('+(o.reason||'bounded')+')').join(' · ');
+      card.appendChild(omitted);
+    }
+    target.appendChild(card);
+  }
+
+  function renderMemoryLinks(linksResponse,target){
+    target.innerHTML='';
+    const links=(linksResponse && (linksResponse.links||linksResponse)) || [];
+    const sec=UI.el('div','memory-card');
+    sec.innerHTML='<h3>Memory Links</h3>';
+    if(!links.length){
+      sec.appendChild(UI.el('div','panel-empty','No links'));
+      target.appendChild(sec);
+      return;
+    }
+    const counts={};
+    links.forEach(l=>{const k=l.kind||'Link';counts[k]=(counts[k]||0)+1});
+    const summary=UI.el('div','memory-link-kinds');
+    Object.keys(counts).sort().forEach(function(kind){
+      const chip=UI.el('span','memory-chip');
+      chip.textContent=kind+' '+counts[kind];
+      summary.appendChild(chip);
+    });
+    sec.appendChild(summary);
+    links.slice(0,8).forEach(function(link){
+      const row=UI.el('div','memory-link-row');
+      row.innerHTML='<b>'+UI.esc(String(link.kind||'Link'))+'</b><small>'+UI.esc(String(link.from||'').slice(0,8))+' → '+UI.esc(String(link.to||'').slice(0,8))+' · '+(typeof link.weight==='number'?link.weight.toFixed(2):'n/a')+'</small><em>'+UI.esc(link.evidence||'')+'</em>';
+      sec.appendChild(row);
+    });
+    target.appendChild(sec);
+  }
+
   async function renderMemory(){
     const c=cont();c.innerHTML='';
     const hdr=UI.el('div','panel-section');
@@ -17,19 +98,35 @@ window.Panels = (()=>{
     hdr.appendChild(search);
     c.appendChild(hdr);
 
-    const stats=UI.el('div','panel-section');
+    const stats=UI.el('div','panel-section memory-overview');
     c.appendChild(stats);
     try{
       const status=await Api.memoryStatus();
       const s=await Api.memoryStats();
       const label=status.status||((status.enabled)?'ready':'disabled');
       const reason=status.degraded_reason||status.message||'';
-      stats.innerHTML='Status: '+UI.esc(label)
-        +' | Entries: '+(s.total_entries||s.count||0)
-        +' | Entities: '+(s.entity_count||s.entities||0)
-        +' | Triples: '+(s.triple_count||s.triples||0)
-        +(reason?' | '+UI.esc(reason):'');
+      const kh=status.kernel_health||{};
+      const header=UI.el('div','memory-overview-head');
+      header.innerHTML='<span class="'+memoryHealthClass(status)+'">'+UI.esc(label)+'</span>'+(reason?'<small>'+UI.esc(reason)+'</small>':'');
+      stats.appendChild(header);
+      const grid=UI.el('div','memory-metrics');
+      grid.appendChild(renderMemoryMetric('entries',fmtNumber(s.total_entries||s.count)));
+      grid.appendChild(renderMemoryMetric('entities',fmtNumber(s.entity_count||s.entities)));
+      grid.appendChild(renderMemoryMetric('triples',fmtNumber(s.triple_count||s.triples)));
+      grid.appendChild(renderMemoryMetric('evidence',fmtPct(kh.evidence_coverage),'coverage'));
+      grid.appendChild(renderMemoryMetric('links',fmtPct(kh.link_coverage),'coverage'));
+      grid.appendChild(renderMemoryMetric('lag',fmtNumber(kh.background_lag_ms)+'ms','background'));
+      stats.appendChild(grid);
     }catch(e){stats.textContent='Stats unavailable'}
+
+    const kernelSec=UI.el('div','memory-grid');
+    const packetSec=UI.el('div');
+    const linksSec=UI.el('div');
+    kernelSec.appendChild(packetSec);
+    kernelSec.appendChild(linksSec);
+    c.appendChild(kernelSec);
+    renderMemoryPacket(null,packetSec);
+    try{renderMemoryLinks(await Api.memoryLinks(),linksSec)}catch(e){renderMemoryLinks({links:[]},linksSec)}
 
     const entitySec=UI.el('div','panel-section');
     entitySec.innerHTML='<h3>Entities</h3>';
@@ -149,6 +246,10 @@ window.Panels = (()=>{
     const sec=c.querySelector('.panel-section:last-child');
     if(!sec)return;
     try{
+      const packetTarget=c.querySelector('.memory-grid > div:first-child');
+      if(packetTarget){
+        try{renderMemoryPacket(await Api.memoryPacket(q,{max_items:8,max_tokens:2000}),packetTarget)}catch(e){}
+      }
       const r=await Api.recallExplain(q,20);
       const results=r.results||r||[];
       const list=UI.el('div');

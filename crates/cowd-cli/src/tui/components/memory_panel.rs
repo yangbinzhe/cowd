@@ -5,7 +5,7 @@
 //   - Layer browser (L0/L1/L2/L3/L4 filter)
 //   - Search via CognitiveContextManager
 //   - Entry detail view with full content + metadata
-//   - Delete capability
+//   - Archive capability
 //   - Refresh from cognitive context
 
 #![allow(dead_code)]
@@ -21,8 +21,8 @@ use ratatui::{
 };
 
 use memory::cognitive::CognitiveContextManager;
-use memory::{MemoryInformationState, MemoryKernel};
-use memory::types::MemoryLayer;
+use memory::types::{MemoryId, MemoryLayer};
+use memory::{MemoryInformationState, MemoryKernel, MemoryTurnContext};
 
 use crate::tui::app::{App, MemoryEntry};
 use crate::tui::components::{Component, EventResult, RenderContext};
@@ -110,7 +110,7 @@ enum ViewMode {
 /// - Layer filtering (cycle through L0–L4 or show all)
 /// - Full-text search via CognitiveContextManager
 /// - Detail view for individual entries
-/// - Delete selected entries
+/// - Archive selected entries
 /// - Keyboard navigation with j/k, Enter, d, /, Esc
 pub struct MemoryPanel {
     pub entries: Vec<MemoryEntry>,
@@ -128,7 +128,7 @@ pub struct MemoryPanel {
     view_mode: ViewMode,
     /// Scroll offset for detail view and long lists.
     pub scroll_offset: u16,
-    /// Status message to display (e.g., "Deleted", "Refreshed").
+    /// Status message to display (e.g., "Archived", "Refreshed").
     status_message: Option<String>,
     /// Tick counter for auto-clearing status messages.
     status_ticks: u32,
@@ -247,7 +247,7 @@ impl MemoryPanel {
         }
     }
 
-    /// Delete the currently selected entry (both in-memory and in cognitive store).
+    /// Archive the currently selected entry in the kernel and remove it from active view.
     fn delete_selected(&mut self) {
         let Some(idx) = self.selected_entry else {
             return;
@@ -258,13 +258,13 @@ impl MemoryPanel {
         if let Some(ref mm) = self.memory_manager {
             if let Some(ref id) = entry_id {
                 if let Err(err) = delete_memory_entry_blocking(Arc::clone(mm), id.clone()) {
-                    self.set_status(&format!("Delete failed in store: {err}"));
+                    self.set_status(&format!("Archive failed in store: {err}"));
                 }
             }
         }
 
         self.remove_entry_at(idx);
-        self.set_status("Entry deleted");
+        self.set_status("Entry archived");
     }
 
     fn remove_entry_at(&mut self, idx: usize) {
@@ -360,13 +360,13 @@ impl MemoryPanel {
                 Style::default().fg(Color::DarkGray),
             )));
             lines.push(Line::from(Span::styled(
-                "Keys: / search  l/L layer filter  r refresh  j↓ k↑  Enter view  d delete",
+                "Keys: / search  l/L layer filter  r refresh  j↓ k↑  Enter view  d archive",
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
             let total = self.entries.len();
             lines.push(Line::from(Span::styled(
-                format!("{total} entries | j↓ k↑ select | Enter view | d delete | / search | l/L layer | r refresh"),
+                format!("{total} entries active | j↓ k↑ select | Enter view | d archive | / search | l/L layer | r refresh"),
                 Style::default().fg(Color::Yellow),
             )));
             lines.push(Line::raw(""));
@@ -507,7 +507,7 @@ impl MemoryPanel {
         // Footer
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            " Esc:back  j↓/k↑:scroll  d:delete ",
+            " Esc:back  j↓/k↑:scroll  d:archive ",
             Style::default().fg(Color::Yellow),
         )));
 
@@ -873,7 +873,13 @@ fn delete_memory_entry_blocking(
     manager: Arc<CognitiveContextManager>,
     id: String,
 ) -> Result<(), String> {
-    run_memory_operation_blocking(move || async move { manager.delete_entry(&id).await })
+    let memory_id = MemoryId::try_parse(&id).map_err(|_| "invalid memory id".to_string())?;
+    run_memory_operation_blocking(move || async move {
+        let ctx = MemoryTurnContext::new("tui-memory-archive", "tui");
+        MemoryKernel::new(manager)
+            .archive(&ctx, memory_id, "archived from TUI memory panel")
+            .await
+    })
 }
 
 fn run_memory_operation_blocking<F, Fut, T, E>(operation: F) -> Result<T, String>
@@ -1273,6 +1279,38 @@ mod tests {
         assert_eq!(panel.entries[0].content, "a");
         assert_eq!(panel.entries[1].content, "c");
         assert_eq!(panel.selected_entry, Some(1));
+    }
+
+    #[tokio::test]
+    async fn delete_archives_entry_in_memory_kernel() {
+        let manager = seeded_memory_manager().await;
+        let views = MemoryKernel::new(Arc::clone(&manager))
+            .layer_views(MemoryInformationState::Orientation)
+            .await
+            .unwrap();
+        let id = views
+            .into_iter()
+            .flat_map(|view| view.atoms.into_iter())
+            .next()
+            .expect("seeded manager should contain one memory atom")
+            .id;
+
+        delete_memory_entry_blocking(Arc::clone(&manager), id.to_string()).unwrap();
+
+        let events = MemoryKernel::new(Arc::clone(&manager))
+            .lifecycle_events(id)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.to == memory::MemoryState::Archived),
+            "TUI delete key should archive through the memory kernel"
+        );
+        assert!(
+            manager.get_entry(&id.to_string()).await.unwrap().is_some(),
+            "archiving must preserve the underlying memory entry"
+        );
     }
 
     #[test]

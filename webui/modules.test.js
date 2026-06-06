@@ -56,6 +56,8 @@ describe('API module', () => {
     expect(typeof window.Api.listMemoryLayers).toBe('function');
     expect(typeof window.Api.searchMemory).toBe('function');
     expect(typeof window.Api.recallExplain).toBe('function');
+    expect(typeof window.Api.memoryPacket).toBe('function');
+    expect(typeof window.Api.memoryLinks).toBe('function');
     expect(typeof window.Api.createMemoryEntry).toBe('function');
     expect(typeof window.Api.updateMemoryEntry).toBe('function');
     expect(typeof window.Api.deleteMemoryEntry).toBe('function');
@@ -97,6 +99,24 @@ describe('API module', () => {
 
     expect(String(mockF.mock.calls[0][0])).toBe('/api/memory/recall/explain?q=SessionKernel&limit=7');
     expect(explain.mode).toBe('keyword');
+  });
+
+  it('memory packet and link endpoints use kernel routes', async () => {
+    const mockF = vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/memory/packet')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ packet: { selected: [] } }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ links: [{ kind: 'Supports' }] }) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.memoryPacket('SessionKernel', { max_items: 9, max_tokens: 1234 });
+    const links = await window.Api.memoryLinks();
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/memory/packet?q=SessionKernel&max_items=9&max_tokens=1234');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/memory/links');
+    expect(links.links[0].kind).toBe('Supports');
   });
 
   it('has all skill endpoints', () => {
@@ -551,6 +571,9 @@ describe('API module', () => {
       if (path.includes('/api/memory/layers')) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ layers: [{ layer: 'L4', entry_count: 2 }] }) });
       }
+      if (path.includes('/api/memory/links')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ links: [] }) });
+      }
       return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
     }));
 
@@ -587,6 +610,25 @@ describe('API module', () => {
           }]
         }) });
       }
+      if (path.includes('/api/memory/packet')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          packet: {
+            selected: [{
+              role: 'Orientation',
+              reason: 'query match',
+              atom: { title: 'SessionKernel owns durable sessions', layer: 'L3', category: 'ProjectKnowledge', state: 'Active' },
+            }],
+            omitted: [{ title: 'Old session note', reason: 'budget' }],
+            token_estimate: 42,
+            truncated: false,
+          }
+        }) });
+      }
+      if (path.includes('/api/memory/links')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          links: [{ from: '11111111-1111-1111-1111-111111111111', to: '22222222-2222-2222-2222-222222222222', kind: 'Supports', weight: 0.8, evidence: 'same decision' }]
+        }) });
+      }
       if (path.includes('/api/memory/layers')) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ layers: [] }) });
       }
@@ -603,6 +645,10 @@ describe('API module', () => {
     const text = document.getElementById('panel-content').textContent;
     expect(String(mockF.mock.calls.at(-1)[0])).toContain('/api/memory/recall/explain?q=SessionKernel&limit=20');
     expect(text).toContain('Recall Explain');
+    expect(text).toContain('Context Packet');
+    expect(text).toContain('Orientation');
+    expect(text).toContain('Memory Links');
+    expect(text).toContain('Supports 1');
     expect(text).toContain('Mode: keyword');
     expect(text).toContain('L3');
     expect(text).toContain('score 0.87');

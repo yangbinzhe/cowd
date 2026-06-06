@@ -68,7 +68,7 @@ test('live gateway workbench renders persisted task phase state', async ({ page,
   await expect(page.locator('#panel-content')).toContainText('accepted by live browser scenario');
 
   await page.click('[data-panel="memory"]');
-  await expect(page.locator('#panel-content')).toContainText('Status: disabled');
+  await expect(page.locator('#panel-content')).toContainText('disabled');
 
   expect(created.taskId).toBeTruthy();
   expect(created.phaseId).toBeTruthy();

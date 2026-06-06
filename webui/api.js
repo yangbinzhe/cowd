@@ -152,6 +152,15 @@ window.Api = (()=>{
     async listMemoryLayers(){return req('GET','/api/memory/layers')},
     async searchMemory(q){return req('GET','/api/memory/search?q='+encodeURIComponent(q))},
     async recallExplain(q,limit){return req('GET','/api/memory/recall/explain?q='+encodeURIComponent(q)+'&limit='+(limit||10))},
+    async memoryPacket(q,opts){
+      const o=opts||{};
+      const params=new URLSearchParams();
+      params.set('q',q||'');
+      if(o.max_items)params.set('max_items',o.max_items);
+      if(o.max_tokens)params.set('max_tokens',o.max_tokens);
+      return req('GET','/api/memory/packet?'+params.toString());
+    },
+    async memoryLinks(){return req('GET','/api/memory/links')},
     async getMemoryLayer(layer){return req('GET','/api/memory/'+layer)},
     async createMemoryEntry(layer,entry){return req('POST','/api/memory/'+layer,entry)},
     async updateMemoryEntry(id,entry){return req('PATCH','/api/memory/entry/'+id,entry)},
