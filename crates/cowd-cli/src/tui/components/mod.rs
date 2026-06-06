@@ -23,6 +23,7 @@ pub mod prompt;
 pub mod question_form;
 pub mod render_engine;
 pub mod revert_dialog;
+pub mod runtime_activity_panel;
 pub mod session_sidebar;
 pub mod skills_panel;
 pub mod status_bar;

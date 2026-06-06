@@ -42,6 +42,7 @@ use crate::tui::components::performance_dashboard::PerformanceDashboard;
 use crate::tui::components::prompt::Prompt;
 use crate::tui::components::question_form::QuestionForm;
 use crate::tui::components::revert_dialog::RevertDialog;
+use crate::tui::components::runtime_activity_panel::RuntimeActivityPanel;
 use crate::tui::components::session_sidebar::SessionSidebar;
 use crate::tui::components::skills_panel::SkillsPanel;
 use crate::tui::components::status_bar::StatusBar;
@@ -180,7 +181,10 @@ pub struct TuiState {
     /// Gateway panel showing backend daemon/API gateway status.
     pub gateway_panel: GatewayPanel,
 
-    /// Active tab index in the sidebar (0=Context, 1=Changes, 2=Todo, 3=Diff, 4=Files, 5=Sessions, 6=Memory, 7=Skills, 8=Gateway).
+    /// Runtime activity panel summarizing run/context/tool state.
+    pub runtime_activity_panel: RuntimeActivityPanel,
+
+    /// Active tab index in the sidebar (0=Runtime, 1=Context, 2=Changes, 3=Todo, 4=Diff, 5=Files, 6=Sessions, 7=Memory, 8=Skills, 9=Gateway).
     pub sidebar_active_tab: usize,
 
     /// Status bar at the bottom showing model, tokens, and system info.
@@ -271,6 +275,7 @@ impl TuiState {
         let performance_dashboard = PerformanceDashboard::new();
         let skills_panel = SkillsPanel::new();
         let gateway_panel = GatewayPanel::new();
+        let runtime_activity_panel = RuntimeActivityPanel::new();
 
         Self {
             app,
@@ -310,6 +315,7 @@ impl TuiState {
             performance_dashboard,
             skills_panel,
             gateway_panel,
+            runtime_activity_panel,
             sidebar_active_tab: 0,
             accessibility,
             active_sessions: None,
@@ -435,6 +441,7 @@ impl TuiState {
         self.thinking_panel.tick();
 
         // Sync sidebar panels from App state
+        self.runtime_activity_panel.sync_from_app(&self.app);
         self.context_panel.sync_from_app(&self.app);
 
         // Sync file changes panel from timeline (ToolCall outputs with file change info)
@@ -461,7 +468,7 @@ impl TuiState {
 
         // Sync memory panel from the real cognitive store only when the tab is
         // visible. Keep App fallback for memory-disabled sessions.
-        if self.sidebar_active_tab == 6 && self.memory_panel.memory_manager.is_some() {
+        if self.sidebar_active_tab == 7 && self.memory_panel.memory_manager.is_some() {
             let should_sync = self
                 .memory_panel_last_sync
                 .map(|last| last.elapsed() >= Duration::from_millis(750))
@@ -551,8 +558,8 @@ impl TuiState {
             // Render sidebar: tab bar + active panel
             let tab_height = 1u16;
             let tab_labels = [
-                "Context", "Changes", "Todo", "Diff", "Files", "Sessions", "Memory", "Skills",
-                "Gateway",
+                "Runtime", "Context", "Changes", "Todo", "Diff", "Files", "Sessions", "Memory",
+                "Skills", "Gateway",
             ];
             let tab_area = ratatui::layout::Rect::new(
                 sidebar_area.x,
@@ -602,13 +609,21 @@ impl TuiState {
             match self.sidebar_active_tab {
                 0 => {
                     let _ = error_recovery::catch_render_panic(
+                        "runtime_activity_panel",
+                        AssertUnwindSafe(|| {
+                            self.runtime_activity_panel.render(&mut main_ctx, panel_area);
+                        }),
+                    );
+                }
+                1 => {
+                    let _ = error_recovery::catch_render_panic(
                         "context_panel",
                         AssertUnwindSafe(|| {
                             self.context_panel.render(&mut main_ctx, panel_area);
                         }),
                     );
                 }
-                1 => {
+                2 => {
                     let _ = error_recovery::catch_render_panic(
                         "file_changes_panel",
                         AssertUnwindSafe(|| {
@@ -616,7 +631,7 @@ impl TuiState {
                         }),
                     );
                 }
-                2 => {
+                3 => {
                     let _ = error_recovery::catch_render_panic(
                         "todo_panel",
                         AssertUnwindSafe(|| {
@@ -624,7 +639,7 @@ impl TuiState {
                         }),
                     );
                 }
-                3 => {
+                4 => {
                     let _guard = self.render_profiler.guard("diff_viewer");
                     let _ = error_recovery::catch_render_panic(
                         "diff_viewer",
@@ -633,7 +648,7 @@ impl TuiState {
                         }),
                     );
                 }
-                4 => {
+                5 => {
                     let _guard = self.render_profiler.guard("file_tree");
                     let _ = error_recovery::catch_render_panic(
                         "file_tree",
@@ -642,7 +657,7 @@ impl TuiState {
                         }),
                     );
                 }
-                5 => {
+                6 => {
                     let _guard = self.render_profiler.guard("session_sidebar");
                     let _ = error_recovery::catch_render_panic(
                         "session_sidebar",
@@ -651,7 +666,7 @@ impl TuiState {
                         }),
                     );
                 }
-                6 => {
+                7 => {
                     let _guard = self.render_profiler.guard("memory_panel");
                     let _ = error_recovery::catch_render_panic(
                         "memory_panel",
@@ -660,7 +675,7 @@ impl TuiState {
                         }),
                     );
                 }
-                7 => {
+                8 => {
                     let _ = error_recovery::catch_render_panic(
                         "skills_panel",
                         AssertUnwindSafe(|| {
@@ -668,7 +683,7 @@ impl TuiState {
                         }),
                     );
                 }
-                8 => {
+                9 => {
                     let _ = error_recovery::catch_render_panic(
                         "gateway_panel",
                         AssertUnwindSafe(|| {
@@ -1028,12 +1043,14 @@ impl TuiState {
         // 1.75. Tab/BackTab sidebar cycling (before keybind engine which maps Tab to no-op NextPanel)
         match event.code {
             KeyCode::Tab => {
-                self.sidebar_active_tab = (self.sidebar_active_tab + 1) % 9;
+                const SIDEBAR_TAB_COUNT: usize = 10;
+                self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
                 return true;
             }
             KeyCode::BackTab => {
+                const SIDEBAR_TAB_COUNT: usize = 10;
                 self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
-                    8
+                    SIDEBAR_TAB_COUNT - 1
                 } else {
                     self.sidebar_active_tab - 1
                 };
@@ -1229,7 +1246,7 @@ impl TuiState {
 
         // ── Sidebar tab switching ──
         // Tab / Shift+Tab: cycle through sidebar tabs (Context / Changes / Todo / Diff / Files / Sessions / Memory / Skills / Gateway)
-        const SIDEBAR_TAB_COUNT: usize = 9;
+        const SIDEBAR_TAB_COUNT: usize = 10;
         if key.code == KeyCode::Tab {
             self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
             return ProcessedKey::Nothing;
@@ -1643,13 +1660,13 @@ impl TuiState {
                 }
             }
             Action::FocusDiff => {
-                self.sidebar_active_tab = 3;
-            }
-            Action::FocusFileTree => {
                 self.sidebar_active_tab = 4;
             }
-            Action::FocusSessions => {
+            Action::FocusFileTree => {
                 self.sidebar_active_tab = 5;
+            }
+            Action::FocusSessions => {
+                self.sidebar_active_tab = 6;
             }
             Action::Execute(ref _cmd) => {}
             Action::TogglePanel(ref _name) => {}

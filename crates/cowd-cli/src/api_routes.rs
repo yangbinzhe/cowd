@@ -5859,6 +5859,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_maintenance_without_config_degrades() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/maintenance")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["degraded_reason"], "memory not configured");
+        assert!(json["candidates"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_maintenance_scan_and_transition() {
+        let dir = std::env::temp_dir().join(format!(
+            "cowd-api-maintenance-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = Arc::new(
+            CognitiveContextManager::new(test_memory_config(&dir.join("memory.db")))
+                .await
+                .unwrap(),
+        );
+        let id = MemoryId::new_v4();
+        manager
+            .remember(MemoryEntry {
+                id,
+                layer: MemoryLayer::L2,
+                category: MemoryCategory::Reference,
+                priority: Priority::Normal,
+                source: MemorySource::UserExplicit,
+                title: "Old context rule".to_string(),
+                content: "Prefer bounded context packets".to_string(),
+                embedding: None,
+                tags: vec![],
+                relations: vec![],
+                confidence: 0.7,
+                access_count: 0,
+                staleness: 0.95,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                last_accessed_at: None,
+                scope: MemoryScope::Session("maintenance-test".to_string()),
+                session_id: None,
+                source_agent: None,
+                visibility: AgentVisibility::Shared,
+            })
+            .await
+            .unwrap();
+
+        let app = api_router(test_state_with_memory(manager));
+        let scan_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memory/maintenance")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"stale_threshold":0.9}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scan_response.status(), StatusCode::OK);
+        let scan_body = to_bytes(scan_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let scan_json: serde_json::Value = serde_json::from_slice(&scan_body).unwrap();
+        let candidate_id = scan_json["candidates"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(scan_json["candidates"][0]["kind"], "stale");
+
+        let ack_response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/memory/maintenance/{candidate_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"status":"acknowledged"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ack_response.status(), StatusCode::OK);
+        let ack_body = to_bytes(ack_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack_json: serde_json::Value = serde_json::from_slice(&ack_body).unwrap();
+        assert_eq!(ack_json["candidate"]["status"], "acknowledged");
+    }
+
+    #[tokio::test]
     async fn memory_recall_explain_reports_source_mode_and_score() {
         let tmp = std::env::temp_dir().join(format!("cowd-api-memory-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();

@@ -681,6 +681,91 @@ window.Panels = (()=>{
     }catch(e){layers.appendChild(UI.el('div','panel-empty','No layers'))}
   }
 
+  async function renderRuntimeConsole(){
+    const c=cont();c.innerHTML='';
+    const hdr=UI.el('div','panel-section context-header');
+    hdr.innerHTML='<h3>Runtime Console</h3>';
+    const controls=UI.el('div','context-controls');
+    const input=UI.el('input');
+    input.placeholder='Runtime intent...';
+    const profile=UI.el('select');
+    profile.innerHTML='<option value="MainTurn">Main</option><option value="SoloGoal">Solo</option><option value="YoloGoal">Yolo</option><option value="Review">Review</option><option value="Resume">Resume</option><option value="SubAgent">SubAgent</option><option value="Collaboration">Collab</option><option value="Cron">Cron</option>';
+    const refresh=UI.el('button','btn-secondary btn-sm');
+    refresh.textContent='Refresh';
+    controls.appendChild(input);
+    controls.appendChild(profile);
+    controls.appendChild(refresh);
+    hdr.appendChild(controls);
+    c.appendChild(hdr);
+
+    const grid=UI.el('div','runtime-console-grid');
+    const summary=UI.el('div','panel-section runtime-console-summary');
+    const runsSec=UI.el('div','panel-section runtime-runs');
+    const contextSec=UI.el('div','panel-section context-list');
+    const maintSec=UI.el('div','panel-section memory-maintenance');
+    grid.appendChild(summary);
+    grid.appendChild(runsSec);
+    grid.appendChild(contextSec);
+    grid.appendChild(maintSec);
+    c.appendChild(grid);
+
+    async function load(){
+      summary.innerHTML='<h3>Runtime State</h3>';
+      runsSec.innerHTML='<h3>Runtime Runs</h3>';
+      contextSec.innerHTML='<h3>Active Context</h3>';
+      maintSec.innerHTML='<h3>Memory Maintenance</h3>';
+      const opts={q:input.value||'',profile:profile.value};
+      if(Api.sid)opts.session_id=Api.sid;
+
+      let envelope={};
+      let diagnostics={};
+      let budget={};
+      try{
+        const ctx=await Api.currentContext(opts);
+        envelope=(ctx&&ctx.envelope)||{};
+        diagnostics=envelope.diagnostics||{};
+        budget=envelope.budget||{};
+      }catch(e){
+        contextSec.appendChild(UI.el('div','panel-empty','Context unavailable'));
+      }
+
+      const metrics=UI.el('div','memory-metrics');
+      metrics.appendChild(renderMemoryMetric('profile',envelope.profile||profile.value,'mode'));
+      metrics.appendChild(renderMemoryMetric('pressure',fmtPressure(diagnostics.pressure_bp),'context'));
+      metrics.appendChild(renderMemoryMetric('selected',(envelope.selected||[]).length,'items'));
+      metrics.appendChild(renderMemoryMetric('omitted',(envelope.omitted||[]).length,'items'));
+      metrics.appendChild(renderMemoryMetric('used',budget.used_tokens||0,'tokens'));
+      metrics.appendChild(renderMemoryMetric('stable',shortHash(diagnostics.stable_head_hash),'hash'));
+      summary.appendChild(metrics);
+      if((diagnostics.degraded_sources||[]).length){
+        const degraded=UI.el('div','context-degraded');
+        degraded.textContent='degraded: '+diagnostics.degraded_sources.join(', ');
+        summary.appendChild(degraded);
+      }
+
+      const selected=envelope.selected||[];
+      if(!selected.length)contextSec.appendChild(UI.el('div','panel-empty','No selected context'));
+      selected.slice(0,6).forEach(function(item){contextSec.appendChild(renderContextItem(item))});
+
+      if(!Api.sid){
+        runsSec.appendChild(UI.el('div','panel-empty','No active session'));
+      }else{
+        try{
+          const data=await Api.runtimeRuns(Api.sid,{limit:10});
+          const rows=data.runs||[];
+          if(!rows.length)runsSec.appendChild(UI.el('div','panel-empty','No runtime runs'));
+          rows.slice(-10).reverse().forEach(function(item){runsSec.appendChild(renderRuntimeRunItem(item))});
+        }catch(e){runsSec.appendChild(UI.el('div','panel-empty','Runtime runs unavailable'))}
+      }
+
+      await renderMemoryMaintenance(maintSec);
+    }
+    refresh.onclick=load;
+    input.onkeydown=function(e){if(e.key==='Enter')load()};
+    profile.onchange=load;
+    await load();
+  }
+
   async function renderMemoryLayer(layer){
     const c=cont();c.innerHTML='';
     c.appendChild(UI.el('div','panel-section','<h3>'+UI.esc(layer)+'</h3>'));
@@ -1251,5 +1336,5 @@ window.Panels = (()=>{
     }catch(e){c.appendChild(UI.el('div','panel-section','Progress unavailable'))}
   }
 
-  return{renderMemory,renderContext,renderMemoryLayer,renderMemorySymbolResults,showMemoryEntryForm,renderMemorySpatial,renderMemoryNetwork,renderProgress,renderSkills,renderCrons,renderSettings,renderAgents,renderTools,renderGateway,renderAudit,renderCCConfig,renderCCProviders,renderCCApproval,renderCCHistory,renderCCUsage};
+  return{renderMemory,renderContext,renderRuntimeConsole,renderMemoryLayer,renderMemorySymbolResults,showMemoryEntryForm,renderMemorySpatial,renderMemoryNetwork,renderProgress,renderSkills,renderCrons,renderSettings,renderAgents,renderTools,renderGateway,renderAudit,renderCCConfig,renderCCProviders,renderCCApproval,renderCCHistory,renderCCUsage};
 })();

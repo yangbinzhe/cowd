@@ -577,6 +577,7 @@ describe('API module', () => {
   it('Panels module exposes all panel renderers', () => {
     expect(typeof window.Panels.renderMemory).toBe('function');
     expect(typeof window.Panels.renderContext).toBe('function');
+    expect(typeof window.Panels.renderRuntimeConsole).toBe('function');
     expect(typeof window.Panels.renderMemoryNetwork).toBe('function');
     expect(typeof window.Panels.renderSkills).toBe('function');
     expect(typeof window.Panels.renderCrons).toBe('function');
@@ -596,7 +597,9 @@ describe('API module', () => {
   it('index exposes the context panel tab and slash command', () => {
     const html = fs.readFileSync('index.html', 'utf8');
     expect(html).toContain('data-panel="context"');
+    expect(html).toContain('data-panel="runtime"');
     expect(window.Commands.getMatches('/context')[0].cmd).toBe('/context');
+    expect(window.Commands.getMatches('/runtime')[0].cmd).toBe('/runtime');
   });
 
   it('Sessions search uses backend query and renders returned sessions', async () => {
@@ -865,6 +868,88 @@ describe('API module', () => {
     document.querySelector('.context-evidence-ref').click();
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(document.getElementById('panel-content').textContent).toContain('"available": true');
+  });
+
+  it('renders the runtime console as a unified operational view', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    window.Api.sid = 's1';
+    vi.stubGlobal('fetch', vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/sessions/s1/runs')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            runs: [{
+              sequence: 9,
+              created_at_ms: 1005,
+              run: {
+                run_id: 'run-console-1',
+                profile: 'YoloGoal',
+                status: 'completed',
+                intent_preview: 'complete runtime hardening',
+              },
+            }]
+          })
+        });
+      }
+      if (path.includes('/api/memory/maintenance')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            enabled: true,
+            candidates: [{
+              id: 'maint-1',
+              kind: 'stale',
+              status: 'open',
+              summary: 'Review stale memory',
+              reason: 'staleness crossed review threshold',
+              entry_ids: ['m1'],
+            }]
+          })
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          enabled: true,
+          source: 'runtime',
+          envelope: {
+            id: 'ctx-runtime',
+            profile: 'YoloGoal',
+            selected: [{
+              role: 'Evidence',
+              source: 'Memory',
+              authority: 'Project',
+              visibility: 'Shared',
+              content: 'Runtime console should show unified state',
+              score: 0.91,
+              token_estimate: 11,
+              evidence: ['session://s1/memory/m1'],
+            }],
+            omitted: [{ source: 'ToolTrace', reason: 'lease exhausted', token_estimate: 20 }],
+            budget: { total_tokens: 10000, used_tokens: 700 },
+            diagnostics: {
+              pressure_bp: 700,
+              stable_head_hash: 'stable-runtime-hash',
+              degraded_sources: ['Memory'],
+            },
+          },
+        })
+      });
+    }));
+
+    await window.Panels.renderRuntimeConsole();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const text = document.getElementById('panel-content').textContent;
+    expect(text).toContain('Runtime Console');
+    expect(text).toContain('Runtime State');
+    expect(text).toContain('YoloGoal');
+    expect(text).toContain('Runtime Runs');
+    expect(text).toContain('run-console-1');
+    expect(text).toContain('Runtime console should show unified state');
+    expect(text).toContain('Memory Maintenance');
+    expect(text).toContain('Review stale memory');
   });
 
   it('renders recall explain metadata in the memory panel', async () => {

@@ -7,6 +7,7 @@ window.Commands = (()=>{
     {cmd:'/theme',desc:'Switch theme',args:'dark|light|system'},
     {cmd:'/workspace',desc:'Open workspace panel'},
     {cmd:'/memory',desc:'Open memory panel'},
+    {cmd:'/runtime',desc:'Open runtime console'},
     {cmd:'/context',desc:'Open context panel'},
     {cmd:'/skills',desc:'Open skills panel'},
     {cmd:'/crons',desc:'Open crons panel'},
@@ -47,6 +48,7 @@ window.Commands = (()=>{
       case'/theme':document.documentElement.dataset.theme=args;localStorage.setItem('cowd-theme',args);UI.showToast('Theme: '+args);break;
       case'/workspace':Workspace.render();break;
       case'/memory':Panels.renderMemory();break;
+      case'/runtime':Panels.renderRuntimeConsole();break;
       case'/context':Panels.renderContext();break;
       case'/skills':Panels.renderSkills();break;
       case'/crons':Panels.renderCrons();break;
