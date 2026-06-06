@@ -4,8 +4,8 @@
 //! a write guard that prevents writing to protected memory layers (L0/L1),
 //! and a token budget that caps its execution.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::tool_orchestrator::ToolResultBudget;
 
 use memory::cognitive::CognitiveContextManager;
-use memory::{MemoryKernel, MemoryTurnContext};
-use memory::types::{MemoryLayer, MemoryCategory, MemorySource, Priority};
 use memory::project_scope::MemoryScope;
 use memory::types::AgentVisibility;
+use memory::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
+use memory::{MemoryKernel, MemoryTurnContext};
 
 pub trait SubAgentProgressCallback: Send + Sync {
     fn on_turn_complete(&self, turn: u32, max_turns: usize, tokens_used: usize);
@@ -87,7 +87,9 @@ where
             crate::session::Session::new(),
             client,
             std::sync::Arc::clone(&self.tool_executor),
-            crate::permissions::PermissionPolicy::new(crate::permissions::PermissionMode::DangerFullAccess),
+            crate::permissions::PermissionPolicy::new(
+                crate::permissions::PermissionMode::DangerFullAccess,
+            ),
             vec!["system".to_string()],
             &crate::config::RuntimeFeatureConfig::default(),
         );
@@ -299,6 +301,82 @@ impl Default for SubAgentResult {
     }
 }
 
+impl SubAgentResult {
+    pub fn to_agent_return_packet(
+        &self,
+        parent_session_id: impl Into<String>,
+        child_agent_id: impl Into<String>,
+    ) -> crate::context_runtime::AgentReturnPacket {
+        let output = self.output.trim();
+        let mut evidence = Vec::new();
+        evidence.push(format!(
+            "tools={} tokens={} memory_writes={} denied={}",
+            self.tool_call_count,
+            self.tokens_used,
+            self.memory_write_attempts,
+            self.memory_writes_denied
+        ));
+        if let Some(trace) = self
+            .reasoning_trace
+            .as_ref()
+            .filter(|trace| !trace.trim().is_empty())
+        {
+            evidence.push(format!("reasoning: {}", preview_text(trace, 240)));
+        }
+
+        let decisions = prefixed_lines(output, &["decision:", "decided:", "conclusion:"]);
+        let mut conflicts = prefixed_lines(output, &["conflict:", "risk:", "blocked:"]);
+        if !self.completed_normally {
+            conflicts.push(preview_text(output, 240));
+        }
+
+        crate::context_runtime::AgentReturnPacket {
+            parent_session_id: parent_session_id.into(),
+            child_agent_id: child_agent_id.into(),
+            result_summary: preview_text(output, 500),
+            evidence,
+            decisions,
+            conflicts,
+            memory_candidates: prefixed_lines(output, &["memory:", "remember:"]),
+            next_actions: prefixed_lines(output, &["next:", "todo:", "action:"]),
+            failed: !self.completed_normally,
+        }
+    }
+
+    pub fn to_context_item(
+        &self,
+        parent_session_id: impl Into<String>,
+        child_agent_id: impl Into<String>,
+    ) -> crate::context_runtime::ContextItem {
+        let packet = self.to_agent_return_packet(parent_session_id, child_agent_id);
+        crate::context_runtime::ContextRuntimeKernel::agent_return_item(&packet)
+    }
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        normalized
+    } else {
+        normalized.chars().take(max_chars).collect::<String>() + "..."
+    }
+}
+
+fn prefixed_lines(text: &str, prefixes: &[&str]) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            prefixes.iter().find_map(|prefix| {
+                lower
+                    .strip_prefix(prefix)
+                    .map(|_| trimmed[prefix.len()..].trim().to_string())
+            })
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // SubAgentError
 // ---------------------------------------------------------------------------
@@ -498,8 +576,7 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
     pub fn build_result(&self, output: String) -> SubAgentResult {
         // Unregister from the global agent directory on first result build.
         if self.registered.swap(false, Ordering::SeqCst) {
-            memory::agent_directory::AgentDirectory::global()
-                .unregister(&self.agent_id);
+            memory::agent_directory::AgentDirectory::global().unregister(&self.agent_id);
         }
 
         if let Some(ref m) = self.parent_memory {
@@ -513,12 +590,8 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
         if let Some(ref rep_mgr) = self.reputation_manager {
             let quality = if completed_normally { 0.85 } else { 0.4 };
             let domains: Vec<String> = self.config.capabilities.clone();
-            let _ = rep_mgr.record_completion(
-                &self.agent_id,
-                quality,
-                completed_normally,
-                &domains,
-            );
+            let _ =
+                rep_mgr.record_completion(&self.agent_id, quality, completed_normally, &domains);
 
             // P9.1: Sync reputation to AgentDirectory for TeamDiscovery consumption.
             if let Ok(Some(metrics)) = rep_mgr.get(&self.agent_id) {
@@ -552,7 +625,9 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
 
     /// Get remaining token budget.
     pub fn remaining_budget(&self) -> usize {
-        self.config.budget_tokens.saturating_sub(self.tokens_consumed)
+        self.config
+            .budget_tokens
+            .saturating_sub(self.tokens_consumed)
     }
 
     /// Get remaining turns.
@@ -566,10 +641,7 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
     ///
     /// After completion, results are shared with the parent agent via
     /// L4 `team_remember` if a parent memory manager is configured.
-    pub async fn run_loop_async(
-        &mut self,
-        initial_prompt: &str,
-    ) -> SubAgentResult {
+    pub async fn run_loop_async(&mut self, initial_prompt: &str) -> SubAgentResult {
         use crate::permissions::SharedPrompter;
 
         let mut output_parts: Vec<String> = Vec::new();
@@ -602,14 +674,18 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
 
         // A2: Inject available peer agents from AgentDirectory into the system prompt.
         if self.config.inject_peer_context {
-            let active_agents = memory::agent_directory::AgentDirectory::global()
-                .list_active();
-            let peers: Vec<String> = active_agents.iter()
+            let active_agents = memory::agent_directory::AgentDirectory::global().list_active();
+            let peers: Vec<String> = active_agents
+                .iter()
                 .filter(|a| a.agent_id != self.agent_id)
-                .map(|a| format!("  - {} (role: {}, capabilities: {:?})",
-                    &a.agent_id[..std::cmp::min(8, a.agent_id.len())],
-                    a.role,
-                    a.capabilities))
+                .map(|a| {
+                    format!(
+                        "  - {} (role: {}, capabilities: {:?})",
+                        &a.agent_id[..std::cmp::min(8, a.agent_id.len())],
+                        a.role,
+                        a.capabilities
+                    )
+                })
                 .collect();
             if !peers.is_empty() {
                 current_prompt = format!(
@@ -633,7 +709,11 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             }
 
             let prompter = SharedPrompter::none();
-            let summary = match self.runtime.run_turn_async(&current_prompt, &prompter).await {
+            let summary = match self
+                .runtime
+                .run_turn_async(&current_prompt, &prompter)
+                .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("SubAgent turn failed: {}", e);
@@ -696,20 +776,22 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
                 .iter()
                 .flat_map(|msg| &msg.blocks)
                 .filter_map(|block| match block {
-                    crate::session::ContentBlock::ToolResult { tool_name, output, .. } => {
-                        Some(format!(
-                            "Tool {} returned: {}",
-                            tool_name,
-                            truncate_str(output, 500)
-                        ))
-                    }
+                    crate::session::ContentBlock::ToolResult {
+                        tool_name, output, ..
+                    } => Some(format!(
+                        "Tool {} returned: {}",
+                        tool_name,
+                        truncate_str(output, 500)
+                    )),
                     _ => None,
                 })
                 .collect();
 
             if !tool_outputs.is_empty() {
-                current_prompt =
-                    format!("Continue based on tool results:\n{}", tool_outputs.join("\n"));
+                current_prompt = format!(
+                    "Continue based on tool results:\n{}",
+                    tool_outputs.join("\n")
+                );
             } else {
                 break;
             }
@@ -721,12 +803,7 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             let task_desc = self.config.task_description.clone();
             let output_snippet = truncate_str(&final_output, 2000);
             let memory_ctx = self.memory_turn_context();
-            let _ = team_remember_result(
-                mem,
-                &memory_ctx,
-                &task_desc,
-                &output_snippet,
-            ).await;
+            let _ = team_remember_result(mem, &memory_ctx, &task_desc, &output_snippet).await;
         }
 
         // P9.1: Record completion metrics for reputation tracking.
@@ -734,12 +811,7 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             let quality = if completed_normally { 0.85 } else { 0.4 };
             let on_time = completed_normally;
             let domains: Vec<String> = self.config.capabilities.clone();
-            let _ = rep_mgr.record_completion(
-                &self.agent_id,
-                quality,
-                on_time,
-                &domains,
-            );
+            let _ = rep_mgr.record_completion(&self.agent_id, quality, on_time, &domains);
 
             // P9.1: Sync reputation to AgentDirectory for TeamDiscovery consumption.
             if let Ok(Some(metrics)) = rep_mgr.get(&self.agent_id) {
@@ -844,8 +916,8 @@ async fn team_remember_result(
     task_description: &str,
     result_output: &str,
 ) {
-    use memory::types::{MemoryEntry, MemoryId};
     use chrono::Utc;
+    use memory::types::{MemoryEntry, MemoryId};
 
     let entry = MemoryEntry {
         id: MemoryId::new_v4(),
@@ -888,8 +960,8 @@ async fn team_remember_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::pin::Pin;
     use futures::stream::Stream;
+    use std::pin::Pin;
 
     struct MockApiClient;
 
@@ -897,9 +969,21 @@ mod tests {
         fn stream(
             &mut self,
             _request: crate::conversation::ApiRequest,
-        ) -> Pin<Box<dyn Stream<Item = Result<crate::conversation::AssistantEvent, crate::conversation::RuntimeError>> + Send + '_>> {
+        ) -> Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<
+                            crate::conversation::AssistantEvent,
+                            crate::conversation::RuntimeError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
             Box::pin(futures::stream::iter(vec![
-                Ok(crate::conversation::AssistantEvent::TextDelta("mock".to_string())),
+                Ok(crate::conversation::AssistantEvent::TextDelta(
+                    "mock".to_string(),
+                )),
                 Ok(crate::conversation::AssistantEvent::MessageStop),
             ]))
         }
@@ -908,12 +992,17 @@ mod tests {
     struct MockToolExecutor;
 
     impl crate::conversation::ToolExecutor for MockToolExecutor {
-        fn execute(&self, _tool_name: &str, _input: &str) -> Result<String, crate::conversation::ToolError> {
+        fn execute(
+            &self,
+            _tool_name: &str,
+            _input: &str,
+        ) -> Result<String, crate::conversation::ToolError> {
             Ok("mock result".to_string())
         }
     }
 
-    fn make_dummy_runtime() -> crate::conversation::ConversationRuntime<MockApiClient, MockToolExecutor> {
+    fn make_dummy_runtime()
+    -> crate::conversation::ConversationRuntime<MockApiClient, MockToolExecutor> {
         use crate::permissions::{PermissionMode, PermissionPolicy};
         use crate::session::Session;
 
@@ -934,6 +1023,56 @@ mod tests {
         assert_eq!(config.write_source, "SubAgent");
         assert_eq!(config.model, None);
         assert_eq!(config.tool_mode, SubAgentToolMode::FullToolSet);
+    }
+
+    #[test]
+    fn sub_agent_result_converts_to_context_return_packet() {
+        let result = SubAgentResult {
+            output:
+                "Decision: keep DB sessions\nMemory: JSONL is deprecated\nNext: add migration UI"
+                    .to_string(),
+            tool_call_count: 3,
+            tokens_used: 1200,
+            reasoning_trace: Some("checked session store and API routes".to_string()),
+            ..SubAgentResult::default()
+        };
+
+        let packet = result.to_agent_return_packet("parent-session", "reviewer");
+
+        assert_eq!(packet.parent_session_id, "parent-session");
+        assert_eq!(packet.child_agent_id, "reviewer");
+        assert!(!packet.failed);
+        assert_eq!(packet.decisions, vec!["keep DB sessions"]);
+        assert_eq!(packet.memory_candidates, vec!["JSONL is deprecated"]);
+        assert_eq!(packet.next_actions, vec!["add migration UI"]);
+        assert!(packet.evidence.iter().any(|line| line.contains("tools=3")));
+    }
+
+    #[test]
+    fn sub_agent_failed_result_becomes_warning_context_item() {
+        let result = SubAgentResult {
+            output: "Risk: missing fixture\nCould not complete".to_string(),
+            completed_normally: false,
+            ..SubAgentResult::default()
+        };
+
+        let item = result.to_context_item("parent-session", "tester");
+
+        assert_eq!(
+            item.source,
+            crate::context_runtime::ContextSourceKind::AgentPeer
+        );
+        assert_eq!(item.role, crate::context_runtime::ContextRole::Warning);
+        assert_eq!(
+            item.authority,
+            crate::context_runtime::ContextAuthority::Agent
+        );
+        assert_eq!(
+            item.visibility,
+            crate::context_runtime::ContextVisibility::Shared
+        );
+        assert!(item.content.contains("tester"));
+        assert!(item.content.contains("missing fixture"));
     }
 
     #[test]
