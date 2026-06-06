@@ -45,6 +45,8 @@ check_no_test_tmux() {
 main() {
   cd "$ROOT"
 
+  run scripts/context_runtime_lean_spike.sh
+  run cargo test -p runtime agent_collaboration -- --nocapture
   run cargo test -p runtime context_runtime -- --nocapture
   run cargo test -p cowd-memory maintenance -- --nocapture
   run cargo test -p cowd-cli session_kernel -- --nocapture
