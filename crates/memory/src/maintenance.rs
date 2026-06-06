@@ -402,4 +402,31 @@ mod tests {
             .unwrap()
             .is_empty());
     }
+
+    #[test]
+    fn large_scan_respects_candidate_cap() {
+        let entries = (0..2_000)
+            .map(|index| {
+                let mut item = entry(
+                    &format!("Old decision {index}"),
+                    "Historical implementation note",
+                );
+                item.staleness = 0.99;
+                item
+            })
+            .collect::<Vec<_>>();
+
+        let candidates = scan_maintenance_candidates(
+            &entries,
+            &MaintenanceScanConfig {
+                max_candidates: 25,
+                ..MaintenanceScanConfig::default()
+            },
+        );
+
+        assert_eq!(candidates.len(), 25);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.kind == MaintenanceCandidateKind::Stale));
+    }
 }

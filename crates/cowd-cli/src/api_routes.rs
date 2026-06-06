@@ -5965,6 +5965,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_maintenance_rejects_invalid_status_filter() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/maintenance?status=unknown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["degraded_reason"], "memory not configured");
+
+        let dir = std::env::temp_dir().join(format!(
+            "cowd-api-maintenance-invalid-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = Arc::new(
+            CognitiveContextManager::new(test_memory_config(&dir.join("memory.db")))
+                .await
+                .unwrap(),
+        );
+        let app = api_router(test_state_with_memory(manager));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/maintenance?status=unknown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn memory_recall_explain_reports_source_mode_and_score() {
         let tmp = std::env::temp_dir().join(format!("cowd-api-memory-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
