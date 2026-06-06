@@ -43,12 +43,13 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::context_runtime::{
     ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
-    ContextMode, ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
-    ContextVisibility, ResumeContextPacket, ToolTracePacket, ToolTraceStatus,
+    ContextMode, ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel,
+    ContextSourceKind, ContextVisibility, ResumeContextPacket, ToolTracePacket, ToolTraceStatus,
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
+use crate::runtime_control::{RuntimeControlPolicy, TaskComplexityInput, TaskComplexityProfile};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
@@ -1068,30 +1069,11 @@ where
     }
 
     /// Determine whether the current user message warrants multi-agent collaboration.
-    ///
-    /// Uses a simple keyword heuristic; can be upgraded to LLM-based classification.
     fn should_use_collaboration(&self, user_message: &str) -> bool {
-        let multi_step_keywords = [
-            "multi-step",
-            "parallel",
-            "refactor",
-            "重构",
-            "migrate",
-            "迁移",
-            "deploy",
-            "部署",
-            "analyze",
-            "分析",
-            "implement",
-            "实现",
-        ];
-        let lower = user_message.to_lowercase();
-        multi_step_keywords.iter().any(|k| lower.contains(k))
-            || user_message
-                .split(|c: char| c.is_ascii_punctuation() || c == '\n')
-                .filter(|s| !s.trim().is_empty())
-                .count()
-                > 5
+        RuntimeControlPolicy::default().should_collaborate(&TaskComplexityInput::new(
+            user_message,
+            self.context_profile(),
+        ))
     }
 
     /// Infer required capability keywords from a task description.
@@ -1342,10 +1324,17 @@ where
             .await
             .push_user_text(user_input.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let user_sequence = self.session().messages.len().wrapping_sub(1);
         self.dual_write_message(
             &ConversationMessage::user_text(user_input.clone()),
-            self.session().messages.len().wrapping_sub(1),
+            user_sequence,
         );
+        let control_policy = RuntimeControlPolicy::default();
+        let complexity = control_policy.profile_task(&TaskComplexityInput::new(
+            user_input.clone(),
+            self.context_profile(),
+        ));
+        self.record_runtime_policy_decision(&complexity, user_sequence);
 
         let mut effective_system_prompt = self.prepare_memory_context(&user_input).await;
 
@@ -3059,6 +3048,62 @@ where
             });
         }
     }
+
+    fn record_runtime_policy_decision(&self, profile: &TaskComplexityProfile, sequence: usize) {
+        if let Some(ref cowd) = self.cowd_bus {
+            cowd.emit(crate::cowd_event::CowdEvent::RuntimePolicyDecision {
+                summary: crate::cowd_event::RuntimePolicyDecisionSummary {
+                    level: format!("{:?}", profile.level),
+                    score: profile.score,
+                    recommended_profile: format!("{:?}", profile.recommended_profile),
+                    agent_mode: format!("{:?}", profile.recommended_agent_mode),
+                    requires_review: profile.requires_review,
+                    signal_count: profile.signals.len(),
+                },
+            });
+        }
+
+        let Some(ref store) = self.session_store else {
+            return;
+        };
+        let session_id = self.session().session_id;
+        let payload = serde_json::json!({
+            "complexity": {
+                "level": format!("{:?}", profile.level),
+                "score": profile.score,
+                "signals": profile.signals,
+            },
+            "recommended_profile": format!("{:?}", profile.recommended_profile),
+            "agent_mode": format!("{:?}", profile.recommended_agent_mode),
+            "requires_review": profile.requires_review,
+        });
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let mut event = memory::RuntimeEvent::new(
+            session_id.clone(),
+            sequence,
+            memory::RuntimeEventScope::Policy,
+            "runtime.policy.decided",
+            payload,
+            created_at_ms,
+        );
+        event.status = Some("completed".to_string());
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            match event.to_session_event() {
+                Ok(record) => {
+                    if let Err(error) = store.append_event(&record).await {
+                        tracing::warn!(%error, session_id, sequence, "runtime policy event append failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, session_id, sequence, "runtime policy event serialization failed");
+                }
+            }
+        });
+    }
 }
 
 fn message_appended_session_event(
@@ -3338,16 +3383,16 @@ mod tests {
     };
     use crate::SubAgentConfig;
     use crate::ToolError;
-    use crate::compact::CompactionConfig;
-    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::agent_collaboration::{
         AgentTeam, CollaborationContextResult, CollaborationOps, CollaborationReviewPacket,
         CollaborationScorecard, CollaborationTask, SubTask,
     };
     use crate::agent_workgraph::AgentWorkGraph;
+    use crate::compact::CompactionConfig;
+    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::context_runtime::{
-        ContextAuthority, ContextItem, ContextMode, ContextProfile, ContextRole,
-        ContextSourceKind, ResumeContextPacket, ResumeContextSource,
+        ContextAuthority, ContextItem, ContextMode, ContextProfile, ContextRole, ContextSourceKind,
+        ResumeContextPacket, ResumeContextSource,
     };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
@@ -4175,7 +4220,7 @@ mod tests {
                 .expect("turn should succeed");
 
             for _ in 0..20 {
-                if store.get_events(&session_id, 0).await.unwrap().len() >= 2 {
+                if store.get_events(&session_id, 0).await.unwrap().len() >= 3 {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -4185,16 +4230,33 @@ mod tests {
             let events = store.get_events(&session_id, 0).await.unwrap();
 
             assert_eq!(messages.len(), 2);
-            assert_eq!(events.len(), 2);
-            assert_eq!(events[0].event_type, "message_appended");
-            assert_eq!(events[0].sequence, 0);
-            assert_eq!(events[1].sequence, 1);
+            assert!(events.len() >= 3);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.event_type == memory::RUNTIME_EVENT_TYPE)
+            );
 
+            let user_event = events
+                .iter()
+                .find(|event| event.event_type == "message_appended" && event.sequence == 0)
+                .expect("user message event");
             let event_json: serde_json::Value =
-                serde_json::from_str(&events[0].event_json).expect("event json");
+                serde_json::from_str(&user_event.event_json).expect("event json");
             assert_eq!(event_json["role"], "user");
             assert_eq!(event_json["message"]["role"], "user");
             assert_eq!(event_json["message"]["blocks"][0]["text"], "persist events");
+
+            let policy = events
+                .iter()
+                .find(|event| event.event_type == memory::RUNTIME_EVENT_TYPE)
+                .and_then(|event| memory::RuntimeEvent::from_session_event(event).ok())
+                .expect("runtime policy event");
+            assert_eq!(policy.scope, memory::RuntimeEventScope::Policy);
+            assert_eq!(policy.kind, "runtime.policy.decided");
+            assert_eq!(policy.payload["complexity"]["level"], "Simple");
+            assert_eq!(policy.payload["agent_mode"], "Off");
+            assert_eq!(policy.payload["requires_review"], false);
         });
     }
 

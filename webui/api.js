@@ -209,6 +209,9 @@ window.Api = (()=>{
       if(o.limit!==undefined)params.set('limit',o.limit);
       return req('GET','/api/runtime/timeline?'+params.toString());
     },
+    async runtimeEffectiveConfig(){
+      return req('GET','/api/runtime/config/effective');
+    },
     async contextEnvelope(envelopeId){
       return req('GET','/api/context/'+encodeURIComponent(envelopeId));
     },

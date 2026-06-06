@@ -51,6 +51,7 @@ pub mod platform;
 mod policy_engine;
 mod prompt;
 pub mod recovery_recipes;
+pub mod runtime_control;
 mod remote;
 pub mod sandbox;
 mod session;
@@ -234,7 +235,9 @@ pub use session::{
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use profile::{Profile, ProfileManager, ProfileMeta};
-pub use cowd_event::{CowdEvent, CowdEventBus, RuntimeWorkGraphSummary};
+pub use cowd_event::{
+    CowdEvent, CowdEventBus, RuntimePolicyDecisionSummary, RuntimeWorkGraphSummary,
+};
 pub use stale_base::{
     check_base_commit, format_stale_base_warning, read_cowd_base_file, resolve_expected_base,
     BaseCommitSource, BaseCommitState,
@@ -276,6 +279,11 @@ pub use context_runtime::{
     ContextRuntimeKernel, ContextSourceKind, ContextVisibility,
     ResumeContextPacket, ResumeContextSource, StableHeadComparison, ToolTracePacket,
     ToolTraceStatus, WorkspacePacket,
+};
+pub use runtime_control::{
+    AgentControlPolicy, AgentMode, ComplexityLevel, ComplexitySignal, ComplexityThresholds,
+    ContextControlPolicy, MemoryControlPolicy, ObservabilityPolicy, PermissionControlPolicy,
+    RuntimeControlPolicy, TaskComplexityInput, TaskComplexityProfile, TaskControlPolicy,
 };
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

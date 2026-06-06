@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use super::{AppState, ErrorResponse};
 use memory::RuntimeEvent;
+use runtime::RuntimeControlPolicy;
 
 #[derive(Deserialize)]
 pub(super) struct RuntimeTimelineParams {
@@ -69,6 +70,18 @@ pub(super) async fn get_runtime_timeline(
         "degraded_reason": null,
         "workgraph_summary": workgraph_summary,
     })))
+}
+
+pub(super) async fn get_runtime_effective_config(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<Value> {
+    Json(serde_json::json!({
+        "source": "default",
+        "workspace_root": state.workspace_root,
+        "profile_id": state.profile_id,
+        "control_policy": RuntimeControlPolicy::default(),
+        "warnings": [],
+    }))
 }
 
 fn workgraph_summary(events: &[RuntimeEvent]) -> Value {

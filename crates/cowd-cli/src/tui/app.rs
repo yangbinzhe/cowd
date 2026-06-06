@@ -199,6 +199,7 @@ pub struct App {
     pub last_drawn_version: u64,
     pub context_window: u64,
     pub latest_context_envelope: Option<runtime::ContextEnvelope>,
+    pub latest_runtime_policy: Option<runtime::RuntimePolicyDecisionSummary>,
     pub latest_workgraph_summary: Option<runtime::RuntimeWorkGraphSummary>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -396,6 +397,7 @@ impl App {
             last_drawn_version: u64::MAX,
             context_window: 0,
             latest_context_envelope: None,
+            latest_runtime_policy: None,
             latest_workgraph_summary: None,
             input_tokens: 0,
             output_tokens: 0,
@@ -1027,6 +1029,10 @@ impl App {
             }
             CowdEvent::ContextEnvelope { envelope } => {
                 self.latest_context_envelope = Some(envelope);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+            CowdEvent::RuntimePolicyDecision { summary } => {
+                self.latest_runtime_policy = Some(summary);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
             CowdEvent::WorkGraphSummary { summary } => {

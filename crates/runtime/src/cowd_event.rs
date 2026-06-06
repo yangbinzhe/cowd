@@ -30,7 +30,10 @@ impl RuntimeWorkGraphSummary {
             .count();
         Self {
             graph_id: Some(graph.graph_id.clone()),
-            board_id: graph.board_id.clone().or_else(|| Some(packet.board_id.clone())),
+            board_id: graph
+                .board_id
+                .clone()
+                .or_else(|| Some(packet.board_id.clone())),
             status: format!("{:?}", graph.status).to_lowercase(),
             agent_tasks,
             memory_candidates: packet.maintenance_candidates.len(),
@@ -40,6 +43,16 @@ impl RuntimeWorkGraphSummary {
             complementarity_score: Some(packet.scorecard.complementarity_score),
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuntimePolicyDecisionSummary {
+    pub level: String,
+    pub score: u16,
+    pub recommended_profile: String,
+    pub agent_mode: String,
+    pub requires_review: bool,
+    pub signal_count: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -88,6 +101,9 @@ pub enum CowdEvent {
     ContextWindow(u64),
     ContextEnvelope {
         envelope: crate::context_runtime::ContextEnvelope,
+    },
+    RuntimePolicyDecision {
+        summary: RuntimePolicyDecisionSummary,
     },
     WorkGraphSummary {
         summary: RuntimeWorkGraphSummary,

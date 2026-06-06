@@ -29,8 +29,8 @@ use runtime::approval_gate::SmartApprovalGate;
 use runtime::permission_enforcer::{ApprovalPersistence, ApprovalVerdict};
 use runtime::{
     ApprovalConfig, ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem,
-    ContextMode, ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
-    ContextVisibility, ResumeContextPacket, ResumeContextSource,
+    ContextMode, ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel,
+    ContextSourceKind, ContextVisibility, ResumeContextPacket, ResumeContextSource,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -57,7 +57,7 @@ use memory::{
 };
 
 mod runtime_routes;
-use runtime_routes::get_runtime_timeline;
+use runtime_routes::{get_runtime_effective_config, get_runtime_timeline};
 
 // ── Shared application state ───────────────────────────────────
 
@@ -181,6 +181,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
         .route("/api/context/current", get(context_current_handler))
         .route("/api/runtime/timeline", get(get_runtime_timeline))
+        .route(
+            "/api/runtime/config/effective",
+            get(get_runtime_effective_config),
+        )
         .route(
             "/api/context/:envelope_id",
             get(get_context_envelope_handler),
@@ -933,7 +937,9 @@ async fn context_current_handler(
         identity,
         intent: query,
         stable_head: vec!["cowd-context-runtime:v0.8.13".to_string()],
-        runtime_header: vec![format!("session:{session_id} agent:api profile:{profile:?}")],
+        runtime_header: vec![format!(
+            "session:{session_id} agent:api profile:{profile:?}"
+        )],
         dynamic_items,
         omitted: omitted_items,
         total_budget_tokens: 8_000,
@@ -1473,10 +1479,7 @@ async fn send_message(
     let run_id = uuid::Uuid::new_v4().to_string();
     let run_started_at_ms = current_time_ms();
     let active_task = state.task_kernel.current();
-    let run_profile = if active_task
-        .as_ref()
-        .is_some_and(|task| task.yolo_mode)
-    {
+    let run_profile = if active_task.as_ref().is_some_and(|task| task.yolo_mode) {
         ContextProfile::YoloGoal
     } else {
         ContextProfile::MainTurn
@@ -3342,11 +3345,7 @@ fn runtime_run_tree_summary(runs: &[serde_json::Value]) -> serde_json::Value {
                 Some(parent_id) => !parents.contains_key(parent_id),
                 None => true,
             };
-            if is_root {
-                Some(run_id.clone())
-            } else {
-                None
-            }
+            if is_root { Some(run_id.clone()) } else { None }
         })
         .collect::<Vec<_>>();
     let root_count = roots.len();
@@ -3585,15 +3584,17 @@ async fn get_context_recommendation_stats(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("acknowledged");
-        let entry = grouped.entry(recommendation.to_string()).or_insert_with(|| {
-            serde_json::json!({
-                "recommendation": recommendation,
-                "count": 0_u64,
-                "actions": {},
-                "latest_envelope_id": null,
-                "latest_created_at_ms": 0_u64,
-            })
-        });
+        let entry = grouped
+            .entry(recommendation.to_string())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "recommendation": recommendation,
+                    "count": 0_u64,
+                    "actions": {},
+                    "latest_envelope_id": null,
+                    "latest_created_at_ms": 0_u64,
+                })
+            });
         let count = entry["count"].as_u64().unwrap_or(0) + 1;
         entry["count"] = serde_json::json!(count);
         let action_count = entry["actions"][action].as_u64().unwrap_or(0) + 1;
@@ -3633,7 +3634,11 @@ async fn resolve_evidence_ref_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(reference) = params.get("ref").map(|value| value.trim()).filter(|value| !value.is_empty()) else {
+    let Some(reference) = params
+        .get("ref")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -3834,12 +3839,14 @@ async fn resolve_tool_evidence(
                     .get("tool_use_id")
                     .and_then(|value| value.as_str())
                     .is_some_and(|id| id == tool_id);
-            id_matches.then(|| serde_json::json!({
-                "type": event.event_type,
-                "sequence": event.sequence,
-                "created_at_ms": event.created_at_ms,
-                "payload": payload,
-            }))
+            id_matches.then(|| {
+                serde_json::json!({
+                    "type": event.event_type,
+                    "sequence": event.sequence,
+                    "created_at_ms": event.created_at_ms,
+                    "payload": payload,
+                })
+            })
         })
         .collect::<Vec<_>>();
 
@@ -5286,8 +5293,14 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["workgraph_summary"]["count"], 1);
-        assert_eq!(json["workgraph_summary"]["latest"]["graph_id"], "graph-summary");
-        assert_eq!(json["workgraph_summary"]["latest"]["board_id"], "board-summary");
+        assert_eq!(
+            json["workgraph_summary"]["latest"]["graph_id"],
+            "graph-summary"
+        );
+        assert_eq!(
+            json["workgraph_summary"]["latest"]["board_id"],
+            "board-summary"
+        );
         assert_eq!(json["workgraph_summary"]["latest"]["completion_rate"], 1.0);
         assert_eq!(json["workgraph_summary"]["agent_tasks"], 1);
         assert_eq!(json["workgraph_summary"]["memory_candidates"], 1);
@@ -5313,6 +5326,32 @@ mod tests {
         assert_eq!(json["degraded"], true);
         assert_eq!(json["events"].as_array().unwrap().len(), 0);
         assert_eq!(json["workgraph_summary"]["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_effective_config_exposes_default_control_policy() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/config/effective")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source"], "default");
+        assert_eq!(json["control_policy"]["enabled"], true);
+        assert_eq!(json["control_policy"]["agent"]["max_parallel_agents"], 4);
+        assert_eq!(
+            json["control_policy"]["task"]["thresholds"]["critical_min"],
+            80
+        );
+        assert!(json["warnings"].as_array().unwrap().is_empty());
     }
 
     fn test_context_envelope(
@@ -5556,12 +5595,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["session_id"], session_id);
         assert_eq!(json["total"], 2);
-        assert_eq!(json["recommendations"][0]["recommendation"], "Start a handoff");
-        assert_eq!(json["recommendations"][0]["count"], 2);
         assert_eq!(
-            json["recommendations"][0]["actions"]["acknowledged"],
-            1
+            json["recommendations"][0]["recommendation"],
+            "Start a handoff"
         );
+        assert_eq!(json["recommendations"][0]["count"], 2);
+        assert_eq!(json["recommendations"][0]["actions"]["acknowledged"], 1);
         assert_eq!(json["recommendations"][0]["actions"]["applied"], 1);
         assert_eq!(json["recommendations"][0]["latest_envelope_id"], "env-1");
     }
@@ -5792,10 +5831,7 @@ mod tests {
         assert_eq!(json["lean_probe"]["envelope_id"], json["envelope"]["id"]);
         assert_eq!(json["lean_probe"]["pressure_level"], "Nominal");
         assert_eq!(json["lean_probe"]["degradation_path"], "SourceFallback");
-        assert_eq!(
-            json["policy_decision"]["action"],
-            "PreferOrientationPacket"
-        );
+        assert_eq!(json["policy_decision"]["action"], "PreferOrientationPacket");
         assert_eq!(
             json["policy_decision"]["stable_head_hash"],
             json["lean_probe"]["stable_head_hash"]
@@ -5820,10 +5856,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["envelope"]["profile"], "YoloGoal");
         assert_eq!(json["envelope"]["identity"]["mode"], "YoloGoal");
-        assert_eq!(
-            json["envelope"]["budget"]["leases"][0]["source"],
-            "Task"
-        );
+        assert_eq!(json["envelope"]["budget"]["leases"][0]["source"], "Task");
         assert!(
             json["envelope"]["assembled"]["runtime_header"][0]
                 .as_str()
@@ -5931,7 +5964,10 @@ mod tests {
         assert_eq!(json["runs"][1]["run"]["status"], "completed");
         assert_eq!(json["runs"][1]["run"]["context_envelope_id"], "ctx-1");
         assert_eq!(json["runs"][1]["run"]["duration_ms"], 15);
-        assert_eq!(json["runs"][1]["run"]["refs"][0]["type"], "context_envelope");
+        assert_eq!(
+            json["runs"][1]["run"]["refs"][0]["type"],
+            "context_envelope"
+        );
         assert_eq!(json["tree"]["roots"][0], "run-1");
         assert_eq!(json["tree"]["children"]["run-1"][0], "agent-run-1");
         assert_eq!(json["tree"]["summary"]["span_count"], 2);
@@ -6293,10 +6329,8 @@ mod tests {
 
     #[tokio::test]
     async fn memory_maintenance_scan_and_transition() {
-        let dir = std::env::temp_dir().join(format!(
-            "cowd-api-maintenance-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cowd-api-maintenance-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let manager = Arc::new(
             CognitiveContextManager::new(test_memory_config(&dir.join("memory.db")))

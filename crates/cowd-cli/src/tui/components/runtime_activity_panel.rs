@@ -16,6 +16,11 @@ pub struct RuntimeActivityPanel {
     degradation_path: String,
     policy_action: String,
     policy_reason: String,
+    runtime_policy_level: String,
+    runtime_policy_score: u16,
+    runtime_policy_agent: String,
+    runtime_policy_review: bool,
+    runtime_policy_signals: usize,
     selected_count: usize,
     omitted_count: usize,
     stable_hash: String,
@@ -72,6 +77,19 @@ impl RuntimeActivityPanel {
             self.runtime_hash = "n/a".to_string();
             self.dynamic_hash = "n/a".to_string();
         }
+        if let Some(policy) = &app.latest_runtime_policy {
+            self.runtime_policy_level = policy.level.clone();
+            self.runtime_policy_score = policy.score;
+            self.runtime_policy_agent = policy.agent_mode.clone();
+            self.runtime_policy_review = policy.requires_review;
+            self.runtime_policy_signals = policy.signal_count;
+        } else {
+            self.runtime_policy_level = "Simple".to_string();
+            self.runtime_policy_score = 0;
+            self.runtime_policy_agent = "Off".to_string();
+            self.runtime_policy_review = false;
+            self.runtime_policy_signals = 0;
+        }
         if let Some(summary) = &app.latest_workgraph_summary {
             self.workgraph_status = summary.status.clone();
             self.workgraph_graph_id = summary
@@ -115,18 +133,27 @@ impl Component for RuntimeActivityPanel {
         let mut lines = Vec::new();
         lines.push(Line::from(Span::styled(
             "Runtime Activity",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
             Span::styled("Session:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(short_id(&self.session_id), Style::default().fg(Color::White)),
+            Span::styled(
+                short_id(&self.session_id),
+                Style::default().fg(Color::White),
+            ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("Profile:  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 &self.profile,
-                Style::default().fg(if self.yolo_mode { Color::Yellow } else { Color::White }),
+                Style::default().fg(if self.yolo_mode {
+                    Color::Yellow
+                } else {
+                    Color::White
+                }),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -148,15 +175,48 @@ impl Component for RuntimeActivityPanel {
         lines.push(Line::from(vec![
             Span::styled("Context:  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("selected {} omitted {}", self.selected_count, self.omitted_count),
+                format!(
+                    "selected {} omitted {}",
+                    self.selected_count, self.omitted_count
+                ),
                 Style::default().fg(Color::White),
             ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("Policy:   ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} - {}", self.policy_action, preview(&self.policy_reason, 72)),
+                format!(
+                    "{} - {}",
+                    self.policy_action,
+                    preview(&self.policy_reason, 72)
+                ),
                 Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Control:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} score {} agent {} review {} signals {}",
+                    self.runtime_policy_level,
+                    self.runtime_policy_score,
+                    self.runtime_policy_agent,
+                    if self.runtime_policy_review {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                    self.runtime_policy_signals
+                ),
+                Style::default().fg(if self.runtime_policy_review {
+                    Color::Yellow
+                } else if self.runtime_policy_agent == "Parallel"
+                    || self.runtime_policy_agent == "CriticalSwarm"
+                {
+                    Color::Cyan
+                } else {
+                    Color::White
+                }),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -202,7 +262,9 @@ impl Component for RuntimeActivityPanel {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "Recent",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         if self.recent_activity.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -227,8 +289,12 @@ impl Component for RuntimeActivityPanel {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(" Runtime ");
-        ctx.frame_mut()
-            .render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+        ctx.frame_mut().render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
     }
 
     fn handle_event(&mut self, _event: &crossterm::event::Event) -> EventResult {
@@ -249,8 +315,14 @@ fn activity_label(entry: TimelineEntry) -> String {
         TimelineEntry::Message { role, content, .. } => {
             format!("{role}: {}", preview(&content, 64))
         }
-        TimelineEntry::Thinking { content, complete, .. } => {
-            format!("thinking{}: {}", if complete { "" } else { "*" }, preview(&content, 64))
+        TimelineEntry::Thinking {
+            content, complete, ..
+        } => {
+            format!(
+                "thinking{}: {}",
+                if complete { "" } else { "*" },
+                preview(&content, 64)
+            )
         }
         TimelineEntry::ToolCall {
             name,
@@ -261,10 +333,18 @@ fn activity_label(entry: TimelineEntry) -> String {
         } => {
             let status = exit_code
                 .map(|code| format!("exit {code}"))
-                .unwrap_or_else(|| if done { "done".to_string() } else { "running".to_string() });
+                .unwrap_or_else(|| {
+                    if done {
+                        "done".to_string()
+                    } else {
+                        "running".to_string()
+                    }
+                });
             format!("tool {name} {status}: {}", preview(&tool_preview, 48))
         }
-        TimelineEntry::SlashOutput { command, output, .. } => {
+        TimelineEntry::SlashOutput {
+            command, output, ..
+        } => {
             format!("/{command}: {}", preview(&output, 64))
         }
     }
@@ -340,6 +420,16 @@ mod tests {
                 complementarity_score: Some(0.75),
             },
         });
+        app.apply_event(runtime::CowdEvent::RuntimePolicyDecision {
+            summary: runtime::RuntimePolicyDecisionSummary {
+                level: "Complex".to_string(),
+                score: 70,
+                recommended_profile: "Collaboration".to_string(),
+                agent_mode: "Parallel".to_string(),
+                requires_review: false,
+                signal_count: 3,
+            },
+        });
 
         let identity = runtime::ContextIdentity::main("session-runtime-123456789".to_string());
         app.latest_context_envelope = Some(runtime::ContextRuntimeKernel::build_envelope(
@@ -368,6 +458,7 @@ mod tests {
         assert!(rendered.contains("YoloGoal"));
         assert!(rendered.contains("Nominal"));
         assert!(rendered.contains("None"));
+        assert!(rendered.contains("Complex score 70 agent Parallel"));
         assert!(rendered.contains("selected 1 omitted 0"));
         assert!(rendered.contains("WorkGraph"));
         assert!(rendered.contains("completed 100% agents 2"));

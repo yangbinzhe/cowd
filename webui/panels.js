@@ -181,11 +181,30 @@ window.Panels = (()=>{
     const refs=(item.refs||[]).map(function(ref){return (ref.type||ref.ref_type||'ref')+':'+(ref.id||'')}).filter(Boolean).slice(0,3).join(' · ');
     const payload=item.payload||{};
     const score=payload.scorecard||{};
+    const complexity=(payload.complexity)||{};
+    const policyText=item.kind==='runtime.policy.decided'
+      ? 'level '+(complexity.level||'n/a')+' · score '+(complexity.score??'n/a')+' · agent '+(payload.agent_mode||'n/a')+' · review '+(payload.requires_review?'yes':'no')
+      : '';
     const scoreText=payload.board_id
       ? 'board '+payload.board_id+' · complete '+fmtPct(score.completion_rate)+' · conflicts '+fmtNumber(score.conflict_count)+' · candidates '+((payload.maintenance_candidates||[]).length)
       : '';
-    row.innerHTML='<b>'+UI.esc(item.kind||'event')+'</b><small>'+UI.esc([item.scope||'runtime','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(refs||scoreText||payload.summary||payload.error||payload.intent_preview||''))+'</em>';
+    row.innerHTML='<b>'+UI.esc(item.kind||'event')+'</b><small>'+UI.esc([item.scope||'runtime','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(policyText||refs||scoreText||payload.summary||payload.error||payload.intent_preview||''))+'</em>';
     return row;
+  }
+
+  function latestPolicyDecision(events){
+    const policyEvents=(events||[]).filter(function(item){return item&&item.kind==='runtime.policy.decided'});
+    const latest=policyEvents[policyEvents.length-1]||null;
+    const payload=(latest&&latest.payload)||{};
+    const complexity=payload.complexity||{};
+    return {
+      count: policyEvents.length,
+      level: complexity.level||'n/a',
+      score: complexity.score??'n/a',
+      agent: payload.agent_mode||'n/a',
+      review: payload.requires_review?'yes':'no',
+      signals: (complexity.signals||[]).length,
+    };
   }
 
   function summarizeWorkGraphs(events,serverSummary){
@@ -828,6 +847,7 @@ window.Panels = (()=>{
       let policyDecision=null;
       let diagnostics={};
       let budget={};
+      let controlPolicy=null;
       try{
         const ctx=await Api.currentContext(opts);
         envelope=(ctx&&ctx.envelope)||{};
@@ -838,6 +858,10 @@ window.Panels = (()=>{
       }catch(e){
         contextSec.appendChild(UI.el('div','panel-empty','Context unavailable'));
       }
+      try{
+        const cfg=await Api.runtimeEffectiveConfig();
+        controlPolicy=(cfg&&cfg.control_policy)||null;
+      }catch(e){}
 
       const metrics=UI.el('div','memory-metrics');
       metrics.appendChild(renderMemoryMetric('profile',envelope.profile||profile.value,'mode'));
@@ -846,6 +870,10 @@ window.Panels = (()=>{
       metrics.appendChild(renderMemoryMetric('omitted',(envelope.omitted||[]).length,'items'));
       metrics.appendChild(renderMemoryMetric('used',budget.used_tokens||0,'tokens'));
       metrics.appendChild(renderMemoryMetric('stable',shortHash(diagnostics.stable_head_hash),'hash'));
+      if(controlPolicy){
+        const agent=controlPolicy.agent||{};
+        metrics.appendChild(renderMemoryMetric('agents',agent.max_parallel_agents??0,'max'));
+      }
       summary.appendChild(metrics);
       summary.appendChild(renderLeanProbe(leanProbe,policyDecision));
       if((diagnostics.degraded_sources||[]).length){
@@ -885,6 +913,15 @@ window.Panels = (()=>{
           if(timeline.degraded_reason)timelineSec.appendChild(UI.el('div','panel-empty',timeline.degraded_reason));
           if(!events.length)timelineSec.appendChild(UI.el('div','panel-empty','No runtime events'));
           timelineSec.appendChild(renderWorkGraphSummary(events,timeline.workgraph_summary));
+          const runtimePolicy=latestPolicyDecision(events);
+          if(runtimePolicy.count){
+            const policyBox=UI.el('div','agent-workgraph-summary');
+            policyBox.innerHTML='<h4>Runtime Control</h4><div class="memory-metrics"></div><small>'+UI.esc('agent '+runtimePolicy.agent+' · review '+runtimePolicy.review+' · signals '+runtimePolicy.signals)+'</small>';
+            const policyMetrics=policyBox.querySelector('.memory-metrics');
+            policyMetrics.appendChild(renderMemoryMetric('level',runtimePolicy.level,'policy'));
+            policyMetrics.appendChild(renderMemoryMetric('score',runtimePolicy.score,'complexity'));
+            timelineSec.appendChild(policyBox);
+          }
           events.slice(-12).reverse().forEach(function(item){timelineSec.appendChild(renderRuntimeTimelineItem(item))});
         }catch(e){timelineSec.appendChild(UI.el('div','panel-empty','Runtime timeline unavailable'))}
       }

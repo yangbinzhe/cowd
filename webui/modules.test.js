@@ -206,6 +206,21 @@ describe('API module', () => {
     expect(timeline.events[0].kind).toBe('ToolStart');
   });
 
+  it('runtimeEffectiveConfig reads active runtime control policy', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ control_policy: { enabled: true } })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const config = await window.Api.runtimeEffectiveConfig();
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/runtime/config/effective');
+    expect(config.control_policy.enabled).toBe(true);
+  });
+
   it('resolveEvidence encodes refs and session id', async () => {
     const mockF = vi.fn(() =>
       Promise.resolve({
@@ -936,7 +951,7 @@ describe('API module', () => {
         return Promise.resolve({
           ok: true,
           json: () => Promise.resolve({
-            total: 2,
+            total: 3,
             next_seq: 12,
             degraded: false,
             workgraph_summary: {
@@ -956,6 +971,23 @@ describe('API module', () => {
               conflicts: 1,
             },
             events: [
+              {
+                kind: 'runtime.policy.decided',
+                scope: 'policy',
+                status: 'completed',
+                sequence: 10,
+                created_at_ms: 1008,
+                payload: {
+                  complexity: {
+                    level: 'Complex',
+                    score: 70,
+                    signals: [{ name: 'engineering_change' }, { name: 'verification_required' }],
+                  },
+                  agent_mode: 'Parallel',
+                  requires_review: false,
+                  recommended_profile: 'Collaboration',
+                },
+              },
               {
                 kind: 'ToolComplete',
                 scope: 'tool',
@@ -995,6 +1027,18 @@ describe('API module', () => {
                 },
               },
             ]
+          })
+        });
+      }
+      if (path.includes('/api/runtime/config/effective')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            source: 'default',
+            control_policy: {
+              enabled: true,
+              agent: { max_parallel_agents: 4 },
+            },
           })
         });
       }
@@ -1070,6 +1114,10 @@ describe('API module', () => {
     expect(text).toContain('spans');
     expect(text).toContain('run-console-1');
     expect(text).toContain('Runtime Timeline');
+    expect(text).toContain('Runtime Control');
+    expect(text).toContain('Complex');
+    expect(text).toContain('Parallel');
+    expect(text).toContain('runtime.policy.decided');
     expect(text).toContain('ToolComplete');
     expect(text).toContain('agent.workgraph.reviewed');
     expect(text).toContain('runtime_run:run-console-1');
