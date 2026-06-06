@@ -75,6 +75,7 @@ pub mod team_discovery;
 pub mod agent;
 pub mod agent_collaboration;
 pub mod agent_discussion;
+pub mod agent_workgraph;
 pub mod joint_problem_solving;
 pub mod approval_gate;
 pub mod pairing;
@@ -92,6 +93,10 @@ pub use agent_collaboration::{
     AgentTaskTrace, AgentTeam, CollaborationBoard, CollaborationOrchestrator, CollaborationOps,
     CollaborationReviewPacket, CollaborationScorecard, CollaborationTask, MemoryPulseCandidate,
     MemoryPulseKind, SharedBoardEntry, SubTask,
+};
+pub use agent_workgraph::{
+    AgentWorkGraph, WorkGraphEdge, WorkGraphEdgeKind, WorkGraphNode, WorkGraphNodeKind,
+    WorkGraphRef, WorkGraphStatus,
 };
 pub use team_discovery::{
     DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol,
