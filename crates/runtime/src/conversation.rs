@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{RwLock, Semaphore};
@@ -38,9 +38,14 @@ use crate::agent::{SubAgentConfig, SubAgentRuntime};
 use crate::agent_collaboration::CollaborationOps;
 use crate::agent_discussion::DiscussionEngine;
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    CompactionConfig, CompactionResult, compact_session, estimate_session_tokens,
 };
 use crate::config::RuntimeFeatureConfig;
+use crate::context_runtime::{
+    ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
+    ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
+    ContextVisibility,
+};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
@@ -303,6 +308,8 @@ pub struct ConversationRuntime<C, T> {
     cancellation_token: CancellationToken,
     /// T36: Tool orchestrator for result budgeting and truncation.
     tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator,
+    /// Latest assembled context envelope used by a real turn.
+    last_context_envelope: std::sync::Mutex<Option<ContextEnvelope>>,
     /// T4: Semaphore for WriteLocal tool concurrency (permits: 4).
     write_semaphore: Arc<Semaphore>,
     /// T4: Semaphore for Network tool concurrency (permits: 3).
@@ -376,7 +383,9 @@ where
                             (Some(Arc::new(mgr)), None)
                         }
                         Err(err) => {
-                            let msg = format!("Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory.");
+                            let msg = format!(
+                                "Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory."
+                            );
                             tracing::error!("{msg}");
                             (None, Some(msg))
                         }
@@ -391,17 +400,23 @@ where
                             Ok(mgr) => {
                                 mgr.set_active_agent("primary".to_string());
                                 let mgr = mgr.init_memory_sync();
-                                tracing::debug!("memory: CognitiveContextManager initialised, active_agent=primary");
+                                tracing::debug!(
+                                    "memory: CognitiveContextManager initialised, active_agent=primary"
+                                );
                                 (Some(Arc::new(mgr)), None)
                             }
                             Err(err) => {
-                                let msg = format!("Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory.");
+                                let msg = format!(
+                                    "Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory."
+                                );
                                 tracing::error!("{msg}");
                                 (None, Some(msg))
                             }
                         },
                         Err(e) => {
-                            let msg = format!("Memory system unavailable: failed to create runtime: {e}. Memory features will NOT work.");
+                            let msg = format!(
+                                "Memory system unavailable: failed to create runtime: {e}. Memory features will NOT work."
+                            );
                             tracing::error!("{msg}");
                             (None, Some(msg))
                         }
@@ -463,6 +478,7 @@ where
             fallbacks: feature_config.fallbacks().to_vec(),
             cancellation_token: CancellationToken::new(),
             tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
+            last_context_envelope: std::sync::Mutex::new(None),
             write_semaphore: Arc::new(Semaphore::new(
                 crate::tool_orchestrator::ToolSafetyCategory::WriteLocal.max_concurrency(),
             )),
@@ -499,6 +515,53 @@ where
     /// Return the current project lifecycle phase.
     pub fn phase(&self) -> &str {
         &self.project_phase
+    }
+
+    /// Return the latest context envelope assembled for an actual model turn.
+    pub fn last_context_envelope(&self) -> Option<ContextEnvelope> {
+        self.last_context_envelope
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn remember_context_envelope(&self, envelope: ContextEnvelope) {
+        if let Ok(mut guard) = self.last_context_envelope.lock() {
+            *guard = Some(envelope);
+        }
+    }
+
+    fn context_budget_tokens(&self) -> u64 {
+        if self.model_context_window > 0 {
+            u64::from(self.model_context_window)
+        } else {
+            8_000
+        }
+    }
+
+    fn build_context_envelope(
+        &self,
+        user_input: &str,
+        dynamic_items: Vec<ContextItem>,
+        omitted: Vec<ContextOmission>,
+        degraded_sources: Vec<ContextSourceKind>,
+    ) -> ContextEnvelope {
+        let session_id = self.session().session_id;
+        let identity = ContextIdentity::main(session_id.clone());
+        let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            profile: ContextProfile::from(identity.mode),
+            identity,
+            intent: user_input.to_string(),
+            stable_head: self.system_prompt.clone(),
+            runtime_header: vec![format!(
+                "session:{session_id} agent:primary profile:MainTurn"
+            )],
+            dynamic_items,
+            omitted,
+            total_budget_tokens: self.context_budget_tokens(),
+        });
+        envelope.diagnostics.degraded_sources = degraded_sources;
+        envelope
     }
 
     #[must_use]
@@ -1425,7 +1488,7 @@ where
             // Phase 2: Parallel+serial tool dispatch based on safety categories
             let mut callback_inject = None;
             {
-                use crate::tool_dispatch::{categorize, ToolRequest};
+                use crate::tool_dispatch::{ToolRequest, categorize};
                 use futures::stream::{FuturesUnordered, StreamExt};
 
                 let requests: Vec<ToolRequest> = pending_tool_uses
@@ -2000,11 +2063,7 @@ where
                         tool_name.to_string(),
                         effective_input.clone(),
                     ));
-                    if r.success {
-                        Some(r.data)
-                    } else {
-                        None
-                    }
+                    if r.success { Some(r.data) } else { None }
                 });
 
                 let start = Instant::now();
@@ -2356,6 +2415,13 @@ where
             for &layer in &CacheLayer::all() {
                 self.cached_prompt.rebuild_layer(layer, Vec::new(), 0);
             }
+            let envelope = self.build_context_envelope(
+                user_input,
+                Vec::new(),
+                Vec::new(),
+                vec![ContextSourceKind::Memory],
+            );
+            self.remember_context_envelope(envelope);
             return self.system_prompt.clone();
         };
 
@@ -2438,11 +2504,23 @@ where
                     for &layer in &CacheLayer::all() {
                         self.cached_prompt.rebuild_layer(layer, Vec::new(), 0);
                     }
+                    let omissions = packet
+                        .omitted
+                        .iter()
+                        .map(|omitted| ContextOmission {
+                            source: ContextSourceKind::Memory,
+                            reason: format!("{}: {}", omitted.reason, omitted.title),
+                            token_estimate: 0,
+                        })
+                        .collect();
+                    let envelope =
+                        self.build_context_envelope(user_input, Vec::new(), omissions, Vec::new());
+                    self.remember_context_envelope(envelope);
                     return self.system_prompt.clone();
                 }
 
-                use memory::types::MemoryLayer;
                 use crate::cached_prompt::CacheLayer;
+                use memory::types::MemoryLayer;
                 let mut items_by_layer: std::collections::HashMap<
                     CacheLayer,
                     Vec<&memory::MemoryPacketItem>,
@@ -2537,8 +2615,50 @@ where
                     omitted = packet.omitted.len(),
                     "memory context packet prepared"
                 );
+                let dynamic_items = packet
+                    .selected
+                    .iter()
+                    .map(|item| {
+                        let role = match item.role {
+                            memory::MemoryPacketRole::Orientation => ContextRole::Orientation,
+                            memory::MemoryPacketRole::Supporting => ContextRole::Evidence,
+                            memory::MemoryPacketRole::Warning
+                            | memory::MemoryPacketRole::Conflict => ContextRole::Warning,
+                        };
+                        let mut context_item = ContextItem::new(
+                            item.atom.id.to_string(),
+                            ContextSourceKind::Memory,
+                            role,
+                            format!(
+                                "{}\nreason: {}\nevidence: {}",
+                                item.atom.title,
+                                item.reason,
+                                item.atom.evidence_pointer.as_deref().unwrap_or("")
+                            ),
+                        );
+                        context_item.authority = ContextAuthority::Session;
+                        context_item.visibility = ContextVisibility::Private;
+                        context_item.score = item.atom.confidence;
+                        if let Some(evidence) = item.atom.evidence_pointer.as_ref() {
+                            context_item.evidence.push(evidence.clone());
+                        }
+                        context_item
+                    })
+                    .collect::<Vec<_>>();
+                let omissions = packet
+                    .omitted
+                    .iter()
+                    .map(|omitted| ContextOmission {
+                        source: ContextSourceKind::Memory,
+                        reason: format!("{}: {}", omitted.reason, omitted.title),
+                        token_estimate: 0,
+                    })
+                    .collect::<Vec<_>>();
+                let envelope =
+                    self.build_context_envelope(user_input, dynamic_items, omissions, Vec::new());
+                self.remember_context_envelope(envelope);
                 let mut prompt = self.system_prompt.clone();
-                prompt.insert(0, context);
+                prompt.push(context);
                 prompt
             }
             Err(err) => {
@@ -2546,6 +2666,13 @@ where
                 if let Some(cb) = &self.memory_callback {
                     cb.on_memory_update(Vec::new(), &format!("memory error: {err}"));
                 }
+                let envelope = self.build_context_envelope(
+                    user_input,
+                    Vec::new(),
+                    Vec::new(),
+                    vec![ContextSourceKind::Memory],
+                );
+                self.remember_context_envelope(envelope);
                 self.system_prompt.clone()
             }
         }
@@ -2966,8 +3093,10 @@ mod tests {
         ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
         PromptCacheEvent, RuntimeError, StaticToolExecutor,
     };
+    use crate::ToolError;
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::context_runtime::ContextSourceKind;
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest, SharedPrompter,
@@ -2975,7 +3104,6 @@ mod tests {
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
-    use crate::ToolError;
     use futures::stream::Stream;
     use std::fs;
     use std::path::PathBuf;
@@ -3010,10 +3138,12 @@ mod tests {
             self.call_count += 1;
             let events = match self.call_count {
                 1 => {
-                    assert!(request
-                        .messages
-                        .iter()
-                        .any(|message| message.role == MessageRole::User));
+                    assert!(
+                        request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::User)
+                    );
                     vec![
                         AssistantEvent::TextDelta("Let me calculate that.".to_string()),
                         AssistantEvent::ToolUse {
@@ -3385,10 +3515,12 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(request
-                            .messages
-                            .iter()
-                            .any(|message| message.role == MessageRole::Tool));
+                        assert!(
+                            request
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::Tool)
+                        );
                         to_stream(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -3466,10 +3598,12 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(request
-                            .messages
-                            .iter()
-                            .any(|message| message.role == MessageRole::Tool));
+                        assert!(
+                            request
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::Tool)
+                        );
                         to_stream(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -3824,6 +3958,32 @@ mod tests {
             1,
             "without memory manager, returns base system prompt only"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2_prepare_without_memory_records_degraded_context_envelope() {
+        let session = Session::new();
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["stable system".to_string()],
+        )
+        .without_memory();
+        let prompt = rt.prepare_memory_context("remember this").await;
+        let envelope = rt
+            .last_context_envelope()
+            .expect("context envelope should be recorded");
+
+        assert_eq!(prompt, vec!["stable system".to_string()]);
+        assert_eq!(envelope.intent, "remember this");
+        assert_eq!(envelope.assembled.stable_head, vec!["stable system"]);
+        assert_eq!(
+            envelope.diagnostics.degraded_sources,
+            vec![ContextSourceKind::Memory]
+        );
+        assert!(envelope.selected.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

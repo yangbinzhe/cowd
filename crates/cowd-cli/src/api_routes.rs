@@ -25,12 +25,13 @@ use axum::{
 };
 use futures::StreamExt;
 use futures::stream::Stream;
-use runtime::{
-    ApprovalConfig, ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem,
-    ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind, ContextVisibility,
-};
 use runtime::approval_gate::SmartApprovalGate;
 use runtime::permission_enforcer::{ApprovalPersistence, ApprovalVerdict};
+use runtime::{
+    ApprovalConfig, ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem,
+    ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
+    ContextVisibility,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
@@ -43,7 +44,6 @@ use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use crate::session_kernel::SessionKernel;
 use crate::task_kernel::{TaskKernel, TaskStatus};
-use memory::{MemoryKernel, MemoryScope, MemoryTurnContext, SearchMemoriesRequest};
 use memory::RotAlert;
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
@@ -51,6 +51,7 @@ use memory::store::session::{SessionListOptions, SessionRecord};
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
+use memory::{MemoryKernel, MemoryScope, MemoryTurnContext, SearchMemoriesRequest};
 
 // ── Shared application state ───────────────────────────────────
 
@@ -181,7 +182,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/memory", get(memory_handler))
         .route("/api/memory/status", get(memory_status_handler))
         .route("/api/memory/search", get(memory_search_handler))
-        .route("/api/memory/recall/explain", get(memory_recall_explain_handler))
+        .route(
+            "/api/memory/recall/explain",
+            get(memory_recall_explain_handler),
+        )
         .route("/api/memory/packet", get(memory_packet_handler))
         .route("/api/memory/links", get(memory_links_handler))
         .route("/api/memory/stats", get(memory_stats_handler))
@@ -758,8 +762,21 @@ async fn context_current_handler(
         .or_else(|| state.list_active_session_ids().into_iter().next())
         .unwrap_or_else(|| "api-context".to_string());
     let query = params.get("q").cloned().unwrap_or_default();
+
+    if let Some(runtime_entry) = state.active_runtime(&session_id) {
+        let runtime = runtime_entry.lock().await;
+        if let Some(envelope) = runtime.last_context_envelope() {
+            return Json(serde_json::json!({
+                "enabled": true,
+                "source": "runtime",
+                "envelope": envelope,
+            }));
+        }
+    }
+
     let identity = ContextIdentity::main(session_id.clone());
     let mut dynamic_items = Vec::new();
+    let mut omitted_items = Vec::new();
     let mut degraded = Vec::new();
 
     if let Some(ref mgr) = state.memory_manager {
@@ -808,6 +825,13 @@ async fn context_current_handler(
                     context_item.score = item.atom.confidence;
                     dynamic_items.push(context_item);
                 }
+                for omitted in packet.omitted {
+                    omitted_items.push(ContextOmission {
+                        source: ContextSourceKind::Memory,
+                        reason: format!("{}: {}", omitted.reason, omitted.title),
+                        token_estimate: 0,
+                    });
+                }
             }
             Err(_) => degraded.push(ContextSourceKind::Memory),
         }
@@ -822,13 +846,14 @@ async fn context_current_handler(
         stable_head: vec!["cowd-context-runtime:v0.8.13".to_string()],
         runtime_header: vec![format!("session:{session_id} agent:api profile:MainTurn")],
         dynamic_items,
-        omitted: Vec::new(),
+        omitted: omitted_items,
         total_budget_tokens: 8_000,
     });
     envelope.diagnostics.degraded_sources = degraded;
 
     Json(serde_json::json!({
         "enabled": true,
+        "source": "synthetic",
         "envelope": envelope,
     }))
 }
@@ -2041,7 +2066,9 @@ async fn memory_packet_handler(
     }
 }
 
-async fn memory_links_handler(AxumState(state): AxumState<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn memory_links_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<serde_json::Value> {
     let Some(ref mgr) = state.memory_manager else {
         return Json(serde_json::json!({
             "enabled": false,
@@ -4152,9 +4179,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["enabled"], true);
         assert_eq!(json["envelope"]["identity"]["session_id"], "session-1");
@@ -4432,7 +4457,8 @@ mod tests {
 
     #[tokio::test]
     async fn memory_packet_returns_explainable_packet() {
-        let tmp = std::env::temp_dir().join(format!("cowd-api-memory-packet-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("cowd-api-memory-packet-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
             CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
@@ -4484,7 +4510,8 @@ mod tests {
 
     #[tokio::test]
     async fn memory_links_returns_kernel_links() {
-        let tmp = std::env::temp_dir().join(format!("cowd-api-memory-links-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("cowd-api-memory-links-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let manager = Arc::new(
             CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
