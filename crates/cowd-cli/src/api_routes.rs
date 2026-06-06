@@ -178,6 +178,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/api/context/:envelope_id",
             get(get_context_envelope_handler),
         )
+        .route("/api/evidence/resolve", get(resolve_evidence_ref_handler))
         .route("/api/tasks", get(tasks_status_handler))
         .route("/api/tasks/start", post(start_task_handler))
         .route("/api/tasks/:id/phases", post(start_task_phase_handler))
@@ -3314,6 +3315,229 @@ async fn get_context_recommendation_stats(
     })))
 }
 
+async fn resolve_evidence_ref_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let Some(reference) = params.get("ref").map(|value| value.trim()).filter(|value| !value.is_empty()) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "ref query parameter is required".to_string(),
+            }),
+        ));
+    };
+    let session_id = params
+        .get("session_id")
+        .cloned()
+        .or_else(|| state.list_active_session_ids().into_iter().next());
+
+    let resolved = if let Some(path) = reference.strip_prefix("workspace://changed-file/") {
+        resolve_workspace_evidence(&state.workspace_root, reference, path)
+    } else if let Some(symbol) = reference.strip_prefix("workspace://symbol/") {
+        serde_json::json!({
+            "ref": reference,
+            "kind": "workspace_symbol",
+            "available": true,
+            "symbol": symbol,
+        })
+    } else if let Some(session_ref) = reference.strip_prefix("session://") {
+        resolve_session_evidence(&state, reference, session_ref).await
+    } else if reference.starts_with("tool://") {
+        resolve_tool_evidence(&state, reference, session_id.as_deref()).await
+    } else if reference.starts_with("agent://") {
+        serde_json::json!({
+            "ref": reference,
+            "kind": "agent",
+            "available": false,
+            "reason": "agent evidence payload drilldown is not persisted yet",
+        })
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("unsupported evidence ref: {reference}"),
+            }),
+        ));
+    };
+
+    Ok(Json(resolved))
+}
+
+fn resolve_workspace_evidence(root: &FsPath, reference: &str, relative: &str) -> serde_json::Value {
+    const MAX_BYTES: u64 = 256 * 1024;
+    const PREVIEW_BYTES: usize = 4096;
+
+    let path = root.join(relative);
+    let Ok(canonical_root) = root.canonicalize() else {
+        return serde_json::json!({
+            "ref": reference,
+            "kind": "workspace_file",
+            "available": false,
+            "reason": "workspace root unavailable",
+        });
+    };
+    let Ok(canonical_path) = path.canonicalize() else {
+        return serde_json::json!({
+            "ref": reference,
+            "kind": "workspace_file",
+            "available": false,
+            "reason": "file unavailable",
+        });
+    };
+    if !canonical_path.starts_with(&canonical_root) {
+        return serde_json::json!({
+            "ref": reference,
+            "kind": "workspace_file",
+            "available": false,
+            "reason": "file is outside workspace",
+        });
+    }
+    let Ok(metadata) = std::fs::metadata(&canonical_path) else {
+        return serde_json::json!({
+            "ref": reference,
+            "kind": "workspace_file",
+            "available": false,
+            "reason": "file metadata unavailable",
+        });
+    };
+    if !metadata.is_file() {
+        return serde_json::json!({
+            "ref": reference,
+            "kind": "workspace_file",
+            "available": false,
+            "reason": "path is not a file",
+        });
+    }
+    if metadata.len() > MAX_BYTES {
+        return serde_json::json!({
+            "ref": reference,
+            "kind": "workspace_file",
+            "available": true,
+            "truncated": true,
+            "size_bytes": metadata.len(),
+            "reason": "file exceeds preview limit",
+        });
+    }
+    let preview = std::fs::read_to_string(&canonical_path)
+        .map(|content| content.chars().take(PREVIEW_BYTES).collect::<String>())
+        .unwrap_or_default();
+    serde_json::json!({
+        "ref": reference,
+        "kind": "workspace_file",
+        "available": true,
+        "path": relative,
+        "size_bytes": metadata.len(),
+        "preview": preview,
+        "truncated": metadata.len() as usize > PREVIEW_BYTES,
+    })
+}
+
+async fn resolve_session_evidence(
+    state: &AppState,
+    reference: &str,
+    session_ref: &str,
+) -> serde_json::Value {
+    let session_id = session_ref.split('/').next().unwrap_or_default();
+    if session_id.is_empty() {
+        return serde_json::json!({
+            "ref": reference,
+            "kind": "session",
+            "available": false,
+            "reason": "missing session id",
+        });
+    }
+    match state.session_kernel.stored_session(session_id).await {
+        Ok(Some(session)) => serde_json::json!({
+            "ref": reference,
+            "kind": "session",
+            "available": true,
+            "session": {
+                "session_id": session.session_id,
+                "platform": session.platform,
+                "model": session.model,
+                "created_at": session.created_at,
+                "last_activity": session.last_activity,
+                "message_count": session.message_count,
+                "status": session.status,
+            },
+        }),
+        Ok(None) => serde_json::json!({
+            "ref": reference,
+            "kind": "session",
+            "available": false,
+            "reason": "session not found",
+        }),
+        Err(error) => serde_json::json!({
+            "ref": reference,
+            "kind": "session",
+            "available": false,
+            "reason": format!("session lookup failed: {error}"),
+        }),
+    }
+}
+
+async fn resolve_tool_evidence(
+    state: &AppState,
+    reference: &str,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    let Some(session_id) = session_id else {
+        return serde_json::json!({
+            "ref": reference,
+            "kind": "tool",
+            "available": false,
+            "reason": "session_id is required for tool evidence",
+        });
+    };
+    let tool_id = reference
+        .strip_prefix("tool://")
+        .and_then(|tail| tail.split('/').next())
+        .unwrap_or_default();
+    let Some((_, events)) = state
+        .session_kernel
+        .stored_events_page(session_id, 0, 500)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return serde_json::json!({
+            "ref": reference,
+            "kind": "tool",
+            "available": false,
+            "reason": "session events unavailable",
+        });
+    };
+    let matches = events
+        .into_iter()
+        .filter_map(|event| {
+            let payload = serde_json::from_str::<serde_json::Value>(&event.event_json).ok()?;
+            let id_matches = payload
+                .get("id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|id| id == tool_id)
+                || payload
+                    .get("tool_use_id")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|id| id == tool_id);
+            id_matches.then(|| serde_json::json!({
+                "type": event.event_type,
+                "sequence": event.sequence,
+                "created_at_ms": event.created_at_ms,
+                "payload": payload,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "ref": reference,
+        "kind": "tool",
+        "available": !matches.is_empty(),
+        "session_id": session_id,
+        "events": matches,
+    })
+}
+
 async fn record_context_recommendation_action(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
@@ -5195,6 +5419,72 @@ mod tests {
         assert_eq!(json["runs"][0]["run"]["phase"], "started");
         assert_eq!(json["runs"][1]["run"]["status"], "completed");
         assert_eq!(json["runs"][1]["run"]["context_envelope_id"], "ctx-1");
+    }
+
+    #[tokio::test]
+    async fn evidence_resolver_reads_tool_events_by_ref() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "evidence-tool-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_event(&memory::SessionEvent {
+                session_id: session_id.to_string(),
+                event_type: "ToolComplete".to_string(),
+                event_json: serde_json::json!({
+                    "type": "ToolComplete",
+                    "id": "tool-1",
+                    "name": "bash",
+                    "summary": "tests passed",
+                })
+                .to_string(),
+                sequence: 0,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/evidence/resolve?session_id={session_id}&ref=tool%3A%2F%2Ftool-1%2Fevidence%2Fevent-1"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["available"], true);
+        assert_eq!(json["kind"], "tool");
+        assert_eq!(json["events"][0]["payload"]["summary"], "tests passed");
+    }
+
+    #[tokio::test]
+    async fn evidence_resolver_rejects_unsupported_refs() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/evidence/resolve?ref=unknown%3A%2F%2Fvalue")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

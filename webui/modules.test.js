@@ -168,6 +168,20 @@ describe('API module', () => {
     expect(runs.runs[0].run.run_id).toBe('run-1');
   });
 
+  it('resolveEvidence encodes refs and session id', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ available: true })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.resolveEvidence('tool://tool-1/evidence/event-1', { session_id: 's1' });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/evidence/resolve?ref=tool%3A%2F%2Ftool-1%2Fevidence%2Fevent-1&session_id=s1');
+  });
+
   it('records context recommendation actions', async () => {
     const mockF = vi.fn(() =>
       Promise.resolve({

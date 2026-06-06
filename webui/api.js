@@ -191,6 +191,13 @@ window.Api = (()=>{
     async contextEnvelope(envelopeId){
       return req('GET','/api/context/'+encodeURIComponent(envelopeId));
     },
+    async resolveEvidence(ref,opts){
+      const o=opts||{};
+      const params=new URLSearchParams();
+      params.set('ref',ref||'');
+      if(o.session_id||this.sid)params.set('session_id',o.session_id||this.sid);
+      return req('GET','/api/evidence/resolve?'+params.toString());
+    },
     async recordContextRecommendation(sessionId,payload){
       const sid=sessionId||this.sid;
       return req('POST','/api/sessions/'+encodeURIComponent(sid)+'/context/recommendations',payload||{});
