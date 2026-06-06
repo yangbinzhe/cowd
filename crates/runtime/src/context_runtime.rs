@@ -281,6 +281,49 @@ pub struct ContextDiagnostics {
     pub recommendations: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextPressureLevel {
+    Nominal,
+    Elevated,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextDegradationPath {
+    None,
+    SourceFallback,
+    TrimDynamicTail,
+    SummarizeEvidence,
+    HandoffBoundary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextLeanProbe {
+    pub envelope_id: String,
+    pub profile: ContextProfile,
+    pub stable_head_hash: String,
+    pub runtime_header_hash: String,
+    pub dynamic_tail_hash: String,
+    pub selected_count: usize,
+    pub omitted_count: usize,
+    pub budget_total_tokens: u64,
+    pub budget_used_tokens: u64,
+    pub pressure_bp: u16,
+    pub pressure_level: ContextPressureLevel,
+    pub degradation_path: ContextDegradationPath,
+    pub degraded_sources: Vec<ContextSourceKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StableHeadComparison {
+    pub previous_hash: String,
+    pub next_hash: String,
+    pub reusable: bool,
+    pub runtime_header_changed: bool,
+    pub dynamic_tail_changed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssembledContext {
     pub stable_head: Vec<String>,
@@ -390,6 +433,56 @@ impl ContextRuntimeKernel {
             assembled,
             created_at: Utc::now(),
         }
+    }
+
+    pub fn lean_probe(envelope: &ContextEnvelope) -> ContextLeanProbe {
+        ContextLeanProbe {
+            envelope_id: envelope.id.clone(),
+            profile: envelope.profile,
+            stable_head_hash: envelope.diagnostics.stable_head_hash.clone(),
+            runtime_header_hash: envelope.diagnostics.runtime_header_hash.clone(),
+            dynamic_tail_hash: envelope.diagnostics.dynamic_tail_hash.clone(),
+            selected_count: envelope.selected.len(),
+            omitted_count: envelope.omitted.len(),
+            budget_total_tokens: envelope.budget.total_tokens,
+            budget_used_tokens: envelope.budget.used_tokens,
+            pressure_bp: envelope.diagnostics.pressure_bp,
+            pressure_level: pressure_level_for_bp(envelope.diagnostics.pressure_bp),
+            degradation_path: degradation_path_for(
+                envelope.diagnostics.pressure_bp,
+                envelope.omitted.len(),
+                &envelope.diagnostics.degraded_sources,
+            ),
+            degraded_sources: envelope.diagnostics.degraded_sources.clone(),
+        }
+    }
+
+    pub fn compare_stable_head(
+        previous: &ContextEnvelope,
+        next: &ContextEnvelope,
+    ) -> StableHeadComparison {
+        StableHeadComparison {
+            previous_hash: previous.diagnostics.stable_head_hash.clone(),
+            next_hash: next.diagnostics.stable_head_hash.clone(),
+            reusable: previous.diagnostics.stable_head_hash
+                == next.diagnostics.stable_head_hash,
+            runtime_header_changed: previous.diagnostics.runtime_header_hash
+                != next.diagnostics.runtime_header_hash,
+            dynamic_tail_changed: previous.diagnostics.dynamic_tail_hash
+                != next.diagnostics.dynamic_tail_hash,
+        }
+    }
+
+    pub fn pressure_level(pressure_bp: u16) -> ContextPressureLevel {
+        pressure_level_for_bp(pressure_bp)
+    }
+
+    pub fn degradation_path(envelope: &ContextEnvelope) -> ContextDegradationPath {
+        degradation_path_for(
+            envelope.diagnostics.pressure_bp,
+            envelope.omitted.len(),
+            &envelope.diagnostics.degraded_sources,
+        )
     }
 
     pub fn apply_leases(
@@ -709,6 +802,36 @@ fn context_recommendations(
     recommendations
 }
 
+fn pressure_level_for_bp(pressure_bp: u16) -> ContextPressureLevel {
+    if pressure_bp >= 9_000 {
+        ContextPressureLevel::Critical
+    } else if pressure_bp >= 8_500 {
+        ContextPressureLevel::High
+    } else if pressure_bp >= 7_000 {
+        ContextPressureLevel::Elevated
+    } else {
+        ContextPressureLevel::Nominal
+    }
+}
+
+fn degradation_path_for(
+    pressure_bp: u16,
+    omitted_count: usize,
+    degraded_sources: &[ContextSourceKind],
+) -> ContextDegradationPath {
+    if pressure_bp >= 9_000 {
+        ContextDegradationPath::HandoffBoundary
+    } else if pressure_bp >= 8_500 {
+        ContextDegradationPath::SummarizeEvidence
+    } else if pressure_bp >= 7_000 || omitted_count > 0 {
+        ContextDegradationPath::TrimDynamicTail
+    } else if !degraded_sources.is_empty() {
+        ContextDegradationPath::SourceFallback
+    } else {
+        ContextDegradationPath::None
+    }
+}
+
 fn hash_segments(segments: &[String]) -> String {
     let mut bytes = Vec::new();
     for segment in segments {
@@ -758,6 +881,17 @@ mod tests {
         }
     }
 
+    fn item_with_tokens(
+        id: &str,
+        source: ContextSourceKind,
+        role: ContextRole,
+        token_estimate: u64,
+    ) -> ContextItem {
+        let mut item = ContextItem::new(id, source, role, id);
+        item.token_estimate = token_estimate;
+        item
+    }
+
     #[test]
     fn envelope_preserves_prompt_segment_order() {
         let envelope = ContextRuntimeKernel::build_envelope(request_with_dynamic("dynamic memory"));
@@ -784,6 +918,130 @@ mod tests {
         assert_ne!(
             a.diagnostics.dynamic_tail_hash,
             b.diagnostics.dynamic_tail_hash
+        );
+    }
+
+    #[test]
+    fn stable_head_comparison_tracks_cache_reuse_and_tail_change() {
+        let a = ContextRuntimeKernel::build_envelope(request_with_dynamic("memory alpha"));
+        let b = ContextRuntimeKernel::build_envelope(request_with_dynamic("memory beta"));
+        let comparison = ContextRuntimeKernel::compare_stable_head(&a, &b);
+
+        assert!(comparison.reusable);
+        assert!(!comparison.runtime_header_changed);
+        assert!(comparison.dynamic_tail_changed);
+        assert_eq!(
+            comparison.previous_hash,
+            a.diagnostics.stable_head_hash
+        );
+
+        let mut changed_request = request_with_dynamic("memory beta");
+        changed_request.stable_head = vec!["system: changed stable instructions".to_string()];
+        let changed = ContextRuntimeKernel::build_envelope(changed_request);
+        let changed_comparison = ContextRuntimeKernel::compare_stable_head(&a, &changed);
+        assert!(!changed_comparison.reusable);
+    }
+
+    #[test]
+    fn lean_probe_reports_critical_pressure_degradation_path() {
+        let identity = ContextIdentity::main("session-hot");
+        let envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            profile: ContextProfile::MainTurn,
+            identity,
+            intent: "stress context pressure".to_string(),
+            stable_head: vec!["stable".to_string()],
+            runtime_header: vec!["runtime".to_string()],
+            dynamic_items: vec![
+                item_with_tokens(
+                    "conversation-hot",
+                    ContextSourceKind::Conversation,
+                    ContextRole::RecentTurn,
+                    3_000,
+                ),
+                item_with_tokens(
+                    "memory-hot",
+                    ContextSourceKind::Memory,
+                    ContextRole::Orientation,
+                    2_800,
+                ),
+                item_with_tokens(
+                    "task-hot",
+                    ContextSourceKind::Task,
+                    ContextRole::TaskState,
+                    2_000,
+                ),
+                item_with_tokens(
+                    "tool-hot",
+                    ContextSourceKind::ToolTrace,
+                    ContextRole::ToolSummary,
+                    1_000,
+                ),
+                item_with_tokens(
+                    "workspace-hot",
+                    ContextSourceKind::Workspace,
+                    ContextRole::Evidence,
+                    1_000,
+                ),
+            ],
+            omitted: Vec::new(),
+            total_budget_tokens: 10_000,
+        });
+
+        let probe = ContextRuntimeKernel::lean_probe(&envelope);
+
+        assert_eq!(probe.selected_count, 5);
+        assert_eq!(probe.omitted_count, 0);
+        assert!(probe.pressure_bp >= 9_000);
+        assert_eq!(probe.pressure_level, ContextPressureLevel::Critical);
+        assert_eq!(
+            probe.degradation_path,
+            ContextDegradationPath::HandoffBoundary
+        );
+        assert_eq!(
+            probe.stable_head_hash,
+            envelope.diagnostics.stable_head_hash
+        );
+    }
+
+    #[test]
+    fn lean_probe_distinguishes_source_fallback_from_pressure() {
+        let mut envelope = ContextRuntimeKernel::build_envelope(request_with_dynamic("tiny memory"));
+        envelope.diagnostics.degraded_sources = vec![ContextSourceKind::Memory];
+        let probe = ContextRuntimeKernel::lean_probe(&envelope);
+
+        assert_eq!(probe.pressure_level, ContextPressureLevel::Nominal);
+        assert_eq!(probe.degradation_path, ContextDegradationPath::SourceFallback);
+        assert_eq!(probe.degraded_sources, vec![ContextSourceKind::Memory]);
+    }
+
+    #[test]
+    fn lean_probe_reports_lease_omission_as_tail_trim_path() {
+        let mut oversized = item_with_tokens(
+            "memory-oversized",
+            ContextSourceKind::Memory,
+            ContextRole::Orientation,
+            400,
+        );
+        oversized.score = 1.0;
+
+        let envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            identity: ContextIdentity::main("session-lease"),
+            profile: ContextProfile::MainTurn,
+            intent: "force lease omission".to_string(),
+            stable_head: vec!["stable".to_string()],
+            runtime_header: vec!["runtime".to_string()],
+            dynamic_items: vec![oversized],
+            omitted: Vec::new(),
+            total_budget_tokens: 1_000,
+        });
+        let probe = ContextRuntimeKernel::lean_probe(&envelope);
+
+        assert_eq!(probe.selected_count, 0);
+        assert_eq!(probe.omitted_count, 1);
+        assert_eq!(probe.pressure_level, ContextPressureLevel::Nominal);
+        assert_eq!(
+            probe.degradation_path,
+            ContextDegradationPath::TrimDynamicTail
         );
     }
 

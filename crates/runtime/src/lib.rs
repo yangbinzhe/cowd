@@ -262,10 +262,11 @@ pub use prompt_cache::{
 };
 pub use context_runtime::{
     AgentContextLease, AgentReturnPacket, AgentReturnRequirement, AssembledContext,
-    ContextAuthority, ContextBudgetReport, ContextDiagnostics, ContextEnvelope,
-    ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextLease, ContextMode,
-    ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
-    ContextVisibility, ResumeContextPacket, ResumeContextSource, ToolTracePacket,
+    ContextAuthority, ContextBudgetReport, ContextDegradationPath, ContextDiagnostics,
+    ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextLeanProbe,
+    ContextLease, ContextMode, ContextOmission, ContextPressureLevel, ContextProfile,
+    ContextRole, ContextRuntimeKernel, ContextSourceKind, ContextVisibility,
+    ResumeContextPacket, ResumeContextSource, StableHeadComparison, ToolTracePacket,
     ToolTraceStatus, WorkspacePacket,
 };
 #[cfg(test)]
