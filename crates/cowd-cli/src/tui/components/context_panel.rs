@@ -251,6 +251,20 @@ impl Component for ContextPanel {
                     ),
                 ]));
             }
+            if !envelope.diagnostics.recommendations.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "Recommendations",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for recommendation in envelope.diagnostics.recommendations.iter().take(3) {
+                    lines.push(Line::from(vec![
+                        Span::styled("- ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(Self::preview(recommendation, 72), Style::default()),
+                    ]));
+                }
+            }
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 "Selected",
@@ -461,13 +475,14 @@ mod tests {
         let mut panel = ContextPanel::new();
         panel.latest_envelope = Some(envelope);
 
-        let lines = render_panel(&mut panel, 88, 26);
+        let lines = render_panel(&mut panel, 88, 32);
         let joined = lines.join("\n");
         assert!(joined.contains("Runtime Envelope"));
         assert!(joined.contains("SessionKernel owns durable sessions"));
         assert!(joined.contains("context lease exhausted"));
         assert!(joined.contains(&stable_hash));
         assert!(joined.contains("stable 1"));
+        assert!(joined.contains("Recommendations"));
     }
 
     #[test]

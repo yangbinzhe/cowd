@@ -669,6 +669,7 @@ describe('API module', () => {
               runtime_header_hash: 'runtimehashabcdef',
               dynamic_tail_hash: 'dynamichashabcdef',
               degraded_sources: ['Memory'],
+              recommendations: ['Start a handoff before adding more context'],
             },
             assembled: {
               stable_head: ['stable system'],
@@ -691,6 +692,7 @@ describe('API module', () => {
     expect(text).toContain('stable system');
     expect(text).toContain('dynamichasha');
     expect(text).toContain('degraded: Memory');
+    expect(text).toContain('Start a handoff');
     expect(text).toContain('Context Timeline');
     expect(text).toContain('ship now');
   });

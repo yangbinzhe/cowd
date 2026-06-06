@@ -277,6 +277,8 @@ pub struct ContextDiagnostics {
     pub dynamic_tail_hash: String,
     pub degraded_sources: Vec<ContextSourceKind>,
     pub pressure_bp: u16,
+    #[serde(default)]
+    pub recommendations: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,6 +362,11 @@ impl ContextRuntimeKernel {
             dynamic_tail_hash: hash_segments(&assembled.dynamic_tail),
             degraded_sources: Vec::new(),
             pressure_bp,
+            recommendations: context_recommendations(
+                pressure_bp,
+                request.dynamic_items.len(),
+                request.omitted.len(),
+            ),
         };
         let id = envelope_id(&request.identity, &request.intent, &diagnostics);
 
@@ -518,6 +525,36 @@ fn estimate_tokens(text: &str) -> u64 {
     (text.len() as u64).div_ceil(4).max(1)
 }
 
+fn context_recommendations(
+    pressure_bp: u16,
+    selected_count: usize,
+    omitted_count: usize,
+) -> Vec<String> {
+    let mut recommendations = Vec::new();
+    if pressure_bp >= 9_000 {
+        recommendations.push(
+            "Start a handoff or session boundary before adding more large context".to_string(),
+        );
+        recommendations
+            .push("Prefer summarized tool traces and memory packets over raw evidence".to_string());
+    } else if pressure_bp >= 7_000 {
+        recommendations
+            .push("Review omitted context and compact low-value recent turns".to_string());
+    }
+    if omitted_count > 0 {
+        recommendations.push(format!(
+            "{omitted_count} context items were omitted; inspect omissions before relying on recall completeness"
+        ));
+    }
+    if selected_count == 0 {
+        recommendations.push(
+            "No dynamic context selected; verify memory/session/task sources are available"
+                .to_string(),
+        );
+    }
+    recommendations
+}
+
 fn hash_segments(segments: &[String]) -> String {
     let mut bytes = Vec::new();
     for segment in segments {
@@ -612,7 +649,37 @@ mod tests {
 
         assert!(json.contains("stable_head_hash"));
         assert!(json.contains("dynamic_tail_hash"));
+        assert!(json.contains("recommendations"));
         assert!(json.contains("serialize me"));
+    }
+
+    #[test]
+    fn envelope_reports_pressure_recommendations() {
+        let mut request = request_with_dynamic(&"x".repeat(3_600));
+        request.total_budget_tokens = 1_000;
+        request.omitted.push(ContextOmission {
+            source: ContextSourceKind::Memory,
+            reason: "lease exhausted".to_string(),
+            token_estimate: 128,
+        });
+
+        let envelope = ContextRuntimeKernel::build_envelope(request);
+
+        assert!(envelope.diagnostics.pressure_bp >= 9_000);
+        assert!(
+            envelope
+                .diagnostics
+                .recommendations
+                .iter()
+                .any(|item| item.contains("handoff"))
+        );
+        assert!(
+            envelope
+                .diagnostics
+                .recommendations
+                .iter()
+                .any(|item| item.contains("omitted"))
+        );
     }
 
     #[test]

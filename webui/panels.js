@@ -153,6 +153,16 @@ window.Panels = (()=>{
           degraded.textContent='degraded: '+diagnostics.degraded_sources.join(', ');
           overview.appendChild(degraded);
         }
+        if((diagnostics.recommendations||[]).length){
+          const recs=UI.el('div','context-recommendations');
+          recs.innerHTML='<h4>Recommendations</h4>';
+          diagnostics.recommendations.slice(0,4).forEach(function(text){
+            const row=UI.el('div','context-recommendation');
+            row.textContent=text;
+            recs.appendChild(row);
+          });
+          overview.appendChild(recs);
+        }
         mount.appendChild(overview);
 
         const selected=UI.el('div','panel-section context-list');

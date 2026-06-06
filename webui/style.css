@@ -182,6 +182,9 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .context-title b{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .context-title span{font-size:10px;color:var(--accent);border:1px solid var(--border);border-radius:999px;padding:2px 6px;text-transform:uppercase}
 .context-degraded{margin-top:8px;color:var(--warn);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.context-recommendations{margin-top:8px;border-top:1px solid var(--border);padding-top:8px}
+.context-recommendations h4{font-size:11px;color:var(--text2);margin-bottom:4px}
+.context-recommendation{font-size:11px;color:var(--text2);line-height:1.35;padding:2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .context-list h3,.context-segments h3,.context-history h3{font-size:12px;margin-bottom:8px}
 .context-item{display:grid;grid-template-columns:76px minmax(0,1fr);gap:8px;padding:7px 0;border-top:1px solid var(--border)}
 .context-item:first-of-type{border-top:0}
