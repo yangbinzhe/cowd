@@ -44,7 +44,7 @@ use crate::config::RuntimeFeatureConfig;
 use crate::context_runtime::{
     ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
     ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
-    ContextVisibility, ResumeContextPacket,
+    ContextVisibility, ResumeContextPacket, ToolTracePacket, ToolTraceStatus,
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::joint_problem_solving::{JpsOps, ProblemStatement};
@@ -312,6 +312,8 @@ pub struct ConversationRuntime<C, T> {
     last_context_envelope: std::sync::Mutex<Option<ContextEnvelope>>,
     /// Runtime-owned context supplied by outer orchestration layers.
     external_context_items: std::sync::Mutex<Vec<ContextItem>>,
+    /// Bounded short-term tool trace context for subsequent turns.
+    tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// T4: Semaphore for WriteLocal tool concurrency (permits: 4).
     write_semaphore: Arc<Semaphore>,
     /// T4: Semaphore for Network tool concurrency (permits: 3).
@@ -482,6 +484,7 @@ where
             tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
             last_context_envelope: std::sync::Mutex::new(None),
             external_context_items: std::sync::Mutex::new(Vec::new()),
+            tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             write_semaphore: Arc::new(Semaphore::new(
                 crate::tool_orchestrator::ToolSafetyCategory::WriteLocal.max_concurrency(),
             )),
@@ -563,9 +566,59 @@ where
             .unwrap_or_default()
     }
 
+    fn tool_trace_context_items(&self) -> Vec<ContextItem> {
+        self.tool_trace_context_items
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn remember_tool_trace_from_message(&self, message: &ConversationMessage) {
+        let Some(ContentBlock::ToolResult {
+            tool_use_id,
+            tool_name,
+            output,
+            is_error,
+        }) = message.blocks.first()
+        else {
+            return;
+        };
+        let summary = output
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(600)
+            .collect::<String>();
+        let packet = ToolTracePacket {
+            tool_name: tool_name.clone(),
+            invocation_id: tool_use_id.clone(),
+            status: if *is_error {
+                ToolTraceStatus::Failed
+            } else {
+                ToolTraceStatus::Succeeded
+            },
+            summary,
+            changed_files: Vec::new(),
+            evidence_ids: vec![tool_use_id.clone()],
+            token_estimate: (output.len() as u64).div_ceil(4).min(256).max(1),
+        };
+        let mut item = ContextRuntimeKernel::tool_trace_item(&packet);
+        item.score = if *is_error { 0.9 } else { 0.65 };
+        if let Ok(mut guard) = self.tool_trace_context_items.lock() {
+            guard.retain(|existing| existing.id != item.id);
+            guard.push(item);
+            let overflow = guard.len().saturating_sub(8);
+            if overflow > 0 {
+                guard.drain(0..overflow);
+            }
+        }
+    }
+
     fn external_context_prompt_tail(&self) -> String {
         self.external_context_items()
             .into_iter()
+            .chain(self.tool_trace_context_items())
             .map(|item| {
                 format!(
                     "<context_item source=\"{:?}\" role=\"{:?}\" score=\"{:.2}\">\n{}\n</context_item>",
@@ -614,6 +667,7 @@ where
         let session_id = self.session().session_id;
         let identity = ContextIdentity::main(session_id.clone());
         let mut selected_items = self.external_context_items();
+        selected_items.extend(self.tool_trace_context_items());
         selected_items.extend(dynamic_items);
         let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
             profile: ContextProfile::from(identity.mode),
@@ -1756,6 +1810,7 @@ where
 
                 for id in &ordered_ids {
                     if let Some((msg, inject)) = result_map.remove(id) {
+                        self.remember_tool_trace_from_message(&msg);
                         let tool_name_str = msg
                             .blocks
                             .first()
@@ -3222,7 +3277,7 @@ mod tests {
         PermissionRequest, SharedPrompter,
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
-    use crate::session::{ContentBlock, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
     use futures::stream::Stream;
     use std::fs;
@@ -4176,6 +4231,44 @@ mod tests {
         assert_eq!(envelope.selected[0].source, ContextSourceKind::Handoff);
         assert_eq!(envelope.selected[0].authority, ContextAuthority::Session);
         assert!(envelope.selected[0].content.contains("Active task"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recent_tool_trace_enters_next_prompt_and_envelope() {
+        let session = Session::new();
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["stable system".to_string()],
+        )
+        .without_memory();
+
+        let tool_result = ConversationMessage::tool_result(
+            "tool-1".to_string(),
+            "bash".to_string(),
+            "cargo test passed for context runtime".to_string(),
+            false,
+        );
+        rt.remember_tool_trace_from_message(&tool_result);
+
+        let prompt = rt.prepare_memory_context("next turn").await;
+        let envelope = rt
+            .last_context_envelope()
+            .expect("context envelope should be recorded");
+
+        assert!(
+            prompt
+                .iter()
+                .any(|segment| segment.contains("cargo test passed"))
+        );
+        assert!(
+            envelope
+                .selected
+                .iter()
+                .any(|item| item.source == ContextSourceKind::ToolTrace)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
