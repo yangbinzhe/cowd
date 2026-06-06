@@ -2,6 +2,7 @@
 //! wave-based parallel dispatch, result synthesis with fact-checking, and
 //! L4 team memory finalization.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -45,6 +46,61 @@ pub struct CollaborationTask {
 pub struct CollaborationContextResult {
     pub synthesis: String,
     pub context_items: Vec<ContextItem>,
+}
+
+// ── Shared Board / Synthesis Scoring ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemoryPulseKind {
+    Remember,
+    Refresh,
+    Promote,
+    Retire,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPulseCandidate {
+    pub kind: MemoryPulseKind,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedBoardEntry {
+    pub agent_id: String,
+    pub completed_normally: bool,
+    pub output_preview: String,
+    pub decisions: Vec<String>,
+    pub evidence: Vec<String>,
+    pub conflicts: Vec<String>,
+    pub memory_pulses: Vec<MemoryPulseCandidate>,
+    pub next_actions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollaborationScorecard {
+    pub completion_rate: f32,
+    pub synthesis_lift: f32,
+    pub complementarity_score: f32,
+    pub active_memory_score: f32,
+    pub conflict_count: usize,
+    pub memory_pulse_count: usize,
+    pub surfaced_conflicts: Vec<String>,
+}
+
+impl CollaborationScorecard {
+    pub fn shows_multi_agent_lift(&self) -> bool {
+        self.synthesis_lift > 1.0 && self.complementarity_score > 0.0
+    }
+
+    pub fn needs_memory_pulse(&self) -> bool {
+        self.memory_pulse_count > 0 || self.conflict_count > 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollaborationBoard {
+    pub entries: Vec<SharedBoardEntry>,
+    pub scorecard: CollaborationScorecard,
 }
 
 // ── AgentTeam ──────────────────────────────────────────────────────────────────
@@ -250,10 +306,21 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
 
     // ── synthesize ─────────────────────────────────────────────────────────
 
+    /// Build a lightweight shared board from sub-agent returns.
+    ///
+    /// The board keeps the experiment cheap: it only inspects structured text
+    /// prefixes already returned by agents, then computes deterministic scores
+    /// that indicate collaboration lift, surfaced conflicts, and live-memory
+    /// pulse candidates.
+    pub fn build_shared_board(&self, results: &[SubAgentResult]) -> CollaborationBoard {
+        build_collaboration_board(results)
+    }
+
     /// Merge sub-agent results into a coherent synthesis, detecting and
     /// flagging conflicts via `FactChecker`.
     pub fn synthesize(&self, results: &[SubAgentResult]) -> String {
         let mut output = String::from("## Collaboration Synthesis\n\n");
+        let board = self.build_shared_board(results);
 
         let mut checker = FactChecker::new();
         let mut conflicts: Vec<FactCheckResult> = Vec::new();
@@ -291,6 +358,59 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         output.push_str(&format!("**Corrections**: {}\n", report.corrected));
         output.push_str(&format!("**Flagged for review**: {}\n", report.flagged));
         output.push_str(&format!("**Pruned**: {}\n\n", report.pruned));
+
+        output.push_str("### Shared Board Scorecard\n\n");
+        output.push_str(&format!(
+            "**Completion rate**: {:.0}%\n",
+            board.scorecard.completion_rate * 100.0
+        ));
+        output.push_str(&format!(
+            "**Synthesis lift**: {:.2}x\n",
+            board.scorecard.synthesis_lift
+        ));
+        output.push_str(&format!(
+            "**Complementarity**: {:.2}\n",
+            board.scorecard.complementarity_score
+        ));
+        output.push_str(&format!(
+            "**Memory pulses**: {}\n",
+            board.scorecard.memory_pulse_count
+        ));
+        output.push_str(&format!(
+            "**Surfaced conflicts**: {}\n\n",
+            board.scorecard.conflict_count + conflicts.len()
+        ));
+
+        if !board.scorecard.surfaced_conflicts.is_empty() {
+            output.push_str("### Surfaced Conflicts\n\n");
+            for conflict in &board.scorecard.surfaced_conflicts {
+                output.push_str(&format!("- {}\n", truncate_str(conflict, 240)));
+            }
+            output.push('\n');
+        }
+
+        let memory_pulses: Vec<_> = board
+            .entries
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .memory_pulses
+                    .iter()
+                    .map(move |pulse| (&entry.agent_id, pulse))
+            })
+            .collect();
+        if !memory_pulses.is_empty() {
+            output.push_str("### Memory Pulse Candidates\n\n");
+            for (agent_id, pulse) in memory_pulses {
+                output.push_str(&format!(
+                    "- **{}** [{:?}]: {}\n",
+                    agent_id,
+                    pulse.kind,
+                    truncate_str(&pulse.content, 240)
+                ));
+            }
+            output.push('\n');
+        }
 
         if !conflicts.is_empty() {
             output.push_str("### Conflicts Detected\n\n");
@@ -591,6 +711,199 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
+fn build_collaboration_board(results: &[SubAgentResult]) -> CollaborationBoard {
+    let entries: Vec<SharedBoardEntry> = results
+        .iter()
+        .enumerate()
+        .map(|(idx, result)| board_entry_from_result(idx, result))
+        .collect();
+    let scorecard = score_collaboration_board(&entries);
+
+    CollaborationBoard { entries, scorecard }
+}
+
+fn board_entry_from_result(idx: usize, result: &SubAgentResult) -> SharedBoardEntry {
+    let agent_id = format!("agent-{}", idx + 1);
+    let mut conflicts = extract_prefixed_lines(
+        &result.output,
+        &["conflict:", "risk:", "blocked:", "disagreement:"],
+    );
+
+    if !result.completed_normally {
+        conflicts.push(format!(
+            "agent did not complete normally: {}",
+            truncate_str(&result.output, 240)
+        ));
+    }
+
+    SharedBoardEntry {
+        agent_id,
+        completed_normally: result.completed_normally,
+        output_preview: truncate_str(&normalize_whitespace(&result.output), 320),
+        decisions: extract_prefixed_lines(
+            &result.output,
+            &["decision:", "decided:", "conclusion:"],
+        ),
+        evidence: extract_prefixed_lines(
+            &result.output,
+            &["evidence:", "source:", "verified:", "test:"],
+        ),
+        conflicts,
+        memory_pulses: extract_memory_pulses(&result.output),
+        next_actions: extract_prefixed_lines(&result.output, &["next:", "todo:", "action:"]),
+    }
+}
+
+fn score_collaboration_board(entries: &[SharedBoardEntry]) -> CollaborationScorecard {
+    if entries.is_empty() {
+        return CollaborationScorecard {
+            completion_rate: 0.0,
+            synthesis_lift: 0.0,
+            complementarity_score: 0.0,
+            active_memory_score: 0.0,
+            conflict_count: 0,
+            memory_pulse_count: 0,
+            surfaced_conflicts: Vec::new(),
+        };
+    }
+
+    let completed = entries
+        .iter()
+        .filter(|entry| entry.completed_normally)
+        .count();
+    let completion_rate = completed as f32 / entries.len() as f32;
+
+    let mut all_signals = BTreeSet::new();
+    let mut strongest_single_agent = 0usize;
+    let mut memory_pulse_count = 0usize;
+    let mut surfaced_conflicts = Vec::new();
+    let mut agents_with_memory_pulse = 0usize;
+
+    for entry in entries {
+        let signals = entry_signal_set(entry);
+        strongest_single_agent = strongest_single_agent.max(signals.len());
+        all_signals.extend(signals);
+
+        let pulse_count = entry.memory_pulses.len();
+        memory_pulse_count += pulse_count;
+        if pulse_count > 0 {
+            agents_with_memory_pulse += 1;
+        }
+
+        surfaced_conflicts.extend(
+            entry
+                .conflicts
+                .iter()
+                .map(|conflict| format!("{}: {}", entry.agent_id, conflict)),
+        );
+    }
+
+    let synthesis_lift = if strongest_single_agent == 0 {
+        0.0
+    } else {
+        all_signals.len() as f32 / strongest_single_agent as f32
+    };
+    let complementarity_score = if all_signals.is_empty() {
+        0.0
+    } else {
+        (all_signals.len().saturating_sub(strongest_single_agent)) as f32 / all_signals.len() as f32
+    };
+    let active_memory_score = agents_with_memory_pulse as f32 / entries.len() as f32;
+
+    CollaborationScorecard {
+        completion_rate,
+        synthesis_lift,
+        complementarity_score,
+        active_memory_score,
+        conflict_count: surfaced_conflicts.len(),
+        memory_pulse_count,
+        surfaced_conflicts,
+    }
+}
+
+fn entry_signal_set(entry: &SharedBoardEntry) -> BTreeSet<String> {
+    let mut signals = BTreeSet::new();
+    add_signals(&mut signals, "decision", &entry.decisions);
+    add_signals(&mut signals, "evidence", &entry.evidence);
+    add_signals(&mut signals, "next", &entry.next_actions);
+
+    for pulse in &entry.memory_pulses {
+        let key = format!(
+            "memory:{:?}:{}",
+            pulse.kind,
+            normalize_for_scoring(&pulse.content)
+        );
+        signals.insert(key);
+    }
+
+    signals
+}
+
+fn add_signals(signals: &mut BTreeSet<String>, kind: &str, values: &[String]) {
+    for value in values {
+        let normalized = normalize_for_scoring(value);
+        if !normalized.is_empty() {
+            signals.insert(format!("{kind}:{normalized}"));
+        }
+    }
+}
+
+fn extract_prefixed_lines(text: &str, prefixes: &[&str]) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            prefixes.iter().find_map(|prefix| {
+                lower
+                    .strip_prefix(prefix)
+                    .map(|_| trimmed[prefix.len()..].trim().to_string())
+            })
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn extract_memory_pulses(text: &str) -> Vec<MemoryPulseCandidate> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            let (kind, prefix) = [
+                (MemoryPulseKind::Remember, "memory:"),
+                (MemoryPulseKind::Remember, "remember:"),
+                (MemoryPulseKind::Refresh, "refresh:"),
+                (MemoryPulseKind::Refresh, "stale:"),
+                (MemoryPulseKind::Promote, "promote:"),
+                (MemoryPulseKind::Retire, "forget:"),
+                (MemoryPulseKind::Retire, "retire:"),
+            ]
+            .into_iter()
+            .find(|(_, prefix)| lower.starts_with(prefix))?;
+
+            let content = trimmed[prefix.len()..].trim();
+            if content.is_empty() {
+                None
+            } else {
+                Some(MemoryPulseCandidate {
+                    kind,
+                    content: content.to_string(),
+                })
+            }
+        })
+        .collect()
+}
+
+fn normalize_for_scoring(text: &str) -> String {
+    normalize_whitespace(text)
+        .to_ascii_lowercase()
+        .trim_matches(|c: char| c.is_ascii_punctuation())
+        .to_string()
+}
+
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 // ── CollaborationOps ────────────────────────────────────────────────────────────
 
 use futures::Future;
@@ -796,6 +1109,97 @@ mod tests {
         let output = orch.synthesize(&results);
         assert!(output.contains("Sub-agents completed"));
         assert!(output.contains("Agent Results"));
+    }
+
+    #[test]
+    fn shared_board_extracts_conflicts_and_memory_pulses() {
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
+        let results = vec![
+            SubAgentResult {
+                output: "\
+Decision: keep runtime scoring pure
+Evidence: unit test covers board extraction
+Memory: runtime shared board produced a useful signal
+Next: wire scorecard into synthesis"
+                    .to_string(),
+                completed_normally: true,
+                ..SubAgentResult::default()
+            },
+            SubAgentResult {
+                output: "\
+Decision: surface conflicts before final synthesis
+Conflict: scoring disagrees with missing evidence
+Refresh: collaboration scoring should be revisited after live agent runs"
+                    .to_string(),
+                completed_normally: true,
+                ..SubAgentResult::default()
+            },
+        ];
+
+        let board = orch.build_shared_board(&results);
+
+        assert_eq!(board.entries.len(), 2);
+        assert_eq!(board.entries[0].decisions.len(), 1);
+        assert_eq!(board.entries[0].memory_pulses.len(), 1);
+        assert_eq!(
+            board.entries[0].memory_pulses[0].kind,
+            MemoryPulseKind::Remember
+        );
+        assert_eq!(board.scorecard.conflict_count, 1);
+        assert_eq!(board.scorecard.memory_pulse_count, 2);
+        assert!(board.scorecard.needs_memory_pulse());
+    }
+
+    #[test]
+    fn scorecard_detects_multi_agent_lift() {
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
+        let results = vec![
+            SubAgentResult {
+                output: "\
+Decision: add deterministic scorecard
+Evidence: board unit test"
+                    .to_string(),
+                completed_normally: true,
+                ..SubAgentResult::default()
+            },
+            SubAgentResult {
+                output: "\
+Decision: expose memory pulse candidates
+Evidence: synthesis includes live memory section"
+                    .to_string(),
+                completed_normally: true,
+                ..SubAgentResult::default()
+            },
+        ];
+
+        let board = orch.build_shared_board(&results);
+
+        assert_eq!(board.scorecard.completion_rate, 1.0);
+        assert!(
+            board.scorecard.synthesis_lift > 1.0,
+            "expected complementary agent outputs to score above single-agent baseline"
+        );
+        assert!(board.scorecard.complementarity_score > 0.0);
+        assert!(board.scorecard.shows_multi_agent_lift());
+    }
+
+    #[test]
+    fn synthesize_includes_shared_board_scorecard() {
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
+        let results = vec![SubAgentResult {
+            output: "\
+Decision: keep the spike lightweight
+Memory: lightweight spike has a live-memory pulse candidate"
+                .to_string(),
+            completed_normally: true,
+            ..SubAgentResult::default()
+        }];
+
+        let output = orch.synthesize(&results);
+
+        assert!(output.contains("Shared Board Scorecard"));
+        assert!(output.contains("Synthesis lift"));
+        assert!(output.contains("Memory Pulse Candidates"));
     }
 
     #[test]
