@@ -712,6 +712,26 @@ describe('API module', () => {
     expect(text).toContain('SessionKernel');
     expect(text).toContain('owns');
     expect(text).toContain('Supports');
+
+    const graph = document.querySelector('.memory-network');
+    const filter = graph.querySelector('input[placeholder="Filter network..."]');
+    const type = graph.querySelector('select');
+    expect(filter).toBeTruthy();
+    expect(type).toBeTruthy();
+
+    type.value = 'link';
+    type.dispatchEvent(new Event('change'));
+    expect(graph.textContent).toContain('Supports');
+    expect(graph.textContent).not.toContain('owns');
+
+    type.value = 'all';
+    type.dispatchEvent(new Event('change'));
+    filter.value = 'SessionKernel';
+    filter.dispatchEvent(new Event('input'));
+    expect(graph.querySelector('.memory-node.matched')).toBeTruthy();
+
+    graph.querySelector('[data-node-id="SessionKernel"]').dispatchEvent(new Event('click'));
+    expect(graph.querySelector('.memory-network-detail').textContent).toContain('SessionKernel');
   });
 
   it('renders durable task status in the agents panel', async () => {

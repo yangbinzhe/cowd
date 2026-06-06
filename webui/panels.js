@@ -109,57 +109,144 @@ window.Panels = (()=>{
     const wrap=UI.el('div','memory-network');
     const width=316,height=260,cx=width/2,cy=height/2;
     const ns='http://www.w3.org/2000/svg';
+    const controls=UI.el('div','memory-network-controls');
+    const search=UI.el('input');
+    search.placeholder='Filter network...';
+    const type=UI.el('select');
+    type.innerHTML='<option value="all">All relations</option><option value="triple">Triples</option><option value="link">Memory links</option>';
+    const reset=UI.el('button','btn-secondary btn-sm');
+    reset.textContent='Reset';
+    controls.appendChild(search);
+    controls.appendChild(type);
+    controls.appendChild(reset);
+    wrap.appendChild(controls);
+
     const svg=document.createElementNS(ns,'svg');
     svg.setAttribute('viewBox','0 0 '+width+' '+height);
     svg.setAttribute('role','img');
     svg.setAttribute('aria-label','Knowledge network');
     const nodes=data.nodes||[];
     const edges=data.edges||[];
+    const detail=UI.el('div','memory-network-detail');
     if(!nodes.length){
       wrap.appendChild(UI.el('div','panel-empty','No network'));
       target.appendChild(wrap);
       return;
     }
-    const pos={};
-    const radius=Math.min(104,Math.max(56,28+nodes.length*3));
-    nodes.forEach(function(node,i){
-      const angle=(-Math.PI/2)+(Math.PI*2*i/nodes.length);
-      pos[node.id]={x:cx+Math.cos(angle)*radius,y:cy+Math.sin(angle)*radius};
-    });
-    edges.forEach(function(edge){
-      const a=pos[edge.from],b=pos[edge.to];
-      if(!a||!b)return;
-      const line=document.createElementNS(ns,'line');
-      line.setAttribute('x1',a.x);line.setAttribute('y1',a.y);line.setAttribute('x2',b.x);line.setAttribute('y2',b.y);
-      line.setAttribute('class','memory-edge '+edge.type);
-      line.setAttribute('stroke-width',String(1+Math.min(2,edge.weight||0)));
-      svg.appendChild(line);
-      const label=document.createElementNS(ns,'text');
-      label.setAttribute('x',(a.x+b.x)/2);label.setAttribute('y',(a.y+b.y)/2-3);
-      label.setAttribute('class','memory-edge-label');
-      label.textContent=edge.label;
-      svg.appendChild(label);
-    });
-    nodes.forEach(function(node){
-      const p=pos[node.id];
-      const group=document.createElementNS(ns,'g');
-      group.setAttribute('class','memory-node '+node.type);
-      group.onclick=function(){UI.showToast(node.label)};
-      const circle=document.createElementNS(ns,'circle');
-      circle.setAttribute('cx',p.x);circle.setAttribute('cy',p.y);circle.setAttribute('r',node.type==='entity'?13:11);
-      const text=document.createElementNS(ns,'text');
-      text.setAttribute('x',p.x);text.setAttribute('y',p.y+28);
-      text.setAttribute('class','memory-node-label');
-      text.textContent=node.label.length>14?node.label.slice(0,13)+'...':node.label;
-      group.appendChild(circle);
-      group.appendChild(text);
-      svg.appendChild(group);
-    });
+    const nodeById=new Map(nodes.map(n=>[n.id,n]));
+    let selectedId=null;
+
+    function nodeText(id){
+      const n=nodeById.get(id);
+      return ((n&&n.label)||id||'').toLowerCase();
+    }
+
+    function matchesQuery(edge,q){
+      if(!q)return true;
+      return nodeText(edge.from).includes(q)
+        || nodeText(edge.to).includes(q)
+        || String(edge.label||'').toLowerCase().includes(q)
+        || String(edge.evidence||'').toLowerCase().includes(q);
+    }
+
+    function renderDetail(visibleEdges){
+      const node=selectedId&&nodeById.get(selectedId);
+      if(!node){
+        detail.innerHTML='<b>Network</b><small>'+nodes.length+' nodes · '+visibleEdges.length+' visible relations</small>';
+        return;
+      }
+      const connected=visibleEdges.filter(e=>e.from===selectedId||e.to===selectedId);
+      detail.innerHTML='<b>'+UI.esc(node.label)+'</b><small>'+UI.esc(node.type)+' · '+connected.length+' visible connections</small>';
+      connected.slice(0,6).forEach(function(edge){
+        const other=edge.from===selectedId?edge.to:edge.from;
+        const row=UI.el('em');
+        row.textContent=edge.label+' -> '+((nodeById.get(other)||{}).label||String(other).slice(0,8));
+        detail.appendChild(row);
+      });
+    }
+
+    function draw(){
+      svg.innerHTML='';
+      const q=search.value.trim().toLowerCase();
+      const selectedType=type.value;
+      const visibleEdges=edges.filter(edge=>(selectedType==='all'||edge.type===selectedType)&&matchesQuery(edge,q));
+      const visibleNodeIds=new Set();
+      visibleEdges.forEach(edge=>{visibleNodeIds.add(edge.from);visibleNodeIds.add(edge.to)});
+      if(!visibleEdges.length&&!q){
+        nodes.forEach(node=>visibleNodeIds.add(node.id));
+      }
+      if(q){
+        nodes.forEach(node=>{
+          if(String(node.label||node.id).toLowerCase().includes(q))visibleNodeIds.add(node.id);
+        });
+      }
+      const visibleNodes=nodes.filter(node=>visibleNodeIds.has(node.id));
+      const pos={};
+      const radius=Math.min(104,Math.max(56,28+visibleNodes.length*3));
+      visibleNodes.forEach(function(node,i){
+        const angle=(-Math.PI/2)+(Math.PI*2*i/Math.max(visibleNodes.length,1));
+        pos[node.id]={x:cx+Math.cos(angle)*radius,y:cy+Math.sin(angle)*radius};
+      });
+      const connectedToSelected=new Set();
+      if(selectedId){
+        visibleEdges.forEach(edge=>{
+          if(edge.from===selectedId)connectedToSelected.add(edge.to);
+          if(edge.to===selectedId)connectedToSelected.add(edge.from);
+        });
+      }
+      visibleEdges.forEach(function(edge){
+        const a=pos[edge.from],b=pos[edge.to];
+        if(!a||!b)return;
+        const active=!selectedId||edge.from===selectedId||edge.to===selectedId;
+        const line=document.createElementNS(ns,'line');
+        line.setAttribute('x1',a.x);line.setAttribute('y1',a.y);line.setAttribute('x2',b.x);line.setAttribute('y2',b.y);
+        line.setAttribute('class','memory-edge '+edge.type+(active?' active':' dim'));
+        line.setAttribute('stroke-width',String(1+Math.min(2,edge.weight||0)));
+        svg.appendChild(line);
+        const label=document.createElementNS(ns,'text');
+        label.setAttribute('x',(a.x+b.x)/2);label.setAttribute('y',(a.y+b.y)/2-3);
+        label.setAttribute('class','memory-edge-label'+(active?' active':' dim'));
+        label.textContent=edge.label;
+        svg.appendChild(label);
+      });
+      visibleNodes.forEach(function(node){
+        const p=pos[node.id];
+        const group=document.createElementNS(ns,'g');
+        const active=!selectedId||node.id===selectedId||connectedToSelected.has(node.id);
+        const matched=q&&String(node.label||node.id).toLowerCase().includes(q);
+        group.setAttribute('class','memory-node '+node.type+(active?' active':' dim')+(node.id===selectedId?' selected':'')+(matched?' matched':''));
+        group.setAttribute('data-node-id',node.id);
+        group.onclick=function(){selectedId=selectedId===node.id?null:node.id;draw()};
+        const circle=document.createElementNS(ns,'circle');
+        circle.setAttribute('cx',p.x);circle.setAttribute('cy',p.y);circle.setAttribute('r',node.type==='entity'?13:11);
+        const text=document.createElementNS(ns,'text');
+        text.setAttribute('x',p.x);text.setAttribute('y',p.y+28);
+        text.setAttribute('class','memory-node-label');
+        text.textContent=node.label.length>14?node.label.slice(0,13)+'...':node.label;
+        group.appendChild(circle);
+        group.appendChild(text);
+        svg.appendChild(group);
+      });
+      if(!visibleNodes.length){
+        const empty=document.createElementNS(ns,'text');
+        empty.setAttribute('x',cx);empty.setAttribute('y',cy);
+        empty.setAttribute('class','memory-node-label');
+        empty.textContent='No matching relations';
+        svg.appendChild(empty);
+      }
+      renderDetail(visibleEdges);
+    }
+
+    search.oninput=draw;
+    type.onchange=function(){selectedId=null;draw()};
+    reset.onclick=function(){search.value='';type.value='all';selectedId=null;draw()};
     wrap.appendChild(svg);
     const legend=UI.el('div','memory-network-legend');
     legend.innerHTML='<span>entity</span><span>memory</span><span>triple</span><span>link</span>';
     wrap.appendChild(legend);
+    wrap.appendChild(detail);
     target.appendChild(wrap);
+    draw();
   }
 
   async function renderMemory(){

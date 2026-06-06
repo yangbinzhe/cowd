@@ -169,6 +169,15 @@ test('workbench panels render durable task and memory status', async ({ page }) 
   await expect(page.locator('.memory-network svg')).toBeVisible();
   await expect(page.locator('#panel-content')).toContainText('persists');
   await expect(page.locator('#panel-content')).toContainText('Supports');
+  const graph = page.locator('.memory-network');
+  await graph.locator('select').selectOption('link');
+  await expect(graph).toContainText('Supports');
+  await expect(graph).not.toContainText('persists');
+  await graph.locator('select').selectOption('all');
+  await graph.getByPlaceholder('Filter network...').fill('TaskKernel');
+  await expect(graph.locator('.memory-node.matched')).toBeVisible();
+  await graph.locator('[data-node-id="TaskKernel"]').click();
+  await expect(graph.locator('.memory-network-detail')).toContainText('TaskKernel');
 
   expect(errors).toEqual([]);
 });
