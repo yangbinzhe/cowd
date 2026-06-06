@@ -51,7 +51,10 @@ use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
-use memory::{MemoryKernel, MemoryScope, MemoryTurnContext, SearchMemoriesRequest};
+use memory::{
+    MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
+    MaintenanceScanConfig, MemoryKernel, MemoryScope, MemoryTurnContext, SearchMemoriesRequest,
+};
 
 // ── Shared application state ───────────────────────────────────
 
@@ -204,6 +207,14 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/memory/links", get(memory_links_handler))
         .route("/api/memory/stats", get(memory_stats_handler))
         .route("/api/memory/layers", get(memory_layers_handler))
+        .route(
+            "/api/memory/maintenance",
+            get(memory_maintenance_handler).post(scan_memory_maintenance_handler),
+        )
+        .route(
+            "/api/memory/maintenance/:id",
+            axum::routing::patch(update_memory_maintenance_handler),
+        )
         .route("/api/memory/entities", get(memory_entities_handler))
         .route("/api/memory/triples", get(memory_triples_handler))
         .route(
@@ -336,6 +347,33 @@ struct UpdateMemoryEntryRequest {
     tags: Option<Vec<String>>,
     #[serde(default)]
     priority: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MemoryMaintenanceQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct MemoryMaintenanceScanRequest {
+    #[serde(default)]
+    stale_threshold: Option<f32>,
+    #[serde(default)]
+    low_confidence_threshold: Option<f32>,
+    #[serde(default)]
+    authority_confidence_threshold: Option<f32>,
+    #[serde(default)]
+    max_candidates: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct UpdateMemoryMaintenanceRequest {
+    status: String,
 }
 
 #[derive(Deserialize)]
@@ -1921,6 +1959,105 @@ async fn memory_layers_handler(AxumState(state): AxumState<Arc<AppState>>) -> im
     }
 }
 
+async fn memory_maintenance_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(query): Query<MemoryMaintenanceQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let Some(ref mgr) = state.memory_manager else {
+        return Ok(Json(serde_json::json!({
+            "enabled": false,
+            "candidates": [],
+            "degraded_reason": "memory not configured",
+        })));
+    };
+    let status = match query.status.as_deref() {
+        Some(value) => Some(
+            parse_maintenance_status(value)
+                .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "invalid maintenance status"))?,
+        ),
+        None => None,
+    };
+    let kind = match query.kind.as_deref() {
+        Some(value) => Some(
+            parse_maintenance_kind(value)
+                .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "invalid maintenance kind"))?,
+        ),
+        None => None,
+    };
+    let candidates = mgr
+        .list_memory_maintenance(MaintenanceCandidateFilter {
+            status,
+            kind,
+            limit: query.limit.map(|limit| limit.min(500)),
+        })
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "candidates": candidates,
+    })))
+}
+
+async fn scan_memory_maintenance_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(body): Json<MemoryMaintenanceScanRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let Some(ref mgr) = state.memory_manager else {
+        return Ok(Json(serde_json::json!({
+            "enabled": false,
+            "candidates": [],
+            "degraded_reason": "memory not configured",
+        })));
+    };
+    let defaults = MaintenanceScanConfig::default();
+    let config = MaintenanceScanConfig {
+        stale_threshold: body.stale_threshold.unwrap_or(defaults.stale_threshold),
+        low_confidence_threshold: body
+            .low_confidence_threshold
+            .unwrap_or(defaults.low_confidence_threshold),
+        authority_confidence_threshold: body
+            .authority_confidence_threshold
+            .unwrap_or(defaults.authority_confidence_threshold),
+        max_candidates: body
+            .max_candidates
+            .unwrap_or(defaults.max_candidates)
+            .min(500),
+    };
+    let candidates = mgr
+        .scan_memory_maintenance(config)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "candidates": candidates,
+    })))
+}
+
+async fn update_memory_maintenance_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateMemoryMaintenanceRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let Some(ref mgr) = state.memory_manager else {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "memory not configured",
+        ));
+    };
+    let status = parse_maintenance_status(&body.status)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "invalid maintenance status"))?;
+    match mgr.transition_memory_maintenance(&id, status) {
+        Ok(Some(candidate)) => Ok(Json(serde_json::json!({
+            "enabled": true,
+            "candidate": candidate,
+        }))),
+        Ok(None) => Err(api_error(
+            StatusCode::NOT_FOUND,
+            "maintenance candidate not found",
+        )),
+        Err(e) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
 async fn memory_layer_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(layer): Path<String>,
@@ -2441,6 +2578,31 @@ fn parse_memory_priority(priority: &str) -> Option<Priority> {
         "high" => Some(Priority::High),
         "normal" => Some(Priority::Normal),
         "low" => Some(Priority::Low),
+        _ => None,
+    }
+}
+
+fn parse_maintenance_kind(kind: &str) -> Option<MaintenanceCandidateKind> {
+    match kind.to_ascii_lowercase().as_str() {
+        "conflict" => Some(MaintenanceCandidateKind::Conflict),
+        "stale" => Some(MaintenanceCandidateKind::Stale),
+        "duplicate" => Some(MaintenanceCandidateKind::Duplicate),
+        "authoritypromotion" | "authority_promotion" => {
+            Some(MaintenanceCandidateKind::AuthorityPromotion)
+        }
+        "relationshiprefresh" | "relationship_refresh" => {
+            Some(MaintenanceCandidateKind::RelationshipRefresh)
+        }
+        _ => None,
+    }
+}
+
+fn parse_maintenance_status(status: &str) -> Option<MaintenanceCandidateStatus> {
+    match status.to_ascii_lowercase().as_str() {
+        "open" => Some(MaintenanceCandidateStatus::Open),
+        "acknowledged" | "ack" => Some(MaintenanceCandidateStatus::Acknowledged),
+        "applied" => Some(MaintenanceCandidateStatus::Applied),
+        "dismissed" | "dismiss" => Some(MaintenanceCandidateStatus::Dismissed),
         _ => None,
     }
 }

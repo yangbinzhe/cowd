@@ -29,6 +29,8 @@ pub struct ContextPanel {
     pub turn_output_tokens: u64,
     /// Latest runtime context envelope, if one has been assembled for a turn.
     pub latest_envelope: Option<ContextEnvelope>,
+    evidence_detail_open: bool,
+    evidence_cursor: usize,
 }
 
 impl ContextPanel {
@@ -39,6 +41,8 @@ impl ContextPanel {
             turn_input_tokens: 0,
             turn_output_tokens: 0,
             latest_envelope: None,
+            evidence_detail_open: false,
+            evidence_cursor: 0,
         }
     }
 
@@ -107,6 +111,50 @@ impl ContextPanel {
             normalized
         } else {
             normalized.chars().take(max).collect::<String>() + "..."
+        }
+    }
+
+    fn evidence_refs(&self) -> Vec<String> {
+        let Some(envelope) = &self.latest_envelope else {
+            return Vec::new();
+        };
+        let mut refs = Vec::new();
+        for item in &envelope.selected {
+            for evidence_ref in &item.evidence {
+                if !refs.contains(evidence_ref) {
+                    refs.push(evidence_ref.clone());
+                }
+            }
+        }
+        refs
+    }
+
+    fn selected_evidence_ref(&self) -> Option<String> {
+        let refs = self.evidence_refs();
+        refs.get(self.evidence_cursor.min(refs.len().saturating_sub(1)))
+            .cloned()
+    }
+
+    fn evidence_kind(evidence_ref: &str) -> &str {
+        evidence_ref.split("://").next().unwrap_or("unknown")
+    }
+
+    fn evidence_related_preview(&self, evidence_ref: &str) -> Option<String> {
+        let envelope = self.latest_envelope.as_ref()?;
+        envelope
+            .selected
+            .iter()
+            .find(|item| item.evidence.iter().any(|candidate| candidate == evidence_ref))
+            .map(|item| Self::preview(&item.content, 96))
+    }
+
+    fn clamp_evidence_cursor(&mut self) {
+        let len = self.evidence_refs().len();
+        if len == 0 {
+            self.evidence_cursor = 0;
+            self.evidence_detail_open = false;
+        } else if self.evidence_cursor >= len {
+            self.evidence_cursor = len - 1;
         }
     }
 }
@@ -196,6 +244,7 @@ impl Component for ContextPanel {
         )));
 
         if let Some(envelope) = &self.latest_envelope {
+            let evidence_refs = self.evidence_refs();
             lines.push(Line::from(vec![
                 Span::styled("Profile:  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -322,6 +371,51 @@ impl Component for ContextPanel {
                     ]));
                 }
             }
+            if self.evidence_detail_open {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    "Evidence Detail",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                if let Some(evidence_ref) = self.selected_evidence_ref() {
+                    let total = evidence_refs.len();
+                    lines.push(Line::from(vec![
+                        Span::styled("Ref:      ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            Self::preview(&evidence_ref, 88),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("Type:     ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            Self::evidence_kind(&evidence_ref).to_string(),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(
+                            format!(
+                                "  {}/{}",
+                                self.evidence_cursor.min(total.saturating_sub(1)) + 1,
+                                total
+                            ),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                    if let Some(preview) = self.evidence_related_preview(&evidence_ref) {
+                        lines.push(Line::from(vec![
+                            Span::styled("Context:  ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(preview, Style::default()),
+                        ]));
+                    }
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        "No evidence refs in selected context",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 "Segments",
@@ -344,7 +438,7 @@ impl Component for ContextPanel {
 
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "Keys: Tab:switch panel  r:refresh",
+            "Keys: Tab:switch panel  r:refresh  e:evidence  n/p:next/prev ref",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -358,8 +452,35 @@ impl Component for ContextPanel {
         ctx.frame_mut().render_widget(paragraph, area);
     }
 
-    fn handle_event(&mut self, _event: &crossterm::event::Event) -> EventResult {
-        EventResult::NotConsumed
+    fn handle_event(&mut self, event: &crossterm::event::Event) -> EventResult {
+        use crossterm::event::{Event, KeyCode};
+
+        let Event::Key(key) = event else {
+            return EventResult::NotConsumed;
+        };
+        match key.code {
+            KeyCode::Char('e') => {
+                self.evidence_detail_open = !self.evidence_detail_open;
+                self.clamp_evidence_cursor();
+                EventResult::Consumed
+            }
+            KeyCode::Char('n') if self.evidence_detail_open => {
+                let len = self.evidence_refs().len();
+                if len > 0 {
+                    self.evidence_cursor = (self.evidence_cursor + 1).min(len - 1);
+                }
+                EventResult::Consumed
+            }
+            KeyCode::Char('p') if self.evidence_detail_open => {
+                self.evidence_cursor = self.evidence_cursor.saturating_sub(1);
+                EventResult::Consumed
+            }
+            KeyCode::Esc if self.evidence_detail_open => {
+                self.evidence_detail_open = false;
+                EventResult::Consumed
+            }
+            _ => EventResult::NotConsumed,
+        }
     }
 
     fn focusable(&self) -> bool {
@@ -397,6 +518,45 @@ mod tests {
             panel.render(&mut ctx, Rect::new(0, 0, width, height));
         });
         terminal.buffer_lines()
+    }
+
+    fn test_envelope_with_evidence() -> ContextEnvelope {
+        let identity = runtime::ContextIdentity::main("session-1".to_string());
+        runtime::ContextRuntimeKernel::build_envelope(runtime::ContextEnvelopeRequest {
+            profile: runtime::ContextProfile::from(identity.mode),
+            identity,
+            intent: "inspect".to_string(),
+            stable_head: vec!["stable system prompt".to_string()],
+            runtime_header: vec!["session:session-1 agent:primary".to_string()],
+            dynamic_items: vec![
+                {
+                    let mut item = runtime::ContextItem::new(
+                        "mem-1",
+                        runtime::ContextSourceKind::Memory,
+                        runtime::ContextRole::Evidence,
+                        "SessionKernel owns durable sessions",
+                    );
+                    item.evidence = vec!["session://session-1/memory/mem-1".to_string()];
+                    item
+                },
+                {
+                    let mut item = runtime::ContextItem::new(
+                        "tool-1",
+                        runtime::ContextSourceKind::ToolTrace,
+                        runtime::ContextRole::Evidence,
+                        "cargo test completed successfully",
+                    );
+                    item.evidence = vec!["tool://tool-1".to_string()];
+                    item
+                },
+            ],
+            omitted: vec![runtime::ContextOmission {
+                source: runtime::ContextSourceKind::Memory,
+                reason: "context lease exhausted".to_string(),
+                token_estimate: 24,
+            }],
+            total_budget_tokens: 8_000,
+        })
     }
 
     #[test]
@@ -466,31 +626,7 @@ mod tests {
 
     #[test]
     fn renders_runtime_envelope_diagnostics() {
-        let identity = runtime::ContextIdentity::main("session-1".to_string());
-        let envelope =
-            runtime::ContextRuntimeKernel::build_envelope(runtime::ContextEnvelopeRequest {
-                profile: runtime::ContextProfile::from(identity.mode),
-                identity,
-                intent: "inspect".to_string(),
-                stable_head: vec!["stable system prompt".to_string()],
-                runtime_header: vec!["session:session-1 agent:primary".to_string()],
-                dynamic_items: vec![{
-                    let mut item = runtime::ContextItem::new(
-                        "mem-1",
-                        runtime::ContextSourceKind::Memory,
-                        runtime::ContextRole::Evidence,
-                        "SessionKernel owns durable sessions",
-                    );
-                    item.evidence = vec!["session://session-1/memory/mem-1".to_string()];
-                    item
-                }],
-                omitted: vec![runtime::ContextOmission {
-                    source: runtime::ContextSourceKind::Memory,
-                    reason: "context lease exhausted".to_string(),
-                    token_estimate: 24,
-                }],
-                total_budget_tokens: 8_000,
-            });
+        let envelope = test_envelope_with_evidence();
         let stable_hash = ContextPanel::short_hash(&envelope.diagnostics.stable_head_hash);
         let mut panel = ContextPanel::new();
         panel.latest_envelope = Some(envelope);
@@ -504,6 +640,46 @@ mod tests {
         assert!(joined.contains(&stable_hash));
         assert!(joined.contains("stable 1"));
         assert!(joined.contains("Recommendations"));
+    }
+
+    #[test]
+    fn evidence_detail_opens_and_renders_selected_ref() {
+        let mut panel = ContextPanel::new();
+        panel.latest_envelope = Some(test_envelope_with_evidence());
+
+        let event = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('e'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        assert!(panel.handle_event(&event).is_consumed());
+        let lines = render_panel(&mut panel, 96, 36);
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("Evidence Detail"));
+        assert!(joined.contains("session://session-1/memory/mem-1"));
+        assert!(joined.contains("SessionKernel owns durable sessions"));
+    }
+
+    #[test]
+    fn evidence_detail_can_navigate_refs_and_close() {
+        let mut panel = ContextPanel::new();
+        panel.latest_envelope = Some(test_envelope_with_evidence());
+        panel.evidence_detail_open = true;
+
+        let next = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let close = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        assert!(panel.handle_event(&next).is_consumed());
+        assert_eq!(panel.selected_evidence_ref().as_deref(), Some("tool://tool-1"));
+        assert!(panel.handle_event(&close).is_consumed());
+        assert!(!panel.evidence_detail_open);
     }
 
     #[test]

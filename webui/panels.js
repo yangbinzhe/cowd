@@ -360,6 +360,52 @@ window.Panels = (()=>{
     target.appendChild(sec);
   }
 
+  async function renderMemoryMaintenance(target){
+    target.innerHTML='<h3>Memory Maintenance</h3>';
+    const actions=UI.el('div','context-controls');
+    const scan=UI.el('button');
+    scan.textContent='Scan';
+    scan.onclick=async()=>{
+      try{
+        await Api.scanMemoryMaintenance({max_candidates:50});
+        await renderMemoryMaintenance(target);
+      }catch(e){UI.showToast(e.message,'error')}
+    };
+    actions.appendChild(scan);
+    target.appendChild(actions);
+    try{
+      const data=await Api.memoryMaintenance({status:'open',limit:8});
+      const candidates=data.candidates||[];
+      if(!candidates.length){
+        target.appendChild(UI.el('div','panel-empty',data.degraded_reason||'No open maintenance candidates'));
+        return;
+      }
+      candidates.forEach(candidate=>{
+        const row=UI.el('div','panel-item memory-maintenance-item');
+        const body=UI.el('div');
+        body.innerHTML='<b>'+UI.esc(candidate.summary||candidate.kind||'candidate')+'</b><small>'+UI.esc([candidate.kind,candidate.status,(candidate.entry_ids||[]).length+' refs'].filter(Boolean).join(' · '))+'</small><em>'+UI.esc(candidate.reason||'')+'</em>';
+        row.appendChild(body);
+        const ack=UI.el('button');
+        ack.textContent='Ack';
+        ack.onclick=async(e)=>{
+          e.stopPropagation();
+          try{await Api.updateMemoryMaintenance(candidate.id,'acknowledged');await renderMemoryMaintenance(target)}catch(err){UI.showToast(err.message,'error')}
+        };
+        const dismiss=UI.el('button');
+        dismiss.textContent='Dismiss';
+        dismiss.onclick=async(e)=>{
+          e.stopPropagation();
+          try{await Api.updateMemoryMaintenance(candidate.id,'dismissed');await renderMemoryMaintenance(target)}catch(err){UI.showToast(err.message,'error')}
+        };
+        row.appendChild(ack);
+        row.appendChild(dismiss);
+        target.appendChild(row);
+      });
+    }catch(e){
+      target.appendChild(UI.el('div','panel-empty','Maintenance unavailable'));
+    }
+  }
+
   function addNetworkNode(nodes,id,label,type){
     const key=String(id||label||'node');
     if(!nodes.has(key))nodes.set(key,{id:key,label:String(label||key),type:type||'memory'});
@@ -568,6 +614,10 @@ window.Panels = (()=>{
       grid.appendChild(renderMemoryMetric('lag',fmtNumber(kh.background_lag_ms)+'ms','background'));
       stats.appendChild(grid);
     }catch(e){stats.textContent='Stats unavailable'}
+
+    const maintenanceSec=UI.el('div','panel-section memory-maintenance');
+    c.appendChild(maintenanceSec);
+    await renderMemoryMaintenance(maintenanceSec);
 
     const kernelSec=UI.el('div','memory-grid');
     const packetSec=UI.el('div');

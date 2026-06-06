@@ -47,6 +47,10 @@ use crate::{
     extractor::MemoryExtractor,
     fresh_context::FreshContextManager,
     handoff::HandoffManager,
+    maintenance::{
+        MaintenanceCandidate, MaintenanceCandidateFilter, MaintenanceCandidateStatus,
+        MaintenanceQueue, MaintenanceScanConfig, scan_maintenance_candidates,
+    },
     orchestrator::MemoryOrchestrator,
     project_scope::{build_project_kg, ProjectScopeManager},
     search::HybridSearcher,
@@ -185,6 +189,8 @@ pub struct CognitiveContextManager {
     session_resume: Option<SessionResume>,
     /// Optional project scope manager for KG staleness detection.
     project_scope_mgr: Option<std::sync::Arc<ProjectScopeManager>>,
+    /// Reviewable lifecycle candidates for memory self-maintenance.
+    maintenance_queue: MaintenanceQueue,
     /// Path of the currently loaded project KG, used for auto-rebuild.
     project_kg_path: Mutex<Option<PathBuf>>,
     /// Tick counter for periodic KG rebuild (every 100 ticks).
@@ -499,6 +505,7 @@ impl CognitiveContextManager {
             delegation_results: Mutex::new(Vec::new()),
             session_resume,
             project_scope_mgr: None,
+            maintenance_queue: MaintenanceQueue::new(),
             project_kg_path: Mutex::new(None),
             kg_rebuild_tick_counter: AtomicU64::new(0),
             cross_store_verify_counter: AtomicU64::new(0),
@@ -2301,6 +2308,35 @@ impl CognitiveContextManager {
     /// List all memory entries across layers.
     pub async fn list_all_entries(&self) -> Result<Vec<crate::types::MemoryEntry>> {
         self.orchestrator.store().list_all().await
+    }
+
+    /// Scan current memories and enqueue reviewable lifecycle maintenance
+    /// candidates. This never mutates or deletes memory entries.
+    pub async fn scan_memory_maintenance(
+        &self,
+        config: MaintenanceScanConfig,
+    ) -> Result<Vec<MaintenanceCandidate>> {
+        let entries = self.list_all_entries().await?;
+        let candidates = scan_maintenance_candidates(&entries, &config);
+        self.maintenance_queue.upsert_many(candidates.clone())?;
+        Ok(candidates)
+    }
+
+    /// List queued memory lifecycle candidates.
+    pub fn list_memory_maintenance(
+        &self,
+        filter: MaintenanceCandidateFilter,
+    ) -> Result<Vec<MaintenanceCandidate>> {
+        self.maintenance_queue.list(filter)
+    }
+
+    /// Move a maintenance candidate through the explicit review lifecycle.
+    pub fn transition_memory_maintenance(
+        &self,
+        id: &str,
+        status: MaintenanceCandidateStatus,
+    ) -> Result<Option<MaintenanceCandidate>> {
+        self.maintenance_queue.transition(id, status)
     }
 
     /// List persisted knowledge-graph entities.

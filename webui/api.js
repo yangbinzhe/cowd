@@ -161,6 +161,17 @@ window.Api = (()=>{
       return req('GET','/api/memory/packet?'+params.toString());
     },
     async memoryLinks(){return req('GET','/api/memory/links')},
+    async memoryMaintenance(opts){
+      const o=opts||{};
+      const params=new URLSearchParams();
+      if(o.status)params.set('status',o.status);
+      if(o.kind)params.set('kind',o.kind);
+      if(o.limit)params.set('limit',o.limit);
+      const query=params.toString();
+      return req('GET','/api/memory/maintenance'+(query?'?'+query:''));
+    },
+    async scanMemoryMaintenance(opts){return req('POST','/api/memory/maintenance',opts||{})},
+    async updateMemoryMaintenance(id,status){return req('PATCH','/api/memory/maintenance/'+encodeURIComponent(id),{status})},
     async currentContext(opts){
       const o=opts||{};
       const params=new URLSearchParams();

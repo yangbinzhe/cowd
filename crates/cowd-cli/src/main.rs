@@ -62,6 +62,7 @@ use runtime::{
     TokenUsage, ToolError, ToolExecutor, UsageTracker, check_base_commit,
     format_stale_base_warning, load_system_prompt, resolve_expected_base, resolve_sandbox_status,
 };
+use runtime::ContextProfile;
 use serde::Deserialize;
 use serde_json::json;
 use tools::{GlobalToolRegistry, RuntimeToolDefinition};
@@ -3648,6 +3649,7 @@ pub(crate) struct LiveCli {
     permission_mode: PermissionMode,
     yolo_mode: bool,
     yolo_task: Option<task_kernel::TaskRecord>,
+    next_turn_resume_profile: bool,
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
@@ -3681,6 +3683,7 @@ pub(crate) struct BuiltRuntime {
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     mcp_active: bool,
+    resume_context_loaded: bool,
 }
 
 impl BuiltRuntime {
@@ -3688,6 +3691,7 @@ impl BuiltRuntime {
         runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+        resume_context_loaded: bool,
     ) -> Self {
         Self {
             runtime: Some(runtime),
@@ -3695,6 +3699,7 @@ impl BuiltRuntime {
             plugins_active: true,
             mcp_state,
             mcp_active: true,
+            resume_context_loaded,
         }
     }
 
@@ -3727,6 +3732,44 @@ impl BuiltRuntime {
         }
         Ok(())
     }
+
+    fn resume_context_loaded(&self) -> bool {
+        self.resume_context_loaded
+    }
+}
+
+fn cli_turn_context_profile(
+    yolo_mode: bool,
+    permission_mode: PermissionMode,
+    resume_context: bool,
+    review_context: bool,
+) -> ContextProfile {
+    if review_context {
+        ContextProfile::Review
+    } else if resume_context {
+        ContextProfile::Resume
+    } else if yolo_mode {
+        ContextProfile::YoloGoal
+    } else if permission_mode == PermissionMode::DangerFullAccess {
+        ContextProfile::SoloGoal
+    } else {
+        ContextProfile::MainTurn
+    }
+}
+
+fn apply_cli_turn_context_profile(
+    runtime: &BuiltRuntime,
+    yolo_mode: bool,
+    permission_mode: PermissionMode,
+    resume_context: bool,
+    review_context: bool,
+) {
+    runtime.set_context_profile(cli_turn_context_profile(
+        yolo_mode,
+        permission_mode,
+        resume_context,
+        review_context,
+    ));
 }
 
 impl Deref for BuiltRuntime {
@@ -4249,6 +4292,7 @@ impl LiveCli {
             permission_mode,
             yolo_mode,
             yolo_task: None,
+            next_turn_resume_profile: false,
             system_prompt,
             runtime,
             session,
@@ -4330,6 +4374,14 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor, _) = self.prepare_turn_runtime(true, None, None)?;
+        let resume_context = std::mem::take(&mut self.next_turn_resume_profile);
+        apply_cli_turn_context_profile(
+            &runtime,
+            self.yolo_mode,
+            self.permission_mode,
+            resume_context,
+            false,
+        );
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
@@ -4907,6 +4959,7 @@ impl LiveCli {
             id: session_id,
             path: handle.path,
         };
+        self.next_turn_resume_profile = true;
         println!(
             "{}",
             format_resume_report(
@@ -5252,6 +5305,13 @@ impl LiveCli {
             None,
             None,
         )?;
+        apply_cli_turn_context_profile(
+            &runtime,
+            self.yolo_mode,
+            self.permission_mode,
+            false,
+            true,
+        );
         let prompter = runtime::permissions::SharedPrompter::new(Box::new(
             CliPermissionPrompter::new(self.permission_mode),
         ));
@@ -7328,6 +7388,13 @@ fn run_prompt(
         None,
         None,
     )?;
+    apply_cli_turn_context_profile(
+        &runtime,
+        yolo_mode,
+        permission_mode,
+        false,
+        false,
+    );
     if let Some(effort) = reasoning_effort {
         if let Some(rt) = runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(Some(effort));
@@ -7859,9 +7926,11 @@ fn inject_auto_resume_context(
     runtime: &ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
     session_packet: Option<ResumeContextPacket>,
     session_id: &str,
-) {
+) -> bool {
+    let mut injected = false;
     if let Some(packet) = session_packet {
         runtime.inject_resume_context(packet);
+        injected = true;
     }
     let manager = memory::HandoffManager::new();
     let handoff = manager
@@ -7878,7 +7947,9 @@ fn inject_auto_resume_context(
         });
     if let Some(handoff) = handoff {
         runtime.inject_resume_context(handoff_resume_context_packet(&handoff));
+        injected = true;
     }
+    injected
 }
 
 fn workspace_context_item(session: &Session, model_ctx: u32) -> runtime::ContextItem {
@@ -8169,7 +8240,7 @@ fn build_runtime_with_plugin_state(
     let cowd_bus = runtime::CowdEventBus::new();
     runtime = runtime.with_cowd_event_bus(cowd_bus);
     runtime.push_external_context_item(workspace_item);
-    inject_auto_resume_context(&runtime, session_resume_packet, session_id);
+    let resume_context_loaded = inject_auto_resume_context(&runtime, session_resume_packet, session_id);
     // Wire the production sub-agent executor so the collaboration pipeline
     // can delegate real work to sub-agents.
     {
@@ -8201,7 +8272,12 @@ fn build_runtime_with_plugin_state(
         >(executor_arc);
         runtime = runtime.with_jps_pipeline(jps_pipeline);
     }
-    Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+    Ok(BuiltRuntime::new(
+        runtime,
+        plugin_registry,
+        mcp_state,
+        resume_context_loaded,
+    ))
 }
 
 struct CliHookProgressReporter;
@@ -10163,7 +10239,7 @@ mod tests {
         slash_command_completion_candidates_with_sessions, status_context,
         suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
         sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
-        workspace_context_item, write_mcp_server_fixture,
+        workspace_context_item, write_mcp_server_fixture, cli_turn_context_profile,
     };
     use crate::task_kernel::{
         TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
@@ -10174,7 +10250,7 @@ mod tests {
     };
     use runtime::{
         AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, GatewayPlatformConfig,
-        JsonValue, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
+        ContextProfile, JsonValue, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
         load_oauth_credentials, save_oauth_credentials,
     };
     use serde_json::json;
@@ -11838,6 +11914,30 @@ mod tests {
 
         assert!(banner.contains("yolo"));
         assert!(banner.contains("session-yolo-test"));
+    }
+
+    #[test]
+    fn cli_turn_context_profile_maps_runtime_modes() {
+        assert_eq!(
+            cli_turn_context_profile(false, PermissionMode::WorkspaceWrite, false, false),
+            ContextProfile::MainTurn
+        );
+        assert_eq!(
+            cli_turn_context_profile(false, PermissionMode::DangerFullAccess, false, false),
+            ContextProfile::SoloGoal
+        );
+        assert_eq!(
+            cli_turn_context_profile(true, PermissionMode::DangerFullAccess, false, false),
+            ContextProfile::YoloGoal
+        );
+        assert_eq!(
+            cli_turn_context_profile(true, PermissionMode::DangerFullAccess, true, false),
+            ContextProfile::Resume
+        );
+        assert_eq!(
+            cli_turn_context_profile(true, PermissionMode::DangerFullAccess, true, true),
+            ContextProfile::Review
+        );
     }
 
     #[test]

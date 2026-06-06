@@ -40,6 +40,7 @@ pub mod handoff;
 pub mod hot_reload;
 pub mod kernel;
 pub mod layers;
+pub mod maintenance;
 pub mod memory_sync;
 pub mod orchestrator;
 pub mod resolution;
@@ -74,6 +75,11 @@ pub mod transaction;
 // --- Convenience re-exports ---
 
 pub use layers::shared::{L4Event, L4EventBus, L4Operation};
+pub use maintenance::{
+    MaintenanceCandidate, MaintenanceCandidateFilter, MaintenanceCandidateKind,
+    MaintenanceCandidateStatus, MaintenanceQueue, MaintenanceScanConfig,
+    scan_maintenance_candidates,
+};
 pub use cognitive::{CognitiveContextManager, SessionRestoreStats, VectorIndexStats};
 pub use kernel::{
     MemoryAtomView, MemoryDegradation, MemoryHealth, MemoryInformationState, MemoryKernel,

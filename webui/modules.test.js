@@ -59,6 +59,9 @@ describe('API module', () => {
     expect(typeof window.Api.recallExplain).toBe('function');
     expect(typeof window.Api.memoryPacket).toBe('function');
     expect(typeof window.Api.memoryLinks).toBe('function');
+    expect(typeof window.Api.memoryMaintenance).toBe('function');
+    expect(typeof window.Api.scanMemoryMaintenance).toBe('function');
+    expect(typeof window.Api.updateMemoryMaintenance).toBe('function');
     expect(typeof window.Api.currentContext).toBe('function');
     expect(typeof window.Api.createMemoryEntry).toBe('function');
     expect(typeof window.Api.updateMemoryEntry).toBe('function');
@@ -119,6 +122,26 @@ describe('API module', () => {
     expect(String(mockF.mock.calls[0][0])).toBe('/api/memory/packet?q=SessionKernel&max_items=9&max_tokens=1234');
     expect(String(mockF.mock.calls[1][0])).toBe('/api/memory/links');
     expect(links.links[0].kind).toBe('Supports');
+  });
+
+  it('memory maintenance endpoints use lifecycle routes', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ candidates: [{ id: 'c1', kind: 'stale' }] })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.memoryMaintenance({ status: 'open', kind: 'stale', limit: 5 });
+    await window.Api.scanMemoryMaintenance({ stale_threshold: 0.8 });
+    await window.Api.updateMemoryMaintenance('c1', 'acknowledged');
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/memory/maintenance?status=open&kind=stale&limit=5');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/memory/maintenance');
+    expect(mockF.mock.calls[1][1].method).toBe('POST');
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/memory/maintenance/c1');
+    expect(JSON.parse(mockF.mock.calls[2][1].body).status).toBe('acknowledged');
   });
 
   it('currentContext uses the context envelope endpoint', async () => {
