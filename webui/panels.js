@@ -107,7 +107,7 @@ window.Panels = (()=>{
     const diagnostics=envelope.diagnostics||{};
     const stamp=item.created_at_ms?new Date(item.created_at_ms).toLocaleTimeString():'n/a';
     row.type='button';
-    row.innerHTML='<b>'+UI.esc(envelope.profile||'Context')+'</b><small>'+UI.esc([item.envelope_id||envelope.id||'no-id','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(envelope.intent||''))+'</em><span>'+UI.esc(fmtPressure(diagnostics.pressure_bp))+'</span>';
+    row.innerHTML='<b>'+UI.esc(envelope.profile||'Context')+'</b><small>'+UI.esc([item.envelope_id||envelope.id||'no-id',item.run_id||'no-run','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(envelope.intent||''))+'</em><span>'+UI.esc(fmtPressure(diagnostics.pressure_bp))+'</span>';
     row.onclick=function(){if(onSelect)onSelect(item)};
     return row;
   }
@@ -116,7 +116,7 @@ window.Panels = (()=>{
     const detail=UI.el('div','context-history-detail');
     const envelope=(item&&item.envelope)||{};
     const diagnostics=envelope.diagnostics||{};
-    detail.innerHTML='<h4>'+UI.esc(envelope.profile||'Context')+'</h4><small>'+UI.esc([item.envelope_id||envelope.id||'no-id','pressure '+fmtPressure(diagnostics.pressure_bp),'selected '+((envelope.selected||[]).length),'omitted '+((envelope.omitted||[]).length)].join(' · '))+'</small>';
+    detail.innerHTML='<h4>'+UI.esc(envelope.profile||'Context')+'</h4><small>'+UI.esc([item.envelope_id||envelope.id||'no-id',item.run_id||'no-run','pressure '+fmtPressure(diagnostics.pressure_bp),'selected '+((envelope.selected||[]).length),'omitted '+((envelope.omitted||[]).length)].join(' · '))+'</small>';
     const selected=(envelope.selected||[]).slice(0,3);
     if(selected.length){
       selected.forEach(function(ctxItem){detail.appendChild(renderContextItem(ctxItem))});

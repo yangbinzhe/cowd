@@ -699,6 +699,7 @@ describe('API module', () => {
           json: () => Promise.resolve({
             context: {
               envelope_id: 'ctx-1',
+              run_id: 'run-1',
               envelope: {
                 id: 'ctx-1',
                 profile: 'MainTurn',
@@ -744,6 +745,7 @@ describe('API module', () => {
           json: () => Promise.resolve({
             envelopes: [{
               envelope_id: 'ctx-1',
+              run_id: 'run-1',
               sequence: 4,
               created_at_ms: 1000,
               envelope: { id: 'ctx-1', profile: 'MainTurn', intent: 'ship now', diagnostics: { pressure_bp: 150 } },

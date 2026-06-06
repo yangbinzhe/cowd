@@ -1411,6 +1411,7 @@ async fn send_message(
             let eb = event_bus.clone();
             let sid = session_id.clone();
             let kernel = state.session_kernel.clone();
+            let active_run_id = run_id.clone();
             tokio::spawn(async move {
                 while let Ok(event) = rx.recv().await {
                     match event {
@@ -1510,6 +1511,7 @@ async fn send_message(
                             let json = serde_json::json!({
                                 "type": "ContextEnvelope",
                                 "envelope_id": envelope.id.clone(),
+                                "run_id": active_run_id.clone(),
                                 "session_id": envelope.identity.session_id.clone(),
                                 "agent_id": envelope.identity.agent_id.clone(),
                                 "profile": envelope.profile,
@@ -3103,6 +3105,10 @@ fn context_envelope_event_json(event: SessionEvent) -> serde_json::Value {
         .cloned()
         .or_else(|| envelope.get("id").cloned())
         .unwrap_or(serde_json::Value::Null);
+    let run_id = payload
+        .get("run_id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     serde_json::json!({
         "session_id": event.session_id,
@@ -3110,6 +3116,7 @@ fn context_envelope_event_json(event: SessionEvent) -> serde_json::Value {
         "sequence": event.sequence,
         "created_at_ms": event.created_at_ms,
         "envelope_id": envelope_id,
+        "run_id": run_id,
         "envelope": envelope,
     })
 }
@@ -4625,6 +4632,7 @@ mod tests {
         serde_json::json!({
             "type": "ContextEnvelope",
             "envelope_id": envelope.id,
+            "run_id": format!("run-{envelope_id}"),
             "session_id": session_id,
             "envelope": envelope,
         })
@@ -4697,6 +4705,7 @@ mod tests {
         assert_eq!(json["envelopes"].as_array().unwrap().len(), 2);
         assert_eq!(json["envelopes"][0]["sequence"], 1);
         assert_eq!(json["envelopes"][0]["envelope_id"], "env-1");
+        assert_eq!(json["envelopes"][0]["run_id"], "run-env-1");
         assert_eq!(json["envelopes"][1]["envelope"]["intent"], "second");
     }
 
