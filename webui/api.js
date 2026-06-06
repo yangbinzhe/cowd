@@ -169,6 +169,18 @@ window.Api = (()=>{
       const query=params.toString();
       return req('GET','/api/context/current'+(query?'?'+query:''));
     },
+    async contextHistory(sessionId,opts){
+      const sid=sessionId||this.sid;
+      const o=opts||{};
+      const params=new URLSearchParams();
+      if(o.from_seq!==undefined)params.set('from_seq',o.from_seq);
+      if(o.limit!==undefined)params.set('limit',o.limit);
+      const query=params.toString();
+      return req('GET','/api/sessions/'+encodeURIComponent(sid)+'/context'+(query?'?'+query:''));
+    },
+    async contextEnvelope(envelopeId){
+      return req('GET','/api/context/'+encodeURIComponent(envelopeId));
+    },
     async getMemoryLayer(layer){return req('GET','/api/memory/'+layer)},
     async createMemoryEntry(layer,entry){return req('POST','/api/memory/'+layer,entry)},
     async updateMemoryEntry(id,entry){return req('PATCH','/api/memory/entry/'+id,entry)},

@@ -136,6 +136,23 @@ describe('API module', () => {
     expect(context.envelope.id).toBe('ctx-1');
   });
 
+  it('context history uses persisted envelope endpoints', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ envelopes: [{ envelope_id: 'ctx-1' }] })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const history = await window.Api.contextHistory('s1', { from_seq: 10, limit: 8 });
+    await window.Api.contextEnvelope('ctx-1');
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/sessions/s1/context?from_seq=10&limit=8');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/context/ctx-1');
+    expect(history.envelopes[0].envelope_id).toBe('ctx-1');
+  });
+
   it('has all skill endpoints', () => {
     expect(typeof window.Api.listSkills).toBe('function');
     expect(typeof window.Api.installSkill).toBe('function');
@@ -611,8 +628,23 @@ describe('API module', () => {
 
   it('renders context envelope diagnostics and segments', async () => {
     document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
-    vi.stubGlobal('fetch', vi.fn(() =>
-      Promise.resolve({
+    window.Api.sid = 's1';
+    vi.stubGlobal('fetch', vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/sessions/s1/context')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            envelopes: [{
+              envelope_id: 'ctx-1',
+              sequence: 4,
+              created_at_ms: 1000,
+              envelope: { id: 'ctx-1', profile: 'MainTurn', intent: 'ship now', diagnostics: { pressure_bp: 150 } },
+            }]
+          })
+        });
+      }
+      return Promise.resolve({
         ok: true,
         json: () => Promise.resolve({
           enabled: true,
@@ -645,8 +677,8 @@ describe('API module', () => {
             },
           },
         })
-      })
-    ));
+      });
+    }));
 
     await window.Panels.renderContext();
     await new Promise(resolve => setTimeout(resolve, 0));
@@ -659,6 +691,8 @@ describe('API module', () => {
     expect(text).toContain('stable system');
     expect(text).toContain('dynamichasha');
     expect(text).toContain('degraded: Memory');
+    expect(text).toContain('Context Timeline');
+    expect(text).toContain('ship now');
   });
 
   it('renders recall explain metadata in the memory panel', async () => {

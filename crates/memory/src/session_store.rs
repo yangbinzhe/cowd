@@ -26,11 +26,11 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::store::Result;
 use crate::store::session::{
     SessionEvent, SessionListOptions, SessionListPage, SessionMessage, SessionRecord,
     SessionSearchResult, SessionSnapshot, SqliteSessionStore,
 };
-use crate::store::Result;
 
 // ---------------------------------------------------------------------------
 // UnifiedSessionStore
@@ -223,12 +223,50 @@ impl UnifiedSessionStore {
             .get_events_limited(session_id, from_seq, limit)
     }
 
+    /// Retrieve at most `limit` events of one type for a session.
+    pub async fn get_events_by_type_limited(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        self.inner
+            .lock()
+            .await
+            .get_events_by_type_limited(session_id, event_type, from_seq, limit)
+    }
+
     /// Count events for a session from `from_seq`.
     pub async fn count_events_from(&self, session_id: &str, from_seq: usize) -> Result<usize> {
         self.inner
             .lock()
             .await
             .count_events_from(session_id, from_seq)
+    }
+
+    /// Count events of one type for a session from `from_seq`.
+    pub async fn count_events_by_type_from(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_seq: usize,
+    ) -> Result<usize> {
+        self.inner
+            .lock()
+            .await
+            .count_events_by_type_from(session_id, event_type, from_seq)
+    }
+
+    /// Retrieve a context envelope event by its envelope id.
+    pub async fn get_context_event_by_envelope_id(
+        &self,
+        envelope_id: &str,
+    ) -> Result<Option<SessionEvent>> {
+        self.inner
+            .lock()
+            .await
+            .get_context_event_by_envelope_id(envelope_id)
     }
 
     /// Return the next append sequence for a session event.

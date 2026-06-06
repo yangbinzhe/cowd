@@ -182,7 +182,7 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .context-title b{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .context-title span{font-size:10px;color:var(--accent);border:1px solid var(--border);border-radius:999px;padding:2px 6px;text-transform:uppercase}
 .context-degraded{margin-top:8px;color:var(--warn);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.context-list h3,.context-segments h3{font-size:12px;margin-bottom:8px}
+.context-list h3,.context-segments h3,.context-history h3{font-size:12px;margin-bottom:8px}
 .context-item{display:grid;grid-template-columns:76px minmax(0,1fr);gap:8px;padding:7px 0;border-top:1px solid var(--border)}
 .context-item:first-of-type{border-top:0}
 .context-role{align-self:start;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 6px;border:1px solid var(--border);border-radius:999px;font-size:10px;text-align:center;color:var(--text2)}
@@ -197,6 +197,14 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .context-segment{border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);padding:8px;margin-top:8px;min-width:0}
 .context-segment h4{font-size:11px;color:var(--text2);text-transform:uppercase;margin-bottom:6px}
 .context-segment pre{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:10px;line-height:1.4;color:var(--text2);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:6px;margin-top:6px;max-height:92px;overflow:auto}
+.context-history-item{width:100%;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 8px;text-align:left;border:0;border-top:1px solid var(--border);border-radius:0;background:transparent;color:var(--text);padding:7px 0;cursor:pointer}
+.context-history-item:first-of-type{border-top:0}
+.context-history-item:hover{background:var(--surface)}
+.context-history-item b,.context-history-item small,.context-history-item em{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.context-history-item b{font-size:12px}
+.context-history-item small{grid-column:1;font-size:10px;color:var(--text3)}
+.context-history-item em{grid-column:1;font-style:normal;font-size:11px;color:var(--text2)}
+.context-history-item span{grid-column:2;grid-row:1 / span 3;align-self:center;font-size:11px;color:var(--accent)}
 
 .audit-controls{display:flex;gap:8px;align-items:center}
 .audit-controls select{flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:13px}

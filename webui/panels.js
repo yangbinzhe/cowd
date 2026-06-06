@@ -95,6 +95,21 @@ window.Panels = (()=>{
     return sec;
   }
 
+  function renderContextHistoryItem(item){
+    const row=UI.el('button','context-history-item');
+    const envelope=item.envelope||{};
+    const diagnostics=envelope.diagnostics||{};
+    const stamp=item.created_at_ms?new Date(item.created_at_ms).toLocaleTimeString():'n/a';
+    row.type='button';
+    row.innerHTML='<b>'+UI.esc(envelope.profile||'Context')+'</b><small>'+UI.esc([item.envelope_id||envelope.id||'no-id','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(envelope.intent||''))+'</em><span>'+UI.esc(fmtPressure(diagnostics.pressure_bp))+'</span>';
+    row.onclick=function(){
+      const next=(item.envelope)||{};
+      const evt=new CustomEvent('cowd-context-history-selected',{detail:next});
+      window.dispatchEvent(evt);
+    };
+    return row;
+  }
+
   async function renderContext(){
     const c=cont();c.innerHTML='';
     const hdr=UI.el('div','panel-section context-header');
@@ -164,6 +179,24 @@ window.Panels = (()=>{
         segments.appendChild(renderContextSegment('runtime header',assembled.runtime_header));
         segments.appendChild(renderContextSegment('dynamic tail',assembled.dynamic_tail));
         mount.appendChild(segments);
+
+        const history=UI.el('div','panel-section context-history');
+        history.innerHTML='<h3>Context Timeline</h3>';
+        if(!Api.sid){
+          history.appendChild(UI.el('div','panel-empty','No active session'));
+        }else{
+          try{
+            const timeline=await Api.contextHistory(Api.sid,{limit:8});
+            const rows=timeline.envelopes||[];
+            if(!rows.length)history.appendChild(UI.el('div','panel-empty','No persisted envelopes'));
+            rows.slice(-8).reverse().forEach(function(item){
+              history.appendChild(renderContextHistoryItem(item));
+            });
+          }catch(historyError){
+            history.appendChild(UI.el('div','panel-empty','Context timeline unavailable'));
+          }
+        }
+        mount.appendChild(history);
       }catch(e){
         mount.appendChild(UI.el('div','panel-empty','Context unavailable: '+e.message));
       }

@@ -17,7 +17,7 @@ use chrono::Utc;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::{error::MemoryError, store::Result};
 
@@ -225,6 +225,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
         )",
         r"CREATE INDEX IF NOT EXISTS idx_session_events_session     ON session_events(session_id)",
         r"CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, sequence)",
+        r"CREATE INDEX IF NOT EXISTS idx_session_events_session_type_seq
+            ON session_events(session_id, event_type, sequence)",
         r"CREATE TABLE IF NOT EXISTS session_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
@@ -1247,6 +1249,38 @@ impl SqliteSessionStore {
         Ok(events)
     }
 
+    /// Retrieve at most `limit` events of one type for a session.
+    /// Ordered by sequence ascending.
+    pub fn get_events_by_type_limited(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+                 FROM session_events
+                 WHERE session_id = ?1 AND event_type = ?2 AND sequence >= ?3
+                 ORDER BY sequence ASC
+                 LIMIT ?4",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(
+                params![session_id, event_type, from_seq as i64, limit as i64],
+                row_to_event,
+            )
+            .map_err(sql_err)?;
+        let mut events = Vec::new();
+        for r in rows {
+            events.push(r.map_err(sql_err)?);
+        }
+        Ok(events)
+    }
+
     /// Count events for a session starting from `from_seq`.
     pub fn count_events_from(&self, session_id: &str, from_seq: usize) -> Result<usize> {
         let conn = self.conn()?;
@@ -1258,6 +1292,44 @@ impl SqliteSessionStore {
             )
             .map_err(sql_err)?;
         Ok(count as usize)
+    }
+
+    /// Count events of one type for a session starting from `from_seq`.
+    pub fn count_events_by_type_from(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_seq: usize,
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = ?1 AND event_type = ?2 AND sequence >= ?3",
+                params![session_id, event_type, from_seq as i64],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        Ok(count as usize)
+    }
+
+    /// Retrieve a context envelope event by its envelope id.
+    pub fn get_context_event_by_envelope_id(
+        &self,
+        envelope_id: &str,
+    ) -> Result<Option<SessionEvent>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            r"SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+              FROM session_events
+              WHERE event_type = 'ContextEnvelope'
+                AND json_extract(event_json, '$.envelope.id') = ?1
+              ORDER BY created_at_ms DESC
+              LIMIT 1",
+            params![envelope_id],
+            row_to_event,
+        )
+        .optional()
+        .map_err(sql_err)
     }
 
     /// Return the next append sequence for a session event.
@@ -1564,14 +1636,16 @@ mod tests {
 
         assert_eq!(page.total, 1667);
         assert_eq!(page.records.len(), 7);
-        assert!(page
-            .records
-            .windows(2)
-            .all(|pair| pair[0].last_activity >= pair[1].last_activity));
-        assert!(page
-            .records
-            .iter()
-            .all(|r| r.model.as_deref() == Some("claude-sonnet-4-6") && r.status == "active"));
+        assert!(
+            page.records
+                .windows(2)
+                .all(|pair| pair[0].last_activity >= pair[1].last_activity)
+        );
+        assert!(
+            page.records
+                .iter()
+                .all(|r| r.model.as_deref() == Some("claude-sonnet-4-6") && r.status == "active")
+        );
     }
 
     #[test]
@@ -1647,9 +1721,79 @@ mod tests {
     }
 
     #[test]
+    fn get_events_by_type_pages_context_envelopes_only() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-context-events"))
+            .unwrap();
+        for (sequence, event_type) in [
+            (0, "TextDelta"),
+            (1, "ContextEnvelope"),
+            (2, "ToolStart"),
+            (3, "ContextEnvelope"),
+        ] {
+            store
+                .append_event(&SessionEvent {
+                    session_id: "s-context-events".to_string(),
+                    event_type: event_type.to_string(),
+                    event_json: serde_json::json!({
+                        "envelope_id": format!("env-{sequence}"),
+                        "envelope": {"id": format!("env-{sequence}")}
+                    })
+                    .to_string(),
+                    sequence,
+                    created_at_ms: sequence as u64,
+                })
+                .unwrap();
+        }
+
+        let events = store
+            .get_events_by_type_limited("s-context-events", "ContextEnvelope", 0, 10)
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].sequence, 3);
+        assert_eq!(
+            store
+                .count_events_by_type_from("s-context-events", "ContextEnvelope", 0)
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn get_context_event_by_envelope_id_reads_json_payload() {
+        let (store, _dir) = make_store();
+        store.create_session(&make_record("s-context-id")).unwrap();
+        store
+            .append_event(&SessionEvent {
+                session_id: "s-context-id".to_string(),
+                event_type: "ContextEnvelope".to_string(),
+                event_json: serde_json::json!({
+                    "envelope_id": "env-target",
+                    "envelope": {"id": "env-target", "intent": "ship"}
+                })
+                .to_string(),
+                sequence: 7,
+                created_at_ms: 7,
+            })
+            .unwrap();
+
+        let event = store
+            .get_context_event_by_envelope_id("env-target")
+            .unwrap()
+            .expect("context event");
+        assert_eq!(event.session_id, "s-context-id");
+        assert_eq!(event.sequence, 7);
+        assert!(event.event_json.contains("ship"));
+    }
+
+    #[test]
     fn delete_events_from_removes_tail_only() {
         let (store, _dir) = make_store();
-        store.create_session(&make_record("s-events-delete")).unwrap();
+        store
+            .create_session(&make_record("s-events-delete"))
+            .unwrap();
         for i in 0..5 {
             store
                 .append_event(&SessionEvent {
@@ -1672,7 +1816,9 @@ mod tests {
     #[test]
     fn delete_events_by_type_from_preserves_other_event_types() {
         let (store, _dir) = make_store();
-        store.create_session(&make_record("s-events-delete-type")).unwrap();
+        store
+            .create_session(&make_record("s-events-delete-type"))
+            .unwrap();
         for (sequence, event_type) in [
             (0, "message_appended"),
             (1, "TextDelta"),
@@ -1751,6 +1897,38 @@ mod tests {
     }
 
     #[test]
+    fn event_type_page_query_uses_session_type_sequence_index() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-context-event-index"))
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r"EXPLAIN QUERY PLAN
+                  SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+                  FROM session_events
+                  WHERE session_id = ?1 AND event_type = ?2 AND sequence >= ?3
+                  ORDER BY sequence ASC
+                  LIMIT ?4",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(
+                params!["s-context-event-index", "ContextEnvelope", 100_i64, 20_i64],
+                |row| row.get(3),
+            )
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let plan_text = plan.join(" | ");
+        assert!(
+            plan_text.contains("idx_session_events_session_type_seq"),
+            "expected context event type index in query plan, got: {plan_text}"
+        );
+    }
+
+    #[test]
     fn get_messages_from_sequence_pages_100k_history() {
         let (store, _dir) = make_store();
         let mut record = make_record("s-100k");
@@ -1770,8 +1948,9 @@ mod tests {
                     .unwrap();
                 for i in 0..100_000 {
                     let role = if i % 2 == 0 { "user" } else { "assistant" };
-                    let content = serde_json::json!([{"type":"text","text":format!("message {i}")}])
-                        .to_string();
+                    let content =
+                        serde_json::json!([{"type":"text","text":format!("message {i}")}])
+                            .to_string();
                     stmt.execute(params![i as i64, role, content, i as i64])
                         .unwrap();
                 }
@@ -1779,7 +1958,9 @@ mod tests {
             tx.commit().unwrap();
         }
 
-        let page = store.get_messages_from_sequence("s-100k", 99_950, 50).unwrap();
+        let page = store
+            .get_messages_from_sequence("s-100k", 99_950, 50)
+            .unwrap();
         assert_eq!(page.len(), 50);
         assert_eq!(page[0].sequence, 99_950);
         assert_eq!(page[49].sequence, 99_999);
@@ -1788,7 +1969,9 @@ mod tests {
     #[test]
     fn message_sequence_page_query_uses_session_sequence_index() {
         let (store, _dir) = make_store();
-        store.create_session(&make_record("s-message-index")).unwrap();
+        store
+            .create_session(&make_record("s-message-index"))
+            .unwrap();
         let conn = store.conn().unwrap();
         let mut stmt = conn
             .prepare(

@@ -47,7 +47,7 @@ use crate::task_kernel::{TaskKernel, TaskStatus};
 use memory::RotAlert;
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
-use memory::store::session::{SessionListOptions, SessionRecord};
+use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
@@ -161,10 +161,18 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             get(get_session_messages).post(send_message),
         )
         .route("/api/sessions/:id/events", get(get_session_events))
+        .route(
+            "/api/sessions/:id/context",
+            get(get_session_context_history),
+        )
         .route("/api/sessions/:id/stream", get(sse_stream_handler))
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
         .route("/api/context/current", get(context_current_handler))
+        .route(
+            "/api/context/:envelope_id",
+            get(get_context_envelope_handler),
+        )
         .route("/api/tasks", get(tasks_status_handler))
         .route("/api/tasks/start", post(start_task_handler))
         .route("/api/tasks/:id/phases", post(start_task_phase_handler))
@@ -1330,6 +1338,31 @@ async fn send_message(
                                 &kernel,
                                 &sid,
                                 "TurnError",
+                                json,
+                            )
+                            .await;
+                        }
+                        runtime::CowdEvent::ContextEnvelope { envelope } => {
+                            let json = serde_json::json!({
+                                "type": "ContextEnvelope",
+                                "envelope_id": envelope.id.clone(),
+                                "session_id": envelope.identity.session_id.clone(),
+                                "agent_id": envelope.identity.agent_id.clone(),
+                                "profile": envelope.profile,
+                                "diagnostics": envelope.diagnostics.clone(),
+                                "budget": envelope.budget.clone(),
+                                "hashes": {
+                                    "stable_head": envelope.diagnostics.stable_head_hash,
+                                    "runtime_header": envelope.diagnostics.runtime_header_hash,
+                                    "dynamic_tail": envelope.diagnostics.dynamic_tail_hash,
+                                },
+                                "envelope": envelope,
+                            });
+                            eb.broadcast(&sid, &json.to_string()).await;
+                            append_session_timeline_event_to_kernel(
+                                &kernel,
+                                &sid,
+                                "ContextEnvelope",
                                 json,
                             )
                             .await;
@@ -2748,6 +2781,119 @@ async fn get_session_events(
     })))
 }
 
+fn context_envelope_event_json(event: SessionEvent) -> serde_json::Value {
+    let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
+    let envelope = payload
+        .get("envelope")
+        .cloned()
+        .unwrap_or_else(|| payload.clone());
+    let envelope_id = payload
+        .get("envelope_id")
+        .cloned()
+        .or_else(|| envelope.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null);
+
+    serde_json::json!({
+        "session_id": event.session_id,
+        "type": event.event_type,
+        "sequence": event.sequence,
+        "created_at_ms": event.created_at_ms,
+        "envelope_id": envelope_id,
+        "envelope": envelope,
+    })
+}
+
+async fn get_session_context_history(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<GetEventsParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let from_seq = params.from_seq.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).min(200);
+    let Some((total, stored_events)) = state
+        .session_kernel
+        .stored_events_by_type_page(&id, "ContextEnvelope", from_seq, limit)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load context timeline: {e}"),
+                }),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
+
+    let envelopes: Vec<serde_json::Value> = stored_events
+        .into_iter()
+        .map(context_envelope_event_json)
+        .collect();
+    let next_seq = envelopes
+        .last()
+        .and_then(|event| event["sequence"].as_u64())
+        .map(|sequence| sequence as usize + 1);
+    let has_more = envelopes.len() < total;
+
+    Ok(Json(serde_json::json!({
+        "session_id": id,
+        "envelopes": envelopes,
+        "total": total,
+        "from_seq": from_seq,
+        "next_seq": next_seq,
+        "limit": limit,
+        "has_more": has_more,
+    })))
+}
+
+async fn get_context_envelope_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(envelope_id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if !state.has_unified_store() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    }
+
+    let Some(event) = state
+        .session_kernel
+        .context_event_by_envelope_id(&envelope_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load context envelope: {e}"),
+                }),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("context envelope {envelope_id} not found"),
+            }),
+        ));
+    };
+
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "source": "history",
+        "context": context_envelope_event_json(event),
+    })))
+}
+
 // ── Session messages search handler ───────────────────────────────
 
 async fn search_messages_handler(
@@ -4006,6 +4152,149 @@ mod tests {
         assert_eq!(json["events"][0]["sequence"], 0);
         assert_eq!(json["events"][0]["payload"]["role"], "user");
         assert_eq!(json["has_more"], false);
+    }
+
+    fn test_context_envelope(
+        session_id: &str,
+        envelope_id: &str,
+        intent: &str,
+    ) -> serde_json::Value {
+        let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            profile: ContextProfile::MainTurn,
+            identity: ContextIdentity::main(session_id),
+            intent: intent.to_string(),
+            stable_head: vec!["stable".to_string()],
+            runtime_header: vec!["runtime".to_string()],
+            dynamic_items: vec![ContextItem::new(
+                format!("{envelope_id}-item"),
+                ContextSourceKind::Memory,
+                ContextRole::Orientation,
+                "orientation",
+            )],
+            omitted: Vec::new(),
+            total_budget_tokens: 4_000,
+        });
+        envelope.id = envelope_id.to_string();
+        serde_json::json!({
+            "type": "ContextEnvelope",
+            "envelope_id": envelope.id,
+            "session_id": session_id,
+            "envelope": envelope,
+        })
+    }
+
+    #[tokio::test]
+    async fn session_context_history_reads_context_events_only() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "context-history-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        for (sequence, event_type, payload) in [
+            (
+                0,
+                "TextDelta",
+                serde_json::json!({"type":"TextDelta","content":"skip"}),
+            ),
+            (
+                1,
+                "ContextEnvelope",
+                test_context_envelope(session_id, "env-1", "first"),
+            ),
+            (
+                2,
+                "ToolStart",
+                serde_json::json!({"type":"ToolStart","name":"skip"}),
+            ),
+            (
+                3,
+                "ContextEnvelope",
+                test_context_envelope(session_id, "env-2", "second"),
+            ),
+        ] {
+            store
+                .append_event(&memory::SessionEvent {
+                    session_id: session_id.to_string(),
+                    event_type: event_type.to_string(),
+                    event_json: payload.to_string(),
+                    sequence,
+                    created_at_ms: sequence as u64,
+                })
+                .await
+                .unwrap();
+        }
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions/{session_id}/context?from_seq=0&limit=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["session_id"], session_id);
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["envelopes"].as_array().unwrap().len(), 2);
+        assert_eq!(json["envelopes"][0]["sequence"], 1);
+        assert_eq!(json["envelopes"][0]["envelope_id"], "env-1");
+        assert_eq!(json["envelopes"][1]["envelope"]["intent"], "second");
+    }
+
+    #[tokio::test]
+    async fn context_envelope_route_reads_by_envelope_id() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "context-id-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_event(&memory::SessionEvent {
+                session_id: session_id.to_string(),
+                event_type: "ContextEnvelope".to_string(),
+                event_json: test_context_envelope(session_id, "env-target", "inspect").to_string(),
+                sequence: 4,
+                created_at_ms: 4,
+            })
+            .await
+            .unwrap();
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/env-target")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["source"], "history");
+        assert_eq!(json["context"]["session_id"], session_id);
+        assert_eq!(json["context"]["sequence"], 4);
+        assert_eq!(json["context"]["envelope"]["id"], "env-target");
     }
 
     #[tokio::test]

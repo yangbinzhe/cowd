@@ -194,6 +194,35 @@ impl SessionKernel {
         Ok(Some((total, events)))
     }
 
+    pub(crate) async fn stored_events_by_type_page(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Option<(usize, Vec<SessionEvent>)>, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        let total = store
+            .count_events_by_type_from(session_id, event_type, from_sequence)
+            .await?;
+        let events = store
+            .get_events_by_type_limited(session_id, event_type, from_sequence, limit)
+            .await?;
+        Ok(Some((total, events)))
+    }
+
+    pub(crate) async fn context_event_by_envelope_id(
+        &self,
+        envelope_id: &str,
+    ) -> Result<Option<SessionEvent>, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store.get_context_event_by_envelope_id(envelope_id).await
+    }
+
     pub(crate) async fn search_stored_messages(
         &self,
         query: &str,
