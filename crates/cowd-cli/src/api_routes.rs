@@ -5219,6 +5219,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_timeline_projects_workgraph_summary() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "runtime-workgraph-summary-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        let mut event = memory::RuntimeEvent::new(
+            session_id,
+            0,
+            memory::RuntimeEventScope::Workgraph,
+            "agent.workgraph.reviewed",
+            serde_json::json!({
+                "board_id": "board-summary",
+                "graph": {
+                    "graph_id": "graph-summary",
+                    "status": "completed",
+                    "nodes": [
+                        {"kind": "AgentTask", "node_id": "task-1"},
+                        {"kind": "Synthesis", "node_id": "synthesis-board-summary"}
+                    ]
+                },
+                "scorecard": {
+                    "completion_rate": 1.0,
+                    "synthesis_lift": 1.2,
+                    "complementarity_score": 0.75,
+                    "conflict_count": 1
+                },
+                "maintenance_candidates": [{"id": "candidate-summary"}]
+            }),
+            10,
+        );
+        event.refs = vec![
+            memory::RuntimeRef {
+                ref_type: "workgraph".to_string(),
+                id: "graph-summary".to_string(),
+                label: None,
+            },
+            memory::RuntimeRef {
+                ref_type: "collaboration_board".to_string(),
+                id: "board-summary".to_string(),
+                label: None,
+            },
+        ];
+        store.append_runtime_event(&event).await.unwrap();
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["workgraph_summary"]["count"], 1);
+        assert_eq!(json["workgraph_summary"]["latest"]["graph_id"], "graph-summary");
+        assert_eq!(json["workgraph_summary"]["latest"]["board_id"], "board-summary");
+        assert_eq!(json["workgraph_summary"]["latest"]["completion_rate"], 1.0);
+        assert_eq!(json["workgraph_summary"]["agent_tasks"], 1);
+        assert_eq!(json["workgraph_summary"]["memory_candidates"], 1);
+        assert_eq!(json["workgraph_summary"]["conflicts"], 1);
+    }
+
+    #[tokio::test]
     async fn runtime_projection_degrades_missing_sources() {
         let app = api_router(test_state());
         let response = app
@@ -5236,6 +5312,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["degraded"], true);
         assert_eq!(json["events"].as_array().unwrap().len(), 0);
+        assert_eq!(json["workgraph_summary"]["count"], 0);
     }
 
     fn test_context_envelope(

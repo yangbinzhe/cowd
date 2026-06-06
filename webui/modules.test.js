@@ -939,6 +939,22 @@ describe('API module', () => {
             total: 2,
             next_seq: 12,
             degraded: false,
+            workgraph_summary: {
+              count: 1,
+              latest: {
+                sequence: 12,
+                kind: 'agent.workgraph.reviewed',
+                status: 'completed',
+                graph_id: 'workgraph-1',
+                board_id: 'board-1',
+                completion_rate: 1,
+                synthesis_lift: 1.2,
+                complementarity_score: 0.75,
+              },
+              agent_tasks: 1,
+              memory_candidates: 1,
+              conflicts: 1,
+            },
             events: [
               {
                 kind: 'ToolComplete',

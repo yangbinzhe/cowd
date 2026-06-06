@@ -21,6 +21,13 @@ pub struct RuntimeActivityPanel {
     stable_hash: String,
     runtime_hash: String,
     dynamic_hash: String,
+    workgraph_status: String,
+    workgraph_graph_id: String,
+    workgraph_board_id: String,
+    workgraph_agent_tasks: usize,
+    workgraph_candidates: usize,
+    workgraph_conflicts: usize,
+    workgraph_completion_pct: String,
     recent_activity: Vec<String>,
     yolo_mode: bool,
     session_id: String,
@@ -64,6 +71,34 @@ impl RuntimeActivityPanel {
             self.stable_hash = "n/a".to_string();
             self.runtime_hash = "n/a".to_string();
             self.dynamic_hash = "n/a".to_string();
+        }
+        if let Some(summary) = &app.latest_workgraph_summary {
+            self.workgraph_status = summary.status.clone();
+            self.workgraph_graph_id = summary
+                .graph_id
+                .as_deref()
+                .map(short_id)
+                .unwrap_or_else(|| "n/a".to_string());
+            self.workgraph_board_id = summary
+                .board_id
+                .as_deref()
+                .map(short_id)
+                .unwrap_or_else(|| "n/a".to_string());
+            self.workgraph_agent_tasks = summary.agent_tasks;
+            self.workgraph_candidates = summary.memory_candidates;
+            self.workgraph_conflicts = summary.conflicts;
+            self.workgraph_completion_pct = summary
+                .completion_rate
+                .map(|value| format!("{}%", (value * 100.0).round() as u16))
+                .unwrap_or_else(|| "n/a".to_string());
+        } else {
+            self.workgraph_status = "n/a".to_string();
+            self.workgraph_graph_id = "n/a".to_string();
+            self.workgraph_board_id = "n/a".to_string();
+            self.workgraph_agent_tasks = 0;
+            self.workgraph_candidates = 0;
+            self.workgraph_conflicts = 0;
+            self.workgraph_completion_pct = "n/a".to_string();
         }
         self.recent_activity = app
             .timeline_clone_vec()
@@ -130,6 +165,36 @@ impl Component for RuntimeActivityPanel {
                 format!(
                     "stable {} runtime {} dyn {}",
                     self.stable_hash, self.runtime_hash, self.dynamic_hash
+                ),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("WorkGraph:", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    " {} {} agents {} done conflicts {} candidates {}",
+                    self.workgraph_status,
+                    self.workgraph_completion_pct,
+                    self.workgraph_agent_tasks,
+                    self.workgraph_conflicts,
+                    self.workgraph_candidates
+                ),
+                Style::default().fg(if self.workgraph_conflicts > 0 {
+                    Color::Yellow
+                } else if self.workgraph_status == "completed" {
+                    Color::Green
+                } else {
+                    Color::White
+                }),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Graph:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "graph {} board {}",
+                    self.workgraph_graph_id, self.workgraph_board_id
                 ),
                 Style::default().fg(Color::White),
             ),
@@ -262,6 +327,19 @@ mod tests {
             summary: "ok".to_string(),
             exit_code: Some(0),
         });
+        app.apply_event(runtime::CowdEvent::WorkGraphSummary {
+            summary: runtime::RuntimeWorkGraphSummary {
+                graph_id: Some("graph-run".to_string()),
+                board_id: Some("board-run".to_string()),
+                status: "completed".to_string(),
+                agent_tasks: 2,
+                memory_candidates: 1,
+                conflicts: 1,
+                completion_rate: Some(1.0),
+                synthesis_lift: Some(1.2),
+                complementarity_score: Some(0.75),
+            },
+        });
 
         let identity = runtime::ContextIdentity::main("session-runtime-123456789".to_string());
         app.latest_context_envelope = Some(runtime::ContextRuntimeKernel::build_envelope(
@@ -291,6 +369,11 @@ mod tests {
         assert!(rendered.contains("Nominal"));
         assert!(rendered.contains("None"));
         assert!(rendered.contains("selected 1 omitted 0"));
+        assert!(rendered.contains("WorkGraph"));
+        assert!(rendered.contains("completed 100% agents 2"));
+        assert!(rendered.contains("conflicts 1 candidates 1"));
+        assert!(rendered.contains("graph-run"));
+        assert!(rendered.contains("board-run"));
         assert!(rendered.contains("tool bash exit 0"));
         assert!(rendered.contains("user: ship the runtime console"));
     }

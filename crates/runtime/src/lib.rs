@@ -234,7 +234,7 @@ pub use session::{
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use profile::{Profile, ProfileManager, ProfileMeta};
-pub use cowd_event::{CowdEvent, CowdEventBus};
+pub use cowd_event::{CowdEvent, CowdEventBus, RuntimeWorkGraphSummary};
 pub use stale_base::{
     check_base_commit, format_stale_base_warning, read_cowd_base_file, resolve_expected_base,
     BaseCommitSource, BaseCommitState,

@@ -101,6 +101,19 @@ mod tests {
                 assistant_text: "ok".into(),
                 iterations: 1,
             },
+            runtime::CowdEvent::WorkGraphSummary {
+                summary: runtime::RuntimeWorkGraphSummary {
+                    graph_id: Some("graph".into()),
+                    board_id: Some("board".into()),
+                    status: "completed".into(),
+                    agent_tasks: 1,
+                    memory_candidates: 1,
+                    conflicts: 0,
+                    completion_rate: Some(1.0),
+                    synthesis_lift: Some(1.1),
+                    complementarity_score: Some(0.5),
+                },
+            },
             runtime::CowdEvent::TurnError { error: "e".into() },
             runtime::CowdEvent::CompactionNotice { removed_count: 5 },
         ];

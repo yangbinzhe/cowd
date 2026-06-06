@@ -188,7 +188,26 @@ window.Panels = (()=>{
     return row;
   }
 
-  function summarizeWorkGraphs(events){
+  function summarizeWorkGraphs(events,serverSummary){
+    if(serverSummary&&typeof serverSummary==='object'){
+      const latest=serverSummary.latest||{};
+      return {
+        count: fmtNumber(serverSummary.count),
+        latest: serverSummary.count?latest:null,
+        graph: {graph_id: latest.graph_id, status: latest.status},
+        score: {
+          completion_rate: latest.completion_rate,
+          synthesis_lift: latest.synthesis_lift,
+          complementarity_score: latest.complementarity_score,
+        },
+        candidates: new Array(fmtNumber(serverSummary.memory_candidates)),
+        boardId: latest.board_id||'n/a',
+        graphId: latest.graph_id||'n/a',
+        status: latest.status||'n/a',
+        agentTasks: fmtNumber(serverSummary.agent_tasks),
+        conflicts: fmtNumber(serverSummary.conflicts),
+      };
+    }
     const graphEvents=(events||[]).filter(function(item){
       return item && (item.kind==='agent.workgraph.reviewed' || item.kind==='agent.workgraph.planned');
     });
@@ -211,8 +230,8 @@ window.Panels = (()=>{
     };
   }
 
-  function renderWorkGraphSummary(events){
-    const summary=summarizeWorkGraphs(events);
+  function renderWorkGraphSummary(events,serverSummary){
+    const summary=summarizeWorkGraphs(events,serverSummary);
     const sec=UI.el('div','runtime-workgraph-summary');
     sec.innerHTML='<h4>Agent WorkGraph</h4>';
     const metrics=UI.el('div','memory-metrics');
@@ -865,7 +884,7 @@ window.Panels = (()=>{
           timelineSec.appendChild(metrics);
           if(timeline.degraded_reason)timelineSec.appendChild(UI.el('div','panel-empty',timeline.degraded_reason));
           if(!events.length)timelineSec.appendChild(UI.el('div','panel-empty','No runtime events'));
-          timelineSec.appendChild(renderWorkGraphSummary(events));
+          timelineSec.appendChild(renderWorkGraphSummary(events,timeline.workgraph_summary));
           events.slice(-12).reverse().forEach(function(item){timelineSec.appendChild(renderRuntimeTimelineItem(item))});
         }catch(e){timelineSec.appendChild(UI.el('div','panel-empty','Runtime timeline unavailable'))}
       }

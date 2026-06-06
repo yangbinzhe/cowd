@@ -5,6 +5,44 @@
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeWorkGraphSummary {
+    pub graph_id: Option<String>,
+    pub board_id: Option<String>,
+    pub status: String,
+    pub agent_tasks: usize,
+    pub memory_candidates: usize,
+    pub conflicts: usize,
+    pub completion_rate: Option<f32>,
+    pub synthesis_lift: Option<f32>,
+    pub complementarity_score: Option<f32>,
+}
+
+impl RuntimeWorkGraphSummary {
+    #[must_use]
+    pub fn from_review(
+        graph: &crate::agent_workgraph::AgentWorkGraph,
+        packet: &crate::agent_collaboration::CollaborationReviewPacket,
+    ) -> Self {
+        let agent_tasks = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == crate::agent_workgraph::WorkGraphNodeKind::AgentTask)
+            .count();
+        Self {
+            graph_id: Some(graph.graph_id.clone()),
+            board_id: graph.board_id.clone().or_else(|| Some(packet.board_id.clone())),
+            status: format!("{:?}", graph.status).to_lowercase(),
+            agent_tasks,
+            memory_candidates: packet.maintenance_candidates.len(),
+            conflicts: packet.scorecard.conflict_count,
+            completion_rate: Some(packet.scorecard.completion_rate),
+            synthesis_lift: Some(packet.scorecard.synthesis_lift),
+            complementarity_score: Some(packet.scorecard.complementarity_score),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CowdEvent {
     // Streaming — field names match TuiEvent
     TextDelta {
@@ -50,6 +88,9 @@ pub enum CowdEvent {
     ContextWindow(u64),
     ContextEnvelope {
         envelope: crate::context_runtime::ContextEnvelope,
+    },
+    WorkGraphSummary {
+        summary: RuntimeWorkGraphSummary,
     },
     // System
     Warning {

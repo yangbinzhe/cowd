@@ -3251,6 +3251,16 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                             match prepared.run_turn_async(&text, &runtime::permissions::SharedPrompter::none()).await {
                                                 Ok(summary) => {
                                                     let final_text = final_assistant_text(&summary);
+                                                    if let Some(collaboration_result) =
+                                                        prepared.last_collaboration_result()
+                                                    {
+                                                        let _ = tx.send(runtime::CowdEvent::WorkGraphSummary {
+                                                            summary: runtime::RuntimeWorkGraphSummary::from_review(
+                                                                &collaboration_result.work_graph,
+                                                                &collaboration_result.review_packet,
+                                                            ),
+                                                        });
+                                                    }
                                                     tracing::info!(text_len = final_text.len(), iterations = summary.iterations, "TUI turn complete");
                                                     let _ = tx.send(runtime::CowdEvent::TurnComplete {
                                                         assistant_text: final_text.clone(),
