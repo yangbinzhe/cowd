@@ -4,7 +4,7 @@ mod sqlite;
 pub use jsonl::JsonlStorage;
 pub use sqlite::SqliteStorage;
 
-use crate::error::CowdError;
+use crate::error::{CowdError, StorageError};
 use std::path::PathBuf;
 
 pub trait StorageBackend: Send + Sync {
@@ -22,9 +22,10 @@ pub enum StorageType {
 
 pub fn create_storage(st: StorageType) -> Result<Box<dyn StorageBackend>, CowdError> {
     match st {
-        StorageType::Jsonl { path } => {
-            JsonlStorage::open(path).map(|s| Box::new(s) as Box<dyn StorageBackend>)
-        }
+        StorageType::Jsonl { path } => Err(CowdError::Storage(StorageError::Corruption(format!(
+            "JSONL session storage is retired from runtime creation; import explicitly instead: {}",
+            path.display()
+        )))),
         StorageType::Sqlite { path } => {
             SqliteStorage::open(path).map(|s| Box::new(s) as Box<dyn StorageBackend>)
         }
@@ -145,12 +146,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_factory_jsonl() {
+    fn storage_factory_rejects_jsonl_runtime_creation() {
         let dir = temp_dir();
-        let s = create_storage(StorageType::Jsonl { path: dir.clone() }).unwrap();
-        s.write("k", b"v").unwrap();
-        let val = s.read("k").unwrap().expect("should exist");
-        assert!(String::from_utf8_lossy(&val).contains('v'));
+        let error = match create_storage(StorageType::Jsonl { path: dir.clone() }) {
+            Ok(_) => panic!("JSONL runtime storage must be retired"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("JSONL session storage is retired"));
     }
 
     #[test]

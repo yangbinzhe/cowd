@@ -116,7 +116,7 @@ impl CowdError {
         match self {
             Self::Storage(StorageError::WalRecoveryNeeded(_)) => {
                 RecoveryStrategy::Fallback {
-                    reason: "WAL recovery needed — falling back to JSONL storage".into(),
+                    reason: "WAL recovery needed — entering SQLite recovery mode; JSONL runtime fallback is disabled".into(),
                 }
             }
             Self::Storage(StorageError::NotFound(_)) => RecoveryStrategy::Abort,
@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(
             err.recovery_strategy(),
             RecoveryStrategy::Fallback {
-                reason: "WAL recovery needed — falling back to JSONL storage".into()
+                reason: "WAL recovery needed — entering SQLite recovery mode; JSONL runtime fallback is disabled".into()
             }
         );
     }
