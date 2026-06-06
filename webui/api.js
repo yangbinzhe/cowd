@@ -181,6 +181,10 @@ window.Api = (()=>{
     async contextEnvelope(envelopeId){
       return req('GET','/api/context/'+encodeURIComponent(envelopeId));
     },
+    async recordContextRecommendation(sessionId,payload){
+      const sid=sessionId||this.sid;
+      return req('POST','/api/sessions/'+encodeURIComponent(sid)+'/context/recommendations',payload||{});
+    },
     async getMemoryLayer(layer){return req('GET','/api/memory/'+layer)},
     async createMemoryEntry(layer,entry){return req('POST','/api/memory/'+layer,entry)},
     async updateMemoryEntry(id,entry){return req('PATCH','/api/memory/entry/'+id,entry)},

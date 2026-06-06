@@ -158,7 +158,26 @@ window.Panels = (()=>{
           recs.innerHTML='<h4>Recommendations</h4>';
           diagnostics.recommendations.slice(0,4).forEach(function(text){
             const row=UI.el('div','context-recommendation');
-            row.textContent=text;
+            const label=UI.el('span');
+            label.textContent=text;
+            row.appendChild(label);
+            if(Api.sid && envelope.id){
+              const ack=UI.el('button','btn-secondary btn-xs');
+              ack.type='button';
+              ack.textContent='Ack';
+              ack.onclick=async function(){
+                try{
+                  await Api.recordContextRecommendation(Api.sid,{
+                    envelope_id:envelope.id,
+                    recommendation:text,
+                    action:'acknowledged'
+                  });
+                  ack.textContent='Done';
+                  ack.disabled=true;
+                }catch(e){UI.showToast(e.message,'error')}
+              };
+              row.appendChild(ack);
+            }
             recs.appendChild(row);
           });
           overview.appendChild(recs);

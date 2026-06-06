@@ -165,6 +165,10 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             "/api/sessions/:id/context",
             get(get_session_context_history),
         )
+        .route(
+            "/api/sessions/:id/context/recommendations",
+            post(record_context_recommendation_action),
+        )
         .route("/api/sessions/:id/stream", get(sse_stream_handler))
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
@@ -286,6 +290,20 @@ struct CreateSessionRequest {
 #[derive(Deserialize)]
 struct SendMessageRequest {
     content: String,
+}
+
+#[derive(Deserialize)]
+struct ContextRecommendationActionRequest {
+    envelope_id: String,
+    recommendation: String,
+    #[serde(default = "default_context_recommendation_action")]
+    action: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+fn default_context_recommendation_action() -> String {
+    "acknowledged".to_string()
 }
 
 #[derive(Deserialize)]
@@ -2955,6 +2973,52 @@ async fn get_context_envelope_handler(
     })))
 }
 
+async fn record_context_recommendation_action(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ContextRecommendationActionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if body.envelope_id.trim().is_empty() || body.recommendation.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "envelope_id and recommendation are required".to_string(),
+            }),
+        ));
+    }
+    let action = if body.action.trim().is_empty() {
+        "acknowledged".to_string()
+    } else {
+        body.action
+    };
+    let payload = serde_json::json!({
+        "type": "ContextRecommendationAction",
+        "session_id": id.clone(),
+        "envelope_id": body.envelope_id,
+        "recommendation": body.recommendation,
+        "action": action,
+        "note": body.note,
+    });
+    state
+        .session_kernel
+        .append_timeline_event(&id, "ContextRecommendationAction", payload.clone())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to record context recommendation action: {e}"),
+                }),
+            )
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "session_id": id,
+        "event": payload,
+    })))
+}
+
 // ── Session messages search handler ───────────────────────────────
 
 async fn search_messages_handler(
@@ -4356,6 +4420,52 @@ mod tests {
         assert_eq!(json["context"]["session_id"], session_id);
         assert_eq!(json["context"]["sequence"], 4);
         assert_eq!(json["context"]["envelope"]["id"], "env-target");
+    }
+
+    #[tokio::test]
+    async fn context_recommendation_action_records_session_event() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "context-recommendation-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+
+        let state = test_state_with_store(store.clone());
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/sessions/{session_id}/context/recommendations"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "envelope_id": "env-1",
+                            "recommendation": "Start a handoff",
+                            "action": "acknowledged",
+                            "note": "handled"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = store.get_events(session_id, 0).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "ContextRecommendationAction");
+        let payload: serde_json::Value = serde_json::from_str(&events[0].event_json).unwrap();
+        assert_eq!(payload["envelope_id"], "env-1");
+        assert_eq!(payload["recommendation"], "Start a handoff");
+        assert_eq!(payload["note"], "handled");
     }
 
     #[test]

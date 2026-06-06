@@ -153,6 +153,26 @@ describe('API module', () => {
     expect(history.envelopes[0].envelope_id).toBe('ctx-1');
   });
 
+  it('records context recommendation actions', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ ok: true })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.recordContextRecommendation('s1', {
+      envelope_id: 'ctx-1',
+      recommendation: 'Start a handoff',
+      action: 'acknowledged'
+    });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/sessions/s1/context/recommendations');
+    expect(mockF.mock.calls[0][1].method).toBe('POST');
+    expect(mockF.mock.calls[0][1].body).toContain('Start a handoff');
+  });
+
   it('has all skill endpoints', () => {
     expect(typeof window.Api.listSkills).toBe('function');
     expect(typeof window.Api.installSkill).toBe('function');
@@ -693,6 +713,7 @@ describe('API module', () => {
     expect(text).toContain('dynamichasha');
     expect(text).toContain('degraded: Memory');
     expect(text).toContain('Start a handoff');
+    expect(text).toContain('Ack');
     expect(text).toContain('Context Timeline');
     expect(text).toContain('ship now');
   });
