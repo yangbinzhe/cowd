@@ -967,6 +967,8 @@ fn collaboration_maintenance_candidate(
         summary,
         reason: format!("multi-agent collaboration pulse: {reason}"),
         confidence: confidence.clamp(0.0, 1.0),
+        source: Some("collaboration_board".to_string()),
+        source_ref: None,
         created_at: now,
         updated_at: now,
     }

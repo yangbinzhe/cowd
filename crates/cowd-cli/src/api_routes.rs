@@ -356,6 +356,8 @@ struct MemoryMaintenanceQuery {
     #[serde(default)]
     kind: Option<String>,
     #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
     limit: Option<usize>,
 }
 
@@ -1991,6 +1993,7 @@ async fn memory_maintenance_handler(
         .list_memory_maintenance(MaintenanceCandidateFilter {
             status,
             kind,
+            source: query.source.filter(|source| !source.trim().is_empty()),
             limit: query.limit.map(|limit| limit.min(500)),
         })
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

@@ -133,11 +133,11 @@ describe('API module', () => {
     );
     vi.stubGlobal('fetch', mockF);
 
-    await window.Api.memoryMaintenance({ status: 'open', kind: 'stale', limit: 5 });
+    await window.Api.memoryMaintenance({ status: 'open', kind: 'stale', source: 'scan', limit: 5 });
     await window.Api.scanMemoryMaintenance({ stale_threshold: 0.8 });
     await window.Api.updateMemoryMaintenance('c1', 'acknowledged');
 
-    expect(String(mockF.mock.calls[0][0])).toBe('/api/memory/maintenance?status=open&kind=stale&limit=5');
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/memory/maintenance?status=open&kind=stale&source=scan&limit=5');
     expect(String(mockF.mock.calls[1][0])).toBe('/api/memory/maintenance');
     expect(mockF.mock.calls[1][1].method).toBe('POST');
     expect(String(mockF.mock.calls[2][0])).toBe('/api/memory/maintenance/c1');

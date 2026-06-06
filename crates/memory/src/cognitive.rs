@@ -497,6 +497,17 @@ impl CognitiveContextManager {
             }
         };
 
+        let maintenance_queue = match MaintenanceQueue::open_sqlite(&config.store.sqlite_path) {
+            Ok(queue) => queue,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "memory maintenance: durable queue unavailable, using in-memory fallback"
+                );
+                MaintenanceQueue::new()
+            }
+        };
+
         Ok(Self {
             drift: DriftDetector::new(config.drift.clone()),
             fresh_ctx: FreshContextManager::new(config.budget.context_window),
@@ -505,7 +516,7 @@ impl CognitiveContextManager {
             delegation_results: Mutex::new(Vec::new()),
             session_resume,
             project_scope_mgr: None,
-            maintenance_queue: MaintenanceQueue::new(),
+            maintenance_queue,
             project_kg_path: Mutex::new(None),
             kg_rebuild_tick_counter: AtomicU64::new(0),
             cross_store_verify_counter: AtomicU64::new(0),

@@ -166,6 +166,7 @@ window.Api = (()=>{
       const params=new URLSearchParams();
       if(o.status)params.set('status',o.status);
       if(o.kind)params.set('kind',o.kind);
+      if(o.source)params.set('source',o.source);
       if(o.limit)params.set('limit',o.limit);
       const query=params.toString();
       return req('GET','/api/memory/maintenance'+(query?'?'+query:''));
