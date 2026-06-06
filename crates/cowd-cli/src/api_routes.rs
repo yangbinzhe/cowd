@@ -29,7 +29,7 @@ use runtime::approval_gate::SmartApprovalGate;
 use runtime::permission_enforcer::{ApprovalPersistence, ApprovalVerdict};
 use runtime::{
     ApprovalConfig, ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem,
-    ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
+    ContextMode, ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
     ContextVisibility, ResumeContextPacket, ResumeContextSource,
 };
 use serde::{Deserialize, Serialize};
@@ -796,6 +796,10 @@ async fn context_current_handler(
         .or_else(|| state.list_active_session_ids().into_iter().next())
         .unwrap_or_else(|| "api-context".to_string());
     let query = params.get("q").cloned().unwrap_or_default();
+    let profile = params
+        .get("profile")
+        .and_then(|value| parse_context_profile(value))
+        .unwrap_or(ContextProfile::MainTurn);
 
     if let Some(runtime_entry) = state.active_runtime(&session_id) {
         let runtime = runtime_entry.lock().await;
@@ -808,7 +812,8 @@ async fn context_current_handler(
         }
     }
 
-    let identity = ContextIdentity::main(session_id.clone());
+    let mut identity = ContextIdentity::main(session_id.clone());
+    identity.mode = context_mode_for_profile(profile);
     let mut dynamic_items = Vec::new();
     let mut omitted_items = Vec::new();
     let mut degraded = Vec::new();
@@ -874,11 +879,11 @@ async fn context_current_handler(
     }
 
     let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
-        profile: ContextProfile::from(identity.mode),
+        profile,
         identity,
         intent: query,
         stable_head: vec!["cowd-context-runtime:v0.8.13".to_string()],
-        runtime_header: vec![format!("session:{session_id} agent:api profile:MainTurn")],
+        runtime_header: vec![format!("session:{session_id} agent:api profile:{profile:?}")],
         dynamic_items,
         omitted: omitted_items,
         total_budget_tokens: 8_000,
@@ -890,6 +895,33 @@ async fn context_current_handler(
         "source": "synthetic",
         "envelope": envelope,
     }))
+}
+
+fn parse_context_profile(value: &str) -> Option<ContextProfile> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "mainturn" | "main" => Some(ContextProfile::MainTurn),
+        "sologoal" | "solo" => Some(ContextProfile::SoloGoal),
+        "yologoal" | "yolo" => Some(ContextProfile::YoloGoal),
+        "subagent" | "sub_agent" => Some(ContextProfile::SubAgent),
+        "collaboration" => Some(ContextProfile::Collaboration),
+        "review" => Some(ContextProfile::Review),
+        "resume" => Some(ContextProfile::Resume),
+        "cron" => Some(ContextProfile::Cron),
+        _ => None,
+    }
+}
+
+fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
+    match profile {
+        ContextProfile::MainTurn => ContextMode::MainTurn,
+        ContextProfile::SoloGoal => ContextMode::SoloGoal,
+        ContextProfile::YoloGoal => ContextMode::YoloGoal,
+        ContextProfile::SubAgent => ContextMode::SubAgent,
+        ContextProfile::Collaboration => ContextMode::Collaboration,
+        ContextProfile::Review => ContextMode::Review,
+        ContextProfile::Resume => ContextMode::Resume,
+        ContextProfile::Cron => ContextMode::Cron,
+    }
 }
 
 async fn start_task_handler(
@@ -4849,6 +4881,36 @@ mod tests {
         assert_eq!(
             json["envelope"]["diagnostics"]["degraded_sources"][0],
             "Memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_current_accepts_profile_query_for_synthetic_envelope() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/current?q=ship&session_id=session-1&profile=yolo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["envelope"]["profile"], "YoloGoal");
+        assert_eq!(json["envelope"]["identity"]["mode"], "YoloGoal");
+        assert_eq!(
+            json["envelope"]["budget"]["leases"][0]["source"],
+            "Task"
+        );
+        assert!(
+            json["envelope"]["assembled"]["runtime_header"][0]
+                .as_str()
+                .unwrap()
+                .contains("profile:YoloGoal")
         );
     }
 

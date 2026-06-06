@@ -133,9 +133,12 @@ window.Panels = (()=>{
     const controls=UI.el('div','context-controls');
     const input=UI.el('input');
     input.placeholder='Inspect intent...';
+    const profile=UI.el('select');
+    profile.innerHTML='<option value="MainTurn">Main</option><option value="SoloGoal">Solo</option><option value="YoloGoal">Yolo</option><option value="Review">Review</option><option value="Resume">Resume</option><option value="SubAgent">SubAgent</option><option value="Collaboration">Collab</option><option value="Cron">Cron</option>';
     const refresh=UI.el('button','btn-secondary btn-sm');
     refresh.textContent='Refresh';
     controls.appendChild(input);
+    controls.appendChild(profile);
     controls.appendChild(refresh);
     hdr.appendChild(controls);
     c.appendChild(hdr);
@@ -144,7 +147,7 @@ window.Panels = (()=>{
     c.appendChild(mount);
     async function load(){
       mount.innerHTML='';
-      const opts={q:input.value||''};
+      const opts={q:input.value||'',profile:profile.value};
       if(Api.sid)opts.session_id=Api.sid;
       try{
         const response=await Api.currentContext(opts);
@@ -282,6 +285,7 @@ window.Panels = (()=>{
     }
     refresh.onclick=load;
     input.onkeydown=function(e){if(e.key==='Enter')load()};
+    profile.onchange=load;
     load();
   }
 

@@ -130,9 +130,9 @@ describe('API module', () => {
     );
     vi.stubGlobal('fetch', mockF);
 
-    const context = await window.Api.currentContext({ q: 'ship', session_id: 's1' });
+    const context = await window.Api.currentContext({ q: 'ship', session_id: 's1', profile: 'Review' });
 
-    expect(String(mockF.mock.calls[0][0])).toBe('/api/context/current?q=ship&session_id=s1');
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/context/current?q=ship&session_id=s1&profile=Review');
     expect(context.envelope.id).toBe('ctx-1');
   });
 

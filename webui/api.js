@@ -166,6 +166,7 @@ window.Api = (()=>{
       const params=new URLSearchParams();
       if(o.q)params.set('q',o.q);
       if(o.session_id)params.set('session_id',o.session_id);
+      if(o.profile)params.set('profile',o.profile);
       const query=params.toString();
       return req('GET','/api/context/current'+(query?'?'+query:''));
     },
