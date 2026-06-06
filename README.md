@@ -1,10 +1,24 @@
 # COWD — AI 编程智能体框架
 
-> **Rust 原生多智能体编程框架** | 当前版本 v0.8.4
+> **Rust 原生多智能体编程框架** | 当前版本 v0.8.17
 > 统一网关 · 全功能 TUI · API 完全对等 · Session SQLite 存储
 > 内存系统 · 代码智能 · 权限管控 · MCP 协议 · 多平台接入
 
 ---
+
+## 当前重构主线：Runtime Event Kernel
+
+v0.8.17 的核心目标是把 Cowd 从功能模块拼接型 Agent 应用升级为事件驱动的 AI Runtime OS。后续主线围绕以下内核运转：
+
+```
+RuntimeCommand -> RuntimeEventLog -> RuntimeProjection
+              -> AgentWorkGraph
+              -> MemoryPulseConsumer
+              -> ContextPolicyEngine
+              -> TUI/WebUI Runtime Cockpit
+```
+
+这条主线要求 Session、Agent、Task、Tool、Memory、Context、Policy、UI 全部围绕同一事实源协作。SQLite/DB 是运行态事实源；JSONL 只保留为显式导入、导出和 debug bundle 格式。
 
 ## 项目规模
 
