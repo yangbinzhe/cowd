@@ -7895,11 +7895,13 @@ fn workspace_context_item(session: &Session, model_ctx: u32) -> runtime::Context
     if git_snapshot.touched_files_truncated {
         project_notes.push("changed_files_truncated=true".to_string());
     }
-    let token_estimate = 64 + (git_snapshot.touched_files.len() as u64 * 16);
+    let hot_symbols = workspace_hot_symbols(&root_path, &git_snapshot.touched_files, 8);
+    let token_estimate =
+        64 + (git_snapshot.touched_files.len() as u64 * 16) + (hot_symbols.len() as u64 * 18);
     let packet = runtime::WorkspacePacket {
         root: root_path.display().to_string(),
         touched_files: git_snapshot.touched_files,
-        hot_symbols: Vec::new(),
+        hot_symbols,
         project_notes,
         token_estimate,
     };
@@ -7974,6 +7976,58 @@ fn parse_git_status_path(line: &str) -> Option<String> {
         .trim_matches('"')
         .to_string();
     (!path.is_empty()).then_some(path)
+}
+
+fn workspace_hot_symbols(root: &Path, touched_files: &[String], symbol_limit: usize) -> Vec<String> {
+    const FILE_LIMIT: usize = 4;
+    const MAX_BYTES: u64 = 256 * 1024;
+
+    if touched_files.is_empty() || symbol_limit == 0 {
+        return Vec::new();
+    }
+    let mut indexer = match memory::CodeIndexer::new(root) {
+        Ok(indexer) => indexer,
+        Err(err) => {
+            tracing::debug!(error = %err, "failed to initialise workspace code indexer");
+            return Vec::new();
+        }
+    };
+
+    let mut hot_symbols = Vec::new();
+    for relative in touched_files.iter().take(FILE_LIMIT) {
+        if hot_symbols.len() >= symbol_limit {
+            break;
+        }
+        let path = root.join(relative);
+        if !memory::IndexLanguage::is_indexable(&path) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > MAX_BYTES {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok((symbols, _edges)) = indexer.index_content(&content, &path) else {
+            continue;
+        };
+        for symbol in symbols {
+            if hot_symbols.len() >= symbol_limit {
+                break;
+            }
+            hot_symbols.push(format!(
+                "{}:{}:{}:{}",
+                symbol.file_path,
+                symbol.line,
+                symbol.kind.as_str(),
+                symbol.name
+            ));
+        }
+    }
+    hot_symbols
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -12088,12 +12142,18 @@ mod tests {
             .output()
             .expect("run git init");
         assert!(git_init.status.success());
-        let tracked_path = root.join("tracked.txt");
-        std::fs::write(&tracked_path, "workspace evidence").expect("tracked file");
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).expect("src dir");
+        let tracked_path = src_dir.join("lib.rs");
+        std::fs::write(
+            &tracked_path,
+            "pub fn workspace_context_probe() -> bool { true }\n",
+        )
+        .expect("tracked file");
         let git_add = Command::new("git")
             .args(["-C"])
             .arg(&root)
-            .args(["add", "tracked.txt"])
+            .args(["add", "src/lib.rs"])
             .output()
             .expect("run git add");
         assert!(git_add.status.success());
@@ -12104,7 +12164,8 @@ mod tests {
         assert_eq!(item.source, runtime::ContextSourceKind::Workspace);
         assert!(item.content.contains(&root.display().to_string()));
         assert!(item.content.contains("model_context_window=200000"));
-        assert!(item.content.contains("tracked.txt"));
+        assert!(item.content.contains("src/lib.rs"));
+        assert!(item.content.contains("workspace_context_probe"));
         let _ = std::fs::remove_dir_all(root);
     }
 
