@@ -286,6 +286,22 @@ impl Component for ContextPanel {
                         ),
                         Span::styled(Self::preview(&item.content, 52), Style::default()),
                     ]));
+                    if !item.evidence.is_empty() {
+                        let refs = item
+                            .evidence
+                            .iter()
+                            .take(2)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        lines.push(Line::from(vec![
+                            Span::styled("  refs:   ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                Self::preview(&refs, 64),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]));
+                    }
                 }
             }
             if !envelope.omitted.is_empty() {
@@ -458,12 +474,16 @@ mod tests {
                 intent: "inspect".to_string(),
                 stable_head: vec!["stable system prompt".to_string()],
                 runtime_header: vec!["session:session-1 agent:primary".to_string()],
-                dynamic_items: vec![runtime::ContextItem::new(
-                    "mem-1",
-                    runtime::ContextSourceKind::Memory,
-                    runtime::ContextRole::Evidence,
-                    "SessionKernel owns durable sessions",
-                )],
+                dynamic_items: vec![{
+                    let mut item = runtime::ContextItem::new(
+                        "mem-1",
+                        runtime::ContextSourceKind::Memory,
+                        runtime::ContextRole::Evidence,
+                        "SessionKernel owns durable sessions",
+                    );
+                    item.evidence = vec!["session://session-1/memory/mem-1".to_string()];
+                    item
+                }],
                 omitted: vec![runtime::ContextOmission {
                     source: runtime::ContextSourceKind::Memory,
                     reason: "context lease exhausted".to_string(),
@@ -479,6 +499,7 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("Runtime Envelope"));
         assert!(joined.contains("SessionKernel owns durable sessions"));
+        assert!(joined.contains("session://session-1/memory/mem-1"));
         assert!(joined.contains("context lease exhausted"));
         assert!(joined.contains(&stable_hash));
         assert!(joined.contains("stable 1"));

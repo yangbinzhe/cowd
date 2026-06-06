@@ -74,6 +74,12 @@ window.Panels = (()=>{
     role.textContent=item.role||item.source||'item';
     const body=UI.el('div','context-item-body');
     body.innerHTML='<b>'+UI.esc(contextTextPreview(item.content||item.id||'context item'))+'</b><small>'+UI.esc([item.source,item.authority,item.visibility].filter(Boolean).join(' · '))+'</small><em>score '+UI.esc(typeof item.score==='number'?item.score.toFixed(2):'n/a')+' · '+UI.esc(item.token_estimate||0)+' tk</em>';
+    const evidence=(item.evidence||[]).slice(0,2);
+    if(evidence.length){
+      const refs=UI.el('em','context-evidence');
+      refs.textContent='refs '+evidence.join(' · ');
+      body.appendChild(refs);
+    }
     row.appendChild(role);
     row.appendChild(body);
     return row;

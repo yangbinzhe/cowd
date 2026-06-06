@@ -707,6 +707,7 @@ describe('API module', () => {
               content: 'SessionKernel owns durable sessions',
               score: 0.93,
               token_estimate: 12,
+              evidence: ['session://s1/memory/mem-1'],
             }],
             omitted: [{ source: 'Memory', reason: 'context lease exhausted', token_estimate: 30 }],
             budget: { total_tokens: 8000, used_tokens: 120 },
@@ -735,6 +736,7 @@ describe('API module', () => {
     expect(text).toContain('Context Runtime');
     expect(text).toContain('runtime');
     expect(text).toContain('SessionKernel owns durable sessions');
+    expect(text).toContain('session://s1/memory/mem-1');
     expect(text).toContain('context lease exhausted');
     expect(text).toContain('stable system');
     expect(text).toContain('dynamichasha');
