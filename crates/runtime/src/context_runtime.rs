@@ -335,6 +335,20 @@ pub struct ContextPolicyDecision {
     pub stable_head_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextPolicyProposal {
+    pub proposal_id: String,
+    pub session_id: String,
+    pub envelope_id: String,
+    pub action: ContextPolicyAction,
+    pub confidence: f32,
+    pub expected_saving_tokens: u64,
+    pub affected_sources: Vec<ContextSourceKind>,
+    pub safe_to_auto_apply: bool,
+    pub reason: String,
+    pub stable_head_hash: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StableHeadComparison {
     pub previous_hash: String,
@@ -486,6 +500,27 @@ impl ContextRuntimeKernel {
             action,
             reason,
             stable_head_hash: probe.stable_head_hash.clone(),
+        }
+    }
+
+    pub fn policy_proposal(envelope: &ContextEnvelope) -> ContextPolicyProposal {
+        let probe = Self::lean_probe(envelope);
+        let decision = Self::policy_decision(&probe);
+        ContextPolicyProposal {
+            proposal_id: format!(
+                "ctx-proposal-{}-{}",
+                envelope.id,
+                context_policy_action_name(decision.action)
+            ),
+            session_id: envelope.identity.session_id.clone(),
+            envelope_id: envelope.id.clone(),
+            action: decision.action,
+            confidence: confidence_for_policy(&probe, decision.action),
+            expected_saving_tokens: expected_saving_tokens(&probe, decision.action),
+            affected_sources: affected_sources_for_action(decision.action, &probe),
+            safe_to_auto_apply: safe_to_auto_apply(decision.action),
+            reason: decision.reason,
+            stable_head_hash: probe.stable_head_hash,
         }
     }
 
@@ -912,6 +947,78 @@ fn context_policy_action(probe: &ContextLeanProbe) -> (ContextPolicyAction, Stri
             ContextPolicyAction::None,
             "context pressure nominal; no policy action required".to_string(),
         ),
+    }
+}
+
+fn context_policy_action_name(action: ContextPolicyAction) -> &'static str {
+    match action {
+        ContextPolicyAction::None => "none",
+        ContextPolicyAction::TrimToolTrace => "trim_tool_trace",
+        ContextPolicyAction::SummarizeEvidence => "summarize_evidence",
+        ContextPolicyAction::PreferOrientationPacket => "prefer_orientation_packet",
+        ContextPolicyAction::WriteHandoff => "write_handoff",
+        ContextPolicyAction::RecommendSessionBoundary => "recommend_session_boundary",
+    }
+}
+
+fn safe_to_auto_apply(action: ContextPolicyAction) -> bool {
+    matches!(
+        action,
+        ContextPolicyAction::TrimToolTrace
+            | ContextPolicyAction::PreferOrientationPacket
+            | ContextPolicyAction::RecommendSessionBoundary
+            | ContextPolicyAction::None
+    )
+}
+
+fn expected_saving_tokens(probe: &ContextLeanProbe, action: ContextPolicyAction) -> u64 {
+    let pressure_over_target = probe
+        .budget_used_tokens
+        .saturating_sub(probe.budget_total_tokens.saturating_mul(7) / 10);
+    match action {
+        ContextPolicyAction::None => 0,
+        ContextPolicyAction::TrimToolTrace => {
+            pressure_over_target.max(probe.budget_total_tokens / 20)
+        }
+        ContextPolicyAction::PreferOrientationPacket => {
+            pressure_over_target.max(probe.budget_total_tokens / 25)
+        }
+        ContextPolicyAction::RecommendSessionBoundary => pressure_over_target,
+        ContextPolicyAction::SummarizeEvidence => {
+            pressure_over_target.max(probe.budget_total_tokens / 10)
+        }
+        ContextPolicyAction::WriteHandoff => {
+            pressure_over_target.max(probe.budget_total_tokens / 8)
+        }
+    }
+}
+
+fn confidence_for_policy(probe: &ContextLeanProbe, action: ContextPolicyAction) -> f32 {
+    if action == ContextPolicyAction::None {
+        return 1.0;
+    }
+    let pressure = f32::from(probe.pressure_bp) / 10_000.0;
+    let omission_bonus = (probe.omitted_count as f32 * 0.03).min(0.15);
+    (0.45 + pressure * 0.4 + omission_bonus).clamp(0.1, 0.95)
+}
+
+fn affected_sources_for_action(
+    action: ContextPolicyAction,
+    probe: &ContextLeanProbe,
+) -> Vec<ContextSourceKind> {
+    if !probe.degraded_sources.is_empty() {
+        return probe.degraded_sources.clone();
+    }
+    match action {
+        ContextPolicyAction::TrimToolTrace => vec![ContextSourceKind::ToolTrace],
+        ContextPolicyAction::SummarizeEvidence => {
+            vec![ContextSourceKind::Workspace, ContextSourceKind::ToolTrace]
+        }
+        ContextPolicyAction::PreferOrientationPacket => vec![ContextSourceKind::Memory],
+        ContextPolicyAction::WriteHandoff => {
+            vec![ContextSourceKind::Handoff, ContextSourceKind::Conversation]
+        }
+        ContextPolicyAction::RecommendSessionBoundary | ContextPolicyAction::None => Vec::new(),
     }
 }
 
@@ -1472,6 +1579,70 @@ mod tests {
         assert_eq!(
             probe.degradation_path,
             ContextDegradationPath::TrimDynamicTail
+        );
+    }
+
+    #[test]
+    fn context_policy_proposes_token_saving_action() {
+        let envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            identity: ContextIdentity::main("policy-session"),
+            profile: ContextProfile::MainTurn,
+            intent: "continue under pressure".to_string(),
+            stable_head: vec!["stable instructions ".repeat(200)],
+            runtime_header: vec!["runtime".to_string()],
+            dynamic_items: Vec::new(),
+            omitted: Vec::new(),
+            total_budget_tokens: 100,
+        });
+
+        let proposal = ContextRuntimeKernel::policy_proposal(&envelope);
+        assert_ne!(proposal.action, ContextPolicyAction::None);
+        assert!(proposal.expected_saving_tokens > 0);
+        assert!(proposal.safe_to_auto_apply);
+        assert_eq!(proposal.session_id, "policy-session");
+    }
+
+    #[test]
+    fn context_policy_preserves_stable_head() {
+        let envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            identity: ContextIdentity::main("stable-session"),
+            profile: ContextProfile::MainTurn,
+            intent: "protect stable head".to_string(),
+            stable_head: vec!["stable instructions".to_string()],
+            runtime_header: vec!["runtime".to_string()],
+            dynamic_items: Vec::new(),
+            omitted: Vec::new(),
+            total_budget_tokens: 1_000,
+        });
+        let before = envelope.assembled.stable_head.clone();
+        let proposal = ContextRuntimeKernel::policy_proposal(&envelope);
+
+        assert_eq!(envelope.assembled.stable_head, before);
+        assert_eq!(
+            proposal.stable_head_hash,
+            envelope.diagnostics.stable_head_hash
+        );
+    }
+
+    #[test]
+    fn context_policy_review_evidence_requires_review() {
+        let envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            identity: ContextIdentity::main("review-session"),
+            profile: ContextProfile::Review,
+            intent: "review evidence".to_string(),
+            stable_head: vec!["stable review instructions ".repeat(200)],
+            runtime_header: Vec::new(),
+            dynamic_items: Vec::new(),
+            omitted: Vec::new(),
+            total_budget_tokens: 100,
+        });
+
+        let proposal = ContextRuntimeKernel::policy_proposal(&envelope);
+        assert_eq!(proposal.action, ContextPolicyAction::SummarizeEvidence);
+        assert!(!proposal.safe_to_auto_apply);
+        assert_eq!(
+            proposal.affected_sources,
+            vec![ContextSourceKind::Workspace, ContextSourceKind::ToolTrace]
         );
     }
 
