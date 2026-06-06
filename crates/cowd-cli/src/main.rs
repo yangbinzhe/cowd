@@ -7881,6 +7881,23 @@ fn inject_auto_resume_context(
     }
 }
 
+fn workspace_context_item(session: &Session, model_ctx: u32) -> runtime::ContextItem {
+    let root = session
+        .workspace_root
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let packet = runtime::WorkspacePacket {
+        root,
+        touched_files: Vec::new(),
+        hot_symbols: Vec::new(),
+        project_notes: vec![format!("model_context_window={model_ctx}")],
+        token_estimate: 64,
+    };
+    runtime::ContextRuntimeKernel::workspace_item(&packet)
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_runtime(
@@ -7978,6 +7995,7 @@ fn build_runtime_with_plugin_state(
         .map_err(std::io::Error::other)?;
     let overrides = feature_config.model_context_windows();
     let model_ctx = api::model_context_window_with_overrides(&model, Some(&overrides));
+    let workspace_item = workspace_context_item(&session, model_ctx);
     // Clone model for sub-agent usage before it's consumed by the main runtime.
     let subagent_model = model.clone();
     // Shared tool executor — used by both the main runtime and sub-agent factory.
@@ -8018,6 +8036,7 @@ fn build_runtime_with_plugin_state(
     }
     let cowd_bus = runtime::CowdEventBus::new();
     runtime = runtime.with_cowd_event_bus(cowd_bus);
+    runtime.push_external_context_item(workspace_item);
     inject_auto_resume_context(&runtime, session_resume_packet, session_id);
     // Wire the production sub-agent executor so the collaboration pipeline
     // can delegate real work to sub-agents.
@@ -10012,7 +10031,7 @@ mod tests {
         slash_command_completion_candidates_with_sessions, status_context,
         suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
         sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture,
+        workspace_context_item, write_mcp_server_fixture,
     };
     use crate::task_kernel::{
         TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
@@ -11975,6 +11994,23 @@ mod tests {
                 .iter()
                 .any(|blocker| blocker.contains("fallback to latest"))
         );
+    }
+
+    #[test]
+    fn workspace_context_item_summarizes_runtime_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-workspace-context-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("temp workspace");
+        let session = runtime::Session::new().with_workspace_root(root.clone());
+
+        let item = workspace_context_item(&session, 200_000);
+
+        assert_eq!(item.source, runtime::ContextSourceKind::Workspace);
+        assert!(item.content.contains(&root.display().to_string()));
+        assert!(item.content.contains("model_context_window=200000"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

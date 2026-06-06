@@ -484,6 +484,35 @@ impl ContextRuntimeKernel {
         item
     }
 
+    pub fn workspace_item(packet: &WorkspacePacket) -> ContextItem {
+        let mut parts = vec![format!("Workspace root: {}", packet.root)];
+        if !packet.touched_files.is_empty() {
+            parts.push(format!(
+                "Touched files: {}",
+                packet.touched_files.join("; ")
+            ));
+        }
+        if !packet.hot_symbols.is_empty() {
+            parts.push(format!("Hot symbols: {}", packet.hot_symbols.join("; ")));
+        }
+        if !packet.project_notes.is_empty() {
+            parts.push(format!(
+                "Project notes: {}",
+                packet.project_notes.join("; ")
+            ));
+        }
+        let mut item = ContextItem::new(
+            format!("workspace:{}", stable_hash_bytes(packet.root.as_bytes())),
+            ContextSourceKind::Workspace,
+            ContextRole::Evidence,
+            parts.join("\n"),
+        );
+        item.authority = ContextAuthority::Project;
+        item.visibility = ContextVisibility::Shared;
+        item.token_estimate = packet.token_estimate;
+        item
+    }
+
     pub fn resume_item(packet: &ResumeContextPacket) -> ContextItem {
         let mut parts = Vec::new();
         if let Some(summary) = &packet.handoff_summary {
@@ -782,5 +811,24 @@ mod tests {
         let task_item = ContextRuntimeKernel::resume_item(&task_resume);
         assert_eq!(task_item.source, ContextSourceKind::Task);
         assert!(task_item.content.contains("phase 6"));
+    }
+
+    #[test]
+    fn workspace_packet_becomes_project_context_item() {
+        let packet = WorkspacePacket {
+            root: "/workspace/cowd".to_string(),
+            touched_files: vec!["crates/runtime/src/context_runtime.rs".to_string()],
+            hot_symbols: vec!["ContextRuntimeKernel".to_string()],
+            project_notes: vec!["develop branch".to_string()],
+            token_estimate: 42,
+        };
+
+        let item = ContextRuntimeKernel::workspace_item(&packet);
+
+        assert_eq!(item.source, ContextSourceKind::Workspace);
+        assert_eq!(item.authority, ContextAuthority::Project);
+        assert_eq!(item.visibility, ContextVisibility::Shared);
+        assert_eq!(item.token_estimate, 42);
+        assert!(item.content.contains("ContextRuntimeKernel"));
     }
 }
