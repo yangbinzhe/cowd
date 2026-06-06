@@ -191,6 +191,21 @@ describe('API module', () => {
     expect(runs.runs[0].run.run_id).toBe('run-1');
   });
 
+  it('runtimeTimeline reads unified runtime projection', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ events: [{ kind: 'ToolStart' }] })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const timeline = await window.Api.runtimeTimeline('s1', { from_seq: 3, limit: 12 });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/runtime/timeline?session_id=s1&from_seq=3&limit=12');
+    expect(timeline.events[0].kind).toBe('ToolStart');
+  });
+
   it('resolveEvidence encodes refs and session id', async () => {
     const mockF = vi.fn(() =>
       Promise.resolve({
@@ -917,6 +932,24 @@ describe('API module', () => {
           })
         });
       }
+      if (path.includes('/api/runtime/timeline')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            total: 2,
+            next_seq: 12,
+            degraded: false,
+            events: [{
+              kind: 'ToolComplete',
+              scope: 'tool',
+              sequence: 11,
+              created_at_ms: 1010,
+              refs: [{ type: 'runtime_run', id: 'run-console-1' }],
+              payload: { summary: 'cargo test completed' },
+            }]
+          })
+        });
+      }
       if (path.includes('/api/memory/maintenance')) {
         return Promise.resolve({
           ok: true,
@@ -988,6 +1021,9 @@ describe('API module', () => {
     expect(text).toContain('Runtime Runs');
     expect(text).toContain('spans');
     expect(text).toContain('run-console-1');
+    expect(text).toContain('Runtime Timeline');
+    expect(text).toContain('ToolComplete');
+    expect(text).toContain('runtime_run:run-console-1');
     expect(text).toContain('Runtime console should show unified state');
     expect(text).toContain('Memory Maintenance');
     expect(text).toContain('Review stale memory');

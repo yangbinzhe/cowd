@@ -175,6 +175,15 @@ window.Panels = (()=>{
     return row;
   }
 
+  function renderRuntimeTimelineItem(item){
+    const row=UI.el('div','runtime-run-item runtime-timeline-item');
+    const stamp=item.created_at_ms?new Date(item.created_at_ms).toLocaleTimeString():'n/a';
+    const refs=(item.refs||[]).map(function(ref){return (ref.type||ref.ref_type||'ref')+':'+(ref.id||'')}).filter(Boolean).slice(0,3).join(' · ');
+    const payload=item.payload||{};
+    row.innerHTML='<b>'+UI.esc(item.kind||'event')+'</b><small>'+UI.esc([item.scope||'runtime','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(refs||payload.summary||payload.error||payload.intent_preview||''))+'</em>';
+    return row;
+  }
+
   async function renderContext(){
     const c=cont();c.innerHTML='';
     const hdr=UI.el('div','panel-section context-header');
@@ -727,10 +736,12 @@ window.Panels = (()=>{
     const grid=UI.el('div','runtime-console-grid');
     const summary=UI.el('div','panel-section runtime-console-summary');
     const runsSec=UI.el('div','panel-section runtime-runs');
+    const timelineSec=UI.el('div','panel-section runtime-timeline');
     const contextSec=UI.el('div','panel-section context-list');
     const maintSec=UI.el('div','panel-section memory-maintenance');
     grid.appendChild(summary);
     grid.appendChild(runsSec);
+    grid.appendChild(timelineSec);
     grid.appendChild(contextSec);
     grid.appendChild(maintSec);
     c.appendChild(grid);
@@ -738,6 +749,7 @@ window.Panels = (()=>{
     async function load(){
       summary.innerHTML='<h3>Runtime State</h3>';
       runsSec.innerHTML='<h3>Runtime Runs</h3>';
+      timelineSec.innerHTML='<h3>Runtime Timeline</h3>';
       contextSec.innerHTML='<h3>Active Context</h3>';
       maintSec.innerHTML='<h3>Memory Maintenance</h3>';
       const opts={q:input.value||'',profile:profile.value};
@@ -794,6 +806,18 @@ window.Panels = (()=>{
           if(!rows.length)runsSec.appendChild(UI.el('div','panel-empty','No runtime runs'));
           rows.slice(-10).reverse().forEach(function(item){runsSec.appendChild(renderRuntimeRunItem(item))});
         }catch(e){runsSec.appendChild(UI.el('div','panel-empty','Runtime runs unavailable'))}
+        try{
+          const timeline=await Api.runtimeTimeline(Api.sid,{limit:12});
+          const events=timeline.events||[];
+          const metrics=UI.el('div','memory-metrics');
+          metrics.appendChild(renderMemoryMetric('events',timeline.total||0,'timeline'));
+          metrics.appendChild(renderMemoryMetric('next',timeline.next_seq??'end','seq'));
+          metrics.appendChild(renderMemoryMetric('degraded',timeline.degraded?'yes':'no','state'));
+          timelineSec.appendChild(metrics);
+          if(timeline.degraded_reason)timelineSec.appendChild(UI.el('div','panel-empty',timeline.degraded_reason));
+          if(!events.length)timelineSec.appendChild(UI.el('div','panel-empty','No runtime events'));
+          events.slice(-12).reverse().forEach(function(item){timelineSec.appendChild(renderRuntimeTimelineItem(item))});
+        }catch(e){timelineSec.appendChild(UI.el('div','panel-empty','Runtime timeline unavailable'))}
       }
 
       await renderMemoryMaintenance(maintSec);

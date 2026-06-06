@@ -200,6 +200,15 @@ window.Api = (()=>{
       const query=params.toString();
       return req('GET','/api/sessions/'+encodeURIComponent(sid)+'/runs'+(query?'?'+query:''));
     },
+    async runtimeTimeline(sessionId,opts){
+      const sid=sessionId||this.sid;
+      const o=opts||{};
+      const params=new URLSearchParams();
+      params.set('session_id',sid||'');
+      if(o.from_seq!==undefined)params.set('from_seq',o.from_seq);
+      if(o.limit!==undefined)params.set('limit',o.limit);
+      return req('GET','/api/runtime/timeline?'+params.toString());
+    },
     async contextEnvelope(envelopeId){
       return req('GET','/api/context/'+encodeURIComponent(envelopeId));
     },
