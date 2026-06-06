@@ -678,6 +678,33 @@ describe('API module', () => {
           })
         });
       }
+      if (path.includes('/api/context/ctx-1')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            context: {
+              envelope_id: 'ctx-1',
+              envelope: {
+                id: 'ctx-1',
+                profile: 'MainTurn',
+                intent: 'ship now',
+                diagnostics: { pressure_bp: 150 },
+                selected: [{
+                  role: 'Evidence',
+                  source: 'ToolTrace',
+                  authority: 'Tool',
+                  visibility: 'Private',
+                  content: 'historical cargo test passed',
+                  score: 0.88,
+                  token_estimate: 8,
+                  evidence: ['tool://test/evidence/event-1'],
+                }],
+                omitted: [],
+              },
+            },
+          })
+        });
+      }
       if (path.includes('/api/sessions/s1/context')) {
         return Promise.resolve({
           ok: true,
@@ -731,6 +758,7 @@ describe('API module', () => {
 
     await window.Panels.renderContext();
     await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
 
     const text = document.getElementById('panel-content').textContent;
     expect(text).toContain('Context Runtime');
@@ -746,6 +774,8 @@ describe('API module', () => {
     expect(text).toContain('Ack');
     expect(text).toContain('Context Timeline');
     expect(text).toContain('ship now');
+    expect(text).toContain('historical cargo test passed');
+    expect(text).toContain('tool://test/evidence/event-1');
   });
 
   it('renders recall explain metadata in the memory panel', async () => {

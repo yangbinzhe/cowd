@@ -101,19 +101,29 @@ window.Panels = (()=>{
     return sec;
   }
 
-  function renderContextHistoryItem(item){
+  function renderContextHistoryItem(item,onSelect){
     const row=UI.el('button','context-history-item');
     const envelope=item.envelope||{};
     const diagnostics=envelope.diagnostics||{};
     const stamp=item.created_at_ms?new Date(item.created_at_ms).toLocaleTimeString():'n/a';
     row.type='button';
     row.innerHTML='<b>'+UI.esc(envelope.profile||'Context')+'</b><small>'+UI.esc([item.envelope_id||envelope.id||'no-id','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(envelope.intent||''))+'</em><span>'+UI.esc(fmtPressure(diagnostics.pressure_bp))+'</span>';
-    row.onclick=function(){
-      const next=(item.envelope)||{};
-      const evt=new CustomEvent('cowd-context-history-selected',{detail:next});
-      window.dispatchEvent(evt);
-    };
+    row.onclick=function(){if(onSelect)onSelect(item)};
     return row;
+  }
+
+  function renderContextHistoryDetail(item){
+    const detail=UI.el('div','context-history-detail');
+    const envelope=(item&&item.envelope)||{};
+    const diagnostics=envelope.diagnostics||{};
+    detail.innerHTML='<h4>'+UI.esc(envelope.profile||'Context')+'</h4><small>'+UI.esc([item.envelope_id||envelope.id||'no-id','pressure '+fmtPressure(diagnostics.pressure_bp),'selected '+((envelope.selected||[]).length),'omitted '+((envelope.omitted||[]).length)].join(' · '))+'</small>';
+    const selected=(envelope.selected||[]).slice(0,3);
+    if(selected.length){
+      selected.forEach(function(ctxItem){detail.appendChild(renderContextItem(ctxItem))});
+    }else{
+      detail.appendChild(UI.el('div','panel-empty','No selected context in this envelope'));
+    }
+    return detail;
   }
 
   async function renderContext(){
@@ -239,12 +249,28 @@ window.Panels = (()=>{
           history.appendChild(UI.el('div','panel-empty','No active session'));
         }else{
           try{
+            const detailMount=UI.el('div','context-history-detail-mount');
+            async function showHistoryItem(item){
+              detailMount.innerHTML='';
+              let selected=item;
+              const envelopeId=item.envelope_id||(item.envelope||{}).id;
+              if(envelopeId){
+                try{
+                  const detail=await Api.contextEnvelope(envelopeId);
+                  selected=detail.context||item;
+                }catch(detailError){}
+              }
+              detailMount.appendChild(renderContextHistoryDetail(selected));
+            }
             const timeline=await Api.contextHistory(Api.sid,{limit:8});
             const rows=timeline.envelopes||[];
             if(!rows.length)history.appendChild(UI.el('div','panel-empty','No persisted envelopes'));
-            rows.slice(-8).reverse().forEach(function(item){
-              history.appendChild(renderContextHistoryItem(item));
+            const visibleRows=rows.slice(-8).reverse();
+            visibleRows.forEach(function(item){
+              history.appendChild(renderContextHistoryItem(item,showHistoryItem));
             });
+            history.appendChild(detailMount);
+            if(visibleRows[0])showHistoryItem(visibleRows[0]);
           }catch(historyError){
             history.appendChild(UI.el('div','panel-empty','Context timeline unavailable'));
           }
