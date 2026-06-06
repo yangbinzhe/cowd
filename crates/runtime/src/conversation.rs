@@ -44,7 +44,7 @@ use crate::config::RuntimeFeatureConfig;
 use crate::context_runtime::{
     ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
     ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
-    ContextVisibility,
+    ContextVisibility, ResumeContextPacket,
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::joint_problem_solving::{JpsOps, ProblemStatement};
@@ -310,6 +310,8 @@ pub struct ConversationRuntime<C, T> {
     tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator,
     /// Latest assembled context envelope used by a real turn.
     last_context_envelope: std::sync::Mutex<Option<ContextEnvelope>>,
+    /// Runtime-owned context supplied by outer orchestration layers.
+    external_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// T4: Semaphore for WriteLocal tool concurrency (permits: 4).
     write_semaphore: Arc<Semaphore>,
     /// T4: Semaphore for Network tool concurrency (permits: 3).
@@ -479,6 +481,7 @@ where
             cancellation_token: CancellationToken::new(),
             tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
             last_context_envelope: std::sync::Mutex::new(None),
+            external_context_items: std::sync::Mutex::new(Vec::new()),
             write_semaphore: Arc::new(Semaphore::new(
                 crate::tool_orchestrator::ToolSafetyCategory::WriteLocal.max_concurrency(),
             )),
@@ -525,6 +528,65 @@ where
             .and_then(|guard| guard.clone())
     }
 
+    /// Replace runtime-owned context supplied by orchestration layers.
+    pub fn set_external_context_items(&self, items: Vec<ContextItem>) {
+        if let Ok(mut guard) = self.external_context_items.lock() {
+            *guard = items;
+        }
+    }
+
+    /// Add one runtime-owned context item supplied by orchestration layers.
+    pub fn push_external_context_item(&self, item: ContextItem) {
+        if let Ok(mut guard) = self.external_context_items.lock() {
+            guard.push(item);
+        }
+    }
+
+    /// Remove runtime-owned context items from a given source.
+    pub fn clear_external_context_source(&self, source: ContextSourceKind) {
+        if let Ok(mut guard) = self.external_context_items.lock() {
+            guard.retain(|item| item.source != source);
+        }
+    }
+
+    /// Inject resume/handoff state into the next runtime context envelope.
+    pub fn inject_resume_context(&self, packet: ResumeContextPacket) {
+        let item = ContextRuntimeKernel::resume_item(&packet);
+        self.clear_external_context_source(item.source);
+        self.push_external_context_item(item);
+    }
+
+    fn external_context_items(&self) -> Vec<ContextItem> {
+        self.external_context_items
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn external_context_prompt_tail(&self) -> String {
+        self.external_context_items()
+            .into_iter()
+            .map(|item| {
+                format!(
+                    "<context_item source=\"{:?}\" role=\"{:?}\" score=\"{:.2}\">\n{}\n</context_item>",
+                    item.source, item.role, item.score, item.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn dynamic_tail_with_external_context(&self, tail: String) -> String {
+        let external = self.external_context_prompt_tail();
+        if external.trim().is_empty() {
+            tail
+        } else if tail.trim().is_empty() {
+            external
+        } else {
+            format!("{external}\n{tail}")
+        }
+    }
+
     fn remember_context_envelope(&self, envelope: ContextEnvelope) {
         if let Ok(mut guard) = self.last_context_envelope.lock() {
             *guard = Some(envelope.clone());
@@ -551,6 +613,8 @@ where
     ) -> ContextEnvelope {
         let session_id = self.session().session_id;
         let identity = ContextIdentity::main(session_id.clone());
+        let mut selected_items = self.external_context_items();
+        selected_items.extend(dynamic_items);
         let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
             profile: ContextProfile::from(identity.mode),
             identity,
@@ -559,7 +623,7 @@ where
             runtime_header: vec![format!(
                 "session:{session_id} agent:primary profile:MainTurn"
             )],
-            dynamic_items,
+            dynamic_items: selected_items,
             omitted,
             total_budget_tokens: self.context_budget_tokens(),
         });
@@ -2706,7 +2770,10 @@ where
                     .collect::<Vec<_>>();
                 let envelope =
                     self.build_context_envelope(user_input, dynamic_items, omissions, Vec::new());
-                let prompt = Self::provider_prompt_from_envelope(&envelope, Some(context));
+                let prompt = Self::provider_prompt_from_envelope(
+                    &envelope,
+                    Some(self.dynamic_tail_with_external_context(context)),
+                );
                 self.remember_context_envelope(envelope);
                 prompt
             }
@@ -3147,7 +3214,9 @@ mod tests {
     use crate::ToolError;
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
-    use crate::context_runtime::ContextSourceKind;
+    use crate::context_runtime::{
+        ContextAuthority, ContextSourceKind, ResumeContextPacket, ResumeContextSource,
+    };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest, SharedPrompter,
@@ -4069,6 +4138,44 @@ mod tests {
             vec![ContextSourceKind::Memory]
         );
         assert!(envelope.selected.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn external_resume_context_enters_prompt_and_envelope_without_memory() {
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["stable system".to_string()],
+        )
+        .without_memory();
+
+        rt.inject_resume_context(ResumeContextPacket {
+            session_id: session_id.clone(),
+            handoff_summary: Some("continue v0.8.13 context work".to_string()),
+            active_task: Some("persist context timeline".to_string()),
+            recent_decisions: vec!["DB session_events is the canonical timeline".to_string()],
+            blockers: vec!["none".to_string()],
+            source: ResumeContextSource::Mixed,
+        });
+
+        let prompt = rt.prepare_memory_context("resume").await;
+        let envelope = rt
+            .last_context_envelope()
+            .expect("context envelope should be recorded");
+
+        assert!(
+            prompt
+                .iter()
+                .any(|segment| segment.contains("continue v0.8.13 context work"))
+        );
+        assert_eq!(envelope.selected.len(), 1);
+        assert_eq!(envelope.selected[0].source, ContextSourceKind::Handoff);
+        assert_eq!(envelope.selected[0].authority, ContextAuthority::Session);
+        assert!(envelope.selected[0].content.contains("Active task"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

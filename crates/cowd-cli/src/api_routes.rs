@@ -30,7 +30,7 @@ use runtime::permission_enforcer::{ApprovalPersistence, ApprovalVerdict};
 use runtime::{
     ApprovalConfig, ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem,
     ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
-    ContextVisibility,
+    ContextVisibility, ResumeContextPacket, ResumeContextSource,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -43,7 +43,7 @@ use tools::GlobalToolRegistry;
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use crate::session_kernel::SessionKernel;
-use crate::task_kernel::{TaskKernel, TaskStatus};
+use crate::task_kernel::{TaskKernel, TaskRecord, TaskStatus};
 use memory::RotAlert;
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
@@ -1220,6 +1220,61 @@ async fn append_session_timeline_event_to_kernel(
     }
 }
 
+fn task_resume_context_packet(session_id: &str, task: &TaskRecord) -> ResumeContextPacket {
+    let current_phase = task.current_phase.as_ref().and_then(|phase_ref| {
+        task.phases
+            .iter()
+            .find(|phase| &phase.id == phase_ref || &phase.name == phase_ref)
+    });
+    let phase_summary = current_phase.map(|phase| {
+        format!(
+            "phase={} status={} objective={} acceptance=[{}]",
+            phase.name,
+            phase.status.as_str(),
+            phase.objective,
+            phase.acceptance.join("; ")
+        )
+    });
+    let active_task = Some(format!(
+        "id={} status={} yolo={} objective={}{}",
+        task.id,
+        task.status.as_str(),
+        task.yolo_mode,
+        task.objective,
+        phase_summary
+            .as_ref()
+            .map(|summary| format!(" current_{summary}"))
+            .unwrap_or_default()
+    ));
+    let recent_decisions = task
+        .audit
+        .iter()
+        .rev()
+        .take(5)
+        .map(|event| format!("{}: {}", event.event_type, event.message))
+        .collect::<Vec<_>>();
+    let mut blockers = Vec::new();
+    if let Some(reason) = task
+        .blocker_reason
+        .as_ref()
+        .filter(|reason| !reason.is_empty())
+    {
+        blockers.push(reason.clone());
+    }
+    if task.failure_count > 0 {
+        blockers.push(format!("failure_count={}", task.failure_count));
+    }
+
+    ResumeContextPacket {
+        session_id: session_id.to_string(),
+        handoff_summary: None,
+        active_task,
+        recent_decisions,
+        blockers,
+        source: ResumeContextSource::TaskRegistry,
+    }
+}
+
 async fn send_message(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1375,6 +1430,12 @@ async fn send_message(
                 }
             });
         }
+    }
+
+    if let Some(task) = state.task_kernel.current() {
+        let packet = task_resume_context_packet(&session_id, &task);
+        let runtime_guard = runtime_entry.lock().await;
+        runtime_guard.inject_resume_context(packet);
     }
 
     const TURN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -4295,6 +4356,45 @@ mod tests {
         assert_eq!(json["context"]["session_id"], session_id);
         assert_eq!(json["context"]["sequence"], 4);
         assert_eq!(json["context"]["envelope"]["id"], "env-target");
+    }
+
+    #[test]
+    fn task_resume_context_packet_summarizes_current_task() {
+        let path = std::env::temp_dir().join(format!(
+            "cowd-api-task-packet-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let kernel = TaskKernel::open(path.clone()).unwrap();
+        let task = kernel.start_goal("ship context runtime", true).unwrap();
+        let phase_id = task.phases[0].id.clone();
+        kernel
+            .record_phase_artifact(
+                &task.id,
+                &phase_id,
+                "evidence",
+                "test",
+                "cargo test -p runtime context_runtime",
+            )
+            .unwrap();
+        let task = kernel.current().unwrap();
+
+        let packet = task_resume_context_packet("session-task", &task);
+
+        assert_eq!(packet.session_id, "session-task");
+        assert_eq!(packet.source, ResumeContextSource::TaskRegistry);
+        assert!(
+            packet
+                .active_task
+                .as_deref()
+                .is_some_and(|task| task.contains("ship context runtime"))
+        );
+        assert!(
+            packet
+                .recent_decisions
+                .iter()
+                .any(|event| event.contains("artifact"))
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

@@ -425,7 +425,10 @@ impl ContextRuntimeKernel {
     }
 
     pub fn agent_return_item(packet: &AgentReturnPacket) -> ContextItem {
-        let mut content = format!("Agent {} returned: {}", packet.child_agent_id, packet.result_summary);
+        let mut content = format!(
+            "Agent {} returned: {}",
+            packet.child_agent_id, packet.result_summary
+        );
         if !packet.decisions.is_empty() {
             content.push_str("\nDecisions:\n");
             for decision in &packet.decisions {
@@ -488,9 +491,14 @@ impl ContextRuntimeKernel {
         if !packet.blockers.is_empty() {
             parts.push(format!("Blockers: {}", packet.blockers.join("; ")));
         }
+        let source = match packet.source {
+            ResumeContextSource::SessionDb => ContextSourceKind::Conversation,
+            ResumeContextSource::Handoff | ResumeContextSource::Mixed => ContextSourceKind::Handoff,
+            ResumeContextSource::TaskRegistry => ContextSourceKind::Task,
+        };
         let mut item = ContextItem::new(
             format!("resume:{}", packet.session_id),
-            ContextSourceKind::Handoff,
+            source,
             ContextRole::TaskState,
             parts.join("\n"),
         );
@@ -574,12 +582,18 @@ mod tests {
         let a = ContextRuntimeKernel::build_envelope(request_with_dynamic("memory alpha"));
         let b = ContextRuntimeKernel::build_envelope(request_with_dynamic("memory beta"));
 
-        assert_eq!(a.diagnostics.stable_head_hash, b.diagnostics.stable_head_hash);
+        assert_eq!(
+            a.diagnostics.stable_head_hash,
+            b.diagnostics.stable_head_hash
+        );
         assert_eq!(
             a.diagnostics.runtime_header_hash,
             b.diagnostics.runtime_header_hash
         );
-        assert_ne!(a.diagnostics.dynamic_tail_hash, b.diagnostics.dynamic_tail_hash);
+        assert_ne!(
+            a.diagnostics.dynamic_tail_hash,
+            b.diagnostics.dynamic_tail_hash
+        );
     }
 
     #[test]
@@ -695,5 +709,11 @@ mod tests {
         let resume_item = ContextRuntimeKernel::resume_item(&resume);
         assert_eq!(resume_item.source, ContextSourceKind::Handoff);
         assert!(resume_item.content.contains("phase 6"));
+
+        let mut task_resume = resume.clone();
+        task_resume.source = ResumeContextSource::TaskRegistry;
+        let task_item = ContextRuntimeKernel::resume_item(&task_resume);
+        assert_eq!(task_item.source, ContextSourceKind::Task);
+        assert!(task_item.content.contains("phase 6"));
     }
 }
