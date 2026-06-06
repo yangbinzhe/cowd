@@ -567,6 +567,25 @@ where
         envelope
     }
 
+    fn provider_prompt_from_envelope(
+        envelope: &ContextEnvelope,
+        dynamic_tail_override: Option<String>,
+    ) -> Vec<String> {
+        let mut prompt = Vec::with_capacity(
+            envelope.assembled.stable_head.len() + envelope.assembled.runtime_header.len() + 1,
+        );
+        prompt.extend(envelope.assembled.stable_head.clone());
+        prompt.extend(envelope.assembled.runtime_header.clone());
+        if let Some(dynamic_tail) = dynamic_tail_override {
+            if !dynamic_tail.trim().is_empty() {
+                prompt.push(dynamic_tail);
+            }
+        } else {
+            prompt.extend(envelope.assembled.dynamic_tail.clone());
+        }
+        prompt
+    }
+
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
@@ -2424,8 +2443,9 @@ where
                 Vec::new(),
                 vec![ContextSourceKind::Memory],
             );
+            let prompt = Self::provider_prompt_from_envelope(&envelope, None);
             self.remember_context_envelope(envelope);
-            return self.system_prompt.clone();
+            return prompt;
         };
 
         // Convert session messages to memory's Message type for context scoring.
@@ -2518,8 +2538,9 @@ where
                         .collect();
                     let envelope =
                         self.build_context_envelope(user_input, Vec::new(), omissions, Vec::new());
+                    let prompt = Self::provider_prompt_from_envelope(&envelope, None);
                     self.remember_context_envelope(envelope);
-                    return self.system_prompt.clone();
+                    return prompt;
                 }
 
                 use crate::cached_prompt::CacheLayer;
@@ -2659,9 +2680,8 @@ where
                     .collect::<Vec<_>>();
                 let envelope =
                     self.build_context_envelope(user_input, dynamic_items, omissions, Vec::new());
+                let prompt = Self::provider_prompt_from_envelope(&envelope, Some(context));
                 self.remember_context_envelope(envelope);
-                let mut prompt = self.system_prompt.clone();
-                prompt.push(context);
                 prompt
             }
             Err(err) => {
@@ -2675,8 +2695,9 @@ where
                     Vec::new(),
                     vec![ContextSourceKind::Memory],
                 );
+                let prompt = Self::provider_prompt_from_envelope(&envelope, None);
                 self.remember_context_envelope(envelope);
-                self.system_prompt.clone()
+                prompt
             }
         }
     }
@@ -3956,10 +3977,12 @@ mod tests {
             vec!["test prompt".to_string()],
         );
         let result = rt.prepare_memory_context("test").await;
-        assert_eq!(
-            result.len(),
-            1,
-            "without memory manager, returns base system prompt only"
+        assert_eq!(result[0], "test prompt");
+        assert!(
+            result
+                .get(1)
+                .is_some_and(|line| line.contains("profile:MainTurn")),
+            "without memory manager, returns stable head followed by runtime header"
         );
     }
 
@@ -3979,7 +4002,8 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert_eq!(prompt, vec!["stable system".to_string()]);
+        assert_eq!(prompt[0], "stable system");
+        assert!(prompt[1].contains("profile:MainTurn"));
         assert_eq!(envelope.intent, "remember this");
         assert_eq!(envelope.assembled.stable_head, vec!["stable system"]);
         assert_eq!(
@@ -4091,8 +4115,9 @@ mod tests {
             vec!["system prompt".to_string()],
         );
         let prompt = rt.prepare_memory_context("test query").await;
-        // Without memory manager, only system prompt is returned
-        assert_eq!(prompt.len(), 1);
+        // Without selected memories, stable head is followed by runtime header.
+        assert_eq!(prompt.len(), 2);
+        assert!(prompt[1].contains("profile:MainTurn"));
         // System prompt should be reasonably sized
         assert!(
             prompt[0].len() < 10000,
