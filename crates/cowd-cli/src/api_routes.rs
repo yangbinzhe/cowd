@@ -5201,7 +5201,7 @@ mod tests {
                     session_id: session_id.to_string(),
                     event_type: event_type.to_string(),
                     event_json: payload.to_string(),
-                    sequence,
+                    sequence: sequence as usize,
                     created_at_ms: sequence as u64,
                 })
                 .await
@@ -5348,7 +5348,7 @@ mod tests {
                         "action": action,
                     })
                     .to_string(),
-                    sequence,
+                    sequence: sequence as usize,
                     created_at_ms: sequence as u64,
                 })
                 .await
@@ -5754,6 +5754,64 @@ mod tests {
         assert_eq!(json["tree"]["children"]["run-1"][0], "agent-run-1");
         assert_eq!(json["tree"]["summary"]["span_count"], 2);
         assert_eq!(json["tree"]["summary"]["failed_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_run_large_page_query_is_bounded() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "runtime-runs-large-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+
+        for sequence in 0..120u64 {
+            let run_id = format!("run-{sequence}");
+            store
+                .append_event(&memory::SessionEvent {
+                    session_id: session_id.to_string(),
+                    event_type: "RuntimeRun".to_string(),
+                    event_json: runtime_run_completed_payload(
+                        session_id,
+                        &run_id,
+                        ContextProfile::MainTurn,
+                        "completed",
+                        Some(1),
+                        None,
+                        None,
+                        sequence.saturating_mul(10),
+                        sequence.saturating_mul(10).saturating_add(3),
+                    )
+                    .to_string(),
+                    sequence: sequence as usize,
+                    created_at_ms: sequence,
+                })
+                .await
+                .unwrap();
+        }
+
+        let app = api_router(test_state_with_store(store));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}/runs?limit=25"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["total"], 120);
+        assert_eq!(json["runs"].as_array().unwrap().len(), 25);
+        assert_eq!(json["tree"]["summary"]["span_count"], 25);
+        assert_eq!(json["tree"]["summary"]["root_count"], 25);
     }
 
     #[tokio::test]

@@ -62,6 +62,7 @@ main() {
   run cargo test -p runtime agent_collaboration -- --nocapture
   run cargo test -p cowd-cli api_routes::tests::context_current -- --nocapture
   run cargo test -p cowd-cli api_routes::tests::session_runs_route_reads_runtime_run_events_only -- --nocapture
+  run cargo test -p cowd-cli api_routes::tests::runtime_run_large_page_query_is_bounded -- --nocapture
   run cargo test -p cowd-cli api_routes::tests::memory_maintenance_scan_and_transition -- --nocapture
   run cargo check -p cowd-cli
 

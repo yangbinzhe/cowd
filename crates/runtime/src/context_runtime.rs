@@ -1442,6 +1442,40 @@ mod tests {
     }
 
     #[test]
+    fn context_policy_large_tail_remains_bounded() {
+        let identity = ContextIdentity::main("large-tail-session");
+        let dynamic_items = (0..200)
+            .map(|idx| {
+                item_with_tokens(
+                    &format!("tool-trace-{idx:03}"),
+                    ContextSourceKind::ToolTrace,
+                    ContextRole::ToolSummary,
+                    50,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            profile: ContextProfile::MainTurn,
+            identity,
+            intent: "inspect large tool tail".to_string(),
+            stable_head: vec!["stable".to_string()],
+            runtime_header: vec!["runtime".to_string()],
+            dynamic_items,
+            omitted: Vec::new(),
+            total_budget_tokens: 1_000,
+        });
+        let probe = ContextRuntimeKernel::lean_probe(&envelope);
+
+        assert!(envelope.selected.len() <= 3);
+        assert!(envelope.omitted.len() >= 197);
+        assert_eq!(
+            probe.degradation_path,
+            ContextDegradationPath::TrimDynamicTail
+        );
+    }
+
+    #[test]
     fn workspace_packet_becomes_project_context_item() {
         let packet = WorkspacePacket {
             root: "/workspace/cowd".to_string(),
