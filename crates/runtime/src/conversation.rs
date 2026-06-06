@@ -839,6 +839,9 @@ where
     where
         C: Clone,
     {
+        let mut config = config.clone();
+        let parent_session_id = self.session().session_id;
+        let lease = config.ensure_context_lease(parent_session_id, "primary");
         let model = config.model.clone().or_else(|| self.model.clone());
         let filtered_prompt =
             filter_system_prompt_for_role(&self.system_prompt, &config.task_description);
@@ -853,12 +856,13 @@ where
         if let Some(ref m) = model {
             sub_rt.model = Some(m.clone());
         }
+        sub_rt = sub_rt.with_model_context_window(lease.max_tokens.min(u64::from(u32::MAX)) as u32);
         sub_rt.max_iterations = config.max_turns;
         sub_rt.tool_orchestrator = self.tool_orchestrator.clone();
         if let Some(ref mem) = self.memory_manager {
             sub_rt = sub_rt.with_memory_manager(Arc::clone(mem));
         }
-        let mut sub_agent = SubAgentRuntime::new(config.clone(), sub_rt);
+        let mut sub_agent = SubAgentRuntime::new(config, sub_rt);
         if let Some(ref mem) = self.memory_manager {
             sub_agent = sub_agent.with_parent_memory(Arc::clone(mem));
         }
@@ -3139,6 +3143,7 @@ mod tests {
         ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
         PromptCacheEvent, RuntimeError, StaticToolExecutor,
     };
+    use crate::SubAgentConfig;
     use crate::ToolError;
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -3245,6 +3250,36 @@ mod tests {
             assert_eq!(request.tool_name, "add");
             PermissionPromptDecision::Allow
         }
+    }
+
+    #[test]
+    fn create_subagent_runtime_assigns_context_lease() {
+        let parent_session = Session::new();
+        let parent_session_id = parent_session.session_id.clone();
+        let runtime = ConversationRuntime::new(
+            parent_session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        let config = SubAgentConfig {
+            task_description: "review implementation".to_string(),
+            budget_tokens: 2_048,
+            ..SubAgentConfig::default()
+        };
+
+        let sub_agent = runtime.create_subagent_runtime(&config);
+        let lease = sub_agent
+            .context_lease()
+            .expect("sub-agent should receive context lease");
+
+        assert_eq!(lease.parent_session_id, parent_session_id);
+        assert_eq!(lease.parent_agent_id, "primary");
+        assert_eq!(lease.task_contract, "review implementation");
+        assert_eq!(lease.max_tokens, 2_048);
+        assert_eq!(sub_agent.agent_id(), lease.child_agent_id);
     }
 
     #[test]
@@ -3946,6 +3981,7 @@ mod tests {
 
     // ── M2: Memory system tests ──────────────────────────────────────
 
+    #[derive(Clone)]
     struct MockApi;
     impl ApiClient for MockApi {
         fn stream(

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::context_runtime::{AgentContextLease, AgentReturnRequirement, ContextSourceKind};
 use crate::tool_orchestrator::ToolResultBudget;
 
 use memory::cognitive::CognitiveContextManager;
@@ -214,6 +215,9 @@ pub struct SubAgentConfig {
     /// Parent session ID for delegation traceability.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Context lease granted by the parent runtime.
+    #[serde(default)]
+    pub context_lease: Option<AgentContextLease>,
 }
 
 fn default_write_source() -> String {
@@ -259,7 +263,50 @@ impl Default for SubAgentConfig {
             inject_memory: true,
             retain_reasoning: true,
             session_id: None,
+            context_lease: None,
         }
+    }
+}
+
+impl SubAgentConfig {
+    pub fn ensure_context_lease(
+        &mut self,
+        parent_session_id: impl Into<String>,
+        parent_agent_id: impl Into<String>,
+    ) -> AgentContextLease {
+        let parent_session_id = parent_session_id.into();
+        let lease = self
+            .context_lease
+            .clone()
+            .unwrap_or_else(|| AgentContextLease {
+                parent_session_id: parent_session_id.clone(),
+                parent_agent_id: parent_agent_id.into(),
+                child_agent_id: uuid::Uuid::new_v4().to_string(),
+                task_contract: self.task_description.clone(),
+                allowed_sources: vec![
+                    ContextSourceKind::Memory,
+                    ContextSourceKind::ToolTrace,
+                    ContextSourceKind::AgentPeer,
+                    ContextSourceKind::Workspace,
+                    ContextSourceKind::Handoff,
+                ],
+                max_tokens: self.budget_tokens as u64,
+                required_return: vec![
+                    AgentReturnRequirement::ResultSummary,
+                    AgentReturnRequirement::Evidence,
+                    AgentReturnRequirement::Decisions,
+                    AgentReturnRequirement::Conflicts,
+                    AgentReturnRequirement::MemoryCandidates,
+                    AgentReturnRequirement::NextActions,
+                ],
+            });
+        self.session_id = Some(parent_session_id);
+        self.context_lease = Some(lease.clone());
+        lease
+    }
+
+    pub fn context_lease(&self) -> Option<&AgentContextLease> {
+        self.context_lease.as_ref()
     }
 }
 
@@ -454,7 +501,11 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
             config.allowed_tools = role_tools(config.role);
         }
 
-        let agent_id = uuid::Uuid::new_v4().to_string();
+        let agent_id = config
+            .context_lease
+            .as_ref()
+            .map(|lease| lease.child_agent_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         // Register this sub-agent in the global agent directory.
         let now_ms = std::time::SystemTime::now()
@@ -570,6 +621,14 @@ impl<C: ApiClient, T: ToolExecutor> SubAgentRuntime<C, T> {
     /// Get the task description.
     pub fn task_description(&self) -> &str {
         &self.config.task_description
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    pub fn context_lease(&self) -> Option<&AgentContextLease> {
+        self.config.context_lease()
     }
 
     /// Build the result from the current state.
@@ -1023,6 +1082,49 @@ mod tests {
         assert_eq!(config.write_source, "SubAgent");
         assert_eq!(config.model, None);
         assert_eq!(config.tool_mode, SubAgentToolMode::FullToolSet);
+    }
+
+    #[test]
+    fn sub_agent_config_creates_context_lease() {
+        let mut config = SubAgentConfig {
+            task_description: "review context runtime".to_string(),
+            budget_tokens: 4_096,
+            ..SubAgentConfig::default()
+        };
+
+        let lease = config.ensure_context_lease("parent-session", "primary");
+
+        assert_eq!(lease.parent_session_id, "parent-session");
+        assert_eq!(lease.parent_agent_id, "primary");
+        assert_eq!(lease.task_contract, "review context runtime");
+        assert_eq!(lease.max_tokens, 4_096);
+        assert!(lease.allowed_sources.contains(&ContextSourceKind::Memory));
+        assert!(
+            lease
+                .required_return
+                .contains(&AgentReturnRequirement::ResultSummary)
+        );
+        assert_eq!(
+            config
+                .context_lease()
+                .map(|lease| lease.child_agent_id.as_str()),
+            Some(lease.child_agent_id.as_str())
+        );
+    }
+
+    #[test]
+    fn sub_agent_runtime_uses_lease_child_agent_id() {
+        let mut config = SubAgentConfig::default();
+        let lease = config.ensure_context_lease("parent-session", "primary");
+        let runtime = SubAgentRuntime::new(config, make_dummy_runtime());
+
+        assert_eq!(runtime.agent_id(), lease.child_agent_id);
+        assert_eq!(
+            runtime
+                .context_lease()
+                .map(|lease| lease.parent_session_id.as_str()),
+            Some("parent-session")
+        );
     }
 
     #[test]
