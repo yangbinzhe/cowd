@@ -43,7 +43,7 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::context_runtime::{
     ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
-    ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
+    ContextMode, ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
     ContextVisibility, ResumeContextPacket, ToolTracePacket, ToolTraceStatus,
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
@@ -174,6 +174,19 @@ pub trait MemoryCallback: Send + Sync {
     /// Called after post-turn memory housekeeping completes
     /// (micro-compact, drift, seeds).
     fn on_memory_stats(&self, total_entries: usize, vector_count: usize, layers: Vec<String>);
+}
+
+fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
+    match profile {
+        ContextProfile::MainTurn => ContextMode::MainTurn,
+        ContextProfile::SoloGoal => ContextMode::SoloGoal,
+        ContextProfile::YoloGoal => ContextMode::YoloGoal,
+        ContextProfile::SubAgent => ContextMode::SubAgent,
+        ContextProfile::Collaboration => ContextMode::Collaboration,
+        ContextProfile::Review => ContextMode::Review,
+        ContextProfile::Resume => ContextMode::Resume,
+        ContextProfile::Cron => ContextMode::Cron,
+    }
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -310,6 +323,8 @@ pub struct ConversationRuntime<C, T> {
     tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator,
     /// Latest assembled context envelope used by a real turn.
     last_context_envelope: std::sync::Mutex<Option<ContextEnvelope>>,
+    /// Active context profile used to assemble the next runtime envelope.
+    context_profile: std::sync::Mutex<ContextProfile>,
     /// Runtime-owned context supplied by outer orchestration layers.
     external_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// Bounded short-term tool trace context for subsequent turns.
@@ -483,6 +498,7 @@ where
             cancellation_token: CancellationToken::new(),
             tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
             last_context_envelope: std::sync::Mutex::new(None),
+            context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
             external_context_items: std::sync::Mutex::new(Vec::new()),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             write_semaphore: Arc::new(Semaphore::new(
@@ -529,6 +545,21 @@ where
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
+    }
+
+    /// Return the active context profile used for the next envelope.
+    pub fn context_profile(&self) -> ContextProfile {
+        self.context_profile
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or(ContextProfile::MainTurn)
+    }
+
+    /// Set the active context profile used for subsequent envelope assembly.
+    pub fn set_context_profile(&self, profile: ContextProfile) {
+        if let Ok(mut guard) = self.context_profile.lock() {
+            *guard = profile;
+        }
     }
 
     /// Replace runtime-owned context supplied by orchestration layers.
@@ -665,17 +696,19 @@ where
         degraded_sources: Vec<ContextSourceKind>,
     ) -> ContextEnvelope {
         let session_id = self.session().session_id;
-        let identity = ContextIdentity::main(session_id.clone());
+        let profile = self.context_profile();
+        let mut identity = ContextIdentity::main(session_id.clone());
+        identity.mode = context_mode_for_profile(profile);
         let mut selected_items = self.external_context_items();
         selected_items.extend(self.tool_trace_context_items());
         selected_items.extend(dynamic_items);
         let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
-            profile: ContextProfile::from(identity.mode),
+            profile,
             identity,
             intent: user_input.to_string(),
             stable_head: self.system_prompt.clone(),
             runtime_header: vec![format!(
-                "session:{session_id} agent:primary profile:MainTurn"
+                "session:{session_id} agent:primary profile:{profile:?}"
             )],
             dynamic_items: selected_items,
             omitted,
@@ -974,6 +1007,7 @@ where
         if let Some(ref m) = model {
             sub_rt.model = Some(m.clone());
         }
+        sub_rt.set_context_profile(ContextProfile::SubAgent);
         sub_rt = sub_rt.with_model_context_window(lease.max_tokens.min(u64::from(u32::MAX)) as u32);
         sub_rt.max_iterations = config.max_turns;
         sub_rt.tool_orchestrator = self.tool_orchestrator.clone();
@@ -3270,7 +3304,8 @@ mod tests {
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::context_runtime::{
-        ContextAuthority, ContextSourceKind, ResumeContextPacket, ResumeContextSource,
+        ContextAuthority, ContextItem, ContextMode, ContextProfile, ContextRole,
+        ContextSourceKind, ResumeContextPacket, ResumeContextSource,
     };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
@@ -3404,6 +3439,36 @@ mod tests {
         assert_eq!(lease.task_contract, "review implementation");
         assert_eq!(lease.max_tokens, 2_048);
         assert_eq!(sub_agent.agent_id(), lease.child_agent_id);
+    }
+
+    #[test]
+    fn context_profile_controls_runtime_envelope_profile() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        runtime.set_context_profile(ContextProfile::YoloGoal);
+        let envelope = runtime.build_context_envelope(
+            "continue task",
+            vec![ContextItem::new(
+                "task",
+                ContextSourceKind::Task,
+                ContextRole::TaskState,
+                "active yolo task",
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(runtime.context_profile(), ContextProfile::YoloGoal);
+        assert_eq!(envelope.profile, ContextProfile::YoloGoal);
+        assert_eq!(envelope.identity.mode, ContextMode::YoloGoal);
+        assert!(envelope.assembled.runtime_header[0].contains("profile:YoloGoal"));
     }
 
     #[test]

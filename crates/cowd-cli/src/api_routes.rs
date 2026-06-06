@@ -1394,7 +1394,15 @@ async fn send_message(
     let session_id = id.clone();
     let event_bus = state.event_bus();
     let run_id = uuid::Uuid::new_v4().to_string();
-    let run_profile = ContextProfile::MainTurn;
+    let active_task = state.task_kernel.current();
+    let run_profile = if active_task
+        .as_ref()
+        .is_some_and(|task| task.yolo_mode)
+    {
+        ContextProfile::YoloGoal
+    } else {
+        ContextProfile::MainTurn
+    };
     append_session_timeline_event_to_kernel(
         &state.session_kernel,
         &session_id,
@@ -1543,10 +1551,14 @@ async fn send_message(
         }
     }
 
-    if let Some(task) = state.task_kernel.current() {
+    if let Some(task) = active_task {
         let packet = task_resume_context_packet(&session_id, &task);
         let runtime_guard = runtime_entry.lock().await;
+        runtime_guard.set_context_profile(run_profile);
         runtime_guard.inject_resume_context(packet);
+    } else {
+        let runtime_guard = runtime_entry.lock().await;
+        runtime_guard.set_context_profile(run_profile);
     }
 
     const TURN_TIMEOUT: Duration = Duration::from_secs(300);
