@@ -6,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use runtime::ContextEnvelope;
 
 use crate::tui::app::App;
 use crate::tui::components::{Component, EventResult, RenderContext};
@@ -26,6 +27,8 @@ pub struct ContextPanel {
     pub turn_input_tokens: u64,
     /// Output tokens for current turn.
     pub turn_output_tokens: u64,
+    /// Latest runtime context envelope, if one has been assembled for a turn.
+    pub latest_envelope: Option<ContextEnvelope>,
 }
 
 impl ContextPanel {
@@ -35,6 +38,7 @@ impl ContextPanel {
             context_window: 0,
             turn_input_tokens: 0,
             turn_output_tokens: 0,
+            latest_envelope: None,
         }
     }
 
@@ -43,6 +47,7 @@ impl ContextPanel {
         self.context_window = app.context_window;
         self.turn_input_tokens = app.turn_input_tokens;
         self.turn_output_tokens = app.turn_output_tokens;
+        self.latest_envelope = app.latest_context_envelope.clone();
     }
 
     pub fn from_app(app: &App) -> Self {
@@ -82,6 +87,27 @@ impl ContextPanel {
         let input_cost = self.token_count as f64 * 3.0 / 1_000_000.0;
         let output_cost = self.turn_output_tokens as f64 * 15.0 / 1_000_000.0;
         input_cost + output_cost
+    }
+
+    fn pressure_pct(envelope: &ContextEnvelope) -> u16 {
+        envelope.diagnostics.pressure_bp / 100
+    }
+
+    fn short_hash(hash: &str) -> String {
+        if hash.is_empty() {
+            "n/a".to_string()
+        } else {
+            hash.chars().take(10).collect()
+        }
+    }
+
+    fn preview(text: &str, max: usize) -> String {
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.chars().count() <= max {
+            normalized
+        } else {
+            normalized.chars().take(max).collect::<String>() + "..."
+        }
     }
 }
 
@@ -163,7 +189,132 @@ impl Component for ContextPanel {
         ]));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "Keys: t:token-detail  r:refresh",
+            "Runtime Envelope",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+
+        if let Some(envelope) = &self.latest_envelope {
+            lines.push(Line::from(vec![
+                Span::styled("Profile:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:?}", envelope.profile),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Pressure: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}%", Self::pressure_pct(envelope)),
+                    Style::default().fg(if envelope.diagnostics.pressure_bp > 8_500 {
+                        Color::Red
+                    } else if envelope.diagnostics.pressure_bp > 7_000 {
+                        Color::Yellow
+                    } else {
+                        Color::Green
+                    }),
+                ),
+                Span::styled(
+                    format!(
+                        "  selected {} omitted {}",
+                        envelope.selected.len(),
+                        envelope.omitted.len()
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Hash:     ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        "stable {} runtime {} dynamic {}",
+                        Self::short_hash(&envelope.diagnostics.stable_head_hash),
+                        Self::short_hash(&envelope.diagnostics.runtime_header_hash),
+                        Self::short_hash(&envelope.diagnostics.dynamic_tail_hash)
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+            if !envelope.diagnostics.degraded_sources.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Degraded: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        envelope
+                            .diagnostics
+                            .degraded_sources
+                            .iter()
+                            .map(|source| format!("{source:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "Selected",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            if envelope.selected.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "No selected context",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                for item in envelope.selected.iter().take(5) {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:?}: ", item.role),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(Self::preview(&item.content, 52), Style::default()),
+                    ]));
+                }
+            }
+            if !envelope.omitted.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    "Omitted",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for omitted in envelope.omitted.iter().take(4) {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:?}: ", omitted.source),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(Self::preview(&omitted.reason, 54), Style::default()),
+                    ]));
+                }
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "Segments",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(format!(
+                "stable {}  runtime {}  dynamic {}",
+                envelope.assembled.stable_head.len(),
+                envelope.assembled.runtime_header.len(),
+                envelope.assembled.dynamic_tail.len()
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "No runtime envelope yet.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "Keys: Tab:switch panel  r:refresh",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -281,6 +432,42 @@ mod tests {
         panel.turn_output_tokens = 10_000;
         let cost = panel.cost_estimate();
         assert!(cost > 0.0, "Cost should be positive");
+    }
+
+    #[test]
+    fn renders_runtime_envelope_diagnostics() {
+        let identity = runtime::ContextIdentity::main("session-1".to_string());
+        let envelope =
+            runtime::ContextRuntimeKernel::build_envelope(runtime::ContextEnvelopeRequest {
+                profile: runtime::ContextProfile::from(identity.mode),
+                identity,
+                intent: "inspect".to_string(),
+                stable_head: vec!["stable system prompt".to_string()],
+                runtime_header: vec!["session:session-1 agent:primary".to_string()],
+                dynamic_items: vec![runtime::ContextItem::new(
+                    "mem-1",
+                    runtime::ContextSourceKind::Memory,
+                    runtime::ContextRole::Evidence,
+                    "SessionKernel owns durable sessions",
+                )],
+                omitted: vec![runtime::ContextOmission {
+                    source: runtime::ContextSourceKind::Memory,
+                    reason: "context lease exhausted".to_string(),
+                    token_estimate: 24,
+                }],
+                total_budget_tokens: 8_000,
+            });
+        let stable_hash = ContextPanel::short_hash(&envelope.diagnostics.stable_head_hash);
+        let mut panel = ContextPanel::new();
+        panel.latest_envelope = Some(envelope);
+
+        let lines = render_panel(&mut panel, 88, 26);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Runtime Envelope"));
+        assert!(joined.contains("SessionKernel owns durable sessions"));
+        assert!(joined.contains("context lease exhausted"));
+        assert!(joined.contains(&stable_hash));
+        assert!(joined.contains("stable 1"));
     }
 
     #[test]

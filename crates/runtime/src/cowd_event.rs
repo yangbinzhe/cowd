@@ -7,36 +7,100 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CowdEvent {
     // Streaming — field names match TuiEvent
-    TextDelta { text: String },
-    ThinkingDelta { thinking: String },
+    TextDelta {
+        text: String,
+    },
+    ThinkingDelta {
+        thinking: String,
+    },
     ThinkingComplete,
-    SignatureDelta { signature: String },
+    SignatureDelta {
+        signature: String,
+    },
     // Tool lifecycle
-    ToolStart { id: String, name: String, preview: String },
-    ToolProgress { id: String, name: String, progress: String },
-    ToolComplete { id: String, name: String, summary: String, exit_code: Option<i32> },
-    ToolExecuted { name: String, duration_ms: u64 },
+    ToolStart {
+        id: String,
+        name: String,
+        preview: String,
+    },
+    ToolProgress {
+        id: String,
+        name: String,
+        progress: String,
+    },
+    ToolComplete {
+        id: String,
+        name: String,
+        summary: String,
+        exit_code: Option<i32>,
+    },
+    ToolExecuted {
+        name: String,
+        duration_ms: u64,
+    },
     // Turn lifecycle
     TurnStarted,
-    TurnComplete { assistant_text: String, iterations: u32 },
-    TurnError { error: String },
+    TurnComplete {
+        assistant_text: String,
+        iterations: u32,
+    },
+    TurnError {
+        error: String,
+    },
     ContextWindow(u64),
+    ContextEnvelope {
+        envelope: crate::context_runtime::ContextEnvelope,
+    },
     // System
-    Warning { message: String },
-    TokenUsage { input: u64, output: u64, cache_create: u64, cache_read: u64 },
-    CompactionNotice { removed_count: usize },
+    Warning {
+        message: String,
+    },
+    TokenUsage {
+        input: u64,
+        output: u64,
+        cache_create: u64,
+        cache_read: u64,
+    },
+    CompactionNotice {
+        removed_count: usize,
+    },
     // Session
-    SessionCreated { id: String, name: String },
-    SessionDeleted { id: String },
-    SessionSwitched { id: String, name: String },
-    SessionList { sessions: Vec<(String, String, String)> },
+    SessionCreated {
+        id: String,
+        name: String,
+    },
+    SessionDeleted {
+        id: String,
+    },
+    SessionSwitched {
+        id: String,
+        name: String,
+    },
+    SessionList {
+        sessions: Vec<(String, String, String)>,
+    },
     // Memory
-    MemoryEntry { layer: String, content: String, relevance: f64 },
-    MemoryUpdate { entries: Vec<(String, String, f64)>, status: String },
-    MemoryStats { total_entries: usize, vector_count: usize, layers: Vec<String> },
-    MemoryExtracted { count: usize },
+    MemoryEntry {
+        layer: String,
+        content: String,
+        relevance: f64,
+    },
+    MemoryUpdate {
+        entries: Vec<(String, String, f64)>,
+        status: String,
+    },
+    MemoryStats {
+        total_entries: usize,
+        vector_count: usize,
+        layers: Vec<String>,
+    },
+    MemoryExtracted {
+        count: usize,
+    },
     // Approval
-    ApprovalRequested { tool: String },
+    ApprovalRequested {
+        tool: String,
+    },
 }
 
 #[derive(Clone)]

@@ -527,7 +527,10 @@ where
 
     fn remember_context_envelope(&self, envelope: ContextEnvelope) {
         if let Ok(mut guard) = self.last_context_envelope.lock() {
-            *guard = Some(envelope);
+            *guard = Some(envelope.clone());
+        }
+        if let Some(cowd) = self.cowd_bus() {
+            cowd.emit(crate::cowd_event::CowdEvent::ContextEnvelope { envelope });
         }
     }
 

@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::tui::layout::{build_default_layout, LayoutState, LayoutTree};
+use crate::tui::layout::{LayoutState, LayoutTree, build_default_layout};
 use ratatui::widgets::{Block, Borders};
 use runtime::CowdEvent;
 use std::collections::VecDeque;
@@ -198,6 +198,7 @@ pub struct App {
     pub msg_version: u64,
     pub last_drawn_version: u64,
     pub context_window: u64,
+    pub latest_context_envelope: Option<runtime::ContextEnvelope>,
     pub input_tokens: u64,
     pub output_tokens: u64,
 
@@ -393,6 +394,7 @@ impl App {
             msg_version: 0,
             last_drawn_version: u64::MAX,
             context_window: 0,
+            latest_context_envelope: None,
             input_tokens: 0,
             output_tokens: 0,
 
@@ -1021,6 +1023,10 @@ impl App {
             CowdEvent::ContextWindow(ctx) => {
                 self.context_window = ctx;
             }
+            CowdEvent::ContextEnvelope { envelope } => {
+                self.latest_context_envelope = Some(envelope);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
 
             CowdEvent::TurnStarted => {
                 self.is_loading = true;
@@ -1196,6 +1202,38 @@ mod tests {
     }
 
     #[test]
+    fn context_envelope_event_updates_app_state() {
+        let identity = runtime::ContextIdentity::main("sess".to_string());
+        let envelope =
+            runtime::ContextRuntimeKernel::build_envelope(runtime::ContextEnvelopeRequest {
+                profile: runtime::ContextProfile::from(identity.mode),
+                identity,
+                intent: "inspect".to_string(),
+                stable_head: vec!["stable".to_string()],
+                runtime_header: vec!["runtime".to_string()],
+                dynamic_items: vec![runtime::ContextItem::new(
+                    "ctx-1",
+                    runtime::ContextSourceKind::Memory,
+                    runtime::ContextRole::Evidence,
+                    "durable context",
+                )],
+                omitted: Vec::new(),
+                total_budget_tokens: 8_000,
+            });
+        let expected_id = envelope.id.clone();
+        let mut app = App::new("test", "sess");
+
+        app.apply_event(CowdEvent::ContextEnvelope { envelope });
+
+        assert_eq!(
+            app.latest_context_envelope
+                .as_ref()
+                .map(|env| env.id.as_str()),
+            Some(expected_id.as_str())
+        );
+    }
+
+    #[test]
     fn page_boundary_seamless() {
         let mut app = App::new("test", "sess");
         for i in 0..PAGE_SIZE {
@@ -1209,16 +1247,18 @@ mod tests {
         assert_eq!(app.timeline_pages.len(), 2);
 
         assert!(app.timeline_get(0).unwrap().full_text().contains("msg 0"));
-        assert!(app
-            .timeline_get(PAGE_SIZE - 1)
-            .unwrap()
-            .full_text()
-            .contains(&format!("msg {}", PAGE_SIZE - 1)));
-        assert!(app
-            .timeline_get(PAGE_SIZE)
-            .unwrap()
-            .full_text()
-            .contains("overflow"));
+        assert!(
+            app.timeline_get(PAGE_SIZE - 1)
+                .unwrap()
+                .full_text()
+                .contains(&format!("msg {}", PAGE_SIZE - 1))
+        );
+        assert!(
+            app.timeline_get(PAGE_SIZE)
+                .unwrap()
+                .full_text()
+                .contains("overflow")
+        );
 
         let count = app.timeline_iter().count();
         assert_eq!(count, PAGE_SIZE + 1);
@@ -1264,16 +1304,18 @@ mod tests {
         }
         assert_eq!(app.timeline_len(), PAGE_SIZE * 3 + 200);
         assert!(app.timeline_get(0).unwrap().full_text().contains("entry 0"));
-        assert!(app
-            .timeline_get(PAGE_SIZE)
-            .unwrap()
-            .full_text()
-            .contains(&format!("entry {}", PAGE_SIZE)));
-        assert!(app
-            .timeline_get(PAGE_SIZE * 2 + 50)
-            .unwrap()
-            .full_text()
-            .contains(&format!("entry {}", PAGE_SIZE * 2 + 50)));
+        assert!(
+            app.timeline_get(PAGE_SIZE)
+                .unwrap()
+                .full_text()
+                .contains(&format!("entry {}", PAGE_SIZE))
+        );
+        assert!(
+            app.timeline_get(PAGE_SIZE * 2 + 50)
+                .unwrap()
+                .full_text()
+                .contains(&format!("entry {}", PAGE_SIZE * 2 + 50))
+        );
     }
 
     #[test]
