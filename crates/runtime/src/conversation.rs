@@ -586,6 +586,20 @@ where
         prompt
     }
 
+    fn append_context_items_to_latest_envelope(&self, user_input: &str, items: Vec<ContextItem>) {
+        if items.is_empty() {
+            return;
+        }
+        let mut dynamic_items = self
+            .last_context_envelope()
+            .map(|envelope| envelope.selected)
+            .unwrap_or_default();
+        dynamic_items.extend(items);
+        let envelope =
+            self.build_context_envelope(user_input, dynamic_items, Vec::new(), Vec::new());
+        self.remember_context_envelope(envelope);
+    }
+
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
@@ -1845,7 +1859,15 @@ where
                     let skills_clone = skills.clone();
                     let memory = self.memory_manager().cloned();
 
-                    if let Some(synthesis) = collab_clone.run_boxed(&task, &skills_clone).await {
+                    if let Some(collab_result) = collab_clone
+                        .run_with_context_boxed(&task, &skills_clone)
+                        .await
+                    {
+                        let synthesis = collab_result.synthesis;
+                        self.append_context_items_to_latest_envelope(
+                            &task,
+                            collab_result.context_items,
+                        );
                         tracing::info!(
                             synthesis_len = synthesis.len(),
                             skills = ?skills_clone,

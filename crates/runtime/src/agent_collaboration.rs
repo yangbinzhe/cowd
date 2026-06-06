@@ -8,17 +8,18 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{SubAgentConfig, SubAgentExecutor, SubAgentResult};
+use crate::context_runtime::ContextItem;
 use crate::team_discovery::TeamDiscoveryProtocol;
 use crate::wave::{TaskId, WaveConfig, WaveOrchestrator, WaveTask};
 
 use memory::agent_directory::{AgentDirectory, AgentInfo};
 use memory::fact_checker::{FactCheckResult, FactChecker};
-use memory::{MemoryKernel, MemoryTurnContext};
 use memory::project_scope::MemoryScope;
 use memory::temporal_graph::Triple;
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
+use memory::{MemoryKernel, MemoryTurnContext};
 
 // ── SubTask ────────────────────────────────────────────────────────────────────
 
@@ -38,6 +39,12 @@ pub struct CollaborationTask {
     pub required_skills: Vec<String>,
     pub subtasks: Vec<SubTask>,
     pub review_criteria: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollaborationContextResult {
+    pub synthesis: String,
+    pub context_items: Vec<ContextItem>,
 }
 
 // ── AgentTeam ──────────────────────────────────────────────────────────────────
@@ -65,10 +72,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         }
     }
 
-    pub fn with_parent_memory(
-        mut self,
-        memory: Arc<memory::CognitiveContextManager>,
-    ) -> Self {
+    pub fn with_parent_memory(mut self, memory: Arc<memory::CognitiveContextManager>) -> Self {
         self.parent_memory = Some(memory);
         self
     }
@@ -122,9 +126,9 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
     /// The highest-ranked agent is elected leader; the rest become workers.
     pub fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam> {
         // Try reputation-aware discovery first.
-        if let Some(discovered) =
-            self.discovery
-                .auto_assemble(&task.description, &task.required_skills)
+        if let Some(discovered) = self
+            .discovery
+            .auto_assemble(&task.description, &task.required_skills)
         {
             return Some(AgentTeam {
                 leader: discovered.leader,
@@ -284,10 +288,7 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
             results.iter().filter(|r| r.completed_normally).count(),
             results.len()
         ));
-        output.push_str(&format!(
-            "**Corrections**: {}\n",
-            report.corrected
-        ));
+        output.push_str(&format!("**Corrections**: {}\n", report.corrected));
         output.push_str(&format!("**Flagged for review**: {}\n", report.flagged));
         output.push_str(&format!("**Pruned**: {}\n\n", report.pruned));
 
@@ -318,6 +319,25 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         output
     }
 
+    pub fn context_items_from_results(
+        &self,
+        team: &AgentTeam,
+        results: &[SubAgentResult],
+    ) -> Vec<ContextItem> {
+        results
+            .iter()
+            .enumerate()
+            .map(|(idx, result)| {
+                let child_agent_id = team
+                    .workers
+                    .get(idx)
+                    .map(|agent| agent.agent_id.clone())
+                    .unwrap_or_else(|| format!("agent-{}", idx + 1));
+                result.to_context_item("collaboration-orchestrator", child_agent_id)
+            })
+            .collect()
+    }
+
     // ── finalize ───────────────────────────────────────────────────────────
 
     /// Persist the collaboration synthesis to L4 team-shared memory so it is
@@ -327,7 +347,8 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
             tracing::debug!("no parent memory configured — skipping L4 finalize");
             return;
         };
-        let memory_ctx = MemoryTurnContext::new("collaboration-orchestrator", "collaboration-orchestrator");
+        let memory_ctx =
+            MemoryTurnContext::new("collaboration-orchestrator", "collaboration-orchestrator");
         let kernel = MemoryKernel::new(Arc::clone(mem));
 
         let entry = MemoryEntry {
@@ -369,6 +390,16 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
     /// End-to-end collaboration loop: decompose, assemble, dispatch,
     /// synthesize, finalize.
     pub async fn run(&self, task: &str, required_skills: &[String]) -> Option<String> {
+        self.run_with_context(task, required_skills)
+            .await
+            .map(|result| result.synthesis)
+    }
+
+    pub async fn run_with_context(
+        &self,
+        task: &str,
+        required_skills: &[String],
+    ) -> Option<CollaborationContextResult> {
         // 1. Decompose
         let subtasks = self.decompose_sequential(task);
 
@@ -386,11 +417,15 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
 
         // 4. Synthesize
         let synthesis = self.synthesize(&results);
+        let context_items = self.context_items_from_results(&team, &results);
 
         // 5. Finalize
         self.finalize(&synthesis, task).await;
 
-        Some(synthesis)
+        Some(CollaborationContextResult {
+            synthesis,
+            context_items,
+        })
     }
 }
 
@@ -417,9 +452,8 @@ where
 /// Split a task description into phases using delimiter keywords.
 fn split_phases(task: &str) -> Vec<String> {
     let delimiters = [
-        "Step 1", "Step 2", "Step 3", "Step 4", "Step 5",
-        "Phase 1", "Phase 2", "Phase 3", "Phase 4",
-        "First", "Next", "Then", "Finally",
+        "Step 1", "Step 2", "Step 3", "Step 4", "Step 5", "Phase 1", "Phase 2", "Phase 3",
+        "Phase 4", "First", "Next", "Then", "Finally",
     ];
 
     let mut phases: Vec<String> = Vec::new();
@@ -498,15 +532,39 @@ fn infer_skills(desc: &str) -> Vec<String> {
 
     let keyword_map: &[(&str, &[&str])] = &[
         ("rust", &["rust", "cargo", "borrow checker", "lifetime"]),
-        ("testing", &["test", "assert", "mock", "coverage", "fixture"]),
-        ("refactoring", &["refactor", "extract", "rename", "restructure", "clean"]),
-        ("review", &["review", "audit", "inspect", "examine", "check"]),
-        ("documentation", &["document", "doc", "readme", "explain", "describe"]),
-        ("planning", &["plan", "design", "architect", "spec", "outline"]),
-        ("execution", &["execute", "run", "build", "compile", "deploy"]),
+        (
+            "testing",
+            &["test", "assert", "mock", "coverage", "fixture"],
+        ),
+        (
+            "refactoring",
+            &["refactor", "extract", "rename", "restructure", "clean"],
+        ),
+        (
+            "review",
+            &["review", "audit", "inspect", "examine", "check"],
+        ),
+        (
+            "documentation",
+            &["document", "doc", "readme", "explain", "describe"],
+        ),
+        (
+            "planning",
+            &["plan", "design", "architect", "spec", "outline"],
+        ),
+        (
+            "execution",
+            &["execute", "run", "build", "compile", "deploy"],
+        ),
         ("debugging", &["debug", "fix", "bug", "error", "crash"]),
-        ("security", &["security", "vuln", "exploit", "injection", "xss"]),
-        ("performance", &["perf", "benchmark", "optimize", "slow", "latency"]),
+        (
+            "security",
+            &["security", "vuln", "exploit", "injection", "xss"],
+        ),
+        (
+            "performance",
+            &["perf", "benchmark", "optimize", "slow", "latency"],
+        ),
     ];
 
     for (skill, keywords) in keyword_map {
@@ -535,23 +593,47 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 // ── CollaborationOps ────────────────────────────────────────────────────────────
 
-use std::pin::Pin;
 use futures::Future;
+use std::pin::Pin;
 
 /// Type-erased handle for CollaborationOrchestrator.
 /// Enables storage without generic parameter propagation.
 pub trait CollaborationOps: Send + Sync {
-    fn run_boxed<'a>(&'a self, task: &'a str, skills: &'a [String]) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>>;
+    fn run_boxed<'a>(
+        &'a self,
+        task: &'a str,
+        skills: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>>;
+    fn run_with_context_boxed<'a>(
+        &'a self,
+        task: &'a str,
+        skills: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>>;
     fn decompose_task(&self, task: &str) -> Vec<SubTask>;
     fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam>;
 }
 
 impl<E: SubAgentExecutor + 'static> CollaborationOps for CollaborationOrchestrator<E> {
-    fn run_boxed<'a>(&'a self, task: &'a str, skills: &'a [String]) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>> {
+    fn run_boxed<'a>(
+        &'a self,
+        task: &'a str,
+        skills: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>> {
         Box::pin(self.run(task, skills))
     }
-    fn decompose_task(&self, task: &str) -> Vec<SubTask> { self.decompose_task(task) }
-    fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam> { self.assemble_team(task) }
+    fn run_with_context_boxed<'a>(
+        &'a self,
+        task: &'a str,
+        skills: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>> {
+        Box::pin(self.run_with_context(task, skills))
+    }
+    fn decompose_task(&self, task: &str) -> Vec<SubTask> {
+        self.decompose_task(task)
+    }
+    fn assemble_team(&self, task: &CollaborationTask) -> Option<AgentTeam> {
+        self.assemble_team(task)
+    }
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
@@ -570,7 +652,8 @@ mod tests {
             &self,
             _config: SubAgentConfig,
             task: &str,
-        ) -> impl std::future::Future<Output = Result<SubAgentResult, crate::agent::SubAgentError>> {
+        ) -> impl std::future::Future<Output = Result<SubAgentResult, crate::agent::SubAgentError>>
+        {
             let task = task.to_string();
             async move {
                 Ok(SubAgentResult {
@@ -587,7 +670,11 @@ mod tests {
         let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
         let input = "Step 1: analyze code. Step 2: refactor module. Step 3: write tests.";
         let subtasks = orch.decompose_task(input);
-        assert!(subtasks.len() >= 2, "expected >= 2 subtasks, got {}", subtasks.len());
+        assert!(
+            subtasks.len() >= 2,
+            "expected >= 2 subtasks, got {}",
+            subtasks.len()
+        );
         for st in &subtasks {
             assert!(!st.description.is_empty());
             assert!(!st.required_skills.is_empty());
@@ -657,6 +744,31 @@ mod tests {
         let results = orch.dispatch_subtasks(&team, &subtasks).await;
         assert_eq!(results.len(), 1);
         assert!(results[0].completed_normally);
+    }
+
+    #[test]
+    fn context_items_from_results_returns_agent_peer_items() {
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
+        let team = AgentTeam {
+            leader: dummy_agent_info("lead", vec![]),
+            workers: vec![dummy_agent_info("reviewer", vec!["testing".to_string()])],
+        };
+        let results = vec![SubAgentResult {
+            output: "Decision: add regression test".to_string(),
+            ..SubAgentResult::default()
+        }];
+        let context_items = orch.context_items_from_results(&team, &results);
+
+        assert_eq!(context_items.len(), 1);
+        assert_eq!(
+            context_items[0].source,
+            crate::context_runtime::ContextSourceKind::AgentPeer
+        );
+        assert_eq!(
+            context_items[0].authority,
+            crate::context_runtime::ContextAuthority::Agent
+        );
+        assert!(context_items[0].content.contains("reviewer"));
     }
 
     #[test]
