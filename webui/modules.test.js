@@ -951,13 +951,32 @@ describe('API module', () => {
               {
                 kind: 'agent.workgraph.reviewed',
                 scope: 'workgraph',
+                status: 'completed',
                 sequence: 12,
                 created_at_ms: 1020,
                 refs: [
                   { type: 'workgraph', id: 'workgraph-1' },
                   { type: 'collaboration_board', id: 'board-1' },
                 ],
-                payload: { maintenance_candidates: [{ id: 'maint-graph' }] },
+                payload: {
+                  board_id: 'board-1',
+                  graph: {
+                    graph_id: 'workgraph-1',
+                    status: 'completed',
+                    board_id: 'board-1',
+                    nodes: [
+                      { kind: 'AgentTask', node_id: 'task-1' },
+                      { kind: 'Synthesis', node_id: 'synthesis-board-1' },
+                    ],
+                  },
+                  scorecard: {
+                    completion_rate: 1,
+                    synthesis_lift: 1.2,
+                    complementarity_score: 0.75,
+                    conflict_count: 1,
+                  },
+                  maintenance_candidates: [{ id: 'maint-graph' }],
+                },
               },
             ]
           })
@@ -1039,6 +1058,11 @@ describe('API module', () => {
     expect(text).toContain('agent.workgraph.reviewed');
     expect(text).toContain('runtime_run:run-console-1');
     expect(text).toContain('workgraph:workgraph-1');
+    expect(text).toContain('Agent WorkGraph');
+    expect(text).toContain('100%');
+    expect(text).toContain('conflicts');
+    expect(text).toContain('candidates');
+    expect(text).toContain('board board-1');
     expect(text).toContain('Runtime console should show unified state');
     expect(text).toContain('Memory Maintenance');
     expect(text).toContain('Review stale memory');

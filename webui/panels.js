@@ -180,8 +180,57 @@ window.Panels = (()=>{
     const stamp=item.created_at_ms?new Date(item.created_at_ms).toLocaleTimeString():'n/a';
     const refs=(item.refs||[]).map(function(ref){return (ref.type||ref.ref_type||'ref')+':'+(ref.id||'')}).filter(Boolean).slice(0,3).join(' · ');
     const payload=item.payload||{};
-    row.innerHTML='<b>'+UI.esc(item.kind||'event')+'</b><small>'+UI.esc([item.scope||'runtime','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(refs||payload.summary||payload.error||payload.intent_preview||''))+'</em>';
+    const score=payload.scorecard||{};
+    const scoreText=payload.board_id
+      ? 'board '+payload.board_id+' · complete '+fmtPct(score.completion_rate)+' · conflicts '+fmtNumber(score.conflict_count)+' · candidates '+((payload.maintenance_candidates||[]).length)
+      : '';
+    row.innerHTML='<b>'+UI.esc(item.kind||'event')+'</b><small>'+UI.esc([item.scope||'runtime','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(refs||scoreText||payload.summary||payload.error||payload.intent_preview||''))+'</em>';
     return row;
+  }
+
+  function summarizeWorkGraphs(events){
+    const graphEvents=(events||[]).filter(function(item){
+      return item && (item.kind==='agent.workgraph.reviewed' || item.kind==='agent.workgraph.planned');
+    });
+    const latest=graphEvents[graphEvents.length-1]||null;
+    const payload=(latest&&latest.payload)||{};
+    const graph=payload.graph||{};
+    const score=payload.scorecard||{};
+    const candidates=payload.maintenance_candidates||[];
+    return {
+      count: graphEvents.length,
+      latest,
+      graph,
+      score,
+      candidates,
+      boardId: payload.board_id||graph.board_id||'n/a',
+      graphId: graph.graph_id||((latest&&latest.refs||[]).find(function(ref){return (ref.type||ref.ref_type)==='workgraph'})||{}).id||'n/a',
+      status: graph.status||(latest&&latest.status)||'n/a',
+      agentTasks: (graph.nodes||[]).filter(function(node){return node.kind==='AgentTask'||node.kind==='agent_task'}).length,
+      conflicts: fmtNumber(score.conflict_count),
+    };
+  }
+
+  function renderWorkGraphSummary(events){
+    const summary=summarizeWorkGraphs(events);
+    const sec=UI.el('div','runtime-workgraph-summary');
+    sec.innerHTML='<h4>Agent WorkGraph</h4>';
+    const metrics=UI.el('div','memory-metrics');
+    metrics.appendChild(renderMemoryMetric('graphs',summary.count,'events'));
+    metrics.appendChild(renderMemoryMetric('status',summary.status,'latest'));
+    metrics.appendChild(renderMemoryMetric('agents',summary.agentTasks,'tasks'));
+    metrics.appendChild(renderMemoryMetric('complete',fmtPct(summary.score.completion_rate),'score'));
+    metrics.appendChild(renderMemoryMetric('conflicts',summary.conflicts,'review'));
+    metrics.appendChild(renderMemoryMetric('candidates',summary.candidates.length,'memory'));
+    sec.appendChild(metrics);
+    if(!summary.latest){
+      sec.appendChild(UI.el('div','panel-empty','No agent workgraph events'));
+      return sec;
+    }
+    const detail=UI.el('div','runtime-workgraph-detail');
+    detail.innerHTML='<b>'+UI.esc(summary.graphId)+'</b><small>'+UI.esc(['board '+summary.boardId,'lift '+fmtPct(summary.score.synthesis_lift),'complement '+fmtPct(summary.score.complementarity_score)].join(' · '))+'</small>';
+    sec.appendChild(detail);
+    return sec;
   }
 
   async function renderContext(){
@@ -816,6 +865,7 @@ window.Panels = (()=>{
           timelineSec.appendChild(metrics);
           if(timeline.degraded_reason)timelineSec.appendChild(UI.el('div','panel-empty',timeline.degraded_reason));
           if(!events.length)timelineSec.appendChild(UI.el('div','panel-empty','No runtime events'));
+          timelineSec.appendChild(renderWorkGraphSummary(events));
           events.slice(-12).reverse().forEach(function(item){timelineSec.appendChild(renderRuntimeTimelineItem(item))});
         }catch(e){timelineSec.appendChild(UI.el('div','panel-empty','Runtime timeline unavailable'))}
       }
