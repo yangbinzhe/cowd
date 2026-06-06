@@ -218,6 +218,7 @@ window.Panels = (()=>{
           completion_rate: latest.completion_rate,
           synthesis_lift: latest.synthesis_lift,
           complementarity_score: latest.complementarity_score,
+          value_verdict: latest.value_verdict,
         },
         candidates: new Array(fmtNumber(serverSummary.memory_candidates)),
         boardId: latest.board_id||'n/a',
@@ -234,12 +235,14 @@ window.Panels = (()=>{
     const payload=(latest&&latest.payload)||{};
     const graph=payload.graph||{};
     const score=payload.scorecard||{};
+    const verdict=payload.value_verdict||score.value_verdict||{};
     const candidates=payload.maintenance_candidates||[];
     return {
       count: graphEvents.length,
       latest,
       graph,
       score,
+      verdict,
       candidates,
       boardId: payload.board_id||graph.board_id||'n/a',
       graphId: graph.graph_id||((latest&&latest.refs||[]).find(function(ref){return (ref.type||ref.ref_type)==='workgraph'})||{}).id||'n/a',
@@ -258,6 +261,7 @@ window.Panels = (()=>{
     metrics.appendChild(renderMemoryMetric('status',summary.status,'latest'));
     metrics.appendChild(renderMemoryMetric('agents',summary.agentTasks,'tasks'));
     metrics.appendChild(renderMemoryMetric('complete',fmtPct(summary.score.completion_rate),'score'));
+    metrics.appendChild(renderMemoryMetric('value',fmtNumber((summary.verdict||summary.score.value_verdict||{}).value_score),'lift'));
     metrics.appendChild(renderMemoryMetric('conflicts',summary.conflicts,'review'));
     metrics.appendChild(renderMemoryMetric('candidates',summary.candidates.length,'memory'));
     sec.appendChild(metrics);
@@ -266,7 +270,8 @@ window.Panels = (()=>{
       return sec;
     }
     const detail=UI.el('div','runtime-workgraph-detail');
-    detail.innerHTML='<b>'+UI.esc(summary.graphId)+'</b><small>'+UI.esc(['board '+summary.boardId,'lift '+fmtPct(summary.score.synthesis_lift),'complement '+fmtPct(summary.score.complementarity_score)].join(' · '))+'</small>';
+    const verdict=summary.verdict||summary.score.value_verdict||{};
+    detail.innerHTML='<b>'+UI.esc(summary.graphId)+'</b><small>'+UI.esc(['board '+summary.boardId,'lift '+fmtPct(summary.score.synthesis_lift),'complement '+fmtPct(summary.score.complementarity_score),'positive '+(verdict.positive_lift?'yes':'no')].join(' · '))+'</small>';
     sec.appendChild(detail);
     return sec;
   }

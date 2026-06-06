@@ -26,6 +26,7 @@ pub enum RuntimeEventScope {
     Workgraph,
     Memory,
     Policy,
+    Task,
     Approval,
     Scheduler,
 }

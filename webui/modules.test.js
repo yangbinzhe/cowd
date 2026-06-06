@@ -965,6 +965,12 @@ describe('API module', () => {
                 completion_rate: 1,
                 synthesis_lift: 1.2,
                 complementarity_score: 0.75,
+                value_verdict: {
+                  positive_lift: true,
+                  continue_multi_agent: true,
+                  value_score: 72,
+                  reasons: ['positive_multi_agent_lift'],
+                },
               },
               agent_tasks: 1,
               memory_candidates: 1,
@@ -1022,6 +1028,12 @@ describe('API module', () => {
                     synthesis_lift: 1.2,
                     complementarity_score: 0.75,
                     conflict_count: 1,
+                  },
+                  value_verdict: {
+                    positive_lift: true,
+                    continue_multi_agent: true,
+                    value_score: 72,
+                    reasons: ['positive_multi_agent_lift'],
                   },
                   maintenance_candidates: [{ id: 'maint-graph' }],
                 },
@@ -1123,6 +1135,7 @@ describe('API module', () => {
     expect(text).toContain('runtime_run:run-console-1');
     expect(text).toContain('workgraph:workgraph-1');
     expect(text).toContain('Agent WorkGraph');
+    expect(text).toContain('positive yes');
     expect(text).toContain('100%');
     expect(text).toContain('conflicts');
     expect(text).toContain('candidates');

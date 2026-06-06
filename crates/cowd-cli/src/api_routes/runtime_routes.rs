@@ -116,6 +116,7 @@ fn workgraph_summary(events: &[RuntimeEvent]) -> Value {
     let payload = &latest.payload;
     let graph = payload.get("graph").unwrap_or(&Value::Null);
     let scorecard = payload.get("scorecard").unwrap_or(&Value::Null);
+    let value_verdict = payload.get("value_verdict").unwrap_or(&Value::Null);
     let agent_tasks = graph
         .get("nodes")
         .and_then(Value::as_array)
@@ -182,6 +183,7 @@ fn workgraph_summary(events: &[RuntimeEvent]) -> Value {
             "complementarity_score": scorecard
                 .get("complementarity_score")
                 .and_then(Value::as_f64),
+            "value_verdict": value_verdict,
         },
         "agent_tasks": agent_tasks,
         "memory_candidates": memory_candidates,

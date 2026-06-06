@@ -369,11 +369,25 @@ impl RuntimeControlPolicy {
         let recommended_agent_mode = if !self.enabled || !self.agent.enabled {
             AgentMode::Off
         } else {
+            let can_parallel =
+                self.agent.max_parallel_agents > 1 && score >= self.agent.min_collaboration_score;
             match level {
                 ComplexityLevel::Simple => AgentMode::Off,
                 ComplexityLevel::Focused => AgentMode::Assist,
-                ComplexityLevel::Complex => AgentMode::Parallel,
-                ComplexityLevel::Critical => AgentMode::CriticalSwarm,
+                ComplexityLevel::Complex => {
+                    if can_parallel {
+                        AgentMode::Parallel
+                    } else {
+                        AgentMode::Assist
+                    }
+                }
+                ComplexityLevel::Critical => {
+                    if can_parallel {
+                        AgentMode::CriticalSwarm
+                    } else {
+                        AgentMode::Assist
+                    }
+                }
             }
         };
         let recommended_profile = match level {
@@ -490,5 +504,21 @@ mod tests {
             policy.profile_task(&input).recommended_agent_mode,
             AgentMode::Off
         );
+    }
+
+    #[test]
+    fn collaboration_threshold_and_parallel_limit_gate_parallel_agents() {
+        let mut policy = RuntimeControlPolicy::default();
+        policy.agent.max_parallel_agents = 1;
+        policy.agent.min_collaboration_score = 90;
+        let input = TaskComplexityInput::new(
+            "refactor the runtime architecture, implement tests, run e2e validation, and update docs",
+            ContextProfile::MainTurn,
+        );
+        let profile = policy.profile_task(&input);
+
+        assert_eq!(profile.level, ComplexityLevel::Complex);
+        assert_eq!(profile.recommended_agent_mode, AgentMode::Assist);
+        assert!(!policy.should_collaborate(&input));
     }
 }

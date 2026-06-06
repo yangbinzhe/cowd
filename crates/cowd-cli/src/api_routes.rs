@@ -992,6 +992,9 @@ async fn start_task_handler(
         .task_kernel
         .start_goal(body.objective, body.yolo_mode)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    append_task_runtime_event(&state, &task, "task.started")
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok((StatusCode::CREATED, Json(task)))
 }
 
@@ -1011,6 +1014,9 @@ async fn start_task_phase_handler(
             body.test_commands,
         )
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    append_task_runtime_event(&state, &task, "task.phase.started")
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok((StatusCode::CREATED, Json(task)))
 }
 
@@ -1023,6 +1029,9 @@ async fn record_task_phase_artifact_handler(
         .task_kernel
         .record_phase_artifact(&id, &phase_id, body.kind, body.label, body.value)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    append_task_runtime_event(&state, &task, "task.phase.artifact.recorded")
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(task))
 }
 
@@ -1035,6 +1044,9 @@ async fn review_task_phase_handler(
         .task_kernel
         .review_phase(&id, &phase_id, body.result, body.completed)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    append_task_runtime_event(&state, &task, "task.phase.reviewed")
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(task))
 }
 
@@ -1046,6 +1058,9 @@ async fn cancel_task_handler(
         .task_kernel
         .transition(&id, TaskStatus::Cancelled, None, "cancelled by user")
         .map_err(|e| api_error(StatusCode::NOT_FOUND, e))?;
+    append_task_runtime_event(&state, &task, "task.cancelled")
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(task))
 }
 
@@ -1057,6 +1072,9 @@ async fn complete_task_handler(
         .task_kernel
         .transition(&id, TaskStatus::Completed, None, "accepted")
         .map_err(|e| api_error(StatusCode::NOT_FOUND, e))?;
+    append_task_runtime_event(&state, &task, "task.completed")
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(task))
 }
 
@@ -1069,7 +1087,89 @@ async fn record_task_failure_handler(
         .task_kernel
         .record_failure(&id, body.reason)
         .map_err(|e| api_error(StatusCode::NOT_FOUND, e))?;
+    let kind = if task.status == TaskStatus::Blocked {
+        "task.blocked"
+    } else {
+        "task.failure.recorded"
+    };
+    append_task_runtime_event(&state, &task, kind)
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(task))
+}
+
+async fn append_task_runtime_event(
+    state: &AppState,
+    task: &TaskRecord,
+    kind: &'static str,
+) -> Result<(), String> {
+    ensure_task_session_record(state, task)
+        .await
+        .map_err(|error| format!("failed to prepare task runtime session: {error}"))?;
+    let latest_audit = task.audit.last();
+    let payload = serde_json::json!({
+        "task": task,
+        "task_id": task.id,
+        "objective": task.objective,
+        "status": task.status.as_str(),
+        "current_phase": task.current_phase,
+        "failure_count": task.failure_count,
+        "latest_audit": latest_audit,
+    });
+    state
+        .session_kernel
+        .append_runtime_event(&task.id, memory::RuntimeEventScope::Task, kind, payload)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("failed to append task runtime event: {error}"))
+}
+
+async fn ensure_task_session_record(state: &AppState, task: &TaskRecord) -> Result<(), String> {
+    let Some(store) = state.unified_store() else {
+        return Ok(());
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let metadata_json = serde_json::json!({
+        "kind": "task",
+        "task_id": task.id,
+        "objective": task.objective,
+        "yolo_mode": task.yolo_mode,
+        "current_phase": task.current_phase,
+    })
+    .to_string();
+    let mut record = SessionRecord {
+        session_id: task.id.clone(),
+        platform: "task".to_string(),
+        chat_id: task.id.clone(),
+        user_id: None,
+        model: None,
+        created_at: now.clone(),
+        last_activity: now,
+        message_count: task.audit.len() as i64,
+        reset_policy: "none".to_string(),
+        metadata_json: Some(metadata_json),
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0.0,
+        status: task.status.as_str().to_string(),
+    };
+    if let Some(existing) = store
+        .get_session(&task.id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        record.created_at = existing.created_at;
+        store
+            .update_session(&record)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        store
+            .create_session(&record)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 async fn list_sessions(
@@ -5257,6 +5357,12 @@ mod tests {
                     "complementarity_score": 0.75,
                     "conflict_count": 1
                 },
+                "value_verdict": {
+                    "positive_lift": true,
+                    "continue_multi_agent": true,
+                    "value_score": 70,
+                    "reasons": ["positive_multi_agent_lift"]
+                },
                 "maintenance_candidates": [{"id": "candidate-summary"}]
             }),
             10,
@@ -5302,6 +5408,10 @@ mod tests {
             "board-summary"
         );
         assert_eq!(json["workgraph_summary"]["latest"]["completion_rate"], 1.0);
+        assert_eq!(
+            json["workgraph_summary"]["latest"]["value_verdict"]["positive_lift"],
+            true
+        );
         assert_eq!(json["workgraph_summary"]["agent_tasks"], 1);
         assert_eq!(json["workgraph_summary"]["memory_candidates"], 1);
         assert_eq!(json["workgraph_summary"]["conflicts"], 1);
@@ -6228,7 +6338,8 @@ runtime:
 
     #[tokio::test]
     async fn task_api_records_phase_artifacts_and_review() {
-        let app = api_router(test_state());
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let app = api_router(test_state_with_store(store));
         let start_response = app
             .clone()
             .oneshot(
@@ -6308,6 +6419,7 @@ runtime:
         assert_eq!(artifact_response.status(), StatusCode::OK);
 
         let review_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -6338,6 +6450,40 @@ runtime:
         assert_eq!(reviewed_phase["status"], "completed");
         assert_eq!(reviewed_phase["review_result"], "accepted");
         assert_eq!(reviewed_phase["artifacts"][0]["label"], "playwright");
+
+        let timeline_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={task_id}&from_seq=0&limit=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timeline_response.status(), StatusCode::OK);
+        let timeline_body = to_bytes(timeline_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let timeline_json: serde_json::Value = serde_json::from_slice(&timeline_body).unwrap();
+        let kinds = timeline_json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "task.started",
+                "task.phase.started",
+                "task.phase.artifact.recorded",
+                "task.phase.reviewed",
+            ]
+        );
+        assert_eq!(timeline_json["events"][0]["scope"], "task");
+        assert_eq!(timeline_json["events"][3]["payload"]["status"], "reviewing");
     }
 
     #[tokio::test]
