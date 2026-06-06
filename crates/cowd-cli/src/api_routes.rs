@@ -177,6 +177,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
         .route("/api/context/current", get(context_current_handler))
+        .route("/api/runtime/timeline", get(get_runtime_timeline))
         .route(
             "/api/context/:envelope_id",
             get(get_context_envelope_handler),
@@ -427,6 +428,15 @@ struct GetMessagesParams {
 
 #[derive(Deserialize)]
 struct GetEventsParams {
+    #[serde(default)]
+    from_seq: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeTimelineParams {
+    session_id: String,
     #[serde(default)]
     from_seq: Option<usize>,
     #[serde(default)]
@@ -3257,6 +3267,52 @@ async fn get_session_events(
     })))
 }
 
+async fn get_runtime_timeline(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(params): Query<RuntimeTimelineParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let from_seq = params.from_seq.unwrap_or(0);
+    let limit = params.limit.unwrap_or(100).min(500);
+    let page = state
+        .session_kernel
+        .stored_timeline_runtime_page(&params.session_id, from_seq, limit)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load runtime timeline: {e}"),
+                }),
+            )
+        })?;
+
+    let Some(page) = page else {
+        return Ok(Json(serde_json::json!({
+            "session_id": params.session_id,
+            "events": [],
+            "total": 0,
+            "from_seq": from_seq,
+            "next_seq": null,
+            "limit": limit,
+            "has_more": false,
+            "degraded": true,
+            "degraded_reason": "session store not available",
+        })));
+    };
+
+    Ok(Json(serde_json::json!({
+        "session_id": params.session_id,
+        "events": page.events,
+        "total": page.total,
+        "from_seq": from_seq,
+        "next_seq": page.next_seq,
+        "limit": limit,
+        "has_more": page.has_more,
+        "degraded": false,
+        "degraded_reason": null,
+    })))
+}
+
 fn runtime_run_event_json(event: SessionEvent) -> serde_json::Value {
     let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
         .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
@@ -5131,6 +5187,86 @@ mod tests {
         assert_eq!(json["events"][0]["sequence"], 0);
         assert_eq!(json["events"][0]["payload"]["role"], "user");
         assert_eq!(json["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_projection_is_paged() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "runtime-timeline-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_event(&memory::SessionEvent {
+                session_id: session_id.to_string(),
+                event_type: "ToolStart".to_string(),
+                event_json: serde_json::json!({"tool": "bash"}).to_string(),
+                sequence: 0,
+                created_at_ms: 10,
+            })
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&memory::RuntimeEvent::new(
+                session_id,
+                1,
+                memory::RuntimeEventScope::Memory,
+                "memory.pulse.created",
+                serde_json::json!({"candidates": 2}),
+                11,
+            ))
+            .await
+            .unwrap();
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=1"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["session_id"], session_id);
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["events"].as_array().unwrap().len(), 1);
+        assert_eq!(json["events"][0]["kind"], "ToolStart");
+        assert_eq!(json["events"][0]["scope"], "tool");
+        assert_eq!(json["next_seq"], 1);
+        assert_eq!(json["has_more"], true);
+        assert_eq!(json["degraded"], false);
+    }
+
+    #[tokio::test]
+    async fn runtime_projection_degrades_missing_sources() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/timeline?session_id=missing-store")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["degraded"], true);
+        assert_eq!(json["events"].as_array().unwrap().len(), 0);
     }
 
     fn test_context_envelope(
