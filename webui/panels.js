@@ -136,6 +136,15 @@ window.Panels = (()=>{
         const diagnostics=envelope.diagnostics||{};
         const budget=envelope.budget||{};
         const assembled=envelope.assembled||{};
+        let recommendationStats={};
+        if(Api.sid){
+          try{
+            const stats=await Api.contextRecommendationStats(Api.sid,{limit:200});
+            (stats.recommendations||[]).forEach(function(item){
+              recommendationStats[item.recommendation]=item;
+            });
+          }catch(statsError){}
+        }
 
         const overview=UI.el('div','panel-section context-overview');
         const source=response.source||'synthetic';
@@ -161,6 +170,15 @@ window.Panels = (()=>{
             const label=UI.el('span');
             label.textContent=text;
             row.appendChild(label);
+            const stat=recommendationStats[text];
+            if(stat&&stat.count){
+              const count=UI.el('span','context-rec-count');
+              const actions=stat.actions||{};
+              const ack=actions.acknowledged||0;
+              const applied=actions.applied||0;
+              count.textContent=applied?('applied '+applied):('ack '+ack);
+              row.appendChild(count);
+            }
             if(Api.sid && envelope.id){
               const ack=UI.el('button','btn-secondary btn-xs');
               ack.type='button';

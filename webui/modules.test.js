@@ -173,6 +173,21 @@ describe('API module', () => {
     expect(mockF.mock.calls[0][1].body).toContain('Start a handoff');
   });
 
+  it('fetches context recommendation stats', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ recommendations: [] })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.contextRecommendationStats('s1', { limit: 20 });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/sessions/s1/context/recommendations?limit=20');
+    expect(mockF.mock.calls[0][1].method).toBe('GET');
+  });
+
   it('has all skill endpoints', () => {
     expect(typeof window.Api.listSkills).toBe('function');
     expect(typeof window.Api.installSkill).toBe('function');
@@ -651,6 +666,18 @@ describe('API module', () => {
     window.Api.sid = 's1';
     vi.stubGlobal('fetch', vi.fn((url) => {
       const path = String(url);
+      if (path.includes('/api/sessions/s1/context/recommendations')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            recommendations: [{
+              recommendation: 'Start a handoff before adding more context',
+              count: 2,
+              actions: { acknowledged: 2 },
+            }]
+          })
+        });
+      }
       if (path.includes('/api/sessions/s1/context')) {
         return Promise.resolve({
           ok: true,
@@ -713,6 +740,7 @@ describe('API module', () => {
     expect(text).toContain('dynamichasha');
     expect(text).toContain('degraded: Memory');
     expect(text).toContain('Start a handoff');
+    expect(text).toContain('ack 2');
     expect(text).toContain('Ack');
     expect(text).toContain('Context Timeline');
     expect(text).toContain('ship now');

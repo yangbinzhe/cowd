@@ -186,6 +186,7 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .context-recommendations h4{font-size:11px;color:var(--text2);margin-bottom:4px}
 .context-recommendation{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2);line-height:1.35;padding:2px 0}
 .context-recommendation span{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.context-recommendation .context-rec-count{flex:0 0 auto;color:var(--text3);font-variant-numeric:tabular-nums}
 .context-list h3,.context-segments h3,.context-history h3{font-size:12px;margin-bottom:8px}
 .context-item{display:grid;grid-template-columns:76px minmax(0,1fr);gap:8px;padding:7px 0;border-top:1px solid var(--border)}
 .context-item:first-of-type{border-top:0}

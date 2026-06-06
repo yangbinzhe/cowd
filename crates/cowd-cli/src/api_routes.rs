@@ -167,7 +167,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/:id/context/recommendations",
-            post(record_context_recommendation_action),
+            get(get_context_recommendation_stats).post(record_context_recommendation_action),
         )
         .route("/api/sessions/:id/stream", get(sse_stream_handler))
         .route("/api/sessions/:id/compact", post(compact_session_handler))
@@ -385,6 +385,14 @@ struct GetMessagesParams {
 
 #[derive(Deserialize)]
 struct GetEventsParams {
+    #[serde(default)]
+    from_seq: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct GetRecommendationStatsParams {
     #[serde(default)]
     from_seq: Option<usize>,
     #[serde(default)]
@@ -2973,6 +2981,97 @@ async fn get_context_envelope_handler(
     })))
 }
 
+async fn get_context_recommendation_stats(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<GetRecommendationStatsParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let from_seq = params.from_seq.unwrap_or(0);
+    let limit = params.limit.unwrap_or(200).min(500);
+    let Some((total, stored_events)) = state
+        .session_kernel
+        .stored_events_by_type_page(&id, "ContextRecommendationAction", from_seq, limit)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load context recommendation stats: {e}"),
+                }),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
+
+    let event_count = stored_events.len();
+    let mut grouped: HashMap<String, serde_json::Value> = HashMap::new();
+    for event in stored_events {
+        let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let Some(recommendation) = payload
+            .get("recommendation")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let action = payload
+            .get("action")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("acknowledged");
+        let entry = grouped.entry(recommendation.to_string()).or_insert_with(|| {
+            serde_json::json!({
+                "recommendation": recommendation,
+                "count": 0_u64,
+                "actions": {},
+                "latest_envelope_id": null,
+                "latest_created_at_ms": 0_u64,
+            })
+        });
+        let count = entry["count"].as_u64().unwrap_or(0) + 1;
+        entry["count"] = serde_json::json!(count);
+        let action_count = entry["actions"][action].as_u64().unwrap_or(0) + 1;
+        entry["actions"][action] = serde_json::json!(action_count);
+        if event.created_at_ms >= entry["latest_created_at_ms"].as_u64().unwrap_or(0) {
+            entry["latest_created_at_ms"] = serde_json::json!(event.created_at_ms);
+            entry["latest_envelope_id"] = payload
+                .get("envelope_id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+        }
+    }
+
+    let mut recommendations: Vec<serde_json::Value> = grouped.into_values().collect();
+    recommendations.sort_by(|left, right| {
+        right["count"]
+            .as_u64()
+            .cmp(&left["count"].as_u64())
+            .then_with(|| {
+                left["recommendation"]
+                    .as_str()
+                    .cmp(&right["recommendation"].as_str())
+            })
+    });
+
+    Ok(Json(serde_json::json!({
+        "session_id": id,
+        "recommendations": recommendations,
+        "total": total,
+        "from_seq": from_seq,
+        "limit": limit,
+        "has_more": event_count < total,
+    })))
+}
+
 async fn record_context_recommendation_action(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
@@ -4466,6 +4565,66 @@ mod tests {
         assert_eq!(payload["envelope_id"], "env-1");
         assert_eq!(payload["recommendation"], "Start a handoff");
         assert_eq!(payload["note"], "handled");
+    }
+
+    #[tokio::test]
+    async fn context_recommendation_stats_groups_actions() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "context-recommendation-stats-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        for (sequence, action) in [(0, "acknowledged"), (1, "applied")] {
+            store
+                .append_event(&memory::SessionEvent {
+                    session_id: session_id.to_string(),
+                    event_type: "ContextRecommendationAction".to_string(),
+                    event_json: serde_json::json!({
+                        "type": "ContextRecommendationAction",
+                        "session_id": session_id,
+                        "envelope_id": format!("env-{sequence}"),
+                        "recommendation": "Start a handoff",
+                        "action": action,
+                    })
+                    .to_string(),
+                    sequence,
+                    created_at_ms: sequence as u64,
+                })
+                .await
+                .unwrap();
+        }
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions/{session_id}/context/recommendations?limit=20"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["session_id"], session_id);
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["recommendations"][0]["recommendation"], "Start a handoff");
+        assert_eq!(json["recommendations"][0]["count"], 2);
+        assert_eq!(
+            json["recommendations"][0]["actions"]["acknowledged"],
+            1
+        );
+        assert_eq!(json["recommendations"][0]["actions"]["applied"], 1);
+        assert_eq!(json["recommendations"][0]["latest_envelope_id"], "env-1");
     }
 
     #[test]
