@@ -753,6 +753,16 @@ describe('API module', () => {
           })
         });
       }
+      if (path.includes('/api/evidence/resolve')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            available: true,
+            kind: 'session',
+            ref: 'session://s1/memory/mem-1',
+          })
+        });
+      }
       if (path.includes('/api/sessions/s1/context')) {
         return Promise.resolve({
           ok: true,
@@ -828,6 +838,10 @@ describe('API module', () => {
     expect(text).toContain('ship now');
     expect(text).toContain('historical cargo test passed');
     expect(text).toContain('tool://test/evidence/event-1');
+
+    document.querySelector('.context-evidence-ref').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(document.getElementById('panel-content').textContent).toContain('"available": true');
   });
 
   it('renders recall explain metadata in the memory panel', async () => {

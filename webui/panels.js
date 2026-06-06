@@ -77,7 +77,25 @@ window.Panels = (()=>{
     const evidence=(item.evidence||[]).slice(0,2);
     if(evidence.length){
       const refs=UI.el('em','context-evidence');
-      refs.textContent='refs '+evidence.join(' · ');
+      refs.appendChild(document.createTextNode('refs '));
+      evidence.forEach(function(ref,index){
+        if(index)refs.appendChild(document.createTextNode(' · '));
+        const btn=UI.el('button','context-evidence-ref');
+        btn.type='button';
+        btn.textContent=ref;
+        btn.onclick=async function(){
+          try{
+            const resolved=await Api.resolveEvidence(ref,{session_id:Api.sid});
+            let detail=body.querySelector('.context-evidence-detail');
+            if(!detail){
+              detail=UI.el('pre','context-evidence-detail');
+              body.appendChild(detail);
+            }
+            detail.textContent=JSON.stringify(resolved,null,2).slice(0,1600);
+          }catch(e){UI.showToast(e.message,'error')}
+        };
+        refs.appendChild(btn);
+      });
       body.appendChild(refs);
     }
     row.appendChild(role);
