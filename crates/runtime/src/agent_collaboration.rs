@@ -91,6 +91,33 @@ pub struct CollaborationScorecard {
     pub surfaced_conflicts: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTaskTrace {
+    pub task_id: String,
+    pub parent_run_id: Option<String>,
+    pub agent_run_id: Option<String>,
+    pub role: String,
+    pub objective: String,
+    pub status: String,
+    pub context_envelope_id: Option<String>,
+    pub result_summary: String,
+    pub evidence_refs: Vec<String>,
+    pub collaboration_board_id: String,
+    pub confidence: f32,
+    pub conflicts: Vec<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollaborationReviewPacket {
+    pub board_id: String,
+    pub parent_run_id: Option<String>,
+    pub scorecard: CollaborationScorecard,
+    pub agent_tasks: Vec<AgentTaskTrace>,
+    pub maintenance_candidates: Vec<MaintenanceCandidate>,
+}
+
 impl CollaborationScorecard {
     pub fn shows_multi_agent_lift(&self) -> bool {
         self.synthesis_lift > 1.0 && self.complementarity_score > 0.0
@@ -103,6 +130,7 @@ impl CollaborationScorecard {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollaborationBoard {
+    pub board_id: String,
     pub entries: Vec<SharedBoardEntry>,
     pub scorecard: CollaborationScorecard,
 }
@@ -116,6 +144,7 @@ impl CollaborationBoard {
                 format!("Review multi-agent conflict: {}", truncate_for_candidate(conflict)),
                 conflict.clone(),
                 self.scorecard_candidate_confidence(),
+                &self.board_id,
             ));
         }
 
@@ -147,11 +176,26 @@ impl CollaborationBoard {
                         entry.agent_id, pulse.kind, pulse.content
                     ),
                     self.scorecard_candidate_confidence(),
+                    &self.board_id,
                 ));
             }
         }
 
         candidates
+    }
+
+    pub fn review_packet(
+        &self,
+        parent_run_id: Option<String>,
+        agent_tasks: Vec<AgentTaskTrace>,
+    ) -> CollaborationReviewPacket {
+        CollaborationReviewPacket {
+            board_id: self.board_id.clone(),
+            parent_run_id,
+            scorecard: self.scorecard.clone(),
+            agent_tasks,
+            maintenance_candidates: self.memory_maintenance_candidates(),
+        }
     }
 
     fn scorecard_candidate_confidence(&self) -> f32 {
@@ -778,7 +822,11 @@ fn build_collaboration_board(results: &[SubAgentResult]) -> CollaborationBoard {
         .collect();
     let scorecard = score_collaboration_board(&entries);
 
-    CollaborationBoard { entries, scorecard }
+    CollaborationBoard {
+        board_id: format!("board-{}", Uuid::new_v4()),
+        entries,
+        scorecard,
+    }
 }
 
 fn board_entry_from_result(idx: usize, result: &SubAgentResult) -> SharedBoardEntry {
@@ -957,6 +1005,7 @@ fn collaboration_maintenance_candidate(
     summary: String,
     reason: String,
     confidence: f32,
+    board_id: &str,
 ) -> MaintenanceCandidate {
     let now = Utc::now();
     MaintenanceCandidate {
@@ -968,7 +1017,7 @@ fn collaboration_maintenance_candidate(
         reason: format!("multi-agent collaboration pulse: {reason}"),
         confidence: confidence.clamp(0.0, 1.0),
         source: Some("collaboration_board".to_string()),
-        source_ref: None,
+        source_ref: Some(board_id.to_string()),
         created_at: now,
         updated_at: now,
     }
@@ -1230,6 +1279,7 @@ Refresh: collaboration scoring should be revisited after live agent runs"
 
         let board = orch.build_shared_board(&results);
 
+        assert!(board.board_id.starts_with("board-"));
         assert_eq!(board.entries.len(), 2);
         assert_eq!(board.entries[0].decisions.len(), 1);
         assert_eq!(board.entries[0].memory_pulses.len(), 1);
@@ -1284,7 +1334,57 @@ Retire: stale local jsonl resume assumptions"
         assert!(candidates.iter().all(|candidate| candidate.entry_ids.is_empty()));
         assert!(candidates
             .iter()
+            .all(|candidate| candidate.source.as_deref() == Some("collaboration_board")));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.source_ref.as_deref() == Some(board.board_id.as_str())));
+        assert!(candidates
+            .iter()
             .all(|candidate| candidate.reason.contains("multi-agent collaboration pulse")));
+    }
+
+    #[test]
+    fn collaboration_review_packet_binds_agent_tasks_and_memory_candidates() {
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
+        let results = vec![SubAgentResult {
+            output: "\
+Decision: use bounded context policy
+Evidence: runtime probe pressure stayed low
+Conflict: agent evidence needs review
+Promote: stable head policy verified by tests"
+                .to_string(),
+            completed_normally: true,
+            ..SubAgentResult::default()
+        }];
+
+        let board = orch.build_shared_board(&results);
+        let task = AgentTaskTrace {
+            task_id: "task-1".to_string(),
+            parent_run_id: Some("run-parent".to_string()),
+            agent_run_id: Some("run-agent-1".to_string()),
+            role: "reviewer".to_string(),
+            objective: "review context policy".to_string(),
+            status: "completed".to_string(),
+            context_envelope_id: Some("ctx-1".to_string()),
+            result_summary: "bounded policy reviewed".to_string(),
+            evidence_refs: vec!["test:runtime_probe".to_string()],
+            collaboration_board_id: board.board_id.clone(),
+            confidence: 0.82,
+            conflicts: board.scorecard.surfaced_conflicts.clone(),
+            created_at_ms: 10,
+            updated_at_ms: 20,
+        };
+
+        let packet = board.review_packet(Some("run-parent".to_string()), vec![task]);
+
+        assert_eq!(packet.board_id, board.board_id);
+        assert_eq!(packet.parent_run_id.as_deref(), Some("run-parent"));
+        assert_eq!(packet.agent_tasks.len(), 1);
+        assert_eq!(packet.agent_tasks[0].collaboration_board_id, packet.board_id);
+        assert!(!packet.maintenance_candidates.is_empty());
+        assert!(packet.maintenance_candidates.iter().all(|candidate| {
+            candidate.source_ref.as_deref() == Some(packet.board_id.as_str())
+        }));
     }
 
     #[test]

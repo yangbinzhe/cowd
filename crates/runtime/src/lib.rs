@@ -89,8 +89,9 @@ pub use agent::{
     SubAgentResult, SubAgentToolMode,
 };
 pub use agent_collaboration::{
-    AgentTeam, CollaborationBoard, CollaborationOrchestrator, CollaborationTask, CollaborationOps,
-    CollaborationScorecard, MemoryPulseCandidate, MemoryPulseKind, SharedBoardEntry, SubTask,
+    AgentTaskTrace, AgentTeam, CollaborationBoard, CollaborationOrchestrator, CollaborationOps,
+    CollaborationReviewPacket, CollaborationScorecard, CollaborationTask, MemoryPulseCandidate,
+    MemoryPulseKind, SharedBoardEntry, SubTask,
 };
 pub use team_discovery::{
     DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol,
