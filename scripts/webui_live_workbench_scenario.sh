@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="$ROOT/target/debug/cowd"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
+BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
 PORT="${COWD_WEBUI_LIVE_PORT:-18669}"
 BASE_URL="http://127.0.0.1:$PORT"
 CHROMIUM="${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-/snap/bin/chromium}"

@@ -63,6 +63,9 @@ maybe_live_scenarios() {
     return 0
   fi
 
+  run cargo build -p cowd-cli
+  export COWD_BIN="${COWD_BIN:-$CARGO_TARGET_DIR/debug/cowd}"
+
   run scripts/tui_smoke.sh
   if [ -x scripts/webui_live_workbench_scenario.sh ]; then
     run scripts/webui_live_workbench_scenario.sh

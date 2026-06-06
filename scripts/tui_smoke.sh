@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="$ROOT/target/debug/cowd"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
+BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
 SESSION="cowd-tui-smoke-$$"
 TMP_DIR="$(mktemp -d /tmp/cowd-tui-smoke.XXXXXX)"
 CAPTURE="$TMP_DIR/pane.txt"
