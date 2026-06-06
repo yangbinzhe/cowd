@@ -1293,10 +1293,7 @@ async fn append_session_timeline_event(
             return;
         }
     };
-    let created_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0);
+    let created_at_ms = current_time_ms();
     let event = memory::SessionEvent {
         session_id: session_id.to_string(),
         event_type: event_type.to_string(),
@@ -1307,6 +1304,13 @@ async fn append_session_timeline_event(
     if let Err(error) = store.append_event(&event).await {
         tracing::warn!(%session_id, %event_type, error = %error, "failed to append session event");
     }
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 async fn append_session_timeline_event_to_kernel(
@@ -1383,16 +1387,21 @@ fn runtime_run_started_payload(
     run_id: &str,
     profile: ContextProfile,
     intent: &str,
+    started_at_ms: u64,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "RuntimeRun",
         "phase": "started",
         "run_id": run_id,
         "parent_run_id": null,
+        "kind": "main_turn",
         "session_id": session_id,
         "profile": profile,
         "status": "running",
+        "summary": intent.chars().take(120).collect::<String>(),
         "intent_preview": intent.chars().take(240).collect::<String>(),
+        "started_at_ms": started_at_ms,
+        "refs": [],
     })
 }
 
@@ -1404,18 +1413,33 @@ fn runtime_run_completed_payload(
     iterations: Option<usize>,
     context_envelope_id: Option<String>,
     error: Option<String>,
+    started_at_ms: u64,
+    completed_at_ms: u64,
 ) -> serde_json::Value {
+    let refs = context_envelope_id
+        .as_ref()
+        .map(|id| vec![serde_json::json!({"type": "context_envelope", "id": id})])
+        .unwrap_or_default();
     serde_json::json!({
         "type": "RuntimeRun",
         "phase": "completed",
         "run_id": run_id,
         "parent_run_id": null,
+        "kind": "main_turn",
         "session_id": session_id,
         "profile": profile,
         "status": status,
+        "summary": error
+            .as_ref()
+            .map(|value| value.chars().take(160).collect::<String>())
+            .unwrap_or_else(|| format!("turn {status}")),
         "iterations": iterations,
         "context_envelope_id": context_envelope_id,
         "error": error,
+        "started_at_ms": started_at_ms,
+        "completed_at_ms": completed_at_ms,
+        "duration_ms": completed_at_ms.saturating_sub(started_at_ms),
+        "refs": refs,
     })
 }
 
@@ -1438,6 +1462,7 @@ async fn send_message(
     let session_id = id.clone();
     let event_bus = state.event_bus();
     let run_id = uuid::Uuid::new_v4().to_string();
+    let run_started_at_ms = current_time_ms();
     let active_task = state.task_kernel.current();
     let run_profile = if active_task
         .as_ref()
@@ -1451,7 +1476,13 @@ async fn send_message(
         &state.session_kernel,
         &session_id,
         "RuntimeRun",
-        runtime_run_started_payload(&session_id, &run_id, run_profile, &body.content),
+        runtime_run_started_payload(
+            &session_id,
+            &run_id,
+            run_profile,
+            &body.content,
+            run_started_at_ms,
+        ),
     )
     .await;
 
@@ -1690,6 +1721,8 @@ async fn send_message(
                     Some(summary.iterations),
                     context_envelope_id,
                     None,
+                    run_started_at_ms,
+                    current_time_ms(),
                 ),
             )
             .await;
@@ -1725,6 +1758,8 @@ async fn send_message(
                     None,
                     context_envelope_id,
                     Some(error_msg.clone()),
+                    run_started_at_ms,
+                    current_time_ms(),
                 ),
             )
             .await;
@@ -1763,6 +1798,8 @@ async fn send_message(
                     None,
                     context_envelope_id,
                     Some(error_msg.clone()),
+                    run_started_at_ms,
+                    current_time_ms(),
                 ),
             )
             .await;
@@ -1786,6 +1823,8 @@ async fn send_message(
                     None,
                     None,
                     Some(error_msg.clone()),
+                    run_started_at_ms,
+                    current_time_ms(),
                 ),
             )
             .await;
@@ -5618,7 +5657,13 @@ mod tests {
             (
                 1,
                 "RuntimeRun",
-                runtime_run_started_payload(session_id, "run-1", ContextProfile::MainTurn, "ship"),
+                runtime_run_started_payload(
+                    session_id,
+                    "run-1",
+                    ContextProfile::MainTurn,
+                    "ship",
+                    10,
+                ),
             ),
             (
                 2,
@@ -5631,6 +5676,8 @@ mod tests {
                     Some(2),
                     Some("ctx-1".to_string()),
                     None,
+                    10,
+                    25,
                 ),
             ),
             (
@@ -5642,9 +5689,14 @@ mod tests {
                     "run_id": "agent-run-1",
                     "parent_run_id": "run-1",
                     "session_id": session_id,
+                    "kind": "agent_task",
                     "profile": ContextProfile::SubAgent,
                     "status": "failed",
+                    "started_at_ms": 11,
+                    "completed_at_ms": 20,
+                    "duration_ms": 9,
                     "error": "review failed",
+                    "refs": [],
                 }),
             ),
         ] {
@@ -5679,8 +5731,12 @@ mod tests {
         assert_eq!(json["total"], 3);
         assert_eq!(json["runs"].as_array().unwrap().len(), 3);
         assert_eq!(json["runs"][0]["run"]["phase"], "started");
+        assert_eq!(json["runs"][0]["run"]["kind"], "main_turn");
+        assert_eq!(json["runs"][0]["run"]["started_at_ms"], 10);
         assert_eq!(json["runs"][1]["run"]["status"], "completed");
         assert_eq!(json["runs"][1]["run"]["context_envelope_id"], "ctx-1");
+        assert_eq!(json["runs"][1]["run"]["duration_ms"], 15);
+        assert_eq!(json["runs"][1]["run"]["refs"][0]["type"], "context_envelope");
         assert_eq!(json["tree"]["roots"][0], "run-1");
         assert_eq!(json["tree"]["children"]["run-1"][0], "agent-run-1");
         assert_eq!(json["tree"]["summary"]["span_count"], 2);
