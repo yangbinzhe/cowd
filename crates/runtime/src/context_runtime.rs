@@ -315,6 +315,26 @@ pub struct ContextLeanProbe {
     pub degraded_sources: Vec<ContextSourceKind>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextPolicyAction {
+    None,
+    TrimToolTrace,
+    SummarizeEvidence,
+    PreferOrientationPacket,
+    WriteHandoff,
+    RecommendSessionBoundary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPolicyDecision {
+    pub profile: ContextProfile,
+    pub pressure_level: ContextPressureLevel,
+    pub degradation_path: ContextDegradationPath,
+    pub action: ContextPolicyAction,
+    pub reason: String,
+    pub stable_head_hash: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StableHeadComparison {
     pub previous_hash: String,
@@ -454,6 +474,18 @@ impl ContextRuntimeKernel {
                 &envelope.diagnostics.degraded_sources,
             ),
             degraded_sources: envelope.diagnostics.degraded_sources.clone(),
+        }
+    }
+
+    pub fn policy_decision(probe: &ContextLeanProbe) -> ContextPolicyDecision {
+        let (action, reason) = context_policy_action(probe);
+        ContextPolicyDecision {
+            profile: probe.profile,
+            pressure_level: probe.pressure_level,
+            degradation_path: probe.degradation_path,
+            action,
+            reason,
+            stable_head_hash: probe.stable_head_hash.clone(),
         }
     }
 
@@ -832,6 +864,57 @@ fn degradation_path_for(
     }
 }
 
+fn context_policy_action(probe: &ContextLeanProbe) -> (ContextPolicyAction, String) {
+    if matches!(probe.degradation_path, ContextDegradationPath::SourceFallback) {
+        return (
+            ContextPolicyAction::PreferOrientationPacket,
+            "source fallback detected; prefer compact orientation before broad recall".to_string(),
+        );
+    }
+
+    match (probe.pressure_level, probe.profile) {
+        (ContextPressureLevel::Critical, ContextProfile::Review) => (
+            ContextPolicyAction::SummarizeEvidence,
+            "critical review pressure; keep evidence references and summarize bulky detail"
+                .to_string(),
+        ),
+        (
+            ContextPressureLevel::Critical,
+            ContextProfile::YoloGoal | ContextProfile::SoloGoal,
+        ) => (
+            ContextPolicyAction::WriteHandoff,
+            "critical goal pressure; preserve active task state with a handoff boundary".to_string(),
+        ),
+        (ContextPressureLevel::Critical, _) => (
+            ContextPolicyAction::RecommendSessionBoundary,
+            "critical context pressure; recommend explicit session boundary".to_string(),
+        ),
+        (ContextPressureLevel::High, ContextProfile::Review) => (
+            ContextPolicyAction::SummarizeEvidence,
+            "high review pressure; summarize evidence bodies while retaining refs".to_string(),
+        ),
+        (
+            ContextPressureLevel::High,
+            ContextProfile::YoloGoal | ContextProfile::SoloGoal,
+        ) => (
+            ContextPolicyAction::TrimToolTrace,
+            "high goal pressure; trim tool trace before task and memory context".to_string(),
+        ),
+        (ContextPressureLevel::High, _) => (
+            ContextPolicyAction::TrimToolTrace,
+            "high context pressure; trim low-value tool trace first".to_string(),
+        ),
+        (ContextPressureLevel::Elevated, _) if probe.omitted_count > 0 => (
+            ContextPolicyAction::PreferOrientationPacket,
+            "elevated pressure with omissions; prefer compact orientation packet".to_string(),
+        ),
+        _ => (
+            ContextPolicyAction::None,
+            "context pressure nominal; no policy action required".to_string(),
+        ),
+    }
+}
+
 fn hash_segments(segments: &[String]) -> String {
     let mut bytes = Vec::new();
     for segment in segments {
@@ -890,6 +973,39 @@ mod tests {
         let mut item = ContextItem::new(id, source, role, id);
         item.token_estimate = token_estimate;
         item
+    }
+
+    fn probe_for_policy(
+        profile: ContextProfile,
+        pressure_level: ContextPressureLevel,
+        degradation_path: ContextDegradationPath,
+        omitted_count: usize,
+    ) -> ContextLeanProbe {
+        ContextLeanProbe {
+            envelope_id: "env-policy".to_string(),
+            profile,
+            stable_head_hash: "stable-head".to_string(),
+            runtime_header_hash: "runtime-header".to_string(),
+            dynamic_tail_hash: "dynamic-tail".to_string(),
+            selected_count: 3,
+            omitted_count,
+            budget_total_tokens: 10_000,
+            budget_used_tokens: match pressure_level {
+                ContextPressureLevel::Nominal => 4_000,
+                ContextPressureLevel::Elevated => 7_500,
+                ContextPressureLevel::High => 8_700,
+                ContextPressureLevel::Critical => 9_500,
+            },
+            pressure_bp: match pressure_level {
+                ContextPressureLevel::Nominal => 4_000,
+                ContextPressureLevel::Elevated => 7_500,
+                ContextPressureLevel::High => 8_700,
+                ContextPressureLevel::Critical => 9_500,
+            },
+            pressure_level,
+            degradation_path,
+            degraded_sources: Vec::new(),
+        }
     }
 
     #[test]
@@ -1001,6 +1117,56 @@ mod tests {
             probe.stable_head_hash,
             envelope.diagnostics.stable_head_hash
         );
+    }
+
+    #[test]
+    fn context_policy_uses_probe_for_safe_degradation() {
+        let probe = probe_for_policy(
+            ContextProfile::MainTurn,
+            ContextPressureLevel::Critical,
+            ContextDegradationPath::HandoffBoundary,
+            2,
+        );
+
+        let decision = ContextRuntimeKernel::policy_decision(&probe);
+
+        assert_eq!(
+            decision.action,
+            ContextPolicyAction::RecommendSessionBoundary
+        );
+        assert_eq!(decision.stable_head_hash, probe.stable_head_hash);
+        assert_eq!(decision.pressure_level, ContextPressureLevel::Critical);
+    }
+
+    #[test]
+    fn yolo_policy_preserves_active_task_under_pressure() {
+        let probe = probe_for_policy(
+            ContextProfile::YoloGoal,
+            ContextPressureLevel::High,
+            ContextDegradationPath::SummarizeEvidence,
+            1,
+        );
+
+        let decision = ContextRuntimeKernel::policy_decision(&probe);
+
+        assert_eq!(decision.action, ContextPolicyAction::TrimToolTrace);
+        assert!(decision.reason.contains("task and memory"));
+        assert_eq!(decision.stable_head_hash, "stable-head");
+    }
+
+    #[test]
+    fn review_policy_prioritizes_evidence_refs() {
+        let probe = probe_for_policy(
+            ContextProfile::Review,
+            ContextPressureLevel::Critical,
+            ContextDegradationPath::HandoffBoundary,
+            1,
+        );
+
+        let decision = ContextRuntimeKernel::policy_decision(&probe);
+
+        assert_eq!(decision.action, ContextPolicyAction::SummarizeEvidence);
+        assert!(decision.reason.contains("evidence references"));
     }
 
     #[test]

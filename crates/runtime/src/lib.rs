@@ -266,8 +266,9 @@ pub use context_runtime::{
     AgentContextLease, AgentReturnPacket, AgentReturnRequirement, AssembledContext,
     ContextAuthority, ContextBudgetReport, ContextDegradationPath, ContextDiagnostics,
     ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextLeanProbe,
-    ContextLease, ContextMode, ContextOmission, ContextPressureLevel, ContextProfile,
-    ContextRole, ContextRuntimeKernel, ContextSourceKind, ContextVisibility,
+    ContextLease, ContextMode, ContextOmission, ContextPolicyAction, ContextPolicyDecision,
+    ContextPressureLevel, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
+    ContextVisibility,
     ResumeContextPacket, ResumeContextSource, StableHeadComparison, ToolTracePacket,
     ToolTraceStatus, WorkspacePacket,
 };
