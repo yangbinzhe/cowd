@@ -7882,20 +7882,98 @@ fn inject_auto_resume_context(
 }
 
 fn workspace_context_item(session: &Session, model_ctx: u32) -> runtime::ContextItem {
-    let root = session
+    let root_path = session
         .workspace_root
         .clone()
         .or_else(|| std::env::current_dir().ok())
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| ".".to_string());
+        .unwrap_or_else(|| PathBuf::from("."));
+    let git_snapshot = workspace_git_snapshot(&root_path, 16);
+    let mut project_notes = vec![format!("model_context_window={model_ctx}")];
+    if let Some(branch) = git_snapshot.branch {
+        project_notes.push(format!("git_branch={branch}"));
+    }
+    if git_snapshot.touched_files_truncated {
+        project_notes.push("changed_files_truncated=true".to_string());
+    }
+    let token_estimate = 64 + (git_snapshot.touched_files.len() as u64 * 16);
     let packet = runtime::WorkspacePacket {
-        root,
-        touched_files: Vec::new(),
+        root: root_path.display().to_string(),
+        touched_files: git_snapshot.touched_files,
         hot_symbols: Vec::new(),
-        project_notes: vec![format!("model_context_window={model_ctx}")],
-        token_estimate: 64,
+        project_notes,
+        token_estimate,
     };
     runtime::ContextRuntimeKernel::workspace_item(&packet)
+}
+
+struct WorkspaceGitSnapshot {
+    branch: Option<String>,
+    touched_files: Vec<String>,
+    touched_files_truncated: bool,
+}
+
+fn workspace_git_snapshot(root: &Path, file_limit: usize) -> WorkspaceGitSnapshot {
+    let branch = git_current_branch(root);
+    let (touched_files, touched_files_truncated) = git_changed_files(root, file_limit);
+    WorkspaceGitSnapshot {
+        branch,
+        touched_files,
+        touched_files_truncated,
+    }
+}
+
+fn git_current_branch(root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["branch", "--show-current"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!branch.is_empty()).then_some(branch)
+}
+
+fn git_changed_files(root: &Path, file_limit: usize) -> (Vec<String>, bool) {
+    let output = match Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["status", "--short", "--untracked-files=no"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return (Vec::new(), false),
+    };
+
+    let mut files = Vec::new();
+    let mut truncated = false;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(path) = parse_git_status_path(line) else {
+            continue;
+        };
+        if files.len() >= file_limit {
+            truncated = true;
+            break;
+        }
+        files.push(path);
+    }
+    (files, truncated)
+}
+
+fn parse_git_status_path(line: &str) -> Option<String> {
+    let path = line.get(3..)?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let path = path
+        .rsplit_once(" -> ")
+        .map(|(_, target)| target)
+        .unwrap_or(path)
+        .trim_matches('"')
+        .to_string();
+    (!path.is_empty()).then_some(path)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -12003,6 +12081,22 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&root).expect("temp workspace");
+        let git_init = Command::new("git")
+            .args(["-C"])
+            .arg(&root)
+            .arg("init")
+            .output()
+            .expect("run git init");
+        assert!(git_init.status.success());
+        let tracked_path = root.join("tracked.txt");
+        std::fs::write(&tracked_path, "workspace evidence").expect("tracked file");
+        let git_add = Command::new("git")
+            .args(["-C"])
+            .arg(&root)
+            .args(["add", "tracked.txt"])
+            .output()
+            .expect("run git add");
+        assert!(git_add.status.success());
         let session = runtime::Session::new().with_workspace_root(root.clone());
 
         let item = workspace_context_item(&session, 200_000);
@@ -12010,6 +12104,7 @@ mod tests {
         assert_eq!(item.source, runtime::ContextSourceKind::Workspace);
         assert!(item.content.contains(&root.display().to_string()));
         assert!(item.content.contains("model_context_window=200000"));
+        assert!(item.content.contains("tracked.txt"));
         let _ = std::fs::remove_dir_all(root);
     }
 
