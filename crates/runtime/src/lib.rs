@@ -46,6 +46,7 @@ pub mod plugin_lifecycle;
 pub mod provider_pool;
 pub mod effect;
 pub mod context_profiler;
+pub mod context_runtime;
 pub mod platform;
 mod policy_engine;
 mod prompt;
@@ -258,6 +259,14 @@ pub use prompt_cache::{
     CacheBreakEvent, CacheUsage, PromptCache, PromptCacheConfig, PromptCachePaths,
     PromptCacheRecord, PromptCacheStats, RequestFingerprintHashes, hash_serializable,
     now_unix_secs, request_hash_hex_from_fnv, sanitize_path_segment, stable_hash_bytes,
+};
+pub use context_runtime::{
+    AgentContextLease, AgentReturnPacket, AgentReturnRequirement, AssembledContext,
+    ContextAuthority, ContextBudgetReport, ContextDiagnostics, ContextEnvelope,
+    ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextLease, ContextMode,
+    ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
+    ContextVisibility, ResumeContextPacket, ResumeContextSource, ToolTracePacket,
+    ToolTraceStatus, WorkspacePacket,
 };
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

@@ -58,6 +58,7 @@ describe('API module', () => {
     expect(typeof window.Api.recallExplain).toBe('function');
     expect(typeof window.Api.memoryPacket).toBe('function');
     expect(typeof window.Api.memoryLinks).toBe('function');
+    expect(typeof window.Api.currentContext).toBe('function');
     expect(typeof window.Api.createMemoryEntry).toBe('function');
     expect(typeof window.Api.updateMemoryEntry).toBe('function');
     expect(typeof window.Api.deleteMemoryEntry).toBe('function');
@@ -117,6 +118,21 @@ describe('API module', () => {
     expect(String(mockF.mock.calls[0][0])).toBe('/api/memory/packet?q=SessionKernel&max_items=9&max_tokens=1234');
     expect(String(mockF.mock.calls[1][0])).toBe('/api/memory/links');
     expect(links.links[0].kind).toBe('Supports');
+  });
+
+  it('currentContext uses the context envelope endpoint', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ enabled: true, envelope: { id: 'ctx-1' } })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const context = await window.Api.currentContext({ q: 'ship', session_id: 's1' });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/context/current?q=ship&session_id=s1');
+    expect(context.envelope.id).toBe('ctx-1');
   });
 
   it('has all skill endpoints', () => {

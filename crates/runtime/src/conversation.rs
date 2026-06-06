@@ -27,7 +27,6 @@ impl CancellationToken {
 
 use futures::stream::Stream;
 use memory::cognitive::CognitiveContextManager;
-use memory::coherence;
 use memory::config::MemoryConfig as CcMemoryConfig;
 use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
 use memory::{MemoryKernel, MemoryTurnContext};
@@ -261,7 +260,6 @@ pub struct ConversationRuntime<C, T> {
     turn_callback: Option<Arc<TurnCallback>>,
     profiler: crate::context_profiler::ContextProfiler,
     use_aaak_index: bool,
-    coherence_threshold: f32,
     auto_compaction_input_tokens_threshold: u32,
     model_context_window: u32,
     cached_prompt: crate::cached_prompt::CachedSystemPrompt,
@@ -427,7 +425,6 @@ where
             turn_callback: None,
             profiler: crate::context_profiler::ContextProfiler::new(),
             use_aaak_index: feature_config.memory().aaak_index_enabled,
-            coherence_threshold: feature_config.memory().coherence_threshold_bp as f32 / 10000.0,
             auto_compaction_input_tokens_threshold: {
                 let env_val = auto_compaction_threshold_from_env();
                 if env_val > 0 {
@@ -2426,10 +2423,13 @@ where
         let session_id = self.session().session_id;
         let memory_ctx = MemoryTurnContext::new(session_id.clone(), "primary");
         let kernel = MemoryKernel::new(Arc::clone(mgr));
-        match kernel.prepare(&memory_ctx, user_input, &mem_messages).await {
-            Ok(mut prepared) => {
-                if prepared.entries.is_empty() {
-                    tracing::debug!(entries = 0, "memory context prepared");
+        match kernel
+            .context_packet(&memory_ctx, user_input, &mem_messages, 20, 8_000)
+            .await
+        {
+            Ok(packet) => {
+                if packet.selected.is_empty() {
+                    tracing::debug!(entries = 0, "memory context packet prepared");
                     if let Some(cb) = &self.memory_callback {
                         cb.on_memory_update(Vec::new(), "no memories found");
                     }
@@ -2441,76 +2441,32 @@ where
                     return self.system_prompt.clone();
                 }
 
-                // M2: Budget enforcement — sort by layer priority then confidence, truncate to budget
                 use memory::types::MemoryLayer;
-                // P1-1: Coherence filtering — Jaccard similarity against current query
-                let threshold = self.coherence_threshold;
-                let relevant: Vec<_> = prepared
-                    .entries
-                    .iter()
-                    .filter(|e| {
-                        coherence::is_relevant(
-                            &e.content,
-                            user_input,
-                            threshold,
-                            matches!(e.layer, MemoryLayer::L0),
-                        )
-                    })
-                    .cloned()
-                    .collect();
-                if !relevant.is_empty() {
-                    prepared.entries = relevant;
-                }
-                prepared.entries.sort_by(|a, b| {
-                    let layer_rank = |l: MemoryLayer| match l {
-                        MemoryLayer::L0 => 5,
-                        MemoryLayer::L1 => 4,
-                        MemoryLayer::L2 => 3,
-                        MemoryLayer::L3 => 2,
-                        MemoryLayer::L4 => 1,
-                    };
-                    layer_rank(b.layer).cmp(&layer_rank(a.layer)).then(
-                        b.confidence
-                            .partial_cmp(&a.confidence)
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    )
-                });
-
-                let budget = prepared.budget.available.min(8000);
-                let mut used: u64 = 0;
-                let max_entries = prepared.entries.len().min(20);
-                prepared.entries.truncate(max_entries);
-
-                // P5.2: Build per-layer entry fragments with per-layer staleness checks.
                 use crate::cached_prompt::CacheLayer;
-                let mut entries_by_layer: std::collections::HashMap<
+                let mut items_by_layer: std::collections::HashMap<
                     CacheLayer,
-                    Vec<&memory::types::MemoryEntry>,
+                    Vec<&memory::MemoryPacketItem>,
                 > = std::collections::HashMap::new();
-                for entry in &prepared.entries {
-                    if used >= budget {
-                        break;
-                    }
-                    let tokens = (entry.title.len() + entry.content.len()) as u64 / 4;
-                    used += tokens;
-                    let cl = match entry.layer {
+                for item in &packet.selected {
+                    let cl = match item.atom.layer {
                         MemoryLayer::L0 => CacheLayer::L0,
                         MemoryLayer::L1 => CacheLayer::L1,
                         MemoryLayer::L2 => CacheLayer::L2,
                         MemoryLayer::L3 => CacheLayer::L3,
                         MemoryLayer::L4 => CacheLayer::L4,
                     };
-                    entries_by_layer.entry(cl).or_default().push(entry);
+                    items_by_layer.entry(cl).or_default().push(item);
                 }
 
                 for cache_layer in CacheLayer::all() {
-                    let entries = entries_by_layer.remove(&cache_layer).unwrap_or_default();
-                    let count = entries.len();
+                    let items = items_by_layer.remove(&cache_layer).unwrap_or_default();
+                    let count = items.len();
 
                     if self.cached_prompt.needs_rebuild(cache_layer, count) {
                         let mut layer_text = String::new();
-                        for entry in &entries {
-                            let layer_tag = match entry.layer {
+                        for item in &items {
+                            let atom = &item.atom;
+                            let layer_tag = match atom.layer {
                                 MemoryLayer::L0 => "identity",
                                 MemoryLayer::L1 => "working",
                                 MemoryLayer::L2 => "project",
@@ -2518,8 +2474,15 @@ where
                                 MemoryLayer::L4 => "raw",
                             };
                             layer_text.push_str(&format!(
-                                "  <entry layer=\"{}\" confidence=\"{:.2}\">\n    <title>{}</title>\n    <content>{}</content>\n  </entry>\n",
-                                layer_tag, entry.confidence, entry.title, entry.content
+                                "  <memory role=\"{:?}\" layer=\"{}\" state=\"{:?}\" confidence=\"{:.2}\" salience=\"{:.2}\">\n    <title>{}</title>\n    <reason>{}</reason>\n    <evidence>{}</evidence>\n  </memory>\n",
+                                item.role,
+                                layer_tag,
+                                atom.state,
+                                atom.confidence,
+                                atom.salience,
+                                atom.title,
+                                item.reason,
+                                atom.evidence_pointer.as_deref().unwrap_or("")
                             ));
                         }
                         self.cached_prompt
@@ -2527,8 +2490,13 @@ where
                     }
                 }
 
-                // Compose full context from cached per-layer fragments.
-                let mut context = String::from("<memory_context>\n");
+                let mut context = format!(
+                    "<memory_context mode=\"packet\" selected=\"{}\" omitted=\"{}\" tokens=\"{}\" truncated=\"{}\">\n",
+                    packet.selected.len(),
+                    packet.omitted.len(),
+                    packet.token_estimate,
+                    packet.truncated
+                );
                 for cache_layer in CacheLayer::all() {
                     let fragment = self.cached_prompt.get_layer(cache_layer);
                     for line in &fragment {
@@ -2537,79 +2505,26 @@ where
                 }
                 context.push_str("</memory_context>");
 
-                // M2-L1-3: entity/triple relations as knowledge graph
-                let mut rel_count = 0;
-                for entry in &prepared.entries {
-                    for rel in &entry.relations {
-                        if rel_count == 0 {
-                            context.push_str("\n<knowledge_graph>\n");
-                        }
-                        rel_count += 1;
-                        if rel_count > 15 {
-                            break;
-                        }
-                        // 09: skip expired or not-yet-valid temporal relations
-                        if let Some(ref tm) = rel.temporal {
-                            if let Some(from) = tm.valid_from {
-                                if from > chrono::Utc::now() {
-                                    continue;
-                                }
-                            }
-                            if let Some(until) = tm.valid_until {
-                                if until < chrono::Utc::now() {
-                                    continue;
-                                }
-                            }
-                        }
-                        let mut attrs = format!(
-                            "subject=\"{}\" kind=\"{:?}\" strength=\"{:.2}\"",
-                            entry.title, rel.kind, rel.strength
-                        );
-                        if let Some(ref entity_name) = rel.entity {
-                            attrs.push_str(&format!(" entity=\"{}\"", entity_name));
-                        }
-                        if let Some(ref tm) = rel.temporal {
-                            if let Some(from) = tm.valid_from {
-                                attrs.push_str(&format!(
-                                    " valid_from=\"{}\"",
-                                    from.format("%Y-%m-%d")
-                                ));
-                            }
-                            if let Some(until) = tm.valid_until {
-                                attrs.push_str(&format!(
-                                    " valid_until=\"{}\"",
-                                    until.format("%Y-%m-%d")
-                                ));
-                            }
-                        }
-                        context.push_str(&format!("  <relation {}/>\n", attrs));
+                if !packet.omitted.is_empty() {
+                    context.push_str("\n<context_omissions>\n");
+                    for omitted in packet.omitted.iter().take(8) {
+                        context.push_str(&format!(
+                            "  <omitted id=\"{}\" reason=\"{}\">{}</omitted>\n",
+                            omitted.id, omitted.reason, omitted.title
+                        ));
                     }
-                    if rel_count > 15 {
-                        break;
-                    }
-                }
-                if rel_count > 0 {
-                    context.push_str("</knowledge_graph>\n");
-                }
-
-                // P1: Inject code symbols from tree-sitter code indexer
-                if let Some(ref cc) = prepared.code_context {
-                    if !cc.is_empty() {
-                        context.push_str("\n# Relevant Code Symbols\n");
-                        context.push_str(cc);
-                        context.push('\n');
-                    }
+                    context.push_str("</context_omissions>\n");
                 }
 
                 if let Some(cb) = &self.memory_callback {
-                    let entries: Vec<(String, String, f64)> = prepared
-                        .entries
+                    let entries: Vec<(String, String, f64)> = packet
+                        .selected
                         .iter()
-                        .map(|e| {
+                        .map(|item| {
                             (
-                                format!("{:?}", e.layer),
-                                e.content.clone(),
-                                e.confidence as f64,
+                                format!("{:?}", item.atom.layer),
+                                item.atom.title.clone(),
+                                item.atom.confidence as f64,
                             )
                         })
                         .collect();
@@ -2617,7 +2532,11 @@ where
                     cb.on_memory_update(entries, &status);
                 }
 
-                tracing::debug!(entries = prepared.entries.len(), "memory context prepared");
+                tracing::debug!(
+                    selected = packet.selected.len(),
+                    omitted = packet.omitted.len(),
+                    "memory context packet prepared"
+                );
                 let mut prompt = self.system_prompt.clone();
                 prompt.insert(0, context);
                 prompt

@@ -25,7 +25,10 @@ use axum::{
 };
 use futures::StreamExt;
 use futures::stream::Stream;
-use runtime::ApprovalConfig;
+use runtime::{
+    ApprovalConfig, ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem,
+    ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind, ContextVisibility,
+};
 use runtime::approval_gate::SmartApprovalGate;
 use runtime::permission_enforcer::{ApprovalPersistence, ApprovalVerdict};
 use serde::{Deserialize, Serialize};
@@ -160,6 +163,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/:id/stream", get(sse_stream_handler))
         .route("/api/sessions/:id/compact", post(compact_session_handler))
         .route("/api/sessions/:id/stats", get(get_session_stats_handler))
+        .route("/api/context/current", get(context_current_handler))
         .route("/api/tasks", get(tasks_status_handler))
         .route("/api/tasks/start", post(start_task_handler))
         .route("/api/tasks/:id/phases", post(start_task_phase_handler))
@@ -741,6 +745,91 @@ async fn tasks_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> imp
     Json(serde_json::json!({
         "tasks": state.task_kernel.list(),
         "current": state.task_kernel.current(),
+    }))
+}
+
+async fn context_current_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let session_id = params
+        .get("session_id")
+        .cloned()
+        .or_else(|| state.list_active_session_ids().into_iter().next())
+        .unwrap_or_else(|| "api-context".to_string());
+    let query = params.get("q").cloned().unwrap_or_default();
+    let identity = ContextIdentity::main(session_id.clone());
+    let mut dynamic_items = Vec::new();
+    let mut degraded = Vec::new();
+
+    if let Some(ref mgr) = state.memory_manager {
+        let mgr = Arc::clone(mgr);
+        let session_for_packet = session_id.clone();
+        let query_for_packet = query.clone();
+        let packet_result = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| err.to_string())?;
+            rt.block_on(async move {
+                let kernel = MemoryKernel::new(mgr);
+                let memory_ctx = MemoryTurnContext::new(session_for_packet, "api");
+                kernel
+                    .context_packet(&memory_ctx, &query_for_packet, &[], 12, 2_000)
+                    .await
+                    .map_err(|err| err.to_string())
+            })
+        })
+        .await
+        .map_err(|err| err.to_string())
+        .and_then(|result| result);
+
+        match packet_result {
+            Ok(packet) => {
+                for item in packet.selected {
+                    let mut context_item = ContextItem::new(
+                        item.atom.id.to_string(),
+                        ContextSourceKind::Memory,
+                        match item.role {
+                            memory::MemoryPacketRole::Orientation => ContextRole::Orientation,
+                            memory::MemoryPacketRole::Supporting => ContextRole::Evidence,
+                            memory::MemoryPacketRole::Warning
+                            | memory::MemoryPacketRole::Conflict => ContextRole::Warning,
+                        },
+                        format!(
+                            "{}\nreason: {}\nevidence: {}",
+                            item.atom.title,
+                            item.reason,
+                            item.atom.evidence_pointer.as_deref().unwrap_or("")
+                        ),
+                    );
+                    context_item.authority = ContextAuthority::Session;
+                    context_item.visibility = ContextVisibility::Private;
+                    context_item.score = item.atom.confidence;
+                    dynamic_items.push(context_item);
+                }
+            }
+            Err(_) => degraded.push(ContextSourceKind::Memory),
+        }
+    } else {
+        degraded.push(ContextSourceKind::Memory);
+    }
+
+    let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+        profile: ContextProfile::from(identity.mode),
+        identity,
+        intent: query,
+        stable_head: vec!["cowd-context-runtime:v0.8.13".to_string()],
+        runtime_header: vec![format!("session:{session_id} agent:api profile:MainTurn")],
+        dynamic_items,
+        omitted: Vec::new(),
+        total_budget_tokens: 8_000,
+    });
+    envelope.diagnostics.degraded_sources = degraded;
+
+    Json(serde_json::json!({
+        "enabled": true,
+        "envelope": envelope,
     }))
 }
 
@@ -4048,6 +4137,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(solo_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn context_current_returns_degraded_envelope_without_memory() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/current?q=ship&session_id=session-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["envelope"]["identity"]["session_id"], "session-1");
+        assert_eq!(json["envelope"]["intent"], "ship");
+        assert_eq!(
+            json["envelope"]["assembled"]["stable_head"][0],
+            "cowd-context-runtime:v0.8.13"
+        );
+        assert_eq!(
+            json["envelope"]["diagnostics"]["degraded_sources"][0],
+            "Memory"
+        );
     }
 
     #[tokio::test]
