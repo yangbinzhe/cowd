@@ -6,6 +6,7 @@ import './panels.js';
 import './sessions.js';
 import './messages.js';
 import './workspace.js';
+import './commands.js';
 import './boot.js';
 
 describe('WebUI single implementation boundary', () => {
@@ -471,6 +472,7 @@ describe('API module', () => {
 
   it('Panels module exposes all panel renderers', () => {
     expect(typeof window.Panels.renderMemory).toBe('function');
+    expect(typeof window.Panels.renderContext).toBe('function');
     expect(typeof window.Panels.renderMemoryNetwork).toBe('function');
     expect(typeof window.Panels.renderSkills).toBe('function');
     expect(typeof window.Panels.renderCrons).toBe('function');
@@ -485,6 +487,12 @@ describe('API module', () => {
     expect(typeof window.Panels.renderCCApproval).toBe('function');
     expect(typeof window.Panels.renderCCHistory).toBe('function');
     expect(typeof window.Panels.renderCCUsage).toBe('function');
+  });
+
+  it('index exposes the context panel tab and slash command', () => {
+    const html = fs.readFileSync('index.html', 'utf8');
+    expect(html).toContain('data-panel="context"');
+    expect(window.Commands.getMatches('/context')[0].cmd).toBe('/context');
   });
 
   it('Sessions search uses backend query and renders returned sessions', async () => {
@@ -599,6 +607,58 @@ describe('API module', () => {
     const text = document.getElementById('panel-content').textContent;
     expect(text).toContain('L4');
     expect(text).not.toContain('[object Object]');
+  });
+
+  it('renders context envelope diagnostics and segments', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    vi.stubGlobal('fetch', vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          enabled: true,
+          source: 'runtime',
+          envelope: {
+            id: 'ctx-1',
+            profile: 'MainTurn',
+            selected: [{
+              role: 'Evidence',
+              source: 'Memory',
+              authority: 'Session',
+              visibility: 'Private',
+              content: 'SessionKernel owns durable sessions',
+              score: 0.93,
+              token_estimate: 12,
+            }],
+            omitted: [{ source: 'Memory', reason: 'context lease exhausted', token_estimate: 30 }],
+            budget: { total_tokens: 8000, used_tokens: 120 },
+            diagnostics: {
+              pressure_bp: 150,
+              stable_head_hash: 'stablehashabcdef',
+              runtime_header_hash: 'runtimehashabcdef',
+              dynamic_tail_hash: 'dynamichashabcdef',
+              degraded_sources: ['Memory'],
+            },
+            assembled: {
+              stable_head: ['stable system'],
+              runtime_header: ['session:s1 agent:primary'],
+              dynamic_tail: ['memory packet body'],
+            },
+          },
+        })
+      })
+    ));
+
+    await window.Panels.renderContext();
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const text = document.getElementById('panel-content').textContent;
+    expect(text).toContain('Context Runtime');
+    expect(text).toContain('runtime');
+    expect(text).toContain('SessionKernel owns durable sessions');
+    expect(text).toContain('context lease exhausted');
+    expect(text).toContain('stable system');
+    expect(text).toContain('dynamichasha');
+    expect(text).toContain('degraded: Memory');
   });
 
   it('renders recall explain metadata in the memory panel', async () => {

@@ -55,6 +55,124 @@ window.Panels = (()=>{
     target.appendChild(card);
   }
 
+  function shortHash(value){
+    return String(value||'').slice(0,12)||'n/a';
+  }
+
+  function fmtPressure(bp){
+    if(typeof bp !== 'number')return 'n/a';
+    return Math.round(bp/100)+'%';
+  }
+
+  function contextTextPreview(value){
+    return String(value||'').replace(/\s+/g,' ').trim().slice(0,180);
+  }
+
+  function renderContextItem(item){
+    const row=UI.el('div','context-item');
+    const role=UI.el('span','context-role '+String(item.role||'').toLowerCase());
+    role.textContent=item.role||item.source||'item';
+    const body=UI.el('div','context-item-body');
+    body.innerHTML='<b>'+UI.esc(contextTextPreview(item.content||item.id||'context item'))+'</b><small>'+UI.esc([item.source,item.authority,item.visibility].filter(Boolean).join(' · '))+'</small><em>score '+UI.esc(typeof item.score==='number'?item.score.toFixed(2):'n/a')+' · '+UI.esc(item.token_estimate||0)+' tk</em>';
+    row.appendChild(role);
+    row.appendChild(body);
+    return row;
+  }
+
+  function renderContextSegment(label,items){
+    const sec=UI.el('div','context-segment');
+    sec.innerHTML='<h4>'+UI.esc(label)+'</h4>';
+    const list=Array.isArray(items)?items:[];
+    if(!list.length){
+      sec.appendChild(UI.el('div','panel-empty','empty'));
+      return sec;
+    }
+    list.slice(0,4).forEach(function(text){
+      const pre=UI.el('pre');
+      pre.textContent=contextTextPreview(text);
+      sec.appendChild(pre);
+    });
+    return sec;
+  }
+
+  async function renderContext(){
+    const c=cont();c.innerHTML='';
+    const hdr=UI.el('div','panel-section context-header');
+    hdr.innerHTML='<h3>Context Runtime</h3>';
+    const controls=UI.el('div','context-controls');
+    const input=UI.el('input');
+    input.placeholder='Inspect intent...';
+    const refresh=UI.el('button','btn-secondary btn-sm');
+    refresh.textContent='Refresh';
+    controls.appendChild(input);
+    controls.appendChild(refresh);
+    hdr.appendChild(controls);
+    c.appendChild(hdr);
+
+    const mount=UI.el('div');
+    c.appendChild(mount);
+    async function load(){
+      mount.innerHTML='';
+      const opts={q:input.value||''};
+      if(Api.sid)opts.session_id=Api.sid;
+      try{
+        const response=await Api.currentContext(opts);
+        const envelope=(response&&response.envelope)||{};
+        const diagnostics=envelope.diagnostics||{};
+        const budget=envelope.budget||{};
+        const assembled=envelope.assembled||{};
+
+        const overview=UI.el('div','panel-section context-overview');
+        const source=response.source||'synthetic';
+        overview.innerHTML='<div class="context-title"><b>'+UI.esc(envelope.profile||'MainTurn')+'</b><span>'+UI.esc(source)+'</span></div>';
+        const metrics=UI.el('div','memory-metrics');
+        metrics.appendChild(renderMemoryMetric('pressure',fmtPressure(diagnostics.pressure_bp),'context'));
+        metrics.appendChild(renderMemoryMetric('used',budget.used_tokens||0,'tokens'));
+        metrics.appendChild(renderMemoryMetric('total',budget.total_tokens||0,'tokens'));
+        metrics.appendChild(renderMemoryMetric('stable',shortHash(diagnostics.stable_head_hash),'hash'));
+        metrics.appendChild(renderMemoryMetric('runtime',shortHash(diagnostics.runtime_header_hash),'hash'));
+        metrics.appendChild(renderMemoryMetric('dynamic',shortHash(diagnostics.dynamic_tail_hash),'hash'));
+        overview.appendChild(metrics);
+        if((diagnostics.degraded_sources||[]).length){
+          const degraded=UI.el('div','context-degraded');
+          degraded.textContent='degraded: '+diagnostics.degraded_sources.join(', ');
+          overview.appendChild(degraded);
+        }
+        mount.appendChild(overview);
+
+        const selected=UI.el('div','panel-section context-list');
+        selected.innerHTML='<h3>Selected Context</h3>';
+        const items=envelope.selected||[];
+        if(!items.length)selected.appendChild(UI.el('div','panel-empty','No selected context'));
+        items.slice(0,12).forEach(function(item){selected.appendChild(renderContextItem(item))});
+        mount.appendChild(selected);
+
+        const omitted=UI.el('div','panel-section context-list');
+        omitted.innerHTML='<h3>Omitted Context</h3>';
+        const omittedItems=envelope.omitted||[];
+        if(!omittedItems.length)omitted.appendChild(UI.el('div','panel-empty','No omitted context'));
+        omittedItems.slice(0,8).forEach(function(item){
+          const row=UI.el('div','context-omission');
+          row.textContent=(item.source||'context')+' · '+(item.reason||'omitted')+' · '+(item.token_estimate||0)+' tk';
+          omitted.appendChild(row);
+        });
+        mount.appendChild(omitted);
+
+        const segments=UI.el('div','panel-section context-segments');
+        segments.innerHTML='<h3>Prompt Segments</h3>';
+        segments.appendChild(renderContextSegment('stable head',assembled.stable_head));
+        segments.appendChild(renderContextSegment('runtime header',assembled.runtime_header));
+        segments.appendChild(renderContextSegment('dynamic tail',assembled.dynamic_tail));
+        mount.appendChild(segments);
+      }catch(e){
+        mount.appendChild(UI.el('div','panel-empty','Context unavailable: '+e.message));
+      }
+    }
+    refresh.onclick=load;
+    input.onkeydown=function(e){if(e.key==='Enter')load()};
+    load();
+  }
+
   function renderMemoryLinks(linksResponse,target){
     target.innerHTML='';
     const links=(linksResponse && (linksResponse.links||linksResponse)) || [];
@@ -923,5 +1041,5 @@ window.Panels = (()=>{
     }catch(e){c.appendChild(UI.el('div','panel-section','Progress unavailable'))}
   }
 
-  return{renderMemory,renderMemoryLayer,renderMemorySymbolResults,showMemoryEntryForm,renderMemorySpatial,renderMemoryNetwork,renderProgress,renderSkills,renderCrons,renderSettings,renderAgents,renderTools,renderGateway,renderAudit,renderCCConfig,renderCCProviders,renderCCApproval,renderCCHistory,renderCCUsage};
+  return{renderMemory,renderContext,renderMemoryLayer,renderMemorySymbolResults,showMemoryEntryForm,renderMemorySpatial,renderMemoryNetwork,renderProgress,renderSkills,renderCrons,renderSettings,renderAgents,renderTools,renderGateway,renderAudit,renderCCConfig,renderCCProviders,renderCCApproval,renderCCHistory,renderCCUsage};
 })();

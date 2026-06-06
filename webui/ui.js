@@ -110,6 +110,7 @@ window.UI = (()=>{
     if(typeof Workspace!=='undefined'&&name==='workspace')Workspace.render();
     if(typeof Panels!=='undefined'){
       if(name==='memory')Panels.renderMemory();
+      else if(name==='context')Panels.renderContext();
       else if(name==='skills')Panels.renderSkills();
       else if(name==='crons')Panels.renderCrons();
       else if(name==='agents')Panels.renderAgents();

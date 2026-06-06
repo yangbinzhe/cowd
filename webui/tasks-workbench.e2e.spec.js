@@ -131,6 +131,38 @@ test('workbench panels render durable task and memory status', async ({ page }) 
       });
     }
     if (path === '/api/memory/layers') return json({ layers: [{ name: 'L3' }, { name: 'L4' }] });
+    if (path === '/api/context/current') {
+      return json({
+        enabled: true,
+        source: 'runtime',
+        envelope: {
+          profile: 'MainTurn',
+          selected: [{
+            role: 'Evidence',
+            source: 'Memory',
+            authority: 'Session',
+            visibility: 'Private',
+            content: 'SessionKernel owns durable sessions',
+            score: 0.91,
+            token_estimate: 14,
+          }],
+          omitted: [{ source: 'Memory', reason: 'context lease exhausted', token_estimate: 21 }],
+          budget: { total_tokens: 8000, used_tokens: 120 },
+          diagnostics: {
+            pressure_bp: 150,
+            stable_head_hash: 'stablehashabcdef',
+            runtime_header_hash: 'runtimehashabcdef',
+            dynamic_tail_hash: 'dynamichashabcdef',
+            degraded_sources: [],
+          },
+          assembled: {
+            stable_head: ['stable system prompt'],
+            runtime_header: ['session:session-1 agent:primary'],
+            dynamic_tail: ['memory packet body'],
+          },
+        },
+      });
+    }
 
     return json({});
   });
@@ -178,6 +210,14 @@ test('workbench panels render durable task and memory status', async ({ page }) 
   await expect(graph.locator('.memory-node.matched')).toBeVisible();
   await graph.locator('[data-node-id="TaskKernel"]').click();
   await expect(graph.locator('.memory-network-detail')).toContainText('TaskKernel');
+
+  await page.click('[data-panel="context"]');
+  await expect(page.locator('#panel-content')).toContainText('Context Runtime');
+  await expect(page.locator('#panel-content')).toContainText('runtime');
+  await expect(page.locator('#panel-content')).toContainText('SessionKernel owns durable sessions');
+  await expect(page.locator('#panel-content')).toContainText('context lease exhausted');
+  await expect(page.locator('#panel-content')).toContainText('stable system prompt');
+  await expect(page.locator('#panel-content')).toContainText('dynamichasha');
 
   expect(errors).toEqual([]);
 });
