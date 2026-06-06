@@ -187,7 +187,7 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .context-recommendation{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text2);line-height:1.35;padding:2px 0}
 .context-recommendation span{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .context-recommendation .context-rec-count{flex:0 0 auto;color:var(--text3);font-variant-numeric:tabular-nums}
-.context-list h3,.context-segments h3,.context-history h3{font-size:12px;margin-bottom:8px}
+.context-list h3,.context-segments h3,.context-history h3,.runtime-runs h3{font-size:12px;margin-bottom:8px}
 .context-item{display:grid;grid-template-columns:76px minmax(0,1fr);gap:8px;padding:7px 0;border-top:1px solid var(--border)}
 .context-item:first-of-type{border-top:0}
 .context-role{align-self:start;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 6px;border:1px solid var(--border);border-radius:999px;font-size:10px;text-align:center;color:var(--text2)}
@@ -214,6 +214,12 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .context-history-detail{border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);padding:8px}
 .context-history-detail h4{font-size:11px;margin-bottom:2px;color:var(--text2)}
 .context-history-detail>small{display:block;color:var(--text3);font-size:10px;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.runtime-run-item{border-top:1px solid var(--border);padding:7px 0}
+.runtime-run-item:first-of-type{border-top:0}
+.runtime-run-item b,.runtime-run-item small,.runtime-run-item em{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.runtime-run-item b{font-size:12px}
+.runtime-run-item small{margin-top:2px;color:var(--text3);font-size:10px}
+.runtime-run-item em{margin-top:2px;color:var(--text2);font-size:11px;font-style:normal}
 
 .audit-controls{display:flex;gap:8px;align-items:center}
 .audit-controls select{flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:13px}

@@ -720,6 +720,24 @@ describe('API module', () => {
           })
         });
       }
+      if (path.includes('/api/sessions/s1/runs')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            runs: [{
+              sequence: 7,
+              created_at_ms: 1002,
+              run: {
+                run_id: 'run-1',
+                profile: 'MainTurn',
+                status: 'completed',
+                intent_preview: 'ship now',
+                context_envelope_id: 'ctx-1',
+              },
+            }]
+          })
+        });
+      }
       if (path.includes('/api/sessions/s1/context')) {
         return Promise.resolve({
           ok: true,
@@ -788,6 +806,9 @@ describe('API module', () => {
     expect(text).toContain('ack 2');
     expect(text).toContain('Ack');
     expect(text).toContain('Context Timeline');
+    expect(text).toContain('Runtime Runs');
+    expect(text).toContain('run-1');
+    expect(text).toContain('completed');
     expect(text).toContain('ship now');
     expect(text).toContain('historical cargo test passed');
     expect(text).toContain('tool://test/evidence/event-1');

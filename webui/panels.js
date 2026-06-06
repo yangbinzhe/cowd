@@ -126,6 +126,14 @@ window.Panels = (()=>{
     return detail;
   }
 
+  function renderRuntimeRunItem(item){
+    const row=UI.el('div','runtime-run-item');
+    const run=(item&&item.run)||{};
+    const stamp=item.created_at_ms?new Date(item.created_at_ms).toLocaleTimeString():'n/a';
+    row.innerHTML='<b>'+UI.esc(run.status||run.phase||'run')+'</b><small>'+UI.esc([run.profile||'MainTurn',run.run_id||'no-run-id','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(run.intent_preview||run.error||run.context_envelope_id||''))+'</em>';
+    return row;
+  }
+
   async function renderContext(){
     const c=cont();c.innerHTML='';
     const hdr=UI.el('div','panel-section context-header');
@@ -245,6 +253,24 @@ window.Panels = (()=>{
         segments.appendChild(renderContextSegment('runtime header',assembled.runtime_header));
         segments.appendChild(renderContextSegment('dynamic tail',assembled.dynamic_tail));
         mount.appendChild(segments);
+
+        const runs=UI.el('div','panel-section runtime-runs');
+        runs.innerHTML='<h3>Runtime Runs</h3>';
+        if(!Api.sid){
+          runs.appendChild(UI.el('div','panel-empty','No active session'));
+        }else{
+          try{
+            const runTimeline=await Api.runtimeRuns(Api.sid,{limit:8});
+            const rows=runTimeline.runs||[];
+            if(!rows.length)runs.appendChild(UI.el('div','panel-empty','No runtime runs'));
+            rows.slice(-8).reverse().forEach(function(item){
+              runs.appendChild(renderRuntimeRunItem(item));
+            });
+          }catch(runError){
+            runs.appendChild(UI.el('div','panel-empty','Runtime runs unavailable'));
+          }
+        }
+        mount.appendChild(runs);
 
         const history=UI.el('div','panel-section context-history');
         history.innerHTML='<h3>Context Timeline</h3>';
