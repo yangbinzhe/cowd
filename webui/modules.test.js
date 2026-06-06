@@ -837,6 +837,14 @@ describe('API module', () => {
               dynamic_tail: ['memory packet body'],
             },
           },
+          lean_probe: {
+            pressure_level: 'Nominal',
+            degradation_path: 'SourceFallback',
+            selected_count: 1,
+            omitted_count: 1,
+            stable_head_hash: 'stablehashabcdef',
+            dynamic_tail_hash: 'dynamichashabcdef',
+          },
         })
       });
     }));
@@ -847,6 +855,8 @@ describe('API module', () => {
 
     const text = document.getElementById('panel-content').textContent;
     expect(text).toContain('Context Runtime');
+    expect(text).toContain('Runtime Probe');
+    expect(text).toContain('SourceFallback');
     expect(text).toContain('runtime');
     expect(text).toContain('SessionKernel owns durable sessions');
     expect(text).toContain('session://s1/memory/mem-1');
@@ -888,7 +898,17 @@ describe('API module', () => {
                 status: 'completed',
                 intent_preview: 'complete runtime hardening',
               },
-            }]
+            }],
+            tree: {
+              roots: ['run-console-1'],
+              children: {},
+              summary: {
+                span_count: 1,
+                root_count: 1,
+                failed_count: 0,
+                running_count: 0,
+              },
+            },
           })
         });
       }
@@ -934,6 +954,14 @@ describe('API module', () => {
               degraded_sources: ['Memory'],
             },
           },
+          lean_probe: {
+            pressure_level: 'Elevated',
+            degradation_path: 'TrimDynamicTail',
+            selected_count: 1,
+            omitted_count: 1,
+            stable_head_hash: 'stable-runtime-hash',
+            dynamic_tail_hash: 'runtime-tail-hash',
+          },
         })
       });
     }));
@@ -944,8 +972,11 @@ describe('API module', () => {
     const text = document.getElementById('panel-content').textContent;
     expect(text).toContain('Runtime Console');
     expect(text).toContain('Runtime State');
+    expect(text).toContain('Runtime Probe');
+    expect(text).toContain('TrimDynamicTail');
     expect(text).toContain('YoloGoal');
     expect(text).toContain('Runtime Runs');
+    expect(text).toContain('spans');
     expect(text).toContain('run-console-1');
     expect(text).toContain('Runtime console should show unified state');
     expect(text).toContain('Memory Maintenance');

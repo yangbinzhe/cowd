@@ -844,10 +844,12 @@ async fn context_current_handler(
     if let Some(runtime_entry) = state.active_runtime(&session_id) {
         let runtime = runtime_entry.lock().await;
         if let Some(envelope) = runtime.last_context_envelope() {
+            let lean_probe = ContextRuntimeKernel::lean_probe(&envelope);
             return Json(serde_json::json!({
                 "enabled": true,
                 "source": "runtime",
                 "envelope": envelope,
+                "lean_probe": lean_probe,
             }));
         }
     }
@@ -933,6 +935,7 @@ async fn context_current_handler(
     Json(serde_json::json!({
         "enabled": true,
         "source": "synthetic",
+        "lean_probe": ContextRuntimeKernel::lean_probe(&envelope),
         "envelope": envelope,
     }))
 }
@@ -3219,6 +3222,81 @@ fn runtime_run_event_json(event: SessionEvent) -> serde_json::Value {
     })
 }
 
+fn runtime_run_tree_summary(runs: &[serde_json::Value]) -> serde_json::Value {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut parents: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut children: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut latest_status: BTreeMap<String, String> = BTreeMap::new();
+    let mut failed_count = 0usize;
+    let mut completed_count = 0usize;
+    let mut running_count = 0usize;
+
+    for event in runs {
+        let run = &event["run"];
+        let Some(run_id) = run.get("run_id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let parent = run
+            .get("parent_run_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        parents.entry(run_id.to_string()).or_insert(parent.clone());
+        if let Some(parent_id) = parent {
+            children
+                .entry(parent_id)
+                .or_default()
+                .insert(run_id.to_string());
+        }
+        if let Some(status) = run.get("status").and_then(|value| value.as_str()) {
+            latest_status.insert(run_id.to_string(), status.to_string());
+        }
+    }
+
+    for status in latest_status.values() {
+        match status.as_str() {
+            "completed" => completed_count += 1,
+            "failed" | "timeout" | "cancelled" => failed_count += 1,
+            "running" => running_count += 1,
+            _ => {}
+        }
+    }
+
+    let roots = parents
+        .iter()
+        .filter_map(|(run_id, parent)| {
+            let is_root = match parent.as_ref() {
+                Some(parent_id) => !parents.contains_key(parent_id),
+                None => true,
+            };
+            if is_root {
+                Some(run_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let root_count = roots.len();
+    let child_map = children
+        .into_iter()
+        .map(|(parent, child_ids)| (parent, child_ids.into_iter().collect::<Vec<_>>()))
+        .collect::<BTreeMap<_, _>>();
+
+    serde_json::json!({
+        "roots": roots,
+        "children": child_map,
+        "summary": {
+            "event_count": runs.len(),
+            "span_count": parents.len(),
+            "root_count": root_count,
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "running_count": running_count,
+        }
+    })
+}
+
 async fn get_session_runs(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
@@ -3251,6 +3329,7 @@ async fn get_session_runs(
         .into_iter()
         .map(runtime_run_event_json)
         .collect();
+    let tree = runtime_run_tree_summary(&runs);
     let next_seq = runs
         .last()
         .and_then(|event| event["sequence"].as_u64())
@@ -3260,6 +3339,7 @@ async fn get_session_runs(
     Ok(Json(serde_json::json!({
         "session_id": id,
         "runs": runs,
+        "tree": tree,
         "total": total,
         "from_seq": from_seq,
         "next_seq": next_seq,
@@ -5480,6 +5560,9 @@ mod tests {
             json["envelope"]["diagnostics"]["degraded_sources"][0],
             "Memory"
         );
+        assert_eq!(json["lean_probe"]["envelope_id"], json["envelope"]["id"]);
+        assert_eq!(json["lean_probe"]["pressure_level"], "Nominal");
+        assert_eq!(json["lean_probe"]["degradation_path"], "SourceFallback");
     }
 
     #[tokio::test]
@@ -5547,6 +5630,20 @@ mod tests {
                     None,
                 ),
             ),
+            (
+                3,
+                "RuntimeRun",
+                serde_json::json!({
+                    "type": "RuntimeRun",
+                    "phase": "completed",
+                    "run_id": "agent-run-1",
+                    "parent_run_id": "run-1",
+                    "session_id": session_id,
+                    "profile": ContextProfile::SubAgent,
+                    "status": "failed",
+                    "error": "review failed",
+                }),
+            ),
         ] {
             store
                 .append_event(&memory::SessionEvent {
@@ -5576,11 +5673,15 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["session_id"], session_id);
-        assert_eq!(json["total"], 2);
-        assert_eq!(json["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["runs"].as_array().unwrap().len(), 3);
         assert_eq!(json["runs"][0]["run"]["phase"], "started");
         assert_eq!(json["runs"][1]["run"]["status"], "completed");
         assert_eq!(json["runs"][1]["run"]["context_envelope_id"], "ctx-1");
+        assert_eq!(json["tree"]["roots"][0], "run-1");
+        assert_eq!(json["tree"]["children"]["run-1"][0], "agent-run-1");
+        assert_eq!(json["tree"]["summary"]["span_count"], 2);
+        assert_eq!(json["tree"]["summary"]["failed_count"], 1);
     }
 
     #[tokio::test]

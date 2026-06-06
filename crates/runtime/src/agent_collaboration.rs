@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::agent::{SubAgentConfig, SubAgentExecutor, SubAgentResult};
 use crate::context_runtime::ContextItem;
@@ -20,7 +21,10 @@ use memory::temporal_graph::Triple;
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
-use memory::{MemoryKernel, MemoryTurnContext};
+use memory::{
+    MaintenanceCandidate, MaintenanceCandidateKind, MaintenanceCandidateStatus, MemoryKernel,
+    MemoryTurnContext,
+};
 
 // ── SubTask ────────────────────────────────────────────────────────────────────
 
@@ -101,6 +105,61 @@ impl CollaborationScorecard {
 pub struct CollaborationBoard {
     pub entries: Vec<SharedBoardEntry>,
     pub scorecard: CollaborationScorecard,
+}
+
+impl CollaborationBoard {
+    pub fn memory_maintenance_candidates(&self) -> Vec<MaintenanceCandidate> {
+        let mut candidates = Vec::new();
+        for conflict in &self.scorecard.surfaced_conflicts {
+            candidates.push(collaboration_maintenance_candidate(
+                MaintenanceCandidateKind::Conflict,
+                format!("Review multi-agent conflict: {}", truncate_for_candidate(conflict)),
+                conflict.clone(),
+                self.scorecard_candidate_confidence(),
+            ));
+        }
+
+        for entry in &self.entries {
+            for pulse in &entry.memory_pulses {
+                let (kind, summary) = match pulse.kind {
+                    MemoryPulseKind::Remember => (
+                        MaintenanceCandidateKind::RelationshipRefresh,
+                        "Review agent-discovered knowledge",
+                    ),
+                    MemoryPulseKind::Refresh => (
+                        MaintenanceCandidateKind::RelationshipRefresh,
+                        "Refresh agent-recalled knowledge",
+                    ),
+                    MemoryPulseKind::Promote => (
+                        MaintenanceCandidateKind::AuthorityPromotion,
+                        "Consider promoting agent-verified knowledge",
+                    ),
+                    MemoryPulseKind::Retire => (
+                        MaintenanceCandidateKind::Stale,
+                        "Move stale agent-mentioned knowledge out of foreground",
+                    ),
+                };
+                candidates.push(collaboration_maintenance_candidate(
+                    kind,
+                    format!("{}: {}", summary, truncate_for_candidate(&pulse.content)),
+                    format!(
+                        "agent={} pulse={:?}; {}",
+                        entry.agent_id, pulse.kind, pulse.content
+                    ),
+                    self.scorecard_candidate_confidence(),
+                ));
+            }
+        }
+
+        candidates
+    }
+
+    fn scorecard_candidate_confidence(&self) -> f32 {
+        let base = 0.55 + (self.scorecard.active_memory_score * 0.25);
+        let lift = (self.scorecard.synthesis_lift - 1.0).max(0.0).min(1.0) * 0.15;
+        let completion = self.scorecard.completion_rate * 0.05;
+        (base + lift + completion).clamp(0.1, 0.95)
+    }
 }
 
 // ── AgentTeam ──────────────────────────────────────────────────────────────────
@@ -893,6 +952,37 @@ fn extract_memory_pulses(text: &str) -> Vec<MemoryPulseCandidate> {
         .collect()
 }
 
+fn collaboration_maintenance_candidate(
+    kind: MaintenanceCandidateKind,
+    summary: String,
+    reason: String,
+    confidence: f32,
+) -> MaintenanceCandidate {
+    let now = Utc::now();
+    MaintenanceCandidate {
+        id: Uuid::new_v4().to_string(),
+        kind,
+        status: MaintenanceCandidateStatus::Open,
+        entry_ids: Vec::new(),
+        summary,
+        reason: format!("multi-agent collaboration pulse: {reason}"),
+        confidence: confidence.clamp(0.0, 1.0),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn truncate_for_candidate(text: &str) -> String {
+    const LIMIT: usize = 96;
+    let normalized = normalize_whitespace(text);
+    if normalized.chars().count() <= LIMIT {
+        return normalized;
+    }
+    let mut truncated = normalized.chars().take(LIMIT).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
 fn normalize_for_scoring(text: &str) -> String {
     normalize_whitespace(text)
         .to_ascii_lowercase()
@@ -1148,6 +1238,51 @@ Refresh: collaboration scoring should be revisited after live agent runs"
         assert_eq!(board.scorecard.conflict_count, 1);
         assert_eq!(board.scorecard.memory_pulse_count, 2);
         assert!(board.scorecard.needs_memory_pulse());
+    }
+
+    #[test]
+    fn collaboration_board_exports_reviewable_memory_maintenance_candidates() {
+        let orch = CollaborationOrchestrator::<DummyExecutor>::new(Arc::new(DummyExecutor));
+        let results = vec![
+            SubAgentResult {
+                output: "\
+Conflict: implementation confidence differs from review evidence
+Promote: context stable head policy is verified by runtime tests
+Retire: stale local jsonl resume assumptions"
+                    .to_string(),
+                completed_normally: true,
+                ..SubAgentResult::default()
+            },
+            SubAgentResult {
+                output: "Refresh: memory pulse candidates should feed the review queue".to_string(),
+                completed_normally: true,
+                ..SubAgentResult::default()
+            },
+        ];
+
+        let board = orch.build_shared_board(&results);
+        let candidates = board.memory_maintenance_candidates();
+
+        assert_eq!(candidates.len(), 4);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == MaintenanceCandidateKind::Conflict));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == MaintenanceCandidateKind::AuthorityPromotion));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == MaintenanceCandidateKind::Stale));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == MaintenanceCandidateKind::RelationshipRefresh));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.status == MaintenanceCandidateStatus::Open));
+        assert!(candidates.iter().all(|candidate| candidate.entry_ids.is_empty()));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.reason.contains("multi-agent collaboration pulse")));
     }
 
     #[test]

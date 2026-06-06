@@ -12,6 +12,8 @@ use crate::tui::components::{Component, EventResult, RenderContext};
 pub struct RuntimeActivityPanel {
     profile: String,
     pressure_pct: u16,
+    pressure_level: String,
+    degradation_path: String,
     selected_count: usize,
     omitted_count: usize,
     stable_hash: String,
@@ -31,8 +33,11 @@ impl RuntimeActivityPanel {
         self.yolo_mode = app.yolo_mode;
         self.session_id = app.session_id.clone();
         if let Some(envelope) = &app.latest_context_envelope {
+            let probe = runtime::ContextRuntimeKernel::lean_probe(envelope);
             self.profile = format!("{:?}", envelope.profile);
             self.pressure_pct = envelope.diagnostics.pressure_bp / 100;
+            self.pressure_level = format!("{:?}", probe.pressure_level);
+            self.degradation_path = format!("{:?}", probe.degradation_path);
             self.selected_count = envelope.selected.len();
             self.omitted_count = envelope.omitted.len();
             self.stable_hash = short_hash(&envelope.diagnostics.stable_head_hash);
@@ -45,6 +50,8 @@ impl RuntimeActivityPanel {
                 "MainTurn".to_string()
             };
             self.pressure_pct = 0;
+            self.pressure_level = "Nominal".to_string();
+            self.degradation_path = "None".to_string();
             self.selected_count = 0;
             self.omitted_count = 0;
             self.stable_hash = "n/a".to_string();
@@ -83,7 +90,10 @@ impl Component for RuntimeActivityPanel {
         lines.push(Line::from(vec![
             Span::styled("Pressure: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{}%", self.pressure_pct),
+                format!(
+                    "{}% {} via {}",
+                    self.pressure_pct, self.pressure_level, self.degradation_path
+                ),
                 Style::default().fg(if self.pressure_pct > 85 {
                     Color::Red
                 } else if self.pressure_pct > 70 {
@@ -264,6 +274,8 @@ mod tests {
 
         assert!(rendered.contains("Runtime Activity"));
         assert!(rendered.contains("YoloGoal"));
+        assert!(rendered.contains("Nominal"));
+        assert!(rendered.contains("None"));
         assert!(rendered.contains("selected 1 omitted 0"));
         assert!(rendered.contains("tool bash exit 0"));
         assert!(rendered.contains("user: ship the runtime console"));
