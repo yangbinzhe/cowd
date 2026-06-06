@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::agent_collaboration::{
     AgentTaskTrace, CollaborationReviewPacket, CollaborationScorecard, CollaborationTask,
 };
+use memory::{RuntimeEvent, RuntimeEventScope, RuntimeRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,6 +161,79 @@ impl AgentWorkGraph {
         self
     }
 
+    #[must_use]
+    pub fn planned_runtime_event(&self, sequence: usize) -> RuntimeEvent {
+        let mut event = RuntimeEvent::new(
+            self.session_id.clone(),
+            sequence,
+            RuntimeEventScope::Workgraph,
+            "agent.workgraph.planned",
+            serde_json::json!({
+                "graph": self,
+            }),
+            current_time_ms(),
+        );
+        event.status = Some(workgraph_status_name(self.status).to_string());
+        event.refs = self.runtime_refs();
+        event
+    }
+
+    #[must_use]
+    pub fn reviewed_runtime_event(
+        &self,
+        sequence: usize,
+        packet: &CollaborationReviewPacket,
+    ) -> RuntimeEvent {
+        let mut event = RuntimeEvent::new(
+            self.session_id.clone(),
+            sequence,
+            RuntimeEventScope::Workgraph,
+            "agent.workgraph.reviewed",
+            serde_json::json!({
+                "graph": self,
+                "board_id": packet.board_id,
+                "scorecard": packet.scorecard,
+                "maintenance_candidates": packet.maintenance_candidates,
+            }),
+            current_time_ms(),
+        );
+        event.status = Some(workgraph_status_name(self.status).to_string());
+        event.correlation_id = packet.parent_run_id.clone();
+        event.refs = self.runtime_refs();
+        event
+    }
+
+    #[must_use]
+    pub fn runtime_refs(&self) -> Vec<RuntimeRef> {
+        let mut refs = vec![RuntimeRef {
+            ref_type: "workgraph".to_string(),
+            id: self.graph_id.clone(),
+            label: Some(self.objective.clone()),
+        }];
+        if let Some(board_id) = &self.board_id {
+            refs.push(RuntimeRef {
+                ref_type: "collaboration_board".to_string(),
+                id: board_id.clone(),
+                label: None,
+            });
+        }
+        for node in &self.nodes {
+            for reference in &node.refs {
+                if matches!(
+                    reference.ref_type.as_str(),
+                    "parent_runtime_run" | "agent_runtime_run" | "context_envelope"
+                ) {
+                    refs.push(RuntimeRef {
+                        ref_type: reference.ref_type.clone(),
+                        id: reference.id.clone(),
+                        label: Some(node.label.clone()),
+                    });
+                }
+            }
+        }
+        dedupe_refs(refs)
+    }
+
     fn upsert_trace_node(&mut self, trace: &AgentTaskTrace, now: u64) {
         let node_id = trace.task_id.clone();
         let refs = trace_refs(trace, self.graph_id.as_str());
@@ -220,6 +294,29 @@ impl AgentWorkGraph {
             }
         }
     }
+}
+
+fn workgraph_status_name(status: WorkGraphStatus) -> &'static str {
+    match status {
+        WorkGraphStatus::Planned => "planned",
+        WorkGraphStatus::Running => "running",
+        WorkGraphStatus::Completed => "completed",
+        WorkGraphStatus::Degraded => "degraded",
+        WorkGraphStatus::Failed => "failed",
+    }
+}
+
+fn dedupe_refs(refs: Vec<RuntimeRef>) -> Vec<RuntimeRef> {
+    let mut deduped = Vec::new();
+    for reference in refs {
+        if deduped.iter().any(|existing: &RuntimeRef| {
+            existing.ref_type == reference.ref_type && existing.id == reference.id
+        }) {
+            continue;
+        }
+        deduped.push(reference);
+    }
+    deduped
 }
 
 fn trace_refs(trace: &AgentTaskTrace, graph_id: &str) -> Vec<WorkGraphRef> {
@@ -395,5 +492,105 @@ mod tests {
         let graph =
             AgentWorkGraph::from_collaboration_task("session-1", &task).with_review_packet(&packet);
         assert_eq!(graph.status, WorkGraphStatus::Degraded);
+    }
+
+    #[test]
+    fn agent_workgraph_emits_planned_runtime_event() {
+        let task = CollaborationTask {
+            description: "parallel implementation".to_string(),
+            required_skills: vec!["rust".to_string()],
+            subtasks: vec![SubTask {
+                id: "worker".to_string(),
+                description: "implement".to_string(),
+                required_skills: vec!["rust".to_string()],
+                depends_on: Vec::new(),
+            }],
+            review_criteria: None,
+        };
+
+        let graph = AgentWorkGraph::from_collaboration_task("session-1", &task);
+        let event = graph.planned_runtime_event(9);
+
+        assert_eq!(event.session_id, "session-1");
+        assert_eq!(event.sequence, 9);
+        assert_eq!(event.kind, "agent.workgraph.planned");
+        assert_eq!(event.scope, RuntimeEventScope::Workgraph);
+        assert_eq!(event.status.as_deref(), Some("planned"));
+        assert!(event
+            .refs
+            .iter()
+            .any(|reference| reference.ref_type == "workgraph"
+                && reference.id == graph.graph_id));
+        assert_eq!(event.payload["graph"]["objective"], "parallel implementation");
+    }
+
+    #[test]
+    fn agent_workgraph_review_event_carries_memory_candidates_and_refs() {
+        use chrono::Utc;
+        use memory::{
+            MaintenanceCandidate, MaintenanceCandidateKind, MaintenanceCandidateStatus,
+        };
+
+        let task = CollaborationTask {
+            description: "review implementation".to_string(),
+            required_skills: vec!["review".to_string()],
+            subtasks: Vec::new(),
+            review_criteria: None,
+        };
+        let trace = AgentTaskTrace {
+            task_id: "review-node".to_string(),
+            parent_run_id: Some("turn-run".to_string()),
+            agent_run_id: Some("agent-run".to_string()),
+            role: "reviewer".to_string(),
+            objective: "review code".to_string(),
+            status: "completed".to_string(),
+            context_envelope_id: Some("env-1".to_string()),
+            result_summary: "ok".to_string(),
+            evidence_refs: Vec::new(),
+            collaboration_board_id: "board-1".to_string(),
+            confidence: 0.9,
+            conflicts: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        let candidate = MaintenanceCandidate {
+            id: "candidate-1".to_string(),
+            kind: MaintenanceCandidateKind::RelationshipRefresh,
+            status: MaintenanceCandidateStatus::Open,
+            entry_ids: Vec::new(),
+            summary: "refresh relationship".to_string(),
+            reason: "agent review".to_string(),
+            confidence: 0.8,
+            source: Some("test".to_string()),
+            source_ref: Some("board-1".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let packet = CollaborationReviewPacket {
+            board_id: "board-1".to_string(),
+            parent_run_id: Some("turn-run".to_string()),
+            scorecard: scorecard(),
+            agent_tasks: vec![trace],
+            maintenance_candidates: vec![candidate],
+        };
+
+        let graph =
+            AgentWorkGraph::from_collaboration_task("session-1", &task).with_review_packet(&packet);
+        let event = graph.reviewed_runtime_event(10, &packet);
+
+        assert_eq!(event.kind, "agent.workgraph.reviewed");
+        assert_eq!(event.status.as_deref(), Some("completed"));
+        assert_eq!(event.correlation_id.as_deref(), Some("turn-run"));
+        assert_eq!(event.payload["maintenance_candidates"][0]["id"], "candidate-1");
+        assert!(event
+            .refs
+            .iter()
+            .any(|reference| reference.ref_type == "agent_runtime_run"
+                && reference.id == "agent-run"));
+        assert!(event
+            .refs
+            .iter()
+            .any(|reference| reference.ref_type == "context_envelope"
+                && reference.id == "env-1"));
     }
 }

@@ -51,6 +51,7 @@ use crate::{
         MaintenanceCandidate, MaintenanceCandidateFilter, MaintenanceCandidateStatus,
         MaintenanceQueue, MaintenanceScanConfig, scan_maintenance_candidates,
     },
+    memory_pulse::{MemoryPulseBatch, MemoryPulseConsumer, MemoryPulseReport},
     orchestrator::MemoryOrchestrator,
     project_scope::{build_project_kg, ProjectScopeManager},
     search::HybridSearcher,
@@ -2348,6 +2349,22 @@ impl CognitiveContextManager {
         status: MaintenanceCandidateStatus,
     ) -> Result<Option<MaintenanceCandidate>> {
         self.maintenance_queue.transition(id, status)
+    }
+
+    /// Consume reviewable maintenance candidates from a runtime event.
+    ///
+    /// Irrelevant events return `Ok(None)`. Candidate parsing failures are
+    /// treated as irrelevant so a malformed pulse cannot block the session.
+    pub fn process_memory_pulse_runtime_event(
+        &self,
+        event: &crate::RuntimeEvent,
+    ) -> Result<Option<MemoryPulseReport>> {
+        let Some(batch) = MemoryPulseBatch::from_runtime_event(event) else {
+            return Ok(None);
+        };
+        MemoryPulseConsumer::new(self.maintenance_queue.clone())
+            .process_batch(batch)
+            .map(Some)
     }
 
     /// List persisted knowledge-graph entities.

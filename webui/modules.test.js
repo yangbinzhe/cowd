@@ -939,14 +939,27 @@ describe('API module', () => {
             total: 2,
             next_seq: 12,
             degraded: false,
-            events: [{
-              kind: 'ToolComplete',
-              scope: 'tool',
-              sequence: 11,
-              created_at_ms: 1010,
-              refs: [{ type: 'runtime_run', id: 'run-console-1' }],
-              payload: { summary: 'cargo test completed' },
-            }]
+            events: [
+              {
+                kind: 'ToolComplete',
+                scope: 'tool',
+                sequence: 11,
+                created_at_ms: 1010,
+                refs: [{ type: 'runtime_run', id: 'run-console-1' }],
+                payload: { summary: 'cargo test completed' },
+              },
+              {
+                kind: 'agent.workgraph.reviewed',
+                scope: 'workgraph',
+                sequence: 12,
+                created_at_ms: 1020,
+                refs: [
+                  { type: 'workgraph', id: 'workgraph-1' },
+                  { type: 'collaboration_board', id: 'board-1' },
+                ],
+                payload: { maintenance_candidates: [{ id: 'maint-graph' }] },
+              },
+            ]
           })
         });
       }
@@ -1023,7 +1036,9 @@ describe('API module', () => {
     expect(text).toContain('run-console-1');
     expect(text).toContain('Runtime Timeline');
     expect(text).toContain('ToolComplete');
+    expect(text).toContain('agent.workgraph.reviewed');
     expect(text).toContain('runtime_run:run-console-1');
+    expect(text).toContain('workgraph:workgraph-1');
     expect(text).toContain('Runtime console should show unified state');
     expect(text).toContain('Memory Maintenance');
     expect(text).toContain('Review stale memory');

@@ -5,9 +5,10 @@ use std::{
 
 use memory::store::session::{SessionEvent, SessionListOptions, SessionListPage, SessionMessage};
 use memory::{
-    MemoryError, RuntimeEvent, RuntimeEventPage, RuntimeEventScope, SessionRecord,
-    UnifiedSessionStore,
+    CognitiveContextManager, MemoryError, MemoryPulseReport, RuntimeEvent, RuntimeEventPage,
+    RuntimeEventScope, SessionRecord, UnifiedSessionStore,
 };
+use runtime::{AgentWorkGraph, CollaborationReviewPacket};
 use tokio::sync::Mutex;
 
 use crate::event_bus::SessionEventBus;
@@ -39,6 +40,15 @@ pub(crate) struct RuntimeCommandResult {
     pub kind: &'static str,
     pub persisted: bool,
     pub runtime_event_sequence: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RuntimeClosedLoopResult {
+    pub session_id: String,
+    pub persisted: bool,
+    pub runtime_event_sequence: Option<usize>,
+    pub memory_pulse: Option<MemoryPulseReport>,
+    pub degraded_reason: Option<String>,
 }
 
 impl RuntimeCommand {
@@ -324,6 +334,40 @@ impl SessionKernel {
         Ok(Some(sequence))
     }
 
+    pub(crate) async fn persist_workgraph_review(
+        &self,
+        graph: &AgentWorkGraph,
+        packet: &CollaborationReviewPacket,
+        memory_manager: Option<&Arc<CognitiveContextManager>>,
+    ) -> Result<RuntimeClosedLoopResult, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(RuntimeClosedLoopResult {
+                session_id: graph.session_id.clone(),
+                persisted: false,
+                runtime_event_sequence: None,
+                memory_pulse: None,
+                degraded_reason: Some("session store not available".to_string()),
+            });
+        };
+
+        let sequence = store.next_event_sequence(&graph.session_id).await?;
+        let event = graph.reviewed_runtime_event(sequence, packet);
+        store.append_runtime_event(&event).await?;
+
+        let memory_pulse = memory_manager
+            .map(|manager| manager.process_memory_pulse_runtime_event(&event))
+            .transpose()?
+            .flatten();
+
+        Ok(RuntimeClosedLoopResult {
+            session_id: graph.session_id.clone(),
+            persisted: true,
+            runtime_event_sequence: Some(sequence),
+            memory_pulse,
+            degraded_reason: None,
+        })
+    }
+
     pub(crate) async fn stored_runtime_events_page(
         &self,
         session_id: &str,
@@ -529,6 +573,74 @@ mod tests {
     use super::{RuntimeCommand, SessionKernel};
     use crate::event_bus::SessionEventBus;
     use crate::gateway::ActiveSessions;
+    use memory::{
+        MaintenanceCandidate, MaintenanceCandidateKind, MaintenanceCandidateStatus,
+    };
+    use runtime::{
+        AgentTaskTrace, AgentWorkGraph, CollaborationReviewPacket, CollaborationScorecard,
+        CollaborationTask,
+    };
+
+    fn scorecard() -> CollaborationScorecard {
+        CollaborationScorecard {
+            completion_rate: 1.0,
+            synthesis_lift: 1.2,
+            complementarity_score: 0.7,
+            active_memory_score: 0.5,
+            conflict_count: 0,
+            memory_pulse_count: 1,
+            surfaced_conflicts: Vec::new(),
+        }
+    }
+
+    fn review_packet() -> CollaborationReviewPacket {
+        let now = chrono::Utc::now();
+        CollaborationReviewPacket {
+            board_id: "board-closed-loop".to_string(),
+            parent_run_id: Some("parent-run".to_string()),
+            scorecard: scorecard(),
+            agent_tasks: vec![AgentTaskTrace {
+                task_id: "agent-review".to_string(),
+                parent_run_id: Some("parent-run".to_string()),
+                agent_run_id: Some("agent-run".to_string()),
+                role: "reviewer".to_string(),
+                objective: "review implementation".to_string(),
+                status: "completed".to_string(),
+                context_envelope_id: Some("ctx-1".to_string()),
+                result_summary: "accepted".to_string(),
+                evidence_refs: Vec::new(),
+                collaboration_board_id: "board-closed-loop".to_string(),
+                confidence: 0.9,
+                conflicts: Vec::new(),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            }],
+            maintenance_candidates: vec![MaintenanceCandidate {
+                id: "candidate-closed-loop".to_string(),
+                kind: MaintenanceCandidateKind::RelationshipRefresh,
+                status: MaintenanceCandidateStatus::Open,
+                entry_ids: Vec::new(),
+                summary: "refresh discovered relationship".to_string(),
+                reason: "agent review".to_string(),
+                confidence: 0.8,
+                source: Some("test".to_string()),
+                source_ref: Some("board-closed-loop".to_string()),
+                created_at: now,
+                updated_at: now,
+            }],
+        }
+    }
+
+    fn reviewed_graph(packet: &CollaborationReviewPacket) -> AgentWorkGraph {
+        let task = CollaborationTask {
+            description: "review implementation".to_string(),
+            required_skills: vec!["review".to_string()],
+            subtasks: Vec::new(),
+            review_criteria: None,
+        };
+        AgentWorkGraph::from_collaboration_task("closed-loop-session", &task)
+            .with_review_packet(packet)
+    }
 
     #[test]
     fn kernel_shares_session_runtime_store_and_event_bus_handles() {
@@ -741,5 +853,72 @@ mod tests {
 
         assert!(!result.persisted);
         assert_eq!(result.runtime_event_sequence, None);
+    }
+
+    #[tokio::test]
+    async fn runtime_closed_loop_persists_workgraph_review_event() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let kernel = SessionKernel::new(
+            Arc::new(ActiveSessions::new()),
+            Some(store.clone()),
+            SessionEventBus::new(),
+        );
+        kernel
+            .execute_runtime_command(RuntimeCommand::CreateSession {
+                session_id: "closed-loop-session".to_string(),
+                model: None,
+            })
+            .await
+            .unwrap();
+        let packet = review_packet();
+        let graph = reviewed_graph(&packet);
+
+        let result = kernel
+            .persist_workgraph_review(&graph, &packet, None)
+            .await
+            .unwrap();
+
+        assert!(result.persisted);
+        assert_eq!(result.runtime_event_sequence, Some(1));
+        assert!(result.memory_pulse.is_none());
+        let page = kernel
+            .stored_runtime_events_page("closed-loop-session", 0, 10)
+            .await
+            .unwrap()
+            .expect("runtime page");
+        assert_eq!(page.total, 2);
+        let review_event = page
+            .events
+            .iter()
+            .find(|event| event.kind == "agent.workgraph.reviewed")
+            .expect("review event");
+        assert_eq!(review_event.scope, memory::RuntimeEventScope::Workgraph);
+        assert_eq!(
+            review_event.payload["maintenance_candidates"][0]["id"],
+            "candidate-closed-loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_closed_loop_without_store_degrades_without_error() {
+        let kernel = SessionKernel::new(
+            Arc::new(ActiveSessions::new()),
+            None,
+            SessionEventBus::new(),
+        );
+        let packet = review_packet();
+        let graph = reviewed_graph(&packet);
+
+        let result = kernel
+            .persist_workgraph_review(&graph, &packet, None)
+            .await
+            .unwrap();
+
+        assert!(!result.persisted);
+        assert_eq!(result.runtime_event_sequence, None);
+        assert_eq!(
+            result.degraded_reason.as_deref(),
+            Some("session store not available")
+        );
     }
 }
