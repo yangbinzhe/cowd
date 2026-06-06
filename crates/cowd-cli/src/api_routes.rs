@@ -847,11 +847,13 @@ async fn context_current_handler(
         let runtime = runtime_entry.lock().await;
         if let Some(envelope) = runtime.last_context_envelope() {
             let lean_probe = ContextRuntimeKernel::lean_probe(&envelope);
+            let policy_decision = ContextRuntimeKernel::policy_decision(&lean_probe);
             return Json(serde_json::json!({
                 "enabled": true,
                 "source": "runtime",
                 "envelope": envelope,
                 "lean_probe": lean_probe,
+                "policy_decision": policy_decision,
             }));
         }
     }
@@ -933,11 +935,14 @@ async fn context_current_handler(
         total_budget_tokens: 8_000,
     });
     envelope.diagnostics.degraded_sources = degraded;
+    let lean_probe = ContextRuntimeKernel::lean_probe(&envelope);
+    let policy_decision = ContextRuntimeKernel::policy_decision(&lean_probe);
 
     Json(serde_json::json!({
         "enabled": true,
         "source": "synthetic",
-        "lean_probe": ContextRuntimeKernel::lean_probe(&envelope),
+        "lean_probe": lean_probe,
+        "policy_decision": policy_decision,
         "envelope": envelope,
     }))
 }
@@ -5605,6 +5610,14 @@ mod tests {
         assert_eq!(json["lean_probe"]["envelope_id"], json["envelope"]["id"]);
         assert_eq!(json["lean_probe"]["pressure_level"], "Nominal");
         assert_eq!(json["lean_probe"]["degradation_path"], "SourceFallback");
+        assert_eq!(
+            json["policy_decision"]["action"],
+            "PreferOrientationPacket"
+        );
+        assert_eq!(
+            json["policy_decision"]["stable_head_hash"],
+            json["lean_probe"]["stable_head_hash"]
+        );
     }
 
     #[tokio::test]

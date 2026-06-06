@@ -14,6 +14,8 @@ pub struct RuntimeActivityPanel {
     pressure_pct: u16,
     pressure_level: String,
     degradation_path: String,
+    policy_action: String,
+    policy_reason: String,
     selected_count: usize,
     omitted_count: usize,
     stable_hash: String,
@@ -34,10 +36,13 @@ impl RuntimeActivityPanel {
         self.session_id = app.session_id.clone();
         if let Some(envelope) = &app.latest_context_envelope {
             let probe = runtime::ContextRuntimeKernel::lean_probe(envelope);
+            let policy = runtime::ContextRuntimeKernel::policy_decision(&probe);
             self.profile = format!("{:?}", envelope.profile);
             self.pressure_pct = envelope.diagnostics.pressure_bp / 100;
             self.pressure_level = format!("{:?}", probe.pressure_level);
             self.degradation_path = format!("{:?}", probe.degradation_path);
+            self.policy_action = format!("{:?}", policy.action);
+            self.policy_reason = policy.reason;
             self.selected_count = envelope.selected.len();
             self.omitted_count = envelope.omitted.len();
             self.stable_hash = short_hash(&envelope.diagnostics.stable_head_hash);
@@ -52,6 +57,8 @@ impl RuntimeActivityPanel {
             self.pressure_pct = 0;
             self.pressure_level = "Nominal".to_string();
             self.degradation_path = "None".to_string();
+            self.policy_action = "None".to_string();
+            self.policy_reason = "context pressure nominal; no policy action required".to_string();
             self.selected_count = 0;
             self.omitted_count = 0;
             self.stable_hash = "n/a".to_string();
@@ -107,6 +114,13 @@ impl Component for RuntimeActivityPanel {
             Span::styled("Context:  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("selected {} omitted {}", self.selected_count, self.omitted_count),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Policy:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} - {}", self.policy_action, preview(&self.policy_reason, 72)),
                 Style::default().fg(Color::White),
             ),
         ]));

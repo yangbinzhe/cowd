@@ -119,7 +119,7 @@ window.Panels = (()=>{
     return sec;
   }
 
-  function renderLeanProbe(probe){
+  function renderLeanProbe(probe,policy){
     const sec=UI.el('div','context-lean-probe');
     if(!probe)return sec;
     sec.innerHTML='<h4>Runtime Probe</h4>';
@@ -130,7 +130,15 @@ window.Panels = (()=>{
     metrics.appendChild(renderMemoryMetric('omitted',probe.omitted_count||0,'items'));
     metrics.appendChild(renderMemoryMetric('stable',shortHash(probe.stable_head_hash),'cache'));
     metrics.appendChild(renderMemoryMetric('tail',shortHash(probe.dynamic_tail_hash),'cache'));
+    if(policy&&policy.action){
+      metrics.appendChild(renderMemoryMetric('policy',policy.action,'action'));
+    }
     sec.appendChild(metrics);
+    if(policy&&policy.reason){
+      const reason=UI.el('small','runtime-policy-reason');
+      reason.textContent=policy.reason;
+      sec.appendChild(reason);
+    }
     return sec;
   }
 
@@ -194,6 +202,7 @@ window.Panels = (()=>{
         const response=await Api.currentContext(opts);
         const envelope=(response&&response.envelope)||{};
         const leanProbe=(response&&response.lean_probe)||null;
+        const policyDecision=(response&&response.policy_decision)||null;
         const diagnostics=envelope.diagnostics||{};
         const budget=envelope.budget||{};
         const assembled=envelope.assembled||{};
@@ -218,7 +227,7 @@ window.Panels = (()=>{
         metrics.appendChild(renderMemoryMetric('runtime',shortHash(diagnostics.runtime_header_hash),'hash'));
         metrics.appendChild(renderMemoryMetric('dynamic',shortHash(diagnostics.dynamic_tail_hash),'hash'));
         overview.appendChild(metrics);
-        overview.appendChild(renderLeanProbe(leanProbe));
+        overview.appendChild(renderLeanProbe(leanProbe,policyDecision));
         if((diagnostics.degraded_sources||[]).length){
           const degraded=UI.el('div','context-degraded');
           degraded.textContent='degraded: '+diagnostics.degraded_sources.join(', ');
@@ -736,12 +745,14 @@ window.Panels = (()=>{
 
       let envelope={};
       let leanProbe=null;
+      let policyDecision=null;
       let diagnostics={};
       let budget={};
       try{
         const ctx=await Api.currentContext(opts);
         envelope=(ctx&&ctx.envelope)||{};
         leanProbe=(ctx&&ctx.lean_probe)||null;
+        policyDecision=(ctx&&ctx.policy_decision)||null;
         diagnostics=envelope.diagnostics||{};
         budget=envelope.budget||{};
       }catch(e){
@@ -756,7 +767,7 @@ window.Panels = (()=>{
       metrics.appendChild(renderMemoryMetric('used',budget.used_tokens||0,'tokens'));
       metrics.appendChild(renderMemoryMetric('stable',shortHash(diagnostics.stable_head_hash),'hash'));
       summary.appendChild(metrics);
-      summary.appendChild(renderLeanProbe(leanProbe));
+      summary.appendChild(renderLeanProbe(leanProbe,policyDecision));
       if((diagnostics.degraded_sources||[]).length){
         const degraded=UI.el('div','context-degraded');
         degraded.textContent='degraded: '+diagnostics.degraded_sources.join(', ');

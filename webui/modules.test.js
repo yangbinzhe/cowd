@@ -845,6 +845,10 @@ describe('API module', () => {
             stable_head_hash: 'stablehashabcdef',
             dynamic_tail_hash: 'dynamichashabcdef',
           },
+          policy_decision: {
+            action: 'PreferOrientationPacket',
+            reason: 'source fallback detected; prefer compact orientation before broad recall',
+          },
         })
       });
     }));
@@ -857,6 +861,7 @@ describe('API module', () => {
     expect(text).toContain('Context Runtime');
     expect(text).toContain('Runtime Probe');
     expect(text).toContain('SourceFallback');
+    expect(text).toContain('PreferOrientationPacket');
     expect(text).toContain('runtime');
     expect(text).toContain('SessionKernel owns durable sessions');
     expect(text).toContain('session://s1/memory/mem-1');
@@ -962,6 +967,10 @@ describe('API module', () => {
             stable_head_hash: 'stable-runtime-hash',
             dynamic_tail_hash: 'runtime-tail-hash',
           },
+          policy_decision: {
+            action: 'TrimToolTrace',
+            reason: 'high goal pressure; trim tool trace before task and memory context',
+          },
         })
       });
     }));
@@ -974,6 +983,7 @@ describe('API module', () => {
     expect(text).toContain('Runtime State');
     expect(text).toContain('Runtime Probe');
     expect(text).toContain('TrimDynamicTail');
+    expect(text).toContain('TrimToolTrace');
     expect(text).toContain('YoloGoal');
     expect(text).toContain('Runtime Runs');
     expect(text).toContain('spans');
