@@ -50,6 +50,7 @@ pub mod shared;
 pub mod splitter;
 pub mod state_rebuilder;
 pub mod store;
+pub mod runtime_event;
 pub mod search;
 pub mod types;
 pub mod aaak_compression;
@@ -90,6 +91,9 @@ pub use kernel::{
 pub use config::{MemoryConfig, TuningConfig, VectorConfig};
 pub use fresh_context::{
     FreshContextManager, FreshEntry, SessionTokenBudget, SessionBudgetStatus,
+};
+pub use runtime_event::{
+    RuntimeEvent, RuntimeEventPage, RuntimeEventScope, RuntimeRef, RUNTIME_EVENT_TYPE,
 };
 pub use session_store::UnifiedSessionStore;
 pub use store::session::{SessionEvent, SessionMessage, SessionRecord, SessionSearchResult, SessionSnapshot};
