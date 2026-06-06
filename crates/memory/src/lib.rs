@@ -42,6 +42,7 @@ pub mod kernel;
 pub mod layers;
 pub mod maintenance;
 pub mod memory_sync;
+pub mod memory_pulse;
 pub mod orchestrator;
 pub mod resolution;
 pub mod seeds;
@@ -80,6 +81,10 @@ pub use maintenance::{
     MaintenanceCandidate, MaintenanceCandidateFilter, MaintenanceCandidateKind,
     MaintenanceCandidateStatus, MaintenanceQueue, MaintenanceScanConfig,
     scan_maintenance_candidates,
+};
+pub use memory_pulse::{
+    MemoryPulseBatch, MemoryPulseConfig, MemoryPulseConsumer, MemoryPulseReport,
+    MemoryPulseTransition,
 };
 pub use cognitive::{CognitiveContextManager, SessionRestoreStats, VectorIndexStats};
 pub use kernel::{
