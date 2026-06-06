@@ -21,6 +21,7 @@ futures = "0.3"
 libc = "0.2"
 pulldown-cmark = "0.13"
 rustyline = "15"
+rusqlite = { version = "0.31", features = ["bundled"] }
 ratatui = "0.29"
 tui-textarea = "0.7"
 runtime = { path = "../runtime" }
@@ -49,4 +50,3 @@ mock-anthropic-service = { path = "../mock-anthropic-service" }
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
-

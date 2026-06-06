@@ -189,7 +189,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     }
     let profile_id = profile_manager.active_id();
     let task_kernel = Arc::new(
-        crate::task_kernel::TaskKernel::open(approval_dir.join("tasks.json"))
+        crate::task_kernel::TaskKernel::open(approval_dir.join("tasks.db"))
             .map_err(|e| format!("failed to initialize task kernel: {e}"))?,
     );
 

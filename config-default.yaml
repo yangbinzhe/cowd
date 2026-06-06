@@ -21,6 +21,39 @@ aliases:
   main: "claude-sonnet-4-6"
   fast: "claude-haiku-4-5-20251213"
 
+# =============================================================================
+# Runtime Control Plane
+# =============================================================================
+# 运行时控制面用于统一任务复杂度、Agent 协作、Context 预算、记忆脉冲和权限审查。
+# scenario 可选: coding | research | office | ops | personal
+runtime:
+  scenario: "coding"
+  control:
+    enabled: true
+    agent:
+      enabled: true
+      max_parallel_agents: 4
+      review_on_conflict: true
+      require_positive_lift: true
+      min_collaboration_score: 50
+    task:
+      auto_phase_for_yolo: true
+      review_after_each_phase: true
+      max_failures_before_review: 2
+    context:
+      preserve_stable_head: true
+      yolo_budget_tokens: 12000
+      collaboration_budget_tokens: 10000
+      review_budget_tokens: 9000
+      degrade_on_pressure_bp: 8500
+    memory:
+      emit_pulses_from_workgraph: true
+      review_conflicts: true
+      max_candidates_per_turn: 8
+    permission:
+      solo_honor_critical: true
+      review_critical_actions: true
+
 # 模型上下文窗口覆盖 (优先级高于内置静态表)
 # 格式: "模型名": token数
 # 使用场景: 自定义 API endpoint 的窗口大小不同、限制本地模型上下文等

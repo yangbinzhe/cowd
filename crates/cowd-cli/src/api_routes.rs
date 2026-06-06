@@ -5330,7 +5330,12 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_effective_config_exposes_default_control_policy() {
-        let app = api_router(test_state());
+        let root = test_temp_dir("runtime-control-default");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        let app = api_router(test_state_with_workspace(workspace, config_home));
         let response = app
             .oneshot(
                 Request::builder()
@@ -5345,6 +5350,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["source"], "default");
+        assert_eq!(json["scenario"], "coding");
         assert_eq!(json["control_policy"]["enabled"], true);
         assert_eq!(json["control_policy"]["agent"]["max_parallel_agents"], 4);
         assert_eq!(
@@ -5352,6 +5358,59 @@ mod tests {
             80
         );
         assert!(json["warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_effective_config_exposes_configured_control_policy() {
+        let root = test_temp_dir("runtime-control-config");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            config_home.join("config.yaml"),
+            r#"
+runtime:
+  scenario: office
+  control:
+    enabled: false
+    agent:
+      max_parallel_agents: 2
+      min_collaboration_score: 77
+    context:
+      yolo_budget_tokens: 7000
+"#,
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/config/effective")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source"], "config");
+        assert_eq!(json["scenario"], "office");
+        assert_eq!(json["control_policy"]["enabled"], false);
+        assert_eq!(json["control_policy"]["agent"]["max_parallel_agents"], 2);
+        assert_eq!(
+            json["control_policy"]["agent"]["min_collaboration_score"],
+            77
+        );
+        assert_eq!(
+            json["control_policy"]["context"]["yolo_budget_tokens"],
+            7000
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn test_context_envelope(

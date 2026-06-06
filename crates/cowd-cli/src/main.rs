@@ -7712,7 +7712,7 @@ pub(crate) fn ensure_yolo_task(
         return Ok(None);
     }
     let kernel =
-        task_kernel::TaskKernel::open(runtime::cowd_dirs::config_home_dir().join("tasks.json"))?;
+        task_kernel::TaskKernel::open(runtime::cowd_dirs::config_home_dir().join("tasks.db"))?;
     if let Some(current) = kernel.current() {
         return Ok(Some(current));
     }
@@ -10965,7 +10965,7 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(second.objective, "ship v0.8.10");
-        assert!(config_home.join("tasks.json").is_file());
+        assert!(config_home.join("tasks.db").is_file());
 
         match original {
             Some(value) => std::env::set_var("COWD_CONFIG_HOME", value),

@@ -326,6 +326,8 @@ pub struct ConversationRuntime<C, T> {
     last_context_envelope: std::sync::Mutex<Option<ContextEnvelope>>,
     /// Active context profile used to assemble the next runtime envelope.
     context_profile: std::sync::Mutex<ContextProfile>,
+    /// Effective runtime control policy loaded from configuration.
+    runtime_control_policy: RuntimeControlPolicy,
     /// Runtime-owned context supplied by outer orchestration layers.
     external_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// Latest multi-agent collaboration packet for outer persistence.
@@ -502,6 +504,7 @@ where
             tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
             last_context_envelope: std::sync::Mutex::new(None),
             context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
+            runtime_control_policy: feature_config.runtime_control().policy.clone(),
             external_context_items: std::sync::Mutex::new(Vec::new()),
             last_collaboration_result: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
@@ -899,6 +902,12 @@ where
         self
     }
 
+    #[must_use]
+    pub fn with_runtime_control_policy(mut self, policy: RuntimeControlPolicy) -> Self {
+        self.runtime_control_policy = policy;
+        self
+    }
+
     /// P2-10: Register an EffectHandler for side-effect tracking.
     ///
     /// # Safety
@@ -1040,6 +1049,7 @@ where
             sub_rt.model = Some(m.clone());
         }
         sub_rt.set_context_profile(ContextProfile::SubAgent);
+        sub_rt.runtime_control_policy = self.runtime_control_policy.clone();
         sub_rt = sub_rt.with_model_context_window(lease.max_tokens.min(u64::from(u32::MAX)) as u32);
         sub_rt.max_iterations = config.max_turns;
         sub_rt.tool_orchestrator = self.tool_orchestrator.clone();
@@ -1070,10 +1080,11 @@ where
 
     /// Determine whether the current user message warrants multi-agent collaboration.
     fn should_use_collaboration(&self, user_message: &str) -> bool {
-        RuntimeControlPolicy::default().should_collaborate(&TaskComplexityInput::new(
-            user_message,
-            self.context_profile(),
-        ))
+        self.runtime_control_policy
+            .should_collaborate(&TaskComplexityInput::new(
+                user_message,
+                self.context_profile(),
+            ))
     }
 
     /// Infer required capability keywords from a task description.
@@ -1329,11 +1340,12 @@ where
             &ConversationMessage::user_text(user_input.clone()),
             user_sequence,
         );
-        let control_policy = RuntimeControlPolicy::default();
-        let complexity = control_policy.profile_task(&TaskComplexityInput::new(
-            user_input.clone(),
-            self.context_profile(),
-        ));
+        let complexity = self
+            .runtime_control_policy
+            .profile_task(&TaskComplexityInput::new(
+                user_input.clone(),
+                self.context_profile(),
+            ));
         self.record_runtime_policy_decision(&complexity, user_sequence);
 
         let mut effective_system_prompt = self.prepare_memory_context(&user_input).await;
@@ -4381,6 +4393,32 @@ mod tests {
 
         assert!(runtime.take_collaboration_result().is_some());
         assert!(runtime.take_collaboration_result().is_none());
+    }
+
+    #[test]
+    fn runtime_control_policy_disables_collaboration_routing() {
+        let session = Session::new();
+        let mut policy = crate::runtime_control::RuntimeControlPolicy::default();
+        policy.agent.enabled = false;
+        let features = RuntimeFeatureConfig::default().with_runtime_control(
+            crate::config::RuntimeControlConfig {
+                scenario: crate::config::DomainProfile::Coding,
+                policy,
+            },
+        );
+        let runtime = ConversationRuntime::new_with_features(
+            session,
+            MockApi,
+            Arc::new(StaticToolExecutor::new()),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+            &features,
+        )
+        .without_memory();
+
+        assert!(!runtime.should_use_collaboration(
+            "please refactor the architecture, design a multi agent plan, implement tests, and review risks"
+        ));
     }
 
     #[test]

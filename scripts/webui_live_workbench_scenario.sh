@@ -79,7 +79,9 @@ curl -fsS "$BASE_URL/health" >/dev/null
       --config=playwright.live.config.js \
       --browser=chromium)
 
-rg -q "Live WebUI workbench enterprise scenario" "$CONFIG_HOME/tasks.json"
-rg -q "accepted by live browser scenario" "$CONFIG_HOME/tasks.json"
+sqlite3 "$CONFIG_HOME/tasks.db" "SELECT record_json FROM tasks;" \
+  | rg -q "Live WebUI workbench enterprise scenario"
+sqlite3 "$CONFIG_HOME/tasks.db" "SELECT record_json FROM tasks;" \
+  | rg -q "accepted by live browser scenario"
 
 echo "live WebUI workbench scenario passed"

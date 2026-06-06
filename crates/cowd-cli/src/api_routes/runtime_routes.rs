@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::{AppState, ErrorResponse};
 use memory::RuntimeEvent;
-use runtime::RuntimeControlPolicy;
+use runtime::{ConfigLoader, RuntimeConfig};
 
 #[derive(Deserialize)]
 pub(super) struct RuntimeTimelineParams {
@@ -75,12 +75,30 @@ pub(super) async fn get_runtime_timeline(
 pub(super) async fn get_runtime_effective_config(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
+    let (source, runtime_config, warnings) =
+        match ConfigLoader::new(&state.workspace_root, &state.config_home).load() {
+            Ok(config) => {
+                let source = if config.loaded_entries().is_empty() {
+                    "default"
+                } else {
+                    "config"
+                };
+                (source, config, Vec::<String>::new())
+            }
+            Err(error) => (
+                "default",
+                RuntimeConfig::empty(),
+                vec![format!("failed to load runtime config: {error}")],
+            ),
+        };
+    let control = runtime_config.runtime_control();
     Json(serde_json::json!({
-        "source": "default",
+        "source": source,
         "workspace_root": state.workspace_root,
         "profile_id": state.profile_id,
-        "control_policy": RuntimeControlPolicy::default(),
-        "warnings": [],
+        "scenario": control.scenario.as_str(),
+        "control_policy": control.policy,
+        "warnings": warnings,
     }))
 }
 

@@ -11,6 +11,7 @@ pub static PENDING_WARNINGS: std::sync::LazyLock<Mutex<Vec<crate::cowd_event::Co
 use serde::{Deserialize, Serialize};
 
 use crate::json::JsonValue;
+use crate::runtime_control::RuntimeControlPolicy;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
 // ── Config Error Types ─────────────────────────────────────────────────
@@ -76,14 +77,27 @@ pub struct ApprovalConfig {
 
 impl Default for ApprovalConfig {
     fn default() -> Self {
-        Self { solo_mode: false, solo_honor_critical: true, auto_pass_read_only: true, auto_pass_low_risk: true }
+        Self {
+            solo_mode: false,
+            solo_honor_critical: true,
+            auto_pass_read_only: true,
+            auto_pass_low_risk: true,
+        }
     }
 }
 
 impl ApprovalConfig {
-    pub fn new() -> Self { Self::default() }
-    pub fn with_solo_mode(mut self, enabled: bool) -> Self { self.solo_mode = enabled; self }
-    pub fn with_solo_honor_critical(mut self, honor: bool) -> Self { self.solo_honor_critical = honor; self }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_solo_mode(mut self, enabled: bool) -> Self {
+        self.solo_mode = enabled;
+        self
+    }
+    pub fn with_solo_honor_critical(mut self, honor: bool) -> Self {
+        self.solo_honor_critical = honor;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,8 +148,6 @@ pub struct OAuthConfig {
 
 // ── Runtime Config Types ───────────────────────────────────────────────
 
-
-
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RuntimeHookConfig {
     #[serde(default)]
@@ -148,15 +160,29 @@ pub struct RuntimeHookConfig {
 
 impl RuntimeHookConfig {
     #[must_use]
-    pub fn new(pre_tool_use: Vec<String>, post_tool_use: Vec<String>, post_tool_use_failure: Vec<String>) -> Self {
-        Self { pre_tool_use, post_tool_use, post_tool_use_failure }
+    pub fn new(
+        pre_tool_use: Vec<String>,
+        post_tool_use: Vec<String>,
+        post_tool_use_failure: Vec<String>,
+    ) -> Self {
+        Self {
+            pre_tool_use,
+            post_tool_use,
+            post_tool_use_failure,
+        }
     }
     #[must_use]
-    pub fn pre_tool_use(&self) -> &[String] { &self.pre_tool_use }
+    pub fn pre_tool_use(&self) -> &[String] {
+        &self.pre_tool_use
+    }
     #[must_use]
-    pub fn post_tool_use(&self) -> &[String] { &self.post_tool_use }
+    pub fn post_tool_use(&self) -> &[String] {
+        &self.post_tool_use
+    }
     #[must_use]
-    pub fn post_tool_use_failure(&self) -> &[String] { &self.post_tool_use_failure }
+    pub fn post_tool_use_failure(&self) -> &[String] {
+        &self.post_tool_use_failure
+    }
     #[must_use]
     pub fn merged(&self, other: &Self) -> Self {
         let mut merged = self.clone();
@@ -164,12 +190,27 @@ impl RuntimeHookConfig {
         merged
     }
     pub fn extend(&mut self, other: &Self) {
-        let mut pre_set: std::collections::HashSet<String> = self.pre_tool_use.iter().cloned().collect();
-        for item in &other.pre_tool_use { if pre_set.insert(item.clone()) { self.pre_tool_use.push(item.clone()); } }
-        let mut post_set: std::collections::HashSet<String> = self.post_tool_use.iter().cloned().collect();
-        for item in &other.post_tool_use { if post_set.insert(item.clone()) { self.post_tool_use.push(item.clone()); } }
-        let mut fail_set: std::collections::HashSet<String> = self.post_tool_use_failure.iter().cloned().collect();
-        for item in &other.post_tool_use_failure { if fail_set.insert(item.clone()) { self.post_tool_use_failure.push(item.clone()); } }
+        let mut pre_set: std::collections::HashSet<String> =
+            self.pre_tool_use.iter().cloned().collect();
+        for item in &other.pre_tool_use {
+            if pre_set.insert(item.clone()) {
+                self.pre_tool_use.push(item.clone());
+            }
+        }
+        let mut post_set: std::collections::HashSet<String> =
+            self.post_tool_use.iter().cloned().collect();
+        for item in &other.post_tool_use {
+            if post_set.insert(item.clone()) {
+                self.post_tool_use.push(item.clone());
+            }
+        }
+        let mut fail_set: std::collections::HashSet<String> =
+            self.post_tool_use_failure.iter().cloned().collect();
+        for item in &other.post_tool_use_failure {
+            if fail_set.insert(item.clone()) {
+                self.post_tool_use_failure.push(item.clone());
+            }
+        }
     }
 }
 
@@ -185,13 +226,21 @@ pub struct RuntimePermissionRuleConfig {
 
 impl RuntimePermissionRuleConfig {
     #[must_use]
-    pub fn new(allow: Vec<String>, deny: Vec<String>, ask: Vec<String>) -> Self { Self { allow, deny, ask } }
+    pub fn new(allow: Vec<String>, deny: Vec<String>, ask: Vec<String>) -> Self {
+        Self { allow, deny, ask }
+    }
     #[must_use]
-    pub fn allow(&self) -> &[String] { &self.allow }
+    pub fn allow(&self) -> &[String] {
+        &self.allow
+    }
     #[must_use]
-    pub fn deny(&self) -> &[String] { &self.deny }
+    pub fn deny(&self) -> &[String] {
+        &self.deny
+    }
     #[must_use]
-    pub fn ask(&self) -> &[String] { &self.ask }
+    pub fn ask(&self) -> &[String] {
+        &self.ask
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,27 +267,44 @@ impl Default for RuntimePluginConfig {
             install_root: None,
             registry_path: None,
             bundled_root: None,
-            max_output_tokens: std::env::var("COWD_MAX_OUTPUT_TOKENS").ok().and_then(|v| v.parse().ok()),
+            max_output_tokens: std::env::var("COWD_MAX_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         }
     }
 }
 
 impl RuntimePluginConfig {
     #[must_use]
-    pub fn enabled_plugins(&self) -> &BTreeMap<String, bool> { &self.enabled_plugins }
+    pub fn enabled_plugins(&self) -> &BTreeMap<String, bool> {
+        &self.enabled_plugins
+    }
     #[must_use]
-    pub fn external_directories(&self) -> &[String] { &self.external_directories }
+    pub fn external_directories(&self) -> &[String] {
+        &self.external_directories
+    }
     #[must_use]
-    pub fn install_root(&self) -> Option<&str> { self.install_root.as_deref() }
+    pub fn install_root(&self) -> Option<&str> {
+        self.install_root.as_deref()
+    }
     #[must_use]
-    pub fn registry_path(&self) -> Option<&str> { self.registry_path.as_deref() }
+    pub fn registry_path(&self) -> Option<&str> {
+        self.registry_path.as_deref()
+    }
     #[must_use]
-    pub fn bundled_root(&self) -> Option<&str> { self.bundled_root.as_deref() }
+    pub fn bundled_root(&self) -> Option<&str> {
+        self.bundled_root.as_deref()
+    }
     #[must_use]
-    pub fn max_output_tokens(&self) -> Option<u32> { self.max_output_tokens }
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
     #[must_use]
     pub fn state_for(&self, plugin_id: &str, default_enabled: bool) -> bool {
-        self.enabled_plugins.get(plugin_id).copied().unwrap_or(default_enabled)
+        self.enabled_plugins
+            .get(plugin_id)
+            .copied()
+            .unwrap_or(default_enabled)
     }
 }
 
@@ -271,13 +337,25 @@ pub struct LayerConfig {
     pub l4_enabled: bool,
 }
 
-fn default_l1_max_tokens() -> u32 { 2000 }
-fn default_l2_max_tokens() -> u32 { 3000 }
-fn default_l3_search_limit() -> u32 { 5 }
+fn default_l1_max_tokens() -> u32 {
+    2000
+}
+fn default_l2_max_tokens() -> u32 {
+    3000
+}
+fn default_l3_search_limit() -> u32 {
+    5
+}
 
 impl Default for LayerConfig {
     fn default() -> Self {
-        Self { l0_enabled: true, l1_max_tokens: 2000, l2_max_tokens: 3000, l3_search_limit: 5, l4_enabled: false }
+        Self {
+            l0_enabled: true,
+            l1_max_tokens: 2000,
+            l2_max_tokens: 3000,
+            l3_search_limit: 5,
+            l4_enabled: false,
+        }
     }
 }
 
@@ -301,13 +379,24 @@ pub struct VectorConfig {
     pub batch_size: usize,
 }
 
-fn default_timeout() -> u64 { 30 }
-fn default_batch_size() -> usize { 32 }
+fn default_timeout() -> u64 {
+    30
+}
+fn default_batch_size() -> usize {
+    32
+}
 
 impl Default for VectorConfig {
     fn default() -> Self {
-        Self { enabled: false, model: String::new(), api_url: String::new(), api_key: String::new(),
-               dimension: 0, timeout_secs: 30, batch_size: 32 }
+        Self {
+            enabled: false,
+            model: String::new(),
+            api_url: String::new(),
+            api_key: String::new(),
+            dimension: 0,
+            timeout_secs: 30,
+            batch_size: 32,
+        }
     }
 }
 
@@ -323,12 +412,22 @@ pub struct MicroCompactConfig {
     pub time_decay_factor: f32,
 }
 
-fn default_tool_result_max_chars() -> u32 { 4000 }
-fn default_decay_factor() -> f32 { 0.9 }
+fn default_tool_result_max_chars() -> u32 {
+    4000
+}
+fn default_decay_factor() -> f32 {
+    0.9
+}
 
 impl Eq for MicroCompactConfig {}
 impl Default for MicroCompactConfig {
-    fn default() -> Self { Self { enabled: true, tool_result_max_chars: 4000, time_decay_factor: 0.9 } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tool_result_max_chars: 4000,
+            time_decay_factor: 0.9,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -343,13 +442,28 @@ pub struct SessionCompactConfig {
     pub buffer_tokens: u32,
 }
 
-fn default_session_threshold_tokens() -> u32 { 80000 }
-fn default_preserve_recent() -> u32 { 6 }
-fn default_summary_max() -> u32 { 2000 }
-fn default_buffer_tokens() -> u32 { 13000 }
+fn default_session_threshold_tokens() -> u32 {
+    80000
+}
+fn default_preserve_recent() -> u32 {
+    6
+}
+fn default_summary_max() -> u32 {
+    2000
+}
+fn default_buffer_tokens() -> u32 {
+    13000
+}
 
 impl Default for SessionCompactConfig {
-    fn default() -> Self { Self { threshold_tokens: 80000, preserve_recent: 6, summary_max_tokens: 2000, buffer_tokens: 13000 } }
+    fn default() -> Self {
+        Self {
+            threshold_tokens: 80000,
+            preserve_recent: 6,
+            summary_max_tokens: 2000,
+            buffer_tokens: 13000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -361,7 +475,12 @@ pub struct DeepCompactConfig {
 }
 
 impl Default for DeepCompactConfig {
-    fn default() -> Self { Self { enabled: true, iterative_update: true } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            iterative_update: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -372,11 +491,20 @@ pub struct CircuitBreakerConfig {
     pub cooldown_secs: u32,
 }
 
-fn default_max_retries_3() -> u32 { 3 }
-fn default_cooldown_secs() -> u32 { 30 }
+fn default_max_retries_3() -> u32 {
+    3
+}
+fn default_cooldown_secs() -> u32 {
+    30
+}
 
 impl Default for CircuitBreakerConfig {
-    fn default() -> Self { Self { max_retries: 3, cooldown_secs: 30 } }
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            cooldown_secs: 30,
+        }
+    }
 }
 
 // ── Compression Config ─────────────────────────────────────────────────
@@ -395,7 +523,9 @@ pub struct CompressionConfig {
     pub llm: LlmSummarizerConfig,
 }
 
-fn default_true_bool() -> bool { true }
+fn default_true_bool() -> bool {
+    true
+}
 
 impl Eq for CompressionConfig {}
 impl Default for CompressionConfig {
@@ -430,12 +560,19 @@ impl LlmSummarizerConfig {
     }
 }
 
-fn default_llm_model() -> String { "gpt-4o-mini".to_string() }
+fn default_llm_model() -> String {
+    "gpt-4o-mini".to_string()
+}
 
 impl Eq for LlmSummarizerConfig {}
 impl Default for LlmSummarizerConfig {
     fn default() -> Self {
-        Self { enabled: false, api_url: String::new(), api_key: String::new(), model: "gpt-4o-mini".to_string() }
+        Self {
+            enabled: false,
+            api_url: String::new(),
+            api_key: String::new(),
+            model: "gpt-4o-mini".to_string(),
+        }
     }
 }
 
@@ -474,6 +611,46 @@ pub struct RuntimeFeatureConfig {
     compression: CompressionConfig,
     gateway: GatewayConfig,
     gate_auto_fix: GateAutoFixConfig,
+    runtime_control: RuntimeControlConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainProfile {
+    #[default]
+    Coding,
+    Research,
+    Office,
+    Ops,
+    Personal,
+}
+
+impl DomainProfile {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Coding => "coding",
+            Self::Research => "research",
+            Self::Office => "office",
+            Self::Ops => "ops",
+            Self::Personal => "personal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeControlConfig {
+    pub scenario: DomainProfile,
+    pub policy: RuntimeControlPolicy,
+}
+
+impl Default for RuntimeControlConfig {
+    fn default() -> Self {
+        Self {
+            scenario: DomainProfile::Coding,
+            policy: RuntimeControlPolicy::default(),
+        }
+    }
 }
 
 /// Configuration for a single named provider (OpenAI-compatible endpoint).
@@ -535,7 +712,9 @@ impl ProvidersConfig {
     /// or `None` if no provider claims the model.
     #[must_use]
     pub fn resolve_full(&self, model: &str) -> Option<&ProviderConfig> {
-        self.providers.values().find(|p| p.models.iter().any(|m| m == model))
+        self.providers
+            .values()
+            .find(|p| p.models.iter().any(|m| m == model))
     }
 
     /// Returns the named provider if it exists.
@@ -557,7 +736,6 @@ pub struct ScopedMcpServerConfig {
     pub scope: ConfigSource,
     pub config: McpServerConfig,
 }
-
 
 /// Scope-normalized MCP server configuration variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -608,8 +786,6 @@ pub struct McpManagedProxyServerConfig {
     pub url: String,
     pub id: String,
 }
-
-
 
 // ---- Memory configuration ----
 
@@ -747,41 +923,34 @@ impl ConfigLoader {
     #[must_use]
     pub fn discover(&self) -> Vec<ConfigEntry> {
         let cc_user_dir = &self.config_home;
+        let entry = |source, path: PathBuf| ConfigEntry {
+            exists: path.exists(),
+            source,
+            path,
+        };
 
         vec![
             // ── User-level: ~/.cc paths ──────────────────────────────────────
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::User,
-                path: cc_user_dir.join("config.yaml"),
-            },
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::User,
-                path: cc_user_dir.join("config.yml"),
-            },
+            entry(ConfigSource::User, cc_user_dir.join("config.yaml")),
+            entry(ConfigSource::User, cc_user_dir.join("config.yml")),
             // ── Project-level: .cowd/ paths ──────────────────────────────────
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::Project,
-                path: self.cwd.join(".cowd").join("config.yaml"),
-            },
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::Project,
-                path: self.cwd.join(".cowd").join("config.yml"),
-            },
+            entry(
+                ConfigSource::Project,
+                self.cwd.join(".cowd").join("config.yaml"),
+            ),
+            entry(
+                ConfigSource::Project,
+                self.cwd.join(".cowd").join("config.yml"),
+            ),
             // ── Local overrides: highest priority ────────────────────────────
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::Local,
-                path: self.cwd.join(".cowd").join("config.local.yaml"),
-            },
-            ConfigEntry {
-                exists: true,
-                source: ConfigSource::Local,
-                path: self.cwd.join(".cowd").join("config.local.yml"),
-            },
+            entry(
+                ConfigSource::Local,
+                self.cwd.join(".cowd").join("config.local.yaml"),
+            ),
+            entry(
+                ConfigSource::Local,
+                self.cwd.join(".cowd").join("config.local.yml"),
+            ),
         ]
     }
 
@@ -831,7 +1000,9 @@ impl ConfigLoader {
         for warning in &all_warnings {
             tracing::warn!("{warning}");
             if let Ok(mut w) = PENDING_WARNINGS.lock() {
-                w.push(crate::cowd_event::CowdEvent::Warning { message: warning.to_string() });
+                w.push(crate::cowd_event::CowdEvent::Warning {
+                    message: warning.to_string(),
+                });
             }
         }
 
@@ -858,6 +1029,7 @@ impl ConfigLoader {
             compression: parse_optional_compression_config(&merged_value)?,
             gateway: parse_optional_gateway_config(&merged_value)?,
             gate_auto_fix: parse_optional_gate_auto_fix_config(&merged_value)?,
+            runtime_control: parse_optional_runtime_control_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -992,6 +1164,11 @@ impl RuntimeConfig {
     pub fn gate_auto_fix(&self) -> &GateAutoFixConfig {
         &self.feature_config.gate_auto_fix
     }
+
+    #[must_use]
+    pub fn runtime_control(&self) -> &RuntimeControlConfig {
+        &self.feature_config.runtime_control
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -1004,6 +1181,12 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn with_plugins(mut self, plugins: RuntimePluginConfig) -> Self {
         self.plugins = plugins;
+        self
+    }
+
+    #[must_use]
+    pub fn with_runtime_control(mut self, runtime_control: RuntimeControlConfig) -> Self {
+        self.runtime_control = runtime_control;
         self
     }
 
@@ -1101,6 +1284,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn gate_auto_fix(&self) -> &GateAutoFixConfig {
         &self.gate_auto_fix
+    }
+
+    #[must_use]
+    pub fn runtime_control(&self) -> &RuntimeControlConfig {
+        &self.runtime_control
     }
 }
 impl McpConfigCollection {
@@ -1372,7 +1560,9 @@ fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, 
     Ok(optional_string_map(object, "aliases", "merged settings")?.unwrap_or_default())
 }
 
-fn parse_optional_model_context_windows(root: &JsonValue) -> Result<BTreeMap<String, u32>, ConfigError> {
+fn parse_optional_model_context_windows(
+    root: &JsonValue,
+) -> Result<BTreeMap<String, u32>, ConfigError> {
     let Some(object) = root.as_object() else {
         return Ok(BTreeMap::new());
     };
@@ -1380,16 +1570,22 @@ fn parse_optional_model_context_windows(root: &JsonValue) -> Result<BTreeMap<Str
         return Ok(BTreeMap::new());
     };
     let map = val.as_object().ok_or_else(|| {
-        ConfigError::Parse("merged settings: field model_context_windows must be an object".to_string())
+        ConfigError::Parse(
+            "merged settings: field model_context_windows must be an object".to_string(),
+        )
     })?;
     let mut result = BTreeMap::new();
     for (k, v) in map {
-        let num: i64 = v.as_i64().ok_or_else(|| ConfigError::Parse(format!(
-            "merged settings: field model_context_windows.{k} must be a number"
-        )))?;
-        let n: u32 = num.try_into().map_err(|_| ConfigError::Parse(format!(
-            "merged settings: field model_context_windows.{k} value out of u32 range"
-        )))?;
+        let num: i64 = v.as_i64().ok_or_else(|| {
+            ConfigError::Parse(format!(
+                "merged settings: field model_context_windows.{k} must be a number"
+            ))
+        })?;
+        let n: u32 = num.try_into().map_err(|_| {
+            ConfigError::Parse(format!(
+                "merged settings: field model_context_windows.{k} value out of u32 range"
+            ))
+        })?;
         result.insert(k.clone(), n);
     }
     Ok(result)
@@ -1465,10 +1661,30 @@ fn parse_optional_approval_config(root: &JsonValue) -> Result<ApprovalConfig, Co
     };
 
     Ok(ApprovalConfig {
-        solo_mode: optional_bool(approval, "solo_mode", "merged settings.permissions.approval")?.unwrap_or(false),
-        solo_honor_critical: optional_bool(approval, "solo_honor_critical", "merged settings.permissions.approval")?.unwrap_or(true),
-        auto_pass_read_only: optional_bool(approval, "auto_pass_read_only", "merged settings.permissions.approval")?.unwrap_or(true),
-        auto_pass_low_risk: optional_bool(approval, "auto_pass_low_risk", "merged settings.permissions.approval")?.unwrap_or(true),
+        solo_mode: optional_bool(
+            approval,
+            "solo_mode",
+            "merged settings.permissions.approval",
+        )?
+        .unwrap_or(false),
+        solo_honor_critical: optional_bool(
+            approval,
+            "solo_honor_critical",
+            "merged settings.permissions.approval",
+        )?
+        .unwrap_or(true),
+        auto_pass_read_only: optional_bool(
+            approval,
+            "auto_pass_read_only",
+            "merged settings.permissions.approval",
+        )?
+        .unwrap_or(true),
+        auto_pass_low_risk: optional_bool(
+            approval,
+            "auto_pass_low_risk",
+            "merged settings.permissions.approval",
+        )?
+        .unwrap_or(true),
     })
 }
 
@@ -1492,19 +1708,25 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
     }
     config.external_directories =
         optional_string_array(plugins, "externalDirectories", "merged settings.plugins")?
-            .map(|v| v.into_iter().map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string()).collect())
+            .map(|v| {
+                v.into_iter()
+                    .map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string())
+                    .collect()
+            })
             .unwrap_or_default();
-    config.install_root =
-        optional_string_dual(plugins, "install_root", "merged settings.plugins")?
-            .map(|s| crate::cowd_dirs::expand_tilde(s).display().to_string());
+    config.install_root = optional_string_dual(plugins, "install_root", "merged settings.plugins")?
+        .map(|s| crate::cowd_dirs::expand_tilde(s).display().to_string());
     config.registry_path =
         optional_string_dual(plugins, "registry_path", "merged settings.plugins")?
             .map(|s| crate::cowd_dirs::expand_tilde(s).display().to_string());
-    config.bundled_root =
-        optional_string_dual(plugins, "bundled_root", "merged settings.plugins")?
-            .map(|s| crate::cowd_dirs::expand_tilde(s).display().to_string());
+    config.bundled_root = optional_string_dual(plugins, "bundled_root", "merged settings.plugins")?
+        .map(|s| crate::cowd_dirs::expand_tilde(s).display().to_string());
     config.max_output_tokens = optional_u32(plugins, "maxOutputTokens", "merged settings.plugins")?
-        .or_else(|| std::env::var("COWD_MAX_OUTPUT_TOKENS").ok().and_then(|v| v.parse().ok()));
+        .or_else(|| {
+            std::env::var("COWD_MAX_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        });
     Ok(config)
 }
 
@@ -1550,9 +1772,10 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         return Ok(SandboxConfig::default());
     };
     let sandbox = expect_object(sandbox_value, "merged settings.sandbox")?;
-    let filesystem_mode = optional_string_dual(sandbox, "filesystem_mode", "merged settings.sandbox")?
-        .map(parse_filesystem_mode_label)
-        .transpose()?;
+    let filesystem_mode =
+        optional_string_dual(sandbox, "filesystem_mode", "merged settings.sandbox")?
+            .map(parse_filesystem_mode_label)
+            .transpose()?;
     Ok(SandboxConfig {
         enabled: optional_bool(sandbox, "enabled", "merged settings.sandbox")?,
         namespace_restrictions: optional_bool(
@@ -1563,15 +1786,25 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         network_isolation: optional_bool(sandbox, "networkIsolation", "merged settings.sandbox")?,
         filesystem_mode,
         allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
-            .map(|v| v.into_iter().map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string()).collect())
+            .map(|v| {
+                v.into_iter()
+                    .map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string())
+                    .collect()
+            })
             .unwrap_or_default(),
     })
 }
 
 fn parse_fallbacks(root: &JsonValue) -> Vec<String> {
-    let Some(object) = root.as_object() else { return vec![] };
+    let Some(object) = root.as_object() else {
+        return vec![];
+    };
     if let Some(arr) = object.get("fallbacks").and_then(|v| v.as_array()) {
-        return arr.iter().filter_map(|v| v.as_str()).map(str::to_string).collect();
+        return arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect();
     }
     if let Some(v) = find_key_dual(object, "provider_fallbacks", "merged settings") {
         let msg = "'providerFallbacks' is deprecated, use 'fallbacks' instead. All per-model chains are now merged into a single global list.".to_string();
@@ -1594,7 +1827,9 @@ fn extract_fallbacks_from_legacy(value: &JsonValue) -> Vec<String> {
     match value {
         JsonValue::Array(items) => {
             for item in items {
-                if let JsonValue::Object(ref entry) = item { process(entry); }
+                if let JsonValue::Object(ref entry) = item {
+                    process(entry);
+                }
             }
         }
         JsonValue::Object(ref entry) => process(entry),
@@ -1641,10 +1876,8 @@ fn parse_optional_providers_config(root: &JsonValue) -> Result<ProvidersConfig, 
         let api_key = optional_string_dual(entry, "api_key", &ctx)?
             .map(str::to_string)
             .unwrap_or_default();
-        let models =
-            optional_string_array(entry, "models", &ctx)?.unwrap_or_default();
-        let protocol = optional_string_dual(entry, "protocol", &ctx)?
-            .map(str::to_string);
+        let models = optional_string_array(entry, "models", &ctx)?.unwrap_or_default();
+        let protocol = optional_string_dual(entry, "protocol", &ctx)?.map(str::to_string);
 
         if let Some(ref p) = protocol {
             if p != "anthropic" && p != "openai-compat" {
@@ -1677,7 +1910,11 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
     };
     Ok(
         optional_string_array_dual(object, "trusted_roots", "merged settings")?
-            .map(|v| v.into_iter().map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string()).collect())
+            .map(|v| {
+                v.into_iter()
+                    .map(|s| crate::cowd_dirs::expand_tilde(&s).display().to_string())
+                    .collect()
+            })
             .unwrap_or_default(),
     )
 }
@@ -1702,17 +1939,19 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
                 .unwrap_or(LayerConfig::default().l1_max_tokens),
             l2_max_tokens: optional_u32_dual(l, "l2_max_tokens", "merged settings.memory.layers")?
                 .unwrap_or(LayerConfig::default().l2_max_tokens),
-            l3_search_limit: optional_u32_dual(l, "l3_search_limit", "merged settings.memory.layers")?
-                .unwrap_or(LayerConfig::default().l3_search_limit),
+            l3_search_limit: optional_u32_dual(
+                l,
+                "l3_search_limit",
+                "merged settings.memory.layers",
+            )?
+            .unwrap_or(LayerConfig::default().l3_search_limit),
             l4_enabled: optional_bool_dual(l, "l4_enabled", "merged settings.memory.layers")?
                 .unwrap_or(LayerConfig::default().l4_enabled),
         }
     } else {
         LayerConfig::default()
     };
-    let extraction = if let Some(ext_val) = mem.get("extraction")
-        .or_else(|| mem.get("extractor"))
-    {
+    let extraction = if let Some(ext_val) = mem.get("extraction").or_else(|| mem.get("extractor")) {
         let e = expect_object(ext_val, "merged settings.memory.extraction")?;
         ExtractionConfig {
             auto_extract: optional_bool(e, "autoExtract", "merged settings.memory.extraction")?
@@ -1807,10 +2046,18 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
         MicroCompactConfig {
             enabled: optional_bool(m, "enabled", "merged settings.compression.micro")?
                 .unwrap_or(MicroCompactConfig::default().enabled),
-            tool_result_max_chars: optional_u32(m, "toolResultMaxChars", "merged settings.compression.micro")?
-                .unwrap_or(MicroCompactConfig::default().tool_result_max_chars),
-            time_decay_factor: optional_f32(m, "timeDecayFactor", "merged settings.compression.micro")?
-                .unwrap_or(MicroCompactConfig::default().time_decay_factor),
+            tool_result_max_chars: optional_u32(
+                m,
+                "toolResultMaxChars",
+                "merged settings.compression.micro",
+            )?
+            .unwrap_or(MicroCompactConfig::default().tool_result_max_chars),
+            time_decay_factor: optional_f32(
+                m,
+                "timeDecayFactor",
+                "merged settings.compression.micro",
+            )?
+            .unwrap_or(MicroCompactConfig::default().time_decay_factor),
         }
     } else {
         MicroCompactConfig::default()
@@ -1818,12 +2065,24 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
     let session = if let Some(sess_val) = cmp.get("session") {
         let s = expect_object(sess_val, "merged settings.compression.session")?;
         SessionCompactConfig {
-            threshold_tokens: optional_u32(s, "thresholdTokens", "merged settings.compression.session")?
-                .unwrap_or(SessionCompactConfig::default().threshold_tokens),
-            preserve_recent: optional_u32(s, "preserveRecent", "merged settings.compression.session")?
-                .unwrap_or(SessionCompactConfig::default().preserve_recent),
-            summary_max_tokens: optional_u32(s, "summaryMaxTokens", "merged settings.compression.session")?
-                .unwrap_or(SessionCompactConfig::default().summary_max_tokens),
+            threshold_tokens: optional_u32(
+                s,
+                "thresholdTokens",
+                "merged settings.compression.session",
+            )?
+            .unwrap_or(SessionCompactConfig::default().threshold_tokens),
+            preserve_recent: optional_u32(
+                s,
+                "preserveRecent",
+                "merged settings.compression.session",
+            )?
+            .unwrap_or(SessionCompactConfig::default().preserve_recent),
+            summary_max_tokens: optional_u32(
+                s,
+                "summaryMaxTokens",
+                "merged settings.compression.session",
+            )?
+            .unwrap_or(SessionCompactConfig::default().summary_max_tokens),
             buffer_tokens: optional_u32(s, "bufferTokens", "merged settings.compression.session")?
                 .unwrap_or(SessionCompactConfig::default().buffer_tokens),
         }
@@ -1835,8 +2094,12 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
         DeepCompactConfig {
             enabled: optional_bool(d, "enabled", "merged settings.compression.deep")?
                 .unwrap_or(DeepCompactConfig::default().enabled),
-            iterative_update: optional_bool(d, "iterativeUpdate", "merged settings.compression.deep")?
-                .unwrap_or(DeepCompactConfig::default().iterative_update),
+            iterative_update: optional_bool(
+                d,
+                "iterativeUpdate",
+                "merged settings.compression.deep",
+            )?
+            .unwrap_or(DeepCompactConfig::default().iterative_update),
         }
     } else {
         DeepCompactConfig::default()
@@ -1844,10 +2107,18 @@ fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConf
     let circuit_breaker = if let Some(cb_val) = cmp.get("circuitBreaker") {
         let cb = expect_object(cb_val, "merged settings.compression.circuitBreaker")?;
         CircuitBreakerConfig {
-            max_retries: optional_u32(cb, "maxRetries", "merged settings.compression.circuitBreaker")?
-                .unwrap_or(CircuitBreakerConfig::default().max_retries),
-            cooldown_secs: optional_u32(cb, "cooldownSecs", "merged settings.compression.circuitBreaker")?
-                .unwrap_or(CircuitBreakerConfig::default().cooldown_secs),
+            max_retries: optional_u32(
+                cb,
+                "maxRetries",
+                "merged settings.compression.circuitBreaker",
+            )?
+            .unwrap_or(CircuitBreakerConfig::default().max_retries),
+            cooldown_secs: optional_u32(
+                cb,
+                "cooldownSecs",
+                "merged settings.compression.circuitBreaker",
+            )?
+            .unwrap_or(CircuitBreakerConfig::default().cooldown_secs),
         }
     } else {
         CircuitBreakerConfig::default()
@@ -1884,7 +2155,7 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
                 let p = expect_object(v, &ctx)?;
                 Ok(PlatformConfig {
                     platform_type: expect_string(p, "platformType", &ctx)
-                        .or_else(|_| expect_string(p, "type", &ctx))  // fallback: "type" key
+                        .or_else(|_| expect_string(p, "type", &ctx)) // fallback: "type" key
                         .map(|s| s.to_string())?,
                     enabled: optional_bool(p, "enabled", &ctx)?.unwrap_or(true),
                     extra: p
@@ -1921,6 +2192,219 @@ fn parse_optional_gate_auto_fix_config(root: &JsonValue) -> Result<GateAutoFixCo
         enabled,
         max_attempts,
     })
+}
+
+fn parse_optional_runtime_control_config(
+    root: &JsonValue,
+) -> Result<RuntimeControlConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RuntimeControlConfig::default());
+    };
+    let mut config = RuntimeControlConfig::default();
+    let Some(runtime_value) = object.get("runtime") else {
+        return Ok(config);
+    };
+    let runtime = expect_object(runtime_value, "merged settings.runtime")?;
+    if let Some(scenario) = optional_string(runtime, "scenario", "merged settings.runtime")? {
+        config.scenario = parse_domain_profile(scenario, "merged settings.runtime.scenario")?;
+    }
+    let Some(control_value) = runtime.get("control") else {
+        apply_domain_profile_defaults(&mut config.policy, config.scenario);
+        return Ok(config);
+    };
+    let control = expect_object(control_value, "merged settings.runtime.control")?;
+    apply_domain_profile_defaults(&mut config.policy, config.scenario);
+    if let Some(enabled) = optional_bool(control, "enabled", "merged settings.runtime.control")? {
+        config.policy.enabled = enabled;
+    }
+    if let Some(agent_value) = control.get("agent") {
+        let agent = expect_object(agent_value, "merged settings.runtime.control.agent")?;
+        if let Some(enabled) =
+            optional_bool(agent, "enabled", "merged settings.runtime.control.agent")?
+        {
+            config.policy.agent.enabled = enabled;
+        }
+        if let Some(max) = optional_usize(
+            agent,
+            "max_parallel_agents",
+            "merged settings.runtime.control.agent",
+        )? {
+            config.policy.agent.max_parallel_agents = max;
+        }
+        if let Some(review) = optional_bool(
+            agent,
+            "review_on_conflict",
+            "merged settings.runtime.control.agent",
+        )? {
+            config.policy.agent.review_on_conflict = review;
+        }
+        if let Some(required) = optional_bool(
+            agent,
+            "require_positive_lift",
+            "merged settings.runtime.control.agent",
+        )? {
+            config.policy.agent.require_positive_lift = required;
+        }
+        if let Some(score) = optional_u16(
+            agent,
+            "min_collaboration_score",
+            "merged settings.runtime.control.agent",
+        )? {
+            config.policy.agent.min_collaboration_score = score;
+        }
+    }
+    if let Some(task_value) = control.get("task") {
+        let task = expect_object(task_value, "merged settings.runtime.control.task")?;
+        if let Some(enabled) = optional_bool(
+            task,
+            "auto_phase_for_yolo",
+            "merged settings.runtime.control.task",
+        )? {
+            config.policy.task.auto_phase_for_yolo = enabled;
+        }
+        if let Some(review) = optional_bool(
+            task,
+            "review_after_each_phase",
+            "merged settings.runtime.control.task",
+        )? {
+            config.policy.task.review_after_each_phase = review;
+        }
+        if let Some(max) = optional_u32(
+            task,
+            "max_failures_before_review",
+            "merged settings.runtime.control.task",
+        )? {
+            config.policy.task.max_failures_before_review = max;
+        }
+    }
+    if let Some(context_value) = control.get("context") {
+        let context = expect_object(context_value, "merged settings.runtime.control.context")?;
+        if let Some(preserve) = optional_bool(
+            context,
+            "preserve_stable_head",
+            "merged settings.runtime.control.context",
+        )? {
+            config.policy.context.preserve_stable_head = preserve;
+        }
+        if let Some(tokens) = optional_u64(
+            context,
+            "yolo_budget_tokens",
+            "merged settings.runtime.control.context",
+        )? {
+            config.policy.context.yolo_budget_tokens = tokens;
+        }
+        if let Some(tokens) = optional_u64(
+            context,
+            "collaboration_budget_tokens",
+            "merged settings.runtime.control.context",
+        )? {
+            config.policy.context.collaboration_budget_tokens = tokens;
+        }
+        if let Some(tokens) = optional_u64(
+            context,
+            "review_budget_tokens",
+            "merged settings.runtime.control.context",
+        )? {
+            config.policy.context.review_budget_tokens = tokens;
+        }
+        if let Some(pressure) = optional_u16(
+            context,
+            "degrade_on_pressure_bp",
+            "merged settings.runtime.control.context",
+        )? {
+            config.policy.context.degrade_on_pressure_bp = pressure;
+        }
+    }
+    if let Some(memory_value) = control.get("memory") {
+        let memory = expect_object(memory_value, "merged settings.runtime.control.memory")?;
+        if let Some(emit) = optional_bool(
+            memory,
+            "emit_pulses_from_workgraph",
+            "merged settings.runtime.control.memory",
+        )? {
+            config.policy.memory.emit_pulses_from_workgraph = emit;
+        }
+        if let Some(review) = optional_bool(
+            memory,
+            "review_conflicts",
+            "merged settings.runtime.control.memory",
+        )? {
+            config.policy.memory.review_conflicts = review;
+        }
+        if let Some(max) = optional_usize(
+            memory,
+            "max_candidates_per_turn",
+            "merged settings.runtime.control.memory",
+        )? {
+            config.policy.memory.max_candidates_per_turn = max;
+        }
+    }
+    if let Some(permission_value) = control.get("permission") {
+        let permission = expect_object(
+            permission_value,
+            "merged settings.runtime.control.permission",
+        )?;
+        if let Some(honor) = optional_bool(
+            permission,
+            "solo_honor_critical",
+            "merged settings.runtime.control.permission",
+        )? {
+            config.policy.permission.solo_honor_critical = honor;
+        }
+        if let Some(review) = optional_bool(
+            permission,
+            "review_critical_actions",
+            "merged settings.runtime.control.permission",
+        )? {
+            config.policy.permission.review_critical_actions = review;
+        }
+    }
+    Ok(config)
+}
+
+fn parse_domain_profile(value: &str, context: &str) -> Result<DomainProfile, ConfigError> {
+    match value {
+        "coding" | "code" => Ok(DomainProfile::Coding),
+        "research" => Ok(DomainProfile::Research),
+        "office" | "work" => Ok(DomainProfile::Office),
+        "ops" | "operations" => Ok(DomainProfile::Ops),
+        "personal" => Ok(DomainProfile::Personal),
+        other => Err(ConfigError::Parse(format!(
+            "{context}: unsupported runtime scenario {other}"
+        ))),
+    }
+}
+
+fn apply_domain_profile_defaults(policy: &mut RuntimeControlPolicy, scenario: DomainProfile) {
+    match scenario {
+        DomainProfile::Coding => {}
+        DomainProfile::Research => {
+            policy.agent.min_collaboration_score = 60;
+            policy.context.collaboration_budget_tokens = 14_000;
+            policy.context.review_budget_tokens = 11_000;
+            policy.memory.max_candidates_per_turn = 12;
+        }
+        DomainProfile::Office => {
+            policy.agent.max_parallel_agents = 2;
+            policy.agent.min_collaboration_score = 65;
+            policy.context.yolo_budget_tokens = 8_000;
+            policy.context.collaboration_budget_tokens = 8_000;
+            policy.memory.max_candidates_per_turn = 6;
+            policy.permission.review_critical_actions = true;
+        }
+        DomainProfile::Ops => {
+            policy.task.max_failures_before_review = 1;
+            policy.permission.review_critical_actions = true;
+            policy.agent.review_on_conflict = true;
+            policy.task.review_after_each_phase = true;
+        }
+        DomainProfile::Personal => {
+            policy.agent.max_parallel_agents = 1;
+            policy.agent.min_collaboration_score = 70;
+            policy.context.yolo_budget_tokens = 9_000;
+            policy.memory.max_candidates_per_turn = 5;
+        }
+    }
 }
 
 fn parse_session_reset_policy(
@@ -1966,10 +2450,7 @@ fn json_value_type_name(v: &JsonValue) -> &'static str {
     }
 }
 
-fn expect_array<'a>(
-    value: &'a JsonValue,
-    context: &str,
-) -> Result<&'a [JsonValue], ConfigError> {
+fn expect_array<'a>(value: &'a JsonValue, context: &str) -> Result<&'a [JsonValue], ConfigError> {
     value.as_array().ok_or_else(|| {
         ConfigError::Parse(format!(
             "{context}: expected an array, got {}",
@@ -1977,8 +2458,6 @@ fn expect_array<'a>(
         ))
     })
 }
-
-
 
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
     match value {
@@ -2256,9 +2735,7 @@ fn parse_json_string_array(
         .iter()
         .map(|item| {
             item.as_str().map(ToOwned::to_owned).ok_or_else(|| {
-                ConfigError::Parse(format!(
-                    "{context}: field {key} must contain only strings"
-                ))
+                ConfigError::Parse(format!("{context}: field {key} must contain only strings"))
             })
         })
         .collect()
@@ -2337,7 +2814,9 @@ fn optional_string_dual<'a>(
     // Convert snake_case to camelCase and try.
     let camel_key = to_camel_case(snake_key);
     if let Some(_value) = object.get(&camel_key) {
-        tracing::warn!("config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})");
+        tracing::warn!(
+            "config key '{camel_key}' is deprecated, use '{snake_key}' instead (in {ctx})"
+        );
         return optional_string(object, &camel_key, ctx);
     }
 
@@ -2471,9 +2950,9 @@ fn deep_merge_objects(
 #[cfg(test)]
 mod tests {
     use super::{
-        deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeHookConfig,
-        RuntimePluginConfig, COWD_SETTINGS_SCHEMA_NAME,
+        COWD_SETTINGS_SCHEMA_NAME, ConfigLoader, ConfigSource, DomainProfile, McpServerConfig,
+        McpTransport, ResolvedPermissionMode, RuntimeHookConfig, RuntimePluginConfig,
+        deep_merge_objects, parse_permission_mode_label,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -2493,7 +2972,10 @@ mod tests {
                 Some(v) => std::env::set_var(key, v),
                 None => std::env::remove_var(key),
             }
-            Self { key: key.to_string(), original }
+            Self {
+                key: key.to_string(),
+                original,
+            }
         }
     }
 
@@ -2529,9 +3011,11 @@ mod tests {
         let error = ConfigLoader::new(&cwd, &home)
             .load()
             .expect_err("config should fail");
-        assert!(error
-            .to_string()
-            .contains("top-level config value must be an object"));
+        assert!(
+            error
+                .to_string()
+                .contains("top-level config value must be an object")
+        );
 
         if root.exists() {
             fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -2593,16 +3077,20 @@ mod tests {
                 .len(),
             3
         );
-        assert!(loaded
-            .get("hooks")
-            .and_then(JsonValue::as_object)
-            .expect("hooks object")
-            .contains_key("PreToolUse"));
-        assert!(loaded
-            .get("hooks")
-            .and_then(JsonValue::as_object)
-            .expect("hooks object")
-            .contains_key("PostToolUse"));
+        assert!(
+            loaded
+                .get("hooks")
+                .and_then(JsonValue::as_object)
+                .expect("hooks object")
+                .contains_key("PreToolUse")
+        );
+        assert!(
+            loaded
+                .get("hooks")
+                .and_then(JsonValue::as_object)
+                .expect("hooks object")
+                .contains_key("PostToolUse")
+        );
         assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
         assert_eq!(loaded.hooks().post_tool_use(), &["project".to_string()]);
         assert_eq!(
@@ -2660,6 +3148,68 @@ mod tests {
     }
 
     #[test]
+    fn config_runtime_control_merges_scenario_and_policy_overrides() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(cwd.join(".cowd")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            home.join("config.yaml"),
+            r#"{
+              "runtime": {
+                "scenario": "research",
+                "control": {
+                  "agent": {
+                    "max_parallel_agents": 5
+                  },
+                  "context": {
+                    "collaboration_budget_tokens": 16000
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("write user runtime control");
+        fs::write(
+            cwd.join(".cowd").join("config.local.yaml"),
+            r#"{
+              "runtime": {
+                "control": {
+                  "enabled": false,
+                  "agent": {
+                    "min_collaboration_score": 72
+                  },
+                  "task": {
+                    "max_failures_before_review": 1
+                  },
+                  "memory": {
+                    "max_candidates_per_turn": 3
+                  }
+                }
+              }
+            }"#,
+        )
+        .expect("write local runtime control");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("runtime control config should load");
+        let runtime = loaded.runtime_control();
+
+        assert_eq!(runtime.scenario, DomainProfile::Research);
+        assert!(!runtime.policy.enabled);
+        assert_eq!(runtime.policy.agent.max_parallel_agents, 5);
+        assert_eq!(runtime.policy.agent.min_collaboration_score, 72);
+        assert_eq!(runtime.policy.task.max_failures_before_review, 1);
+        assert_eq!(runtime.policy.context.collaboration_budget_tokens, 16_000);
+        assert_eq!(runtime.policy.memory.max_candidates_per_turn, 3);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn parses_provider_fallbacks_legacy_single_object_format() {
         // given
         let root = temp_dir();
@@ -2686,10 +3236,7 @@ mod tests {
         // then
         let chain = loaded.fallbacks();
         assert!(!chain.is_empty());
-        assert_eq!(
-            chain,
-            &["grok-3".to_string(), "grok-3-mini".to_string()]
-        );
+        assert_eq!(chain, &["grok-3".to_string(), "grok-3-mini".to_string()]);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -3046,9 +3593,11 @@ mod tests {
             .expect_err("config should fail");
 
         // then
-        assert!(error
-            .to_string()
-            .contains("mcpServers.broken: missing string field url"));
+        assert!(
+            error
+                .to_string()
+                .contains("mcpServers.broken: missing string field url")
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -3355,7 +3904,10 @@ mod tests {
             .expect("config should load with warning");
 
         // then — config loads successfully; unknown key produces a stderr warning
-        assert!(loaded.get("modle").is_some(), "unknown key should be present in merged config");
+        assert!(
+            loaded.get("modle").is_some(),
+            "unknown key should be present in merged config"
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

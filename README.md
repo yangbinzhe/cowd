@@ -1,14 +1,14 @@
 # COWD — AI 编程智能体框架
 
-> **Rust 原生多智能体编程框架** | 当前版本 v0.8.19
+> **Rust 原生多智能体编程框架** | 当前版本 v0.8.20
 > 统一网关 · 全功能 TUI · API 完全对等 · Session SQLite 存储
 > 内存系统 · 代码智能 · 权限管控 · MCP 协议 · 多平台接入
 
 ---
 
-## 当前重构主线：Runtime Control Policy
+## 当前重构主线：Runtime Control Plane
 
-v0.8.19 的核心目标是在 v0.8.18 Runtime Closed Loop 之上建立统一运行时控制面：任务复杂度、Agent 协作、Context Profile、权限风险、记忆脉冲和 UI 投影由可解释策略统一协调。
+v0.8.20 的核心目标是在 v0.8.19 Runtime Control Policy 之上建立主动运行时控制面与场景内核：配置、场景 Profile、任务、Agent、Context、Memory 和 UI 由同一套 effective policy 驱动。
 
 ```
 RuntimeCommand -> RuntimeEventLog -> RuntimeProjection
