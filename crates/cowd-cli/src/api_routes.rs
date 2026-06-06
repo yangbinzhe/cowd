@@ -161,6 +161,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             get(get_session_messages).post(send_message),
         )
         .route("/api/sessions/:id/events", get(get_session_events))
+        .route("/api/sessions/:id/runs", get(get_session_runs))
         .route(
             "/api/sessions/:id/context",
             get(get_session_context_history),
@@ -1333,6 +1334,47 @@ fn task_resume_context_packet(session_id: &str, task: &TaskRecord) -> ResumeCont
     }
 }
 
+fn runtime_run_started_payload(
+    session_id: &str,
+    run_id: &str,
+    profile: ContextProfile,
+    intent: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "RuntimeRun",
+        "phase": "started",
+        "run_id": run_id,
+        "parent_run_id": null,
+        "session_id": session_id,
+        "profile": profile,
+        "status": "running",
+        "intent_preview": intent.chars().take(240).collect::<String>(),
+    })
+}
+
+fn runtime_run_completed_payload(
+    session_id: &str,
+    run_id: &str,
+    profile: ContextProfile,
+    status: &str,
+    iterations: Option<usize>,
+    context_envelope_id: Option<String>,
+    error: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "RuntimeRun",
+        "phase": "completed",
+        "run_id": run_id,
+        "parent_run_id": null,
+        "session_id": session_id,
+        "profile": profile,
+        "status": status,
+        "iterations": iterations,
+        "context_envelope_id": context_envelope_id,
+        "error": error,
+    })
+}
+
 async fn send_message(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1351,6 +1393,15 @@ async fn send_message(
 
     let session_id = id.clone();
     let event_bus = state.event_bus();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let run_profile = ContextProfile::MainTurn;
+    append_session_timeline_event_to_kernel(
+        &state.session_kernel,
+        &session_id,
+        "RuntimeRun",
+        runtime_run_started_payload(&session_id, &run_id, run_profile, &body.content),
+    )
+    .await;
 
     // Phase 1b: Subscribe CowdEventBus → forward text/thinking/tool events to SessionEventBus
     {
@@ -1539,6 +1590,12 @@ async fn send_message(
                 let runtime_guard = runtime_entry.lock().await;
                 runtime_guard.session().clone()
             };
+            let context_envelope_id = {
+                let runtime_guard = runtime_entry.lock().await;
+                runtime_guard
+                    .last_context_envelope()
+                    .map(|envelope| envelope.id)
+            };
             if let Err(e) = state
                 .session_kernel
                 .sync_runtime_session_snapshot(&session_id, &session_snapshot)
@@ -1563,11 +1620,32 @@ async fn send_message(
             event_bus
                 .broadcast(&session_id, &sse_data.to_string())
                 .await;
+            append_session_timeline_event_to_kernel(
+                &state.session_kernel,
+                &session_id,
+                "RuntimeRun",
+                runtime_run_completed_payload(
+                    &session_id,
+                    &run_id,
+                    run_profile,
+                    "completed",
+                    Some(summary.iterations),
+                    context_envelope_id,
+                    None,
+                ),
+            )
+            .await;
 
             Ok(Json(response))
         }
         Ok(Ok(Err(e))) => {
             let error_msg = e.to_string();
+            let context_envelope_id = {
+                let runtime_guard = runtime_entry.lock().await;
+                runtime_guard
+                    .last_context_envelope()
+                    .map(|envelope| envelope.id)
+            };
 
             let sse_data = serde_json::json!({
                 "type": "TurnError",
@@ -1577,6 +1655,21 @@ async fn send_message(
             event_bus
                 .broadcast(&session_id, &sse_data.to_string())
                 .await;
+            append_session_timeline_event_to_kernel(
+                &state.session_kernel,
+                &session_id,
+                "RuntimeRun",
+                runtime_run_completed_payload(
+                    &session_id,
+                    &run_id,
+                    run_profile,
+                    "failed",
+                    None,
+                    context_envelope_id,
+                    Some(error_msg.clone()),
+                ),
+            )
+            .await;
 
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1585,6 +1678,12 @@ async fn send_message(
         }
         Ok(Err(_elapsed)) => {
             let error_msg = format!("turn timed out after {}s", TURN_TIMEOUT.as_secs());
+            let context_envelope_id = {
+                let runtime_guard = runtime_entry.lock().await;
+                runtime_guard
+                    .last_context_envelope()
+                    .map(|envelope| envelope.id)
+            };
 
             let sse_data = serde_json::json!({
                 "type": "TurnError",
@@ -1594,18 +1693,49 @@ async fn send_message(
             event_bus
                 .broadcast(&session_id, &sse_data.to_string())
                 .await;
+            append_session_timeline_event_to_kernel(
+                &state.session_kernel,
+                &session_id,
+                "RuntimeRun",
+                runtime_run_completed_payload(
+                    &session_id,
+                    &run_id,
+                    run_profile,
+                    "timeout",
+                    None,
+                    context_envelope_id,
+                    Some(error_msg.clone()),
+                ),
+            )
+            .await;
 
             Err((
                 StatusCode::REQUEST_TIMEOUT,
                 Json(ErrorResponse { error: error_msg }),
             ))
         }
-        Err(join_err) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("task join error: {join_err}"),
-            }),
-        )),
+        Err(join_err) => {
+            let error_msg = format!("task join error: {join_err}");
+            append_session_timeline_event_to_kernel(
+                &state.session_kernel,
+                &session_id,
+                "RuntimeRun",
+                runtime_run_completed_payload(
+                    &session_id,
+                    &run_id,
+                    run_profile,
+                    "failed",
+                    None,
+                    None,
+                    Some(error_msg.clone()),
+                ),
+            )
+            .await;
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: error_msg }),
+            ))
+        }
     }
 }
 
@@ -2895,6 +3025,67 @@ async fn get_session_events(
         "events": events,
         "total": total,
         "from_seq": from_seq,
+        "limit": limit,
+        "has_more": has_more,
+    })))
+}
+
+fn runtime_run_event_json(event: SessionEvent) -> serde_json::Value {
+    let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
+    serde_json::json!({
+        "session_id": event.session_id,
+        "type": event.event_type,
+        "sequence": event.sequence,
+        "created_at_ms": event.created_at_ms,
+        "run": payload,
+    })
+}
+
+async fn get_session_runs(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<GetEventsParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let from_seq = params.from_seq.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).min(200);
+    let Some((total, stored_events)) = state
+        .session_kernel
+        .stored_events_by_type_page(&id, "RuntimeRun", from_seq, limit)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load runtime runs: {e}"),
+                }),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
+
+    let runs: Vec<serde_json::Value> = stored_events
+        .into_iter()
+        .map(runtime_run_event_json)
+        .collect();
+    let next_seq = runs
+        .last()
+        .and_then(|event| event["sequence"].as_u64())
+        .map(|sequence| sequence as usize + 1);
+    let has_more = runs.len() < total;
+
+    Ok(Json(serde_json::json!({
+        "session_id": id,
+        "runs": runs,
+        "total": total,
+        "from_seq": from_seq,
+        "next_seq": next_seq,
         "limit": limit,
         "has_more": has_more,
     })))
@@ -4912,6 +5103,77 @@ mod tests {
                 .unwrap()
                 .contains("profile:YoloGoal")
         );
+    }
+
+    #[tokio::test]
+    async fn session_runs_route_reads_runtime_run_events_only() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "runtime-runs-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        for (sequence, event_type, payload) in [
+            (
+                0,
+                "TextDelta",
+                serde_json::json!({"type":"TextDelta","content":"skip"}),
+            ),
+            (
+                1,
+                "RuntimeRun",
+                runtime_run_started_payload(session_id, "run-1", ContextProfile::MainTurn, "ship"),
+            ),
+            (
+                2,
+                "RuntimeRun",
+                runtime_run_completed_payload(
+                    session_id,
+                    "run-1",
+                    ContextProfile::MainTurn,
+                    "completed",
+                    Some(2),
+                    Some("ctx-1".to_string()),
+                    None,
+                ),
+            ),
+        ] {
+            store
+                .append_event(&memory::SessionEvent {
+                    session_id: session_id.to_string(),
+                    event_type: event_type.to_string(),
+                    event_json: payload.to_string(),
+                    sequence,
+                    created_at_ms: sequence as u64,
+                })
+                .await
+                .unwrap();
+        }
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}/runs?limit=10"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["session_id"], session_id);
+        assert_eq!(json["total"], 2);
+        assert_eq!(json["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(json["runs"][0]["run"]["phase"], "started");
+        assert_eq!(json["runs"][1]["run"]["status"], "completed");
+        assert_eq!(json["runs"][1]["run"]["context_envelope_id"], "ctx-1");
     }
 
     #[tokio::test]

@@ -153,6 +153,21 @@ describe('API module', () => {
     expect(history.envelopes[0].envelope_id).toBe('ctx-1');
   });
 
+  it('runtimeRuns reads session run timeline', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ runs: [{ run: { run_id: 'run-1' } }] })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const runs = await window.Api.runtimeRuns('s1', { limit: 12 });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/sessions/s1/runs?limit=12');
+    expect(runs.runs[0].run.run_id).toBe('run-1');
+  });
+
   it('records context recommendation actions', async () => {
     const mockF = vi.fn(() =>
       Promise.resolve({

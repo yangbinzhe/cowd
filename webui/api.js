@@ -179,6 +179,15 @@ window.Api = (()=>{
       const query=params.toString();
       return req('GET','/api/sessions/'+encodeURIComponent(sid)+'/context'+(query?'?'+query:''));
     },
+    async runtimeRuns(sessionId,opts){
+      const sid=sessionId||this.sid;
+      const o=opts||{};
+      const params=new URLSearchParams();
+      if(o.from_seq!==undefined)params.set('from_seq',o.from_seq);
+      if(o.limit!==undefined)params.set('limit',o.limit);
+      const query=params.toString();
+      return req('GET','/api/sessions/'+encodeURIComponent(sid)+'/runs'+(query?'?'+query:''));
+    },
     async contextEnvelope(envelopeId){
       return req('GET','/api/context/'+encodeURIComponent(envelopeId));
     },
