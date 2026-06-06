@@ -82,6 +82,86 @@ window.Panels = (()=>{
     target.appendChild(sec);
   }
 
+  function addNetworkNode(nodes,id,label,type){
+    const key=String(id||label||'node');
+    if(!nodes.has(key))nodes.set(key,{id:key,label:String(label||key),type:type||'memory'});
+    return key;
+  }
+
+  function buildKnowledgeNetwork(triples,links){
+    const nodes=new Map();
+    const edges=[];
+    (triples||[]).slice(0,30).forEach(function(t){
+      const s=addNetworkNode(nodes,t.subject||t.s,t.subject||t.s,'entity');
+      const o=addNetworkNode(nodes,t.object||t.o,t.object||t.o,'entity');
+      edges.push({from:s,to:o,label:String(t.predicate||t.p||'relates'),type:'triple',weight:1});
+    });
+    (links||[]).slice(0,40).forEach(function(l){
+      const from=addNetworkNode(nodes,l.from,String(l.from||'').slice(0,8),'memory');
+      const to=addNetworkNode(nodes,l.to,String(l.to||'').slice(0,8),'memory');
+      edges.push({from,to,label:String(l.kind||'Link'),type:'link',weight:typeof l.weight==='number'?l.weight:0.5,evidence:l.evidence||''});
+    });
+    return {nodes:[...nodes.values()].slice(0,48),edges};
+  }
+
+  function renderKnowledgeGraph(data,target){
+    target.innerHTML='';
+    const wrap=UI.el('div','memory-network');
+    const width=316,height=260,cx=width/2,cy=height/2;
+    const ns='http://www.w3.org/2000/svg';
+    const svg=document.createElementNS(ns,'svg');
+    svg.setAttribute('viewBox','0 0 '+width+' '+height);
+    svg.setAttribute('role','img');
+    svg.setAttribute('aria-label','Knowledge network');
+    const nodes=data.nodes||[];
+    const edges=data.edges||[];
+    if(!nodes.length){
+      wrap.appendChild(UI.el('div','panel-empty','No network'));
+      target.appendChild(wrap);
+      return;
+    }
+    const pos={};
+    const radius=Math.min(104,Math.max(56,28+nodes.length*3));
+    nodes.forEach(function(node,i){
+      const angle=(-Math.PI/2)+(Math.PI*2*i/nodes.length);
+      pos[node.id]={x:cx+Math.cos(angle)*radius,y:cy+Math.sin(angle)*radius};
+    });
+    edges.forEach(function(edge){
+      const a=pos[edge.from],b=pos[edge.to];
+      if(!a||!b)return;
+      const line=document.createElementNS(ns,'line');
+      line.setAttribute('x1',a.x);line.setAttribute('y1',a.y);line.setAttribute('x2',b.x);line.setAttribute('y2',b.y);
+      line.setAttribute('class','memory-edge '+edge.type);
+      line.setAttribute('stroke-width',String(1+Math.min(2,edge.weight||0)));
+      svg.appendChild(line);
+      const label=document.createElementNS(ns,'text');
+      label.setAttribute('x',(a.x+b.x)/2);label.setAttribute('y',(a.y+b.y)/2-3);
+      label.setAttribute('class','memory-edge-label');
+      label.textContent=edge.label;
+      svg.appendChild(label);
+    });
+    nodes.forEach(function(node){
+      const p=pos[node.id];
+      const group=document.createElementNS(ns,'g');
+      group.setAttribute('class','memory-node '+node.type);
+      group.onclick=function(){UI.showToast(node.label)};
+      const circle=document.createElementNS(ns,'circle');
+      circle.setAttribute('cx',p.x);circle.setAttribute('cy',p.y);circle.setAttribute('r',node.type==='entity'?13:11);
+      const text=document.createElementNS(ns,'text');
+      text.setAttribute('x',p.x);text.setAttribute('y',p.y+28);
+      text.setAttribute('class','memory-node-label');
+      text.textContent=node.label.length>14?node.label.slice(0,13)+'...':node.label;
+      group.appendChild(circle);
+      group.appendChild(text);
+      svg.appendChild(group);
+    });
+    wrap.appendChild(svg);
+    const legend=UI.el('div','memory-network-legend');
+    legend.innerHTML='<span>entity</span><span>memory</span><span>triple</span><span>link</span>';
+    wrap.appendChild(legend);
+    target.appendChild(wrap);
+  }
+
   async function renderMemory(){
     const c=cont();c.innerHTML='';
     const hdr=UI.el('div','panel-section');
@@ -92,6 +172,11 @@ window.Panels = (()=>{
     spatialBtn.style.cssText='font-size:11px;margin-left:8px;padding:2px 6px;';
     spatialBtn.onclick=()=>renderMemorySpatial();
     hdr.appendChild(spatialBtn);
+    const networkBtn=UI.el('button');
+    networkBtn.textContent='Network';
+    networkBtn.style.cssText='font-size:11px;margin-left:6px;padding:2px 6px;';
+    networkBtn.onclick=()=>renderMemoryNetwork();
+    hdr.appendChild(networkBtn);
     const search=UI.el('input');
     search.placeholder='Search memory...';
     search.oninput=function(){const q=this.value;if(q.length>1)doMemorySearch(q)};
@@ -715,6 +800,30 @@ window.Panels = (()=>{
     c.appendChild(UI.el('div','panel-section','<button onclick="Panels.renderMemory()">← List View</button>'));
   }
 
+  async function renderMemoryNetwork(){
+    const c=cont();c.innerHTML='<h3>Knowledge Network</h3>';
+    const graphSec=UI.el('div','panel-section');
+    c.appendChild(graphSec);
+    try{
+      const triples=await Api.listTriples();
+      const linkData=await Api.memoryLinks();
+      const links=linkData.links||linkData||[];
+      renderKnowledgeGraph(buildKnowledgeNetwork(triples,links),graphSec);
+      const rows=UI.el('div','panel-section');
+      rows.innerHTML='<h3>Relations</h3>';
+      (triples||[]).slice(0,10).forEach(function(t){
+        rows.appendChild(UI.el('div','panel-item',(UI.esc(t.subject||t.s||'')+' → '+UI.esc(t.predicate||t.p||'')+' → '+UI.esc(t.object||t.o||''))));
+      });
+      links.slice(0,10).forEach(function(l){
+        rows.appendChild(UI.el('div','panel-item',(UI.esc(String(l.from||'').slice(0,8))+' → '+UI.esc(l.kind||'Link')+' → '+UI.esc(String(l.to||'').slice(0,8)))));
+      });
+      c.appendChild(rows);
+    }catch(e){
+      graphSec.appendChild(UI.el('div','panel-empty','Network unavailable'));
+    }
+    c.appendChild(UI.el('div','panel-section','<button onclick="Panels.renderMemory()">← Memory</button>'));
+  }
+
   async function renderProgress(){
     const c=cont();c.innerHTML='<h3>Workflow Progress</h3>';
     try{
@@ -727,5 +836,5 @@ window.Panels = (()=>{
     }catch(e){c.appendChild(UI.el('div','panel-section','Progress unavailable'))}
   }
 
-  return{renderMemory,renderMemoryLayer,renderMemorySymbolResults,showMemoryEntryForm,renderMemorySpatial,renderProgress,renderSkills,renderCrons,renderSettings,renderAgents,renderTools,renderGateway,renderAudit,renderCCConfig,renderCCProviders,renderCCApproval,renderCCHistory,renderCCUsage};
+  return{renderMemory,renderMemoryLayer,renderMemorySymbolResults,showMemoryEntryForm,renderMemorySpatial,renderMemoryNetwork,renderProgress,renderSkills,renderCrons,renderSettings,renderAgents,renderTools,renderGateway,renderAudit,renderCCConfig,renderCCProviders,renderCCApproval,renderCCHistory,renderCCUsage};
 })();

@@ -164,6 +164,11 @@ test('workbench panels render durable task and memory status', async ({ page }) 
   await expect(page.locator('#panel-content')).toContainText('Orientation');
   await expect(page.locator('#panel-content')).toContainText('Recall Explain');
   await expect(page.locator('#panel-content')).toContainText('score 0.91');
+  await page.getByRole('button', { name: 'Network' }).click();
+  await expect(page.locator('#panel-content')).toContainText('Knowledge Network');
+  await expect(page.locator('.memory-network svg')).toBeVisible();
+  await expect(page.locator('#panel-content')).toContainText('persists');
+  await expect(page.locator('#panel-content')).toContainText('Supports');
 
   expect(errors).toEqual([]);
 });

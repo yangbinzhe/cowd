@@ -455,6 +455,7 @@ describe('API module', () => {
 
   it('Panels module exposes all panel renderers', () => {
     expect(typeof window.Panels.renderMemory).toBe('function');
+    expect(typeof window.Panels.renderMemoryNetwork).toBe('function');
     expect(typeof window.Panels.renderSkills).toBe('function');
     expect(typeof window.Panels.renderCrons).toBe('function');
     expect(typeof window.Panels.renderMemorySymbolResults).toBe('function');
@@ -688,6 +689,29 @@ describe('API module', () => {
 
     expect(String(mockF.mock.calls.at(-1)[0])).toContain('/api/memory/symbol-links?symbol=authenticate_user');
     expect(document.getElementById('memory-symbol-results').textContent).toContain('Auth impact note');
+  });
+
+  it('renders a knowledge network graph from triples and kernel links', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    vi.stubGlobal('fetch', vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/memory/triples')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ triples: [{ subject: 'SessionKernel', predicate: 'owns', object: 'sessions' }] }) });
+      }
+      if (path.includes('/api/memory/links')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ links: [{ from: '11111111-1111-1111-1111-111111111111', to: '22222222-2222-2222-2222-222222222222', kind: 'Supports', weight: 0.9, evidence: 'shared decision' }] }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    }));
+
+    await window.Panels.renderMemoryNetwork();
+
+    const text = document.getElementById('panel-content').textContent;
+    expect(document.querySelector('.memory-network svg')).toBeTruthy();
+    expect(text).toContain('Knowledge Network');
+    expect(text).toContain('SessionKernel');
+    expect(text).toContain('owns');
+    expect(text).toContain('Supports');
   });
 
   it('renders durable task status in the agents panel', async () => {

@@ -151,6 +151,18 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .memory-link-row b,.memory-link-row small,.memory-link-row em{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .memory-link-row b{font-size:12px}
 .memory-link-row small,.memory-link-row em{font-size:11px;color:var(--text3);font-style:normal;margin-top:2px}
+.memory-network{border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);padding:8px;overflow:hidden}
+.memory-network svg{display:block;width:100%;height:auto;min-height:230px}
+.memory-edge{stroke:var(--border2);opacity:.78}
+.memory-edge.triple{stroke:var(--accent)}
+.memory-edge.link{stroke:var(--success)}
+.memory-edge-label{fill:var(--text3);font-size:8px;text-anchor:middle;pointer-events:none}
+.memory-node{cursor:pointer}
+.memory-node circle{fill:var(--surface);stroke:var(--border2);stroke-width:1.5}
+.memory-node.entity circle{stroke:var(--accent);fill:color-mix(in srgb,var(--accent) 12%,var(--surface))}
+.memory-node.memory circle{stroke:var(--success);fill:color-mix(in srgb,var(--success) 10%,var(--surface))}
+.memory-node-label{fill:var(--text2);font-size:9px;text-anchor:middle;pointer-events:none}
+.memory-network-legend{display:flex;justify-content:center;gap:8px;margin-top:6px;color:var(--text3);font-size:10px;text-transform:uppercase}
 
 .audit-controls{display:flex;gap:8px;align-items:center}
 .audit-controls select{flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:13px}
