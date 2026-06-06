@@ -1694,12 +1694,33 @@ async fn send_message(
                     .last_context_envelope()
                     .map(|envelope| envelope.id)
             };
+            let collaboration_result = {
+                let runtime_guard = runtime_entry.lock().await;
+                runtime_guard.take_collaboration_result()
+            };
             if let Err(e) = state
                 .session_kernel
                 .sync_runtime_session_snapshot(&session_id, &session_snapshot)
                 .await
             {
                 tracing::warn!(%session_id, error = %e, "failed to sync API session to SQLite");
+            }
+            if let Some(collaboration_result) = collaboration_result {
+                if let Err(e) = state
+                    .session_kernel
+                    .persist_workgraph_review(
+                        &collaboration_result.work_graph,
+                        &collaboration_result.review_packet,
+                        state.memory_manager.as_ref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        %session_id,
+                        error = %e,
+                        "failed to persist collaboration closed-loop runtime event"
+                    );
+                }
             }
 
             let response = serde_json::json!({

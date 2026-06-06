@@ -88,6 +88,12 @@ pub struct AgentWorkGraph {
 
 impl AgentWorkGraph {
     #[must_use]
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = session_id.into();
+        self
+    }
+
+    #[must_use]
     pub fn from_collaboration_task(
         session_id: impl Into<String>,
         task: &CollaborationTask,

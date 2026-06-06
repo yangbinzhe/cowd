@@ -35,7 +35,7 @@ use telemetry::SessionTracer;
 use tracing;
 
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
-use crate::agent_collaboration::CollaborationOps;
+use crate::agent_collaboration::{CollaborationContextResult, CollaborationOps};
 use crate::agent_discussion::DiscussionEngine;
 use crate::compact::{
     CompactionConfig, CompactionResult, compact_session, estimate_session_tokens,
@@ -327,6 +327,8 @@ pub struct ConversationRuntime<C, T> {
     context_profile: std::sync::Mutex<ContextProfile>,
     /// Runtime-owned context supplied by outer orchestration layers.
     external_context_items: std::sync::Mutex<Vec<ContextItem>>,
+    /// Latest multi-agent collaboration packet for outer persistence.
+    last_collaboration_result: std::sync::Mutex<Option<CollaborationContextResult>>,
     /// Bounded short-term tool trace context for subsequent turns.
     tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// T4: Semaphore for WriteLocal tool concurrency (permits: 4).
@@ -500,6 +502,7 @@ where
             last_context_envelope: std::sync::Mutex::new(None),
             context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
             external_context_items: std::sync::Mutex::new(Vec::new()),
+            last_collaboration_result: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             write_semaphore: Arc::new(Semaphore::new(
                 crate::tool_orchestrator::ToolSafetyCategory::WriteLocal.max_concurrency(),
@@ -545,6 +548,22 @@ where
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
+    }
+
+    /// Return the latest collaboration result emitted during a runtime turn.
+    pub fn last_collaboration_result(&self) -> Option<CollaborationContextResult> {
+        self.last_collaboration_result
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Take the latest collaboration result so outer layers can persist it once.
+    pub fn take_collaboration_result(&self) -> Option<CollaborationContextResult> {
+        self.last_collaboration_result
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
     }
 
     /// Return the active context profile used for the next envelope.
@@ -749,6 +768,18 @@ where
         let envelope =
             self.build_context_envelope(user_input, dynamic_items, Vec::new(), Vec::new());
         self.remember_context_envelope(envelope);
+    }
+
+    fn remember_collaboration_result(&self, result: CollaborationContextResult) {
+        if let Ok(mut guard) = self.last_collaboration_result.lock() {
+            *guard = Some(result);
+        }
+    }
+
+    fn clear_collaboration_result(&self) {
+        if let Ok(mut guard) = self.last_collaboration_result.lock() {
+            *guard = None;
+        }
     }
 
     #[must_use]
@@ -1289,6 +1320,7 @@ where
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
         tracing::info!(session_id = %self.session().session_id, "turn started");
+        self.clear_collaboration_result();
 
         if self.session.read().await.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
@@ -2020,11 +2052,16 @@ where
                         .run_with_context_boxed(&task, &skills_clone)
                         .await
                     {
-                        let synthesis = collab_result.synthesis;
+                        let mut collab_result = collab_result;
+                        collab_result.work_graph = collab_result
+                            .work_graph
+                            .with_session_id(self.session().session_id.clone());
+                        let synthesis = collab_result.synthesis.clone();
                         self.append_context_items_to_latest_envelope(
                             &task,
-                            collab_result.context_items,
+                            collab_result.context_items.clone(),
                         );
+                        self.remember_collaboration_result(collab_result);
                         tracing::info!(
                             synthesis_len = synthesis.len(),
                             skills = ?skills_clone,
@@ -3303,6 +3340,11 @@ mod tests {
     use crate::ToolError;
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::agent_collaboration::{
+        AgentTeam, CollaborationContextResult, CollaborationOps, CollaborationReviewPacket,
+        CollaborationScorecard, CollaborationTask, SubTask,
+    };
+    use crate::agent_workgraph::AgentWorkGraph;
     use crate::context_runtime::{
         ContextAuthority, ContextItem, ContextMode, ContextProfile, ContextRole,
         ContextSourceKind, ResumeContextPacket, ResumeContextSource,
@@ -3316,6 +3358,7 @@ mod tests {
     use crate::usage::TokenUsage;
     use futures::stream::Stream;
     use std::fs;
+    use std::future::Future;
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -4179,6 +4222,103 @@ mod tests {
         ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             Box::pin(futures::stream::iter(vec![Ok(AssistantEvent::MessageStop)]))
         }
+    }
+
+    struct StubCollaboration;
+
+    impl CollaborationOps for StubCollaboration {
+        fn run_boxed<'a>(
+            &'a self,
+            _task: &'a str,
+            _skills: &'a [String],
+        ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>> {
+            Box::pin(async { Some("stub synthesis".to_string()) })
+        }
+
+        fn run_with_context_boxed<'a>(
+            &'a self,
+            task: &'a str,
+            skills: &'a [String],
+        ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>> {
+            Box::pin(async move {
+                let collaboration_task = CollaborationTask {
+                    description: task.to_string(),
+                    required_skills: skills.to_vec(),
+                    subtasks: vec![SubTask {
+                        id: "stub-review".to_string(),
+                        description: "review stub collaboration".to_string(),
+                        required_skills: vec!["review".to_string()],
+                        depends_on: Vec::new(),
+                    }],
+                    review_criteria: None,
+                };
+                let review_packet = CollaborationReviewPacket {
+                    board_id: "board-stub".to_string(),
+                    parent_run_id: None,
+                    scorecard: CollaborationScorecard {
+                        completion_rate: 1.0,
+                        synthesis_lift: 1.1,
+                        complementarity_score: 0.5,
+                        active_memory_score: 0.0,
+                        conflict_count: 0,
+                        memory_pulse_count: 0,
+                        surfaced_conflicts: Vec::new(),
+                    },
+                    agent_tasks: Vec::new(),
+                    maintenance_candidates: Vec::new(),
+                };
+                let work_graph =
+                    AgentWorkGraph::from_collaboration_task("stub-session", &collaboration_task)
+                        .with_review_packet(&review_packet);
+                Some(CollaborationContextResult {
+                    synthesis: "stub synthesis".to_string(),
+                    context_items: Vec::new(),
+                    collaboration_task,
+                    review_packet,
+                    work_graph,
+                })
+            })
+        }
+
+        fn decompose_task(&self, _task: &str) -> Vec<SubTask> {
+            Vec::new()
+        }
+
+        fn assemble_team(&self, _task: &CollaborationTask) -> Option<AgentTeam> {
+            None
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collaboration_turn_records_takeable_closed_loop_result() {
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        let mut runtime = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_collaboration(Arc::new(StubCollaboration));
+
+        runtime
+            .run_turn_async(
+                "please refactor rust tests and implement the plan",
+                &SharedPrompter::none(),
+            )
+            .await
+            .expect("turn should complete");
+
+        let result = runtime
+            .last_collaboration_result()
+            .expect("collaboration result should be recorded");
+        assert_eq!(result.work_graph.session_id, session_id);
+        assert_eq!(result.review_packet.board_id, "board-stub");
+
+        assert!(runtime.take_collaboration_result().is_some());
+        assert!(runtime.take_collaboration_result().is_none());
     }
 
     #[test]

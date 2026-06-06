@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent::{SubAgentConfig, SubAgentExecutor, SubAgentResult};
+use crate::agent_workgraph::AgentWorkGraph;
 use crate::context_runtime::ContextItem;
 use crate::team_discovery::TeamDiscoveryProtocol;
 use crate::wave::{TaskId, WaveConfig, WaveOrchestrator, WaveTask};
@@ -50,6 +51,9 @@ pub struct CollaborationTask {
 pub struct CollaborationContextResult {
     pub synthesis: String,
     pub context_items: Vec<ContextItem>,
+    pub collaboration_task: CollaborationTask,
+    pub review_packet: CollaborationReviewPacket,
+    pub work_graph: AgentWorkGraph,
 }
 
 // ── Shared Board / Synthesis Scoring ───────────────────────────────────────────
@@ -641,6 +645,11 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         // 4. Synthesize
         let synthesis = self.synthesize(&results);
         let context_items = self.context_items_from_results(&team, &results);
+        let board = self.build_shared_board(&results);
+        let agent_tasks = agent_task_traces_from_results(&subtasks, &results, &board.board_id);
+        let review_packet = board.review_packet(None, agent_tasks);
+        let work_graph = AgentWorkGraph::from_collaboration_task("runtime-session", &collab_task)
+            .with_review_packet(&review_packet);
 
         // 5. Finalize
         self.finalize(&synthesis, task).await;
@@ -648,6 +657,9 @@ impl<E: SubAgentExecutor + 'static> CollaborationOrchestrator<E> {
         Some(CollaborationContextResult {
             synthesis,
             context_items,
+            collaboration_task: collab_task,
+            review_packet,
+            work_graph,
         })
     }
 }
@@ -1043,6 +1055,48 @@ fn normalize_for_scoring(text: &str) -> String {
 
 fn normalize_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn agent_task_traces_from_results(
+    subtasks: &[SubTask],
+    results: &[SubAgentResult],
+    board_id: &str,
+) -> Vec<AgentTaskTrace> {
+    let now = Utc::now().timestamp_millis().max(0) as u64;
+    results
+        .iter()
+        .enumerate()
+        .map(|(idx, result)| {
+            let subtask = subtasks.get(idx);
+            let task_id = subtask
+                .map(|task| task.id.clone())
+                .unwrap_or_else(|| format!("agent-task-{}", idx + 1));
+            AgentTaskTrace {
+                task_id,
+                parent_run_id: None,
+                agent_run_id: None,
+                role: subtask
+                    .and_then(|task| task.required_skills.first().cloned())
+                    .unwrap_or_else(|| "agent".to_string()),
+                objective: subtask
+                    .map(|task| task.description.clone())
+                    .unwrap_or_else(|| "agent collaboration task".to_string()),
+                status: if result.completed_normally {
+                    "completed".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                context_envelope_id: None,
+                result_summary: truncate_for_candidate(&result.output),
+                evidence_refs: extract_prefixed_lines(&result.output, &["Evidence:", "evidence:"]),
+                collaboration_board_id: board_id.to_string(),
+                confidence: if result.completed_normally { 0.75 } else { 0.25 },
+                conflicts: extract_prefixed_lines(&result.output, &["Conflict:", "conflict:"]),
+                created_at_ms: now,
+                updated_at_ms: now,
+            }
+        })
+        .collect()
 }
 
 // ── CollaborationOps ────────────────────────────────────────────────────────────
