@@ -37,14 +37,15 @@ use crate::tui::components::export_dialog::ExportDialog;
 use crate::tui::components::file_changes_panel::FileChangesPanel;
 use crate::tui::components::file_tree::FileTree;
 use crate::tui::components::gateway_panel::GatewayPanel;
-use crate::tui::components::prompt::Prompt;
-use crate::tui::components::question_form::QuestionForm;
 use crate::tui::components::memory_panel::MemoryPanel;
 use crate::tui::components::performance_dashboard::PerformanceDashboard;
-use crate::tui::components::session_sidebar::SessionSidebar;
-use crate::tui::components::status_bar::StatusBar;
+use crate::tui::components::prompt::Prompt;
+use crate::tui::components::question_form::QuestionForm;
 use crate::tui::components::revert_dialog::RevertDialog;
+use crate::tui::components::runtime_activity_panel::RuntimeActivityPanel;
+use crate::tui::components::session_sidebar::SessionSidebar;
 use crate::tui::components::skills_panel::SkillsPanel;
+use crate::tui::components::status_bar::StatusBar;
 use crate::tui::components::thinking_panel::ThinkingPanel;
 use crate::tui::components::toast::{ToastManager, ToastVariant};
 use crate::tui::components::todo_panel::TodoPanel;
@@ -112,6 +113,8 @@ pub struct TuiState {
 
     /// Memory orchestrator for persistent memory operations (vector store, layers).
     pub memory_orchestrator: Option<std::sync::Arc<memory::MemoryOrchestrator>>,
+    /// Last time the MemoryPanel was refreshed from the cognitive store.
+    memory_panel_last_sync: Option<Instant>,
 
     /// Agents overlay showing subagent tree hierarchy.
     pub agents_overlay: AgentsOverlay,
@@ -178,7 +181,10 @@ pub struct TuiState {
     /// Gateway panel showing backend daemon/API gateway status.
     pub gateway_panel: GatewayPanel,
 
-    /// Active tab index in the sidebar (0=Context, 1=Changes, 2=Todo, 3=Diff, 4=Files, 5=Sessions, 6=Memory, 7=Skills, 8=Gateway).
+    /// Runtime activity panel summarizing run/context/tool state.
+    pub runtime_activity_panel: RuntimeActivityPanel,
+
+    /// Active tab index in the sidebar (0=Runtime, 1=Context, 2=Changes, 3=Todo, 4=Diff, 5=Files, 6=Sessions, 7=Memory, 8=Skills, 9=Gateway).
     pub sidebar_active_tab: usize,
 
     /// Status bar at the bottom showing model, tokens, and system info.
@@ -274,6 +280,7 @@ impl TuiState {
         let performance_dashboard = PerformanceDashboard::new();
         let skills_panel = SkillsPanel::new();
         let gateway_panel = GatewayPanel::new();
+        let runtime_activity_panel = RuntimeActivityPanel::new();
 
         Self {
             app,
@@ -286,6 +293,7 @@ impl TuiState {
             dialog_manager,
             toast_manager,
             memory_orchestrator: None,
+            memory_panel_last_sync: None,
             agents_overlay,
             agent_team_panel,
             l4_knowledge_view,
@@ -312,6 +320,7 @@ impl TuiState {
             performance_dashboard,
             skills_panel,
             gateway_panel,
+            runtime_activity_panel,
             sidebar_active_tab: 0,
             accessibility,
             active_sessions: None,
@@ -340,12 +349,18 @@ impl TuiState {
     }
 
     /// Set the shared ActiveSessions registry for the session sidebar.
-    pub fn set_active_sessions(&mut self, active_sessions: std::sync::Arc<crate::gateway::ActiveSessions>) {
+    pub fn set_active_sessions(
+        &mut self,
+        active_sessions: std::sync::Arc<crate::gateway::ActiveSessions>,
+    ) {
         self.active_sessions = Some(active_sessions);
     }
 
     /// Set the tool registry for the skills panel.
-    pub fn set_tool_registry(&mut self, registry: std::sync::Arc<dyn crate::tui::app::ToolRegistry>) {
+    pub fn set_tool_registry(
+        &mut self,
+        registry: std::sync::Arc<dyn crate::tui::app::ToolRegistry>,
+    ) {
         self.skills_panel.set_registry(registry);
     }
 
@@ -359,6 +374,13 @@ impl TuiState {
             self.context_suggestions.set_l4_receiver(rx);
         }
         self.memory_orchestrator = Some(orch);
+    }
+
+    /// Set the cognitive memory manager for TUI memory surfaces.
+    pub fn set_memory_manager(&mut self, mgr: std::sync::Arc<memory::CognitiveContextManager>) {
+        self.memory_panel
+            .set_memory_manager(std::sync::Arc::clone(&mgr));
+        self.set_memory_orchestrator(mgr.orchestrator());
     }
 
     // ── Event Bridging ──────────────────────────────────────────
@@ -426,6 +448,7 @@ impl TuiState {
         self.thinking_panel.tick();
 
         // Sync sidebar panels from App state
+        self.runtime_activity_panel.sync_from_app(&self.app);
         self.context_panel.sync_from_app(&self.app);
 
         // Sync file changes panel from timeline (ToolCall outputs with file change info)
@@ -447,10 +470,23 @@ impl TuiState {
         if !self.app.picker_sessions.is_empty() {
             self.session_sidebar.load(self.app.picker_sessions.clone());
         }
-        self.session_sidebar.set_current_session(&self.app.session_id);
+        self.session_sidebar
+            .set_current_session(&self.app.session_id);
 
-        // Sync memory panel from App state
-        self.memory_panel.sync_from_app(&self.app);
+        // Sync memory panel from the real cognitive store only when the tab is
+        // visible. Keep App fallback for memory-disabled sessions.
+        if self.sidebar_active_tab == 7 && self.memory_panel.memory_manager.is_some() {
+            let should_sync = self
+                .memory_panel_last_sync
+                .map(|last| last.elapsed() >= Duration::from_millis(750))
+                .unwrap_or(true);
+            if should_sync {
+                self.memory_panel.sync_from_cognitive();
+                self.memory_panel_last_sync = Some(Instant::now());
+            }
+        } else {
+            self.memory_panel.sync_from_app(&self.app);
+        }
 
         // Sync performance dashboard from memory orchestrator
         self.performance_dashboard.tick();
@@ -506,10 +542,7 @@ impl TuiState {
                     ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
                 ),
             ]);
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new(search_line),
-                search_area,
-            );
+            frame.render_widget(ratatui::widgets::Paragraph::new(search_line), search_area);
         }
 
         // ── Main content: one RenderContext for chat, sidebar, status, input ──
@@ -523,7 +556,8 @@ impl TuiState {
             // so scroll calculation doesn't think it has more visible lines than available
             chat_area.height = chat_area.height.saturating_sub(1).saturating_sub(input_h);
             let sidebar_w = area.width.saturating_sub(chat_area.width);
-            let sidebar_area = ratatui::layout::Rect::new(chat_area.width, 0, sidebar_w, area.height);
+            let sidebar_area =
+                ratatui::layout::Rect::new(chat_area.width, 0, sidebar_w, area.height);
 
             // Auto-scroll during streaming — computed BEFORE render to eliminate 1-frame lag
             if self.app.auto_scroll {
@@ -547,9 +581,15 @@ impl TuiState {
 
             // Render sidebar: tab bar + active panel
             let tab_height = 1u16;
-            let tab_labels = ["Context", "Changes", "Todo", "Diff", "Files", "Sessions", "Memory", "Skills", "Gateway"];
+            let tab_labels = [
+                "Runtime", "Context", "Changes", "Todo", "Diff", "Files", "Sessions", "Memory",
+                "Skills", "Gateway",
+            ];
             let tab_area = ratatui::layout::Rect::new(
-                sidebar_area.x, sidebar_area.y, sidebar_area.width, tab_height,
+                sidebar_area.x,
+                sidebar_area.y,
+                sidebar_area.width,
+                tab_height,
             );
             let tabs = ratatui::widgets::Tabs::new(tab_labels).select(self.sidebar_active_tab);
             main_ctx.frame_mut().render_widget(tabs, tab_area);
@@ -561,73 +601,119 @@ impl TuiState {
                 sidebar_area.height.saturating_sub(tab_height),
             );
             // Sync diff_viewer before rendering
-        {
-            // Collect diff text from recent tool calls for diff viewer
-            let diffs: Vec<String> = self.app.timeline_clone_vec().iter()
-                .filter_map(|e| {
-                    if let crate::tui::app::TimelineEntry::ToolCall { name, output, .. } = e {
-                        if (name == "edit_file" || name == "patch_file" || name == "apply_diff") && !output.is_empty() {
-                            Some(output.clone())
-                        } else { None }
-                    } else { None }
-                })
-                .collect();
-            if !diffs.is_empty() {
-                let combined = diffs.join("
+            {
+                // Collect diff text from recent tool calls for diff viewer
+                let diffs: Vec<String> = self
+                    .app
+                    .timeline_clone_vec()
+                    .iter()
+                    .filter_map(|e| {
+                        if let crate::tui::app::TimelineEntry::ToolCall { name, output, .. } = e {
+                            if (name == "edit_file" || name == "patch_file" || name == "apply_diff")
+                                && !output.is_empty()
+                            {
+                                Some(output.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !diffs.is_empty() {
+                    let combined = diffs.join(
+                        "
 ---
-");
-                self.diff_viewer.load(&combined);
+",
+                    );
+                    self.diff_viewer.load(&combined);
+                }
             }
-        }
-        match self.sidebar_active_tab {
+            match self.sidebar_active_tab {
                 0 => {
-                    let _ = error_recovery::catch_render_panic("context_panel", AssertUnwindSafe(|| {
-                        self.context_panel.render(&mut main_ctx, panel_area);
-                    }));
+                    let _ = error_recovery::catch_render_panic(
+                        "runtime_activity_panel",
+                        AssertUnwindSafe(|| {
+                            self.runtime_activity_panel.render(&mut main_ctx, panel_area);
+                        }),
+                    );
                 }
                 1 => {
-                    let _ = error_recovery::catch_render_panic("file_changes_panel", AssertUnwindSafe(|| {
-                        self.file_changes_panel.render(&mut main_ctx, panel_area);
-                    }));
+                    let _ = error_recovery::catch_render_panic(
+                        "context_panel",
+                        AssertUnwindSafe(|| {
+                            self.context_panel.render(&mut main_ctx, panel_area);
+                        }),
+                    );
                 }
                 2 => {
-                    let _ = error_recovery::catch_render_panic("todo_panel", AssertUnwindSafe(|| {
-                        self.todo_panel.render(&mut main_ctx, panel_area);
-                    }));
+                    let _ = error_recovery::catch_render_panic(
+                        "file_changes_panel",
+                        AssertUnwindSafe(|| {
+                            self.file_changes_panel.render(&mut main_ctx, panel_area);
+                        }),
+                    );
                 }
                 3 => {
-                    let _guard = self.render_profiler.guard("diff_viewer");
-                    let _ = error_recovery::catch_render_panic("diff_viewer", AssertUnwindSafe(|| {
-                        self.diff_viewer.render(&mut main_ctx, panel_area);
-                    }));
+                    let _ = error_recovery::catch_render_panic(
+                        "todo_panel",
+                        AssertUnwindSafe(|| {
+                            self.todo_panel.render(&mut main_ctx, panel_area);
+                        }),
+                    );
                 }
                 4 => {
-                    let _guard = self.render_profiler.guard("file_tree");
-                    let _ = error_recovery::catch_render_panic("file_tree", AssertUnwindSafe(|| {
-                        self.file_tree.render(&mut main_ctx, panel_area);
-                    }));
+                    let _guard = self.render_profiler.guard("diff_viewer");
+                    let _ = error_recovery::catch_render_panic(
+                        "diff_viewer",
+                        AssertUnwindSafe(|| {
+                            self.diff_viewer.render(&mut main_ctx, panel_area);
+                        }),
+                    );
                 }
                 5 => {
-                    let _guard = self.render_profiler.guard("session_sidebar");
-                    let _ = error_recovery::catch_render_panic("session_sidebar", AssertUnwindSafe(|| {
-                        self.session_sidebar.render(&mut main_ctx, panel_area);
-                    }));
+                    let _guard = self.render_profiler.guard("file_tree");
+                    let _ = error_recovery::catch_render_panic(
+                        "file_tree",
+                        AssertUnwindSafe(|| {
+                            self.file_tree.render(&mut main_ctx, panel_area);
+                        }),
+                    );
                 }
                 6 => {
-                    let _guard = self.render_profiler.guard("memory_panel");
-                    let _ = error_recovery::catch_render_panic("memory_panel", AssertUnwindSafe(|| {
-                        self.memory_panel.render(&mut main_ctx, panel_area);
-                    }));
+                    let _guard = self.render_profiler.guard("session_sidebar");
+                    let _ = error_recovery::catch_render_panic(
+                        "session_sidebar",
+                        AssertUnwindSafe(|| {
+                            self.session_sidebar.render(&mut main_ctx, panel_area);
+                        }),
+                    );
                 }
                 7 => {
-                    let _ = error_recovery::catch_render_panic("skills_panel", AssertUnwindSafe(|| {
-                        self.skills_panel.render(&mut main_ctx, panel_area);
-                    }));
+                    let _guard = self.render_profiler.guard("memory_panel");
+                    let _ = error_recovery::catch_render_panic(
+                        "memory_panel",
+                        AssertUnwindSafe(|| {
+                            self.memory_panel.render(&mut main_ctx, panel_area);
+                        }),
+                    );
                 }
                 8 => {
-                    let _ = error_recovery::catch_render_panic("gateway_panel", AssertUnwindSafe(|| {
-                        self.gateway_panel.render(&mut main_ctx, panel_area);
-                    }));
+                    let _ = error_recovery::catch_render_panic(
+                        "skills_panel",
+                        AssertUnwindSafe(|| {
+                            self.skills_panel.render(&mut main_ctx, panel_area);
+                        }),
+                    );
+                }
+                9 => {
+                    let _ = error_recovery::catch_render_panic(
+                        "gateway_panel",
+                        AssertUnwindSafe(|| {
+                            self.gateway_panel.render(&mut main_ctx, panel_area);
+                        }),
+                    );
                 }
                 _ => {}
             }
@@ -637,17 +723,16 @@ impl TuiState {
 
         // 2. Render status bar at bottom (reuses main_ctx)
         {
-            let status_area = ratatui::layout::Rect::new(
-                0,
-                area.height.saturating_sub(1),
-                area.width,
-                1,
-            );
+            let status_area =
+                ratatui::layout::Rect::new(0, area.height.saturating_sub(1), area.width, 1);
             let degraded = {
                 let _guard = self.render_profiler.guard("status_bar");
-                match error_recovery::catch_render_panic("status_bar", AssertUnwindSafe(|| {
-                    self.status_bar.render(&mut main_ctx, status_area);
-                })) {
+                match error_recovery::catch_render_panic(
+                    "status_bar",
+                    AssertUnwindSafe(|| {
+                        self.status_bar.render(&mut main_ctx, status_area);
+                    }),
+                ) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
                 }
@@ -661,12 +746,7 @@ impl TuiState {
         // FIX B: Set block on textarea before rendering for cursor visibility
         {
             let input_y = area.height.saturating_sub(1 + input_h);
-            let input_area = ratatui::layout::Rect::new(
-                0,
-                input_y,
-                area.width,
-                input_h,
-            );
+            let input_area = ratatui::layout::Rect::new(0, input_y, area.width, input_h);
             self.app.input.set_block(
                 ratatui::widgets::Block::default()
                     .borders(ratatui::widgets::Borders::ALL)
@@ -675,20 +755,28 @@ impl TuiState {
             // Render app.input widget directly — NOT through prompt
             {
                 let _guard = self.render_profiler.guard("input");
-                main_ctx.frame_mut().render_widget(&self.app.input, input_area);
+                main_ctx
+                    .frame_mut()
+                    .render_widget(&self.app.input, input_area);
             }
             // Render prompt's autocomplete dropdown as overlay
             {
                 let _guard = self.render_profiler.guard("prompt_dropdown");
-                let _ = error_recovery::catch_render_panic("prompt_dropdown", AssertUnwindSafe(|| {
-                    self.prompt.render_dropdown(&mut main_ctx, input_area);
-                }));
+                let _ = error_recovery::catch_render_panic(
+                    "prompt_dropdown",
+                    AssertUnwindSafe(|| {
+                        self.prompt.render_dropdown(&mut main_ctx, input_area);
+                    }),
+                );
             }
             // Render context suggestion bar above the input area
             if self.context_suggestions.is_active() {
-                let _ = error_recovery::catch_render_panic("context_suggestions", AssertUnwindSafe(|| {
-                    self.context_suggestions.render(&mut main_ctx, input_area);
-                }));
+                let _ = error_recovery::catch_render_panic(
+                    "context_suggestions",
+                    AssertUnwindSafe(|| {
+                        self.context_suggestions.render(&mut main_ctx, input_area);
+                    }),
+                );
             }
         }
 
@@ -699,9 +787,12 @@ impl TuiState {
         if self.app.turn_active {
             let degraded = {
                 let _guard = self.render_profiler.guard("thinking_panel");
-                match error_recovery::catch_render_panic("thinking_panel", AssertUnwindSafe(|| {
-                    self.thinking_panel.render(&mut overlay_ctx, area);
-                })) {
+                match error_recovery::catch_render_panic(
+                    "thinking_panel",
+                    AssertUnwindSafe(|| {
+                        self.thinking_panel.render(&mut overlay_ctx, area);
+                    }),
+                ) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
                 }
@@ -715,9 +806,12 @@ impl TuiState {
         if self.agents_overlay.visible {
             let degraded = {
                 let _guard = self.render_profiler.guard("agents_overlay");
-                match error_recovery::catch_render_panic("agents_overlay", AssertUnwindSafe(|| {
-                    self.agents_overlay.render(&mut overlay_ctx, area);
-                })) {
+                match error_recovery::catch_render_panic(
+                    "agents_overlay",
+                    AssertUnwindSafe(|| {
+                        self.agents_overlay.render(&mut overlay_ctx, area);
+                    }),
+                ) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
                 }
@@ -731,9 +825,12 @@ impl TuiState {
         if self.agent_team_panel.visible {
             let degraded = {
                 let _guard = self.render_profiler.guard("agent_team_panel");
-                match error_recovery::catch_render_panic("agent_team_panel", AssertUnwindSafe(|| {
-                    self.agent_team_panel.render(&mut overlay_ctx, area);
-                })) {
+                match error_recovery::catch_render_panic(
+                    "agent_team_panel",
+                    AssertUnwindSafe(|| {
+                        self.agent_team_panel.render(&mut overlay_ctx, area);
+                    }),
+                ) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
                 }
@@ -747,15 +844,19 @@ impl TuiState {
         if self.performance_dashboard.visible {
             let degraded = {
                 let _guard = self.render_profiler.guard("performance_dashboard");
-                match error_recovery::catch_render_panic("performance_dashboard", AssertUnwindSafe(|| {
-                    // Render in a centered rectangle (70% width, 60% height)
-                    let dash_w = (area.width as f32 * 0.7) as u16;
-                    let dash_h = (area.height as f32 * 0.55) as u16;
-                    let dash_x = (area.width.saturating_sub(dash_w)) / 2;
-                    let dash_y = (area.height.saturating_sub(dash_h)) / 2;
-                    let dash_area = ratatui::layout::Rect::new(dash_x, dash_y, dash_w, dash_h);
-                    self.performance_dashboard.render(&mut overlay_ctx, dash_area);
-                })) {
+                match error_recovery::catch_render_panic(
+                    "performance_dashboard",
+                    AssertUnwindSafe(|| {
+                        // Render in a centered rectangle (70% width, 60% height)
+                        let dash_w = (area.width as f32 * 0.7) as u16;
+                        let dash_h = (area.height as f32 * 0.55) as u16;
+                        let dash_x = (area.width.saturating_sub(dash_w)) / 2;
+                        let dash_y = (area.height.saturating_sub(dash_h)) / 2;
+                        let dash_area = ratatui::layout::Rect::new(dash_x, dash_y, dash_w, dash_h);
+                        self.performance_dashboard
+                            .render(&mut overlay_ctx, dash_area);
+                    }),
+                ) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
                 }
@@ -771,9 +872,12 @@ impl TuiState {
             if !self.l4_knowledge_view.entries.is_empty() {
                 let degraded = {
                     let _guard = self.render_profiler.guard("l4_knowledge_view");
-                    match error_recovery::catch_render_panic("l4_knowledge_view", AssertUnwindSafe(|| {
-                        self.l4_knowledge_view.render(&mut overlay_ctx, area);
-                    })) {
+                    match error_recovery::catch_render_panic(
+                        "l4_knowledge_view",
+                        AssertUnwindSafe(|| {
+                            self.l4_knowledge_view.render(&mut overlay_ctx, area);
+                        }),
+                    ) {
                         RenderResult::Ok => None,
                         RenderResult::Degraded(msg) => Some(msg),
                     }
@@ -788,9 +892,12 @@ impl TuiState {
         if !self.toast_manager.is_empty() {
             let degraded = {
                 let _guard = self.render_profiler.guard("toast_manager");
-                match error_recovery::catch_render_panic("toast_manager", AssertUnwindSafe(|| {
-                    self.toast_manager.render(&mut overlay_ctx, area);
-                })) {
+                match error_recovery::catch_render_panic(
+                    "toast_manager",
+                    AssertUnwindSafe(|| {
+                        self.toast_manager.render(&mut overlay_ctx, area);
+                    }),
+                ) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
                 }
@@ -804,9 +911,12 @@ impl TuiState {
         if !self.dialog_manager.is_empty() {
             let degraded = {
                 let _guard = self.render_profiler.guard("dialog_manager");
-                match error_recovery::catch_render_panic("dialog_manager", AssertUnwindSafe(|| {
-                    self.dialog_manager.render(&mut overlay_ctx, area);
-                })) {
+                match error_recovery::catch_render_panic(
+                    "dialog_manager",
+                    AssertUnwindSafe(|| {
+                        self.dialog_manager.render(&mut overlay_ctx, area);
+                    }),
+                ) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
                 }
@@ -820,9 +930,12 @@ impl TuiState {
         if self.command_palette.is_open() {
             let degraded = {
                 let _guard = self.render_profiler.guard("command_palette");
-                match error_recovery::catch_render_panic("command_palette", AssertUnwindSafe(|| {
-                    self.command_palette.render(&mut overlay_ctx, area);
-                })) {
+                match error_recovery::catch_render_panic(
+                    "command_palette",
+                    AssertUnwindSafe(|| {
+                        self.command_palette.render(&mut overlay_ctx, area);
+                    }),
+                ) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
                 }
@@ -837,9 +950,12 @@ impl TuiState {
             if qf.is_active() {
                 let degraded = {
                     let _guard = self.render_profiler.guard("question_form");
-                    match error_recovery::catch_render_panic("question_form", AssertUnwindSafe(|| {
-                        qf.render(&mut overlay_ctx, area);
-                    })) {
+                    match error_recovery::catch_render_panic(
+                        "question_form",
+                        AssertUnwindSafe(|| {
+                            qf.render(&mut overlay_ctx, area);
+                        }),
+                    ) {
                         RenderResult::Ok => None,
                         RenderResult::Degraded(msg) => Some(msg),
                     }
@@ -854,9 +970,12 @@ impl TuiState {
         if self.export_dialog_active {
             let degraded = {
                 let _guard = self.render_profiler.guard("export_dialog");
-                match error_recovery::catch_render_panic("export_dialog", AssertUnwindSafe(|| {
-                    self.export_dialog.render(&mut overlay_ctx, area);
-                })) {
+                match error_recovery::catch_render_panic(
+                    "export_dialog",
+                    AssertUnwindSafe(|| {
+                        self.export_dialog.render(&mut overlay_ctx, area);
+                    }),
+                ) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
                 }
@@ -878,9 +997,12 @@ impl TuiState {
         if self.keybind_engine.which_key_visible {
             let degraded = {
                 let _guard = self.render_profiler.guard("which_key");
-                match error_recovery::catch_render_panic("which_key", AssertUnwindSafe(|| {
-                    WhichKey::draw(frame, area, &self.keybind_engine);
-                })) {
+                match error_recovery::catch_render_panic(
+                    "which_key",
+                    AssertUnwindSafe(|| {
+                        WhichKey::draw(frame, area, &self.keybind_engine);
+                    }),
+                ) {
                     RenderResult::Ok => None,
                     RenderResult::Degraded(msg) => Some(msg),
                 }
@@ -930,12 +1052,14 @@ impl TuiState {
         // 1.75. Tab/BackTab sidebar cycling (before keybind engine which maps Tab to no-op NextPanel)
         match event.code {
             KeyCode::Tab => {
-                self.sidebar_active_tab = (self.sidebar_active_tab + 1) % 9;
+                const SIDEBAR_TAB_COUNT: usize = 10;
+                self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
                 return true;
             }
             KeyCode::BackTab => {
+                const SIDEBAR_TAB_COUNT: usize = 10;
                 self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
-                    8
+                    SIDEBAR_TAB_COUNT - 1
                 } else {
                     self.sidebar_active_tab - 1
                 };
@@ -1096,9 +1220,11 @@ impl TuiState {
                 let new_text = self.prompt.text();
                 let mut ta = tui_textarea::TextArea::default();
                 // Preserve the input block style
-                ta.set_block(ratatui::widgets::Block::default()
-                    .borders(ratatui::widgets::Borders::ALL)
-                    .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
+                ta.set_block(
+                    ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+                );
                 if !new_text.is_empty() {
                     ta.insert_str(&new_text);
                 }
@@ -1129,7 +1255,7 @@ impl TuiState {
 
         // ── Sidebar tab switching ──
         // Tab / Shift+Tab: cycle through sidebar tabs (Context / Changes / Todo / Diff / Files / Sessions / Memory / Skills / Gateway)
-        const SIDEBAR_TAB_COUNT: usize = 9;
+        const SIDEBAR_TAB_COUNT: usize = 10;
         if key.code == KeyCode::Tab {
             self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
             return ProcessedKey::Nothing;
@@ -1180,9 +1306,11 @@ impl TuiState {
             let text = self.app.input.lines().join("\n").trim().to_string();
             self.prompt.add_history(text.clone());
             self.app.input = tui_textarea::TextArea::default();
-            self.app.input.set_block(ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
+            self.app.input.set_block(
+                ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+            );
             return ProcessedKey::Submit(text);
         }
 
@@ -1302,7 +1430,8 @@ impl TuiState {
         }
 
         // Non-char textarea keys
-        matches!(event.code,
+        matches!(
+            event.code,
             KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right
         )
     }
@@ -1347,13 +1476,21 @@ impl TuiState {
     /// Open the session picker as a Select dialog.
     pub fn open_session_picker_dialog(&mut self) {
         use crate::tui::components::dialog::{DialogKind, DialogState};
-        let items: Vec<String> = self.app.picker_sessions.iter()
+        let items: Vec<String> = self
+            .app
+            .picker_sessions
+            .iter()
             .map(|s| {
                 let ts = chrono::DateTime::from_timestamp((s.updated_at_ms / 1000) as i64, 0)
                     .map(|d| d.format("%m-%d %H:%M").to_string())
                     .unwrap_or_default();
-                format!("{}  {} msgs  {}  {}",
-                    "", s.message_count, ts, &s.id[..8.min(s.id.len())])
+                format!(
+                    "{}  {} msgs  {}  {}",
+                    "",
+                    s.message_count,
+                    ts,
+                    &s.id[..8.min(s.id.len())]
+                )
             })
             .collect();
         let dialog = DialogState::new(DialogKind::Select {
@@ -1393,12 +1530,10 @@ impl TuiState {
         match action {
             Action::Scroll(delta) => {
                 if delta > 0 {
-                    self.app.scroll_offset =
-                        self.app.scroll_offset.saturating_add(delta as u16);
+                    self.app.scroll_offset = self.app.scroll_offset.saturating_add(delta as u16);
                     self.app.auto_scroll = false;
                 } else {
-                    self.app.scroll_offset =
-                        self.app.scroll_offset.saturating_sub((-delta) as u16);
+                    self.app.scroll_offset = self.app.scroll_offset.saturating_sub((-delta) as u16);
                     self.app.auto_scroll = false;
                 }
             }
@@ -1515,7 +1650,8 @@ impl TuiState {
             }
             Action::NextModel => {
                 if let Some(model) = self.app.next_model() {
-                    self.app.show_notification(&format!("Switched to model: {model}"));
+                    self.app
+                        .show_notification(&format!("Switched to model: {model}"));
                 }
             }
             Action::HistoryBrowse(older) => {
@@ -1526,11 +1662,12 @@ impl TuiState {
                 };
                 if let Some(text) = text {
                     let mut ta = tui_textarea::TextArea::default();
-                    ta.set_block(ratatui::widgets::Block::default()
-                        .borders(ratatui::widgets::Borders::ALL)
-                        .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
-                    ta.set_style(ratatui::style::Style::default()
-                        .fg(ratatui::style::Color::White));
+                    ta.set_block(
+                        ratatui::widgets::Block::default()
+                            .borders(ratatui::widgets::Borders::ALL)
+                            .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+                    );
+                    ta.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
                     if !text.is_empty() {
                         ta.insert_str(&text);
                     }
@@ -1569,13 +1706,13 @@ impl TuiState {
                 }
             }
             Action::FocusDiff => {
-                self.sidebar_active_tab = 3;
-            }
-            Action::FocusFileTree => {
                 self.sidebar_active_tab = 4;
             }
-            Action::FocusSessions => {
+            Action::FocusFileTree => {
                 self.sidebar_active_tab = 5;
+            }
+            Action::FocusSessions => {
+                self.sidebar_active_tab = 6;
             }
             Action::Execute(ref _cmd) => {}
             Action::TogglePanel(ref _name) => {}
@@ -1606,11 +1743,7 @@ impl TuiState {
     /// to create one.
     ///
     /// Shortcut for `self.event_dispatcher.register(id, component)`.
-    pub fn register_component(
-        &mut self,
-        id: EventComponentId,
-        component: Box<dyn Component>,
-    ) {
+    pub fn register_component(&mut self, id: EventComponentId, component: Box<dyn Component>) {
         self.event_dispatcher.register(id, component);
     }
 
@@ -1687,12 +1820,16 @@ impl TuiState {
     }
 
     /// Render the Ctrl+O per-message action menu when pending.
-    fn render_message_menu(&mut self, frame: &mut Frame, area: ratatui::layout::Rect, _skin: &crate::tui::skin::SkinConfig) {
+    fn render_message_menu(
+        &mut self,
+        frame: &mut Frame,
+        area: ratatui::layout::Rect,
+        _skin: &crate::tui::skin::SkinConfig,
+    ) {
         if !self.chat_view.pending_message_menu {
             return;
         }
 
-        
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -1715,7 +1852,9 @@ impl TuiState {
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
             " Message Actions ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::raw(""));
 
@@ -1723,12 +1862,11 @@ impl TuiState {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  [{key}] "),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    *label,
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(*label, Style::default().fg(Color::White)),
             ]));
         }
         lines.push(Line::raw(""));
@@ -1820,6 +1958,8 @@ pub struct L4KnowledgeView {
     pub synced: bool,
     /// Status message (e.g. "Orchestrator available" / "No L4 entries").
     pub status: String,
+    /// Last time entries were refreshed from the memory store.
+    last_sync_at: Option<Instant>,
 }
 
 impl L4KnowledgeView {
@@ -1830,26 +1970,65 @@ impl L4KnowledgeView {
             entries: Vec::new(),
             synced: false,
             status: String::new(),
+            last_sync_at: None,
         }
     }
 
     /// Sync from an optional memory orchestrator reference.
-    /// Since orchestrator operations are async, this just checks availability
-    /// and sets the status. Actual L4 entries are populated via events.
-    pub fn sync(&mut self, memory_orchestrator: &Option<std::sync::Arc<memory::MemoryOrchestrator>>) {
-        if memory_orchestrator.is_some() {
-            if !self.synced {
-                self.status = "L4 orchestrator available".to_string();
-                self.synced = true;
-            }
-        } else if self.synced {
+    pub fn sync(
+        &mut self,
+        memory_orchestrator: &Option<std::sync::Arc<memory::MemoryOrchestrator>>,
+    ) {
+        let Some(orchestrator) = memory_orchestrator else {
             self.status = "No L4 orchestrator".to_string();
             self.synced = false;
+            self.entries.clear();
+            self.last_sync_at = None;
+            return;
+        };
+
+        let should_sync = self
+            .last_sync_at
+            .map(|last| last.elapsed() >= Duration::from_secs(1))
+            .unwrap_or(true);
+        if !should_sync {
+            return;
         }
+
+        match search_l4_entries_blocking(std::sync::Arc::clone(orchestrator)) {
+            Ok(mut entries) => {
+                entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                let count = entries.len();
+                self.entries = entries
+                    .into_iter()
+                    .take(40)
+                    .map(|entry| {
+                        let tags = if entry.tags.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", entry.tags.join(","))
+                        };
+                        format!("{:?} {}{}", entry.priority, entry.title, tags)
+                    })
+                    .collect();
+                self.status = format!("Synced {count} L4 entries");
+                self.synced = true;
+                self.last_sync_at = Some(Instant::now());
+            }
+            Err(err) => {
+                self.status = format!("L4 sync failed: {err}");
+                self.synced = false;
+                self.last_sync_at = Some(Instant::now());
+            }
+        };
     }
 
     /// Render the L4 knowledge view as a compact overlay.
-    pub fn render(&self, ctx: &mut crate::tui::components::RenderContext, area: ratatui::layout::Rect) {
+    pub fn render(
+        &self,
+        ctx: &mut crate::tui::components::RenderContext,
+        area: ratatui::layout::Rect,
+    ) {
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, Borders, Paragraph};
@@ -1863,7 +2042,11 @@ impl L4KnowledgeView {
 
         if self.entries.is_empty() {
             lines.push(Line::from(Span::styled(
-                if self.synced { "No L4 entries yet." } else { "Orchestrator not available." },
+                if self.synced {
+                    "No L4 entries yet."
+                } else {
+                    "Orchestrator not available."
+                },
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
@@ -1884,20 +2067,43 @@ impl L4KnowledgeView {
         if !self.status.is_empty() {
             lines.push(Line::from(Span::styled(
                 &self.status,
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
             )));
         }
 
         let height = (lines.len() as u16 + 2).min(area.height);
-        let rect = ratatui::layout::Rect::new(
-            area.width.saturating_sub(40),
-            0,
-            40,
-            height,
-        );
+        let rect = ratatui::layout::Rect::new(area.width.saturating_sub(40), 0, 40, height);
 
         let paragraph = Paragraph::new(lines).block(block);
         ctx.frame_mut().render_widget(paragraph, rect);
+    }
+}
+
+fn search_l4_entries_blocking(
+    orchestrator: std::sync::Arc<memory::MemoryOrchestrator>,
+) -> Result<Vec<memory::MemoryEntry>, String> {
+    let search = move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())?;
+        runtime
+            .block_on(
+                orchestrator
+                    .store()
+                    .search_by_layer(memory::MemoryLayer::L4),
+            )
+            .map_err(|err| err.to_string())
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(search)
+            .join()
+            .map_err(|_| "L4 sync worker panicked".to_string())?
+    } else {
+        search()
     }
 }
 
@@ -1915,6 +2121,19 @@ mod tests {
     use crate::tui::layout::LayoutNode;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
+
+    fn test_memory_config(path: &std::path::Path) -> memory::MemoryConfig {
+        let mut config = memory::MemoryConfig::default();
+        config.store.sqlite_path = path.to_path_buf();
+        config.store.blob_dir = path.parent().unwrap().join("blobs");
+        config
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     // ── Construction ────────────────────────────────────────────
 
@@ -1938,6 +2157,45 @@ mod tests {
 
         // Theme engine dark by default
         assert_eq!(state.theme_engine.theme.name, "dark");
+    }
+
+    #[tokio::test]
+    async fn set_memory_manager_wires_tui_memory_surfaces() {
+        let dir = unique_temp_dir("cowd-tui-memory");
+        let manager = std::sync::Arc::new(
+            memory::CognitiveContextManager::new(test_memory_config(&dir.join("memory.db")))
+                .await
+                .unwrap(),
+        );
+        manager
+            .create_entry(
+                memory::MemoryLayer::L4,
+                memory::MemoryCategory::Shared,
+                "TUI L4 Decision",
+                "TUI must read real L4 shared memory.",
+                memory::Priority::High,
+                vec!["tui".into(), "l4".into()],
+                memory::MemoryScope::Global,
+            )
+            .await
+            .unwrap();
+
+        let mut state = TuiState::new("test-model", "test-session");
+        state.set_memory_manager(manager);
+
+        assert!(state.memory_panel.memory_manager.is_some());
+        assert!(state.memory_orchestrator.is_some());
+
+        state.l4_knowledge_view.sync(&state.memory_orchestrator);
+
+        assert!(
+            state
+                .l4_knowledge_view
+                .entries
+                .iter()
+                .any(|entry| entry.contains("TUI L4 Decision")),
+            "L4 overlay should sync real entries from the memory store"
+        );
     }
 
     // ── Deref delegation ────────────────────────────────────────
@@ -2021,7 +2279,10 @@ mod tests {
         // The last entry should be "✓ Done"
         let last = state.timeline_get(state.timeline_len() - 1).unwrap();
         let text = last.full_text();
-        assert!(text.contains("Done"), "expected '✓ Done' marker, got: {text}");
+        assert!(
+            text.contains("Done"),
+            "expected '✓ Done' marker, got: {text}"
+        );
     }
 
     #[test]
@@ -2035,9 +2296,9 @@ mod tests {
             preview: "ls -la".into(),
         });
 
-        assert!(state
-            .timeline_iter()
-            .any(|(_, e)| matches!(&e, crate::tui::app::TimelineEntry::ToolCall { id, .. } if id == "t1")));
+        assert!(state.timeline_iter().any(
+            |(_, e)| matches!(&e, crate::tui::app::TimelineEntry::ToolCall { id, .. } if id == "t1")
+        ));
     }
 
     #[test]
@@ -2141,10 +2402,12 @@ mod tests {
 
         // Push an alert dialog
         use crate::tui::components::dialog::{DialogKind, DialogState};
-        state.dialog_manager.push(DialogState::new(DialogKind::Alert {
-            title: "Test".into(),
-            message: "Alert!".into(),
-        }));
+        state
+            .dialog_manager
+            .push(DialogState::new(DialogKind::Alert {
+                title: "Test".into(),
+                message: "Alert!".into(),
+            }));
 
         // Any key should be consumed by the dialog
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
@@ -2202,10 +2465,12 @@ mod tests {
 
         // Push a dialog
         use crate::tui::components::dialog::{DialogKind, DialogState};
-        state.dialog_manager.push(DialogState::new(DialogKind::Alert {
-            title: "X".into(),
-            message: "Y".into(),
-        }));
+        state
+            .dialog_manager
+            .push(DialogState::new(DialogKind::Alert {
+                title: "X".into(),
+                message: "Y".into(),
+            }));
 
         // Esc → Cancel
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -2315,10 +2580,18 @@ mod tests {
         let mut state = TuiState::new("m", "s");
 
         state.update_startup_phase_at(false, state.startup_start + Duration::from_millis(501));
-        assert_eq!(state.startup_phase, StartupPhase::Loading, "should be Loading after delay");
+        assert_eq!(
+            state.startup_phase,
+            StartupPhase::Loading,
+            "should be Loading after delay"
+        );
 
         // Signal ready
         state.update_startup_phase_at(true, state.startup_start + Duration::from_millis(600));
-        assert_eq!(state.startup_phase, StartupPhase::Finishing, "should be Finishing when ready");
+        assert_eq!(
+            state.startup_phase,
+            StartupPhase::Finishing,
+            "should be Finishing when ready"
+        );
     }
 }

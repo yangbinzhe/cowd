@@ -106,7 +106,10 @@ impl QuestionForm {
     /// Panics if `questions` is empty.
     #[must_use]
     pub fn new(questions: Vec<QuestionDef>) -> Self {
-        assert!(!questions.is_empty(), "QuestionForm requires at least one question");
+        assert!(
+            !questions.is_empty(),
+            "QuestionForm requires at least one question"
+        );
         let count = questions.len();
         Self {
             questions,
@@ -133,7 +136,11 @@ impl QuestionForm {
     /// Number of tabs: if single → 1; otherwise → questions.len() + 1 (Confirm).
     #[inline]
     fn tab_count(&self) -> usize {
-        if self.is_single() { 1 } else { self.questions.len() + 1 }
+        if self.is_single() {
+            1
+        } else {
+            self.questions.len() + 1
+        }
     }
 
     /// Returns `true` when the current tab is the Confirm review tab.
@@ -145,7 +152,11 @@ impl QuestionForm {
     /// Reference to the current question, if not on Confirm tab.
     #[inline]
     fn current_question(&self) -> Option<&QuestionDef> {
-        if self.on_confirm() { None } else { Some(&self.questions[self.tab]) }
+        if self.on_confirm() {
+            None
+        } else {
+            Some(&self.questions[self.tab])
+        }
     }
 
     /// Options for the current question.
@@ -166,7 +177,11 @@ impl QuestionForm {
     /// Total number of selectable items (options + custom if enabled).
     fn total_options(&self) -> usize {
         let base = self.current_options().len();
-        if self.current_custom_enabled() { base + 1 } else { base }
+        if self.current_custom_enabled() {
+            base + 1
+        } else {
+            base
+        }
     }
 
     /// Returns `true` if the custom option is currently selected.
@@ -182,8 +197,12 @@ impl QuestionForm {
     /// Whether the custom input for the current question has been picked.
     fn custom_picked(&self) -> bool {
         let val = self.current_custom_input();
-        if val.is_empty() { return false; }
-        self.answers.get(self.tab).map_or(false, |a| a.iter().any(|x| x == val))
+        if val.is_empty() {
+            return false;
+        }
+        self.answers
+            .get(self.tab)
+            .map_or(false, |a| a.iter().any(|x| x == val))
     }
 
     // ── Public Result Access ───────────────────────────────────────
@@ -656,8 +675,12 @@ impl QuestionForm {
 
     /// Render the tab bar: question headers + "Confirm" tab.
     fn render_tab_bar(
-        &self, frame: &mut ratatui::Frame, area: Rect, y_offset: &mut u16,
-        accent: Color, fg: Color,
+        &self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        y_offset: &mut u16,
+        accent: Color,
+        fg: Color,
     ) {
         let mut spans: Vec<Span> = Vec::new();
 
@@ -697,8 +720,12 @@ impl QuestionForm {
 
     /// Render the current question content: question text, options, custom input.
     fn render_question(
-        &self, frame: &mut ratatui::Frame, area: Rect, y_offset: &mut u16,
-        accent: Color, fg: Color,
+        &self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        y_offset: &mut u16,
+        accent: Color,
+        fg: Color,
     ) {
         let q = match self.current_question() {
             Some(q) => q,
@@ -717,8 +744,7 @@ impl QuestionForm {
         let q_lines = Self::wrap_lines(&q_text, inner_w);
         let q_rect = Rect::new(x, *y_offset, inner_w, q_lines);
         frame.render_widget(
-            Paragraph::new(Text::from(q_text.as_str()))
-                .style(Style::default().fg(fg)),
+            Paragraph::new(Text::from(q_text.as_str())).style(Style::default().fg(fg)),
             q_rect,
         );
         *y_offset += q_lines;
@@ -732,7 +758,9 @@ impl QuestionForm {
 
         for (i, opt) in opts.iter().enumerate() {
             let is_selected = i == self.selected;
-            let is_picked = self.answers.get(self.tab)
+            let is_picked = self
+                .answers
+                .get(self.tab)
                 .map_or(false, |a| a.iter().any(|x| x == &opt.label));
 
             // Build option line
@@ -889,8 +917,12 @@ impl QuestionForm {
 
     /// Render the Confirm review page: list all questions with answers.
     fn render_confirm(
-        &self, frame: &mut ratatui::Frame, area: Rect, y_offset: &mut u16,
-        _accent: Color, fg: Color,
+        &self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        y_offset: &mut u16,
+        _accent: Color,
+        fg: Color,
     ) {
         let x = area.x + 2;
         let inner_w = area.width.saturating_sub(6);
@@ -898,7 +930,10 @@ impl QuestionForm {
         // "Review" header
         let header_rect = Rect::new(x, *y_offset, inner_w, 1);
         frame.render_widget(
-            Paragraph::new(Text::from(Span::styled("Review", Style::default().fg(fg).add_modifier(Modifier::BOLD)))),
+            Paragraph::new(Text::from(Span::styled(
+                "Review",
+                Style::default().fg(fg).add_modifier(Modifier::BOLD),
+            ))),
             header_rect,
         );
         *y_offset += 1;
@@ -929,18 +964,19 @@ impl QuestionForm {
 
             let line = Line::from(spans);
             let answer_rect = Rect::new(x + 2, *y_offset, inner_w.saturating_sub(2), 1);
-            frame.render_widget(
-                Paragraph::new(Text::from(vec![line])),
-                answer_rect,
-            );
+            frame.render_widget(Paragraph::new(Text::from(vec![line])), answer_rect);
             *y_offset += 1;
         }
     }
 
     /// Render the footer with keybinding hints.
     fn render_footer(
-        &self, frame: &mut ratatui::Frame, area: Rect, y: u16,
-        accent: Color, _fg: Color,
+        &self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        y: u16,
+        accent: Color,
+        _fg: Color,
     ) {
         let inner_w = area.width.saturating_sub(6);
         let x = area.x + 2;
@@ -964,7 +1000,10 @@ impl QuestionForm {
 
         if !self.on_confirm() {
             spans.push(Span::styled("↑↓ ", Style::default().fg(accent)));
-            spans.push(Span::styled("select  ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "select  ",
+                Style::default().fg(Color::DarkGray),
+            ));
         }
 
         spans.push(Span::styled("enter ", Style::default().fg(accent)));
@@ -974,14 +1013,14 @@ impl QuestionForm {
         ));
 
         spans.push(Span::styled("esc ", Style::default().fg(accent)));
-        spans.push(Span::styled("dismiss", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "dismiss",
+            Style::default().fg(Color::DarkGray),
+        ));
 
         let line = Line::from(spans);
         let footer_rect = Rect::new(x, y, inner_w, 1);
-        frame.render_widget(
-            Paragraph::new(Text::from(vec![line])),
-            footer_rect,
-        );
+        frame.render_widget(Paragraph::new(Text::from(vec![line])), footer_rect);
     }
 }
 
@@ -1028,7 +1067,11 @@ mod tests {
         QuestionForm::new(vec![make_question(
             "Language",
             "What language?",
-            &[("Rust", "Fast and safe"), ("Python", "Simple"), ("Go", "Concurrent")],
+            &[
+                ("Rust", "Fast and safe"),
+                ("Python", "Simple"),
+                ("Go", "Concurrent"),
+            ],
             false,
             false,
         )])
@@ -1545,9 +1588,15 @@ mod tests {
 
         let joined = lines.join("\n");
         assert!(joined.contains("Rust"), "Should show Rust option: {joined}");
-        assert!(joined.contains("Python"), "Should show Python option: {joined}");
+        assert!(
+            joined.contains("Python"),
+            "Should show Python option: {joined}"
+        );
         assert!(joined.contains("Go"), "Should show Go option: {joined}");
-        assert!(joined.contains("What language?"), "Should show question text: {joined}");
+        assert!(
+            joined.contains("What language?"),
+            "Should show question text: {joined}"
+        );
         assert!(joined.contains("esc"), "Should show footer: {joined}");
     }
 
@@ -1576,9 +1625,18 @@ mod tests {
         }
 
         let joined = lines.join("\n");
-        assert!(joined.contains("Language"), "Should show Language tab: {joined}");
-        assert!(joined.contains("Features"), "Should show Features tab: {joined}");
-        assert!(joined.contains("Confirm"), "Should show Confirm tab: {joined}");
+        assert!(
+            joined.contains("Language"),
+            "Should show Language tab: {joined}"
+        );
+        assert!(
+            joined.contains("Features"),
+            "Should show Features tab: {joined}"
+        );
+        assert!(
+            joined.contains("Confirm"),
+            "Should show Confirm tab: {joined}"
+        );
         assert!(joined.contains("tab"), "Should show footer: {joined}");
     }
 
@@ -1614,9 +1672,15 @@ mod tests {
         }
 
         let joined = lines.join("\n");
-        assert!(joined.contains("Review"), "Should show Review header: {joined}");
+        assert!(
+            joined.contains("Review"),
+            "Should show Review header: {joined}"
+        );
         assert!(joined.contains("Rust"), "Should show Rust answer: {joined}");
-        assert!(joined.contains("Export"), "Should show Export answer: {joined}");
+        assert!(
+            joined.contains("Export"),
+            "Should show Export answer: {joined}"
+        );
     }
 
     #[test]
@@ -1647,7 +1711,10 @@ mod tests {
         }
 
         let joined = lines.join("\n");
-        assert!(joined.contains("(not answered)"), "Should show not answered: {joined}");
+        assert!(
+            joined.contains("(not answered)"),
+            "Should show not answered: {joined}"
+        );
     }
 
     #[test]
@@ -1689,7 +1756,10 @@ mod tests {
         }
 
         let joined = lines.join("\n");
-        assert!(joined.contains("Type your own answer"), "Should show custom option: {joined}");
+        assert!(
+            joined.contains("Type your own answer"),
+            "Should show custom option: {joined}"
+        );
         assert!(joined.contains("vim"), "Should show typed text: {joined}");
     }
 
@@ -1725,8 +1795,14 @@ mod tests {
         }
 
         let joined = lines.join("\n");
-        assert!(joined.contains("[ ]"), "Should show empty checkbox: {joined}");
-        assert!(joined.contains("select all that apply"), "Should show multi hint: {joined}");
+        assert!(
+            joined.contains("[ ]"),
+            "Should show empty checkbox: {joined}"
+        );
+        assert!(
+            joined.contains("select all that apply"),
+            "Should show multi hint: {joined}"
+        );
     }
 
     // ── is_active ──────────────────────────────────────────────────
@@ -1747,7 +1823,7 @@ mod tests {
 
     #[test]
     fn is_active_returns_true_while_editing() {
-        let mut form = make_single_q();
+        let form = make_single_q();
         assert!(form.is_active());
     }
 }

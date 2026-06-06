@@ -229,11 +229,7 @@ impl ChatView {
         for i in 0..entry_idx.min(self.entry_line_counts.len()) {
             offset += self.entry_line_counts[i] as usize + 1;
         }
-        let entry_h = self
-            .entry_line_counts
-            .get(entry_idx)
-            .copied()
-            .unwrap_or(1) as usize;
+        let entry_h = self.entry_line_counts.get(entry_idx).copied().unwrap_or(1) as usize;
 
         let scroll = self.scroll_state.offset as usize;
         if offset < scroll {
@@ -381,7 +377,9 @@ impl Component for ChatView {
 impl ChatView {
     fn handle_key(&mut self, key: &KeyEvent) -> EventResult {
         // ── Ctrl+O: open per-message action menu (Task 5) ──
-        if key.modifiers == crossterm::event::KeyModifiers::CONTROL && key.code == KeyCode::Char('o') {
+        if key.modifiers == crossterm::event::KeyModifiers::CONTROL
+            && key.code == KeyCode::Char('o')
+        {
             if !self.timeline.is_empty() && self.timeline_cursor < self.timeline.len() {
                 self.pending_menu_entry_idx = self.timeline_cursor;
                 self.pending_message_menu = true;
@@ -393,7 +391,10 @@ impl ChatView {
             KeyCode::Enter => {
                 // Check if focused entry is a ToolCall with subagent_session_id (Task 9)
                 if let Some(entry) = self.timeline.get(self.timeline_cursor) {
-                    if let TimelineEntry::ToolCall { name, output, done, .. } = entry {
+                    if let TimelineEntry::ToolCall {
+                        name, output, done, ..
+                    } = entry
+                    {
                         if *done && name == "task" && !output.is_empty() {
                             // Try to extract subagent_session_id from output
                             if let Ok(val) = serde_json::from_str::<serde_json::Value>(output) {
@@ -484,12 +485,12 @@ impl ChatView {
             return;
         }
 
-        let prefix_count: usize = self
-            .entry_line_counts
-            .iter()
-            .take(n.saturating_sub(1))
-            .sum::<u16>()
-            .saturating_add((n.saturating_sub(1)) as u16) as usize;
+        let prefix_count: usize =
+            self.entry_line_counts
+                .iter()
+                .take(n.saturating_sub(1))
+                .sum::<u16>()
+                .saturating_add((n.saturating_sub(1)) as u16) as usize;
 
         let last_entry = self.timeline[n - 1].clone();
         let is_focused = (n - 1) == self.timeline_cursor;
@@ -534,9 +535,8 @@ impl ChatView {
 
         for (idx, entry) in self.timeline.iter().enumerate() {
             let is_last = idx == self.timeline.len() - 1;
-            let entry_lines =
-                self.entry_line_counts.get(idx).copied().unwrap_or(1) as usize
-                    + if is_last { 0 } else { 1 };
+            let entry_lines = self.entry_line_counts.get(idx).copied().unwrap_or(1) as usize
+                + if is_last { 0 } else { 1 };
             let entry_end = cumulative + entry_lines;
 
             if entry_end > scroll_offset && cumulative < viewport_end {
@@ -659,7 +659,12 @@ impl ChatView {
     ///
     /// Every occurrence of `search_query` (case-insensitive) gets inverse video.
     /// The current match (at `search_current` global index) gets a yellow background.
-    fn highlight_search_in_line(line: &mut Line<'static>, query: &str, current_match_idx: Option<usize>, global_match_counter: &mut usize) {
+    fn highlight_search_in_line(
+        line: &mut Line<'static>,
+        query: &str,
+        current_match_idx: Option<usize>,
+        global_match_counter: &mut usize,
+    ) {
         if query.is_empty() {
             return;
         }
@@ -684,11 +689,18 @@ impl ChatView {
 
                 // The match itself
                 let matched = &content[abs_pos..abs_pos + query.len()];
-                let is_current = current_match_idx.map(|idx| *global_match_counter == idx).unwrap_or(false);
+                let is_current = current_match_idx
+                    .map(|idx| *global_match_counter == idx)
+                    .unwrap_or(false);
                 let match_style = if is_current {
-                    Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .bg(Color::Yellow)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    span.style.bg(Color::DarkGray).add_modifier(Modifier::REVERSED)
+                    span.style
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::REVERSED)
                 };
                 new_spans.push(Span::styled(matched.to_string(), match_style));
 
@@ -753,8 +765,10 @@ impl ChatView {
                         )));
                         break;
                     }
-                    let mut spans =
-                        vec![Span::styled(prefix.to_string(), Style::default().fg(color).bold())];
+                    let mut spans = vec![Span::styled(
+                        prefix.to_string(),
+                        Style::default().fg(color).bold(),
+                    )];
                     Self::highlight_line(line, &mut spans, color);
                     lines.push(Line::from(spans));
                 }
@@ -897,10 +911,8 @@ impl ChatView {
                     ];
                     if let Some(sa) = &subagent_label {
                         if !sa.is_empty() {
-                            tool_line.push(Span::styled(
-                                sa.clone(),
-                                Style::default().fg(Color::Cyan),
-                            ));
+                            tool_line
+                                .push(Span::styled(sa.clone(), Style::default().fg(Color::Cyan)));
                         }
                     }
                     tool_line.push(Span::styled(
@@ -948,17 +960,12 @@ impl ChatView {
                             format!(": {short_preview}{more}"),
                             Style::default().fg(Color::Gray),
                         ),
-                        Span::styled(
-                            format!(" [{status_icon} {status_text}]"),
-                            status_style,
-                        ),
+                        Span::styled(format!(" [{status_icon} {status_text}]"), status_style),
                     ];
                     if let Some(sa) = &subagent_label {
                         if !sa.is_empty() {
-                            tool_line.push(Span::styled(
-                                sa.clone(),
-                                Style::default().fg(Color::Cyan),
-                            ));
+                            tool_line
+                                .push(Span::styled(sa.clone(), Style::default().fg(Color::Cyan)));
                         }
                     }
                     tool_line.push(Span::styled(
@@ -1209,7 +1216,14 @@ mod tests {
     #[test]
     fn render_tool_call() {
         let mut view = ChatView::new();
-        view.timeline = vec![make_tool_call("t1", "bash", "output line", true, false, Some(0))];
+        view.timeline = vec![make_tool_call(
+            "t1",
+            "bash",
+            "output line",
+            true,
+            false,
+            Some(0),
+        )];
         view.entry_line_counts = vec![1];
         view.msg_version = 0;
         view.lines_dirty = false;
@@ -1272,7 +1286,11 @@ mod tests {
     #[test]
     fn render_slash_output_expanded() {
         let mut view = ChatView::new();
-        view.timeline = vec![make_slash_output("status", "line1\nline2\nline3\nline4", true)];
+        view.timeline = vec![make_slash_output(
+            "status",
+            "line1\nline2\nline3\nline4",
+            true,
+        )];
         view.timeline_cursor = 0;
         view.entry_line_counts = vec![6];
         view.msg_version = 0;
@@ -1284,14 +1302,8 @@ mod tests {
             joined.contains("┌─"),
             "Expected top border '┌─' in expanded slash output"
         );
-        assert!(
-            joined.contains("line1"),
-            "Expected first output line"
-        );
-        assert!(
-            joined.contains("└─"),
-            "Expected bottom border '└─'"
-        );
+        assert!(joined.contains("line1"), "Expected first output line");
+        assert!(joined.contains("└─"), "Expected bottom border '└─'");
     }
 
     // ── Virtual scrolling ─────────────────────────────────────────
@@ -1417,7 +1429,10 @@ mod tests {
 
         // Scroll to entry 0
         view.scroll_to_entry(0);
-        assert_eq!(view.scroll_state.offset, 0, "scroll_to_entry(0) should reset scroll");
+        assert_eq!(
+            view.scroll_state.offset, 0,
+            "scroll_to_entry(0) should reset scroll"
+        );
     }
 
     // ── Empty timeline ────────────────────────────────────────────
@@ -1524,10 +1539,7 @@ mod tests {
     #[test]
     fn highlight_line_code_span() {
         let mut view = ChatView::new();
-        view.timeline = vec![make_message(
-            "user",
-            "use `cargo test` to run tests",
-        )];
+        view.timeline = vec![make_message("user", "use `cargo test` to run tests")];
         view.entry_line_counts = vec![1];
         view.msg_version = 0;
         view.lines_dirty = false;
@@ -1559,10 +1571,7 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("Hello"), "Expected user message");
         assert!(joined.contains("Hi there!"), "Expected assistant message");
-        assert!(
-            joined.contains("Thinking"),
-            "Expected thinking entry"
-        );
+        assert!(joined.contains("Thinking"), "Expected thinking entry");
         assert!(joined.contains("bash"), "Expected tool call entry");
     }
 
@@ -1639,10 +1648,7 @@ mod tests {
             view.pending_message_menu,
             "pending_message_menu should be set"
         );
-        assert_eq!(
-            view.pending_menu_entry_idx, 0,
-            "should target entry 0"
-        );
+        assert_eq!(view.pending_menu_entry_idx, 0, "should target entry 0");
     }
 
     #[test]
@@ -1762,10 +1768,7 @@ mod tests {
         assert!(result.is_consumed(), "Enter should be consumed");
 
         // Without output, should just toggle expand, not set nav
-        assert!(
-            view.pending_subagent_nav.is_none(),
-            "no nav without output"
-        );
+        assert!(view.pending_subagent_nav.is_none(), "no nav without output");
         // Should have expanded the entry
         match &view.timeline[0] {
             TimelineEntry::ToolCall { expanded, .. } => {
@@ -1798,7 +1801,10 @@ mod tests {
         let lines = terminal.buffer_lines();
         let joined = lines.join("\n");
         // The text should still be rendered (containing "test")
-        assert!(joined.contains("test"), "Search match text should be visible");
+        assert!(
+            joined.contains("test"),
+            "Search match text should be visible"
+        );
     }
 
     #[test]

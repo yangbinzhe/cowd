@@ -7,10 +7,7 @@
 use std::sync::mpsc;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{
-    backend::TestBackend,
-    Frame, Terminal,
-};
+use ratatui::{backend::TestBackend, Frame, Terminal};
 
 use crate::tui::app::App;
 use runtime::CowdEvent;
@@ -71,7 +68,8 @@ impl MockTerminal {
         let lines = self.buffer_lines();
         let actual = lines.len();
         assert_eq!(
-            actual, expected,
+            actual,
+            expected,
             "assert_line_count: expected {expected} lines, got {actual}\nBuffer:\n{}",
             self.buffer_str()
         );
@@ -97,10 +95,7 @@ impl MockTerminal {
     /// Return the terminal dimensions as `(columns, rows)`.
     #[must_use]
     pub fn dimensions(&self) -> (u16, u16) {
-        let size = self
-            .terminal
-            .size()
-            .expect("TestBackend::size never fails");
+        let size = self.terminal.size().expect("TestBackend::size never fails");
         (size.width, size.height)
     }
 
@@ -407,7 +402,10 @@ mod tests {
         // So 3 tool calls → 3 timeline entries.
         assert_eq!(app.timeline_len(), 3);
         for (_, entry) in app.timeline_iter() {
-            if let crate::tui::app::TimelineEntry::ToolCall { done, exit_code, .. } = entry {
+            if let crate::tui::app::TimelineEntry::ToolCall {
+                done, exit_code, ..
+            } = entry
+            {
                 assert!(*done, "tool should be done");
                 assert_eq!(exit_code, &Some(0), "exit_code should be 0");
             }
@@ -437,16 +435,22 @@ mod tests {
 
     // ── tui_test! macro tests ────────────────────────────────────
 
-    tui_test!(tui_test_macro_basic, |terminal: &mut MockTerminal, _app: &mut App, _sender: MockEventSender| {
-        terminal.draw(|f: &mut Frame| {
-            f.render_widget(Paragraph::new("macro test"), f.area());
-        });
-        terminal.assert_line_contains("macro test");
-    });
+    tui_test!(
+        tui_test_macro_basic,
+        |terminal: &mut MockTerminal, _app: &mut App, _sender: MockEventSender| {
+            terminal.draw(|f: &mut Frame| {
+                f.render_widget(Paragraph::new("macro test"), f.area());
+            });
+            terminal.assert_line_contains("macro test");
+        }
+    );
 
-    tui_test!(tui_test_macro_dimensions, |terminal: &mut MockTerminal, app: &mut App, _sender: MockEventSender| {
-        assert_eq!(terminal.dimensions(), (80, 24));
-        assert_eq!(app.model, "test-model");
-        assert_eq!(app.session_id, "test-session");
-    });
+    tui_test!(
+        tui_test_macro_dimensions,
+        |terminal: &mut MockTerminal, app: &mut App, _sender: MockEventSender| {
+            assert_eq!(terminal.dimensions(), (80, 24));
+            assert_eq!(app.model, "test-model");
+            assert_eq!(app.session_id, "test-session");
+        }
+    );
 }

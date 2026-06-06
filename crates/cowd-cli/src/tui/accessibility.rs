@@ -71,19 +71,61 @@ impl AccessibilityMode {
 
     /// Register default ARIA labels for common TUI components.
     fn register_default_labels(&mut self) {
-        self.labels.insert("input".into(), "Message input field. Type your message and press Enter to send.".into());
-        self.labels.insert("chat_view".into(), "Chat conversation view. Shows messages between you and the AI assistant.".into());
-        self.labels.insert("status_bar".into(), "Status bar showing model name, token usage, and session info.".into());
-        self.labels.insert("session_sidebar".into(), "Session sidebar. Lists available conversation sessions. Use arrow keys to navigate.".into());
-        self.labels.insert("command_palette".into(), "Command palette. Search and execute commands. Type to filter.".into());
-        self.labels.insert("file_tree".into(), "File tree browser. Shows workspace files and directories. Use arrow keys to navigate.".into());
-        self.labels.insert("diff_viewer".into(), "Diff viewer. Shows code changes with additions in green and deletions in red.".into());
-        self.labels.insert("dialog_alert".into(), "Alert dialog. Press any key to dismiss.".into());
-        self.labels.insert("dialog_confirm".into(), "Confirmation dialog. Press Y to confirm or N to cancel.".into());
-        self.labels.insert("dialog_select".into(), "Selection dialog. Use arrow keys to navigate and Enter to confirm.".into());
-        self.labels.insert("dialog_prompt".into(), "Input prompt. Type your response and press Enter.".into());
-        self.labels.insert("help_panel".into(), "Help panel showing keyboard shortcuts. Press ? to toggle.".into());
-        self.labels.insert("search_field".into(), "Search field. Type to search in conversation. Press Enter to search, Esc to cancel.".into());
+        self.labels.insert(
+            "input".into(),
+            "Message input field. Type your message and press Enter to send.".into(),
+        );
+        self.labels.insert(
+            "chat_view".into(),
+            "Chat conversation view. Shows messages between you and the AI assistant.".into(),
+        );
+        self.labels.insert(
+            "status_bar".into(),
+            "Status bar showing model name, token usage, and session info.".into(),
+        );
+        self.labels.insert(
+            "session_sidebar".into(),
+            "Session sidebar. Lists available conversation sessions. Use arrow keys to navigate."
+                .into(),
+        );
+        self.labels.insert(
+            "command_palette".into(),
+            "Command palette. Search and execute commands. Type to filter.".into(),
+        );
+        self.labels.insert(
+            "file_tree".into(),
+            "File tree browser. Shows workspace files and directories. Use arrow keys to navigate."
+                .into(),
+        );
+        self.labels.insert(
+            "diff_viewer".into(),
+            "Diff viewer. Shows code changes with additions in green and deletions in red.".into(),
+        );
+        self.labels.insert(
+            "dialog_alert".into(),
+            "Alert dialog. Press any key to dismiss.".into(),
+        );
+        self.labels.insert(
+            "dialog_confirm".into(),
+            "Confirmation dialog. Press Y to confirm or N to cancel.".into(),
+        );
+        self.labels.insert(
+            "dialog_select".into(),
+            "Selection dialog. Use arrow keys to navigate and Enter to confirm.".into(),
+        );
+        self.labels.insert(
+            "dialog_prompt".into(),
+            "Input prompt. Type your response and press Enter.".into(),
+        );
+        self.labels.insert(
+            "help_panel".into(),
+            "Help panel showing keyboard shortcuts. Press ? to toggle.".into(),
+        );
+        self.labels.insert(
+            "search_field".into(),
+            "Search field. Type to search in conversation. Press Enter to search, Esc to cancel."
+                .into(),
+        );
     }
 }
 
@@ -109,20 +151,20 @@ impl Default for AccessibilityMode {
 /// All pairings exceed WCAG AA 4.5:1 minimum.
 pub fn high_contrast_dark_palette() -> Palette {
     Palette {
-        accent: Color::Rgb(0, 255, 255),       // Cyan — 16.8:1 on black
-        bg: Color::Rgb(0, 0, 0),               // Black
-        fg: Color::Rgb(255, 255, 255),         // White — 21:1 on black
-        user_color: Color::Rgb(0, 255, 0),     // Green — 15.3:1 on black
-        warn: Color::Rgb(255, 255, 0),         // Yellow — 19.6:1 on black
-        error: Color::Rgb(255, 80, 80),        // Bright red — ~10:1 on black
-        success: Color::Rgb(0, 255, 0),        // Green — 15.3:1 on black
-        muted: Color::Rgb(180, 180, 180),      // Light gray — ~12:1 on black
-        agent_planner: Color::Rgb(100, 149, 237),   // Cornflower blue — ~6:1 on black
-        agent_executor: Color::Rgb(50, 205, 50),    // Lime green — ~9:1 on black
-        agent_reviewer: Color::Rgb(218, 112, 214),  // Orchid — ~10:1 on black
-        agent_idle: Color::Rgb(169, 169, 169),      // Dark gray — ~11:1 on black
-        agent_busy: Color::Rgb(255, 215, 0),        // Gold — ~16:1 on black
-        agent_offline: Color::Rgb(255, 99, 71),     // Tomato — ~7:1 on black
+        accent: Color::Rgb(0, 255, 255),           // Cyan — 16.8:1 on black
+        bg: Color::Rgb(0, 0, 0),                   // Black
+        fg: Color::Rgb(255, 255, 255),             // White — 21:1 on black
+        user_color: Color::Rgb(0, 255, 0),         // Green — 15.3:1 on black
+        warn: Color::Rgb(255, 255, 0),             // Yellow — 19.6:1 on black
+        error: Color::Rgb(255, 80, 80),            // Bright red — ~10:1 on black
+        success: Color::Rgb(0, 255, 0),            // Green — 15.3:1 on black
+        muted: Color::Rgb(180, 180, 180),          // Light gray — ~12:1 on black
+        agent_planner: Color::Rgb(100, 149, 237),  // Cornflower blue — ~6:1 on black
+        agent_executor: Color::Rgb(50, 205, 50),   // Lime green — ~9:1 on black
+        agent_reviewer: Color::Rgb(218, 112, 214), // Orchid — ~10:1 on black
+        agent_idle: Color::Rgb(169, 169, 169),     // Dark gray — ~11:1 on black
+        agent_busy: Color::Rgb(255, 215, 0),       // Gold — ~16:1 on black
+        agent_offline: Color::Rgb(255, 99, 71),    // Tomato — ~7:1 on black
     }
 }
 
@@ -131,20 +173,20 @@ pub fn high_contrast_dark_palette() -> Palette {
 /// Uses black text on white background, with high-saturation accents.
 pub fn high_contrast_light_palette() -> Palette {
     Palette {
-        accent: Color::Rgb(0, 0, 180),         // Darker blue — >10:1 on white
-        bg: Color::Rgb(255, 255, 255),         // White
-        fg: Color::Rgb(0, 0, 0),               // Black — 21:1 on white
-        user_color: Color::Rgb(0, 100, 0),     // Dark green — >8:1 on white
-        warn: Color::Rgb(130, 75, 0),          // Dark amber/brown — >4.5:1 on white
-        error: Color::Rgb(180, 0, 0),          // Dark red — >8:1 on white
-        success: Color::Rgb(0, 110, 0),        // Dark green — >8:1 on white
-        muted: Color::Rgb(90, 90, 90),         // Dark gray — >5:1 on white
-        agent_planner: Color::Rgb(0, 0, 180),        // Dark blue — >10:1 on white
-        agent_executor: Color::Rgb(0, 110, 0),       // Dark green — >8:1 on white
-        agent_reviewer: Color::Rgb(139, 0, 139),     // Dark magenta — >6:1 on white
-        agent_idle: Color::Rgb(90, 90, 90),          // Dark gray — >5:1 on white
-        agent_busy: Color::Rgb(180, 150, 0),         // Dark gold — >5:1 on white
-        agent_offline: Color::Rgb(180, 0, 0),        // Dark red — >8:1 on white
+        accent: Color::Rgb(0, 0, 180),           // Darker blue — >10:1 on white
+        bg: Color::Rgb(255, 255, 255),           // White
+        fg: Color::Rgb(0, 0, 0),                 // Black — 21:1 on white
+        user_color: Color::Rgb(0, 100, 0),       // Dark green — >8:1 on white
+        warn: Color::Rgb(130, 75, 0),            // Dark amber/brown — >4.5:1 on white
+        error: Color::Rgb(180, 0, 0),            // Dark red — >8:1 on white
+        success: Color::Rgb(0, 110, 0),          // Dark green — >8:1 on white
+        muted: Color::Rgb(90, 90, 90),           // Dark gray — >5:1 on white
+        agent_planner: Color::Rgb(0, 0, 180),    // Dark blue — >10:1 on white
+        agent_executor: Color::Rgb(0, 110, 0),   // Dark green — >8:1 on white
+        agent_reviewer: Color::Rgb(139, 0, 139), // Dark magenta — >6:1 on white
+        agent_idle: Color::Rgb(90, 90, 90),      // Dark gray — >5:1 on white
+        agent_busy: Color::Rgb(180, 150, 0),     // Dark gold — >5:1 on white
+        agent_offline: Color::Rgb(180, 0, 0),    // Dark red — >8:1 on white
     }
 }
 
@@ -156,7 +198,11 @@ pub fn high_contrast_theme(dark: bool) -> Theme {
         high_contrast_light_palette()
     };
 
-    let name = if dark { "high-contrast-dark" } else { "high-contrast-light" };
+    let name = if dark {
+        "high-contrast-dark"
+    } else {
+        "high-contrast-light"
+    };
 
     // Compute stylesheet with extra bold for readability
     let mut stylesheet = StyleSheet::from_palette(&palette);
@@ -176,8 +222,7 @@ pub fn high_contrast_theme(dark: bool) -> Theme {
     stylesheet.border_focused = Style::default()
         .fg(palette.accent)
         .add_modifier(Modifier::BOLD);
-    stylesheet.border_unfocused = Style::default()
-        .fg(palette.fg);
+    stylesheet.border_unfocused = Style::default().fg(palette.fg);
 
     // Make search highlight very visible
     stylesheet.search_highlight = Style::default()
@@ -328,7 +373,9 @@ mod tests {
         assert!(mode.label_for("input").contains("Message input field"));
         assert!(mode.label_for("chat_view").contains("Chat conversation"));
         assert!(mode.label_for("status_bar").contains("Status bar"));
-        assert!(mode.label_for("command_palette").contains("Command palette"));
+        assert!(mode
+            .label_for("command_palette")
+            .contains("Command palette"));
         assert!(mode.label_for("file_tree").contains("File tree"));
         assert!(mode.label_for("diff_viewer").contains("Diff viewer"));
         assert!(mode.label_for("help_panel").contains("Help panel"));
@@ -361,9 +408,21 @@ mod tests {
         assert_eq!(theme.name, "high-contrast-dark");
         assert!(matches!(theme.source, ThemeSource::Builtin));
         // Should have bold headings
-        assert!(theme.stylesheet.heading1.add_modifier.contains(Modifier::BOLD));
-        assert!(theme.stylesheet.heading2.add_modifier.contains(Modifier::BOLD));
-        assert!(theme.stylesheet.heading3.add_modifier.contains(Modifier::BOLD));
+        assert!(theme
+            .stylesheet
+            .heading1
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert!(theme
+            .stylesheet
+            .heading2
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert!(theme
+            .stylesheet
+            .heading3
+            .add_modifier
+            .contains(Modifier::BOLD));
     }
 
     #[test]
@@ -409,12 +468,12 @@ mod tests {
         let palette = Palette {
             accent: Color::Rgb(0, 255, 255),
             bg: Color::Rgb(0, 0, 0),
-            fg: Color::Rgb(50, 50, 50),       // Dark gray on black — will fail WCAG
+            fg: Color::Rgb(50, 50, 50), // Dark gray on black — will fail WCAG
             user_color: Color::Rgb(0, 255, 0),
             warn: Color::Rgb(255, 255, 0),
             error: Color::Rgb(255, 0, 0),
             success: Color::Rgb(0, 255, 0),
-            muted: Color::Rgb(40, 40, 40),    // Very dark on black — will fail WCAG
+            muted: Color::Rgb(40, 40, 40), // Very dark on black — will fail WCAG
             agent_planner: Color::Blue,
             agent_executor: Color::Green,
             agent_reviewer: Color::Magenta,

@@ -103,6 +103,7 @@ impl StatusBar {
         sb.add_section(Self::cache_section());
         sb.add_section(Self::search_section());
         sb.add_section(Self::history_section());
+        sb.add_section(Self::task_section());
         sb.add_section(Self::wave_section());
         // Task 12: Footer status sections (right-aligned)
         sb.add_section(Self::mcp_status_section());
@@ -194,6 +195,15 @@ impl StatusBar {
         }
     }
 
+    fn task_section() -> StatusSection {
+        StatusSection {
+            id: "task".into(),
+            content: None,
+            style: Style::default().fg(Color::Magenta),
+            width: SectionWidth::Fixed(28),
+        }
+    }
+
     fn wave_section() -> StatusSection {
         StatusSection {
             id: "wave".into(),
@@ -272,12 +282,7 @@ impl StatusBar {
     ///
     /// The notification is shown for `ttl` ticks then auto-dismisses.
     /// Call [`tick`](Self::tick) each frame to count down.
-    pub fn set_notification(
-        &mut self,
-        text: impl Into<String>,
-        style: Style,
-        ttl: u32,
-    ) {
+    pub fn set_notification(&mut self, text: impl Into<String>, style: Style, ttl: u32) {
         self.notification = Some((text.into(), style));
         self.notification_ttl = ttl;
     }
@@ -324,16 +329,13 @@ impl StatusBar {
                         }
                         None => "未配置".to_string(),
                     };
-                    Some(format!("{label} │ {status} │ {}", app.model))
+                    let mode = if app.yolo_mode { "YOLO" } else { "STD" };
+                    Some(format!("{label} │ {status} │ {mode} │ {}", app.model))
                 }
                 "reputation" => {
                     app.selected_agent_reputation.map(|r| {
                         // Gold/Yellow for >=4.0, Silver/Gray for >=2.0
-                        let style = if r >= 4.0 {
-                            Color::Yellow
-                        } else {
-                            Color::Gray
-                        };
+                        let style = if r >= 4.0 { Color::Yellow } else { Color::Gray };
                         // Override the section's style with dynamic color
                         section.style = section.style.fg(style);
                         format!("⭐{r:.1}")
@@ -352,8 +354,7 @@ impl StatusBar {
                     }
                 }
                 "turn_token" => {
-                    if app.turn_active
-                        && (app.turn_input_tokens > 0 || app.turn_output_tokens > 0)
+                    if app.turn_active && (app.turn_input_tokens > 0 || app.turn_output_tokens > 0)
                     {
                         Some(format!(
                             "turn:in:{} out:{}",
@@ -392,9 +393,32 @@ impl StatusBar {
                         None
                     }
                 }
-                "history" => {
-                    app.history_idx.map(|hidx| format!("hist:{}", hidx + 1))
-                }
+                "history" => app.history_idx.map(|hidx| format!("hist:{}", hidx + 1)),
+                "task" => app.current_task.as_ref().map(|task| {
+                    let short_id: String = task.id.chars().take(8).collect();
+                    let phase = task
+                        .current_phase
+                        .as_deref()
+                        .map(|phase| {
+                            let phase_status = task.phase_status.as_deref().unwrap_or("active");
+                            format!(" · {phase}:{phase_status}")
+                        })
+                        .unwrap_or_default();
+                    let review = task
+                        .review_result
+                        .as_deref()
+                        .map(|result| format!(" · review:{result}"))
+                        .unwrap_or_default();
+                    let artifacts = if task.artifact_count > 0 {
+                        format!(" · art:{}", task.artifact_count)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "Task {} {}{}{}{}",
+                        task.status, short_id, phase, artifacts, review
+                    )
+                }),
                 "wave" => {
                     let ws = &app.wave_state;
                     if ws.total > 0 {
@@ -407,15 +431,9 @@ impl StatusBar {
                         None
                     }
                 }
-                "mcp_status" => {
-                    Some(format!("● MCP:{}", app.mcp_count))
-                }
-                "lsp_status" => {
-                    Some(format!("● LSP:{}", app.lsp_available))
-                }
-                "permission_status" => {
-                    Some("△ 2".to_string())
-                }
+                "mcp_status" => Some(format!("● MCP:{}", app.mcp_count)),
+                "lsp_status" => Some(format!("● LSP:{}", app.lsp_available)),
+                "permission_status" => Some("△ 2".to_string()),
                 _ => None,
             };
         }
@@ -485,8 +503,7 @@ impl Component for StatusBar {
 
         // Render the status line
         let bg = ctx.theme().bg_color();
-        let par = Paragraph::new(Line::from(spans))
-            .style(Style::default().bg(bg));
+        let par = Paragraph::new(Line::from(spans)).style(Style::default().bg(bg));
         ctx.frame_mut().render_widget(par, area);
 
         // ── Notification overlay ──────────────────────────────────
@@ -561,6 +578,7 @@ pub fn token_bar(app: &App) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::CurrentTaskSummary;
     use crate::tui::components::RenderContext;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
@@ -606,6 +624,7 @@ mod tests {
         assert!(ids.contains(&"cache"));
         assert!(ids.contains(&"search"));
         assert!(ids.contains(&"history"));
+        assert!(ids.contains(&"task"));
     }
 
     // ── Notification ─────────────────────────────────────────────
@@ -667,6 +686,66 @@ mod tests {
         let content = section.content.as_deref().unwrap();
         assert!(content.contains("✓ Ready"));
         assert!(content.contains("claude-sonnet-4"));
+    }
+
+    #[test]
+    fn sync_from_app_shows_yolo_mode() {
+        let mut app = App::new("claude-sonnet-4", "test-session");
+        app.yolo_mode = true;
+        let mut bar = StatusBar::with_default_sections();
+
+        bar.sync_from_app(&app);
+
+        let section = bar.section_mut("panel_model_status").unwrap();
+        let content = section.content.as_ref().unwrap();
+        assert!(content.contains("YOLO"));
+    }
+
+    #[test]
+    fn sync_from_app_shows_current_task() {
+        let mut app = App::new("claude-sonnet-4", "test-session");
+        app.current_task = Some(CurrentTaskSummary {
+            id: "task-123456789".to_string(),
+            objective: "ship v0.8.10".to_string(),
+            status: "running".to_string(),
+            current_phase: None,
+            phase_status: None,
+            review_result: None,
+            artifact_count: 0,
+            blocker_reason: None,
+        });
+        let mut bar = StatusBar::with_default_sections();
+
+        bar.sync_from_app(&app);
+
+        let section = bar.section_mut("task").unwrap();
+        let content = section.content.as_ref().unwrap();
+        assert!(content.contains("Task running"));
+        assert!(content.contains("task-123"));
+    }
+
+    #[test]
+    fn sync_from_app_shows_current_task_phase_review_and_artifacts() {
+        let mut app = App::new("claude-sonnet-4", "test-session");
+        app.current_task = Some(CurrentTaskSummary {
+            id: "task-123456789".to_string(),
+            objective: "ship v0.8.10".to_string(),
+            status: "running".to_string(),
+            current_phase: Some("tui-cockpit".to_string()),
+            phase_status: Some("completed".to_string()),
+            review_result: Some("accepted".to_string()),
+            artifact_count: 2,
+            blocker_reason: None,
+        });
+        let mut bar = StatusBar::with_default_sections();
+
+        bar.sync_from_app(&app);
+
+        let section = bar.section_mut("task").unwrap();
+        let content = section.content.as_ref().unwrap();
+        assert!(content.contains("tui-cockpit:completed"));
+        assert!(content.contains("art:2"));
+        assert!(content.contains("review:accepted"));
     }
 
     // ── Render tests ─────────────────────────────────────────────
@@ -808,9 +887,18 @@ mod tests {
     fn with_default_sections_includes_footer_sections() {
         let bar = StatusBar::with_default_sections();
         let ids: Vec<&str> = bar.sections().iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"mcp_status"), "Should have mcp_status section");
-        assert!(ids.contains(&"lsp_status"), "Should have lsp_status section");
-        assert!(ids.contains(&"permission_status"), "Should have permission_status section");
+        assert!(
+            ids.contains(&"mcp_status"),
+            "Should have mcp_status section"
+        );
+        assert!(
+            ids.contains(&"lsp_status"),
+            "Should have lsp_status section"
+        );
+        assert!(
+            ids.contains(&"permission_status"),
+            "Should have permission_status section"
+        );
     }
 
     #[test]
@@ -846,7 +934,10 @@ mod tests {
         app.context_window = 200_000;
         app.token_count = 50_000;
         let bar = token_bar(&app);
-        assert!(bar.is_some(), "token_bar should return Some when context_window > 0");
+        assert!(
+            bar.is_some(),
+            "token_bar should return Some when context_window > 0"
+        );
         assert!(bar.unwrap().contains("25%"), "should show 25% usage");
     }
 
@@ -854,6 +945,9 @@ mod tests {
     fn token_bar_returns_none_when_window_zero() {
         use crate::tui::app::App;
         let app = App::new("test", "test-session");
-        assert!(token_bar(&app).is_none(), "token_bar should return None when context_window == 0");
+        assert!(
+            token_bar(&app).is_none(),
+            "token_bar should return None when context_window == 0"
+        );
     }
 }

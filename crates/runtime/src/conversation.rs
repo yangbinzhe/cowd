@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{RwLock, Semaphore};
@@ -29,26 +29,27 @@ use futures::stream::Stream;
 use memory::cognitive::CognitiveContextManager;
 use memory::config::MemoryConfig as CcMemoryConfig;
 use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
-use memory::coherence;
+use memory::{MemoryKernel, MemoryTurnContext};
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 use tracing;
 
 use crate::agent::{SubAgentConfig, SubAgentRuntime};
-use crate::agent_collaboration::CollaborationOps;
+use crate::agent_collaboration::{CollaborationContextResult, CollaborationOps};
 use crate::agent_discussion::DiscussionEngine;
-use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    CompactionConfig, CompactionResult, compact_session, estimate_session_tokens,
 };
 use crate::config::RuntimeFeatureConfig;
+use crate::context_runtime::{
+    ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
+    ContextMode, ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
+    ContextVisibility, ResumeContextPacket, ToolTracePacket, ToolTraceStatus,
+};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
-use crate::permissions::{
-    PermissionContext, PermissionOutcome, PermissionPolicy,
-};
-use crate::session::{
-    ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog,
-};
+use crate::joint_problem_solving::{JpsOps, ProblemStatement};
+use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
+use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
 
@@ -124,19 +125,22 @@ pub trait ApiClient {
     /// Convenience: collect all events synchronously (backward compat).
     fn stream_collect(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let stream = self.stream(request);
-        tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::try_current()
-                .unwrap_or_else(|_| tokio::runtime::Builder::new_current_thread()
-                    .enable_all().build().expect("stream_collect rt").handle().clone());
-            handle.block_on(async {
-                use futures::StreamExt;
-                let mut events = Vec::new();
-                let mut pinned = stream;
-                while let Some(event) = pinned.next().await {
-                    events.push(event?);
-                }
-                Ok(events)
-            })
+        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("stream_collect rt")
+                .handle()
+                .clone()
+        });
+        handle.block_on(async {
+            use futures::StreamExt;
+            let mut events = Vec::new();
+            let mut pinned = stream;
+            while let Some(event) = pinned.next().await {
+                events.push(event?);
+            }
+            Ok(events)
         })
     }
 }
@@ -170,6 +174,19 @@ pub trait MemoryCallback: Send + Sync {
     /// Called after post-turn memory housekeeping completes
     /// (micro-compact, drift, seeds).
     fn on_memory_stats(&self, total_entries: usize, vector_count: usize, layers: Vec<String>);
+}
+
+fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
+    match profile {
+        ContextProfile::MainTurn => ContextMode::MainTurn,
+        ContextProfile::SoloGoal => ContextMode::SoloGoal,
+        ContextProfile::YoloGoal => ContextMode::YoloGoal,
+        ContextProfile::SubAgent => ContextMode::SubAgent,
+        ContextProfile::Collaboration => ContextMode::Collaboration,
+        ContextProfile::Review => ContextMode::Review,
+        ContextProfile::Resume => ContextMode::Resume,
+        ContextProfile::Cron => ContextMode::Cron,
+    }
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -241,7 +258,9 @@ pub struct TurnCallback {
 }
 impl TurnCallback {
     pub fn new<F: Fn(&str, &str) -> Option<String> + Send + Sync + 'static>(f: F) -> Self {
-        Self { on_tool_result: Box::new(f) }
+        Self {
+            on_tool_result: Box::new(f),
+        }
     }
 }
 
@@ -259,7 +278,6 @@ pub struct ConversationRuntime<C, T> {
     turn_callback: Option<Arc<TurnCallback>>,
     profiler: crate::context_profiler::ContextProfiler,
     use_aaak_index: bool,
-    coherence_threshold: f32,
     auto_compaction_input_tokens_threshold: u32,
     model_context_window: u32,
     cached_prompt: crate::cached_prompt::CachedSystemPrompt,
@@ -303,6 +321,16 @@ pub struct ConversationRuntime<C, T> {
     cancellation_token: CancellationToken,
     /// T36: Tool orchestrator for result budgeting and truncation.
     tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator,
+    /// Latest assembled context envelope used by a real turn.
+    last_context_envelope: std::sync::Mutex<Option<ContextEnvelope>>,
+    /// Active context profile used to assemble the next runtime envelope.
+    context_profile: std::sync::Mutex<ContextProfile>,
+    /// Runtime-owned context supplied by outer orchestration layers.
+    external_context_items: std::sync::Mutex<Vec<ContextItem>>,
+    /// Latest multi-agent collaboration packet for outer persistence.
+    last_collaboration_result: std::sync::Mutex<Option<CollaborationContextResult>>,
+    /// Bounded short-term tool trace context for subsequent turns.
+    tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// T4: Semaphore for WriteLocal tool concurrency (permits: 4).
     write_semaphore: Arc<Semaphore>,
     /// T4: Semaphore for Network tool concurrency (permits: 3).
@@ -370,11 +398,15 @@ where
                         Ok(mgr) => {
                             mgr.set_active_agent("primary".to_string());
                             let mgr = mgr.init_memory_sync();
-                            tracing::debug!("memory: CognitiveContextManager initialised, active_agent=primary");
+                            tracing::debug!(
+                                "memory: CognitiveContextManager initialised, active_agent=primary"
+                            );
                             (Some(Arc::new(mgr)), None)
                         }
                         Err(err) => {
-                            let msg = format!("Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory.");
+                            let msg = format!(
+                                "Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory."
+                            );
                             tracing::error!("{msg}");
                             (None, Some(msg))
                         }
@@ -389,17 +421,23 @@ where
                             Ok(mgr) => {
                                 mgr.set_active_agent("primary".to_string());
                                 let mgr = mgr.init_memory_sync();
-                                tracing::debug!("memory: CognitiveContextManager initialised, active_agent=primary");
+                                tracing::debug!(
+                                    "memory: CognitiveContextManager initialised, active_agent=primary"
+                                );
                                 (Some(Arc::new(mgr)), None)
                             }
                             Err(err) => {
-                                let msg = format!("Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory.");
+                                let msg = format!(
+                                    "Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory."
+                                );
                                 tracing::error!("{msg}");
                                 (None, Some(msg))
                             }
                         },
                         Err(e) => {
-                            let msg = format!("Memory system unavailable: failed to create runtime: {e}. Memory features will NOT work.");
+                            let msg = format!(
+                                "Memory system unavailable: failed to create runtime: {e}. Memory features will NOT work."
+                            );
                             tracing::error!("{msg}");
                             (None, Some(msg))
                         }
@@ -423,11 +461,13 @@ where
             turn_callback: None,
             profiler: crate::context_profiler::ContextProfiler::new(),
             use_aaak_index: feature_config.memory().aaak_index_enabled,
-            coherence_threshold: feature_config.memory().coherence_threshold_bp as f32 / 10000.0,
             auto_compaction_input_tokens_threshold: {
                 let env_val = auto_compaction_threshold_from_env();
-                if env_val > 0 { env_val }
-                else { feature_config.compression().session.threshold_tokens }
+                if env_val > 0 {
+                    env_val
+                } else {
+                    feature_config.compression().session.threshold_tokens
+                }
             },
             model_context_window: 0,
             cached_prompt: crate::cached_prompt::CachedSystemPrompt::new(
@@ -452,11 +492,18 @@ where
             inject_peer_context: true,
             effect_handler: None,
             project_phase: "Discovery".to_string(),
-            gate_evaluator: Some(Arc::new(crate::gates::GateEvaluator::new().with_default_gates())),
+            gate_evaluator: Some(Arc::new(
+                crate::gates::GateEvaluator::new().with_default_gates(),
+            )),
             model: feature_config.model().map(str::to_string),
             fallbacks: feature_config.fallbacks().to_vec(),
             cancellation_token: CancellationToken::new(),
             tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
+            last_context_envelope: std::sync::Mutex::new(None),
+            context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
+            external_context_items: std::sync::Mutex::new(Vec::new()),
+            last_collaboration_result: std::sync::Mutex::new(None),
+            tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             write_semaphore: Arc::new(Semaphore::new(
                 crate::tool_orchestrator::ToolSafetyCategory::WriteLocal.max_concurrency(),
             )),
@@ -495,6 +542,246 @@ where
         &self.project_phase
     }
 
+    /// Return the latest context envelope assembled for an actual model turn.
+    pub fn last_context_envelope(&self) -> Option<ContextEnvelope> {
+        self.last_context_envelope
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Return the latest collaboration result emitted during a runtime turn.
+    pub fn last_collaboration_result(&self) -> Option<CollaborationContextResult> {
+        self.last_collaboration_result
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Take the latest collaboration result so outer layers can persist it once.
+    pub fn take_collaboration_result(&self) -> Option<CollaborationContextResult> {
+        self.last_collaboration_result
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+    }
+
+    /// Return the active context profile used for the next envelope.
+    pub fn context_profile(&self) -> ContextProfile {
+        self.context_profile
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or(ContextProfile::MainTurn)
+    }
+
+    /// Set the active context profile used for subsequent envelope assembly.
+    pub fn set_context_profile(&self, profile: ContextProfile) {
+        if let Ok(mut guard) = self.context_profile.lock() {
+            *guard = profile;
+        }
+    }
+
+    /// Replace runtime-owned context supplied by orchestration layers.
+    pub fn set_external_context_items(&self, items: Vec<ContextItem>) {
+        if let Ok(mut guard) = self.external_context_items.lock() {
+            *guard = items;
+        }
+    }
+
+    /// Add one runtime-owned context item supplied by orchestration layers.
+    pub fn push_external_context_item(&self, item: ContextItem) {
+        if let Ok(mut guard) = self.external_context_items.lock() {
+            guard.push(item);
+        }
+    }
+
+    /// Remove runtime-owned context items from a given source.
+    pub fn clear_external_context_source(&self, source: ContextSourceKind) {
+        if let Ok(mut guard) = self.external_context_items.lock() {
+            guard.retain(|item| item.source != source);
+        }
+    }
+
+    /// Inject resume/handoff state into the next runtime context envelope.
+    pub fn inject_resume_context(&self, packet: ResumeContextPacket) {
+        let item = ContextRuntimeKernel::resume_item(&packet);
+        self.clear_external_context_source(item.source);
+        self.push_external_context_item(item);
+    }
+
+    fn external_context_items(&self) -> Vec<ContextItem> {
+        self.external_context_items
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn tool_trace_context_items(&self) -> Vec<ContextItem> {
+        self.tool_trace_context_items
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn remember_tool_trace_from_message(&self, message: &ConversationMessage) {
+        let Some(ContentBlock::ToolResult {
+            tool_use_id,
+            tool_name,
+            output,
+            is_error,
+        }) = message.blocks.first()
+        else {
+            return;
+        };
+        let summary = output
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(600)
+            .collect::<String>();
+        let packet = ToolTracePacket {
+            tool_name: tool_name.clone(),
+            invocation_id: tool_use_id.clone(),
+            status: if *is_error {
+                ToolTraceStatus::Failed
+            } else {
+                ToolTraceStatus::Succeeded
+            },
+            summary,
+            changed_files: Vec::new(),
+            evidence_ids: vec![tool_use_id.clone()],
+            token_estimate: (output.len() as u64).div_ceil(4).min(256).max(1),
+        };
+        let mut item = ContextRuntimeKernel::tool_trace_item(&packet);
+        item.score = if *is_error { 0.9 } else { 0.65 };
+        if let Ok(mut guard) = self.tool_trace_context_items.lock() {
+            guard.retain(|existing| existing.id != item.id);
+            guard.push(item);
+            let overflow = guard.len().saturating_sub(8);
+            if overflow > 0 {
+                guard.drain(0..overflow);
+            }
+        }
+    }
+
+    fn external_context_prompt_tail(&self) -> String {
+        self.external_context_items()
+            .into_iter()
+            .chain(self.tool_trace_context_items())
+            .map(|item| {
+                format!(
+                    "<context_item source=\"{:?}\" role=\"{:?}\" score=\"{:.2}\">\n{}\n</context_item>",
+                    item.source, item.role, item.score, item.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn dynamic_tail_with_external_context(&self, tail: String) -> String {
+        let external = self.external_context_prompt_tail();
+        if external.trim().is_empty() {
+            tail
+        } else if tail.trim().is_empty() {
+            external
+        } else {
+            format!("{external}\n{tail}")
+        }
+    }
+
+    fn remember_context_envelope(&self, envelope: ContextEnvelope) {
+        if let Ok(mut guard) = self.last_context_envelope.lock() {
+            *guard = Some(envelope.clone());
+        }
+        if let Some(cowd) = self.cowd_bus() {
+            cowd.emit(crate::cowd_event::CowdEvent::ContextEnvelope { envelope });
+        }
+    }
+
+    fn context_budget_tokens(&self) -> u64 {
+        if self.model_context_window > 0 {
+            u64::from(self.model_context_window)
+        } else {
+            8_000
+        }
+    }
+
+    fn build_context_envelope(
+        &self,
+        user_input: &str,
+        dynamic_items: Vec<ContextItem>,
+        omitted: Vec<ContextOmission>,
+        degraded_sources: Vec<ContextSourceKind>,
+    ) -> ContextEnvelope {
+        let session_id = self.session().session_id;
+        let profile = self.context_profile();
+        let mut identity = ContextIdentity::main(session_id.clone());
+        identity.mode = context_mode_for_profile(profile);
+        let mut selected_items = self.external_context_items();
+        selected_items.extend(self.tool_trace_context_items());
+        selected_items.extend(dynamic_items);
+        let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            profile,
+            identity,
+            intent: user_input.to_string(),
+            stable_head: self.system_prompt.clone(),
+            runtime_header: vec![format!(
+                "session:{session_id} agent:primary profile:{profile:?}"
+            )],
+            dynamic_items: selected_items,
+            omitted,
+            total_budget_tokens: self.context_budget_tokens(),
+        });
+        envelope.diagnostics.degraded_sources = degraded_sources;
+        envelope
+    }
+
+    fn provider_prompt_from_envelope(
+        envelope: &ContextEnvelope,
+        dynamic_tail_override: Option<String>,
+    ) -> Vec<String> {
+        let mut prompt = Vec::with_capacity(
+            envelope.assembled.stable_head.len() + envelope.assembled.runtime_header.len() + 1,
+        );
+        prompt.extend(envelope.assembled.stable_head.clone());
+        prompt.extend(envelope.assembled.runtime_header.clone());
+        if let Some(dynamic_tail) = dynamic_tail_override {
+            if !dynamic_tail.trim().is_empty() {
+                prompt.push(dynamic_tail);
+            }
+        } else {
+            prompt.extend(envelope.assembled.dynamic_tail.clone());
+        }
+        prompt
+    }
+
+    fn append_context_items_to_latest_envelope(&self, user_input: &str, items: Vec<ContextItem>) {
+        if items.is_empty() {
+            return;
+        }
+        let mut dynamic_items = self
+            .last_context_envelope()
+            .map(|envelope| envelope.selected)
+            .unwrap_or_default();
+        dynamic_items.extend(items);
+        let envelope =
+            self.build_context_envelope(user_input, dynamic_items, Vec::new(), Vec::new());
+        self.remember_context_envelope(envelope);
+    }
+
+    fn remember_collaboration_result(&self, result: CollaborationContextResult) {
+        if let Ok(mut guard) = self.last_collaboration_result.lock() {
+            *guard = Some(result);
+        }
+    }
+
+    fn clear_collaboration_result(&self) {
+        if let Ok(mut guard) = self.last_collaboration_result.lock() {
+            *guard = None;
+        }
+    }
+
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
@@ -509,8 +796,13 @@ where
         self
     }
 
-    pub fn with_cached_prompt(mut self, config_path: std::path::PathBuf, identity_path: std::path::PathBuf) -> Self {
-        self.cached_prompt = crate::cached_prompt::CachedSystemPrompt::new(config_path, identity_path);
+    pub fn with_cached_prompt(
+        mut self,
+        config_path: std::path::PathBuf,
+        identity_path: std::path::PathBuf,
+    ) -> Self {
+        self.cached_prompt =
+            crate::cached_prompt::CachedSystemPrompt::new(config_path, identity_path);
         self
     }
 
@@ -549,7 +841,10 @@ where
     }
 
     #[must_use]
-    pub fn with_session_store(mut self, store: Arc<memory::session_store::UnifiedSessionStore>) -> Self {
+    pub fn with_session_store(
+        mut self,
+        store: Arc<memory::session_store::UnifiedSessionStore>,
+    ) -> Self {
         self.session_store = Some(store);
         self
     }
@@ -578,7 +873,10 @@ where
 
     /// Set the smart approval gate for intelligent command approval (P0-1).
     #[must_use]
-    pub fn with_approval_gate(mut self, gate: Arc<crate::approval_gate::SmartApprovalGate>) -> Self {
+    pub fn with_approval_gate(
+        mut self,
+        gate: Arc<crate::approval_gate::SmartApprovalGate>,
+    ) -> Self {
         self.approval_gate = Some(gate);
         self
     }
@@ -680,7 +978,10 @@ where
         self,
         hook_progress_reporter: Box<dyn HookProgressReporter + Send>,
     ) -> Self {
-        *self.hook_progress_reporter.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook_progress_reporter);
+        *self
+            .hook_progress_reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook_progress_reporter);
         self
     }
 
@@ -706,23 +1007,26 @@ where
     }
 
     /// Run all commit quality gates against the current state.
-    pub fn check_commit_gates(&self, context: crate::gates::GateContext) -> Option<(bool, Vec<crate::gates::GateResult>)> {
-        self.gate_evaluator.as_ref().map(|evaluator| evaluator.evaluate_all(&context))
+    pub fn check_commit_gates(
+        &self,
+        context: crate::gates::GateContext,
+    ) -> Option<(bool, Vec<crate::gates::GateResult>)> {
+        self.gate_evaluator
+            .as_ref()
+            .map(|evaluator| evaluator.evaluate_all(&context))
     }
 
     /// Create a sub-agent runtime with independent LLM reasoning capabilities.
-    pub fn create_subagent_runtime(
-        &self,
-        config: &SubAgentConfig,
-    ) -> SubAgentRuntime<C, T>
+    pub fn create_subagent_runtime(&self, config: &SubAgentConfig) -> SubAgentRuntime<C, T>
     where
         C: Clone,
     {
+        let mut config = config.clone();
+        let parent_session_id = self.session().session_id;
+        let lease = config.ensure_context_lease(parent_session_id, "primary");
         let model = config.model.clone().or_else(|| self.model.clone());
-        let filtered_prompt = filter_system_prompt_for_role(
-            &self.system_prompt,
-            &config.task_description,
-        );
+        let filtered_prompt =
+            filter_system_prompt_for_role(&self.system_prompt, &config.task_description);
         let mut sub_rt = ConversationRuntime::new_with_features(
             crate::session::Session::new(),
             self.api_client.clone(),
@@ -734,12 +1038,14 @@ where
         if let Some(ref m) = model {
             sub_rt.model = Some(m.clone());
         }
+        sub_rt.set_context_profile(ContextProfile::SubAgent);
+        sub_rt = sub_rt.with_model_context_window(lease.max_tokens.min(u64::from(u32::MAX)) as u32);
         sub_rt.max_iterations = config.max_turns;
         sub_rt.tool_orchestrator = self.tool_orchestrator.clone();
         if let Some(ref mem) = self.memory_manager {
             sub_rt = sub_rt.with_memory_manager(Arc::clone(mem));
         }
-        let mut sub_agent = SubAgentRuntime::new(config.clone(), sub_rt);
+        let mut sub_agent = SubAgentRuntime::new(config, sub_rt);
         if let Some(ref mem) = self.memory_manager {
             sub_agent = sub_agent.with_parent_memory(Arc::clone(mem));
         }
@@ -766,9 +1072,18 @@ where
     /// Uses a simple keyword heuristic; can be upgraded to LLM-based classification.
     fn should_use_collaboration(&self, user_message: &str) -> bool {
         let multi_step_keywords = [
-            "multi-step", "parallel", "refactor", "重构",
-            "migrate", "迁移", "deploy", "部署",
-            "analyze", "分析", "implement", "实现",
+            "multi-step",
+            "parallel",
+            "refactor",
+            "重构",
+            "migrate",
+            "迁移",
+            "deploy",
+            "部署",
+            "analyze",
+            "分析",
+            "implement",
+            "实现",
         ];
         let lower = user_message.to_lowercase();
         multi_step_keywords.iter().any(|k| lower.contains(k))
@@ -784,15 +1099,39 @@ where
         let lower = user_message.to_lowercase();
         let keyword_map: &[(&str, &[&str])] = &[
             ("rust", &["rust", "cargo", "borrow checker", "lifetime"]),
-            ("testing", &["test", "assert", "mock", "coverage", "fixture"]),
-            ("refactoring", &["refactor", "extract", "rename", "restructure", "clean"]),
-            ("review", &["review", "audit", "inspect", "examine", "check"]),
-            ("documentation", &["document", "doc", "readme", "explain", "describe"]),
-            ("planning", &["plan", "design", "architect", "spec", "outline"]),
-            ("execution", &["execute", "run", "build", "compile", "deploy"]),
+            (
+                "testing",
+                &["test", "assert", "mock", "coverage", "fixture"],
+            ),
+            (
+                "refactoring",
+                &["refactor", "extract", "rename", "restructure", "clean"],
+            ),
+            (
+                "review",
+                &["review", "audit", "inspect", "examine", "check"],
+            ),
+            (
+                "documentation",
+                &["document", "doc", "readme", "explain", "describe"],
+            ),
+            (
+                "planning",
+                &["plan", "design", "architect", "spec", "outline"],
+            ),
+            (
+                "execution",
+                &["execute", "run", "build", "compile", "deploy"],
+            ),
             ("debugging", &["debug", "fix", "bug", "error", "crash"]),
-            ("security", &["security", "vuln", "exploit", "injection", "xss"]),
-            ("performance", &["perf", "benchmark", "optimize", "slow", "latency"]),
+            (
+                "security",
+                &["security", "vuln", "exploit", "injection", "xss"],
+            ),
+            (
+                "performance",
+                &["perf", "benchmark", "optimize", "slow", "latency"],
+            ),
         ];
         let mut skills = Vec::new();
         for (skill, keywords) in keyword_map {
@@ -843,7 +1182,13 @@ where
         }
     }
 
-    fn record_context_event(&mut self, event_type: &str, category: &str, summary: &str, priority: u8) {
+    fn record_context_event(
+        &mut self,
+        event_type: &str,
+        category: &str,
+        summary: &str,
+        priority: u8,
+    ) {
         let project_dir = std::env::current_dir()
             .ok()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
@@ -851,20 +1196,24 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        self.profiler.record_dedup(crate::context_profiler::SessionEvent {
-            event_type: event_type.into(),
-            category: category.into(),
-            data_summary: summary.into(),
-            priority,
-            data_hash: 0,     // computed by record_dedup
-            timestamp,
-            project_dir,
-            attribution_confidence: 0.9,
-        });
+        self.profiler
+            .record_dedup(crate::context_profiler::SessionEvent {
+                event_type: event_type.into(),
+                category: category.into(),
+                data_summary: summary.into(),
+                priority,
+                data_hash: 0, // computed by record_dedup
+                timestamp,
+                project_dir,
+                attribution_confidence: 0.9,
+            });
     }
 
     fn run_pre_tool_use_hook(&self, tool_name: &str, input: &str) -> HookRunResult {
-        let mut reporter_guard = self.hook_progress_reporter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reporter_guard = self
+            .hook_progress_reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(reporter) = reporter_guard.as_mut() {
             self.hook_runner.run_pre_tool_use_with_context(
                 tool_name,
@@ -889,7 +1238,10 @@ where
         output: &str,
         is_error: bool,
     ) -> HookRunResult {
-        let mut reporter_guard = self.hook_progress_reporter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reporter_guard = self
+            .hook_progress_reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(reporter) = reporter_guard.as_mut() {
             self.hook_runner.run_post_tool_use_with_context(
                 tool_name,
@@ -917,7 +1269,10 @@ where
         input: &str,
         output: &str,
     ) -> HookRunResult {
-        let mut reporter_guard = self.hook_progress_reporter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reporter_guard = self
+            .hook_progress_reporter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(reporter) = reporter_guard.as_mut() {
             self.hook_runner.run_post_tool_use_failure_with_context(
                 tool_name,
@@ -941,7 +1296,9 @@ where
     /// Returns Ok(()) if healthy, Err if the session appears broken.
     fn run_session_health_probe(&mut self) -> Result<(), String> {
         // Check if we have basic session integrity
-        if self.session.blocking_read().messages.is_empty() && self.session.blocking_read().compaction.is_some() {
+        if self.session.blocking_read().messages.is_empty()
+            && self.session.blocking_read().compaction.is_some()
+        {
             // Freshly compacted with no messages - this is normal
             return Ok(());
         }
@@ -956,40 +1313,56 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-pub async fn run_turn_async(
+    pub async fn run_turn_async(
         &mut self,
         user_input: impl Into<String>,
         prompter: &crate::permissions::SharedPrompter,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
         tracing::info!(session_id = %self.session().session_id, "turn started");
+        self.clear_collaboration_result();
 
         if self.session.read().await.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
-                return Err(RuntimeError::new(format!("Session health probe failed: {error}")));
+                return Err(RuntimeError::new(format!(
+                    "Session health probe failed: {error}"
+                )));
             }
         }
 
         self.record_turn_started(&user_input);
-        self.record_context_event("user_input", "user",
-            &user_input[..user_input.len().min(200)], 8);
-        self.session.write().await
+        self.record_context_event(
+            "user_input",
+            "user",
+            &user_input[..user_input.len().min(200)],
+            8,
+        );
+        self.session
+            .write()
+            .await
             .push_user_text(user_input.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-        self.dual_write_message(&ConversationMessage::user_text(user_input.clone()), self.session().messages.len().wrapping_sub(1));
+        self.dual_write_message(
+            &ConversationMessage::user_text(user_input.clone()),
+            self.session().messages.len().wrapping_sub(1),
+        );
 
         let mut effective_system_prompt = self.prepare_memory_context(&user_input).await;
 
         // A2: Inject available peer agents from AgentDirectory into the system prompt.
         if self.inject_peer_context {
-            let active_agents = memory::agent_directory::AgentDirectory::global()
-                .list_active();
-            let peers: Vec<String> = active_agents.iter()
+            let active_agents = memory::agent_directory::AgentDirectory::global().list_active();
+            let peers: Vec<String> = active_agents
+                .iter()
                 .filter(|a| a.agent_id != self.session().session_id)
-                .map(|a| format!("  - {} (role: {}, capabilities: {:?})",
-                    &a.agent_id[..std::cmp::min(8, a.agent_id.len())],
-                    a.role,
-                    a.capabilities))
+                .map(|a| {
+                    format!(
+                        "  - {} (role: {}, capabilities: {:?})",
+                        &a.agent_id[..std::cmp::min(8, a.agent_id.len())],
+                        a.role,
+                        a.capabilities
+                    )
+                })
                 .collect();
             if !peers.is_empty() {
                 effective_system_prompt.push(format!(
@@ -1018,9 +1391,11 @@ pub async fn run_turn_async(
             }
 
             if self.auto_compaction_input_tokens_threshold > 0
-                && estimate_session_tokens(&*self.session.read().await) > self.auto_compaction_input_tokens_threshold as usize
+                && estimate_session_tokens(&*self.session.read().await)
+                    > self.auto_compaction_input_tokens_threshold as usize
             {
-                let result = compact_session(&*self.session.read().await, CompactionConfig::default());
+                let result =
+                    compact_session(&*self.session.read().await, CompactionConfig::default());
                 if result.removed_message_count > 0 {
                     let compacted_len = result.compacted_session.messages.len();
                     *self.session.write().await = result.compacted_session;
@@ -1048,11 +1423,10 @@ pub async fn run_turn_async(
                 model: String::new(), // filled by fallback loop below
             };
 
-            let mut model_list: Vec<String> = std::iter::once(
-                self.model.as_deref().unwrap_or("").to_string(),
-            )
-            .chain(self.fallbacks.clone())
-            .collect();
+            let mut model_list: Vec<String> =
+                std::iter::once(self.model.as_deref().unwrap_or("").to_string())
+                    .chain(self.fallbacks.clone())
+                    .collect();
             // dedup in case primary also appears in fallbacks
             model_list.dedup();
 
@@ -1088,27 +1462,32 @@ pub async fn run_turn_async(
                                 return Err(RuntimeError::new("conversation cancelled"));
                             }
                             // T31: Enforce a 120-second timeout on each stream chunk.
-                            let next_event = match tokio::time::timeout(
-                                Duration::from_secs(120),
-                                stream.next(),
-                            )
-                            .await
-                            {
-                                Ok(Some(event)) => event,
-                                Ok(None) => break,
-                                Err(_) => {
-                                    return Err(RuntimeError::new(
-                                        "stream timed out after 120s",
-                                    ));
-                                }
-                            };
+                            let next_event =
+                                match tokio::time::timeout(Duration::from_secs(120), stream.next())
+                                    .await
+                                {
+                                    Ok(Some(event)) => event,
+                                    Ok(None) => break,
+                                    Err(_) => {
+                                        return Err(RuntimeError::new(
+                                            "stream timed out after 120s",
+                                        ));
+                                    }
+                                };
                             match next_event {
                                 Ok(AssistantEvent::TextDelta(text)) => {
                                     model_current_text.push_str(&text);
                                     if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::TextDelta { text: text.clone() });
+                                        cowd.emit(crate::cowd_event::CowdEvent::TextDelta {
+                                            text: text.clone(),
+                                        });
                                     }
-                                    model_stream_events.push(("text_delta".into(), "assistant".into(), text[..text.len().min(80)].to_string(), 3));
+                                    model_stream_events.push((
+                                        "text_delta".into(),
+                                        "assistant".into(),
+                                        text[..text.len().min(80)].to_string(),
+                                        3,
+                                    ));
                                     if let Some(ref cb) = self.sse_callback {
                                         let json = serde_json::json!({
                                             "type": "TextDelta",
@@ -1119,7 +1498,12 @@ pub async fn run_turn_async(
                                 }
                                 Ok(AssistantEvent::ThinkingDelta(thinking)) => {
                                     model_thinking_text.push_str(&thinking);
-                                    model_stream_events.push(("thinking".into(), "reasoning".into(), thinking[..thinking.len().min(80)].to_string(), 2));
+                                    model_stream_events.push((
+                                        "thinking".into(),
+                                        "reasoning".into(),
+                                        thinking[..thinking.len().min(80)].to_string(),
+                                        2,
+                                    ));
                                     if let Some(ref cb) = self.sse_callback {
                                         let json = serde_json::json!({
                                             "type": "ThinkingDelta",
@@ -1128,7 +1512,9 @@ pub async fn run_turn_async(
                                         cb(json.to_string());
                                     }
                                     if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ThinkingDelta { thinking: thinking.clone() });
+                                        cowd.emit(crate::cowd_event::CowdEvent::ThinkingDelta {
+                                            thinking: thinking.clone(),
+                                        });
                                     }
                                 }
                                 Ok(AssistantEvent::SignatureDelta(signature)) => {
@@ -1155,7 +1541,11 @@ pub async fn run_turn_async(
                                         cb(json.to_string());
                                     }
                                     if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ToolStart { id: id.clone(), name: name.clone(), preview: preview.clone() });
+                                        cowd.emit(crate::cowd_event::CowdEvent::ToolStart {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            preview: preview.clone(),
+                                        });
                                     }
                                 }
                                 Ok(AssistantEvent::ToolProgress { id, name, progress }) => {
@@ -1172,15 +1562,29 @@ pub async fn run_turn_async(
                                         cb(json.to_string());
                                     }
                                     if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ToolProgress { id: id.clone(), name: name.clone(), progress: progress.clone() });
+                                        cowd.emit(crate::cowd_event::CowdEvent::ToolProgress {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            progress: progress.clone(),
+                                        });
                                     }
                                 }
                                 Ok(AssistantEvent::PromptCache(event)) => {
                                     prompt_cache_events.push(event);
                                 }
-                                Ok(AssistantEvent::ToolComplete { id, name, result_summary, exit_code }) => {
+                                Ok(AssistantEvent::ToolComplete {
+                                    id,
+                                    name,
+                                    result_summary,
+                                    exit_code,
+                                }) => {
                                     if let Some(callback) = &self.tool_callback {
-                                        callback.on_tool_complete(&id, &name, &result_summary, exit_code);
+                                        callback.on_tool_complete(
+                                            &id,
+                                            &name,
+                                            &result_summary,
+                                            exit_code,
+                                        );
                                     }
                                     if let Some(ref cb) = self.sse_callback {
                                         let json = serde_json::json!({
@@ -1193,10 +1597,14 @@ pub async fn run_turn_async(
                                         cb(json.to_string());
                                     }
                                     if let Some(ref cowd) = self.cowd_bus {
-                                        cowd.emit(crate::cowd_event::CowdEvent::ToolComplete { id: id.clone(), name: name.clone(), summary: result_summary.clone(), exit_code });
+                                        cowd.emit(crate::cowd_event::CowdEvent::ToolComplete {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            summary: result_summary.clone(),
+                                            exit_code,
+                                        });
                                     }
                                 }
-                                Ok(_) => {}
                                 Err(e) => {
                                     let err_str = e.to_string();
                                     if is_retryable_error(&err_str) {
@@ -1207,16 +1615,16 @@ pub async fn run_turn_async(
                                         ))
                                         .await;
                                         if attempt == max_retries - 1 {
-                                            tracing::warn!(model, "exhausted retries, switching fallback");
+                                            tracing::warn!(
+                                                model,
+                                                "exhausted retries, switching fallback"
+                                            );
                                         }
-                                    failed = true;
-                                    stream_error = Some(e);
-                                    break;
-                                }
-                                if let Some(bus) = &self.cowd_bus {
-                                    bus.emit(crate::cowd_event::CowdEvent::TurnError { error: e.to_string() });
-                                }
-                                return Err(e);
+                                        failed = true;
+                                        stream_error = Some(e);
+                                        break;
+                                    }
+                                    return Err(e);
                                 }
                             }
                         }
@@ -1242,7 +1650,8 @@ pub async fn run_turn_async(
             };
 
             if !stream_success {
-                return Err(stream_error.unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")));
+                return Err(stream_error
+                    .unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")));
             }
 
             // Flush buffered stream events into context profiler
@@ -1260,8 +1669,15 @@ pub async fn run_turn_async(
             // Build assistant message with text + tool_use blocks
             let mut blocks = Vec::new();
             if !thinking_text.is_empty() {
-                blocks.push(ContentBlock::Thinking { thinking: thinking_text.clone(), signature: thinking_signature.clone() });
-                tracing::debug!(thinking_len = thinking_text.len(), has_signature = thinking_signature.is_some(), "thinking block stored");
+                blocks.push(ContentBlock::Thinking {
+                    thinking: thinking_text.clone(),
+                    signature: thinking_signature.clone(),
+                });
+                tracing::debug!(
+                    thinking_len = thinking_text.len(),
+                    has_signature = thinking_signature.is_some(),
+                    "thinking block stored"
+                );
             }
             blocks.push(ContentBlock::Text { text: current_text });
             for (id, name, input) in &pending_tool_uses {
@@ -1272,10 +1688,20 @@ pub async fn run_turn_async(
                 });
             }
             let role = crate::session::MessageRole::Assistant;
-            let assistant_msg = ConversationMessage { role, blocks, usage: turn_usage };
-            self.session.write().await.push_message(assistant_msg.clone())
+            let assistant_msg = ConversationMessage {
+                role,
+                blocks,
+                usage: turn_usage,
+            };
+            self.session
+                .write()
+                .await
+                .push_message(assistant_msg.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            self.dual_write_message(&assistant_msg, self.session().messages.len().wrapping_sub(1));
+            self.dual_write_message(
+                &assistant_msg,
+                self.session().messages.len().wrapping_sub(1),
+            );
             self.record_assistant_iteration(iterations, &assistant_msg, pending_tool_uses.len());
             assistant_messages.push(assistant_msg);
 
@@ -1286,26 +1712,38 @@ pub async fn run_turn_async(
             // Phase 2: Parallel+serial tool dispatch based on safety categories
             let mut callback_inject = None;
             {
-                use futures::stream::{FuturesUnordered, StreamExt};
                 use crate::tool_dispatch::{ToolRequest, categorize};
+                use futures::stream::{FuturesUnordered, StreamExt};
 
-                let requests: Vec<ToolRequest> = pending_tool_uses.iter().map(|(id, name, input)| {
-                    ToolRequest { tool_use_id: id.clone(), tool_name: name.clone(), input: input.clone(), depends_on: Vec::new() }
-                }).collect();
-                let ordered_ids: Vec<String> = requests.iter().map(|r| r.tool_use_id.clone()).collect();
+                let requests: Vec<ToolRequest> = pending_tool_uses
+                    .iter()
+                    .map(|(id, name, input)| ToolRequest {
+                        tool_use_id: id.clone(),
+                        tool_name: name.clone(),
+                        input: input.clone(),
+                        depends_on: Vec::new(),
+                    })
+                    .collect();
+                let ordered_ids: Vec<String> =
+                    requests.iter().map(|r| r.tool_use_id.clone()).collect();
                 let (read_indices, rest_indices) = categorize(&requests);
 
-                let mut result_map: std::collections::HashMap<String, (ConversationMessage, Option<String>)> =
-                    std::collections::HashMap::new();
+                let mut result_map: std::collections::HashMap<
+                    String,
+                    (ConversationMessage, Option<String>),
+                > = std::collections::HashMap::new();
 
                 // T7: Wave-based execution for tools with dependency relationships
-                let wave_task_indices: Vec<usize> = requests.iter().enumerate()
+                let wave_task_indices: Vec<usize> = requests
+                    .iter()
+                    .enumerate()
                     .filter(|(_, req)| !req.depends_on.is_empty())
                     .map(|(i, _)| i)
                     .collect();
 
                 let (read_indices, rest_indices) = if !wave_task_indices.is_empty() {
-                    let wave_set: std::collections::HashSet<usize> = wave_task_indices.iter().cloned().collect();
+                    let wave_set: std::collections::HashSet<usize> =
+                        wave_task_indices.iter().cloned().collect();
                     let mut wave = crate::wave::WaveOrchestrator::new()
                         .with_config(crate::wave::WaveConfig::default().with_max_parallel(8));
 
@@ -1313,26 +1751,41 @@ pub async fn run_turn_async(
                         let task = self.detect_wave_task(&requests[idx]).unwrap();
                         wave.add_task(task);
                     }
-                    wave.build_waves().map_err(|e: crate::wave::WaveError| RuntimeError::new(e.to_string()))?;
+                    wave.build_waves()
+                        .map_err(|e: crate::wave::WaveError| RuntimeError::new(e.to_string()))?;
 
                     let wave_exec = ToolWaveExecutor::new(Arc::clone(&self.tool_executor));
-                    let wave_results = wave.execute(wave_exec).await
+                    let wave_results = wave
+                        .execute(wave_exec)
+                        .await
                         .map_err(|e: crate::wave::WaveError| RuntimeError::new(e.to_string()))?;
 
                     for wresult in wave_results {
                         for tres in wresult.task_results {
                             let tid = tres.task_id.0.clone();
                             let req = requests.iter().find(|r| r.tool_use_id == tid);
-                            let tool_name_str = req.map_or("unknown", |r| r.tool_name.as_str()).to_string();
-                            let output = tres.output.clone().unwrap_or_else(|| tres.error.clone().unwrap_or_default());
+                            let tool_name_str =
+                                req.map_or("unknown", |r| r.tool_name.as_str()).to_string();
+                            let output = tres
+                                .output
+                                .clone()
+                                .unwrap_or_else(|| tres.error.clone().unwrap_or_default());
                             let is_error = !tres.success;
                             let msg = ConversationMessage::tool_result(
-                                tid.clone(), tool_name_str.clone(), output, is_error,
+                                tid.clone(),
+                                tool_name_str.clone(),
+                                output,
+                                is_error,
                             );
-                            self.session.write().await
+                            self.session
+                                .write()
+                                .await
                                 .push_message(msg.clone())
                                 .map_err(|e| RuntimeError::new(e.to_string()))?;
-                            self.dual_write_message(&msg, self.session().messages.len().wrapping_sub(1));
+                            self.dual_write_message(
+                                &msg,
+                                self.session().messages.len().wrapping_sub(1),
+                            );
                             let inject = self.turn_callback.as_ref().and_then(|cb| {
                                 let out = tres.output.as_deref().unwrap_or("");
                                 (cb.on_tool_result)(&tool_name_str, out)
@@ -1342,8 +1795,14 @@ pub async fn run_turn_async(
                     }
 
                     // Filter wave tasks out of read/rest indices for remaining dispatch
-                    let read: Vec<usize> = read_indices.into_iter().filter(|i| !wave_set.contains(i)).collect();
-                    let rest: Vec<usize> = rest_indices.into_iter().filter(|i| !wave_set.contains(i)).collect();
+                    let read: Vec<usize> = read_indices
+                        .into_iter()
+                        .filter(|i| !wave_set.contains(i))
+                        .collect();
+                    let rest: Vec<usize> = rest_indices
+                        .into_iter()
+                        .filter(|i| !wave_set.contains(i))
+                        .collect();
                     (read, rest)
                 } else {
                     (read_indices, rest_indices)
@@ -1353,19 +1812,24 @@ pub async fn run_turn_async(
                     let mut futs = FuturesUnordered::new();
                     for &idx in &read_indices {
                         let (ref tid, ref tname, ref tinput) = pending_tool_uses[idx];
-                        futs.push(self.execute_single_tool(
-                            tid, tname, tinput,
-                            prompter, iterations,
-                        ));
+                        futs.push(
+                            self.execute_single_tool(tid, tname, tinput, prompter, iterations),
+                        );
                     }
                     while let Some(result) = futs.next().await {
                         let msg = result?;
                         let (msg_id, tool_name_str) = extract_tool_info(&msg);
                         let inject = if let Some(ref cb) = self.turn_callback {
-                            let output = msg.blocks.first().and_then(|b| match b {
-                                ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
-                                _ => None,
-                            }).unwrap_or("");
+                            let output = msg
+                                .blocks
+                                .first()
+                                .and_then(|b| match b {
+                                    ContentBlock::ToolResult { output, .. } => {
+                                        Some(output.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or("");
                             (cb.on_tool_result)(&tool_name_str, output)
                         } else {
                             None
@@ -1377,22 +1841,31 @@ pub async fn run_turn_async(
                 for &idx in &rest_indices {
                     let (ref tool_use_id, ref tool_name, ref input) = pending_tool_uses[idx];
                     let sem = match self.tool_orchestrator.classify(tool_name) {
-                        crate::tool_orchestrator::ToolSafetyCategory::WriteLocal => &self.write_semaphore,
-                        crate::tool_orchestrator::ToolSafetyCategory::Network => &self.network_semaphore,
-                        crate::tool_orchestrator::ToolSafetyCategory::Destructive => &self.destructive_semaphore,
+                        crate::tool_orchestrator::ToolSafetyCategory::WriteLocal => {
+                            &self.write_semaphore
+                        }
+                        crate::tool_orchestrator::ToolSafetyCategory::Network => {
+                            &self.network_semaphore
+                        }
+                        crate::tool_orchestrator::ToolSafetyCategory::Destructive => {
+                            &self.destructive_semaphore
+                        }
                         _ => &self.default_semaphore,
                     };
                     let _permit = sem.acquire().await.unwrap();
-                    let result_msg = self.execute_single_tool(
-                        tool_use_id, tool_name, input,
-                        prompter, iterations,
-                    ).await?;
+                    let result_msg = self
+                        .execute_single_tool(tool_use_id, tool_name, input, prompter, iterations)
+                        .await?;
                     drop(_permit);
                     let inject = if let Some(ref cb) = self.turn_callback {
-                        let output = result_msg.blocks.first().and_then(|b| match b {
-                            ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
-                            _ => None,
-                        }).unwrap_or("");
+                        let output = result_msg
+                            .blocks
+                            .first()
+                            .and_then(|b| match b {
+                                ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or("");
                         (cb.on_tool_result)(tool_name, output)
                     } else {
                         None
@@ -1403,12 +1876,23 @@ pub async fn run_turn_async(
 
                 for id in &ordered_ids {
                     if let Some((msg, inject)) = result_map.remove(id) {
-                        let tool_name_str = msg.blocks.first().and_then(|b| match b {
-                            ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
-                            _ => None,
-                        }).unwrap_or("unknown");
-                        self.record_context_event("tool_use", "tool",
-                            &format!("{}: {}", tool_name_str, ""), 5);
+                        self.remember_tool_trace_from_message(&msg);
+                        let tool_name_str = msg
+                            .blocks
+                            .first()
+                            .and_then(|b| match b {
+                                ContentBlock::ToolResult { tool_name, .. } => {
+                                    Some(tool_name.as_str())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or("unknown");
+                        self.record_context_event(
+                            "tool_use",
+                            "tool",
+                            &format!("{}: {}", tool_name_str, ""),
+                            5,
+                        );
                         if let Some(new_input) = inject {
                             callback_inject = Some(new_input);
                         }
@@ -1418,8 +1902,15 @@ pub async fn run_turn_async(
             }
             if let Some(inject) = callback_inject {
                 let inject_text = inject.clone();
-                self.session.write().await.push_user_text(inject).map_err(|e| RuntimeError::new(e.to_string()))?;
-                self.dual_write_message(&ConversationMessage::user_text(inject_text), self.session().messages.len().wrapping_sub(1));
+                self.session
+                    .write()
+                    .await
+                    .push_user_text(inject)
+                    .map_err(|e| RuntimeError::new(e.to_string()))?;
+                self.dual_write_message(
+                    &ConversationMessage::user_text(inject_text),
+                    self.session().messages.len().wrapping_sub(1),
+                );
                 continue; // continue loop with injected input
             }
         }
@@ -1448,20 +1939,15 @@ pub async fn run_turn_async(
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    let participants = vec![
-                        memory::agent_directory::AgentInfo {
-                            agent_id: "primary".to_string(),
-                            role: "Resolver".to_string(),
-                            capabilities: vec![
-                                "conflict-resolution".to_string(),
-                                "memory".to_string(),
-                            ],
-                            status: memory::agent_directory::AgentStatus::Active,
-                            registered_at_ms: now_ms,
-                            last_heartbeat_ms: 0,
-                            reputation: None,
-                        },
-                    ];
+                    let participants = vec![memory::agent_directory::AgentInfo {
+                        agent_id: "primary".to_string(),
+                        role: "Resolver".to_string(),
+                        capabilities: vec!["conflict-resolution".to_string(), "memory".to_string()],
+                        status: memory::agent_directory::AgentStatus::Active,
+                        registered_at_ms: now_ms,
+                        last_heartbeat_ms: 0,
+                        reputation: None,
+                    }];
 
                     // Drop the lock before async operations
                     drop(engine);
@@ -1536,11 +2022,15 @@ pub async fn run_turn_async(
 
         // A4: Trigger multi-agent collaboration for complex tasks.
         if let Some(ref collab) = self.collaboration {
-            let last_user_msg = self.session().messages.iter()
+            let last_user_msg = self
+                .session()
+                .messages
+                .iter()
                 .rev()
                 .find(|m| matches!(m.role, crate::session::MessageRole::User))
                 .map(|m| {
-                    m.blocks.iter()
+                    m.blocks
+                        .iter()
                         .filter_map(|b| match b {
                             ContentBlock::Text { text } => Some(text.as_str()),
                             _ => None,
@@ -1558,23 +2048,41 @@ pub async fn run_turn_async(
                     let skills_clone = skills.clone();
                     let memory = self.memory_manager().cloned();
 
-                    if let Some(synthesis) = collab_clone
-                        .run_boxed(&task, &skills_clone).await
+                    if let Some(collab_result) = collab_clone
+                        .run_with_context_boxed(&task, &skills_clone)
+                        .await
                     {
+                        let mut collab_result = collab_result;
+                        collab_result.work_graph = collab_result
+                            .work_graph
+                            .with_session_id(self.session().session_id.clone());
+                        let synthesis = collab_result.synthesis.clone();
+                        self.append_context_items_to_latest_envelope(
+                            &task,
+                            collab_result.context_items.clone(),
+                        );
+                        self.remember_collaboration_result(collab_result);
                         tracing::info!(
                             synthesis_len = synthesis.len(),
                             skills = ?skills_clone,
                             "Collaboration synthesis complete"
                         );
                         if let Some(mem) = memory {
+                            let memory_ctx = MemoryTurnContext::new(
+                                self.session().session_id,
+                                "collaboration-orchestrator",
+                            );
+                            let kernel = MemoryKernel::new(Arc::clone(&mem));
                             let entry = memory::types::MemoryEntry {
                                 id: memory::types::MemoryId::new_v4(),
                                 layer: memory::types::MemoryLayer::L4,
                                 category: memory::types::MemoryCategory::Shared,
                                 priority: memory::types::Priority::Normal,
                                 source: memory::types::MemorySource::Import,
-                                title: format!("collaboration-synthesis: {}",
-                                    &task[..task.len().min(80)]),
+                                title: format!(
+                                    "collaboration-synthesis: {}",
+                                    &task[..task.len().min(80)]
+                                ),
                                 content: synthesis,
                                 embedding: None,
                                 tags: vec!["collaboration".to_string(), "synthesis".to_string()],
@@ -1587,10 +2095,10 @@ pub async fn run_turn_async(
                                 last_accessed_at: None,
                                 scope: memory::project_scope::MemoryScope::Global,
                                 session_id: None,
-                                source_agent: Some("collaboration-orchestrator".to_string()),
+                                source_agent: None,
                                 visibility: memory::types::AgentVisibility::Shared,
                             };
-                            let _ = mem.remember(entry).await;
+                            let _ = kernel.remember(&memory_ctx, entry).await;
                         }
                     }
                 }
@@ -1609,7 +2117,10 @@ pub async fn run_turn_async(
                     let problem = ProblemStatement::new(last_user_msg);
                     match jps.run_boxed(problem).await {
                         Some(result) => {
-                            tracing::info!(solutions_count = result.solutions.len(), "JPS pipeline completed");
+                            tracing::info!(
+                                solutions_count = result.solutions.len(),
+                                "JPS pipeline completed"
+                            );
                         }
                         None => {
                             tracing::info!("JPS pipeline returned no solution");
@@ -1630,16 +2141,8 @@ pub async fn run_turn_async(
         self.record_turn_completed(&summary);
         tracing::info!(iterations = %summary.iterations, tokens = %summary.usage.total_tokens(), "turn completed");
         if let Some(ref cowd) = self.cowd_bus {
-            let usage = self.usage_tracker.cumulative_usage();
-            cowd.emit(crate::cowd_event::CowdEvent::TokenUsage {
-                input: usage.input_tokens as u64,
-                output: usage.output_tokens as u64,
-                cache_create: usage.cache_creation_input_tokens as u64,
-                cache_read: usage.cache_read_input_tokens as u64,
-            });
-        }
-        if let Some(ref cowd) = self.cowd_bus {
-            let assistant_text = summary.assistant_messages
+            let assistant_text = summary
+                .assistant_messages
                 .iter()
                 .flat_map(|m| m.blocks.iter())
                 .filter_map(|b| match b {
@@ -1693,11 +2196,17 @@ pub async fn run_turn_async(
             }
         } else if let Some(prompt) = prompter.lock().as_mut() {
             self.permission_policy.authorize_with_context(
-                tool_name, &effective_input, &permission_context, Some(prompt.as_mut()),
+                tool_name,
+                &effective_input,
+                &permission_context,
+                Some(prompt.as_mut()),
             )
         } else {
             self.permission_policy.authorize_with_context(
-                tool_name, &effective_input, &permission_context, None,
+                tool_name,
+                &effective_input,
+                &permission_context,
+                None,
             )
         };
 
@@ -1706,13 +2215,23 @@ pub async fn run_turn_async(
                 // Smart approval gate check
                 if let Some(gate) = &self.approval_gate {
                     let gate_result = gate.evaluate(tool_name, &effective_input).await;
-                    if let crate::approval_gate::ApprovalGateResult::Denied { reason } = gate_result {
+                    if let crate::approval_gate::ApprovalGateResult::Denied { reason } = gate_result
+                    {
                         let denied = ConversationMessage::tool_result(
-                            tool_use_id.to_string(), tool_name.to_string(), reason, true,
+                            tool_use_id.to_string(),
+                            tool_name.to_string(),
+                            reason,
+                            true,
                         );
-                        self.session.write().await.push_message(denied.clone())
+                        self.session
+                            .write()
+                            .await
+                            .push_message(denied.clone())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        self.dual_write_message(&denied, self.session().messages.len().wrapping_sub(1));
+                        self.dual_write_message(
+                            &denied,
+                            self.session().messages.len().wrapping_sub(1),
+                        );
                         return Ok(denied);
                     }
                 }
@@ -1742,7 +2261,10 @@ pub async fn run_turn_async(
                             .map(|r| {
                                 let mut msg = format!("[{}] {}", r.gate_name, r.message);
                                 if !r.suggestions.is_empty() {
-                                    msg.push_str(&format!(" Suggestions: {}", r.suggestions.join(", ")));
+                                    msg.push_str(&format!(
+                                        " Suggestions: {}",
+                                        r.suggestions.join(", ")
+                                    ));
                                 }
                                 msg
                             })
@@ -1753,9 +2275,15 @@ pub async fn run_turn_async(
                             format!("Gate check failed: {}", reasons.join("; ")),
                             true,
                         );
-                        self.session.write().await.push_message(denied.clone())
+                        self.session
+                            .write()
+                            .await
+                            .push_message(denied.clone())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        self.dual_write_message(&denied, self.session().messages.len().wrapping_sub(1));
+                        self.dual_write_message(
+                            &denied,
+                            self.session().messages.len().wrapping_sub(1),
+                        );
                         return Ok(denied);
                     }
                 }
@@ -1769,9 +2297,10 @@ pub async fn run_turn_async(
 
                 // P2-10: EffectHandler interceptor — use mock result if available
                 let effect_mock = self.effect_handler.as_ref().and_then(|handler| {
-                    let r = handler.handle(
-                        crate::effect::Effect::ExecuteTool(tool_name.to_string(), effective_input.clone())
-                    );
+                    let r = handler.handle(crate::effect::Effect::ExecuteTool(
+                        tool_name.to_string(),
+                        effective_input.clone(),
+                    ));
                     if r.success { Some(r.data) } else { None }
                 });
 
@@ -1786,24 +2315,35 @@ pub async fn run_turn_async(
                     // Per-tool timeout: check registry for per-tool override or category default,
                     // then cap with the global self.tool_timeout if set.
                     let registry_timeout = Duration::from_secs(
-                        crate::tool_orchestrator::ToolSafetyRegistry::global().get_timeout_secs(tool_name)
+                        crate::tool_orchestrator::ToolSafetyRegistry::global()
+                            .get_timeout_secs(tool_name),
                     );
-                    let tool_timeout = self.tool_timeout
+                    let tool_timeout = self
+                        .tool_timeout
                         .map_or(registry_timeout, |t| t.min(registry_timeout));
-                    match tokio::time::timeout(tool_timeout, tokio::task::spawn_blocking(move || {
-                        tool_exec.execute(&tname, &tinput)
-                    })).await {
+                    match tokio::time::timeout(
+                        tool_timeout,
+                        tokio::task::spawn_blocking(move || tool_exec.execute(&tname, &tinput)),
+                    )
+                    .await
+                    {
                         Ok(Ok(Ok(output))) => (output, false),
                         Ok(Ok(Err(error))) => (error.to_string(), true),
-                        Ok(Err(join_error)) => (format!("tool execution panicked: {join_error}"), true),
+                        Ok(Err(join_error)) => {
+                            (format!("tool execution panicked: {join_error}"), true)
+                        }
                         Err(_elapsed) => {
                             tracing::warn!(tool = %tname_for_err, timeout_secs = tool_timeout.as_secs(), "tool execution timed out, returning partial result");
-                            (format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"), true)
-                        },
+                            (
+                                format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"),
+                                true,
+                            )
+                        }
                     }
                 };
                 let elapsed_ms = start.elapsed().as_millis() as u64;
-                self.hook_runner.fire_post_tool(tool_name, &output, is_error, elapsed_ms);
+                self.hook_runner
+                    .fire_post_tool(tool_name, &output, is_error, elapsed_ms);
 
                 if let Some(callback) = &self.tool_callback {
                     let summary: String = output.chars().take(500).collect();
@@ -1816,13 +2356,19 @@ pub async fn run_turn_async(
                 } else {
                     self.run_post_tool_use_hook(tool_name, &effective_input, &output, false)
                 };
-                if post_hook_result.is_denied() || post_hook_result.is_failed() || post_hook_result.is_cancelled() {
+                if post_hook_result.is_denied()
+                    || post_hook_result.is_failed()
+                    || post_hook_result.is_cancelled()
+                {
                     is_error = true;
                 }
 
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 if let Some(ref cowd) = self.cowd_bus {
-                    cowd.emit(crate::cowd_event::CowdEvent::ToolExecuted { name: tool_name.to_string(), duration_ms: elapsed_ms });
+                    cowd.emit(crate::cowd_event::CowdEvent::ToolExecuted {
+                        name: tool_name.to_string(),
+                        duration_ms: elapsed_ms,
+                    });
                 }
 
                 // T36: Truncate oversized tool results before storing.
@@ -1838,9 +2384,15 @@ pub async fn run_turn_async(
                 }
                 let truncated = self.tool_orchestrator.truncate_result(&combined);
                 let result = ConversationMessage::tool_result(
-                    tool_use_id.to_string(), tool_name.to_string(), truncated, is_error,
+                    tool_use_id.to_string(),
+                    tool_name.to_string(),
+                    truncated,
+                    is_error,
                 );
-                self.session.write().await.push_message(result.clone())
+                self.session
+                    .write()
+                    .await
+                    .push_message(result.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.dual_write_message(&result, self.session().messages.len().wrapping_sub(1));
                 self.record_tool_finished(iterations, &result);
@@ -1848,9 +2400,15 @@ pub async fn run_turn_async(
             }
             PermissionOutcome::Deny { reason } => {
                 let denied = ConversationMessage::tool_result(
-                    tool_use_id.to_string(), tool_name.to_string(), reason, true,
+                    tool_use_id.to_string(),
+                    tool_name.to_string(),
+                    reason,
+                    true,
                 );
-                self.session.write().await.push_message(denied.clone())
+                self.session
+                    .write()
+                    .await
+                    .push_message(denied.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.dual_write_message(&denied, self.session().messages.len().wrapping_sub(1));
                 Ok(denied)
@@ -1898,9 +2456,7 @@ pub async fn run_turn_async(
 
     #[must_use]
     pub fn session(&self) -> Session {
-        tokio::task::block_in_place(|| {
-            self.session.blocking_read().clone()
-        })
+        tokio::task::block_in_place(|| self.session.blocking_read().clone())
     }
 
     pub fn api_client_mut(&mut self) -> &mut C {
@@ -1922,7 +2478,9 @@ pub async fn run_turn_async(
 
     #[must_use]
     pub fn into_session(self) -> Session {
-        Arc::try_unwrap(self.session).map(|lock| lock.into_inner()).unwrap_or_else(|arc| arc.blocking_read().clone())
+        Arc::try_unwrap(self.session)
+            .map(|lock| lock.into_inner())
+            .unwrap_or_else(|arc| arc.blocking_read().clone())
     }
 
     async fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
@@ -1938,7 +2496,9 @@ pub async fn run_turn_async(
         let result = compact_session(
             &*self.session.read().await,
             CompactionConfig {
-                max_estimated_tokens: 0, priority_threshold: 3, keep_high_priority: true,
+                max_estimated_tokens: 0,
+                priority_threshold: 3,
+                keep_high_priority: true,
                 ..CompactionConfig::default()
             },
         );
@@ -2093,7 +2653,15 @@ pub async fn run_turn_async(
             for &layer in &CacheLayer::all() {
                 self.cached_prompt.rebuild_layer(layer, Vec::new(), 0);
             }
-            return self.system_prompt.clone();
+            let envelope = self.build_context_envelope(
+                user_input,
+                Vec::new(),
+                Vec::new(),
+                vec![ContextSourceKind::Memory],
+            );
+            let prompt = Self::provider_prompt_from_envelope(&envelope, None);
+            self.remember_context_envelope(envelope);
+            return prompt;
         };
 
         // Convert session messages to memory's Message type for context scoring.
@@ -2102,7 +2670,9 @@ pub async fn run_turn_async(
         // Tool execution results are machine-optimised data, not knowledge worth retaining
         // in long-term memory (they can be re-derived by re-running the tool).
         let mem_messages: Vec<MemMessage> = self
-            .session.read().await
+            .session
+            .read()
+            .await
             .messages
             .iter()
             .enumerate()
@@ -2129,11 +2699,15 @@ pub async fn run_turn_async(
                 let (tool_use_id, tool_name) = match msg.role {
                     crate::session::MessageRole::Tool => {
                         let tid = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                            ContentBlock::ToolResult { tool_use_id, .. } => {
+                                Some(tool_use_id.clone())
+                            }
                             _ => None,
                         });
                         let tname = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => Some(tool_name.clone()),
+                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => {
+                                Some(tool_name.clone())
+                            }
                             _ => None,
                         });
                         (tid, tname)
@@ -2152,11 +2726,15 @@ pub async fn run_turn_async(
             .collect();
 
         let session_id = self.session().session_id;
-        mgr.set_active_session(session_id.clone());
-        match mgr.prepare_context(user_input, &mem_messages, Some(&session_id)).await {
-            Ok(mut prepared) => {
-                if prepared.entries.is_empty() {
-                    tracing::debug!(entries = 0, "memory context prepared");
+        let memory_ctx = MemoryTurnContext::new(session_id.clone(), "primary");
+        let kernel = MemoryKernel::new(Arc::clone(mgr));
+        match kernel
+            .context_packet(&memory_ctx, user_input, &mem_messages, 20, 8_000)
+            .await
+        {
+            Ok(packet) => {
+                if packet.selected.is_empty() {
+                    tracing::debug!(entries = 0, "memory context packet prepared");
                     if let Some(cb) = &self.memory_callback {
                         cb.on_memory_update(Vec::new(), "no memories found");
                     }
@@ -2165,72 +2743,78 @@ pub async fn run_turn_async(
                     for &layer in &CacheLayer::all() {
                         self.cached_prompt.rebuild_layer(layer, Vec::new(), 0);
                     }
-                    return self.system_prompt.clone();
+                    let omissions = packet
+                        .omitted
+                        .iter()
+                        .map(|omitted| ContextOmission {
+                            source: ContextSourceKind::Memory,
+                            reason: format!("{}: {}", omitted.reason, omitted.title),
+                            token_estimate: 0,
+                        })
+                        .collect();
+                    let envelope =
+                        self.build_context_envelope(user_input, Vec::new(), omissions, Vec::new());
+                    let prompt = Self::provider_prompt_from_envelope(&envelope, None);
+                    self.remember_context_envelope(envelope);
+                    return prompt;
                 }
 
-                // M2: Budget enforcement — sort by layer priority then confidence, truncate to budget
-                use memory::types::MemoryLayer;
-                // P1-1: Coherence filtering — Jaccard similarity against current query
-                let threshold = self.coherence_threshold;
-                let relevant: Vec<_> = prepared.entries.iter()
-                    .filter(|e| coherence::is_relevant(&e.content, user_input, threshold, matches!(e.layer, MemoryLayer::L0)))
-                    .cloned()
-                    .collect();
-                if !relevant.is_empty() { prepared.entries = relevant; }
-                prepared.entries.sort_by(|a, b| {
-                    let layer_rank = |l: MemoryLayer| match l {
-                        MemoryLayer::L0 => 5, MemoryLayer::L1 => 4,
-                        MemoryLayer::L2 => 3, MemoryLayer::L3 => 2, MemoryLayer::L4 => 1,
-                    };
-                    layer_rank(b.layer)
-                        .cmp(&layer_rank(a.layer))
-                        .then(b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
-                });
-
-                let budget = prepared.budget.available.min(8000);
-                let mut used: u64 = 0;
-                let max_entries = prepared.entries.len().min(20);
-                prepared.entries.truncate(max_entries);
-
-                // P5.2: Build per-layer entry fragments with per-layer staleness checks.
                 use crate::cached_prompt::CacheLayer;
-                let mut entries_by_layer: std::collections::HashMap<CacheLayer, Vec<&memory::types::MemoryEntry>> = std::collections::HashMap::new();
-                for entry in &prepared.entries {
-                    if used >= budget { break; }
-                    let tokens = (entry.title.len() + entry.content.len()) as u64 / 4;
-                    used += tokens;
-                    let cl = match entry.layer {
+                use memory::types::MemoryLayer;
+                let mut items_by_layer: std::collections::HashMap<
+                    CacheLayer,
+                    Vec<&memory::MemoryPacketItem>,
+                > = std::collections::HashMap::new();
+                for item in &packet.selected {
+                    let cl = match item.atom.layer {
                         MemoryLayer::L0 => CacheLayer::L0,
                         MemoryLayer::L1 => CacheLayer::L1,
                         MemoryLayer::L2 => CacheLayer::L2,
                         MemoryLayer::L3 => CacheLayer::L3,
                         MemoryLayer::L4 => CacheLayer::L4,
                     };
-                    entries_by_layer.entry(cl).or_default().push(entry);
+                    items_by_layer.entry(cl).or_default().push(item);
                 }
 
                 for cache_layer in CacheLayer::all() {
-                    let entries = entries_by_layer.remove(&cache_layer).unwrap_or_default();
-                    let count = entries.len();
+                    let items = items_by_layer.remove(&cache_layer).unwrap_or_default();
+                    let count = items.len();
 
                     if self.cached_prompt.needs_rebuild(cache_layer, count) {
                         let mut layer_text = String::new();
-                        for entry in &entries {
-                            let layer_tag = match entry.layer {
-                                MemoryLayer::L0 => "identity", MemoryLayer::L1 => "working",
-                                MemoryLayer::L2 => "project", MemoryLayer::L3 => "recall", MemoryLayer::L4 => "raw",
+                        for item in &items {
+                            let atom = &item.atom;
+                            let layer_tag = match atom.layer {
+                                MemoryLayer::L0 => "identity",
+                                MemoryLayer::L1 => "working",
+                                MemoryLayer::L2 => "project",
+                                MemoryLayer::L3 => "recall",
+                                MemoryLayer::L4 => "raw",
                             };
                             layer_text.push_str(&format!(
-                                "  <entry layer=\"{}\" confidence=\"{:.2}\">\n    <title>{}</title>\n    <content>{}</content>\n  </entry>\n",
-                                layer_tag, entry.confidence, entry.title, entry.content
+                                "  <memory role=\"{:?}\" layer=\"{}\" state=\"{:?}\" confidence=\"{:.2}\" salience=\"{:.2}\">\n    <title>{}</title>\n    <reason>{}</reason>\n    <evidence>{}</evidence>\n  </memory>\n",
+                                item.role,
+                                layer_tag,
+                                atom.state,
+                                atom.confidence,
+                                atom.salience,
+                                atom.title,
+                                item.reason,
+                                atom.evidence_pointer.as_deref().unwrap_or("")
                             ));
                         }
-                        self.cached_prompt.rebuild_layer(cache_layer, vec![layer_text], count);
+                        self.cached_prompt
+                            .rebuild_layer(cache_layer, vec![layer_text], count);
                     }
                 }
 
-                // Compose full context from cached per-layer fragments.
-                let mut context = String::from("<memory_context>\n");
+                let mut context = format!(
+                    "<memory_context mode=\"packet\" selected=\"{}\" omitted=\"{}\" tokens=\"{}\" truncated=\"{}\">\n",
+                    packet.selected.len(),
+                    packet.omitted.len(),
+                    packet.token_estimate,
+                    packet.truncated
+                );
                 for cache_layer in CacheLayer::all() {
                     let fragment = self.cached_prompt.get_layer(cache_layer);
                     for line in &fragment {
@@ -2239,61 +2823,84 @@ pub async fn run_turn_async(
                 }
                 context.push_str("</memory_context>");
 
-                // M2-L1-3: entity/triple relations as knowledge graph
-                let mut rel_count = 0;
-                for entry in &prepared.entries {
-                    for rel in &entry.relations {
-                        if rel_count == 0 { context.push_str("\n<knowledge_graph>\n"); }
-                        rel_count += 1;
-                        if rel_count > 15 { break; }
-                        // 09: skip expired or not-yet-valid temporal relations
-                        if let Some(ref tm) = rel.temporal {
-                            if let Some(from) = tm.valid_from {
-                                if from > chrono::Utc::now() { continue; }
-                            }
-                            if let Some(until) = tm.valid_until {
-                                if until < chrono::Utc::now() { continue; }
-                            }
-                        }
-                        let mut attrs = format!("subject=\"{}\" kind=\"{:?}\" strength=\"{:.2}\"",
-                            entry.title, rel.kind, rel.strength);
-                        if let Some(ref entity_name) = rel.entity {
-                            attrs.push_str(&format!(" entity=\"{}\"", entity_name));
-                        }
-                        if let Some(ref tm) = rel.temporal {
-                            if let Some(from) = tm.valid_from {
-                                attrs.push_str(&format!(" valid_from=\"{}\"", from.format("%Y-%m-%d")));
-                            }
-                            if let Some(until) = tm.valid_until {
-                                attrs.push_str(&format!(" valid_until=\"{}\"", until.format("%Y-%m-%d")));
-                            }
-                        }
-                        context.push_str(&format!("  <relation {}/>\n", attrs));
+                if !packet.omitted.is_empty() {
+                    context.push_str("\n<context_omissions>\n");
+                    for omitted in packet.omitted.iter().take(8) {
+                        context.push_str(&format!(
+                            "  <omitted id=\"{}\" reason=\"{}\">{}</omitted>\n",
+                            omitted.id, omitted.reason, omitted.title
+                        ));
                     }
-                    if rel_count > 15 { break; }
-                }
-                if rel_count > 0 { context.push_str("</knowledge_graph>\n"); }
-
-                // P1: Inject code symbols from tree-sitter code indexer
-                if let Some(ref cc) = prepared.code_context {
-                    if !cc.is_empty() {
-                        context.push_str("\n# Relevant Code Symbols\n");
-                        context.push_str(cc);
-                        context.push('\n');
-                    }
+                    context.push_str("</context_omissions>\n");
                 }
 
                 if let Some(cb) = &self.memory_callback {
-                    let entries: Vec<(String, String, f64)> = prepared.entries.iter()
-                        .map(|e| (format!("{:?}", e.layer), e.content.clone(), e.confidence as f64))
+                    let entries: Vec<(String, String, f64)> = packet
+                        .selected
+                        .iter()
+                        .map(|item| {
+                            (
+                                format!("{:?}", item.atom.layer),
+                                item.atom.title.clone(),
+                                item.atom.confidence as f64,
+                            )
+                        })
                         .collect();
                     let status = format!("{} memory entries loaded", entries.len());
                     cb.on_memory_update(entries, &status);
                 }
 
-                tracing::debug!(entries = prepared.entries.len(), "memory context prepared");
-                let mut prompt = self.system_prompt.clone();
-                prompt.insert(0, context);
+                tracing::debug!(
+                    selected = packet.selected.len(),
+                    omitted = packet.omitted.len(),
+                    "memory context packet prepared"
+                );
+                let dynamic_items = packet
+                    .selected
+                    .iter()
+                    .map(|item| {
+                        let role = match item.role {
+                            memory::MemoryPacketRole::Orientation => ContextRole::Orientation,
+                            memory::MemoryPacketRole::Supporting => ContextRole::Evidence,
+                            memory::MemoryPacketRole::Warning
+                            | memory::MemoryPacketRole::Conflict => ContextRole::Warning,
+                        };
+                        let mut context_item = ContextItem::new(
+                            item.atom.id.to_string(),
+                            ContextSourceKind::Memory,
+                            role,
+                            format!(
+                                "{}\nreason: {}\nevidence: {}",
+                                item.atom.title,
+                                item.reason,
+                                item.atom.evidence_pointer.as_deref().unwrap_or("")
+                            ),
+                        );
+                        context_item.authority = ContextAuthority::Session;
+                        context_item.visibility = ContextVisibility::Private;
+                        context_item.score = item.atom.confidence;
+                        if let Some(evidence) = item.atom.evidence_pointer.as_ref() {
+                            context_item.evidence.push(evidence.clone());
+                        }
+                        context_item
+                    })
+                    .collect::<Vec<_>>();
+                let omissions = packet
+                    .omitted
+                    .iter()
+                    .map(|omitted| ContextOmission {
+                        source: ContextSourceKind::Memory,
+                        reason: format!("{}: {}", omitted.reason, omitted.title),
+                        token_estimate: 0,
+                    })
+                    .collect::<Vec<_>>();
+                let envelope =
+                    self.build_context_envelope(user_input, dynamic_items, omissions, Vec::new());
+                let prompt = Self::provider_prompt_from_envelope(
+                    &envelope,
+                    Some(self.dynamic_tail_with_external_context(context)),
+                );
+                self.remember_context_envelope(envelope);
                 prompt
             }
             Err(err) => {
@@ -2301,7 +2908,15 @@ pub async fn run_turn_async(
                 if let Some(cb) = &self.memory_callback {
                     cb.on_memory_update(Vec::new(), &format!("memory error: {err}"));
                 }
-                self.system_prompt.clone()
+                let envelope = self.build_context_envelope(
+                    user_input,
+                    Vec::new(),
+                    Vec::new(),
+                    vec![ContextSourceKind::Memory],
+                );
+                let prompt = Self::provider_prompt_from_envelope(&envelope, None);
+                self.remember_context_envelope(envelope);
+                prompt
             }
         }
     }
@@ -2314,13 +2929,15 @@ pub async fn run_turn_async(
             return Ok(());
         };
         let session_id = self.session().session_id;
-        mgr.set_active_session(session_id.clone());
-        let mgr = Arc::clone(mgr);
+        let memory_ctx = MemoryTurnContext::new(session_id.clone(), "primary");
+        let kernel = MemoryKernel::new(Arc::clone(mgr));
 
         // Convert session messages to memory's Message type for post-turn extraction.
         // DESIGN: Tool blocks are excluded (same rationale as prepare_memory_context).
         let mem_messages: Vec<MemMessage> = self
-            .session.read().await
+            .session
+            .read()
+            .await
             .messages
             .iter()
             .enumerate()
@@ -2332,59 +2949,77 @@ pub async fn run_turn_async(
                     crate::session::MessageRole::System => MemMessageRole::User,
                 };
                 // Extract only Text blocks; tool blocks are deliberately omitted.
-                let content: String = msg.blocks.iter()
-                    .filter_map(|b| match b { ContentBlock::Text { text } => Some(text.as_str()), _ => None })
-                    .collect::<Vec<_>>().join(" ");
+                let content: String = msg
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 // Pass tool identity for tool result messages.
                 let (tool_use_id, tool_name) = match msg.role {
                     crate::session::MessageRole::Tool => {
                         let tid = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                            ContentBlock::ToolResult { tool_use_id, .. } => {
+                                Some(tool_use_id.clone())
+                            }
                             _ => None,
                         });
                         let tname = msg.blocks.iter().find_map(|b| match b {
-                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => Some(tool_name.clone()),
+                            ContentBlock::ToolResult { tool_name, .. } if !tool_name.is_empty() => {
+                                Some(tool_name.clone())
+                            }
                             _ => None,
                         });
                         (tid, tname)
                     }
                     _ => (None, None),
                 };
-                MemMessage { turn_index: idx, role, content, tool_use_id, tool_name, pinned: false }
-            }).collect();
+                MemMessage {
+                    turn_index: idx,
+                    role,
+                    content,
+                    tool_use_id,
+                    tool_name,
+                    pinned: false,
+                }
+            })
+            .collect();
 
-        let mgr_clone = Arc::clone(&mgr);
-
-        // P5.3: Run Extractor and Drift+Seeds in PARALLEL — they're independent.
         let start = Instant::now();
-        let (extract_result, drift_result) = tokio::join!(
-            async { mgr.extract_and_remember(&mem_messages).await },
-            async { mgr_clone.run_drift_and_seeds(&mem_messages).await },
-        );
+        let mut maintenance_messages = mem_messages;
+        let post_turn_result = kernel
+            .post_turn(&memory_ctx, &mut maintenance_messages)
+            .await;
         let elapsed = start.elapsed();
         tracing::info!(
             elapsed_ms = elapsed.as_millis(),
-            "post_turn: extract ∥ drift+seeds completed"
+            "post_turn: memory kernel completed"
         );
 
-        if let Err(ref e) = extract_result {
-            tracing::warn!(%e, "post_turn: extraction failed");
+        if let Err(ref e) = post_turn_result {
+            tracing::warn!(%e, "post_turn: memory kernel failed");
         }
-        if let Err(ref e) = drift_result {
-            tracing::warn!(%e, "post_turn: drift failed");
-        }
-
-        // ── Remaining sequential maintenance ──────────────────────────────────
-        let mut maintenance_messages = mem_messages;
-        let _ = mgr.run_memory_maintenance(&mut maintenance_messages).await;
 
         if let Some(cb) = &self.memory_callback {
             let layers_data = mgr.list_layers().await;
-            let total_entries: usize = layers_data.iter()
-                .filter_map(|l| l.get("entry_count").and_then(|c| c.as_u64()).map(|c| c as usize))
+            let total_entries: usize = layers_data
+                .iter()
+                .filter_map(|l| {
+                    l.get("entry_count")
+                        .and_then(|c| c.as_u64())
+                        .map(|c| c as usize)
+                })
                 .sum();
-            let layer_names: Vec<String> = layers_data.iter()
-                .filter_map(|l| l.get("layer").and_then(|n| n.as_str()).map(|s| s.to_string()))
+            let layer_names: Vec<String> = layers_data
+                .iter()
+                .filter_map(|l| {
+                    l.get("layer")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
                 .collect();
             let vector_count = mgr.vector_index_count();
             cb.on_memory_stats(total_entries, vector_count, layer_names);
@@ -2407,14 +3042,45 @@ pub async fn run_turn_async(
         if let Some(ref store) = self.session_store {
             let session_id = self.session().session_id;
             let record = msg.to_session_message(&session_id, sequence);
+            let event =
+                message_appended_session_event(msg, &session_id, sequence, record.created_at_ms);
             let store = Arc::clone(store);
             tokio::spawn(async move {
                 if let Err(e) = store.insert_message(&record).await {
                     tracing::warn!(%e, session_id, sequence, "dual_write: SQLite insert failed, retrying");
-                    let _ = store.insert_message(&record).await;
+                    if let Err(retry_error) = store.insert_message(&record).await {
+                        tracing::warn!(%retry_error, session_id, sequence, "dual_write: SQLite retry failed");
+                        return;
+                    }
+                }
+                if let Err(e) = store.append_event(&event).await {
+                    tracing::warn!(%e, session_id, sequence, "dual_write: session event append failed");
                 }
             });
         }
+    }
+}
+
+fn message_appended_session_event(
+    msg: &crate::session::ConversationMessage,
+    session_id: &str,
+    sequence: usize,
+    created_at_ms: u64,
+) -> memory::SessionEvent {
+    let message = serde_json::from_str::<serde_json::Value>(&msg.to_json().render())
+        .unwrap_or(serde_json::Value::Null);
+    memory::SessionEvent {
+        session_id: session_id.to_string(),
+        event_type: "message_appended".to_string(),
+        event_json: serde_json::json!({
+            "type": "message_appended",
+            "sequence": sequence,
+            "role": msg.role.role_str(),
+            "message": message,
+        })
+        .to_string(),
+        sequence,
+        created_at_ms,
     }
 }
 
@@ -2429,7 +3095,9 @@ pub fn auto_compaction_threshold_from_env() -> u32 {
 
 fn resolve_compact_threshold(model_ctx_window: u32) -> u32 {
     let env_val = auto_compaction_threshold_from_env();
-    if env_val > 0 { return env_val; }
+    if env_val > 0 {
+        return env_val;
+    }
     if let Ok(pct_str) = std::env::var("COWD_COMPACT_THRESHOLD_PERCENT") {
         if let Ok(pct) = pct_str.parse::<u32>() {
             return (model_ctx_window * pct / 100).min(model_ctx_window.saturating_sub(8_000));
@@ -2438,10 +3106,7 @@ fn resolve_compact_threshold(model_ctx_window: u32) -> u32 {
     (model_ctx_window * 80 / 100).min(model_ctx_window.saturating_sub(8_000))
 }
 
-fn filter_system_prompt_for_role(
-    system_prompt: &[String],
-    task_description: &str,
-) -> Vec<String> {
+fn filter_system_prompt_for_role(system_prompt: &[String], task_description: &str) -> Vec<String> {
     let mut filtered = vec![format!(
         "You are a sub-agent with the following task:\n\n{}\n\
          Complete this task faithfully and report your results.\n\
@@ -2457,7 +3122,9 @@ fn filter_system_prompt_for_role(
 #[doc(alias = "memory")]
 #[doc(alias = "CognitiveContextManager")]
 pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemoryConfig {
-    use memory::config::{BudgetConfig, CompressionConfig, DriftConfig, ExtractorConfig, StoreConfig};
+    use memory::config::{
+        BudgetConfig, CompressionConfig, DriftConfig, ExtractorConfig, StoreConfig,
+    };
     use std::path::PathBuf;
 
     let mem = feature_config.memory();
@@ -2526,7 +3193,12 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
 }
 
 fn extract_tool_info(msg: &ConversationMessage) -> (String, String) {
-    if let Some(ContentBlock::ToolResult { tool_use_id, tool_name, .. }) = msg.blocks.first() {
+    if let Some(ContentBlock::ToolResult {
+        tool_use_id,
+        tool_name,
+        ..
+    }) = msg.blocks.first()
+    {
         (tool_use_id.clone(), tool_name.clone())
     } else {
         (String::new(), String::new())
@@ -2584,7 +3256,8 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
         self: Arc<Self>,
         task: WaveTask,
         _context: crate::wave::TaskContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult, WaveError>> + Send>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskResult, WaveError>> + Send>>
+    {
         let tool_exec = Arc::clone(&self.tool_exec);
         let task_id = task.id.clone();
         let tool_name = task
@@ -2602,13 +3275,14 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
 
         let tname = tool_name.clone();
         let tool_timeout = Duration::from_secs(
-            crate::tool_orchestrator::ToolSafetyRegistry::global().get_timeout_secs(&tname)
+            crate::tool_orchestrator::ToolSafetyRegistry::global().get_timeout_secs(&tname),
         );
         Box::pin(async move {
             let start = std::time::Instant::now();
-            let raw = tokio::time::timeout(tool_timeout, tokio::task::spawn_blocking(move || {
-                tool_exec.execute(&tool_name, &input)
-            }))
+            let raw = tokio::time::timeout(
+                tool_timeout,
+                tokio::task::spawn_blocking(move || tool_exec.execute(&tool_name, &input)),
+            )
             .await;
             let duration_ms = start.elapsed().as_millis() as u64;
             match raw {
@@ -2642,7 +3316,7 @@ impl<T: ToolExecutor> WaveExecutor for ToolWaveExecutor<T> {
                         error: Some(format!("tool timed out after {:?}", tool_timeout)),
                         duration_ms: 0,
                     })
-                },
+                }
             }
         })
     }
@@ -2659,30 +3333,42 @@ fn is_retryable_error(err_str: &str) -> bool {
 mod tests {
 
     use super::{
-        ApiClient, ApiRequest,
-        AssistantEvent, CognitiveContextManager, ConversationRuntime, PromptCacheEvent,
-        RuntimeError, StaticToolExecutor,
+        ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, StaticToolExecutor,
     };
-    use std::pin::Pin;
-    use futures::stream::Stream;
+    use crate::SubAgentConfig;
+    use crate::ToolError;
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::agent_collaboration::{
+        AgentTeam, CollaborationContextResult, CollaborationOps, CollaborationReviewPacket,
+        CollaborationScorecard, CollaborationTask, SubTask,
+    };
+    use crate::agent_workgraph::AgentWorkGraph;
+    use crate::context_runtime::{
+        ContextAuthority, ContextItem, ContextMode, ContextProfile, ContextRole,
+        ContextSourceKind, ResumeContextPacket, ResumeContextSource,
+    };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
         PermissionRequest, SharedPrompter,
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
-    use crate::session::{ContentBlock, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
-    use crate::ToolError;
+    use futures::stream::Stream;
     use std::fs;
+    use std::future::Future;
     use std::path::PathBuf;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
     // M1 helper: convert Vec<AssistantEvent> into a Stream for test mocks
-    fn to_stream(events: Vec<AssistantEvent>) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>> {
+    fn to_stream(
+        events: Vec<AssistantEvent>,
+    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>> {
         Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
     }
 
@@ -2691,21 +3377,67 @@ mod tests {
     }
 
     impl ApiClient for ScriptedApiClient {
-        fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             use futures::stream;
-            fn wrap(v: Vec<AssistantEvent>) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>> {
+            fn wrap(
+                v: Vec<AssistantEvent>,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + 'static>>
+            {
                 Box::pin(stream::iter(v.into_iter().map(Ok)))
             }
             self.call_count += 1;
             let events = match self.call_count {
                 1 => {
-                    assert!(request.messages.iter().any(|message| message.role == MessageRole::User));
-                    vec![AssistantEvent::TextDelta("Let me calculate that.".to_string()), AssistantEvent::ToolUse { id: "tool-1".to_string(), name: "add".to_string(), input: "2,2".to_string() }, AssistantEvent::Usage(TokenUsage { input_tokens: 20, output_tokens: 6, cache_creation_input_tokens: 1, cache_read_input_tokens: 2 }), AssistantEvent::MessageStop]
+                    assert!(
+                        request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::User)
+                    );
+                    vec![
+                        AssistantEvent::TextDelta("Let me calculate that.".to_string()),
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "add".to_string(),
+                            input: "2,2".to_string(),
+                        },
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 20,
+                            output_tokens: 6,
+                            cache_creation_input_tokens: 1,
+                            cache_read_input_tokens: 2,
+                        }),
+                        AssistantEvent::MessageStop,
+                    ]
                 }
                 2 => {
-                    let last_message = request.messages.last().expect("tool result should be present");
+                    let last_message = request
+                        .messages
+                        .last()
+                        .expect("tool result should be present");
                     assert_eq!(last_message.role, MessageRole::Tool);
-                    vec![AssistantEvent::TextDelta("The answer is 4.".to_string()), AssistantEvent::Usage(TokenUsage { input_tokens: 24, output_tokens: 4, cache_creation_input_tokens: 1, cache_read_input_tokens: 3 }), AssistantEvent::PromptCache(PromptCacheEvent { unexpected: true, reason: "cache read tokens dropped while prompt fingerprint remained stable".to_string(), previous_cache_read_input_tokens: 6_000, current_cache_read_input_tokens: 1_000, token_drop: 5_000 }), AssistantEvent::MessageStop]
+                    vec![
+                        AssistantEvent::TextDelta("The answer is 4.".to_string()),
+                        AssistantEvent::Usage(TokenUsage {
+                            input_tokens: 24,
+                            output_tokens: 4,
+                            cache_creation_input_tokens: 1,
+                            cache_read_input_tokens: 3,
+                        }),
+                        AssistantEvent::PromptCache(PromptCacheEvent {
+                            unexpected: true,
+                            reason:
+                                "cache read tokens dropped while prompt fingerprint remained stable"
+                                    .to_string(),
+                            previous_cache_read_input_tokens: 6_000,
+                            current_cache_read_input_tokens: 1_000,
+                            token_drop: 5_000,
+                        }),
+                        AssistantEvent::MessageStop,
+                    ]
                 }
                 _ => unreachable!("extra API call"),
             };
@@ -2720,6 +3452,66 @@ mod tests {
             assert_eq!(request.tool_name, "add");
             PermissionPromptDecision::Allow
         }
+    }
+
+    #[test]
+    fn create_subagent_runtime_assigns_context_lease() {
+        let parent_session = Session::new();
+        let parent_session_id = parent_session.session_id.clone();
+        let runtime = ConversationRuntime::new(
+            parent_session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        let config = SubAgentConfig {
+            task_description: "review implementation".to_string(),
+            budget_tokens: 2_048,
+            ..SubAgentConfig::default()
+        };
+
+        let sub_agent = runtime.create_subagent_runtime(&config);
+        let lease = sub_agent
+            .context_lease()
+            .expect("sub-agent should receive context lease");
+
+        assert_eq!(lease.parent_session_id, parent_session_id);
+        assert_eq!(lease.parent_agent_id, "primary");
+        assert_eq!(lease.task_contract, "review implementation");
+        assert_eq!(lease.max_tokens, 2_048);
+        assert_eq!(sub_agent.agent_id(), lease.child_agent_id);
+    }
+
+    #[test]
+    fn context_profile_controls_runtime_envelope_profile() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+
+        runtime.set_context_profile(ContextProfile::YoloGoal);
+        let envelope = runtime.build_context_envelope(
+            "continue task",
+            vec![ContextItem::new(
+                "task",
+                ContextSourceKind::Task,
+                ContextRole::TaskState,
+                "active yolo task",
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(runtime.context_profile(), ContextProfile::YoloGoal);
+        assert_eq!(envelope.profile, ContextProfile::YoloGoal);
+        assert_eq!(envelope.identity.mode, ContextMode::YoloGoal);
+        assert!(envelope.assembled.runtime_header[0].contains("profile:YoloGoal"));
     }
 
     #[test]
@@ -2793,8 +3585,7 @@ mod tests {
 
         let prompter = SharedPrompter::new(Box::new(PromptAllowOnce));
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt
-            .block_on(runtime.run_turn_async("what is 2 + 2?", &prompter))
+        rt.block_on(runtime.run_turn_async("what is 2 + 2?", &prompter))
             .expect("conversation loop should succeed");
 
         let events = sink.events();
@@ -2826,7 +3617,11 @@ mod tests {
 
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 if request
                     .messages
                     .iter()
@@ -2857,9 +3652,8 @@ mod tests {
         );
 
         let prompter = SharedPrompter::new(Box::new(RejectPrompter));
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
         let summary = handle
             .block_on(runtime.run_turn_async("use the tool", &prompter))
             .expect("conversation should continue after denied tool");
@@ -2875,7 +3669,11 @@ mod tests {
     fn denies_tool_use_when_pre_tool_hook_blocks() {
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 if request
                     .messages
                     .iter()
@@ -2913,9 +3711,8 @@ mod tests {
         );
 
         let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
         let summary = handle
             .block_on(runtime.run_turn_async("use the tool", &prompter))
             .expect("conversation should continue after hook denial");
@@ -2941,7 +3738,11 @@ mod tests {
     fn denies_tool_use_when_pre_tool_hook_fails() {
         struct SingleCallApiClient;
         impl ApiClient for SingleCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 if request
                     .messages
                     .iter()
@@ -3011,7 +3812,11 @@ mod tests {
         }
 
         impl ApiClient for TwoCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 self.calls += 1;
                 match self.calls {
                     1 => to_stream(vec![
@@ -3023,10 +3828,12 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(request
-                            .messages
-                            .iter()
-                            .any(|message| message.role == MessageRole::Tool));
+                        assert!(
+                            request
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::Tool)
+                        );
                         to_stream(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -3088,7 +3895,11 @@ mod tests {
         }
 
         impl ApiClient for TwoCallApiClient {
-            fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 self.calls += 1;
                 match self.calls {
                     1 => to_stream(vec![
@@ -3100,10 +3911,12 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(request
-                            .messages
-                            .iter()
-                            .any(|message| message.role == MessageRole::Tool));
+                        assert!(
+                            request
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::Tool)
+                        );
                         to_stream(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -3118,8 +3931,10 @@ mod tests {
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),
             TwoCallApiClient { calls: 0 },
-            Arc::new(StaticToolExecutor::new()
-                .register("fail", |_input| Err(ToolError::new("tool exploded")))),
+            Arc::new(
+                StaticToolExecutor::new()
+                    .register("fail", |_input| Err(ToolError::new("tool exploded"))),
+            ),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
@@ -3169,7 +3984,8 @@ mod tests {
             fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 Box::pin(futures::stream::iter(vec![
                     Ok(AssistantEvent::TextDelta("done".to_string())),
                     Ok(AssistantEvent::MessageStop),
@@ -3211,7 +4027,8 @@ mod tests {
             fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 Box::pin(futures::stream::iter(vec![
                     Ok(AssistantEvent::TextDelta("done".to_string())),
                     Ok(AssistantEvent::MessageStop),
@@ -3227,16 +4044,23 @@ mod tests {
             vec!["system".to_string()],
         );
         let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
-        handle.block_on(runtime.run_turn_async("a", &prompter)).expect("turn a");
-        handle.block_on(runtime.run_turn_async("b", &prompter)).expect("turn b");
-        handle.block_on(runtime.run_turn_async("c", &prompter)).expect("turn c");
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
+        handle
+            .block_on(runtime.run_turn_async("a", &prompter))
+            .expect("turn a");
+        handle
+            .block_on(runtime.run_turn_async("b", &prompter))
+            .expect("turn b");
+        handle
+            .block_on(runtime.run_turn_async("c", &prompter))
+            .expect("turn c");
 
         let result = runtime.compact(CompactionConfig {
             preserve_recent_messages: 2,
-            max_estimated_tokens: 1, priority_threshold: 3, keep_high_priority: true,
+            max_estimated_tokens: 1,
+            priority_threshold: 3,
+            keep_high_priority: true,
         });
         assert!(result.summary.contains("Conversation summary"));
         assert_eq!(
@@ -3257,7 +4081,8 @@ mod tests {
             fn stream(
                 &mut self,
                 _request: ApiRequest,
-            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
                 Box::pin(futures::stream::iter(vec![
                     Ok(AssistantEvent::TextDelta("done".to_string())),
                     Ok(AssistantEvent::MessageStop),
@@ -3276,9 +4101,8 @@ mod tests {
         );
 
         let prompter = SharedPrompter::none();
-        let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new().unwrap().handle().clone()
-        });
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
         handle
             .block_on(runtime.run_turn_async("persist this turn", &prompter))
             .expect("turn should succeed");
@@ -3292,6 +4116,86 @@ mod tests {
         assert_eq!(restored.messages[1].role, MessageRole::Assistant);
 
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn dual_write_persists_messages_and_session_events() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
+                Box::pin(futures::stream::iter(vec![
+                    Ok(AssistantEvent::TextDelta("stored".to_string())),
+                    Ok(AssistantEvent::MessageStop),
+                ]))
+            }
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+            let session = Session::new();
+            let session_id = session.session_id.clone();
+            let now = "2026-06-04T00:00:00Z".to_string();
+            store
+                .create_session(&memory::SessionRecord {
+                    session_id: session_id.clone(),
+                    platform: "test".to_string(),
+                    chat_id: session_id.clone(),
+                    user_id: None,
+                    model: Some("test-model".to_string()),
+                    created_at: now.clone(),
+                    last_activity: now,
+                    message_count: 0,
+                    reset_policy: "none".to_string(),
+                    metadata_json: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    estimated_cost_usd: 0.0,
+                    status: "active".to_string(),
+                })
+                .await
+                .unwrap();
+
+            let mut runtime = ConversationRuntime::new(
+                session,
+                SimpleApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::DangerFullAccess),
+                vec!["system".to_string()],
+            )
+            .with_session_store(Arc::clone(&store));
+
+            runtime
+                .run_turn_async("persist events", &SharedPrompter::none())
+                .await
+                .expect("turn should succeed");
+
+            for _ in 0..20 {
+                if store.get_events(&session_id, 0).await.unwrap().len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+
+            let messages = store.get_messages(&session_id, 0, 10).await.unwrap();
+            let events = store.get_events(&session_id, 0).await.unwrap();
+
+            assert_eq!(messages.len(), 2);
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "message_appended");
+            assert_eq!(events[0].sequence, 0);
+            assert_eq!(events[1].sequence, 1);
+
+            let event_json: serde_json::Value =
+                serde_json::from_str(&events[0].event_json).expect("event json");
+            assert_eq!(event_json["role"], "user");
+            assert_eq!(event_json["message"]["role"], "user");
+            assert_eq!(event_json["message"]["blocks"][0]["text"], "persist events");
+        });
     }
 
     fn temp_session_path(suffix: &str) -> PathBuf {
@@ -3309,18 +4213,128 @@ mod tests {
 
     // ── M2: Memory system tests ──────────────────────────────────────
 
+    #[derive(Clone)]
     struct MockApi;
     impl ApiClient for MockApi {
-        fn stream(&mut self, _request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             Box::pin(futures::stream::iter(vec![Ok(AssistantEvent::MessageStop)]))
         }
+    }
+
+    struct StubCollaboration;
+
+    impl CollaborationOps for StubCollaboration {
+        fn run_boxed<'a>(
+            &'a self,
+            _task: &'a str,
+            _skills: &'a [String],
+        ) -> Pin<Box<dyn Future<Output = Option<String>> + 'a>> {
+            Box::pin(async { Some("stub synthesis".to_string()) })
+        }
+
+        fn run_with_context_boxed<'a>(
+            &'a self,
+            task: &'a str,
+            skills: &'a [String],
+        ) -> Pin<Box<dyn Future<Output = Option<CollaborationContextResult>> + 'a>> {
+            Box::pin(async move {
+                let collaboration_task = CollaborationTask {
+                    description: task.to_string(),
+                    required_skills: skills.to_vec(),
+                    subtasks: vec![SubTask {
+                        id: "stub-review".to_string(),
+                        description: "review stub collaboration".to_string(),
+                        required_skills: vec!["review".to_string()],
+                        depends_on: Vec::new(),
+                    }],
+                    review_criteria: None,
+                };
+                let review_packet = CollaborationReviewPacket {
+                    board_id: "board-stub".to_string(),
+                    parent_run_id: None,
+                    scorecard: CollaborationScorecard {
+                        completion_rate: 1.0,
+                        synthesis_lift: 1.1,
+                        complementarity_score: 0.5,
+                        active_memory_score: 0.0,
+                        conflict_count: 0,
+                        memory_pulse_count: 0,
+                        surfaced_conflicts: Vec::new(),
+                    },
+                    agent_tasks: Vec::new(),
+                    maintenance_candidates: Vec::new(),
+                };
+                let work_graph =
+                    AgentWorkGraph::from_collaboration_task("stub-session", &collaboration_task)
+                        .with_review_packet(&review_packet);
+                Some(CollaborationContextResult {
+                    synthesis: "stub synthesis".to_string(),
+                    context_items: Vec::new(),
+                    collaboration_task,
+                    review_packet,
+                    work_graph,
+                })
+            })
+        }
+
+        fn decompose_task(&self, _task: &str) -> Vec<SubTask> {
+            Vec::new()
+        }
+
+        fn assemble_team(&self, _task: &CollaborationTask) -> Option<AgentTeam> {
+            None
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collaboration_turn_records_takeable_closed_loop_result() {
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        let mut runtime = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_collaboration(Arc::new(StubCollaboration));
+
+        runtime
+            .run_turn_async(
+                "please refactor rust tests and implement the plan",
+                &SharedPrompter::none(),
+            )
+            .await
+            .expect("turn should complete");
+
+        let result = runtime
+            .last_collaboration_result()
+            .expect("collaboration result should be recorded");
+        assert_eq!(result.work_graph.session_id, session_id);
+        assert_eq!(result.review_packet.board_id, "board-stub");
+
+        assert!(runtime.take_collaboration_result().is_some());
+        assert!(runtime.take_collaboration_result().is_none());
     }
 
     #[test]
     fn m2_layer_priority_l0_before_l3() {
         use memory::types::MemoryLayer;
-        let rank = |l: MemoryLayer| match l { MemoryLayer::L0=>5,MemoryLayer::L1=>4,MemoryLayer::L2=>3,MemoryLayer::L3=>2,MemoryLayer::L4=>1 };
-        assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L3), "L0 must rank higher than L3");
+        let rank = |l: MemoryLayer| match l {
+            MemoryLayer::L0 => 5,
+            MemoryLayer::L1 => 4,
+            MemoryLayer::L2 => 3,
+            MemoryLayer::L3 => 2,
+            MemoryLayer::L4 => 1,
+        };
+        assert!(
+            rank(MemoryLayer::L0) > rank(MemoryLayer::L3),
+            "L0 must rank higher than L3"
+        );
         assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L1));
         assert!(rank(MemoryLayer::L1) > rank(MemoryLayer::L2));
     }
@@ -3329,7 +4343,8 @@ mod tests {
     async fn m2_empty_session_no_memory_crash() {
         let session = Session::new();
         let rt = ConversationRuntime::new(
-            session, MockApi,
+            session,
+            MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
@@ -3342,20 +4357,131 @@ mod tests {
     async fn m2_budget_cap_without_memory_returns_system_prompt() {
         let session = Session::new();
         let rt = ConversationRuntime::new(
-            session, MockApi,
+            session,
+            MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["test prompt".to_string()],
         );
         let result = rt.prepare_memory_context("test").await;
-        assert_eq!(result.len(), 1, "without memory manager, returns base system prompt only");
+        assert_eq!(result[0], "test prompt");
+        assert!(
+            result
+                .get(1)
+                .is_some_and(|line| line.contains("profile:MainTurn")),
+            "without memory manager, returns stable head followed by runtime header"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2_prepare_without_memory_records_degraded_context_envelope() {
+        let session = Session::new();
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["stable system".to_string()],
+        )
+        .without_memory();
+        let prompt = rt.prepare_memory_context("remember this").await;
+        let envelope = rt
+            .last_context_envelope()
+            .expect("context envelope should be recorded");
+
+        assert_eq!(prompt[0], "stable system");
+        assert!(prompt[1].contains("profile:MainTurn"));
+        assert_eq!(envelope.intent, "remember this");
+        assert_eq!(envelope.assembled.stable_head, vec!["stable system"]);
+        assert_eq!(
+            envelope.diagnostics.degraded_sources,
+            vec![ContextSourceKind::Memory]
+        );
+        assert!(envelope.selected.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn external_resume_context_enters_prompt_and_envelope_without_memory() {
+        let session = Session::new();
+        let session_id = session.session_id.clone();
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["stable system".to_string()],
+        )
+        .without_memory();
+
+        rt.inject_resume_context(ResumeContextPacket {
+            session_id: session_id.clone(),
+            handoff_summary: Some("continue v0.8.13 context work".to_string()),
+            active_task: Some("persist context timeline".to_string()),
+            recent_decisions: vec!["DB session_events is the canonical timeline".to_string()],
+            blockers: vec!["none".to_string()],
+            source: ResumeContextSource::Mixed,
+        });
+
+        let prompt = rt.prepare_memory_context("resume").await;
+        let envelope = rt
+            .last_context_envelope()
+            .expect("context envelope should be recorded");
+
+        assert!(
+            prompt
+                .iter()
+                .any(|segment| segment.contains("continue v0.8.13 context work"))
+        );
+        assert_eq!(envelope.selected.len(), 1);
+        assert_eq!(envelope.selected[0].source, ContextSourceKind::Handoff);
+        assert_eq!(envelope.selected[0].authority, ContextAuthority::Session);
+        assert!(envelope.selected[0].content.contains("Active task"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recent_tool_trace_enters_next_prompt_and_envelope() {
+        let session = Session::new();
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["stable system".to_string()],
+        )
+        .without_memory();
+
+        let tool_result = ConversationMessage::tool_result(
+            "tool-1".to_string(),
+            "bash".to_string(),
+            "cargo test passed for context runtime".to_string(),
+            false,
+        );
+        rt.remember_tool_trace_from_message(&tool_result);
+
+        let prompt = rt.prepare_memory_context("next turn").await;
+        let envelope = rt
+            .last_context_envelope()
+            .expect("context envelope should be recorded");
+
+        assert!(
+            prompt
+                .iter()
+                .any(|segment| segment.contains("cargo test passed"))
+        );
+        assert!(
+            envelope
+                .selected
+                .iter()
+                .any(|item| item.source == ContextSourceKind::ToolTrace)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_structured_xml_format_present() {
         let session = Session::new();
         let rt = ConversationRuntime::new(
-            session, MockApi,
+            session,
+            MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["base prompt".to_string()],
@@ -3367,20 +4493,38 @@ mod tests {
     #[test]
     fn m2_error_propagation_returns_result() {
         let session = Session::new();
-        let rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["sys".to_string()]);
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["sys".to_string()],
+        );
         let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
-            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().handle().clone()
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .handle()
+                .clone()
         });
         let r = handle.block_on(rt.run_memory_post_turn());
-        assert!(r.is_ok(), "run_memory_post_turn should return Ok when no memory manager");
+        assert!(
+            r.is_ok(),
+            "run_memory_post_turn should return Ok when no memory manager"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_structured_injection_has_memory_context_tag() {
         let session = Session::new();
-        let rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["system".to_string()]);
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
         let prompt = rt.prepare_memory_context("test").await;
         assert!(prompt.len() >= 1);
         // Without memory manager, should still return system prompt
@@ -3390,7 +4534,13 @@ mod tests {
     #[test]
     fn m2_layer_ranking_verification() {
         use memory::types::MemoryLayer;
-        let rank = |l: MemoryLayer| match l { MemoryLayer::L0=>5,MemoryLayer::L1=>4,MemoryLayer::L2=>3,MemoryLayer::L3=>2,MemoryLayer::L4=>1 };
+        let rank = |l: MemoryLayer| match l {
+            MemoryLayer::L0 => 5,
+            MemoryLayer::L1 => 4,
+            MemoryLayer::L2 => 3,
+            MemoryLayer::L3 => 2,
+            MemoryLayer::L4 => 1,
+        };
         assert_eq!(rank(MemoryLayer::L0), 5);
         assert_eq!(rank(MemoryLayer::L4), 1);
         assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L3));
@@ -3399,11 +4549,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn m2_budget_cap_applied_on_prepare() {
         let session = Session::new();
-        let rt = ConversationRuntime::new(session, MockApi, StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite), vec!["base".to_string()]);
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["base".to_string()],
+        );
         // Verify that prepare_memory_context doesn't panic with empty session
         let result = rt.prepare_memory_context("any query").await;
-        assert!(!result.is_empty(), "should return at least the system prompt");
+        assert!(
+            !result.is_empty(),
+            "should return at least the system prompt"
+        );
     }
 
     // ── M2-L2: integration-level memory tests ──────────────────────
@@ -3412,22 +4570,35 @@ mod tests {
     async fn m2_l2_budget_enforcement_limits_system_prompt() {
         // M2-L2-2: verify memory context doesn't exceed budget proportions
         let session = Session::new();
-        let rt = ConversationRuntime::new(session, MockApi,
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system prompt".to_string()]);
+            vec!["system prompt".to_string()],
+        );
         let prompt = rt.prepare_memory_context("test query").await;
-        // Without memory manager, only system prompt is returned
-        assert_eq!(prompt.len(), 1);
+        // Without selected memories, stable head is followed by runtime header.
+        assert_eq!(prompt.len(), 2);
+        assert!(prompt[1].contains("profile:MainTurn"));
         // System prompt should be reasonably sized
-        assert!(prompt[0].len() < 10000, "system prompt should not be oversized");
+        assert!(
+            prompt[0].len() < 10000,
+            "system prompt should not be oversized"
+        );
     }
 
     #[test]
     fn m2_l2_layer_priority_preserves_l0_l1() {
         // M2-L2-3: L0/L1 should be ranked before L3 in sorted entries
         use memory::types::MemoryLayer;
-        let rank = |l: MemoryLayer| match l { MemoryLayer::L0=>5,MemoryLayer::L1=>4,MemoryLayer::L2=>3,MemoryLayer::L3=>2,MemoryLayer::L4=>1 };
+        let rank = |l: MemoryLayer| match l {
+            MemoryLayer::L0 => 5,
+            MemoryLayer::L1 => 4,
+            MemoryLayer::L2 => 3,
+            MemoryLayer::L3 => 2,
+            MemoryLayer::L4 => 1,
+        };
         // L0 > L1 > L2 > L3 > L4
         assert!(rank(MemoryLayer::L0) > rank(MemoryLayer::L1));
         assert!(rank(MemoryLayer::L1) > rank(MemoryLayer::L2));
@@ -3439,15 +4610,20 @@ mod tests {
     async fn m2_l2_handoff_roundtrip_preserves_data() {
         // M2-L2-1: cross-session handoff creates/restores handoff data
         let session = Session::new();
-        let rt = ConversationRuntime::new(session, MockApi,
+        let rt = ConversationRuntime::new(
+            session,
+            MockApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()]);
+            vec!["system".to_string()],
+        );
         // Handoff should succeed even without memory manager (returns None)
         let handoff = rt.create_memory_handoff().await;
         // Without memory manager, this is None — which is correct behavior
-        assert!(handoff.is_none() || handoff.is_some(),
-            "handoff API should be callable without crashing");
+        assert!(
+            handoff.is_none() || handoff.is_some(),
+            "handoff API should be callable without crashing"
+        );
         // restore_memory_handoff should also not crash
         if let Some(h) = handoff {
             rt.restore_memory_handoff(h);
@@ -3504,5 +4680,4 @@ mod tests {
             "active_session should be set after prepare_memory_context"
         );
     }
-
 }

@@ -181,12 +181,15 @@ fn resume_latest_restores_the_most_recent_managed_session() {
     // given
     let temp_dir = unique_temp_dir("resume-latest");
     let project_dir = temp_dir.join("project");
+    let config_home = temp_dir.join("home").join(".cowd");
     fs::create_dir_all(&project_dir).expect("project dir should exist");
-    let store = runtime::SessionStore::from_cwd(&project_dir).expect("session store should build");
-    let older_path = store.create_handle("session-older").path;
-    let newer_path = store.create_handle("session-newer").path;
+    fs::create_dir_all(config_home.join("sessions")).expect("session dir should exist");
+
+    let older_path = config_home.join("sessions").join("session-older.jsonl");
+    let newer_path = config_home.join("sessions").join("session-newer.jsonl");
 
     let mut older = workspace_session(&project_dir).with_persistence_path(&older_path);
+    older.session_id = "session-older".to_string();
     older
         .push_user_text("older session")
         .expect("older session write should succeed");
@@ -195,6 +198,7 @@ fn resume_latest_restores_the_most_recent_managed_session() {
         .expect("older session should persist");
 
     let mut newer = workspace_session(&project_dir).with_persistence_path(&newer_path);
+    newer.session_id = "session-newer".to_string();
     newer
         .push_user_text("newer session")
         .expect("newer session write should succeed");
@@ -205,8 +209,25 @@ fn resume_latest_restores_the_most_recent_managed_session() {
         .save_to_path(&newer_path)
         .expect("newer session should persist");
 
+    persist_unified_session_fixture(
+        &config_home,
+        &older,
+        &older_path,
+        "2026-06-05T00:00:00Z",
+    );
+    persist_unified_session_fixture(
+        &config_home,
+        &newer,
+        &newer_path,
+        "2026-06-05T00:00:01Z",
+    );
+
     // when
-    let output = run_cowd(&project_dir, &["--resume", "latest", "/status"]);
+    let output = run_cowd_with_env(
+        &project_dir,
+        &["--resume", "latest", "/status"],
+        &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
+    );
 
     // then
     assert!(
@@ -538,6 +559,56 @@ fn run_cowd(current_dir: &Path, args: &[&str]) -> Output {
 
 fn workspace_session(root: &Path) -> Session {
     Session::new().with_workspace_root(root.to_path_buf())
+}
+
+fn persist_unified_session_fixture(
+    config_home: &Path,
+    session: &Session,
+    path: &Path,
+    last_activity: &str,
+) {
+    let store = memory::UnifiedSessionStore::open(&config_home.join("sessions.db"))
+        .expect("unified session store should open");
+    let record = memory::SessionRecord {
+        session_id: session.session_id.clone(),
+        platform: "cli".to_string(),
+        chat_id: session.session_id.clone(),
+        user_id: None,
+        model: session.model.clone(),
+        created_at: last_activity.to_string(),
+        last_activity: last_activity.to_string(),
+        message_count: session.messages.len() as i64,
+        reset_policy: "none".to_string(),
+        metadata_json: Some(
+            serde_json::json!({
+                "workspace_root": session.workspace_root().map(|path| path.display().to_string()),
+                "legacy_path": path.display().to_string(),
+            })
+            .to_string(),
+        ),
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0.0,
+        status: "active".to_string(),
+    };
+    let messages = session
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(sequence, message)| message.to_session_message(&session.session_id, sequence))
+        .collect::<Vec<_>>();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should create");
+    runtime
+        .block_on(async {
+            store.upsert_session(&record).await?;
+            store.delete_messages_from(&session.session_id, 0).await?;
+            if !messages.is_empty() {
+                store.insert_messages_batch(&messages).await?;
+            }
+            Ok::<(), memory::MemoryError>(())
+        })
+        .expect("fixture should persist to unified store");
 }
 
 fn run_cowd_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {

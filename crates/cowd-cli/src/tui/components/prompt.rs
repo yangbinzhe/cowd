@@ -102,10 +102,13 @@ impl FrecencyTracker {
 
     /// Record that a suggestion was used.
     pub fn record_use(&mut self, suggestion: &Suggestion) {
-        let entry = self.entries.entry(suggestion.clone()).or_insert(FrecencyEntry {
-            freq: 0,
-            last_used: Instant::now(),
-        });
+        let entry = self
+            .entries
+            .entry(suggestion.clone())
+            .or_insert(FrecencyEntry {
+                freq: 0,
+                last_used: Instant::now(),
+            });
         entry.freq += 1;
         entry.last_used = Instant::now();
     }
@@ -339,9 +342,7 @@ impl AutocompleteEngine {
                         name_str.to_string()
                     } else {
                         // Include the directory prefix
-                        let rel_dir = search_dir
-                            .strip_prefix(&self.cwd)
-                            .unwrap_or(&search_dir);
+                        let rel_dir = search_dir.strip_prefix(&self.cwd).unwrap_or(&search_dir);
                         format!("{}/{}", rel_dir.display(), name_str)
                     };
 
@@ -609,7 +610,12 @@ impl Prompt {
         let (row, col) = (self.textarea.cursor().0, self.textarea.cursor().1);
 
         // Get the line the cursor is on
-        let line = self.textarea.lines().get(row).map(|l| l.as_str()).unwrap_or("");
+        let line = self
+            .textarea
+            .lines()
+            .get(row)
+            .map(|l| l.as_str())
+            .unwrap_or("");
 
         // Walk backward from cursor position to find word boundary
         let chars: Vec<char> = line.chars().collect();
@@ -1074,8 +1080,12 @@ impl Prompt {
             }
 
             // ── Navigation keys ──
-            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
-            | KeyCode::Home | KeyCode::End => {
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End => {
                 self.textarea.input(Event::Key(*key));
                 // Don't update suggestions on cursor movement unless
                 // the cursor moved to a different word boundary
@@ -1101,7 +1111,7 @@ impl Prompt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, KeyEventKind};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     // ── Helpers ───────────────────────────────────────────────────
 
@@ -1144,7 +1154,10 @@ mod tests {
 
         // Just recorded, so recency decay should be ~1.0
         let score = ft.score(&s);
-        assert!(score > 0.5, "freshly used item should score high, got {score}");
+        assert!(
+            score > 0.5,
+            "freshly used item should score high, got {score}"
+        );
     }
 
     #[test]
@@ -1186,7 +1199,10 @@ mod tests {
         let mut engine = AutocompleteEngine::new("/tmp");
 
         let suggestions = engine.suggest("/sta");
-        assert!(!suggestions.is_empty(), "should find commands matching '/sta'");
+        assert!(
+            !suggestions.is_empty(),
+            "should find commands matching '/sta'"
+        );
 
         // Should contain /status
         let has_status = suggestions.iter().any(|s| s.text == "/status");
@@ -1271,9 +1287,7 @@ mod tests {
         // But actually @src matches the prefix "src" — the @ is stripped,
         // so it looks for files starting with "src" in cwd.
         // That would match "src/" directory itself since read_dir returns "src"
-        let found = suggestions
-            .iter()
-            .any(|s| s.text.starts_with("src"));
+        let found = suggestions.iter().any(|s| s.text.starts_with("src"));
         assert!(
             found,
             "should find files starting with 'src', got: {:?}",
@@ -1357,7 +1371,10 @@ mod tests {
         let _ = prompt.handle_event(&crossterm::event::Event::Key(key_char('a')));
 
         // Now we should have suggestions
-        assert!(prompt.show_suggestions, "should have suggestions after typing /sta");
+        assert!(
+            prompt.show_suggestions,
+            "should have suggestions after typing /sta"
+        );
         assert!(!prompt.suggestions.is_empty());
 
         // Tab should accept
@@ -1385,7 +1402,11 @@ mod tests {
             "should have suggestions after typing /s, got text='{}'",
             prompt.text()
         );
-        assert!(prompt.suggestions.len() >= 2, "need at least 2 suggestions to test cycling, got {}", prompt.suggestions.len());
+        assert!(
+            prompt.suggestions.len() >= 2,
+            "need at least 2 suggestions to test cycling, got {}",
+            prompt.suggestions.len()
+        );
 
         let initial_highlighted = prompt.highlighted;
 
@@ -1597,13 +1618,21 @@ mod tests {
         // Text with ! in middle should NOT activate shell mode
         prompt.set_text("echo !important");
         prompt.update_shell_mode();
-        assert!(!prompt.is_shell_mode(), "! in middle should not activate shell mode");
+        assert!(
+            !prompt.is_shell_mode(),
+            "! in middle should not activate shell mode"
+        );
 
         // Just '!' alone should not activate shell mode (no command)
         prompt.clear();
         prompt.textarea_mut().insert_str("!");
         prompt.update_shell_mode();
-        assert!(!prompt.is_shell_mode(), "just ! should not activate shell mode, text='{}' len={}", prompt.text(), prompt.text().len());
+        assert!(
+            !prompt.is_shell_mode(),
+            "just ! should not activate shell mode, text='{}' len={}",
+            prompt.text(),
+            prompt.text().len()
+        );
     }
 
     #[test]
@@ -1612,7 +1641,10 @@ mod tests {
 
         // Multi-byte UTF-8 only: "你好世界" (6 bytes, 4 chars) - was crashing
         let result = prompt.current_word_from_text("你好世界");
-        assert_eq!(result, "你好世界", "full UTF-8 text should be returned as the current word");
+        assert_eq!(
+            result, "你好世界",
+            "full UTF-8 text should be returned as the current word"
+        );
 
         // English text should still work
         let result = prompt.current_word_from_text("hello world");
@@ -1620,7 +1652,10 @@ mod tests {
 
         // Mixed CJK with whitespace
         let result = prompt.current_word_from_text("test 你好");
-        assert_eq!(result, "你好", "last CJK word after space should be returned");
+        assert_eq!(
+            result, "你好",
+            "last CJK word after space should be returned"
+        );
 
         // Empty string
         let result = prompt.current_word_from_text("");
@@ -1632,7 +1667,10 @@ mod tests {
 
         // Multi-line with CJK
         let result = prompt.current_word_from_text("first line\nsecond 测试");
-        assert_eq!(result, "测试", "last word on last line with CJK should work");
+        assert_eq!(
+            result, "测试",
+            "last word on last line with CJK should work"
+        );
 
         // Single CJK character
         let result = prompt.current_word_from_text("中");

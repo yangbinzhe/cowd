@@ -26,7 +26,11 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::store::session::{SessionEvent, SessionMessage, SessionRecord, SessionSearchResult, SessionSnapshot, SqliteSessionStore};
+use crate::runtime_event::{RuntimeEvent, RuntimeEventPage, RUNTIME_EVENT_TYPE};
+use crate::store::session::{
+    SessionEvent, SessionListOptions, SessionListPage, SessionMessage, SessionRecord,
+    SessionSearchResult, SessionSnapshot, SqliteSessionStore,
+};
 use crate::store::Result;
 
 // ---------------------------------------------------------------------------
@@ -128,6 +132,14 @@ impl UnifiedSessionStore {
         self.inner.lock().await.list_sessions()
     }
 
+    /// List a filtered, sorted page of sessions directly in the backing store.
+    pub async fn list_sessions_page(
+        &self,
+        opts: &SessionListOptions<'_>,
+    ) -> Result<SessionListPage> {
+        self.inner.lock().await.list_sessions_page(opts)
+    }
+
     /// List all sessions for a given platform, ordered by `last_activity DESC`.
     pub async fn list_sessions_by_platform(&self, platform: &str) -> Result<Vec<SessionRecord>> {
         self.inner.lock().await.list_sessions_by_platform(platform)
@@ -137,7 +149,11 @@ impl UnifiedSessionStore {
     ///
     /// Searches across platform, chat_id, user_id, and metadata_json.
     /// Returns results with highlighted snippets from metadata.
-    pub async fn search_sessions(&self, query: &str, limit: usize) -> Result<Vec<SessionSearchResult>> {
+    pub async fn search_sessions(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionSearchResult>> {
         self.inner.lock().await.search_sessions(query, limit)
     }
 
@@ -148,7 +164,10 @@ impl UnifiedSessionStore {
         platform: &str,
         limit: usize,
     ) -> Result<Vec<SessionSearchResult>> {
-        self.inner.lock().await.search_sessions_by_platform(query, platform, limit)
+        self.inner
+            .lock()
+            .await
+            .search_sessions_by_platform(query, platform, limit)
     }
 
     // -----------------------------------------------------------------------
@@ -159,7 +178,10 @@ impl UnifiedSessionStore {
     ///
     /// `INSERT OR IGNORE` makes this idempotent.
     pub async fn associate_memory(&self, session_id: &str, memory_id: &str) -> Result<()> {
-        self.inner.lock().await.associate_memory(session_id, memory_id)
+        self.inner
+            .lock()
+            .await
+            .associate_memory(session_id, memory_id)
     }
 
     /// Return all memory IDs associated with `session_id`.
@@ -169,7 +191,10 @@ impl UnifiedSessionStore {
 
     /// Remove the association between a session and a memory.
     pub async fn disassociate_memory(&self, session_id: &str, memory_id: &str) -> Result<()> {
-        self.inner.lock().await.disassociate_memory(session_id, memory_id)
+        self.inner
+            .lock()
+            .await
+            .disassociate_memory(session_id, memory_id)
     }
 
     // -----------------------------------------------------------------------
@@ -181,13 +206,162 @@ impl UnifiedSessionStore {
         self.inner.lock().await.append_event(event)
     }
 
+    /// Append a canonical runtime event to the session event log.
+    pub async fn append_runtime_event(&self, event: &RuntimeEvent) -> Result<()> {
+        let event = event.to_session_event()?;
+        self.append_event(&event).await
+    }
+
     /// Retrieve events for a session starting from `from_seq` (inclusive).
-    pub async fn get_events(
+    pub async fn get_events(&self, session_id: &str, from_seq: usize) -> Result<Vec<SessionEvent>> {
+        self.inner.lock().await.get_events(session_id, from_seq)
+    }
+
+    /// Retrieve at most `limit` events for a session from `from_seq`.
+    pub async fn get_events_limited(
         &self,
         session_id: &str,
         from_seq: usize,
+        limit: usize,
     ) -> Result<Vec<SessionEvent>> {
-        self.inner.lock().await.get_events(session_id, from_seq)
+        self.inner
+            .lock()
+            .await
+            .get_events_limited(session_id, from_seq, limit)
+    }
+
+    /// Retrieve at most `limit` events of one type for a session.
+    pub async fn get_events_by_type_limited(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        self.inner
+            .lock()
+            .await
+            .get_events_by_type_limited(session_id, event_type, from_seq, limit)
+    }
+
+    /// Count events for a session from `from_seq`.
+    pub async fn count_events_from(&self, session_id: &str, from_seq: usize) -> Result<usize> {
+        self.inner
+            .lock()
+            .await
+            .count_events_from(session_id, from_seq)
+    }
+
+    /// Count events of one type for a session from `from_seq`.
+    pub async fn count_events_by_type_from(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_seq: usize,
+    ) -> Result<usize> {
+        self.inner
+            .lock()
+            .await
+            .count_events_by_type_from(session_id, event_type, from_seq)
+    }
+
+    /// Retrieve a page of canonical runtime events.
+    pub async fn runtime_events_page(
+        &self,
+        session_id: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> Result<RuntimeEventPage> {
+        let limit = clamp_event_page_limit(limit);
+        let total = self
+            .count_events_by_type_from(session_id, RUNTIME_EVENT_TYPE, from_seq)
+            .await?;
+        let events = self
+            .get_events_by_type_limited(session_id, RUNTIME_EVENT_TYPE, from_seq, limit)
+            .await?
+            .into_iter()
+            .map(|event| RuntimeEvent::from_session_event_lossy(&event))
+            .collect::<Vec<_>>();
+        let next_seq = events.last().map(|event| event.sequence + 1);
+        let has_more = events.len() < total;
+
+        Ok(RuntimeEventPage {
+            total,
+            events,
+            next_seq,
+            has_more,
+        })
+    }
+
+    /// Retrieve a runtime-shaped projection of every session event type.
+    pub async fn timeline_events_page(
+        &self,
+        session_id: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> Result<RuntimeEventPage> {
+        let limit = clamp_event_page_limit(limit);
+        let total = self.count_events_from(session_id, from_seq).await?;
+        let events = self
+            .get_events_limited(session_id, from_seq, limit)
+            .await?
+            .into_iter()
+            .map(|event| RuntimeEvent::from_session_event_lossy(&event))
+            .collect::<Vec<_>>();
+        let next_seq = events.last().map(|event| event.sequence + 1);
+        let has_more = events.len() < total;
+
+        Ok(RuntimeEventPage {
+            total,
+            events,
+            next_seq,
+            has_more,
+        })
+    }
+
+    /// Retrieve a context envelope event by its envelope id.
+    pub async fn get_context_event_by_envelope_id(
+        &self,
+        envelope_id: &str,
+    ) -> Result<Option<SessionEvent>> {
+        self.inner
+            .lock()
+            .await
+            .get_context_event_by_envelope_id(envelope_id)
+    }
+
+    /// Return the next append sequence for a session event.
+    pub async fn next_event_sequence(&self, session_id: &str) -> Result<usize> {
+        self.inner.lock().await.next_event_sequence(session_id)
+    }
+
+    /// Delete all events from `from_sequence` onward in a session.
+    ///
+    /// Returns the number of deleted events.
+    pub async fn delete_events_from(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+    ) -> Result<usize> {
+        self.inner
+            .lock()
+            .await
+            .delete_events_from(session_id, from_sequence)
+    }
+
+    /// Delete events of one type from `from_sequence` onward in a session.
+    ///
+    /// Returns the number of deleted events.
+    pub async fn delete_events_by_type_from(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_sequence: usize,
+    ) -> Result<usize> {
+        self.inner
+            .lock()
+            .await
+            .delete_events_by_type_from(session_id, event_type, from_sequence)
     }
 
     /// Save a full-message-list snapshot at a given event index.
@@ -196,10 +370,7 @@ impl UnifiedSessionStore {
     }
 
     /// Return the most recent snapshot for a session, or `None`.
-    pub async fn get_latest_snapshot(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<SessionSnapshot>> {
+    pub async fn get_latest_snapshot(&self, session_id: &str) -> Result<Option<SessionSnapshot>> {
         self.inner.lock().await.get_latest_snapshot(session_id)
     }
 
@@ -235,7 +406,23 @@ impl UnifiedSessionStore {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        self.inner.lock().await.get_messages(session_id, offset, limit)
+        self.inner
+            .lock()
+            .await
+            .get_messages(session_id, offset, limit)
+    }
+
+    /// Retrieve messages for a session starting at `from_sequence`.
+    pub async fn get_messages_from_sequence(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        self.inner
+            .lock()
+            .await
+            .get_messages_from_sequence(session_id, from_sequence, limit)
     }
 
     /// Retrieve ALL messages for a session (unbounded, no pagination).
@@ -256,7 +443,10 @@ impl UnifiedSessionStore {
         session_id: &str,
         from_sequence: usize,
     ) -> Result<usize> {
-        self.inner.lock().await.delete_messages_from(session_id, from_sequence)
+        self.inner
+            .lock()
+            .await
+            .delete_messages_from(session_id, from_sequence)
     }
 
     /// Search messages using FTS5 full-text search.
@@ -268,6 +458,119 @@ impl UnifiedSessionStore {
         session_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        self.inner.lock().await.search_messages(query, session_id, limit)
+        self.inner
+            .lock()
+            .await
+            .search_messages(query, session_id, limit)
+    }
+}
+
+fn clamp_event_page_limit(limit: usize) -> usize {
+    limit.clamp(1, 500)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_event::RuntimeEventScope;
+
+    fn make_record(id: &str) -> SessionRecord {
+        SessionRecord {
+            session_id: id.to_string(),
+            platform: "test".to_string(),
+            chat_id: "chat-1".to_string(),
+            user_id: Some("user-1".to_string()),
+            model: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            last_activity: "2024-01-01T00:01:00Z".to_string(),
+            message_count: 0,
+            reset_policy: "None".to_string(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
+            status: "active".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_events_page_returns_only_canonical_events() {
+        let store = UnifiedSessionStore::open_in_memory().unwrap();
+        store
+            .create_session(&make_record("s-runtime-page"))
+            .await
+            .unwrap();
+        store
+            .append_event(&SessionEvent {
+                session_id: "s-runtime-page".to_string(),
+                event_type: "TextDelta".to_string(),
+                event_json: serde_json::json!({"text": "legacy"}).to_string(),
+                sequence: 0,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&RuntimeEvent::new(
+                "s-runtime-page",
+                1,
+                RuntimeEventScope::Turn,
+                "turn.completed",
+                serde_json::json!({"ok": true}),
+                2,
+            ))
+            .await
+            .unwrap();
+
+        let page = store
+            .runtime_events_page("s-runtime-page", 0, 50)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].kind, "turn.completed");
+        assert_eq!(page.next_seq, Some(2));
+        assert!(!page.has_more);
+    }
+
+    #[tokio::test]
+    async fn timeline_events_page_projects_legacy_and_runtime_events() {
+        let store = UnifiedSessionStore::open_in_memory().unwrap();
+        store
+            .create_session(&make_record("s-runtime-timeline"))
+            .await
+            .unwrap();
+        store
+            .append_event(&SessionEvent {
+                session_id: "s-runtime-timeline".to_string(),
+                event_type: "ToolStart".to_string(),
+                event_json: serde_json::json!({"tool": "shell"}).to_string(),
+                sequence: 0,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&RuntimeEvent::new(
+                "s-runtime-timeline",
+                1,
+                RuntimeEventScope::Memory,
+                "memory.pulse.created",
+                serde_json::json!({"candidates": 3}),
+                2,
+            ))
+            .await
+            .unwrap();
+
+        let page = store
+            .timeline_events_page("s-runtime-timeline", 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].kind, "ToolStart");
+        assert_eq!(page.events[0].scope, RuntimeEventScope::Tool);
+        assert_eq!(page.next_seq, Some(1));
+        assert!(page.has_more);
     }
 }

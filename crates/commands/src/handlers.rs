@@ -642,7 +642,7 @@ mod tests {
     fn renders_help_from_shared_specs() {
         let help = render_slash_command_help();
         assert!(help.contains("Start here        /status, /diff, /agents, /skills, /commit"));
-        assert!(help.contains("[resume]          also works with --resume SESSION.jsonl"));
+        assert!(help.contains("[resume]          also works with --resume <session-id|latest>"));
         assert!(help.contains("Session"));
         assert!(help.contains("Tools"));
         assert!(help.contains("Config"));
@@ -662,7 +662,7 @@ mod tests {
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
-        assert!(help.contains("/resume <session-path>"));
+        assert!(help.contains("/resume <session-id|latest>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains("/mcp [list|show <server>|help]"));
         assert!(help.contains("/memory"));
@@ -753,7 +753,7 @@ mod tests {
         assert!(help.contains("/mcp"));
         assert!(help.contains("Summary          Inspect configured MCP servers"));
         assert!(help.contains("Category         Tools"));
-        assert!(help.contains("Resume           Supported with --resume SESSION.jsonl"));
+        assert!(help.contains("Resume           Supported with --resume <session-id|latest>"));
     }
 
     #[test]
@@ -871,13 +871,13 @@ mod tests {
         );
         assert!(handle_slash_command("/cost", &session, CompactionConfig::default()).is_some());
         assert!(handle_slash_command(
-            "/resume session.json",
+            "/resume session-alpha",
             &session,
             CompactionConfig::default()
         )
         .is_some());
         assert!(handle_slash_command(
-            "/resume session.jsonl",
+            "/resume latest",
             &session,
             CompactionConfig::default()
         )

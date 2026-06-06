@@ -69,7 +69,10 @@ impl TaskDecompositionView {
         self.dag.clear();
         for sub in &self.subtasks {
             for dep in &sub.depends_on {
-                self.dag.entry(dep.clone()).or_default().push(sub.id.clone());
+                self.dag
+                    .entry(dep.clone())
+                    .or_default()
+                    .push(sub.id.clone());
             }
         }
     }
@@ -161,7 +164,9 @@ impl TaskDecompositionView {
                 Span::raw(indent.clone()),
                 Span::styled(
                     format!("{branch}{status_icon} {id}", id = sub.id),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(
@@ -173,10 +178,7 @@ impl TaskDecompositionView {
             // Description line
             lines.push(Line::from(vec![
                 Span::raw(format!("{indent}   ")),
-                Span::styled(
-                    &sub.description,
-                    Style::default().fg(Color::Gray),
-                ),
+                Span::styled(&sub.description, Style::default().fg(Color::Gray)),
             ]));
 
             // Skills line
@@ -221,8 +223,7 @@ impl TaskDecompositionView {
                 lines.push(Line::from(vec![
                     Span::raw(format!("{indent}   ")),
                     Span::styled(
-                        format!("children: {}",
-                            self.dag.get(&sub.id).map_or(0, |v| v.len())),
+                        format!("children: {}", self.dag.get(&sub.id).map_or(0, |v| v.len())),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
@@ -238,8 +239,7 @@ impl TaskDecompositionView {
             Style::default().fg(Color::DarkGray),
         )));
 
-        let paragraph = Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
         frame.render_widget(paragraph, inner);
     }
 
@@ -308,12 +308,7 @@ impl TaskDecompositionView {
         visiting.remove(node_id);
     }
 
-    fn assign_depth(
-        &self,
-        node_id: &str,
-        depth: u32,
-        depths: &mut HashMap<String, u32>,
-    ) {
+    fn assign_depth(&self, node_id: &str, depth: u32, depths: &mut HashMap<String, u32>) {
         let mut visiting = HashSet::new();
         self.assign_depth_inner(node_id, depth, depths, &mut visiting);
     }
@@ -343,12 +338,7 @@ impl Default for TaskDecompositionView {
 mod tests {
     use super::*;
 
-    fn make_subtask(
-        id: &str,
-        desc: &str,
-        skills: Vec<&str>,
-        deps: Vec<&str>,
-    ) -> SubTask {
+    fn make_subtask(id: &str, desc: &str, skills: Vec<&str>, deps: Vec<&str>) -> SubTask {
         SubTask {
             id: id.to_string(),
             description: desc.to_string(),
@@ -381,9 +371,7 @@ mod tests {
     #[test]
     fn build_dag_handles_no_dependencies() {
         let mut view = TaskDecompositionView::new();
-        view.subtasks = vec![
-            make_subtask("x", "Standalone", vec!["general"], vec![]),
-        ];
+        view.subtasks = vec![make_subtask("x", "Standalone", vec!["general"], vec![])];
         view.build_dag();
         assert!(view.dag.is_empty());
     }
@@ -457,9 +445,7 @@ mod tests {
     #[test]
     fn all_deps_satisfied_false_when_missing() {
         let mut view = TaskDecompositionView::new();
-        view.subtasks = vec![
-            make_subtask("b", "B", vec![], vec!["missing"]),
-        ];
+        view.subtasks = vec![make_subtask("b", "B", vec![], vec!["missing"])];
         view.build_dag();
         assert!(!view.all_deps_satisfied(&view.subtasks[0]));
     }
@@ -467,9 +453,7 @@ mod tests {
     #[test]
     fn all_deps_satisfied_no_deps() {
         let mut view = TaskDecompositionView::new();
-        view.subtasks = vec![
-            make_subtask("a", "A", vec![], vec![]),
-        ];
+        view.subtasks = vec![make_subtask("a", "A", vec![], vec![])];
         view.build_dag();
         assert!(view.all_deps_satisfied(&view.subtasks[0]));
     }
@@ -655,16 +639,17 @@ mod tests {
         let lines = terminal.buffer_lines();
         let joined = lines.join("\n");
         assert!(joined.contains("Root task"), "Should show root description");
-        assert!(joined.contains("Child task"), "Should show child description");
+        assert!(
+            joined.contains("Child task"),
+            "Should show child description"
+        );
     }
 
     #[test]
     fn expand_toggle_shows_detail() {
         let mut view = TaskDecompositionView::new();
         view.visible = true;
-        view.subtasks = vec![
-            make_subtask("t1", "Task One", vec!["rust", "test"], vec![]),
-        ];
+        view.subtasks = vec![make_subtask("t1", "Task One", vec!["rust", "test"], vec![])];
         view.build_dag();
         view.toggle_expand("t1");
 

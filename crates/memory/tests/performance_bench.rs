@@ -3,11 +3,11 @@
 //! Tests key operations with timing assertions to catch regression.
 //! Run with: cargo test --release -p cowd-memory --test performance_bench -- --nocapture
 
-use cowd_memory::{ MemoryScope,
-    CognitiveContextManager, MemoryConfig, MemoryEntry, MemoryLayer, MemoryCategory,
+use cowd_memory::config::{BudgetConfig, StoreConfig, TuningConfig};
+use cowd_memory::{
+    CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
     MemorySource, Priority,
 };
-use cowd_memory::config::{BudgetConfig, StoreConfig};
 use std::time::Instant;
 
 fn bench_config(sqlite_path: &std::path::Path) -> MemoryConfig {
@@ -26,6 +26,18 @@ fn bench_config(sqlite_path: &std::path::Path) -> MemoryConfig {
             ..Default::default()
         },
         ..Default::default()
+    }
+}
+
+fn cached_prepare_config(sqlite_path: &std::path::Path) -> MemoryConfig {
+    MemoryConfig {
+        tuning: TuningConfig {
+            l4_push_enabled: false,
+            prefetch_hot_topics: 0,
+            prepare_context_cache_ttl_ms: 60_000,
+            ..Default::default()
+        },
+        ..bench_config(sqlite_path)
     }
 }
 
@@ -49,8 +61,8 @@ fn test_entry(content: &str) -> MemoryEntry {
         last_accessed_at: None,
         scope: MemoryScope::default(),
         session_id: None,
-            source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+        source_agent: None,
+        visibility: cowd_memory::AgentVisibility::default(),
     }
 }
 
@@ -77,11 +89,19 @@ async fn bench_recall_latency_1k_entries() {
     let results = mgr.recall("Rust programming", 10).await.unwrap_or_default();
     let search_time = search_start.elapsed();
 
-    eprintln!("Search ({} entries): {:?}, found {} results", n, search_time, results.len());
+    eprintln!(
+        "Search ({} entries): {:?}, found {} results",
+        n,
+        search_time,
+        results.len()
+    );
 
     // Accept up to 1 second for full test (includes all overhead)
-    assert!(search_time.as_millis() < 5000,
-        "Search should complete within 5s, took {:?}", search_time);
+    assert!(
+        search_time.as_millis() < 5000,
+        "Search should complete within 5s, took {:?}",
+        search_time
+    );
 }
 
 /// Benchmark: measure get_entry latency.
@@ -109,10 +129,61 @@ async fn bench_get_entry_latency() {
     }
     let elapsed = start.elapsed();
 
-    eprintln!("get_entry {} items: {:?} total, {:?} avg", n, elapsed, elapsed / n);
+    eprintln!(
+        "get_entry {} items: {:?} total, {:?} avg",
+        n,
+        elapsed,
+        elapsed / n
+    );
     assert_eq!(found, n as u32, "All entries should be retrievable");
-    assert!(elapsed.as_millis() < 30_000,
-        "get_entry {} should complete within 30s", n);
+    assert!(
+        elapsed.as_millis() < 30_000,
+        "get_entry {} should complete within 30s",
+        n
+    );
+}
+
+/// Benchmark: repeated prepare_context on a warm local FTS5 path.
+/// Target: p95 <300ms without remote/vector embedding calls.
+#[tokio::test]
+async fn bench_prepare_context_cached_p95_under_300ms() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config = cached_prepare_config(&tmp.path().join("bench.db"));
+    let mgr = CognitiveContextManager::new(config).await.unwrap();
+    assert_eq!(mgr.search_mode_label(), "keyword");
+
+    for i in 0..300 {
+        let entry = test_entry(&format!(
+            "prepare context cache benchmark rust async scheduler latency entry {i}"
+        ));
+        mgr.remember(entry).await.unwrap();
+    }
+
+    let query = "rust async scheduler latency";
+    let warm = mgr.prepare_context(query, &[], None).await.unwrap();
+    assert!(
+        !warm.entries.is_empty(),
+        "warm prepare_context should surface benchmark entries"
+    );
+
+    let mut latencies_ms = Vec::new();
+    for _ in 0..60 {
+        let start = Instant::now();
+        let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
+        assert_eq!(ctx.total_tokens, warm.total_tokens);
+        latencies_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p95 = latencies_ms[(latencies_ms.len() * 95 / 100).min(latencies_ms.len() - 1)];
+    eprintln!(
+        "prepare_context cached p95: {:.3}ms over {} samples",
+        p95,
+        latencies_ms.len()
+    );
+    assert!(
+        p95 < 300.0,
+        "prepare_context cached p95 should be <300ms, got {p95:.3}ms"
+    );
 }
 
 /// Fast stress test: 1000 entries (~0.5s).
@@ -134,13 +205,23 @@ async fn stress_insert_1k_entries() {
 
     let total_time = start.elapsed();
     let layers = mgr.list_layers().await;
-    let l3_count: u64 = layers.iter()
+    let l3_count: u64 = layers
+        .iter()
         .filter_map(|v| {
             if v.get("layer").and_then(|l| l.as_str()) == Some("L3") {
                 v.get("entry_count").and_then(|c| c.as_u64())
-            } else { None }
-        }).next().unwrap_or(0);
-    eprintln!("Stress insert 20K: {:?} ({:?} per entry), L3={}", total_time, total_time / n as u32, l3_count);
+            } else {
+                None
+            }
+        })
+        .next()
+        .unwrap_or(0);
+    eprintln!(
+        "Stress insert 20K: {:?} ({:?} per entry), L3={}",
+        total_time,
+        total_time / n as u32,
+        l3_count
+    );
     assert!(l3_count >= n as u64 / 2);
     assert!(total_time.as_secs() < 300);
 }

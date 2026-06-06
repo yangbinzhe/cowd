@@ -13,10 +13,7 @@ use std::process::Command;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardContent {
     Text(String),
-    Image {
-        data: Vec<u8>,
-        mime: String,
-    },
+    Image { data: Vec<u8>, mime: String },
 }
 
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -48,7 +45,10 @@ pub type PasteCommand = (&'static str, Vec<&'static str>);
 pub fn linux_image_paste_commands() -> Vec<PasteCommand> {
     vec![
         ("wl-paste", vec!["-t", "image/png"]),
-        ("xclip", vec!["-selection", "clipboard", "-t", "image/png", "-o"]),
+        (
+            "xclip",
+            vec!["-selection", "clipboard", "-t", "image/png", "-o"],
+        ),
     ]
 }
 
@@ -437,7 +437,8 @@ mod tests {
     }
 
     fn base64_encode_bytes(input: &[u8]) -> String {
-        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::with_capacity(((input.len() + 2) / 3) * 4);
         for chunk in input.chunks(3) {
             let b0 = chunk[0];

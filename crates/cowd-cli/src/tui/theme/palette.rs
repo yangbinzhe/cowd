@@ -161,12 +161,24 @@ impl<'de> Deserialize<'de> for Palette {
             agent_offline: String,
         }
 
-        fn default_hex_blue() -> String { "#0000FF".into() }
-        fn default_hex_green() -> String { "#00FF00".into() }
-        fn default_hex_magenta() -> String { "#FF00FF".into() }
-        fn default_hex_gray() -> String { "#808080".into() }
-        fn default_hex_yellow() -> String { "#FFFF00".into() }
-        fn default_hex_red() -> String { "#FF0000".into() }
+        fn default_hex_blue() -> String {
+            "#0000FF".into()
+        }
+        fn default_hex_green() -> String {
+            "#00FF00".into()
+        }
+        fn default_hex_magenta() -> String {
+            "#FF00FF".into()
+        }
+        fn default_hex_gray() -> String {
+            "#808080".into()
+        }
+        fn default_hex_yellow() -> String {
+            "#FFFF00".into()
+        }
+        fn default_hex_red() -> String {
+            "#FF0000".into()
+        }
 
         let data = PaletteData::deserialize(deserializer)?;
         Ok(Palette {

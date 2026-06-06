@@ -22,9 +22,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use runtime::agent_discussion::{
-    Contribution, Discussion, DiscussionEngine, DiscussionPhase,
-};
+use runtime::agent_discussion::{Contribution, Discussion, DiscussionEngine, DiscussionPhase};
 
 use crate::tui::components::{Component, EventResult, RenderContext};
 
@@ -146,7 +144,12 @@ impl DiscussionThreadView {
 
         // Topic
         lines.push(Line::from(vec![
-            Span::styled("● Topic: ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "● Topic: ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(discussion.topic.clone(), Style::default().fg(Color::White)),
         ]));
 
@@ -159,7 +162,12 @@ impl DiscussionThreadView {
                 format!("{phase_icon} Phase: "),
                 Style::default().fg(Color::White),
             ),
-            Span::styled(phase_label, Style::default().fg(phase_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                phase_label,
+                Style::default()
+                    .fg(phase_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]));
 
         // Round info
@@ -204,7 +212,9 @@ impl DiscussionThreadView {
             Span::styled("  ", Style::default()),
             Span::styled(
                 format!("{} ", contribution.agent_id),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("(confidence: {conf_text})"),
@@ -271,7 +281,9 @@ impl DiscussionThreadView {
             // Round header
             lines.push(Line::from(Span::styled(
                 format!("─ Round {round} ─"),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )));
 
             for contribution in contributions {
@@ -301,23 +313,39 @@ impl DiscussionThreadView {
 
         lines.push(Line::from(Span::styled(
             "─ Consensus ─",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
 
         // Consensus status
         if consensus.reached {
             lines.push(Line::from(vec![
-                Span::styled("  ✓ Reached  ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                 Span::styled(
-                    format!("({}/{}, score: {:.2})", consensus.agreeing_count, consensus.total_count, consensus.score),
+                    "  ✓ Reached  ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "({}/{}, score: {:.2})",
+                        consensus.agreeing_count, consensus.total_count, consensus.score
+                    ),
                     Style::default().fg(Color::Green),
                 ),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled("  ✗ Not Reached  ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
                 Span::styled(
-                    format!("({}/{}, score: {:.2})", consensus.agreeing_count, consensus.total_count, consensus.score),
+                    "  ✗ Not Reached  ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "({}/{}, score: {:.2})",
+                        consensus.agreeing_count, consensus.total_count, consensus.score
+                    ),
                     Style::default().fg(Color::Red),
                 ),
             ]));
@@ -351,7 +379,9 @@ impl DiscussionThreadView {
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 "  Final Decision:",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(Span::styled(
                 format!("    \"{decision}\""),
@@ -420,7 +450,10 @@ impl Component for DiscussionThreadView {
 
         let phase_color = Self::phase_color(discussion.phase);
         let block = Block::default()
-            .title(format!(" Discussion [{}] ", Self::phase_label(discussion.phase)))
+            .title(format!(
+                " Discussion [{}] ",
+                Self::phase_label(discussion.phase)
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(phase_color));
 
@@ -564,7 +597,10 @@ mod tests {
         let lines = render_view(&mut view, 60, 15);
         let joined = lines.join("\n");
         assert!(joined.contains("Should we refactor?"), "Should show topic");
-        assert!(joined.contains("Contributing"), "Should show Contributing phase");
+        assert!(
+            joined.contains("Contributing"),
+            "Should show Contributing phase"
+        );
         assert!(joined.contains("agent-1"), "Should show participant");
         assert!(joined.contains("agent-2"), "Should show participant");
     }
@@ -599,7 +635,10 @@ mod tests {
         assert!(joined.contains("Round 1"), "Should show round header");
         assert!(joined.contains("alpha"), "Should show agent ID");
         assert!(joined.contains("85%"), "Should show confidence");
-        assert!(joined.contains("I think we should do X"), "Should show content");
+        assert!(
+            joined.contains("I think we should do X"),
+            "Should show content"
+        );
         assert!(joined.contains("claim-1"), "Should show claim");
         assert!(joined.contains("claim-2"), "Should show claim");
     }
@@ -652,7 +691,10 @@ mod tests {
 
         let lines = render_view(&mut view, 60, 20);
         let joined = lines.join("\n");
-        assert!(joined.contains("Consensus"), "Should show Consensus section");
+        assert!(
+            joined.contains("Consensus"),
+            "Should show Consensus section"
+        );
         assert!(joined.contains("Reached"), "Should show reached status");
         assert!(joined.contains("0.95"), "Should show score");
         assert!(joined.contains("3/4"), "Should show agreeing count");
@@ -692,9 +734,15 @@ mod tests {
 
         let lines = render_view(&mut view, 60, 20);
         let joined = lines.join("\n");
-        assert!(joined.contains("Not Reached"), "Should show not-reached status");
+        assert!(
+            joined.contains("Not Reached"),
+            "Should show not-reached status"
+        );
         assert!(joined.contains("WeightedVote"), "Should show method");
-        assert!(joined.contains("Conflicts"), "Should show conflicts section");
+        assert!(
+            joined.contains("Conflicts"),
+            "Should show conflicts section"
+        );
         assert!(
             joined.contains("Path format"),
             "Should show conflict detail"
@@ -757,18 +805,9 @@ mod tests {
 
     #[test]
     fn confidence_colors() {
-        assert_eq!(
-            DiscussionThreadView::confidence_color(0.9),
-            Color::Green
-        );
-        assert_eq!(
-            DiscussionThreadView::confidence_color(0.5),
-            Color::Yellow
-        );
-        assert_eq!(
-            DiscussionThreadView::confidence_color(0.2),
-            Color::Red
-        );
+        assert_eq!(DiscussionThreadView::confidence_color(0.9), Color::Green);
+        assert_eq!(DiscussionThreadView::confidence_color(0.5), Color::Yellow);
+        assert_eq!(DiscussionThreadView::confidence_color(0.2), Color::Red);
     }
 
     #[test]

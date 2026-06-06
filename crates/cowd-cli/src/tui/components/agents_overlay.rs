@@ -128,7 +128,9 @@ impl Component for AgentsOverlay {
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
             " Agents ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::raw(""));
 
@@ -190,7 +192,9 @@ impl Component for AgentsOverlay {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .title(" Agent Tree ");
-        let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
         ctx.frame_mut().render_widget(paragraph, overlay);
     }
 
@@ -238,9 +242,9 @@ impl Component for AgentsOverlay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyEvent;
-    use crate::tui::test_utils::MockTerminal;
     use crate::tui::skin::SkinConfig;
+    use crate::tui::test_utils::MockTerminal;
+    use crossterm::event::KeyEvent;
 
     fn make_tool_call(id: &str, name: &str, done: bool, exit_code: Option<i32>) -> TimelineEntry {
         TimelineEntry::ToolCall {
@@ -293,23 +297,24 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("Build"), "Should show Build agent");
         assert!(joined.contains("Test"), "Should show Test agent");
-        assert!(joined.contains("├──") || joined.contains("└──"), "Should show tree characters");
+        assert!(
+            joined.contains("├──") || joined.contains("└──"),
+            "Should show tree characters"
+        );
     }
 
     #[test]
     fn status_updates() {
         let mut overlay = AgentsOverlay::new();
         overlay.visible = true;
-        overlay.agents = vec![
-            AgentEntry {
-                id: "t1".into(),
-                name: "Running".into(),
-                done: false,
-                exit_code: None,
-                duration_secs: 5,
-                depth: 0,
-            },
-        ];
+        overlay.agents = vec![AgentEntry {
+            id: "t1".into(),
+            name: "Running".into(),
+            done: false,
+            exit_code: None,
+            duration_secs: 5,
+            depth: 0,
+        }];
 
         let s1 = overlay.spinner_char().to_string();
         overlay.tick();
@@ -334,23 +339,24 @@ mod tests {
     fn interrupt_on_x() {
         let mut overlay = AgentsOverlay::new();
         overlay.visible = true;
-        overlay.agents = vec![
-            AgentEntry {
-                id: "t1".into(),
-                name: "Running".into(),
-                done: false,
-                exit_code: None,
-                duration_secs: 5,
-                depth: 0,
-            },
-        ];
+        overlay.agents = vec![AgentEntry {
+            id: "t1".into(),
+            name: "Running".into(),
+            done: false,
+            exit_code: None,
+            duration_secs: 5,
+            depth: 0,
+        }];
 
         let result = overlay.handle_event(&Event::Key(KeyEvent::new(
             KeyCode::Char('x'),
             crossterm::event::KeyModifiers::NONE,
         )));
         assert!(result.is_consumed(), "'x' should be consumed");
-        assert!(overlay.agents[0].done, "Agent should be marked done after interrupt");
+        assert!(
+            overlay.agents[0].done,
+            "Agent should be marked done after interrupt"
+        );
         assert_eq!(overlay.agents[0].exit_code, Some(-1));
     }
 
@@ -363,7 +369,10 @@ mod tests {
             KeyCode::Char('x'),
             crossterm::event::KeyModifiers::NONE,
         )));
-        assert!(result.is_not_consumed(), "Hidden overlay should not consume events");
+        assert!(
+            result.is_not_consumed(),
+            "Hidden overlay should not consume events"
+        );
     }
 
     #[test]

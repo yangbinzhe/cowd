@@ -158,11 +158,7 @@ impl KeybindEngine {
             || Self::map_has_prefix(&self.key_map, chord, prefix_len)
     }
 
-    fn layer_stack_has_prefix(
-        stack: &[ModalLayer],
-        chord: &KeyChord,
-        prefix_len: usize,
-    ) -> bool {
+    fn layer_stack_has_prefix(stack: &[ModalLayer], chord: &KeyChord, prefix_len: usize) -> bool {
         stack.iter().rev().any(|layer| {
             layer
                 .bindings
@@ -422,7 +418,10 @@ pub fn default_bindings() -> KeyMap {
     );
     map.add_grouped(
         KeyChord {
-            keys: vec![KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)],
+            keys: vec![KeyEvent::new(
+                KeyCode::Char('P'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )],
         },
         Action::ToggleCommandPalette,
         "Command palette",
@@ -700,13 +699,19 @@ mod tests {
     #[test]
     fn single_key_dispatch_j_scrolls_down() {
         let mut eng = engine();
-        assert_eq!(eng.handle_key(k(KeyCode::Char('j'))), Some(Action::Scroll(1)));
+        assert_eq!(
+            eng.handle_key(k(KeyCode::Char('j'))),
+            Some(Action::Scroll(1))
+        );
     }
 
     #[test]
     fn single_key_dispatch_k_scrolls_up() {
         let mut eng = engine();
-        assert_eq!(eng.handle_key(k(KeyCode::Char('k'))), Some(Action::Scroll(-1)));
+        assert_eq!(
+            eng.handle_key(k(KeyCode::Char('k'))),
+            Some(Action::Scroll(-1))
+        );
     }
 
     #[test]
@@ -724,10 +729,7 @@ mod tests {
     #[test]
     fn single_key_dispatch_enter_submits() {
         let mut eng = engine();
-        assert_eq!(
-            eng.handle_key(k(KeyCode::Enter)),
-            Some(Action::SubmitInput)
-        );
+        assert_eq!(eng.handle_key(k(KeyCode::Enter)), Some(Action::SubmitInput));
     }
 
     #[test]
@@ -918,8 +920,7 @@ mod tests {
 
     #[test]
     fn timeout_flushes_pending_chord_and_hides_which_key() {
-        let mut eng = KeybindEngine::new(default_bindings())
-            .with_timeout(Duration::from_millis(1));
+        let mut eng = KeybindEngine::new(default_bindings()).with_timeout(Duration::from_millis(1));
 
         // Start a prefix
         assert_eq!(eng.handle_key(k(KeyCode::Char('g'))), None);
@@ -936,8 +937,7 @@ mod tests {
 
     #[test]
     fn timeout_does_not_panic_on_empty_pending() {
-        let mut eng = KeybindEngine::new(default_bindings())
-            .with_timeout(Duration::from_millis(1));
+        let mut eng = KeybindEngine::new(default_bindings()).with_timeout(Duration::from_millis(1));
 
         // No keys pressed — nothing to flush
         eng.check_timeout();
@@ -946,8 +946,8 @@ mod tests {
 
     #[test]
     fn timeout_resets_after_new_key_press() {
-        let mut eng = KeybindEngine::new(default_bindings())
-            .with_timeout(Duration::from_millis(500));
+        let mut eng =
+            KeybindEngine::new(default_bindings()).with_timeout(Duration::from_millis(500));
 
         // Press 'g'
         assert_eq!(eng.handle_key(k(KeyCode::Char('g'))), None);

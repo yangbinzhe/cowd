@@ -28,7 +28,10 @@ mod tests {
     #[test]
     fn event_channel_send_recv() {
         let (tx, rx) = cowd_event_channel();
-        tx.send(runtime::CowdEvent::TextDelta { text: "hello".into() }).unwrap();
+        tx.send(runtime::CowdEvent::TextDelta {
+            text: "hello".into(),
+        })
+        .unwrap();
         let event = rx.recv().unwrap();
         assert!(matches!(event, runtime::CowdEvent::TextDelta { text } if text == "hello"));
     }
@@ -41,18 +44,24 @@ mod tests {
             preview: "ls".into(),
         };
         let cloned = event.clone();
-        assert!(matches!(cloned, runtime::CowdEvent::ToolStart { id, name, preview }
-            if id == "t1" && name == "bash" && preview == "ls"));
+        assert!(
+            matches!(cloned, runtime::CowdEvent::ToolStart { id, name, preview }
+            if id == "t1" && name == "bash" && preview == "ls")
+        );
     }
 
     #[test]
     fn channel_backpressure_no_panic() {
         let (tx, _rx) = cowd_event_channel();
         for i in 0..256 {
-            let _ = tx.try_send(runtime::CowdEvent::TextDelta { text: format!("msg{i}") });
+            let _ = tx.try_send(runtime::CowdEvent::TextDelta {
+                text: format!("msg{i}"),
+            });
         }
         // After channel fills, try_send returns Err — should not panic
-        let result = tx.try_send(runtime::CowdEvent::TextDelta { text: "overflow".into() });
+        let result = tx.try_send(runtime::CowdEvent::TextDelta {
+            text: "overflow".into(),
+        });
         assert!(result.is_err());
     }
 
@@ -61,14 +70,50 @@ mod tests {
         // Ensure all variants produce valid Debug output
         let events = vec![
             runtime::CowdEvent::TextDelta { text: "t".into() },
-            runtime::CowdEvent::ThinkingDelta { thinking: "t".into() },
+            runtime::CowdEvent::ThinkingDelta {
+                thinking: "t".into(),
+            },
             runtime::CowdEvent::ThinkingComplete,
-            runtime::CowdEvent::ToolStart { id: "i".into(), name: "n".into(), preview: "p".into() },
-            runtime::CowdEvent::ToolProgress { id: "i".into(), name: "n".into(), progress: "p".into() },
-            runtime::CowdEvent::ToolComplete { id: "i".into(), name: "n".into(), summary: "s".into(), exit_code: Some(0) },
-            runtime::CowdEvent::TokenUsage { input: 1, output: 2, cache_create: 3, cache_read: 4 },
+            runtime::CowdEvent::ToolStart {
+                id: "i".into(),
+                name: "n".into(),
+                preview: "p".into(),
+            },
+            runtime::CowdEvent::ToolProgress {
+                id: "i".into(),
+                name: "n".into(),
+                progress: "p".into(),
+            },
+            runtime::CowdEvent::ToolComplete {
+                id: "i".into(),
+                name: "n".into(),
+                summary: "s".into(),
+                exit_code: Some(0),
+            },
+            runtime::CowdEvent::TokenUsage {
+                input: 1,
+                output: 2,
+                cache_create: 3,
+                cache_read: 4,
+            },
             runtime::CowdEvent::TurnStarted,
-            runtime::CowdEvent::TurnComplete { assistant_text: "ok".into(), iterations: 1 },
+            runtime::CowdEvent::TurnComplete {
+                assistant_text: "ok".into(),
+                iterations: 1,
+            },
+            runtime::CowdEvent::WorkGraphSummary {
+                summary: runtime::RuntimeWorkGraphSummary {
+                    graph_id: Some("graph".into()),
+                    board_id: Some("board".into()),
+                    status: "completed".into(),
+                    agent_tasks: 1,
+                    memory_candidates: 1,
+                    conflicts: 0,
+                    completion_rate: Some(1.0),
+                    synthesis_lift: Some(1.1),
+                    complementarity_score: Some(0.5),
+                },
+            },
             runtime::CowdEvent::TurnError { error: "e".into() },
             runtime::CowdEvent::CompactionNotice { removed_count: 5 },
         ];
@@ -92,7 +137,10 @@ mod tests {
         let mut app = App::new("test", "test-session");
         app.apply_event(runtime::CowdEvent::TurnStarted);
         app.apply_event(runtime::CowdEvent::TokenUsage {
-            input: 100, output: 50, cache_create: 10, cache_read: 5,
+            input: 100,
+            output: 50,
+            cache_create: 10,
+            cache_read: 5,
         });
         assert_eq!(app.input_tokens, 100);
         assert_eq!(app.output_tokens, 50);

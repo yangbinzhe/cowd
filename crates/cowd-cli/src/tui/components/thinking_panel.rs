@@ -66,7 +66,10 @@ impl ThinkingPanel {
         self.reasoning.clear();
         let mut last_reasoning: Option<(String, bool)> = None;
         for (_, entry) in app.timeline_iter() {
-            if let TimelineEntry::Thinking { content, complete, .. } = entry {
+            if let TimelineEntry::Thinking {
+                content, complete, ..
+            } = entry
+            {
                 last_reasoning = Some((content.clone(), *complete));
             }
         }
@@ -130,9 +133,7 @@ impl Component for ThinkingPanel {
             let total_tools = self.tools.len();
             let done_tools = self.tools.iter().filter(|t| t.done).count();
             let summary = if self.reasoning_complete && total_tools == done_tools {
-                format!(
-                    "✓ {total_tools} tools completed",
-                )
+                format!("✓ {total_tools} tools completed",)
             } else if total_tools > 0 {
                 format!(
                     "{} {} reasoning, {done_tools}/{total_tools} tools",
@@ -160,20 +161,14 @@ impl Component for ThinkingPanel {
         } else {
             // ── Expanded: reasoning inline ────────────────────────
             if !self.reasoning.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{} Reasoning:", self.spinner_char()),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{} Reasoning:", self.spinner_char()),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )]));
                 for line in self.reasoning.lines().take(10) {
-                    let trimmed = if line.len() > 80 {
-                        &line[..80]
-                    } else {
-                        line
-                    };
+                    let trimmed = if line.len() > 80 { &line[..80] } else { line };
                     lines.push(Line::from(Span::styled(
                         format!("  {trimmed}"),
                         Style::default().fg(Color::DarkGray),
@@ -218,15 +213,9 @@ impl Component for ThinkingPanel {
                             format!("  {tree_char}"),
                             Style::default().fg(Color::DarkGray),
                         ),
-                        Span::styled(
-                            format!("{} ", tool.name),
-                            Style::default().fg(Color::White),
-                        ),
+                        Span::styled(format!("{} ", tool.name), Style::default().fg(Color::White)),
                         Span::styled(icon, Style::default().fg(icon_color)),
-                        Span::styled(
-                            format!(" {status}"),
-                            Style::default().fg(Color::DarkGray),
-                        ),
+                        Span::styled(format!(" {status}"), Style::default().fg(Color::DarkGray)),
                     ]));
                 }
             }
@@ -244,7 +233,9 @@ impl Component for ThinkingPanel {
                 if self.collapsed { "💭" } else { "⟳" }
             ));
 
-        let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
         ctx.frame_mut().render_widget(paragraph, area);
     }
 
@@ -277,8 +268,8 @@ impl Component for ThinkingPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::test_utils::MockTerminal;
     use crate::tui::skin::SkinConfig;
+    use crate::tui::test_utils::MockTerminal;
 
     fn render_panel(panel: &mut ThinkingPanel, width: u16, height: u16) -> Vec<String> {
         let mut terminal = MockTerminal::new(width, height);
@@ -318,7 +309,10 @@ mod tests {
         let lines = render_panel(&mut panel, 60, 10);
         let joined = lines.join("\n");
         assert!(joined.contains("Reasoning"), "Should show Reasoning header");
-        assert!(joined.contains("analyze the code"), "Should show reasoning content");
+        assert!(
+            joined.contains("analyze the code"),
+            "Should show reasoning content"
+        );
     }
 
     #[test]
@@ -346,7 +340,10 @@ mod tests {
         assert!(joined.contains("Tools"), "Should show Tools header");
         assert!(joined.contains("bash"), "Should show bash tool");
         assert!(joined.contains("read"), "Should show read tool");
-        assert!(joined.contains("├──") || joined.contains("└──"), "Should show tree characters");
+        assert!(
+            joined.contains("├──") || joined.contains("└──"),
+            "Should show tree characters"
+        );
     }
 
     #[test]

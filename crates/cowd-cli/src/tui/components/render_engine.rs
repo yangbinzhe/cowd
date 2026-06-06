@@ -6,9 +6,7 @@ use ratatui::{
 
 use crate::tui::{
     components::RenderContext,
-    layout::{
-        LayoutNode, LayoutTree,
-    },
+    layout::{LayoutNode, LayoutTree},
     skin::SkinConfig,
 };
 
@@ -70,7 +68,9 @@ fn render_node(node: &mut LayoutNode, frame: &mut Frame, area: Rect, theme: &Ski
             }
         }
         LayoutNode::Panel(panel) => {
-            let block = Block::default().borders(Borders::ALL).title(panel.id.clone());
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(panel.id.clone());
             let inner = block.inner(area);
             frame.render_widget(block, area);
             let mut ctx = RenderContext::new(frame, theme);
@@ -281,10 +281,7 @@ mod tests {
                     LayoutNode::Split(Split {
                         direction: SplitDirection::Vertical,
                         ratio: 0.5,
-                        children: vec![
-                            leaf("tl", "TOP-LEFT"),
-                            leaf("bl", "BOT-LEFT"),
-                        ],
+                        children: vec![leaf("tl", "TOP-LEFT"), leaf("bl", "BOT-LEFT")],
                     }),
                     leaf("right", "RIGHT"),
                 ],

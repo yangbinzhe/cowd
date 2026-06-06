@@ -7,8 +7,8 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::Arc,
     sync::atomic::{AtomicU32, Ordering},
+    sync::Arc,
 };
 
 use chrono::Utc;
@@ -24,16 +24,12 @@ pub fn get_fact_checker() -> &'static parking_lot::Mutex<FactChecker> {
 }
 
 use crate::{
+    closet::{Closet, ClosetManager},
     config::{BudgetCalculator, MemoryConfig},
     context_fence::FenceRegistry,
     context_sync::ContextSync,
-    closet::{ClosetManager, Closet},
     error::MemoryError,
-    fact_checker::{FactChecker, FactCheckResult},
-    performance_monitor::PerformanceReport,
-    project_scope::MemoryScope,
-    shared::SharedMemoryManager,
-    temporal_graph::{Triple, EntityFacts},
+    fact_checker::{FactCheckResult, FactChecker},
     layers::{
         deep::DeepLayer,
         essential::EssentialLayer,
@@ -42,7 +38,11 @@ use crate::{
         shared::{L4EventBus, SharedLayer},
         LayerManager,
     },
+    performance_monitor::PerformanceReport,
+    project_scope::MemoryScope,
+    shared::SharedMemoryManager,
     store::{sqlite::SqliteStore, MemoryStore},
+    temporal_graph::{EntityFacts, Triple},
     types::{
         MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta, MemorySource,
         PreparedContext, Priority, TokenBudget,
@@ -123,18 +123,9 @@ impl MemoryOrchestrator {
         workspace_root: Option<PathBuf>,
     ) -> Result<Self> {
         let l0 = IdentityLayer::new(Arc::clone(&store));
-        let l1 = EssentialLayer::with_config(
-            Arc::clone(&store),
-            2000,
-            config.drift.clone(),
-        );
+        let l1 = EssentialLayer::with_config(Arc::clone(&store), 2000, config.drift.clone());
         let l2 = if let Some(root) = workspace_root {
-            ProjectLayer::with_workspace(
-                Arc::clone(&store),
-                root,
-                3000,
-                config.drift.clone(),
-            )
+            ProjectLayer::with_workspace(Arc::clone(&store), root, 3000, config.drift.clone())
         } else {
             ProjectLayer::new(Arc::clone(&store))
         };
@@ -216,7 +207,8 @@ impl MemoryOrchestrator {
         if symbols.is_empty() {
             return None;
         }
-        let entries: Vec<String> = symbols.iter()
+        let entries: Vec<String> = symbols
+            .iter()
             .take(5)
             .map(|s| format!("{} (freq={:.1})", s.name, s.frequency))
             .collect();
@@ -296,7 +288,8 @@ impl MemoryOrchestrator {
             l3.sort_by(|a, b| {
                 let a_in_closet = drawer_ids.contains(&a.id.to_string());
                 let b_in_closet = drawer_ids.contains(&b.id.to_string());
-                b_in_closet.cmp(&a_in_closet)
+                b_in_closet
+                    .cmp(&a_in_closet)
                     .then(b.priority.cmp(&a.priority))
                     .then(b.updated_at.cmp(&a.updated_at))
             });
@@ -420,12 +413,11 @@ impl MemoryOrchestrator {
         entries.extend(l2_ctx.entries);
 
         // Filter entries through the fence.
-        let filtered_entries: Vec<MemoryEntry> = entries
-            .into_iter()
-            .filter(|e| fence.allows(e))
-            .collect();
+        let filtered_entries: Vec<MemoryEntry> =
+            entries.into_iter().filter(|e| fence.allows(e)).collect();
 
-        let total_tokens: u64 = filtered_entries.iter()
+        let total_tokens: u64 = filtered_entries
+            .iter()
             .map(|e| estimate_tokens(&e.content))
             .sum();
 
@@ -516,8 +508,12 @@ impl MemoryOrchestrator {
             }
         }
 
-        // Auto-fill scope from the active scope
-        entry.scope = self.active_scope.lock().clone();
+        // Auto-fill scope from the active scope only when callers did not
+        // provide an explicit scope. L4/team writes rely on preserving Global
+        // or Project scopes for cross-agent recall.
+        if entry.scope == MemoryScope::default() {
+            entry.scope = self.active_scope.lock().clone();
+        }
 
         // Auto-fill source_agent from the active agent
         if entry.source_agent.is_none() {
@@ -742,20 +738,12 @@ impl MemoryOrchestrator {
     }
 
     /// Recall L4 shared entries scoped to the current project.
-    pub async fn recall_l4_project(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<MemoryEntry>> {
+    pub async fn recall_l4_project(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
         self.l4.recall_project(query, limit).await
     }
 
     /// Recall L4 shared entries scoped globally.
-    pub async fn recall_l4_global(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<MemoryEntry>> {
+    pub async fn recall_l4_global(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
         self.l4.recall_global(query, limit).await
     }
 
@@ -770,7 +758,10 @@ impl MemoryOrchestrator {
         max_per_peer: usize,
         max_peers: usize,
     ) -> Result<Vec<MemoryEntry>> {
-        let mut entries = self.l4.recall_peers(query, current_agent, max_per_peer, max_peers).await?;
+        let mut entries = self
+            .l4
+            .recall_peers(query, current_agent, max_per_peer, max_peers)
+            .await?;
 
         // Inject cross-session context from ContextSync
         let session_id = self.active_session.lock().clone().unwrap_or_default();
@@ -811,7 +802,15 @@ impl MemoryOrchestrator {
         max_per_peer: usize,
         max_peers: usize,
     ) -> Result<Vec<MemoryEntry>> {
-        self.l4.recall_peers_realtime(query, current_agent, current_session_id, max_per_peer, max_peers).await
+        self.l4
+            .recall_peers_realtime(
+                query,
+                current_agent,
+                current_session_id,
+                max_per_peer,
+                max_peers,
+            )
+            .await
     }
 
     // -----------------------------------------------------------------------
@@ -843,7 +842,9 @@ impl MemoryOrchestrator {
 
     /// Check if the Closet should be rebuilt and return true if it's time.
     pub fn should_rebuild_closet(&self) -> bool {
-        self.closet_rebuild_counter.load(Ordering::Relaxed) % self.config.tuning.closet_rebuild_ticks == 0
+        self.closet_rebuild_counter.load(Ordering::Relaxed)
+            % self.config.tuning.closet_rebuild_ticks
+            == 0
     }
 
     /// Force an immediate Closet rebuild.
@@ -914,8 +915,9 @@ fn estimate_tokens(content: &str) -> u64 {
 fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Option<Triple> {
     static PARENT_RE: OnceLock<regex::Regex> = OnceLock::new();
     static CHILD_RE: OnceLock<regex::Regex> = OnceLock::new();
-    
-    let parent_re = PARENT_RE.get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).unwrap());
+
+    let parent_re =
+        PARENT_RE.get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).unwrap());
     if let Some(caps) = parent_re.captures(content) {
         let subject = caps.get(1)?.as_str().to_string();
         let object = caps.get(2)?.as_str().to_string();
@@ -934,7 +936,8 @@ fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Opt
     }
 
     // Pattern: "X is child_of Y"
-    let child_re = CHILD_RE.get_or_init(|| regex::Regex::new(r#"(\w+)\s+is\s+child_of\s+(\w+)"#).unwrap());
+    let child_re =
+        CHILD_RE.get_or_init(|| regex::Regex::new(r#"(\w+)\s+is\s+child_of\s+(\w+)"#).unwrap());
     if let Some(caps) = child_re.captures(content) {
         let subject = caps.get(1)?.as_str().to_string();
         let object = caps.get(2)?.as_str().to_string();
@@ -960,10 +963,17 @@ fn extract_triple_from_content(content: &str, source_agent: Option<&str>) -> Opt
 /// This enables the fact checker to detect contradictions across writes:
 /// first write registers the fact, second write with contradictory value
 /// triggers a warning and confidence downgrade.
-fn register_facts_from_content(checker: &mut FactChecker, content: &str, source_agent: Option<&str>) {
+fn register_facts_from_content(
+    checker: &mut FactChecker,
+    content: &str,
+    source_agent: Option<&str>,
+) {
     static REGISTER_PARENT_RE: OnceLock<regex::Regex> = OnceLock::new();
-    
-    let parent_re = Some(REGISTER_PARENT_RE.get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).unwrap()));
+
+    let parent_re = Some(
+        REGISTER_PARENT_RE
+            .get_or_init(|| regex::Regex::new(r#"(\w+)'s\s+parent\s+is\s+(\w+)"#).unwrap()),
+    );
     if let Some(re) = parent_re {
         for caps in re.captures_iter(content) {
             if let (Some(subj), Some(obj)) = (caps.get(1), caps.get(2)) {
@@ -1073,7 +1083,10 @@ mod tests {
         let store = in_memory_store();
         let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
 
-        let id = orch.remember(test_entry(MemoryLayer::L1, "T", "C")).await.unwrap();
+        let id = orch
+            .remember(test_entry(MemoryLayer::L1, "T", "C"))
+            .await
+            .unwrap();
         let recalled = orch.recall(&id).await.unwrap().expect("should exist");
         assert_eq!(recalled.layer, MemoryLayer::L1);
         assert_eq!(recalled.title, "T");
@@ -1106,8 +1119,26 @@ mod tests {
         assert_eq!(recalled.priority, Priority::High);
         assert_eq!(recalled.source, MemorySource::Import);
         assert_eq!(recalled.tags, vec!["api", "convention"]);
-        assert!(recalled.scope.scope_key().starts_with("session_"));
+        assert_eq!(recalled.scope, MemoryScope::Project("project-x".into()));
         assert!(recalled.confidence > 0.0);
+    }
+
+    #[tokio::test]
+    async fn remember_fills_default_scope_from_active_scope() {
+        let store = in_memory_store();
+        let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
+        orch.set_active_scope(MemoryScope::Project("active-project".into()));
+
+        let id = orch
+            .remember(test_entry(MemoryLayer::L2, "scoped", "content"))
+            .await
+            .unwrap();
+
+        let recalled = orch.recall(&id).await.unwrap().unwrap();
+        assert_eq!(
+            recalled.scope,
+            MemoryScope::Project("active-project".into())
+        );
     }
 
     #[tokio::test]
@@ -1136,10 +1167,16 @@ mod tests {
         let store = in_memory_store();
         let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
 
-        orch.remember(test_entry(MemoryLayer::L0, "identity", "content")).await.unwrap();
-        orch.remember(test_entry(MemoryLayer::L1, "task", "content")).await.unwrap();
+        orch.remember(test_entry(MemoryLayer::L0, "identity", "content"))
+            .await
+            .unwrap();
+        orch.remember(test_entry(MemoryLayer::L1, "task", "content"))
+            .await
+            .unwrap();
         // L2 should NOT appear in fixed layers
-        orch.remember(test_entry(MemoryLayer::L2, "project", "content")).await.unwrap();
+        orch.remember(test_entry(MemoryLayer::L2, "project", "content"))
+            .await
+            .unwrap();
 
         let fixed = orch.load_fixed_layers().await.unwrap();
         let layers: Vec<MemoryLayer> = fixed.iter().map(|e| e.layer).collect();
@@ -1162,7 +1199,10 @@ mod tests {
     async fn forget_removes_entry() {
         let store = in_memory_store();
         let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
-        let id = orch.remember(test_entry(MemoryLayer::L1, "tmp", "x")).await.unwrap();
+        let id = orch
+            .remember(test_entry(MemoryLayer::L1, "tmp", "x"))
+            .await
+            .unwrap();
         assert!(orch.recall(&id).await.unwrap().is_some());
 
         orch.forget(&id).await.unwrap();
@@ -1175,9 +1215,15 @@ mod tests {
     async fn list_layer_returns_metadata() {
         let store = in_memory_store();
         let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
-        orch.remember(test_entry(MemoryLayer::L1, "a", "aa")).await.unwrap();
-        orch.remember(test_entry(MemoryLayer::L1, "b", "bb")).await.unwrap();
-        orch.remember(test_entry(MemoryLayer::L2, "c", "cc")).await.unwrap();
+        orch.remember(test_entry(MemoryLayer::L1, "a", "aa"))
+            .await
+            .unwrap();
+        orch.remember(test_entry(MemoryLayer::L1, "b", "bb"))
+            .await
+            .unwrap();
+        orch.remember(test_entry(MemoryLayer::L2, "c", "cc"))
+            .await
+            .unwrap();
 
         let l1 = orch.list_layer(MemoryLayer::L1).await.unwrap();
         assert_eq!(l1.len(), 2);
@@ -1189,7 +1235,10 @@ mod tests {
     async fn set_identity_creates_l0_entry() {
         let store = in_memory_store();
         let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
-        let id = orch.set_identity("Assistant Persona", "You are a helpful assistant.").await.unwrap();
+        let id = orch
+            .set_identity("Assistant Persona", "You are a helpful assistant.")
+            .await
+            .unwrap();
         let got = orch.recall(&id).await.unwrap().unwrap();
         assert_eq!(got.layer, MemoryLayer::L0);
         assert_eq!(got.title, "Assistant Persona");
@@ -1224,8 +1273,20 @@ mod tests {
         let orch = MemoryOrchestrator::from_store(test_config(), store, None).unwrap();
 
         orch.set_identity("I", "ident content here").await.unwrap();
-        orch.remember(test_entry(MemoryLayer::L1, "task", "task content here today")).await.unwrap();
-        orch.remember(test_entry(MemoryLayer::L2, "proj", "project convention text")).await.unwrap();
+        orch.remember(test_entry(
+            MemoryLayer::L1,
+            "task",
+            "task content here today",
+        ))
+        .await
+        .unwrap();
+        orch.remember(test_entry(
+            MemoryLayer::L2,
+            "proj",
+            "project convention text",
+        ))
+        .await
+        .unwrap();
 
         let ctx = orch.prepare_context().await.unwrap();
         assert!(!ctx.entries.is_empty());

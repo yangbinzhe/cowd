@@ -46,6 +46,7 @@ pub mod plugin_lifecycle;
 pub mod provider_pool;
 pub mod effect;
 pub mod context_profiler;
+pub mod context_runtime;
 pub mod platform;
 mod policy_engine;
 mod prompt;
@@ -74,6 +75,7 @@ pub mod team_discovery;
 pub mod agent;
 pub mod agent_collaboration;
 pub mod agent_discussion;
+pub mod agent_workgraph;
 pub mod joint_problem_solving;
 pub mod approval_gate;
 pub mod pairing;
@@ -88,7 +90,13 @@ pub use agent::{
     SubAgentResult, SubAgentToolMode,
 };
 pub use agent_collaboration::{
-    AgentTeam, CollaborationOrchestrator, CollaborationTask, CollaborationOps, SubTask,
+    AgentTaskTrace, AgentTeam, CollaborationBoard, CollaborationOrchestrator, CollaborationOps,
+    CollaborationReviewPacket, CollaborationScorecard, CollaborationTask, MemoryPulseCandidate,
+    MemoryPulseKind, SharedBoardEntry, SubTask,
+};
+pub use agent_workgraph::{
+    AgentWorkGraph, WorkGraphEdge, WorkGraphEdgeKind, WorkGraphNode, WorkGraphNodeKind,
+    WorkGraphRef, WorkGraphStatus,
 };
 pub use team_discovery::{
     DiscoveredTeam, PersistedTeam, TeamDiscoveryProtocol,
@@ -226,7 +234,7 @@ pub use session::{
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use profile::{Profile, ProfileManager, ProfileMeta};
-pub use cowd_event::{CowdEvent, CowdEventBus};
+pub use cowd_event::{CowdEvent, CowdEventBus, RuntimeWorkGraphSummary};
 pub use stale_base::{
     check_base_commit, format_stale_base_warning, read_cowd_base_file, resolve_expected_base,
     BaseCommitSource, BaseCommitState,
@@ -259,6 +267,16 @@ pub use prompt_cache::{
     CacheBreakEvent, CacheUsage, PromptCache, PromptCacheConfig, PromptCachePaths,
     PromptCacheRecord, PromptCacheStats, RequestFingerprintHashes, hash_serializable,
     now_unix_secs, request_hash_hex_from_fnv, sanitize_path_segment, stable_hash_bytes,
+};
+pub use context_runtime::{
+    AgentContextLease, AgentReturnPacket, AgentReturnRequirement, AssembledContext,
+    ContextAuthority, ContextBudgetReport, ContextDegradationPath, ContextDiagnostics,
+    ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextLeanProbe,
+    ContextLease, ContextMode, ContextOmission, ContextPolicyAction, ContextPolicyDecision,
+    ContextPolicyProposal, ContextPressureLevel, ContextProfile, ContextRole,
+    ContextRuntimeKernel, ContextSourceKind, ContextVisibility,
+    ResumeContextPacket, ResumeContextSource, StableHeadComparison, ToolTracePacket,
+    ToolTraceStatus, WorkspacePacket,
 };
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

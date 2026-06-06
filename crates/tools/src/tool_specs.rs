@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use runtime::PermissionMode;
 
@@ -135,8 +135,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "WebFetch",
-            description:
-                "Fetch a URL, convert it into readable text, and answer a prompt about it.",
+            description: "Fetch a URL, convert it into readable text, and answer a prompt about it.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -802,9 +801,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string" },
-                    "method": { "type": "string", "enum": ["GET", "POST", "PUT", "DELETE"] },
+                    "method": { "type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"] },
                     "headers": { "type": "object" },
-                    "body": { "type": "string" }
+                    "body": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 300000 }
                 },
                 "required": ["url"],
                 "additionalProperties": false

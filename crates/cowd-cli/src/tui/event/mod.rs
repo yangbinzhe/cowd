@@ -93,9 +93,7 @@ impl PartialOrd for RoutedEvent {
 
 impl PartialEq for RoutedEvent {
     fn eq(&self, other: &Self) -> bool {
-        self.target == other.target
-            && self.event == other.event
-            && self.priority == other.priority
+        self.target == other.target && self.event == other.event && self.priority == other.priority
     }
 }
 

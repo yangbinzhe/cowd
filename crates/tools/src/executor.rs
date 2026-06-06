@@ -4,32 +4,36 @@ use std::pin::Pin;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use api::{
-    max_tokens_for_model, ApiError, ContentBlockDelta, InputContentBlock,
-    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    ApiError, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock, max_tokens_for_model,
 };
+use base64::Engine;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput, BranchFreshness,
+    ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput,
+    LaneCommitProvenance, LaneContext, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
+    LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy,
+    PromptCacheEvent, RuntimeError, Session, SharedPrompter, TaskPacket, ToolError, ToolExecutor,
+    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash,
     gates::{GateContext, GateEvaluator},
+    glob_search, grep_search, load_system_prompt,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file,
     summary_compression::compress_summary_text,
     worker_boot::{Worker, WorkerReadySnapshot, WorkerStatus, WorkerTaskReceipt},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneContext, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, RuntimeError, Session, SharedPrompter, TaskPacket, ToolError, ToolExecutor,
+    write_file,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::tool_specs::{mvp_tool_specs, ToolSpec};
-use crate::{global_cron_registry, global_lsp_registry, global_mcp_registry, global_task_registry, global_team_registry, global_worker_registry, GlobalToolRegistry};
+use crate::tool_specs::{ToolSpec, mvp_tool_specs};
+use crate::{
+    GlobalToolRegistry, global_cron_registry, global_lsp_registry, global_mcp_registry,
+    global_task_registry, global_team_registry, global_worker_registry,
+};
 
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
 pub fn enforce_permission_check(
@@ -130,15 +134,27 @@ pub(crate) fn execute_tool_with_enforcer(
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Question" => {
             let q = input.get("question").and_then(|v| v.as_str()).unwrap_or("");
-            let opts = input.get("options").and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "));
-            Ok(format!("[QUESTION] {q}{}", opts.map(|o| format!("\nOptions: {o}")).unwrap_or_default()))
-        },
+            let opts = input.get("options").and_then(|v| v.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            Ok(format!(
+                "[QUESTION] {q}{}",
+                opts.map(|o| format!("\nOptions: {o}")).unwrap_or_default()
+            ))
+        }
         "ast_search" => {
             let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            let lang = input.get("language").and_then(|v| v.as_str()).unwrap_or("rust");
-            Ok(format!("AST search: {pattern} in {lang}\nUse ast_grep_search tool for structured code patterns."))
-        },
+            let lang = input
+                .get("language")
+                .and_then(|v| v.as_str())
+                .unwrap_or("rust");
+            Ok(format!(
+                "AST search: {pattern} in {lang}\nUse ast_grep_search tool for structured code patterns."
+            ))
+        }
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
@@ -205,14 +221,18 @@ pub(crate) fn execute_tool_with_enforcer(
         }
         "execute_code" => {
             use crate::sandbox_exec::execute_code;
-            let lang = input.get("language").and_then(|v| v.as_str()).unwrap_or("python");
+            let lang = input
+                .get("language")
+                .and_then(|v| v.as_str())
+                .unwrap_or("python");
             let code = input.get("code").and_then(|v| v.as_str()).unwrap_or("");
             let result = execute_code(lang, code);
             Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "exit_code": result.exit_code,
-            })).unwrap_or_default())
+            }))
+            .unwrap_or_default())
         }
         _ => Err(format!("unsupported tool: {name}")),
     }
@@ -255,6 +275,27 @@ fn maybe_enforce_permission_check_with_mode(
 fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> {
     use std::io::{self, BufRead, Write};
 
+    if let Ok(response) = std::env::var("COWD_ASK_USER_RESPONSE") {
+        let answer = resolve_ask_user_answer(&response, input.options.as_deref());
+        return to_pretty_json(json!({
+            "question": input.question,
+            "options": input.options,
+            "answer": answer,
+            "status": "answered",
+            "source": "env"
+        }));
+    }
+
+    if std::env::var_os("COWD_NONINTERACTIVE").is_some() {
+        return to_pretty_json(json!({
+            "question": input.question,
+            "options": input.options,
+            "status": "pending_user_input",
+            "requires_user_input": true,
+            "message": "AskUserQuestion requires interactive input; set COWD_ASK_USER_RESPONSE to answer non-interactively."
+        }));
+    }
+
     // Display the question to the user via stdout
     let stdout = io::stdout();
     let stdin = io::stdin();
@@ -281,25 +322,27 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
     let response = response.trim().to_string();
 
     // If options were provided, resolve the numeric choice
-    let answer = if let Some(ref options) = input.options {
-        if let Ok(idx) = response.parse::<usize>() {
-            if idx >= 1 && idx <= options.len() {
-                options[idx - 1].clone()
-            } else {
-                response.clone()
-            }
-        } else {
-            response.clone()
-        }
-    } else {
-        response.clone()
-    };
+    let answer = resolve_ask_user_answer(&response, input.options.as_deref());
 
     to_pretty_json(json!({
         "question": input.question,
+        "options": input.options,
         "answer": answer,
-        "status": "answered"
+        "status": "answered",
+        "source": "stdin"
     }))
+}
+
+fn resolve_ask_user_answer(response: &str, options: Option<&[String]>) -> String {
+    let response = response.trim();
+    if let Some(options) = options {
+        if let Ok(idx) = response.parse::<usize>() {
+            if idx >= 1 && idx <= options.len() {
+                return options[idx - 1].clone();
+            }
+        }
+    }
+    response.to_string()
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -680,17 +723,39 @@ fn run_read_mcp_resource(input: McpResourceInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
     let registry = global_mcp_registry();
+    let auth_url_env = format!(
+        "COWD_MCP_AUTH_URL_{}",
+        input
+            .server
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            })
+            .collect::<String>()
+    );
+    let auth_url = std::env::var(auth_url_env).ok();
     match registry.get_server(&input.server) {
-        Some(state) => to_pretty_json(json!({
+        Some(state) => {
+            let status = state.status.to_string();
+            to_pretty_json(json!({
             "server": input.server,
-            "status": state.status,
+            "status": status,
+            "auth_required": status == "auth_required",
+            "auth_url": auth_url,
+            "next_action": if status == "auth_required" { "open_auth_url_or_complete_external_auth" } else { "none" },
             "server_info": state.server_info,
             "tool_count": state.tools.len(),
             "resource_count": state.resources.len()
-        })),
+            }))
+        }
         None => to_pretty_json(json!({
             "server": input.server,
             "status": "disconnected",
+            "auth_required": false,
+            "auth_url": auth_url,
+            "next_action": "connect_server",
             "message": "Server not registered. Use MCP tool to connect first."
         })),
     }
@@ -728,7 +793,8 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
     }
 
     // Execute with a 30-second timeout
-    let request = request.timeout(Duration::from_secs(30));
+    let timeout = input.timeout_ms.unwrap_or(30_000).clamp(1, 300_000);
+    let request = request.timeout(Duration::from_millis(timeout));
 
     match request.send() {
         Ok(response) => {
@@ -748,12 +814,14 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
                 "method": method,
                 "status_code": status,
                 "body": truncated_body,
+                "timeout_ms": timeout,
                 "success": (200..300).contains(&status)
             }))
         }
         Err(e) => to_pretty_json(json!({
             "url": input.url,
             "method": method,
+            "timeout_ms": timeout,
             "error": e.to_string(),
             "success": false
         })),
@@ -796,15 +864,18 @@ fn run_testing_permission(input: TestingPermissionInput) -> Result<String, Strin
 /// to a multimodal LLM. The actual LLM vision call is handled by the
 /// ConversationRuntime, not this tool — this tool prepares the image data.
 fn run_vision_analyze(input: &Value) -> Result<String, String> {
-    let image_path = input.get("image_path")
+    let image_path = input
+        .get("image_path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "vision_analyze requires 'image_path' parameter".to_string())?;
 
-    let prompt = input.get("prompt")
+    let prompt = input
+        .get("prompt")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "vision_analyze requires 'prompt' parameter".to_string())?;
 
-    let detail = input.get("detail")
+    let detail = input
+        .get("detail")
         .and_then(|v| v.as_str())
         .unwrap_or("auto");
 
@@ -814,7 +885,8 @@ fn run_vision_analyze(input: &Value) -> Result<String, String> {
         return Err(format!("Image file not found: {}", image_path));
     }
 
-    let extension = path.extension()
+    let extension = path
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
@@ -824,10 +896,12 @@ fn run_vision_analyze(input: &Value) -> Result<String, String> {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
-        _ => return Err(format!(
-            "Unsupported image format: '{}'. Supported: PNG, JPG, GIF, WebP",
-            extension
-        )),
+        _ => {
+            return Err(format!(
+                "Unsupported image format: '{}'. Supported: PNG, JPG, GIF, WebP",
+                extension
+            ));
+        }
     };
 
     // Read and base64-encode the image
@@ -944,7 +1018,9 @@ fn workspace_test_branch_preflight(
     if let Some(ref mut ctx) = lane_ctx {
         ctx.stale_branch = Some(freshness.clone());
         ctx.branch_freshness = match &freshness {
-            BranchFreshness::Stale{..} | BranchFreshness::Diverged{..} => Duration::from_secs(999999),
+            BranchFreshness::Stale { .. } | BranchFreshness::Diverged { .. } => {
+                Duration::from_secs(999999)
+            }
             BranchFreshness::Fresh => Duration::from_secs(0),
         };
     }
@@ -1606,6 +1682,8 @@ struct RemoteTriggerInput {
     headers: Option<Value>,
     #[serde(default)]
     body: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2673,13 +2751,14 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 fn run_agent_job(job: &AgentJob) -> Result<(), String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     let shared = SharedPrompter::none();
-    let handle = tokio::runtime::Handle::try_current()
-        .unwrap_or_else(|_| tokio::runtime::Builder::new_current_thread()
+    let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio runtime fallback")
             .handle()
-            .clone());
+            .clone()
+    });
     let summary = handle
         .block_on(runtime.run_turn_async(job.prompt.clone(), &shared))
         .map_err(|error| error.to_string())?;
@@ -3208,7 +3287,9 @@ impl ProviderRuntimeClient {
             match build_provider_entry(fallback_model) {
                 Ok(entry) => chain.push(entry),
                 Err(error) => {
-                    tracing::warn!("skipping unavailable fallback provider {fallback_model}: {error}");
+                    tracing::warn!(
+                        "skipping unavailable fallback provider {fallback_model}: {error}"
+                    );
                 }
             }
         }
@@ -3227,12 +3308,12 @@ impl ProviderRuntimeClient {
 fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
     let resolved = model.trim().to_string();
     let client = match runtime::resolve_global_provider(&resolved) {
-        Some(provider) => ProviderClient::from_config(provider)
-            .map_err(|e| e.to_string())?,
+        Some(provider) => ProviderClient::from_config(provider).map_err(|e| e.to_string())?,
         None => {
-            tracing::warn!("model '{resolved}' not in providers config, falling back to environment variables");
-            ProviderClient::from_model(&resolved)
-                .map_err(|e| e.to_string())?
+            tracing::warn!(
+                "model '{resolved}' not in providers config, falling back to environment variables"
+            );
+            ProviderClient::from_model(&resolved).map_err(|e| e.to_string())?
         }
     };
     Ok(ProviderEntry {
@@ -3245,13 +3326,16 @@ fn load_provider_fallback_config() -> Vec<String> {
     std::env::current_dir()
         .ok()
         .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
-        .map_or_else(Vec::new, |config| {
-            config.fallbacks().to_vec()
-        })
+        .map_or_else(Vec::new, |config| config.fallbacks().to_vec())
 }
 
 impl ApiClient for ProviderRuntimeClient {
-    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+    fn stream(
+        &mut self,
+        request: ApiRequest,
+    ) -> Pin<
+        Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>,
+    > {
         match self.stream_collect_inner(request) {
             Ok(events) => Box::pin(futures::stream::iter(events.into_iter().map(Ok))),
             Err(e) => Box::pin(futures::stream::iter(std::iter::once(Err(e)))),
@@ -3260,7 +3344,10 @@ impl ApiClient for ProviderRuntimeClient {
 }
 
 impl ProviderRuntimeClient {
-    fn stream_collect_inner(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+    fn stream_collect_inner(
+        &mut self,
+        request: ApiRequest,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
             .map(|spec| ToolDefinition {
@@ -3293,7 +3380,10 @@ impl ProviderRuntimeClient {
             match attempt {
                 Ok(events) => return Ok(events),
                 Err(error) if error.is_retryable() && index + 1 < chain.len() => {
-                    tracing::warn!("provider {} failed with retryable error, falling back: {error}", entry.model);
+                    tracing::warn!(
+                        "provider {} failed with retryable error, falling back: {error}",
+                        entry.model
+                    );
                     last_error = Some(error);
                 }
                 Err(error) => return Err(RuntimeError::new(error.to_string())),
@@ -3446,7 +3536,10 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
                     // Thinking blocks contain reasoning_content that must be passed back
                     // to providers like DeepSeek in subsequent requests.
-                    ContentBlock::Thinking { thinking, signature } => InputContentBlock::Thinking {
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => InputContentBlock::Thinking {
                         thinking: thinking.clone(),
                         signature: signature.clone(),
                     },
@@ -3567,7 +3660,11 @@ fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
     GlobalToolRegistry::builtin().search(&input.query, input.max_results.unwrap_or(5), None, None)
 }
 
-pub(crate) fn search_tool_specs(query: &str, max_results: usize, specs: &[SearchableToolSpec]) -> Vec<String> {
+pub(crate) fn search_tool_specs(
+    query: &str,
+    max_results: usize,
+    specs: &[SearchableToolSpec],
+) -> Vec<String> {
     let lowered = query.to_lowercase();
     if let Some(selection) = lowered.strip_prefix("select:") {
         return selection
@@ -4016,7 +4113,7 @@ fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
     }
 }
 
-const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "default_mode"];
+const PERMISSION_DEFAULT_MODE_PATH: &[&str] = &["permissions", "defaultMode"];
 
 fn execute_enter_plan_mode(_input: EnterPlanModeInput) -> Result<PlanModeOutput, String> {
     let settings_path = config_file_for_scope(ConfigScope::Settings)?;
@@ -4226,7 +4323,7 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
 
 struct ReplRuntime {
     program: &'static str,
-    args: &'static [&'static str    ]
+    args: &'static [&'static str],
 }
 
 fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
@@ -4357,10 +4454,10 @@ fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
             path: &["alwaysThinkingEnabled"],
             options: None,
         },
-        "permissions.default_mode" => ConfigSettingSpec {
+        "permissions.defaultMode" => ConfigSettingSpec {
             scope: ConfigScope::Settings,
             kind: ConfigKind::String,
-            path: &["permissions", "default_mode"],
+            path: &["permissions", "defaultMode"],
             options: Some(&["default", "plan", "acceptEdits", "dontAsk", "auto"]),
         },
         "language" => ConfigSettingSpec {
@@ -4390,7 +4487,7 @@ fn normalize_config_value(spec: ConfigSettingSpec, value: ConfigValue) -> Result
             }
         }
         (ConfigKind::Boolean, ConfigValue::Number(_)) => {
-            return Err(String::from("setting requires true or false"))
+            return Err(String::from("setting requires true or false"));
         }
         (ConfigKind::String, ConfigValue::String(value)) => Value::String(value),
         (ConfigKind::String, ConfigValue::Bool(value)) => Value::String(value.to_string()),
@@ -4445,7 +4542,9 @@ fn read_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, Strin
             // (YAML is a superset of JSON so both work)
             let val = serde_json::from_str::<Value>(&contents)
                 .or_else(|_| serde_yaml::from_str::<Value>(&contents))
-                .map_err(|error| format!("failed to parse config (tried JSON then YAML): {error}"))?;
+                .map_err(|error| {
+                    format!("failed to parse config (tried JSON then YAML): {error}")
+                })?;
             val.as_object()
                 .cloned()
                 .ok_or_else(|| String::from("config file must contain a JSON/YAML object"))
@@ -4612,26 +4711,25 @@ fn command_exists(name: &str) -> bool {
         return false;
     }
     // Search PATH directories for the executable
-    std::env::var_os("PATH")
-        .is_some_and(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let full_path = dir.join(name);
-                if !full_path.is_file() {
-                    return false;
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::metadata(&full_path)
-                        .map(|m| m.permissions().mode() & 0o111 != 0)
-                        .unwrap_or(false)
-                }
-                #[cfg(not(unix))]
-                {
-                    true
-                }
-            })
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            let full_path = dir.join(name);
+            if !full_path.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(&full_path)
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
         })
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4829,7 +4927,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
+    use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -4837,21 +4935,21 @@ use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        maybe_commit_provenance,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        ProviderRuntimeClient,
-        SubagentToolExecutor,
+        AgentInput, AgentJob, ProviderRuntimeClient, SubagentToolExecutor, agent_permission_policy,
+        allowed_tools_for_subagent, classify_lane_failure, derive_agent_state,
+        execute_agent_with_spawn, execute_tool, final_assistant_text, maybe_commit_provenance,
+        persist_agent_terminal_state, push_output_block, run_task_packet,
     };
-    use crate::{mvp_tool_specs, permission_mode_from_plugin, GlobalToolRegistry};
+    use crate::{GlobalToolRegistry, mvp_tool_specs, permission_mode_from_plugin};
     use api::OutputContentBlock;
-    use runtime::ConfigLoader;
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        LaneEventName, LaneFailureClass, PermissionMode, PermissionPolicy, RuntimeError, Session, SharedPrompter, TaskPacket, TaskScope, ToolExecutor,
+        ApiRequest, AssistantEvent, ConversationRuntime, LaneEventName, LaneFailureClass,
+        PermissionMode, PermissionPolicy, RuntimeError, Session, SharedPrompter, TaskPacket,
+        TaskScope, ToolExecutor, permission_enforcer::PermissionEnforcer,
     };
     use serde_json::json;
+
+    static ASK_USER_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -5025,13 +5123,16 @@ use std::path::{Path, PathBuf};
     #[test]
     fn worker_create_merges_config_trusted_roots_without_per_call_override() {
         use std::fs;
-        // Write a .cowd/config.yaml in a temp dir with trusted_roots
+        // Write a .cowd/config.yaml in a temp dir with trustedRoots
         let worktree = temp_path("config-trust-worktree");
-        let cc_dir = worktree.join(".cowd");
+        let config_home = temp_path("config-trust-home");
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::set_var("COWD_CONFIG_HOME", &config_home);
+        let cc_dir = config_home.clone();
         fs::create_dir_all(&cc_dir).expect("create .cc dir");
         // Use the actual OS temp dir so the worktree path matches the allowlist
         let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
-        let settings = format!("{{\"trusted_roots\": [\"{tmp_root}\"]}}");
+        let settings = format!("trustedRoots:\n  - \"{tmp_root}\"\n");
         fs::write(cc_dir.join("config.yaml"), settings).expect("write settings");
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
@@ -5049,10 +5150,12 @@ use std::path::{Path, PathBuf};
         // worktree is under /tmp, so config roots auto-resolve trust
         assert_eq!(
             output["trust_auto_resolve"], true,
-            "config-level trusted_roots should auto-resolve trust without per-call override"
+            "config-level trustedRoots should auto-resolve trust without per-call override"
         );
 
         fs::remove_dir_all(&worktree).ok();
+        fs::remove_dir_all(&config_home).ok();
+        std::env::remove_var("COWD_CONFIG_HOME");
     }
 
     #[test]
@@ -5560,9 +5663,11 @@ use std::path::{Path, PathBuf};
             .expect_err("subagent write tool should be denied before dispatch");
 
         // then
-        assert!(error
-            .to_string()
-            .contains("requires workspace-write permission"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires workspace-write permission")
+        );
     }
 
     #[test]
@@ -5700,10 +5805,12 @@ use std::path::{Path, PathBuf};
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["url"], format!("http://{}/plain", server.addr()));
-        assert!(output["result"]
-            .as_str()
-            .expect("result")
-            .contains("plain text response"));
+        assert!(
+            output["result"]
+                .as_str()
+                .expect("result")
+                .contains("plain text response")
+        );
 
         let error = execute_tool(
             "WebFetch",
@@ -6001,14 +6108,18 @@ use std::path::{Path, PathBuf};
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["skill"], "help");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
-        assert!(output["prompt"]
-            .as_str()
-            .expect("prompt")
-            .contains("Guide on using oh-my-codex plugin"));
+        assert!(
+            output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with("/help/SKILL.md")
+        );
+        assert!(
+            output["prompt"]
+                .as_str()
+                .expect("prompt")
+                .contains("Guide on using oh-my-codex plugin")
+        );
 
         let dollar_result = execute_tool(
             "Skill",
@@ -6020,10 +6131,12 @@ use std::path::{Path, PathBuf};
         let dollar_output: serde_json::Value =
             serde_json::from_str(&dollar_result).expect("valid json");
         assert_eq!(dollar_output["skill"], "$help");
-        assert!(dollar_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("/help/SKILL.md"));
+        assert!(
+            dollar_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with("/help/SKILL.md")
+        );
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -6059,19 +6172,23 @@ use std::path::{Path, PathBuf};
             .expect("project-local skill should resolve");
         let skill_output: serde_json::Value =
             serde_json::from_str(&skill_result).expect("valid json");
-        assert!(skill_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".cowd/skills/plan/SKILL.md"));
+        assert!(
+            skill_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".cowd/skills/plan/SKILL.md")
+        );
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
             .expect("legacy command should resolve");
         let command_output: serde_json::Value =
             serde_json::from_str(&command_result).expect("valid json");
-        assert!(command_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".cowd/commands/handoff.md"));
+        assert!(
+            command_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".cowd/commands/handoff.md")
+        );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         fs::remove_dir_all(root).expect("temp project should clean up");
@@ -6106,10 +6223,12 @@ use std::path::{Path, PathBuf};
             .expect("project-local skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/skills/trace/SKILL.md"));
+        assert!(
+            output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".claude/skills/trace/SKILL.md")
+        );
         assert_eq!(output["description"], "Project-local trace helper");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -6168,15 +6287,19 @@ use std::path::{Path, PathBuf};
         let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
         let agents_output: serde_json::Value =
             serde_json::from_str(&agents_result).expect("valid json");
-        assert!(omc_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".cowd/skills/hud/SKILL.md"));
+        assert!(
+            omc_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".cowd/skills/hud/SKILL.md")
+        );
         assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
-        assert!(agents_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".agents/skills/trace/SKILL.md"));
+        assert!(
+            agents_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".agents/skills/trace/SKILL.md")
+        );
         assert_eq!(
             agents_output["description"],
             "Project-local agents compatibility helper"
@@ -6228,10 +6351,12 @@ use std::path::{Path, PathBuf};
             .expect("learned skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/omc-learned/learned/SKILL.md"));
+        assert!(
+            output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with("skills/omc-learned/learned/SKILL.md")
+        );
         assert_eq!(output["description"], "Learned OMC skill");
 
         match original_home {
@@ -6287,20 +6412,24 @@ use std::path::{Path, PathBuf};
             execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
         let direct_skill_output: serde_json::Value =
             serde_json::from_str(&direct_skill).expect("valid skill json");
-        assert!(direct_skill_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("skills/statusline/SKILL.md"));
+        assert!(
+            direct_skill_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with("skills/statusline/SKILL.md")
+        );
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
         let legacy_command =
             execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
         let legacy_command_output: serde_json::Value =
             serde_json::from_str(&legacy_command).expect("valid command json");
-        assert!(legacy_command_output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with("commands/doctor-check.md"));
+        assert!(
+            legacy_command_output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with("commands/doctor-check.md")
+        );
         assert_eq!(
             legacy_command_output["description"],
             "Claude config command"
@@ -6354,10 +6483,12 @@ use std::path::{Path, PathBuf};
             .expect("legacy command markdown should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(output["path"]
-            .as_str()
-            .expect("path")
-            .ends_with(".claude/commands/team.md"));
+        assert!(
+            output["path"]
+                .as_str()
+                .expect("path")
+                .ends_with(".claude/commands/team.md")
+        );
         assert_eq!(output["description"], "Legacy team workflow");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -6426,7 +6557,7 @@ use std::path::{Path, PathBuf};
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
-            
+
                 role: None,
             },
             move |job| {
@@ -6509,7 +6640,7 @@ use std::path::{Path, PathBuf};
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
-            
+
                 role: None,
             },
             |job| {
@@ -6568,7 +6699,7 @@ use std::path::{Path, PathBuf};
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
-            
+
                 role: None,
             },
             |job| {
@@ -6617,7 +6748,7 @@ use std::path::{Path, PathBuf};
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
-            
+
                 role: None,
             },
             |job| {
@@ -6664,7 +6795,7 @@ use std::path::{Path, PathBuf};
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
-            
+
                 role: None,
             },
             |_| Err(String::from("thread creation failed")),
@@ -6852,7 +6983,16 @@ use std::path::{Path, PathBuf};
     }
 
     impl runtime::ApiClient for MockSubagentApiClient {
-fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<
+            Box<
+                dyn futures::stream::Stream<Item = Result<AssistantEvent, RuntimeError>>
+                    + Send
+                    + '_,
+            >,
+        > {
             self.calls += 1;
             let events: Result<Vec<AssistantEvent>, RuntimeError> = match self.calls {
                 1 => {
@@ -6875,7 +7015,9 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
                 }
                 _ => unreachable!("extra mock stream call"),
             };
-            Box::pin(futures::stream::iter(events.into_iter().flat_map(|v| v.into_iter().map(Ok))))
+            Box::pin(futures::stream::iter(
+                events.into_iter().flat_map(|v| v.into_iter().map(Ok)),
+            ))
         }
     }
 
@@ -6907,16 +7049,18 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
             final_assistant_text(&summary),
             "Scope: completed mock review"
         );
-        assert!(runtime
-            .session()
-            .messages
-            .iter()
-            .flat_map(|message| message.blocks.iter())
-            .any(|block| matches!(
-                block,
-                runtime::ContentBlock::ToolResult { output, .. }
-                    if output.contains("hello from child")
-            )));
+        assert!(
+            runtime
+                .session()
+                .messages
+                .iter()
+                .flat_map(|message| message.blocks.iter())
+                .any(|block| matches!(
+                    block,
+                    runtime::ContentBlock::ToolResult { output, .. }
+                        if output.contains("hello from child")
+                ))
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -7080,20 +7224,24 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
             .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
-        assert!(failure_output["stderr"]
-            .as_str()
-            .expect("stderr")
-            .contains("oops"));
+        assert!(
+            failure_output["stderr"]
+                .as_str()
+                .expect("stderr")
+                .contains("oops")
+        );
 
         let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
             .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
         assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
-        assert!(timeout_output["stderr"]
-            .as_str()
-            .expect("stderr")
-            .contains("Command exceeded timeout"));
+        assert!(
+            timeout_output["stderr"]
+                .as_str()
+                .expect("stderr")
+                .contains("Command exceeded timeout")
+        );
 
         let background = execute_tool(
             "bash",
@@ -7134,10 +7282,12 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
             output_json["returnCodeInterpretation"],
             "preflight_blocked:branch_divergence"
         );
-        assert!(output_json["stderr"]
-            .as_str()
-            .expect("stderr")
-            .contains("branch divergence detected before workspace tests"));
+        assert!(
+            output_json["stderr"]
+                .as_str()
+                .expect("stderr")
+                .contains("branch divergence detected before workspace tests")
+        );
         assert_eq!(
             output_json["structuredContent"][0]["event"],
             "branch.stale_against_main"
@@ -7321,10 +7471,12 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(globbed_output["filenames"][0]
-            .as_str()
-            .expect("filename")
-            .ends_with("nested/lib.rs"));
+        assert!(
+            globbed_output["filenames"][0]
+                .as_str()
+                .expect("filename")
+                .ends_with("nested/lib.rs")
+        );
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -7348,10 +7500,12 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
         assert_eq!(grep_content_output["numFiles"], 0);
         assert!(grep_content_output["appliedLimit"].is_null());
         assert_eq!(grep_content_output["appliedOffset"], 1);
-        assert!(grep_content_output["content"]
-            .as_str()
-            .expect("content")
-            .contains("let alpha = 2;"));
+        assert!(
+            grep_content_output["content"]
+                .as_str()
+                .expect("content")
+                .contains("let alpha = 2;")
+        );
 
         let grep_count = execute_tool(
             "grep_search",
@@ -7380,10 +7534,12 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
         let elapsed = started.elapsed();
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["duration_ms"], 20);
-        assert!(output["message"]
-            .as_str()
-            .expect("message")
-            .contains("Slept for 20ms"));
+        assert!(
+            output["message"]
+                .as_str()
+                .expect("message")
+                .contains("Slept for 20ms")
+        );
         assert!(elapsed >= Duration::from_millis(15));
     }
 
@@ -7465,7 +7621,7 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
 
         let set = execute_tool(
             "Config",
-            &json!({"setting": "permissions.default_mode", "value": "plan"}),
+            &json!({"setting": "permissions.defaultMode", "value": "plan"}),
         )
         .expect("set config");
         let set_output: serde_json::Value = serde_json::from_str(&set).expect("json");
@@ -7474,7 +7630,7 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
 
         let invalid = execute_tool(
             "Config",
-            &json!({"setting": "permissions.default_mode", "value": "bogus"}),
+            &json!({"setting": "permissions.defaultMode", "value": "bogus"}),
         )
         .expect_err("invalid config value should error");
         assert!(invalid.contains("Invalid value"));
@@ -7514,7 +7670,7 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
         std::fs::create_dir_all(cwd.join(".cowd")).expect("cwd dir");
         std::fs::write(
             cwd.join(".cowd").join("config.local.yaml"),
-            r#"{"permissions":{"default_mode":"acceptEdits"}}"#,
+            r#"{"permissions":{"defaultMode":"acceptEdits"}}"#,
         )
         .expect("write local config");
 
@@ -7534,7 +7690,7 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
 
         let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("config.local.yaml"))
             .expect("local config after enter");
-        assert!(local_settings.contains(r#""default_mode": "plan""#));
+        assert!(local_settings.contains(r#""defaultMode": "plan""#));
         let state =
             std::fs::read_to_string(cwd.join(".cowd").join("tool-state").join("plan-mode.json"))
                 .expect("plan mode state");
@@ -7550,12 +7706,13 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
 
         let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("config.local.yaml"))
             .expect("local settings after exit");
-        assert!(local_settings.contains(r#""default_mode": "acceptEdits""#));
-        assert!(!cwd
-            .join(".cowd")
-            .join("tool-state")
-            .join("plan-mode.json")
-            .exists());
+        assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
+        assert!(
+            !cwd.join(".cowd")
+                .join("tool-state")
+                .join("plan-mode.json")
+                .exists()
+        );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
@@ -7612,11 +7769,12 @@ fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn futures::stream::Stream
             None,
             "permissions override should be removed on exit"
         );
-        assert!(!cwd
-            .join(".cowd")
-            .join("tool-state")
-            .join("plan-mode.json")
-            .exists());
+        assert!(
+            !cwd.join(".cowd")
+                .join("tool-state")
+                .join("plan-mode.json")
+                .exists()
+        );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
@@ -7773,8 +7931,8 @@ printf 'pwsh:%s' "$1"
     }
 
     fn read_only_registry() -> super::GlobalToolRegistry {
-        use runtime::permission_enforcer::PermissionEnforcer;
         use runtime::PermissionPolicy;
+        use runtime::permission_enforcer::PermissionEnforcer;
 
         let policy = mvp_tool_specs().into_iter().fold(
             PermissionPolicy::new(runtime::PermissionMode::ReadOnly),
@@ -7906,10 +8064,7 @@ printf 'pwsh:%s' "$1"
         let original_xai = std::env::var_os("XAI_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
         std::env::set_var("XAI_API_KEY", "xai-test-key");
-        let fallback_config: Vec<String> = vec![
-            "grok-3".to_string(),
-            "grok-3-mini".to_string(),
-        ];
+        let fallback_config: Vec<String> = vec!["grok-3".to_string(), "grok-3-mini".to_string()];
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
@@ -7945,9 +8100,7 @@ printf 'pwsh:%s' "$1"
         let original_xai = std::env::var_os("XAI_API_KEY");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
         std::env::set_var("XAI_API_KEY", "xai-test-key");
-        let fallback_config: Vec<String> = vec![
-            "claude-sonnet-4-6".to_string(),
-        ];
+        let fallback_config: Vec<String> = vec!["claude-sonnet-4-6".to_string()];
 
         // when
         let client = ProviderRuntimeClient::new_with_fallback_config(
@@ -8039,6 +8192,83 @@ printf 'pwsh:%s' "$1"
         );
     }
 
+    #[test]
+    fn ask_user_question_supports_noninteractive_env_answer() {
+        let _guard = ASK_USER_ENV_LOCK.lock().expect("env lock");
+        std::env::set_var("COWD_ASK_USER_RESPONSE", "2");
+        let result = execute_tool(
+            "AskUserQuestion",
+            &json!({
+                "question": "Choose mode",
+                "options": ["safe", "fast"]
+            }),
+        )
+        .expect("AskUserQuestion should answer from env");
+        std::env::remove_var("COWD_ASK_USER_RESPONSE");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["status"], "answered");
+        assert_eq!(output["answer"], "fast");
+        assert_eq!(output["source"], "env");
+    }
+
+    #[test]
+    fn ask_user_question_reports_pending_in_noninteractive_mode() {
+        let _guard = ASK_USER_ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("COWD_ASK_USER_RESPONSE");
+        std::env::set_var("COWD_NONINTERACTIVE", "1");
+        let result = execute_tool(
+            "AskUserQuestion",
+            &json!({
+                "question": "Continue?",
+                "options": ["yes", "no"]
+            }),
+        )
+        .expect("AskUserQuestion should return pending contract");
+        std::env::remove_var("COWD_NONINTERACTIVE");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["status"], "pending_user_input");
+        assert_eq!(output["requires_user_input"], true);
+    }
+
+    #[test]
+    fn mcp_auth_returns_stable_disconnected_contract() {
+        let result = execute_tool("McpAuth", &json!({"server": "missing-auth-server"}))
+            .expect("McpAuth should return status contract");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+
+        assert_eq!(output["server"], "missing-auth-server");
+        assert_eq!(output["status"], "disconnected");
+        assert_eq!(output["auth_required"], false);
+        assert_eq!(output["next_action"], "connect_server");
+    }
+
+    #[test]
+    fn remote_trigger_posts_with_timeout_contract() {
+        let server = TestServer::spawn(Arc::new(|request_line| {
+            assert!(request_line.starts_with("POST /trigger "));
+            HttpResponse::text(202, "Accepted", "queued")
+        }));
+        let result = execute_tool(
+            "RemoteTrigger",
+            &json!({
+                "url": format!("http://{}/trigger", server.addr()),
+                "method": "POST",
+                "body": "payload",
+                "timeout_ms": 2500
+            }),
+        )
+        .expect("RemoteTrigger should call local server");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["method"], "POST");
+        assert_eq!(output["status_code"], 202);
+        assert_eq!(output["timeout_ms"], 2500);
+        assert_eq!(output["body"], "queued");
+        assert_eq!(output["success"], true);
+    }
+
     struct TestServer {
         addr: SocketAddr,
         shutdown: Option<std::sync::mpsc::Sender<()>>,
@@ -8054,26 +8284,29 @@ printf 'pwsh:%s' "$1"
             let addr = listener.local_addr().expect("local addr");
             let (tx, rx) = std::sync::mpsc::channel::<()>();
 
-            let handle = thread::spawn(move || loop {
-                if rx.try_recv().is_ok() {
-                    break;
-                }
+            let handle = thread::spawn(move || {
+                loop {
+                    if rx.try_recv().is_ok() {
+                        break;
+                    }
 
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut buffer = [0_u8; 4096];
-                        let size = stream.read(&mut buffer).expect("read request");
-                        let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
-                        let request_line = request.lines().next().unwrap_or_default().to_string();
-                        let response = handler(&request_line);
-                        stream
-                            .write_all(response.to_bytes().as_slice())
-                            .expect("write response");
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut buffer = [0_u8; 4096];
+                            let size = stream.read(&mut buffer).expect("read request");
+                            let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
+                            let request_line =
+                                request.lines().next().unwrap_or_default().to_string();
+                            let response = handler(&request_line);
+                            stream
+                                .write_all(response.to_bytes().as_slice())
+                                .expect("write response");
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("server accept failed: {error}"),
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("server accept failed: {error}"),
                 }
             });
 

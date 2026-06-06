@@ -83,9 +83,11 @@ impl PerformanceDashboard {
 
     fn render_content(&self, area: Rect, ctx: &mut RenderContext) {
         let Some(ref report) = self.last_report else {
-            let no_data = Paragraph::new("No performance data available.\nStart a session to collect metrics.")
-                .style(Style::default().fg(Color::DarkGray))
-                .wrap(Wrap { trim: false });
+            let no_data = Paragraph::new(
+                "No performance data available.\nStart a session to collect metrics.",
+            )
+            .style(Style::default().fg(Color::DarkGray))
+            .wrap(Wrap { trim: false });
             ctx.frame_mut().render_widget(no_data, area);
             return;
         };
@@ -93,10 +95,10 @@ impl PerformanceDashboard {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(7),  // Sparkline row
-                Constraint::Length(3),  // Gauge row
-                Constraint::Length(3),  // Compression bar
-                Constraint::Length(4),  // Stats footer
+                Constraint::Length(7), // Sparkline row
+                Constraint::Length(3), // Gauge row
+                Constraint::Length(3), // Compression bar
+                Constraint::Length(4), // Stats footer
             ])
             .split(area);
 
@@ -132,8 +134,16 @@ impl PerformanceDashboard {
             Color::Red
         };
         let gauge = Gauge::default()
-            .block(Block::default().title(" Cache Hit Rate ").borders(Borders::ALL))
-            .gauge_style(Style::default().fg(gauge_color).add_modifier(Modifier::BOLD))
+            .block(
+                Block::default()
+                    .title(" Cache Hit Rate ")
+                    .borders(Borders::ALL),
+            )
+            .gauge_style(
+                Style::default()
+                    .fg(gauge_color)
+                    .add_modifier(Modifier::BOLD),
+            )
             .percent(hit_pct.min(100))
             .label(format!("{:.1}%", report.cache_hit_rate * 100.0));
         ctx.frame_mut().render_widget(gauge, chunks[1]);
@@ -202,10 +212,7 @@ impl PerformanceDashboard {
 
         lines.push(Line::from(vec![
             Span::styled(" Prefetch: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", prefetch),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(format!("{}", prefetch), Style::default().fg(Color::White)),
             Span::styled(
                 format!("  L0 TTL: {}s", l0_ttl),
                 Style::default().fg(Color::DarkGray),
@@ -228,7 +235,9 @@ impl PerformanceDashboard {
             Style::default().fg(Color::DarkGray),
         )));
 
-        let footer_block = Block::default().borders(Borders::ALL).title(" Tuning Config ");
+        let footer_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Tuning Config ");
         let footer = Paragraph::new(Text::from(lines))
             .block(footer_block)
             .wrap(Wrap { trim: false });
@@ -261,12 +270,7 @@ impl Component for PerformanceDashboard {
             // Simple approach: skip rendering at low alpha (flicker-free fade-in)
             self.render_content(inner, ctx);
             // Overlay a dimming effect for fade
-            let dim = Paragraph::new("")
-                .style(
-                    Style::default()
-                        .bg(Color::Black)
-                        .fg(Color::Black),
-                );
+            let dim = Paragraph::new("").style(Style::default().bg(Color::Black).fg(Color::Black));
             if alpha < 0.5 {
                 ctx.frame_mut().render_widget(dim, inner);
             }
@@ -436,7 +440,10 @@ mod tests {
         // Second sync: immediately after — should be rate-limited
         std::thread::sleep(Duration::from_millis(1));
         dashboard.sync(&orchestrator);
-        assert_eq!(dashboard.last_sync, first_sync, "rate limit should prevent re-sync");
+        assert_eq!(
+            dashboard.last_sync, first_sync,
+            "rate limit should prevent re-sync"
+        );
     }
 
     // ── Render: empty state ───────────────────────────────────────
@@ -561,9 +568,10 @@ mod tests {
         let mut dashboard = PerformanceDashboard::new();
         dashboard.visible = true;
 
-        let press_esc = Event::Key(
-            crossterm::event::KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE),
-        );
+        let press_esc = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
         let result = dashboard.handle_event(&press_esc);
         assert!(result.is_consumed());
         assert!(!dashboard.visible);

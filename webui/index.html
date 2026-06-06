@@ -9,7 +9,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css" integrity="sha384-5TcZemv2l/9On385z///+d7MSYlvIEw9FuZTIdZ14vJLqWphw7e7ZPuOiCHJcFCP" crossorigin="anonymous">
 <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js" crossorigin="anonymous" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/plugins/autoloader/prism-autoloader.min.js" crossorigin="anonymous" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js" integrity="sha384-hWrXcNiwGjVMR8+JV5ZCRoDd/8KqKpczP+8dQ1NUXJdLzNu4XhOq6bUaqZUXJeR" crossorigin="anonymous" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js" integrity="sha384-cMkvdD8LoxVzGF/RPUKAcvmm49FQ0oxwDF3BGKtDXcEc+T1b2N+teh/OJfpU0jr6" crossorigin="anonymous" defer></script>
 <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#1f6feb">
@@ -70,11 +70,14 @@
   <div id="panel-tabs">
     <button data-panel="workspace" class="tab-active">Files</button>
     <button data-panel="memory">Memory</button>
+    <button data-panel="runtime">Runtime</button>
+    <button data-panel="context">Context</button>
     <button data-panel="skills">Skills</button>
     <button data-panel="crons">Crons</button>
     <button data-panel="agents">Agents</button>
     <button data-panel="tools">Tools</button>
     <button data-panel="gateway">Gateway</button>
+    <button data-panel="audit">Audit</button>
     <button data-panel="settings">Settings</button>
     <button data-panel="close" title="Close Panel">x</button>
   </div>
@@ -115,7 +118,6 @@
   </div>
 </div>
 
-<!-- Legacy scripts (replaced by Component layer)
 <script src="api.js"></script>
 <script src="state.js"></script>
 <script src="ui.js"></script>
@@ -125,24 +127,5 @@
 <script src="panels.js"></script>
 <script src="commands.js"></script>
 <script src="boot.js"></script>
--->
-<!-- Component layer -->
-<script src="assets/js/state.js"></script>
-<script src="assets/js/i18n.js"></script>
-<script src="assets/js/api.js"></script>
-<script src="assets/js/messages.js"></script>
-<script src="assets/js/sessions.js"></script>
-<script src="assets/js/commands.js"></script>
-<script src="assets/js/panels.js"></script>
-<script src="assets/js/workspace.js"></script>
-<script src="assets/js/approval.js"></script>
-<script src="assets/js/config.js"></script>
-<script src="assets/js/cron.js"></script>
-<script src="assets/js/knowledge-graph.js"></script>
-<script src="assets/js/memory.js"></script>
-<script src="assets/js/platform.js"></script>
-<script src="assets/js/tool-viz.js"></script>
-<script src="assets/js/upload.js"></script>
-<script src="assets/js/boot.js"></script>
 </body>
 </html>

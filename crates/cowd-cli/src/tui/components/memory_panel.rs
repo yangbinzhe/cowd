@@ -5,7 +5,7 @@
 //   - Layer browser (L0/L1/L2/L3/L4 filter)
 //   - Search via CognitiveContextManager
 //   - Entry detail view with full content + metadata
-//   - Delete capability
+//   - Archive capability
 //   - Refresh from cognitive context
 
 #![allow(dead_code)]
@@ -21,7 +21,8 @@ use ratatui::{
 };
 
 use memory::cognitive::CognitiveContextManager;
-use memory::types::MemoryLayer;
+use memory::types::{MemoryId, MemoryLayer};
+use memory::{MemoryInformationState, MemoryKernel, MemoryTurnContext};
 
 use crate::tui::app::{App, MemoryEntry};
 use crate::tui::components::{Component, EventResult, RenderContext};
@@ -109,7 +110,7 @@ enum ViewMode {
 /// - Layer filtering (cycle through L0–L4 or show all)
 /// - Full-text search via CognitiveContextManager
 /// - Detail view for individual entries
-/// - Delete selected entries
+/// - Archive selected entries
 /// - Keyboard navigation with j/k, Enter, d, /, Esc
 pub struct MemoryPanel {
     pub entries: Vec<MemoryEntry>,
@@ -127,7 +128,7 @@ pub struct MemoryPanel {
     view_mode: ViewMode,
     /// Scroll offset for detail view and long lists.
     pub scroll_offset: u16,
-    /// Status message to display (e.g., "Deleted", "Refreshed").
+    /// Status message to display (e.g., "Archived", "Refreshed").
     status_message: Option<String>,
     /// Tick counter for auto-clearing status messages.
     status_ticks: u32,
@@ -180,41 +181,31 @@ impl MemoryPanel {
         let Some(ref mm) = self.memory_manager else {
             return;
         };
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return,
-        };
 
         let fresh: Vec<MemoryEntry> = if let Some(layer) = self.active_layer {
             let mlayer = layer_to_memory_layer(layer);
-            match handle.block_on(mm.list_layer_entries(mlayer)) {
-                Ok(metas) => metas
+            match memory_layer_view_blocking(Arc::clone(mm), mlayer) {
+                Ok(view) => view
+                    .atoms
                     .into_iter()
-                    .map(|m| MemoryEntry {
-                        id: Some(m.id.to_string()),
-                        layer: format!("{:?}", m.layer),
-                        content: m.title,
-                        priority: format!("{:?}", m.priority),
-                    })
+                    .map(memory_atom_to_tui_entry)
                     .collect(),
-                Err(_) => return,
-            }
-        } else {
-            // Fetch across all layers: combine L0-L4
-            let mut all = Vec::new();
-            for l in &[MemoryLayer::L0, MemoryLayer::L1, MemoryLayer::L2, MemoryLayer::L3, MemoryLayer::L4] {
-                if let Ok(metas) = handle.block_on(mm.list_layer_entries(*l)) {
-                    for m in metas {
-                        all.push(MemoryEntry {
-                            id: Some(m.id.to_string()),
-                            layer: format!("{:?}", m.layer),
-                            content: m.title,
-                            priority: format!("{:?}", m.priority),
-                        });
-                    }
+                Err(err) => {
+                    self.set_status(&format!("Refresh failed: {err}"));
+                    return;
                 }
             }
-            all
+        } else {
+            match memory_layer_views_blocking(Arc::clone(mm)) {
+                Ok(views) => views
+                    .into_iter()
+                    .flat_map(|view| view.atoms.into_iter().map(memory_atom_to_tui_entry))
+                    .collect(),
+                Err(err) => {
+                    self.set_status(&format!("Refresh failed: {err}"));
+                    return;
+                }
+            }
         };
 
         self.entries = fresh;
@@ -233,12 +224,8 @@ impl MemoryPanel {
             self.sync_from_cognitive();
             return;
         }
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return,
-        };
 
-        match handle.block_on(mm.search(query)) {
+        match search_memory_blocking(Arc::clone(mm), query.to_string()) {
             Ok(results) => {
                 let count = results.len();
                 self.entries = results
@@ -254,30 +241,30 @@ impl MemoryPanel {
                 self.scroll_offset = 0;
                 self.set_status(&format!("Found {count} results for \"{query}\""));
             }
-            Err(_) => {
-                self.set_status("Search failed");
+            Err(err) => {
+                self.set_status(&format!("Search failed: {err}"));
             }
         }
     }
 
-    /// Delete the currently selected entry (both in-memory and in cognitive store).
+    /// Archive the currently selected entry in the kernel and remove it from active view.
     fn delete_selected(&mut self) {
-        let Some(idx) = self.selected_entry else { return };
+        let Some(idx) = self.selected_entry else {
+            return;
+        };
 
         let entry_id = self.entries.get(idx).and_then(|e| e.id.clone());
 
         if let Some(ref mm) = self.memory_manager {
             if let Some(ref id) = entry_id {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    if handle.block_on(mm.delete_entry(id)).is_err() {
-                        self.set_status("Delete failed in store");
-                    }
+                if let Err(err) = delete_memory_entry_blocking(Arc::clone(mm), id.clone()) {
+                    self.set_status(&format!("Archive failed in store: {err}"));
                 }
             }
         }
 
         self.remove_entry_at(idx);
-        self.set_status("Entry deleted");
+        self.set_status("Entry archived");
     }
 
     fn remove_entry_at(&mut self, idx: usize) {
@@ -373,13 +360,13 @@ impl MemoryPanel {
                 Style::default().fg(Color::DarkGray),
             )));
             lines.push(Line::from(Span::styled(
-                "Keys: / search  l/L layer filter  r refresh  j↓ k↑  Enter view  d delete",
+                "Keys: / search  l/L layer filter  r refresh  j↓ k↑  Enter view  d archive",
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
             let total = self.entries.len();
             lines.push(Line::from(Span::styled(
-                format!("{total} entries | j↓ k↑ select | Enter view | d delete | / search | l/L layer | r refresh"),
+                format!("{total} entries active | j↓ k↑ select | Enter view | d archive | / search | l/L layer | r refresh"),
                 Style::default().fg(Color::Yellow),
             )));
             lines.push(Line::raw(""));
@@ -396,8 +383,12 @@ impl MemoryPanel {
                 let (cursor_style, layer_style, content_style) = if is_selected {
                     (
                         Style::default().fg(Color::Green),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                     )
                 } else {
                     (
@@ -428,7 +419,9 @@ impl MemoryPanel {
             }
         }
 
-        let paragraph = Paragraph::new(Text::from(lines)).block(block).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: false });
         ctx.frame_mut().render_widget(paragraph, area);
     }
 
@@ -458,7 +451,9 @@ impl MemoryPanel {
         // Header info
         lines.push(Line::from(Span::styled(
             format!(" Layer: {}  |  Priority: {}", entry.layer, entry.priority),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         if let Some(ref id) = entry.id {
             lines.push(Line::from(Span::styled(
@@ -501,7 +496,10 @@ impl MemoryPanel {
 
         if offset + max_content_lines < content_lines.len() {
             lines.push(Line::styled(
-                format!("... {} more lines (scroll with j/k)", content_lines.len() - offset - max_content_lines),
+                format!(
+                    "... {} more lines (scroll with j/k)",
+                    content_lines.len() - offset - max_content_lines
+                ),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -509,11 +507,13 @@ impl MemoryPanel {
         // Footer
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            " Esc:back  j↓/k↑:scroll  d:delete ",
+            " Esc:back  j↓/k↑:scroll  d:archive ",
             Style::default().fg(Color::Yellow),
         )));
 
-        let paragraph = Paragraph::new(Text::from(lines)).block(block).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: false });
         ctx.frame_mut().render_widget(paragraph, area);
     }
 
@@ -541,7 +541,9 @@ impl MemoryPanel {
         };
         lines.push(Line::from(Span::styled(
             format!(" Search: {}{}", self.search_query, cursor),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
@@ -587,7 +589,9 @@ impl MemoryPanel {
                             &entry.content
                         },
                         if is_selected {
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::Gray)
                         },
@@ -596,7 +600,9 @@ impl MemoryPanel {
             }
         }
 
-        let paragraph = Paragraph::new(Text::from(lines)).block(block).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: false });
         ctx.frame_mut().render_widget(paragraph, area);
     }
 
@@ -606,9 +612,9 @@ impl MemoryPanel {
     fn handle_list_key(&mut self, key: &crossterm::event::KeyEvent) -> EventResult {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                let next = self.selected_entry.map_or(0, |i| {
-                    (i + 1).min(self.entries.len().saturating_sub(1))
-                });
+                let next = self
+                    .selected_entry
+                    .map_or(0, |i| (i + 1).min(self.entries.len().saturating_sub(1)));
                 if !self.entries.is_empty() {
                     self.selected_entry = Some(next);
                 }
@@ -616,10 +622,8 @@ impl MemoryPanel {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if !self.entries.is_empty() {
-                    self.selected_entry = Some(
-                        self.selected_entry
-                            .map_or(0, |i| i.saturating_sub(1))
-                    );
+                    self.selected_entry =
+                        Some(self.selected_entry.map_or(0, |i| i.saturating_sub(1)));
                 }
                 EventResult::Consumed
             }
@@ -707,7 +711,8 @@ impl MemoryPanel {
             }
             KeyCode::Char('r') => {
                 self.sync_from_cognitive();
-                if self.selected_entry
+                if self
+                    .selected_entry
                     .map_or(true, |i| i >= self.entries.len())
                 {
                     self.view_mode = ViewMode::List;
@@ -827,6 +832,80 @@ fn layer_to_memory_layer(layer: Layer) -> MemoryLayer {
     }
 }
 
+fn memory_atom_to_tui_entry(atom: memory::MemoryAtomView) -> MemoryEntry {
+    MemoryEntry {
+        id: Some(atom.id.to_string()),
+        layer: format!("{:?}", atom.layer),
+        content: atom.title,
+        priority: format!("{:?}", atom.state),
+    }
+}
+
+fn memory_layer_view_blocking(
+    manager: Arc<CognitiveContextManager>,
+    layer: MemoryLayer,
+) -> Result<memory::MemoryLayerView, String> {
+    run_memory_operation_blocking(move || async move {
+        MemoryKernel::new(manager)
+            .layer_view(layer, MemoryInformationState::Orientation)
+            .await
+    })
+}
+
+fn memory_layer_views_blocking(
+    manager: Arc<CognitiveContextManager>,
+) -> Result<Vec<memory::MemoryLayerView>, String> {
+    run_memory_operation_blocking(move || async move {
+        MemoryKernel::new(manager)
+            .layer_views(MemoryInformationState::Orientation)
+            .await
+    })
+}
+
+fn search_memory_blocking(
+    manager: Arc<CognitiveContextManager>,
+    query: String,
+) -> Result<Vec<memory::MemoryEntry>, String> {
+    run_memory_operation_blocking(move || async move { manager.search(&query).await })
+}
+
+fn delete_memory_entry_blocking(
+    manager: Arc<CognitiveContextManager>,
+    id: String,
+) -> Result<(), String> {
+    let memory_id = MemoryId::try_parse(&id).map_err(|_| "invalid memory id".to_string())?;
+    run_memory_operation_blocking(move || async move {
+        let ctx = MemoryTurnContext::new("tui-memory-archive", "tui");
+        MemoryKernel::new(manager)
+            .archive(&ctx, memory_id, "archived from TUI memory panel")
+            .await
+    })
+}
+
+fn run_memory_operation_blocking<F, Fut, T, E>(operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, E>> + Send + 'static,
+    T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let run = move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("build runtime: {err}"))?;
+        rt.block_on(operation()).map_err(|err| err.to_string())
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(run)
+            .join()
+            .map_err(|_| "memory worker panicked".to_string())?
+    } else {
+        run()
+    }
+}
+
 // ── Default impl ─────────────────────────────────────────────────
 
 impl Default for MemoryPanel {
@@ -896,8 +975,43 @@ impl Component for MemoryPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::test_utils::MockTerminal;
     use crate::tui::skin::SkinConfig;
+    use crate::tui::test_utils::MockTerminal;
+
+    fn test_memory_config(path: &std::path::Path) -> memory::MemoryConfig {
+        let mut config = memory::MemoryConfig::default();
+        config.store.sqlite_path = path.to_path_buf();
+        config.store.blob_dir = path.parent().unwrap().join("blobs");
+        config
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn seeded_memory_manager() -> Arc<CognitiveContextManager> {
+        let dir = unique_temp_dir("cowd-memory-panel");
+        let manager = Arc::new(
+            CognitiveContextManager::new(test_memory_config(&dir.join("memory.db")))
+                .await
+                .unwrap(),
+        );
+        manager
+            .create_entry(
+                memory::MemoryLayer::L4,
+                memory::MemoryCategory::Shared,
+                "Runtime Safe Memory Panel",
+                "TUI memory panel must read real memory while running inside Tokio.",
+                memory::Priority::High,
+                vec!["tui".into(), "memory".into()],
+                memory::MemoryScope::Global,
+            )
+            .await
+            .unwrap();
+        manager
+    }
 
     fn render_panel(panel: &mut MemoryPanel, width: u16, height: u16) -> Vec<String> {
         let mut terminal = MockTerminal::new(width, height);
@@ -940,9 +1054,18 @@ mod tests {
 
         let lines = render_panel(&mut panel, 80, 10);
         let joined = lines.join("\n");
-        assert!(joined.contains("2 entries"), "Should show entry count, got: {joined}");
-        assert!(joined.contains("[core]"), "Should show core layer tag, got: {joined}");
-        assert!(joined.contains("[session]"), "Should show session layer tag, got: {joined}");
+        assert!(
+            joined.contains("2 entries"),
+            "Should show entry count, got: {joined}"
+        );
+        assert!(
+            joined.contains("[core]"),
+            "Should show core layer tag, got: {joined}"
+        );
+        assert!(
+            joined.contains("[session]"),
+            "Should show session layer tag, got: {joined}"
+        );
     }
 
     #[test]
@@ -967,20 +1090,50 @@ mod tests {
     #[test]
     fn sync_from_app_populates_entries() {
         let mut app = App::new("test-model", "test-session");
-        app.memory_entries = vec![
-            MemoryEntry {
-                id: None,
-                layer: "core".into(),
-                content: "test memory".into(),
-                priority: "high".into(),
-            },
-        ];
+        app.memory_entries = vec![MemoryEntry {
+            id: None,
+            layer: "core".into(),
+            content: "test memory".into(),
+            priority: "high".into(),
+        }];
 
         let mut panel = MemoryPanel::new();
         panel.sync_from_app(&app);
         assert_eq!(panel.entries.len(), 1);
         assert_eq!(panel.entries[0].layer, "core");
         assert_eq!(panel.entries[0].content, "test memory");
+    }
+
+    #[tokio::test]
+    async fn sync_from_cognitive_reads_entries_inside_tokio_runtime() {
+        let manager = seeded_memory_manager().await;
+        let mut panel = MemoryPanel::new().with_memory_manager(manager);
+
+        panel.sync_from_cognitive();
+
+        assert!(
+            panel
+                .entries
+                .iter()
+                .any(|entry| entry.content == "Runtime Safe Memory Panel"),
+            "memory panel should refresh real memory entries inside an active Tokio runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_search_reads_entries_inside_tokio_runtime() {
+        let manager = seeded_memory_manager().await;
+        let mut panel = MemoryPanel::new().with_memory_manager(manager);
+
+        panel.execute_search("Tokio");
+
+        assert!(
+            panel
+                .entries
+                .iter()
+                .any(|entry| entry.content.contains("Tokio")),
+            "memory panel should search real memory entries inside an active Tokio runtime"
+        );
     }
 
     #[test]
@@ -993,14 +1146,12 @@ mod tests {
     #[test]
     fn from_app_constructor() {
         let mut app = App::new("test", "s");
-        app.memory_entries = vec![
-            MemoryEntry {
-                id: None,
-                layer: "a".into(),
-                content: "b".into(),
-                priority: "c".into(),
-            },
-        ];
+        app.memory_entries = vec![MemoryEntry {
+            id: None,
+            layer: "a".into(),
+            content: "b".into(),
+            priority: "c".into(),
+        }];
         let panel = MemoryPanel::from_app(&app);
         assert_eq!(panel.entries.len(), 1);
     }
@@ -1049,17 +1200,16 @@ mod tests {
     #[test]
     fn detail_view_mode_activated_on_enter() {
         let mut panel = MemoryPanel::new();
-        panel.entries = vec![
-            MemoryEntry {
-                id: Some("abc-123".into()),
-                layer: "L1".into(),
-                content: "Entry content".into(),
-                priority: "high".into(),
-            },
-        ];
+        panel.entries = vec![MemoryEntry {
+            id: Some("abc-123".into()),
+            layer: "L1".into(),
+            content: "Entry content".into(),
+            priority: "high".into(),
+        }];
         panel.selected_entry = Some(0);
 
-        let key = crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        let key =
+            crossterm::event::KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
         let result = panel.handle_list_key(&key);
         assert!(result.is_consumed());
         assert_eq!(panel.view_mode, ViewMode::Detail);
@@ -1069,12 +1219,25 @@ mod tests {
     fn select_cycles_within_bounds() {
         let mut panel = MemoryPanel::new();
         panel.entries = vec![
-            MemoryEntry { id: None, layer: "L1".into(), content: "a".into(), priority: "low".into() },
-            MemoryEntry { id: None, layer: "L1".into(), content: "b".into(), priority: "low".into() },
+            MemoryEntry {
+                id: None,
+                layer: "L1".into(),
+                content: "a".into(),
+                priority: "low".into(),
+            },
+            MemoryEntry {
+                id: None,
+                layer: "L1".into(),
+                content: "b".into(),
+                priority: "low".into(),
+            },
         ];
 
         // Start with no selection
-        let key_j = crossterm::event::KeyEvent::new(KeyCode::Char('j'), crossterm::event::KeyModifiers::NONE);
+        let key_j = crossterm::event::KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        );
         panel.handle_list_key(&key_j);
         assert_eq!(panel.selected_entry, Some(0));
 
@@ -1090,9 +1253,24 @@ mod tests {
     fn delete_removes_entry_and_adjusts_selection() {
         let mut panel = MemoryPanel::new();
         panel.entries = vec![
-            MemoryEntry { id: Some("1".into()), layer: "L1".into(), content: "a".into(), priority: "low".into() },
-            MemoryEntry { id: Some("2".into()), layer: "L1".into(), content: "b".into(), priority: "low".into() },
-            MemoryEntry { id: Some("3".into()), layer: "L1".into(), content: "c".into(), priority: "low".into() },
+            MemoryEntry {
+                id: Some("1".into()),
+                layer: "L1".into(),
+                content: "a".into(),
+                priority: "low".into(),
+            },
+            MemoryEntry {
+                id: Some("2".into()),
+                layer: "L1".into(),
+                content: "b".into(),
+                priority: "low".into(),
+            },
+            MemoryEntry {
+                id: Some("3".into()),
+                layer: "L1".into(),
+                content: "c".into(),
+                priority: "low".into(),
+            },
         ];
         panel.selected_entry = Some(1);
 
@@ -1101,6 +1279,38 @@ mod tests {
         assert_eq!(panel.entries[0].content, "a");
         assert_eq!(panel.entries[1].content, "c");
         assert_eq!(panel.selected_entry, Some(1));
+    }
+
+    #[tokio::test]
+    async fn delete_archives_entry_in_memory_kernel() {
+        let manager = seeded_memory_manager().await;
+        let views = MemoryKernel::new(Arc::clone(&manager))
+            .layer_views(MemoryInformationState::Orientation)
+            .await
+            .unwrap();
+        let id = views
+            .into_iter()
+            .flat_map(|view| view.atoms.into_iter())
+            .next()
+            .expect("seeded manager should contain one memory atom")
+            .id;
+
+        delete_memory_entry_blocking(Arc::clone(&manager), id.to_string()).unwrap();
+
+        let events = MemoryKernel::new(Arc::clone(&manager))
+            .lifecycle_events(id)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.to == memory::MemoryState::Archived),
+            "TUI delete key should archive through the memory kernel"
+        );
+        assert!(
+            manager.get_entry(&id.to_string()).await.unwrap().is_some(),
+            "archiving must preserve the underlying memory entry"
+        );
     }
 
     #[test]
@@ -1114,5 +1324,4 @@ mod tests {
         assert_eq!(panel.view_mode, ViewMode::List);
         assert!(!panel.search_active);
     }
-
 }

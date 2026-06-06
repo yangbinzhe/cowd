@@ -14,17 +14,17 @@ pub fn needs_bootstrap() -> bool {
         config_home.join("config.yml"),
         config_home.join("config.json"),
     ];
-    
+
     // 同时检查 ~/.cc 目录（兼容 CC 配置）
     let cc_path = PathBuf::from(&std::env::var("HOME").unwrap_or_default())
         .join(".cc")
         .join("config.yaml");
-    
+
     // 如果 ~/.cc/config.yaml 存在，直接复用
     if cc_path.exists() {
         return false;
     }
-    
+
     !config_paths.iter().any(|p| p.exists())
 }
 
@@ -32,9 +32,7 @@ pub fn needs_bootstrap() -> bool {
 fn default_config_home() -> PathBuf {
     std::env::var_os("COWD_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cowd"))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cowd")))
         .unwrap_or_else(|| PathBuf::from(".cowd"))
 }
 
@@ -42,36 +40,37 @@ fn default_config_home() -> PathBuf {
 pub fn run_bootstrap() -> Result<(), Box<dyn std::error::Error>> {
     let config_home = default_config_home();
     let config_file = config_home.join("config.yaml");
-    
+
     // 创建配置目录
     if !config_home.exists() {
         fs::create_dir_all(&config_home)?;
     }
-    
+
     println!("\n╔══════════════════════════════════════════════════════════════════╗");
     println!("║                    Cowd 首次启动引导                              ║");
     println!("╚══════════════════════════════════════════════════════════════════╝\n");
-    
+
     println!("检测到您是首次使用 Cowd，让我们进行一些基本配置...\n");
-    
+
     // 引导配置
     let api_key = prompt_user("请输入您的 OpenAI API Key (sk-...): ");
-    let gateway_enabled = prompt_yes_no("是否启用 Gateway 服务? (用于 HTTP API 和 WebSocket 接口) [y/N]: ");
+    let gateway_enabled =
+        prompt_yes_no("是否启用 Gateway 服务? (用于 HTTP API 和 WebSocket 接口) [y/N]: ");
     let gateway_port: u16 = if gateway_enabled {
         prompt_port("请输入 Gateway 端口 (默认 8642): ")
     } else {
         8642
     };
-    
+
     let gateway_token = if gateway_enabled {
         generate_token()
     } else {
         String::new()
     };
-    
+
     // 生成配置
     let config_content = generate_config(&api_key, gateway_enabled, gateway_port, &gateway_token);
-    
+
     // 写入配置文件 (0o600 — only owner can read the API key)
     fs::write(&config_file, config_content)?;
     #[cfg(unix)]
@@ -87,7 +86,7 @@ pub fn run_bootstrap() -> Result<(), Box<dyn std::error::Error>> {
     println!("  1. 编辑配置文件添加更多 Provider 配置");
     println!("  2. 运行 'cowd --help' 查看使用说明");
     println!("  3. 运行 'cowd' 启动交互式 REPL\n");
-    
+
     Ok(())
 }
 
@@ -128,8 +127,9 @@ fn generate_token() -> String {
 fn generate_config(api_key: &str, gateway_enabled: bool, port: u16, token: &str) -> String {
     let gateway_enabled_str = if gateway_enabled { "true" } else { "false" };
     let auth_enabled_str = if gateway_enabled { "true" } else { "false" };
-    
-    format!(r#"# =============================================================================
+
+    format!(
+        r#"# =============================================================================
 # Cowd 用户全局配置
 # =============================================================================
 #
@@ -176,16 +176,16 @@ fallbacks:
 
 # =============================================================================
 # 全局权限配置
-# default_mode: "plan"(只读) | "acceptEdits"(可写工作区) | "dontAsk"(危险全访问)
+# defaultMode: "plan"(只读) | "acceptEdits"(可写工作区) | "dontAsk"(危险全访问)
 # =============================================================================
 permissions:
-  default_mode: "acceptEdits"
+  defaultMode: "acceptEdits"
   allow: []
   deny: []
   ask: []
 
 # 可信工作区根目录
-trusted_roots:
+trustedRoots:
   - "/media/yi/Datas/workspace"
 
 # =============================================================================
@@ -193,23 +193,23 @@ trusted_roots:
 # =============================================================================
 memory:
   enabled: true
-  store_path: "~/.cowd/memory"
+  storePath: "~/.cowd/memory"
   layers:
-    l0_enabled: true
-    l1_max_tokens: 3000
-    l2_max_tokens: 8000
-    l3_search_limit: 5
-    l4_enabled: false
+    l0Enabled: true
+    l1MaxTokens: 3000
+    l2MaxTokens: 8000
+    l3SearchLimit: 5
+    l4Enabled: false
   extraction:
-    auto_extract: true
+    autoExtract: true
   vector:
     enabled: false
-    embedding_model: "text-embedding-3-small"
-    api_url: "https://api.openai.com/v1/embeddings"
-    api_key: ""
+    embeddingModel: "text-embedding-3-small"
+    apiUrl: "https://api.openai.com/v1/embeddings"
+    apiKey: ""
     dimension: 1536
-    timeout_secs: 30
-    batch_size: 32
+    timeoutSecs: 30
+    batchSize: 32
 
 # =============================================================================
 # 压缩管线配置
@@ -217,35 +217,35 @@ memory:
 compression:
   micro:
     enabled: true
-    tool_result_max_chars: 6000
-    time_decay_factor: 0.9
+    toolResultMaxChars: 6000
+    timeDecayFactor: 0.9
   session:
-    threshold_tokens: 180000
-    preserve_recent: 10
-    summary_max_tokens: 2000
-    buffer_tokens: 13000
+    thresholdTokens: 180000
+    preserveRecent: 10
+    summaryMaxTokens: 2000
+    bufferTokens: 13000
   deep:
     enabled: true
-    iterative_update: true
-  circuit_breaker:
-    max_retries: 3
-    cooldown_secs: 30
+    iterativeUpdate: true
+  circuitBreaker:
+    maxRetries: 3
+    cooldownSecs: 30
 
 # =============================================================================
 # 运行时配置
 # =============================================================================
 runtime:
   model: "gpt-4o"
-  permission_mode: "acceptEdits"
+  permissionMode: "acceptEdits"
 
 # =============================================================================
 # 多渠道网关配置
 # =============================================================================
 gateway:
   enabled: {gateway_enabled_str}
-  session_reset: "none"
+  sessionReset: "none"
   platforms:
-    - platform_type: "api_server"
+    - platformType: "api_server"
       enabled: {gateway_enabled_str}
       host: "127.0.0.1"
       port: {port}
@@ -258,33 +258,34 @@ gateway:
 # =============================================================================
 sandbox:
   enabled: false
-  namespace_restrictions: false
-  network_isolation: false
-  filesystem_mode: "none"
-  allowed_dirs: []
+  namespaceRestrictions: false
+  networkIsolation: false
+  filesystemMode: "none"
+  allowedMounts: []
 
 # =============================================================================
 # MCP 服务器配置
 # =============================================================================
-mcp_servers: {{}}
+mcpServers: {{}}
 
 # =============================================================================
 # 钩子配置
 # =============================================================================
 hooks:
-  pre_tool_use: []
-  post_tool_use: []
-  post_tool_use_failure: []
+  PreToolUse: []
+  PostToolUse: []
+  PostToolUseFailure: []
 
 # =============================================================================
 # 插件配置
 # =============================================================================
 plugins:
   enabled: {{}}
-  external_dirs: []
-  install_root: null
-  registry_path: null
-  bundled_root: null
-  max_output_tokens: null
-"#)
+  externalDirectories: []
+  installRoot: null
+  registryPath: null
+  bundledRoot: null
+  maxOutputTokens: null
+"#
+    )
 }

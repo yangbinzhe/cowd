@@ -67,11 +67,7 @@ pub fn write_crash_report(info: &PanicHookInfo) {
          ==============================\n\n"
     );
 
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = file.write_all(report.as_bytes());
         let _ = file.flush();
     }
@@ -89,7 +85,7 @@ pub fn restore_terminal() {
     unsafe {
         // Write escape sequences directly to stdout fd
         let stdout_fd = 1; // STDOUT_FILENO
-        // Leave alternate screen: CSI ? 1049 l
+                           // Leave alternate screen: CSI ? 1049 l
         let _ = libc::write(
             stdout_fd,
             b"\x1b[?1049l" as *const u8 as *const libc::c_void,
@@ -102,11 +98,7 @@ pub fn restore_terminal() {
             6,
         );
         // Reset attributes: CSI 0 m
-        let _ = libc::write(
-            stdout_fd,
-            b"\x1b[0m" as *const u8 as *const libc::c_void,
-            4,
-        );
+        let _ = libc::write(stdout_fd, b"\x1b[0m" as *const u8 as *const libc::c_void, 4);
     }
 }
 
@@ -210,8 +202,7 @@ mod tests {
     #[test]
     fn write_crash_report_creates_file() {
         // Use a temp directory to avoid polluting real crash log
-        let tmp = std::env::temp_dir()
-            .join(format!("cowd-crash-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("cowd-crash-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&tmp);
 
         // Can't easily test write_crash_report without a real PanicHookInfo,
@@ -236,8 +227,14 @@ mod tests {
         });
         match result {
             RenderResult::Degraded(msg) => {
-                assert!(msg.contains("test_component"), "msg should name component: {msg}");
-                assert!(msg.contains("intentional test panic"), "msg should contain panic: {msg}");
+                assert!(
+                    msg.contains("test_component"),
+                    "msg should name component: {msg}"
+                );
+                assert!(
+                    msg.contains("intentional test panic"),
+                    "msg should contain panic: {msg}"
+                );
             }
             RenderResult::Ok => panic!("should have caught the panic"),
         }

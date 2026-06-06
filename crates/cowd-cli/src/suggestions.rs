@@ -36,8 +36,7 @@ pub(crate) fn format_unknown_option(option: &str) -> String {
 
 pub(crate) fn format_unknown_direct_slash_command(name: &str) -> String {
     let mut message = format!("unknown slash command outside the REPL: /{name}");
-    if let Some(suggestions) =
-        render_suggestion_line("Did you mean", &suggest_slash_commands(name))
+    if let Some(suggestions) = render_suggestion_line("Did you mean", &suggest_slash_commands(name))
     {
         message.push('\n');
         message.push_str(&suggestions);
@@ -52,8 +51,7 @@ pub(crate) fn format_unknown_direct_slash_command(name: &str) -> String {
 
 pub(crate) fn format_unknown_slash_command(name: &str) -> String {
     let mut message = format!("Unknown slash command: /{name}");
-    if let Some(suggestions) =
-        render_suggestion_line("Did you mean", &suggest_slash_commands(name))
+    if let Some(suggestions) = render_suggestion_line("Did you mean", &suggest_slash_commands(name))
     {
         message.push('\n');
         message.push_str(&suggestions);

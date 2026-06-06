@@ -33,11 +33,18 @@ impl Default for SkinConfig {
         Self {
             name: "default".into(),
             colors: ColorConfig {
-                accent: "#00FFFF".into(), bg: "#000000".into(), fg: "#FFFFFF".into(),
-                user_color: "#00FF00".into(), warn: "#FFFF00".into(),
-                error: "#FF0000".into(), success: "#00FF00".into(),
+                accent: "#00FFFF".into(),
+                bg: "#000000".into(),
+                fg: "#FFFFFF".into(),
+                user_color: "#00FF00".into(),
+                warn: "#FFFF00".into(),
+                error: "#FF0000".into(),
+                success: "#00FF00".into(),
             },
-            branding: BrandingConfig { agent_name: "Cowd".into(), prompt_symbol: "> ".into() },
+            branding: BrandingConfig {
+                agent_name: "Cowd".into(),
+                prompt_symbol: "> ".into(),
+            },
         }
     }
 }
@@ -65,8 +72,12 @@ pub(crate) fn parse_hex(hex: &str) -> ratatui::style::Color {
     let hex = hex.trim_start_matches('#');
     if hex.len() == 6 {
         if let (Ok(r), Ok(g), Ok(b)) = (
-            u8::from_str_radix(&hex[0..2], 16), u8::from_str_radix(&hex[2..4], 16), u8::from_str_radix(&hex[4..6], 16)
-        ) { return ratatui::style::Color::Rgb(r, g, b); }
+            u8::from_str_radix(&hex[0..2], 16),
+            u8::from_str_radix(&hex[2..4], 16),
+            u8::from_str_radix(&hex[4..6], 16),
+        ) {
+            return ratatui::style::Color::Rgb(r, g, b);
+        }
     }
     ratatui::style::Color::Cyan
 }
@@ -74,6 +85,13 @@ pub(crate) fn parse_hex(hex: &str) -> ratatui::style::Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn p21_default_skin_is_valid() { let s = SkinConfig::default(); assert_eq!(s.name, "default"); }
-    #[test] fn p21_hex_parse_works() { assert_eq!(parse_hex("#FF0000"), ratatui::style::Color::Rgb(255, 0, 0)); }
+    #[test]
+    fn p21_default_skin_is_valid() {
+        let s = SkinConfig::default();
+        assert_eq!(s.name, "default");
+    }
+    #[test]
+    fn p21_hex_parse_works() {
+        assert_eq!(parse_hex("#FF0000"), ratatui::style::Color::Rgb(255, 0, 0));
+    }
 }

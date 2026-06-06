@@ -1,0 +1,936 @@
+//! MemoryKernel boundary and living-memory invariants.
+//!
+//! This module is intentionally a facade over the existing
+//! [`CognitiveContextManager`]. It establishes the v0.8.12 control boundary
+//! without rewriting the mature memory subsystems underneath it.
+
+use std::{sync::Arc, time::Instant};
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    cognitive::CognitiveContextManager,
+    error::MemoryError,
+    project_scope::MemoryScope,
+    types::{
+        AgentVisibility, MemoryEntry, MemoryId, MemoryLayer, Message, PreparedContext, TokenBudget,
+    },
+};
+
+/// Result alias for the MemoryKernel boundary.
+pub type MemoryKernelResult<T> = std::result::Result<T, MemoryKernelError>;
+
+/// Errors at the kernel boundary.
+///
+/// Foreground prepare/post-turn paths should usually degrade instead of
+/// returning this error. The type exists for construction and explicit health
+/// calls where callers need to distinguish memory-system failures from normal
+/// empty recall.
+#[derive(Debug, thiserror::Error)]
+pub enum MemoryKernelError {
+    #[error("memory backend failed: {0}")]
+    Backend(#[from] MemoryError),
+}
+
+/// The five primitive concepts every memory surface must map to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MemoryPrimitive {
+    Atom,
+    Evidence,
+    Link,
+    State,
+    Recall,
+}
+
+impl MemoryPrimitive {
+    #[must_use]
+    pub fn all() -> [Self; 5] {
+        [
+            Self::Atom,
+            Self::Evidence,
+            Self::Link,
+            Self::State,
+            Self::Recall,
+        ]
+    }
+}
+
+/// Runtime information state, orthogonal to L0-L4 governance layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MemoryInformationState {
+    Trace,
+    Pattern,
+    Orientation,
+}
+
+/// Explicit lifecycle state for an interpreted memory atom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MemoryState {
+    Candidate,
+    Active,
+    Conflicted,
+    Superseded,
+    Stale,
+    Archived,
+}
+
+/// Read-side atom projection used by kernel/UI/tests.
+///
+/// This is a view over existing [`MemoryEntry`] data. It is not a new store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryAtomView {
+    pub id: MemoryId,
+    pub layer: MemoryLayer,
+    pub information_state: MemoryInformationState,
+    pub state: MemoryState,
+    pub evidence_pointer: Option<String>,
+    pub explicit_authority: bool,
+    pub confidence: f32,
+    pub salience: f32,
+    pub title: String,
+}
+
+impl MemoryAtomView {
+    #[must_use]
+    pub fn from_entry(entry: &MemoryEntry, information_state: MemoryInformationState) -> Self {
+        let explicit_authority = matches!(entry.layer, MemoryLayer::L0)
+            || matches!(entry.source, crate::types::MemorySource::UserExplicit);
+        let state = if entry.staleness >= 1.0 {
+            MemoryState::Stale
+        } else if entry.confidence < 0.35 {
+            MemoryState::Conflicted
+        } else {
+            MemoryState::Active
+        };
+        let evidence_pointer = match entry.layer {
+            MemoryLayer::L0 | MemoryLayer::L1 => None,
+            MemoryLayer::L2 | MemoryLayer::L3 | MemoryLayer::L4 => {
+                Some(format!("memory:{}", entry.id))
+            }
+        };
+
+        Self {
+            id: entry.id,
+            layer: entry.layer,
+            information_state,
+            state,
+            evidence_pointer,
+            explicit_authority,
+            confidence: entry.confidence,
+            salience: entry.priority as i32 as f32 - entry.staleness,
+            title: entry.title.clone(),
+        }
+    }
+
+    /// Orientation can guide the model only when it is explainable.
+    #[must_use]
+    pub fn is_explainable_orientation(&self) -> bool {
+        self.information_state == MemoryInformationState::Orientation
+            && matches!(self.state, MemoryState::Active)
+            && (self.evidence_pointer.is_some() || self.explicit_authority)
+    }
+}
+
+/// Read-only projection for one governance layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryLayerView {
+    pub layer: MemoryLayer,
+    pub atoms: Vec<MemoryAtomView>,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum MemoryLinkKind {
+    Related,
+    Supersedes,
+    Summarizes,
+    DependsOn,
+    ProducedBy,
+    BelongsTo,
+    Mentions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryLink {
+    pub from: MemoryId,
+    pub to: MemoryId,
+    pub kind: MemoryLinkKind,
+    pub weight: f32,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryPath {
+    pub entries: Vec<MemoryAtomView>,
+    pub links: Vec<MemoryLink>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum MemoryPacketRole {
+    Orientation,
+    Supporting,
+    Warning,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryPacketItem {
+    pub atom: MemoryAtomView,
+    pub role: MemoryPacketRole,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OmittedMemory {
+    pub id: MemoryId,
+    pub title: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryContextPacket {
+    pub selected: Vec<MemoryPacketItem>,
+    pub omitted: Vec<OmittedMemory>,
+    pub token_estimate: u64,
+    pub truncated: bool,
+}
+
+impl MemoryLayerView {
+    #[must_use]
+    pub fn new(layer: MemoryLayer, atoms: Vec<MemoryAtomView>) -> Self {
+        Self {
+            layer,
+            atoms,
+            read_only: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryLifecycleEvent {
+    pub memory_id: MemoryId,
+    pub from: Option<MemoryState>,
+    pub to: MemoryState,
+    pub reason: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub occurred_at: chrono::DateTime<Utc>,
+}
+
+/// Kernel-scoped session/agent/task binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryTurnContext {
+    pub session_id: String,
+    pub project_id: Option<String>,
+    pub agent_id: String,
+    pub team_id: Option<String>,
+    pub task_id: Option<String>,
+}
+
+impl MemoryTurnContext {
+    #[must_use]
+    pub fn new(session_id: impl Into<String>, agent_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            project_id: None,
+            agent_id: agent_id.into(),
+            team_id: None,
+            task_id: None,
+        }
+    }
+}
+
+/// A degraded memory subsystem or fallback path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MemoryDegradation {
+    StoreUnavailable,
+    FtsUnavailable,
+    VectorUnavailable,
+    LinkTraversalLimited,
+    DistillationBacklog,
+    ImportFailed,
+    MalformedAtomSkipped,
+    PrepareFailed(String),
+    PostTurnFailed(String),
+}
+
+/// Product-visible memory health snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryHealth {
+    pub orientation_pressure: f32,
+    pub conflict_pressure: f32,
+    pub stale_pressure: f32,
+    pub evidence_coverage: f32,
+    pub link_coverage: f32,
+    pub background_lag_ms: Option<u64>,
+    pub degraded: Vec<MemoryDegradation>,
+}
+
+impl Default for MemoryHealth {
+    fn default() -> Self {
+        Self {
+            orientation_pressure: 0.0,
+            conflict_pressure: 0.0,
+            stale_pressure: 0.0,
+            evidence_coverage: 1.0,
+            link_coverage: 1.0,
+            background_lag_ms: None,
+            degraded: Vec::new(),
+        }
+    }
+}
+
+impl MemoryHealth {
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        !self.degraded.is_empty()
+    }
+}
+
+/// The only runtime boundary that should prepare or mutate memory for a turn.
+#[derive(Clone)]
+pub struct MemoryKernel {
+    manager: Arc<CognitiveContextManager>,
+}
+
+impl MemoryKernel {
+    #[must_use]
+    pub fn new(manager: Arc<CognitiveContextManager>) -> Self {
+        Self { manager }
+    }
+
+    #[must_use]
+    pub fn manager(&self) -> &Arc<CognitiveContextManager> {
+        &self.manager
+    }
+
+    /// Prepare memory for a turn. Backend failure degrades to an empty context
+    /// so foreground agent/session execution is not aborted by memory.
+    pub async fn prepare(
+        &self,
+        ctx: &MemoryTurnContext,
+        query: &str,
+        messages: &[Message],
+    ) -> MemoryKernelResult<PreparedContext> {
+        self.manager.set_active_session(ctx.session_id.clone());
+        self.manager.set_active_agent(ctx.agent_id.clone());
+
+        match self
+            .manager
+            .prepare_context(query, messages, Some(&ctx.session_id))
+            .await
+        {
+            Ok(mut prepared) => {
+                prepared.entries = self.filter_active_entries(prepared.entries).await;
+                prepared.total_tokens = prepared
+                    .entries
+                    .iter()
+                    .map(|entry| entry.content.len() as u64 / 4)
+                    .sum();
+                Ok(prepared)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %ctx.session_id,
+                    agent_id = %ctx.agent_id,
+                    %error,
+                    "memory kernel prepare degraded"
+                );
+                Ok(Self::empty_degraded_context())
+            }
+        }
+    }
+
+    /// Post-turn memory maintenance. Failures are degraded and non-fatal.
+    pub async fn post_turn(
+        &self,
+        ctx: &MemoryTurnContext,
+        messages: &mut Vec<Message>,
+    ) -> MemoryKernelResult<()> {
+        self.manager.set_active_session(ctx.session_id.clone());
+        self.manager.set_active_agent(ctx.agent_id.clone());
+
+        if let Err(error) = self.manager.on_turn_end(messages).await {
+            tracing::warn!(
+                session_id = %ctx.session_id,
+                agent_id = %ctx.agent_id,
+                %error,
+                "memory kernel post_turn degraded"
+            );
+        }
+        Ok(())
+    }
+
+    /// Write one memory atom through the kernel governance boundary.
+    ///
+    /// The caller supplies the semantic entry. The kernel supplies runtime
+    /// ownership metadata so agent/session writes remain auditable and scoped.
+    pub async fn remember(
+        &self,
+        ctx: &MemoryTurnContext,
+        mut entry: MemoryEntry,
+    ) -> MemoryKernelResult<()> {
+        self.manager.set_active_session(ctx.session_id.clone());
+        self.manager.set_active_agent(ctx.agent_id.clone());
+
+        entry
+            .session_id
+            .get_or_insert_with(|| ctx.session_id.clone());
+        entry
+            .source_agent
+            .get_or_insert_with(|| ctx.agent_id.clone());
+        entry.scope = scoped_entry_scope(ctx, &entry);
+
+        if entry.layer == MemoryLayer::L0
+            && !matches!(entry.source, crate::types::MemorySource::UserExplicit)
+            && ctx.agent_id != "system"
+        {
+            tracing::warn!(
+                session_id = %ctx.session_id,
+                agent_id = %ctx.agent_id,
+                "memory kernel denied non-authoritative L0 write"
+            );
+            return Ok(());
+        }
+
+        let memory_id = entry.id;
+        if let Err(error) = self.manager.remember(entry).await {
+            tracing::warn!(
+                session_id = %ctx.session_id,
+                agent_id = %ctx.agent_id,
+                %error,
+                "memory kernel remember degraded"
+            );
+        } else {
+            self.record_lifecycle_event(
+                ctx,
+                memory_id,
+                None,
+                MemoryState::Active,
+                "remembered through memory kernel",
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    pub async fn archive(
+        &self,
+        ctx: &MemoryTurnContext,
+        memory_id: MemoryId,
+        reason: impl Into<String>,
+    ) -> MemoryKernelResult<()> {
+        self.transition_state(ctx, memory_id, MemoryState::Archived, reason)
+            .await
+    }
+
+    /// Append a lifecycle transition. Evidence is not mutated.
+    pub async fn transition_state(
+        &self,
+        ctx: &MemoryTurnContext,
+        memory_id: MemoryId,
+        to: MemoryState,
+        reason: impl Into<String>,
+    ) -> MemoryKernelResult<()> {
+        let from = self.latest_state(memory_id).await.unwrap_or(None);
+        self.record_lifecycle_event(ctx, memory_id, from, to, reason)
+            .await;
+        Ok(())
+    }
+
+    pub async fn lifecycle_events(
+        &self,
+        memory_id: MemoryId,
+    ) -> MemoryKernelResult<Vec<MemoryLifecycleEvent>> {
+        Ok(self
+            .load_lifecycle_events(memory_id)
+            .await
+            .unwrap_or_default())
+    }
+
+    pub async fn filter_active_entries(&self, entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+        let mut active = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let state = self.latest_state(entry.id).await.ok().flatten();
+            if !matches!(state, Some(MemoryState::Superseded | MemoryState::Archived)) {
+                active.push(entry);
+            }
+        }
+        active
+    }
+
+    pub async fn context_packet(
+        &self,
+        ctx: &MemoryTurnContext,
+        query: &str,
+        messages: &[Message],
+        max_items: usize,
+        max_tokens: u64,
+    ) -> MemoryKernelResult<MemoryContextPacket> {
+        let prepared = self.prepare(ctx, query, messages).await?;
+        self.context_packet_from_entries(prepared.entries, max_items, max_tokens)
+            .await
+    }
+
+    pub async fn context_packet_from_entries(
+        &self,
+        entries: Vec<MemoryEntry>,
+        max_items: usize,
+        max_tokens: u64,
+    ) -> MemoryKernelResult<MemoryContextPacket> {
+        let mut selected = Vec::new();
+        let mut omitted = Vec::new();
+        let mut token_estimate = 0_u64;
+        let mut truncated = false;
+
+        for entry in entries {
+            let atom = self
+                .atom_with_lifecycle_state(&entry, MemoryInformationState::Orientation)
+                .await;
+            let item_tokens = (entry.content.len() as u64 / 4).max(1);
+            if selected.len() >= max_items
+                || token_estimate.saturating_add(item_tokens) > max_tokens
+            {
+                truncated = true;
+                omitted.push(OmittedMemory {
+                    id: entry.id,
+                    title: entry.title,
+                    reason: "packet budget exhausted".to_string(),
+                });
+                continue;
+            }
+
+            let (role, reason) = packet_role_and_reason(&atom);
+            selected.push(MemoryPacketItem { atom, role, reason });
+            token_estimate = token_estimate.saturating_add(item_tokens);
+        }
+
+        Ok(MemoryContextPacket {
+            selected,
+            omitted,
+            token_estimate,
+            truncated,
+        })
+    }
+
+    pub async fn links(&self) -> MemoryKernelResult<Vec<MemoryLink>> {
+        let entries = self.manager.list_all_entries().await?;
+        Ok(build_links(&entries))
+    }
+
+    pub async fn path_recall(
+        &self,
+        start: MemoryId,
+        max_hops: usize,
+        max_nodes: usize,
+    ) -> MemoryKernelResult<MemoryPath> {
+        let entries = self.manager.list_all_entries().await?;
+        let links = build_links(&entries);
+        let entry_by_id: std::collections::HashMap<MemoryId, &MemoryEntry> =
+            entries.iter().map(|entry| (entry.id, entry)).collect();
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::from([(start, 0usize)]);
+        let mut path_entries = Vec::new();
+        let mut path_links = Vec::new();
+        let mut truncated = false;
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(entry) = entry_by_id.get(&current) {
+                let mut atom = MemoryAtomView::from_entry(entry, MemoryInformationState::Trace);
+                if let Ok(Some(state)) = self.latest_state(entry.id).await {
+                    atom.state = state;
+                }
+                path_entries.push(atom);
+            }
+            if path_entries.len() >= max_nodes {
+                truncated = queue.front().is_some()
+                    || links
+                        .iter()
+                        .any(|link| link.from == current || link.to == current);
+                break;
+            }
+            if depth >= max_hops {
+                continue;
+            }
+
+            for link in links
+                .iter()
+                .filter(|link| link.from == current || link.to == current)
+            {
+                let next = if link.from == current {
+                    link.to
+                } else {
+                    link.from
+                };
+                if !visited.contains(&next) {
+                    path_links.push(link.clone());
+                    queue.push_back((next, depth + 1));
+                }
+                if path_entries.len() + queue.len() >= max_nodes {
+                    truncated = true;
+                    break;
+                }
+            }
+            if truncated {
+                break;
+            }
+        }
+
+        Ok(MemoryPath {
+            entries: path_entries,
+            links: path_links,
+            truncated,
+        })
+    }
+
+    pub async fn health(&self, _ctx: &MemoryTurnContext) -> MemoryKernelResult<MemoryHealth> {
+        let started = Instant::now();
+        let entries = match self.manager.list_all_entries().await {
+            Ok(entries) => entries,
+            Err(error) => {
+                return Ok(MemoryHealth {
+                    degraded: vec![MemoryDegradation::PrepareFailed(error.to_string())],
+                    background_lag_ms: Some(started.elapsed().as_millis() as u64),
+                    ..MemoryHealth::default()
+                });
+            }
+        };
+        Ok(health_from_entries(
+            &entries,
+            Some(started.elapsed().as_millis() as u64),
+        ))
+    }
+
+    /// Build a read-only projection for one governance layer.
+    pub async fn layer_view(
+        &self,
+        layer: MemoryLayer,
+        information_state: MemoryInformationState,
+    ) -> MemoryKernelResult<MemoryLayerView> {
+        let entries = self.manager.list_all_entries().await?;
+        let atoms = self
+            .atoms_with_lifecycle_state(
+                entries.iter().filter(|entry| entry.layer == layer),
+                information_state,
+            )
+            .await;
+        Ok(MemoryLayerView::new(layer, atoms))
+    }
+
+    /// Build read-only projections for all governance layers.
+    pub async fn layer_views(
+        &self,
+        information_state: MemoryInformationState,
+    ) -> MemoryKernelResult<Vec<MemoryLayerView>> {
+        let entries = self.manager.list_all_entries().await?;
+        let layers = [
+            MemoryLayer::L0,
+            MemoryLayer::L1,
+            MemoryLayer::L2,
+            MemoryLayer::L3,
+            MemoryLayer::L4,
+        ];
+        let mut views = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let atoms = self
+                .atoms_with_lifecycle_state(
+                    entries.iter().filter(|entry| entry.layer == layer),
+                    information_state,
+                )
+                .await;
+            views.push(MemoryLayerView::new(layer, atoms));
+        }
+        Ok(views)
+    }
+
+    async fn atoms_with_lifecycle_state<'a>(
+        &self,
+        entries: impl Iterator<Item = &'a MemoryEntry>,
+        information_state: MemoryInformationState,
+    ) -> Vec<MemoryAtomView> {
+        let mut atoms = Vec::new();
+        for entry in entries {
+            atoms.push(
+                self.atom_with_lifecycle_state(entry, information_state)
+                    .await,
+            );
+        }
+        atoms
+    }
+
+    async fn atom_with_lifecycle_state(
+        &self,
+        entry: &MemoryEntry,
+        information_state: MemoryInformationState,
+    ) -> MemoryAtomView {
+        let mut atom = MemoryAtomView::from_entry(entry, information_state);
+        if let Ok(Some(state)) = self.latest_state(entry.id).await {
+            atom.state = state;
+        }
+        atom
+    }
+
+    fn empty_degraded_context() -> PreparedContext {
+        PreparedContext {
+            entries: Vec::new(),
+            total_tokens: 0,
+            budget: TokenBudget {
+                total: 0,
+                reserved_system: 0,
+                reserved_response: 0,
+                allocated_memory: 0,
+                allocated_conversation: 0,
+                available: 0,
+            },
+            depth_scale: 0.0,
+            prepared_at: Utc::now(),
+            code_context: None,
+        }
+    }
+
+    async fn record_lifecycle_event(
+        &self,
+        ctx: &MemoryTurnContext,
+        memory_id: MemoryId,
+        from: Option<MemoryState>,
+        to: MemoryState,
+        reason: impl Into<String>,
+    ) {
+        let mut events = self
+            .load_lifecycle_events(memory_id)
+            .await
+            .unwrap_or_default();
+        events.push(MemoryLifecycleEvent {
+            memory_id,
+            from,
+            to,
+            reason: reason.into(),
+            session_id: ctx.session_id.clone(),
+            agent_id: ctx.agent_id.clone(),
+            occurred_at: Utc::now(),
+        });
+
+        match serde_json::to_string(&events) {
+            Ok(raw) => {
+                if let Err(error) = self
+                    .manager
+                    .kernel_kv_put(&lifecycle_key(memory_id), &raw)
+                    .await
+                {
+                    tracing::warn!(%memory_id, %error, "memory lifecycle persist degraded");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%memory_id, %error, "memory lifecycle serialize failed");
+            }
+        }
+    }
+
+    async fn latest_state(&self, memory_id: MemoryId) -> MemoryKernelResult<Option<MemoryState>> {
+        Ok(self
+            .load_lifecycle_events(memory_id)
+            .await?
+            .last()
+            .map(|event| event.to))
+    }
+
+    async fn load_lifecycle_events(
+        &self,
+        memory_id: MemoryId,
+    ) -> MemoryKernelResult<Vec<MemoryLifecycleEvent>> {
+        let raw = self
+            .manager
+            .kernel_kv_get(&lifecycle_key(memory_id))
+            .await?;
+        let Some(raw) = raw else {
+            return Ok(Vec::new());
+        };
+
+        serde_json::from_str(&raw).map_err(|error| {
+            MemoryKernelError::Backend(MemoryError::Store(format!(
+                "decode lifecycle events for {memory_id}: {error}"
+            )))
+        })
+    }
+}
+
+fn lifecycle_key(memory_id: MemoryId) -> String {
+    format!("memory_lifecycle:{memory_id}")
+}
+
+fn build_links(entries: &[MemoryEntry]) -> Vec<MemoryLink> {
+    let mut links = Vec::new();
+    let mut by_session: std::collections::HashMap<&str, Vec<MemoryId>> =
+        std::collections::HashMap::new();
+    let mut by_agent: std::collections::HashMap<&str, Vec<MemoryId>> =
+        std::collections::HashMap::new();
+    let mut by_tag: std::collections::HashMap<&str, Vec<MemoryId>> =
+        std::collections::HashMap::new();
+
+    for entry in entries {
+        for relation in &entry.relations {
+            links.push(MemoryLink {
+                from: entry.id,
+                to: relation.target_id,
+                kind: relation_kind_to_link_kind(relation.kind),
+                weight: relation.strength.clamp(0.0, 1.0),
+                evidence: format!("relation:{:?}", relation.kind),
+            });
+        }
+        if let Some(session_id) = entry.session_id.as_deref() {
+            by_session.entry(session_id).or_default().push(entry.id);
+        }
+        if let Some(agent_id) = entry.source_agent.as_deref() {
+            by_agent.entry(agent_id).or_default().push(entry.id);
+        }
+        for tag in &entry.tags {
+            by_tag.entry(tag.as_str()).or_default().push(entry.id);
+        }
+    }
+
+    add_group_links(&mut links, by_session, MemoryLinkKind::BelongsTo, "session");
+    add_group_links(&mut links, by_agent, MemoryLinkKind::ProducedBy, "agent");
+    add_group_links(&mut links, by_tag, MemoryLinkKind::Mentions, "tag");
+    links
+}
+
+fn add_group_links(
+    links: &mut Vec<MemoryLink>,
+    groups: std::collections::HashMap<&str, Vec<MemoryId>>,
+    kind: MemoryLinkKind,
+    evidence_prefix: &str,
+) {
+    for (key, ids) in groups {
+        for pair in ids.windows(2) {
+            links.push(MemoryLink {
+                from: pair[0],
+                to: pair[1],
+                kind,
+                weight: 0.5,
+                evidence: format!("{evidence_prefix}:{key}"),
+            });
+        }
+    }
+}
+
+fn relation_kind_to_link_kind(kind: crate::types::RelationKind) -> MemoryLinkKind {
+    match kind {
+        crate::types::RelationKind::DependsOn => MemoryLinkKind::DependsOn,
+        crate::types::RelationKind::Supersedes => MemoryLinkKind::Supersedes,
+        crate::types::RelationKind::Summarizes => MemoryLinkKind::Summarizes,
+        _ => MemoryLinkKind::Related,
+    }
+}
+
+fn packet_role_and_reason(atom: &MemoryAtomView) -> (MemoryPacketRole, String) {
+    match atom.state {
+        MemoryState::Conflicted => (
+            MemoryPacketRole::Conflict,
+            "memory has low confidence and needs review".to_string(),
+        ),
+        MemoryState::Stale => (
+            MemoryPacketRole::Warning,
+            "memory is stale and should be treated cautiously".to_string(),
+        ),
+        MemoryState::Candidate => (
+            MemoryPacketRole::Supporting,
+            "candidate memory can support reasoning but is not authoritative".to_string(),
+        ),
+        MemoryState::Active if atom.is_explainable_orientation() => (
+            MemoryPacketRole::Orientation,
+            "active explainable orientation memory".to_string(),
+        ),
+        MemoryState::Active => (
+            MemoryPacketRole::Supporting,
+            "active memory lacks explicit orientation evidence".to_string(),
+        ),
+        MemoryState::Superseded | MemoryState::Archived => (
+            MemoryPacketRole::Warning,
+            "inactive memory should not be used as current orientation".to_string(),
+        ),
+    }
+}
+
+fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemoryScope {
+    match &entry.scope {
+        MemoryScope::Global => {
+            if matches!(entry.visibility, AgentVisibility::Private) {
+                return MemoryScope::Agent(ctx.agent_id.clone());
+            }
+            if let Some(team_id) = &ctx.team_id {
+                return MemoryScope::Project(team_id.clone());
+            }
+            if let Some(project_id) = &ctx.project_id {
+                return MemoryScope::Project(project_id.clone());
+            }
+            MemoryScope::Session(ctx.session_id.clone())
+        }
+        MemoryScope::Project(project) if project == "default" => ctx
+            .project_id
+            .as_ref()
+            .map(|project_id| MemoryScope::Project(project_id.clone()))
+            .unwrap_or_else(|| MemoryScope::Session(ctx.session_id.clone())),
+        other => other.clone(),
+    }
+}
+
+fn health_from_entries(entries: &[MemoryEntry], background_lag_ms: Option<u64>) -> MemoryHealth {
+    if entries.is_empty() {
+        return MemoryHealth {
+            background_lag_ms,
+            ..MemoryHealth::default()
+        };
+    }
+
+    let total = entries.len() as f32;
+    let orientation_like = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.layer,
+                MemoryLayer::L0 | MemoryLayer::L1 | MemoryLayer::L2
+            )
+        })
+        .count() as f32;
+    let conflicted = entries
+        .iter()
+        .filter(|entry| entry.confidence < 0.35)
+        .count() as f32;
+    let stale = entries
+        .iter()
+        .filter(|entry| entry.staleness >= 1.0)
+        .count() as f32;
+    let evidence_backed = entries
+        .iter()
+        .filter(|entry| {
+            matches!(entry.layer, MemoryLayer::L0 | MemoryLayer::L1)
+                || matches!(
+                    entry.source,
+                    crate::types::MemorySource::UserExplicit | crate::types::MemorySource::Import
+                )
+                || matches!(
+                    entry.layer,
+                    MemoryLayer::L2 | MemoryLayer::L3 | MemoryLayer::L4
+                )
+        })
+        .count() as f32;
+    let linked = entries
+        .iter()
+        .filter(|entry| !entry.relations.is_empty() || !entry.tags.is_empty())
+        .count() as f32;
+
+    MemoryHealth {
+        orientation_pressure: (orientation_like / total).clamp(0.0, 1.0),
+        conflict_pressure: (conflicted / total).clamp(0.0, 1.0),
+        stale_pressure: (stale / total).clamp(0.0, 1.0),
+        evidence_coverage: (evidence_backed / total).clamp(0.0, 1.0),
+        link_coverage: (linked / total).clamp(0.0, 1.0),
+        background_lag_ms,
+        degraded: Vec::new(),
+    }
+}

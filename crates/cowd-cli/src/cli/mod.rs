@@ -6,9 +6,9 @@ pub fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     match mode {
         "read-only" | "readonly" | "read_only" => Some("read-only"),
         "workspace-write" | "workspacewrite" | "workspace_write" => Some("workspace-write"),
-        "danger-full-access" | "dangerfull" | "dangerFullAccess" | "danger_full_access" => Some(
-            "danger-full-access",
-        ),
+        "danger-full-access" | "dangerfull" | "dangerFullAccess" | "danger_full_access" => {
+            Some("danger-full-access")
+        }
         "prompt" => Some("prompt"),
         _ => None,
     }
@@ -23,11 +23,15 @@ pub fn permission_mode_from_label(mode: &str) -> runtime::PermissionMode {
     }
 }
 
-pub fn permission_mode_from_resolved(mode: runtime::ResolvedPermissionMode) -> runtime::PermissionMode {
+pub fn permission_mode_from_resolved(
+    mode: runtime::ResolvedPermissionMode,
+) -> runtime::PermissionMode {
     match mode {
         runtime::ResolvedPermissionMode::ReadOnly => runtime::PermissionMode::ReadOnly,
         runtime::ResolvedPermissionMode::WorkspaceWrite => runtime::PermissionMode::WorkspaceWrite,
-        runtime::ResolvedPermissionMode::DangerFullAccess => runtime::PermissionMode::DangerFullAccess,
+        runtime::ResolvedPermissionMode::DangerFullAccess => {
+            runtime::PermissionMode::DangerFullAccess
+        }
     }
 }
 

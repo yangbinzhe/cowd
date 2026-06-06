@@ -39,19 +39,22 @@ fn make_session(store: &SqliteSessionStore, id: &str) {
             input_tokens: 0,
             output_tokens: 0,
             estimated_cost_usd: 0.0,
+            status: "active".to_string(),
         })
         .expect("create session");
 }
 
-fn make_message(session_id: &str, sequence: usize, role: &str, content_text: &str) -> SessionMessage {
+fn make_message(
+    session_id: &str,
+    sequence: usize,
+    role: &str,
+    content_text: &str,
+) -> SessionMessage {
     SessionMessage {
         session_id: session_id.to_string(),
         sequence,
         role: role.to_string(),
-        content_json: format!(
-            r#"[{{"type":"text","text":"{}"}}]"#,
-            content_text
-        ),
+        content_json: format!(r#"[{{"type":"text","text":"{}"}}]"#, content_text),
         blocks_count: 1,
         tool_use_id: None,
         tool_name: None,
@@ -107,7 +110,10 @@ fn message_persistence_schema_exists() {
             |row| row.get(0),
         )
         .expect("count message indexes");
-    assert!(idx_count >= 2, "idx_messages_session and idx_messages_session_seq should exist");
+    assert!(
+        idx_count >= 2,
+        "idx_messages_session and idx_messages_session_seq should exist"
+    );
 
     // Check FTS virtual table
     let fts_count: i64 = conn
@@ -127,7 +133,10 @@ fn message_persistence_schema_exists() {
             |row| row.get(0),
         )
         .expect("count message triggers");
-    assert_eq!(trigger_count, 3, "messages_fts_ai, messages_fts_ad, messages_fts_au should exist");
+    assert_eq!(
+        trigger_count, 3,
+        "messages_fts_ai, messages_fts_ad, messages_fts_au should exist"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +251,12 @@ fn message_persistence_fts_english() {
     make_session(&store, "sess-en");
 
     store
-        .insert_message(&make_message("sess-en", 0, "user", "How do I write a Rust async function?"))
+        .insert_message(&make_message(
+            "sess-en",
+            0,
+            "user",
+            "How do I write a Rust async function?",
+        ))
         .expect("insert 1");
     store
         .insert_message(&make_message(
@@ -253,7 +267,12 @@ fn message_persistence_fts_english() {
         ))
         .expect("insert 2");
     store
-        .insert_message(&make_message("sess-en", 2, "user", "Thanks, that is helpful."))
+        .insert_message(&make_message(
+            "sess-en",
+            2,
+            "user",
+            "Thanks, that is helpful.",
+        ))
         .expect("insert 3");
 
     // Search for "async"
@@ -263,7 +282,9 @@ fn message_persistence_fts_english() {
     assert!(!results.is_empty(), "should find messages about async");
     // The assistant message should match
     assert!(
-        results.iter().any(|m| m.content_json.contains("async keyword")),
+        results
+            .iter()
+            .any(|m| m.content_json.contains("async keyword")),
         "should find the async explanation"
     );
 
@@ -284,7 +305,12 @@ fn message_persistence_fts_chinese() {
     make_session(&store, "sess-zh");
 
     store
-        .insert_message(&make_message("sess-zh", 0, "user", "你能解释一下什么是异步编程吗？"))
+        .insert_message(&make_message(
+            "sess-zh",
+            0,
+            "user",
+            "你能解释一下什么是异步编程吗？",
+        ))
         .expect("insert zh 1");
     store
         .insert_message(&make_message(
@@ -300,7 +326,10 @@ fn message_persistence_fts_chinese() {
     let results = store
         .search_messages("异步*", Some("sess-zh"), 10)
         .expect("search zh messages");
-    assert!(!results.is_empty(), "should find Chinese messages about async");
+    assert!(
+        !results.is_empty(),
+        "should find Chinese messages about async"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +360,10 @@ fn message_persistence_multi_block() {
     let results2 = store
         .search_messages("result", Some("sess-mb"), 10)
         .expect("search for result");
-    assert!(!results2.is_empty(), "should find message with 'result' text");
+    assert!(
+        !results2.is_empty(),
+        "should find message with 'result' text"
+    );
 
     // Tool name search via the tool_name column
     let results3 = store

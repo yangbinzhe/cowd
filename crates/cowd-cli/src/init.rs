@@ -115,8 +115,15 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
         // Copy permissions.defaultMode from legacy .claude.json to config.local.yaml
         if let Ok(content) = fs::read_to_string(&claude_json) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(mode) = val.get("permissions").and_then(|p| p.get("defaultMode")).and_then(|m| m.as_str()) {
-                    fs::write(&project_local, format!("permissions:\n  default_mode: {mode}\n"))?;
+                if let Some(mode) = val
+                    .get("permissions")
+                    .and_then(|p| p.get("defaultMode"))
+                    .and_then(|m| m.as_str())
+                {
+                    fs::write(
+                        &project_local,
+                        format!("permissions:\n  defaultMode: {mode}\n"),
+                    )?;
                     artifacts.push(InitArtifact {
                         name: ".cowd/config.local.yaml (migrated from .claude.json)",
                         status: InitStatus::Created,
@@ -257,7 +264,8 @@ pub(crate) fn render_init_claude_md(cwd: &Path) -> String {
     let mut lines = vec![
         "# CLAUDE.md".to_string(),
         String::new(),
-        "This file provides guidance to Cowd (cowd.dev) when working with code in this repository.".to_string(),
+        "This file provides guidance to Cowd (cowd.dev) when working with code in this repository."
+            .to_string(),
         String::new(),
     ];
 
@@ -471,9 +479,10 @@ mod tests {
         fs::write(root.join(".gitignore"), ".cowd/config.local.yaml\n").expect("write gitignore");
 
         let first = initialize_repo(&root).expect("first init should succeed");
-        assert!(first
-            .render()
-            .contains("CLAUDE.md") && first.render().contains("skipped (already exists)"));
+        assert!(
+            first.render().contains("CLAUDE.md")
+                && first.render().contains("skipped (already exists)")
+        );
         let second = initialize_repo(&root).expect("second init should succeed");
         let second_rendered = second.render();
         assert!(second_rendered.contains(".cowd/"));

@@ -1,8 +1,6 @@
-
-
+use crate::{CliOutputFormat, VERSION};
 use runtime::{McpServer, McpServerSpec, McpTool};
 use tools::{execute_tool, mvp_tool_specs};
-use crate::{CliOutputFormat, VERSION};
 /// Starts a minimal Model Context Protocol server that exposes cowd's
 /// built-in tools over stdio.
 ///
@@ -12,7 +10,9 @@ use crate::{CliOutputFormat, VERSION};
 /// This is the file-based worker observability surface: `push_event()` in `worker_boot.rs`
 /// atomically writes state transitions here so external observers (cowd-orchestrator, orchestrators)
 /// can poll current `WorkerStatus` without needing an HTTP route on the opencode binary.
-pub(crate) fn run_worker_state(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_worker_state(
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let state_path = runtime::cowd_dirs::worker_state_path();
     if !state_path.exists() {
         // Emit a structured error, then return Err so the process exits 1.

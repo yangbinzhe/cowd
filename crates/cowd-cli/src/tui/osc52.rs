@@ -92,6 +92,8 @@ mod tests {
     #[test]
     fn osc52_sequence_structure() {
         let seq = build_osc52_sequence("c", "aGVsbG8=");
-        assert!(seq.contains("\x1b]52;c;aGVsbG8=\x07") || seq.contains("tmux") || seq.contains("P"));
+        assert!(
+            seq.contains("\x1b]52;c;aGVsbG8=\x07") || seq.contains("tmux") || seq.contains("P")
+        );
     }
 }

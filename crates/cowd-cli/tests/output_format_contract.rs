@@ -209,7 +209,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert!(summary["failures"].as_u64().is_some());
 
     let checks = doctor["checks"].as_array().expect("doctor checks");
-    assert_eq!(checks.len(), 6);
+    assert_eq!(checks.len(), 7);
     let check_names = checks
         .iter()
         .map(|check| {
@@ -227,9 +227,27 @@ fn doctor_and_resume_status_emit_json_when_requested() {
             "install source",
             "workspace",
             "sandbox",
-            "system"
+            "system",
+            "enterprise readiness"
         ]
     );
+    let readiness = checks
+        .iter()
+        .find(|check| check["name"] == "enterprise readiness")
+        .expect("enterprise readiness check");
+    let components = readiness["components"]
+        .as_object()
+        .expect("readiness components");
+    for component in ["webui", "tui", "session", "memory", "provider"] {
+        assert!(
+            components
+                .get(component)
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.as_str())
+                .is_some(),
+            "missing readiness component {component}"
+        );
+    }
 
     let install_source = checks
         .iter()
@@ -239,10 +257,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         install_source["official_repo"],
         "https://github.com/ultraworkers/cowd"
     );
-    assert_eq!(
-        install_source["deprecated_install"],
-        "cargo install cowd"
-    );
+    assert_eq!(install_source["deprecated_install"], "cargo install cowd");
 
     let workspace = checks
         .iter()
@@ -387,12 +402,15 @@ fn run_cowd(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output 
         if *key == "COWD_CONFIG_HOME" {
             let config_dir = Path::new(value);
             let _ = fs::create_dir_all(config_dir);
-            let _ = fs::write(config_dir.join("config.yaml"), "model: \"sonnet\"\n\
+            let _ = fs::write(
+                config_dir.join("config.yaml"),
+                "model: \"sonnet\"\n\
                 providers:\n  anthropic:\n    base_url: \"https://api.anthropic.com/v1\"\n    \
                 api_key: \"test-key\"\n    models: [\"sonnet\"]\n    protocol: \"anthropic\"\n\
                 permissions:\n  defaultMode: \"acceptEdits\"\n  allow: []\n  deny: []\n  ask: []\n\
                 memory:\n  enabled: false\n\
-                gateway:\n  enabled: false\n");
+                gateway:\n  enabled: false\n",
+            );
             break;
         }
     }

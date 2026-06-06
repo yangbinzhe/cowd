@@ -16,7 +16,8 @@ use std::path::Path;
 use chrono::Utc;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::{error::MemoryError, store::Result};
 
@@ -59,8 +60,6 @@ fn set_conn_pragmas(conn: &Connection) -> Result<()> {
 // Schema DDL
 // ---------------------------------------------------------------------------
 
-
-
 /// FTS5 search result for sessions.
 #[derive(Debug, Clone)]
 pub struct SessionSearchResult {
@@ -73,6 +72,26 @@ pub struct SessionSearchResult {
     pub message_count: i64,
     /// Highlighted snippet from metadata_json
     pub snippet: Option<String>,
+}
+
+/// Filter/sort/page options for DB-backed session listing.
+#[derive(Debug, Clone, Default)]
+pub struct SessionListOptions<'a> {
+    pub query: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub sort: &'a str,
+    pub order: &'a str,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+/// A page of session records plus the total number of rows matching the
+/// filters before pagination.
+#[derive(Debug, Clone)]
+pub struct SessionListPage {
+    pub records: Vec<SessionRecord>,
+    pub total: usize,
 }
 
 /// A single message within a conversation session.
@@ -147,6 +166,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
         END",
         r"CREATE INDEX IF NOT EXISTS idx_sessions_platform      ON sessions(platform)",
         r"CREATE INDEX IF NOT EXISTS idx_sessions_last_activity ON sessions(last_activity)",
+        r"CREATE INDEX IF NOT EXISTS idx_sessions_status_model_last_activity
+            ON sessions(status COLLATE NOCASE, model COLLATE NOCASE, last_activity DESC)",
+        r"CREATE INDEX IF NOT EXISTS idx_sessions_model_last_activity
+            ON sessions(model COLLATE NOCASE, last_activity DESC)",
+        r"CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at)",
+        r"CREATE INDEX IF NOT EXISTS idx_sessions_message_count ON sessions(message_count)",
         r"CREATE TABLE IF NOT EXISTS messages (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id      TEXT NOT NULL,
@@ -200,6 +225,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
         )",
         r"CREATE INDEX IF NOT EXISTS idx_session_events_session     ON session_events(session_id)",
         r"CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, sequence)",
+        r"CREATE INDEX IF NOT EXISTS idx_session_events_session_type_seq
+            ON session_events(session_id, event_type, sequence)",
         r"CREATE TABLE IF NOT EXISTS session_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
@@ -210,12 +237,80 @@ fn init_schema(conn: &Connection) -> Result<()> {
         )",
         r"CREATE INDEX IF NOT EXISTS idx_session_snapshots_session ON session_snapshots(session_id)",
         r"CREATE INDEX IF NOT EXISTS idx_session_snapshots_latest  ON session_snapshots(session_id, event_idx DESC)",
-
     ];
 
     for stmt in statements {
         conn.execute_batch(stmt).map_err(sql_err)?;
     }
+
+    let existing_session_columns = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(sql_err)?;
+        let mut columns = std::collections::BTreeSet::new();
+        for row in rows {
+            columns.insert(row.map_err(sql_err)?);
+        }
+        columns
+    };
+    if !existing_session_columns.contains("input_tokens") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    if !existing_session_columns.contains("output_tokens") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    if !existing_session_columns.contains("estimated_cost_usd") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN estimated_cost_usd REAL NOT NULL DEFAULT 0.0",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    if !existing_session_columns.contains("status") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)",
+        [],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        r"CREATE INDEX IF NOT EXISTS idx_sessions_status_model_last_activity
+            ON sessions(status COLLATE NOCASE, model COLLATE NOCASE, last_activity DESC)",
+        [],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        r"CREATE INDEX IF NOT EXISTS idx_sessions_model_last_activity
+            ON sessions(model COLLATE NOCASE, last_activity DESC)",
+        [],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at)",
+        [],
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_message_count ON sessions(message_count)",
+        [],
+    )
+    .map_err(sql_err)?;
 
     conn.execute_batch("COMMIT;").map_err(sql_err)?;
     Ok(())
@@ -254,6 +349,8 @@ pub struct SessionRecord {
     pub output_tokens: i64,
     /// Estimated total cost in USD.
     pub estimated_cost_usd: f64,
+    /// Lifecycle status (`active`, `closed`, etc.).
+    pub status: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +372,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         input_tokens: row.get(10)?,
         output_tokens: row.get(11)?,
         estimated_cost_usd: row.get(12)?,
+        status: row.get(13)?,
     })
 }
 
@@ -341,6 +439,74 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSnapshot>
     })
 }
 
+fn escape_like_pattern(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn session_sort_expression(sort: &str) -> &'static str {
+    match sort {
+        "created_at" => "created_at",
+        "message_count" => "message_count",
+        "model" => "COALESCE(model, '') COLLATE NOCASE",
+        "title" => "COALESCE(json_extract(metadata_json, '$.title'), '') COLLATE NOCASE",
+        _ => "last_activity",
+    }
+}
+
+fn session_sort_order(order: &str) -> &'static str {
+    if order.eq_ignore_ascii_case("asc") {
+        "ASC"
+    } else {
+        "DESC"
+    }
+}
+
+fn session_list_where_clause(opts: &SessionListOptions<'_>) -> (String, Vec<Value>) {
+    let mut where_parts: Vec<&'static str> = Vec::new();
+    let mut values = Vec::new();
+
+    if let Some(status) = opts.status.map(str::trim).filter(|s| !s.is_empty()) {
+        where_parts.push("status = ? COLLATE NOCASE");
+        values.push(Value::Text(status.to_string()));
+    }
+    if let Some(model) = opts.model.map(str::trim).filter(|s| !s.is_empty()) {
+        where_parts.push("model = ? COLLATE NOCASE");
+        values.push(Value::Text(model.to_string()));
+    }
+    if let Some(query) = opts.query.map(str::trim).filter(|s| !s.is_empty()) {
+        where_parts.push(
+            "(session_id LIKE ? ESCAPE '\\' COLLATE NOCASE
+              OR platform LIKE ? ESCAPE '\\' COLLATE NOCASE
+              OR chat_id LIKE ? ESCAPE '\\' COLLATE NOCASE
+              OR COALESCE(user_id, '') LIKE ? ESCAPE '\\' COLLATE NOCASE
+              OR COALESCE(model, '') LIKE ? ESCAPE '\\' COLLATE NOCASE
+              OR status LIKE ? ESCAPE '\\' COLLATE NOCASE
+              OR COALESCE(metadata_json, '') LIKE ? ESCAPE '\\' COLLATE NOCASE)",
+        );
+        let pattern = format!("%{}%", escape_like_pattern(query));
+        for _ in 0..7 {
+            values.push(Value::Text(pattern.clone()));
+        }
+    }
+
+    let clause = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+    (clause, values)
+}
+
 // ---------------------------------------------------------------------------
 // SqliteSessionStore
 // ---------------------------------------------------------------------------
@@ -398,7 +564,10 @@ impl SqliteSessionStore {
     }
 
     pub fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
-        let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemoryError::Store(e.to_string()))?;
         set_conn_pragmas(&conn)?;
         Ok(conn)
     }
@@ -417,8 +586,8 @@ impl SqliteSessionStore {
             r"INSERT OR IGNORE INTO sessions
                (session_id, platform, chat_id, user_id, model,
                 created_at, last_activity, message_count, reset_policy, metadata_json,
-                input_tokens, output_tokens, estimated_cost_usd)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                input_tokens, output_tokens, estimated_cost_usd, status)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 session.session_id,
                 session.platform,
@@ -433,6 +602,7 @@ impl SqliteSessionStore {
                 session.input_tokens,
                 session.output_tokens,
                 session.estimated_cost_usd,
+                session.status,
             ],
         )
         .map_err(sql_err)?;
@@ -445,7 +615,7 @@ impl SqliteSessionStore {
         conn.query_row(
             r"SELECT session_id, platform, chat_id, user_id, model,
                       created_at, last_activity, message_count, reset_policy, metadata_json,
-                      input_tokens, output_tokens, estimated_cost_usd
+                      input_tokens, output_tokens, estimated_cost_usd, status
                FROM sessions WHERE session_id = ?1",
             params![session_id],
             row_to_record,
@@ -472,7 +642,8 @@ impl SqliteSessionStore {
                metadata_json = ?9,
                input_tokens  = ?10,
                output_tokens = ?11,
-               estimated_cost_usd = ?12
+               estimated_cost_usd = ?12,
+               status = ?13
                WHERE session_id = ?1",
             params![
                 session.session_id,
@@ -487,6 +658,7 @@ impl SqliteSessionStore {
                 session.input_tokens,
                 session.output_tokens,
                 session.estimated_cost_usd,
+                session.status,
             ],
         )
         .map_err(sql_err)?;
@@ -503,8 +675,8 @@ impl SqliteSessionStore {
             r"INSERT OR REPLACE INTO sessions
                (session_id, platform, chat_id, user_id, model,
                 created_at, last_activity, message_count, reset_policy, metadata_json,
-                input_tokens, output_tokens, estimated_cost_usd)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                input_tokens, output_tokens, estimated_cost_usd, status)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 session.session_id,
                 session.platform,
@@ -519,6 +691,7 @@ impl SqliteSessionStore {
                 session.input_tokens,
                 session.output_tokens,
                 session.estimated_cost_usd,
+                session.status,
             ],
         )
         .map_err(sql_err)?;
@@ -551,7 +724,7 @@ impl SqliteSessionStore {
             .prepare(
                 r"SELECT session_id, platform, chat_id, user_id, model,
                           created_at, last_activity, message_count, reset_policy, metadata_json,
-                          input_tokens, output_tokens, estimated_cost_usd
+                          input_tokens, output_tokens, estimated_cost_usd, status
                    FROM sessions ORDER BY last_activity DESC",
             )
             .map_err(sql_err)?;
@@ -563,6 +736,50 @@ impl SqliteSessionStore {
         Ok(records)
     }
 
+    /// List a filtered, sorted page of sessions directly in SQLite.
+    ///
+    /// This is the API-facing path for large workspaces. It avoids loading all
+    /// sessions into memory before filtering and paginating.
+    pub fn list_sessions_page(&self, opts: &SessionListOptions<'_>) -> Result<SessionListPage> {
+        let conn = self.conn()?;
+        let limit = opts.limit.max(1).min(500);
+        let offset = opts.offset;
+        let (where_sql, mut values) = session_list_where_clause(opts);
+
+        let count_sql = format!("SELECT COUNT(*) FROM sessions{where_sql}");
+        let total: i64 = conn
+            .query_row(&count_sql, params_from_iter(values.iter()), |row| {
+                row.get(0)
+            })
+            .map_err(sql_err)?;
+
+        let sort_expr = session_sort_expression(opts.sort);
+        let sort_order = session_sort_order(opts.order);
+        let page_sql = format!(
+            r"SELECT session_id, platform, chat_id, user_id, model,
+                      created_at, last_activity, message_count, reset_policy, metadata_json,
+                      input_tokens, output_tokens, estimated_cost_usd, status
+                 FROM sessions{where_sql}
+                ORDER BY {sort_expr} {sort_order}, session_id ASC
+                LIMIT ? OFFSET ?"
+        );
+        values.push(Value::Integer(limit as i64));
+        values.push(Value::Integer(offset as i64));
+
+        let mut stmt = conn.prepare(&page_sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params_from_iter(values.iter()), row_to_record)
+            .map_err(sql_err)?;
+        let mut records = Vec::new();
+        for r in rows {
+            records.push(r.map_err(sql_err)?);
+        }
+        Ok(SessionListPage {
+            records,
+            total: total as usize,
+        })
+    }
+
     /// List all sessions for a given platform, ordered by `last_activity DESC`.
     pub fn list_sessions_by_platform(&self, platform: &str) -> Result<Vec<SessionRecord>> {
         let conn = self.conn()?;
@@ -570,7 +787,7 @@ impl SqliteSessionStore {
             .prepare(
                 r"SELECT session_id, platform, chat_id, user_id, model,
                           created_at, last_activity, message_count, reset_policy, metadata_json,
-                          input_tokens, output_tokens, estimated_cost_usd
+                          input_tokens, output_tokens, estimated_cost_usd, status
                    FROM sessions WHERE platform = ?1 ORDER BY last_activity DESC",
             )
             .map_err(sql_err)?;
@@ -810,6 +1027,42 @@ impl SqliteSessionStore {
         Ok(msgs)
     }
 
+    /// Retrieve messages for a session starting at `from_sequence`.
+    ///
+    /// This keyset-style path is stable for deep history paging because it
+    /// uses the `(session_id, sequence)` index instead of scanning through a
+    /// large OFFSET window.
+    pub fn get_messages_from_sequence(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                r"SELECT session_id, sequence, role, content_json,
+                          blocks_count, tool_use_id, tool_name,
+                          token_usage_json, created_at_ms
+                   FROM messages
+                  WHERE session_id = ?1 AND sequence >= ?2
+                  ORDER BY sequence ASC
+                  LIMIT ?3",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(
+                params![session_id, from_sequence as i64, limit as i64],
+                row_to_message,
+            )
+            .map_err(sql_err)?;
+        let mut msgs = Vec::new();
+        for r in rows {
+            msgs.push(r.map_err(sql_err)?);
+        }
+        Ok(msgs)
+    }
+
     /// Retrieve ALL messages for a session (unbounded, no pagination).
     pub fn get_all_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
         let conn = self.conn()?;
@@ -820,13 +1073,19 @@ impl SqliteSessionStore {
                  FROM messages WHERE session_id = ?1 ORDER BY sequence ASC",
             )
             .map_err(sql_err)?;
-        let rows = stmt.query_map(params![session_id], row_to_message).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![session_id], row_to_message)
+            .map_err(sql_err)?;
         let mut messages = Vec::new();
         for row in rows {
             messages.push(row.map_err(sql_err)?);
         }
         if messages.len() > 1000 {
-            tracing::warn!(session_id, count = messages.len(), "get_all_messages: large session, consider pagination");
+            tracing::warn!(
+                session_id,
+                count = messages.len(),
+                "get_all_messages: large session, consider pagination"
+            );
         }
         Ok(messages)
     }
@@ -847,11 +1106,7 @@ impl SqliteSessionStore {
     /// Delete all messages in a session starting from `from_sequence` (inclusive).
     ///
     /// Returns the number of rows deleted.
-    pub fn delete_messages_from(
-        &self,
-        session_id: &str,
-        from_sequence: usize,
-    ) -> Result<usize> {
+    pub fn delete_messages_from(&self, session_id: &str, from_sequence: usize) -> Result<usize> {
         let conn = self.conn()?;
         let removed = conn
             .execute(
@@ -943,11 +1198,7 @@ impl SqliteSessionStore {
 
     /// Retrieve events for a session starting from `from_seq` (inclusive).
     /// Ordered by sequence ascending.
-    pub fn get_events(
-        &self,
-        session_id: &str,
-        from_seq: usize,
-    ) -> Result<Vec<SessionEvent>> {
+    pub fn get_events(&self, session_id: &str, from_seq: usize) -> Result<Vec<SessionEvent>> {
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare(
@@ -965,6 +1216,162 @@ impl SqliteSessionStore {
             events.push(r.map_err(sql_err)?);
         }
         Ok(events)
+    }
+
+    /// Retrieve at most `limit` events for a session starting from `from_seq`.
+    /// Ordered by sequence ascending.
+    pub fn get_events_limited(
+        &self,
+        session_id: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+                 FROM session_events
+                 WHERE session_id = ?1 AND sequence >= ?2
+                 ORDER BY sequence ASC
+                 LIMIT ?3",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(
+                params![session_id, from_seq as i64, limit as i64],
+                row_to_event,
+            )
+            .map_err(sql_err)?;
+        let mut events = Vec::new();
+        for r in rows {
+            events.push(r.map_err(sql_err)?);
+        }
+        Ok(events)
+    }
+
+    /// Retrieve at most `limit` events of one type for a session.
+    /// Ordered by sequence ascending.
+    pub fn get_events_by_type_limited(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+                 FROM session_events
+                 WHERE session_id = ?1 AND event_type = ?2 AND sequence >= ?3
+                 ORDER BY sequence ASC
+                 LIMIT ?4",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(
+                params![session_id, event_type, from_seq as i64, limit as i64],
+                row_to_event,
+            )
+            .map_err(sql_err)?;
+        let mut events = Vec::new();
+        for r in rows {
+            events.push(r.map_err(sql_err)?);
+        }
+        Ok(events)
+    }
+
+    /// Count events for a session starting from `from_seq`.
+    pub fn count_events_from(&self, session_id: &str, from_seq: usize) -> Result<usize> {
+        let conn = self.conn()?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = ?1 AND sequence >= ?2",
+                params![session_id, from_seq as i64],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        Ok(count as usize)
+    }
+
+    /// Count events of one type for a session starting from `from_seq`.
+    pub fn count_events_by_type_from(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_seq: usize,
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = ?1 AND event_type = ?2 AND sequence >= ?3",
+                params![session_id, event_type, from_seq as i64],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        Ok(count as usize)
+    }
+
+    /// Retrieve a context envelope event by its envelope id.
+    pub fn get_context_event_by_envelope_id(
+        &self,
+        envelope_id: &str,
+    ) -> Result<Option<SessionEvent>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            r"SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+              FROM session_events
+              WHERE event_type = 'ContextEnvelope'
+                AND json_extract(event_json, '$.envelope.id') = ?1
+              ORDER BY created_at_ms DESC
+              LIMIT 1",
+            params![envelope_id],
+            row_to_event,
+        )
+        .optional()
+        .map_err(sql_err)
+    }
+
+    /// Return the next append sequence for a session event.
+    pub fn next_event_sequence(&self, session_id: &str) -> Result<usize> {
+        let conn = self.conn()?;
+        let next: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 0) FROM session_events WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        Ok(next.max(0) as usize)
+    }
+
+    /// Delete all events from `from_sequence` onward in a session.
+    pub fn delete_events_from(&self, session_id: &str, from_sequence: usize) -> Result<usize> {
+        let conn = self.conn()?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM session_events WHERE session_id = ?1 AND sequence >= ?2",
+                params![session_id, from_sequence as i64],
+            )
+            .map_err(sql_err)?;
+        Ok(deleted)
+    }
+
+    /// Delete events of one type from `from_sequence` onward in a session.
+    pub fn delete_events_by_type_from(
+        &self,
+        session_id: &str,
+        event_type: &str,
+        from_sequence: usize,
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM session_events WHERE session_id = ?1 AND event_type = ?2 AND sequence >= ?3",
+                params![session_id, event_type, from_sequence as i64],
+            )
+            .map_err(sql_err)?;
+        Ok(deleted)
     }
 
     /// Save a full-message-list snapshot at a given event index.
@@ -986,10 +1393,7 @@ impl SqliteSessionStore {
     }
 
     /// Return the most recent snapshot for a session, or `None`.
-    pub fn get_latest_snapshot(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<SessionSnapshot>> {
+    pub fn get_latest_snapshot(&self, session_id: &str) -> Result<Option<SessionSnapshot>> {
         let conn = self.conn()?;
         conn.query_row(
             "SELECT id, session_id, event_idx, messages_json, created_at_ms
@@ -1058,7 +1462,9 @@ impl SqliteSessionStore {
                         for entry in entries.flatten() {
                             let name = entry.file_name();
                             let name_str = name.to_string_lossy();
-                            if name_str.starts_with(&format!("{id}.rot-")) && name_str.ends_with(".jsonl") {
+                            if name_str.starts_with(&format!("{id}.rot-"))
+                                && name_str.ends_with(".jsonl")
+                            {
                                 let _ = std::fs::remove_file(entry.path());
                             }
                         }
@@ -1115,6 +1521,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             estimated_cost_usd: 0.0,
+            status: "active".to_string(),
         }
     }
 
@@ -1171,6 +1578,428 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_page_filters_sorts_and_counts_at_scale() {
+        let (store, _dir) = make_store();
+        {
+            let mut conn = store.conn().unwrap();
+            let tx = conn.transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        r"INSERT INTO sessions
+                           (session_id, platform, chat_id, user_id, model,
+                            created_at, last_activity, message_count, reset_policy, metadata_json,
+                            input_tokens, output_tokens, estimated_cost_usd, status)
+                           VALUES (?1, 'api_server', ?1, NULL, ?2, ?3, ?3, ?4, 'none', ?5, 0, 0, 0.0, ?6)",
+                    )
+                    .unwrap();
+                for i in 0..10_000 {
+                    let model = if i % 2 == 0 {
+                        "claude-sonnet-4-6"
+                    } else {
+                        "claude-haiku-4-5"
+                    };
+                    let status = if i % 3 == 0 { "active" } else { "closed" };
+                    let ts = format!(
+                        "2026-06-04T{:02}:{:02}:{:02}Z",
+                        (i / 3600) % 24,
+                        (i / 60) % 60,
+                        i % 60
+                    );
+                    let title =
+                        serde_json::json!({"title": format!("Perf Session {i:05}")}).to_string();
+                    stmt.execute(params![
+                        format!("perf-{i:05}"),
+                        model,
+                        ts,
+                        i as i64,
+                        title,
+                        status
+                    ])
+                    .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        let page = store
+            .list_sessions_page(&SessionListOptions {
+                model: Some("claude-sonnet-4-6"),
+                status: Some("active"),
+                sort: "last_activity",
+                order: "desc",
+                limit: 7,
+                offset: 0,
+                ..SessionListOptions::default()
+            })
+            .unwrap();
+
+        assert_eq!(page.total, 1667);
+        assert_eq!(page.records.len(), 7);
+        assert!(
+            page.records
+                .windows(2)
+                .all(|pair| pair[0].last_activity >= pair[1].last_activity)
+        );
+        assert!(
+            page.records
+                .iter()
+                .all(|r| r.model.as_deref() == Some("claude-sonnet-4-6") && r.status == "active")
+        );
+    }
+
+    #[test]
+    fn list_sessions_page_escapes_like_wildcards() {
+        let (store, _dir) = make_store();
+        let mut literal = make_record("literal-percent");
+        literal.metadata_json = Some(serde_json::json!({"title":"Auth% Literal"}).to_string());
+        store.create_session(&literal).unwrap();
+
+        let mut wildcard = make_record("wildcard-match");
+        wildcard.metadata_json = Some(serde_json::json!({"title":"Auth Wildcard"}).to_string());
+        store.create_session(&wildcard).unwrap();
+
+        let page = store
+            .list_sessions_page(&SessionListOptions {
+                query: Some("Auth%"),
+                limit: 20,
+                ..SessionListOptions::default()
+            })
+            .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.records[0].session_id, "literal-percent");
+    }
+
+    #[test]
+    fn status_model_recent_session_query_uses_composite_index() {
+        let (store, _dir) = make_store();
+        store.create_session(&make_record("s-index")).unwrap();
+        let conn = store.conn().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r"EXPLAIN QUERY PLAN
+                  SELECT session_id FROM sessions
+                  WHERE status = ?1 COLLATE NOCASE AND model = ?2 COLLATE NOCASE
+                  ORDER BY last_activity DESC
+                  LIMIT 20 OFFSET 0",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["active", "claude-sonnet-4-6"], |row| row.get(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let plan_text = plan.join(" | ");
+        assert!(
+            plan_text.contains("idx_sessions_status_model_last_activity"),
+            "expected composite index in query plan, got: {plan_text}"
+        );
+    }
+
+    #[test]
+    fn get_events_limited_pages_from_sequence_and_counts_total() {
+        let (store, _dir) = make_store();
+        store.create_session(&make_record("s-events")).unwrap();
+        for i in 0..1000 {
+            store
+                .append_event(&SessionEvent {
+                    session_id: "s-events".to_string(),
+                    event_type: "message_appended".to_string(),
+                    event_json: serde_json::json!({"sequence": i}).to_string(),
+                    sequence: i,
+                    created_at_ms: i as u64,
+                })
+                .unwrap();
+        }
+
+        let events = store.get_events_limited("s-events", 990, 5).unwrap();
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0].sequence, 990);
+        assert_eq!(events[4].sequence, 994);
+        assert_eq!(store.count_events_from("s-events", 990).unwrap(), 10);
+    }
+
+    #[test]
+    fn get_events_by_type_pages_context_envelopes_only() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-context-events"))
+            .unwrap();
+        for (sequence, event_type) in [
+            (0, "TextDelta"),
+            (1, "ContextEnvelope"),
+            (2, "ToolStart"),
+            (3, "ContextEnvelope"),
+        ] {
+            store
+                .append_event(&SessionEvent {
+                    session_id: "s-context-events".to_string(),
+                    event_type: event_type.to_string(),
+                    event_json: serde_json::json!({
+                        "envelope_id": format!("env-{sequence}"),
+                        "envelope": {"id": format!("env-{sequence}")}
+                    })
+                    .to_string(),
+                    sequence,
+                    created_at_ms: sequence as u64,
+                })
+                .unwrap();
+        }
+
+        let events = store
+            .get_events_by_type_limited("s-context-events", "ContextEnvelope", 0, 10)
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].sequence, 3);
+        assert_eq!(
+            store
+                .count_events_by_type_from("s-context-events", "ContextEnvelope", 0)
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn get_context_event_by_envelope_id_reads_json_payload() {
+        let (store, _dir) = make_store();
+        store.create_session(&make_record("s-context-id")).unwrap();
+        store
+            .append_event(&SessionEvent {
+                session_id: "s-context-id".to_string(),
+                event_type: "ContextEnvelope".to_string(),
+                event_json: serde_json::json!({
+                    "envelope_id": "env-target",
+                    "envelope": {"id": "env-target", "intent": "ship"}
+                })
+                .to_string(),
+                sequence: 7,
+                created_at_ms: 7,
+            })
+            .unwrap();
+
+        let event = store
+            .get_context_event_by_envelope_id("env-target")
+            .unwrap()
+            .expect("context event");
+        assert_eq!(event.session_id, "s-context-id");
+        assert_eq!(event.sequence, 7);
+        assert!(event.event_json.contains("ship"));
+    }
+
+    #[test]
+    fn delete_events_from_removes_tail_only() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-events-delete"))
+            .unwrap();
+        for i in 0..5 {
+            store
+                .append_event(&SessionEvent {
+                    session_id: "s-events-delete".to_string(),
+                    event_type: "message_appended".to_string(),
+                    event_json: serde_json::json!({"sequence": i}).to_string(),
+                    sequence: i,
+                    created_at_ms: i as u64,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(store.delete_events_from("s-events-delete", 3).unwrap(), 2);
+        let events = store.get_events("s-events-delete", 0).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].sequence, 0);
+        assert_eq!(events[2].sequence, 2);
+    }
+
+    #[test]
+    fn delete_events_by_type_from_preserves_other_event_types() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-events-delete-type"))
+            .unwrap();
+        for (sequence, event_type) in [
+            (0, "message_appended"),
+            (1, "TextDelta"),
+            (2, "message_appended"),
+            (3, "ToolStart"),
+        ] {
+            store
+                .append_event(&SessionEvent {
+                    session_id: "s-events-delete-type".to_string(),
+                    event_type: event_type.to_string(),
+                    event_json: serde_json::json!({"sequence": sequence}).to_string(),
+                    sequence,
+                    created_at_ms: sequence as u64,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .delete_events_by_type_from("s-events-delete-type", "message_appended", 0)
+                .unwrap(),
+            2
+        );
+        let events = store.get_events("s-events-delete-type", 0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "TextDelta");
+        assert_eq!(events[1].event_type, "ToolStart");
+    }
+
+    #[test]
+    fn next_event_sequence_uses_max_sequence_plus_one() {
+        let (store, _dir) = make_store();
+        store.create_session(&make_record("s-next-event")).unwrap();
+        assert_eq!(store.next_event_sequence("s-next-event").unwrap(), 0);
+
+        for sequence in [0, 5, 2] {
+            store
+                .append_event(&SessionEvent {
+                    session_id: "s-next-event".to_string(),
+                    event_type: "TextDelta".to_string(),
+                    event_json: serde_json::json!({"sequence": sequence}).to_string(),
+                    sequence,
+                    created_at_ms: sequence as u64,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(store.next_event_sequence("s-next-event").unwrap(), 6);
+    }
+
+    #[test]
+    fn event_page_query_uses_session_sequence_index() {
+        let (store, _dir) = make_store();
+        store.create_session(&make_record("s-event-index")).unwrap();
+        let conn = store.conn().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r"EXPLAIN QUERY PLAN
+                  SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+                  FROM session_events
+                  WHERE session_id = ?1 AND sequence >= ?2
+                  ORDER BY sequence ASC
+                  LIMIT ?3",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["s-event-index", 100_i64, 20_i64], |row| row.get(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let plan_text = plan.join(" | ");
+        assert!(
+            plan_text.contains("idx_session_events_session_seq"),
+            "expected event sequence index in query plan, got: {plan_text}"
+        );
+    }
+
+    #[test]
+    fn event_type_page_query_uses_session_type_sequence_index() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-context-event-index"))
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r"EXPLAIN QUERY PLAN
+                  SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+                  FROM session_events
+                  WHERE session_id = ?1 AND event_type = ?2 AND sequence >= ?3
+                  ORDER BY sequence ASC
+                  LIMIT ?4",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(
+                params!["s-context-event-index", "ContextEnvelope", 100_i64, 20_i64],
+                |row| row.get(3),
+            )
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let plan_text = plan.join(" | ");
+        assert!(
+            plan_text.contains("idx_session_events_session_type_seq"),
+            "expected context event type index in query plan, got: {plan_text}"
+        );
+    }
+
+    #[test]
+    fn get_messages_from_sequence_pages_100k_history() {
+        let (store, _dir) = make_store();
+        let mut record = make_record("s-100k");
+        record.message_count = 100_000;
+        store.create_session(&record).unwrap();
+        {
+            let mut conn = store.conn().unwrap();
+            let tx = conn.transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        r"INSERT INTO messages
+                           (session_id, sequence, role, content_json, blocks_count,
+                            tool_use_id, tool_name, token_usage_json, created_at_ms)
+                           VALUES ('s-100k', ?1, ?2, ?3, 1, NULL, NULL, NULL, ?4)",
+                    )
+                    .unwrap();
+                for i in 0..100_000 {
+                    let role = if i % 2 == 0 { "user" } else { "assistant" };
+                    let content =
+                        serde_json::json!([{"type":"text","text":format!("message {i}")}])
+                            .to_string();
+                    stmt.execute(params![i as i64, role, content, i as i64])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        let page = store
+            .get_messages_from_sequence("s-100k", 99_950, 50)
+            .unwrap();
+        assert_eq!(page.len(), 50);
+        assert_eq!(page[0].sequence, 99_950);
+        assert_eq!(page[49].sequence, 99_999);
+    }
+
+    #[test]
+    fn message_sequence_page_query_uses_session_sequence_index() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-message-index"))
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r"EXPLAIN QUERY PLAN
+                  SELECT session_id, sequence, role, content_json,
+                         blocks_count, tool_use_id, tool_name,
+                         token_usage_json, created_at_ms
+                  FROM messages
+                  WHERE session_id = ?1 AND sequence >= ?2
+                  ORDER BY sequence ASC
+                  LIMIT ?3",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["s-message-index", 99_950_i64, 50_i64], |row| {
+                row.get(3)
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let plan_text = plan.join(" | ");
+        assert!(
+            plan_text.contains("idx_messages_session_seq"),
+            "expected message sequence index in query plan, got: {plan_text}"
+        );
+    }
+
+    #[test]
     fn test_list_by_platform() {
         let (store, _dir) = make_store();
         let mut rec = make_record("s-tg");
@@ -1205,11 +2034,7 @@ mod tests {
         let timeout: i32 = conn
             .pragma_query_value(None, "busy_timeout", |row| row.get(0))
             .unwrap();
-        assert!(
-            timeout > 0,
-            "busy_timeout should be > 0, got {}",
-            timeout
-        );
+        assert!(timeout > 0, "busy_timeout should be > 0, got {}", timeout);
     }
 
     #[test]

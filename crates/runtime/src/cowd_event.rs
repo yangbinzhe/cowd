@@ -5,38 +5,143 @@
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeWorkGraphSummary {
+    pub graph_id: Option<String>,
+    pub board_id: Option<String>,
+    pub status: String,
+    pub agent_tasks: usize,
+    pub memory_candidates: usize,
+    pub conflicts: usize,
+    pub completion_rate: Option<f32>,
+    pub synthesis_lift: Option<f32>,
+    pub complementarity_score: Option<f32>,
+}
+
+impl RuntimeWorkGraphSummary {
+    #[must_use]
+    pub fn from_review(
+        graph: &crate::agent_workgraph::AgentWorkGraph,
+        packet: &crate::agent_collaboration::CollaborationReviewPacket,
+    ) -> Self {
+        let agent_tasks = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == crate::agent_workgraph::WorkGraphNodeKind::AgentTask)
+            .count();
+        Self {
+            graph_id: Some(graph.graph_id.clone()),
+            board_id: graph.board_id.clone().or_else(|| Some(packet.board_id.clone())),
+            status: format!("{:?}", graph.status).to_lowercase(),
+            agent_tasks,
+            memory_candidates: packet.maintenance_candidates.len(),
+            conflicts: packet.scorecard.conflict_count,
+            completion_rate: Some(packet.scorecard.completion_rate),
+            synthesis_lift: Some(packet.scorecard.synthesis_lift),
+            complementarity_score: Some(packet.scorecard.complementarity_score),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CowdEvent {
     // Streaming — field names match TuiEvent
-    TextDelta { text: String },
-    ThinkingDelta { thinking: String },
+    TextDelta {
+        text: String,
+    },
+    ThinkingDelta {
+        thinking: String,
+    },
     ThinkingComplete,
-    SignatureDelta { signature: String },
+    SignatureDelta {
+        signature: String,
+    },
     // Tool lifecycle
-    ToolStart { id: String, name: String, preview: String },
-    ToolProgress { id: String, name: String, progress: String },
-    ToolComplete { id: String, name: String, summary: String, exit_code: Option<i32> },
-    ToolExecuted { name: String, duration_ms: u64 },
+    ToolStart {
+        id: String,
+        name: String,
+        preview: String,
+    },
+    ToolProgress {
+        id: String,
+        name: String,
+        progress: String,
+    },
+    ToolComplete {
+        id: String,
+        name: String,
+        summary: String,
+        exit_code: Option<i32>,
+    },
+    ToolExecuted {
+        name: String,
+        duration_ms: u64,
+    },
     // Turn lifecycle
     TurnStarted,
-    TurnComplete { assistant_text: String, iterations: u32 },
-    TurnError { error: String },
+    TurnComplete {
+        assistant_text: String,
+        iterations: u32,
+    },
+    TurnError {
+        error: String,
+    },
     ContextWindow(u64),
+    ContextEnvelope {
+        envelope: crate::context_runtime::ContextEnvelope,
+    },
+    WorkGraphSummary {
+        summary: RuntimeWorkGraphSummary,
+    },
     // System
-    Warning { message: String },
-    TokenUsage { input: u64, output: u64, cache_create: u64, cache_read: u64 },
-    CompactionNotice { removed_count: usize },
+    Warning {
+        message: String,
+    },
+    TokenUsage {
+        input: u64,
+        output: u64,
+        cache_create: u64,
+        cache_read: u64,
+    },
+    CompactionNotice {
+        removed_count: usize,
+    },
     // Session
-    SessionCreated { id: String, name: String },
-    SessionDeleted { id: String },
-    SessionSwitched { id: String, name: String },
-    SessionList { sessions: Vec<(String, String, String)> },
+    SessionCreated {
+        id: String,
+        name: String,
+    },
+    SessionDeleted {
+        id: String,
+    },
+    SessionSwitched {
+        id: String,
+        name: String,
+    },
+    SessionList {
+        sessions: Vec<(String, String, String)>,
+    },
     // Memory
-    MemoryEntry { layer: String, content: String, relevance: f64 },
-    MemoryUpdate { entries: Vec<(String, String, f64)>, status: String },
-    MemoryStats { total_entries: usize, vector_count: usize, layers: Vec<String> },
-    MemoryExtracted { count: usize },
+    MemoryEntry {
+        layer: String,
+        content: String,
+        relevance: f64,
+    },
+    MemoryUpdate {
+        entries: Vec<(String, String, f64)>,
+        status: String,
+    },
+    MemoryStats {
+        total_entries: usize,
+        vector_count: usize,
+        layers: Vec<String>,
+    },
+    MemoryExtracted {
+        count: usize,
+    },
     // Approval
-    ApprovalRequested { tool: String },
+    ApprovalRequested {
+        tool: String,
+    },
 }
 
 #[derive(Clone)]

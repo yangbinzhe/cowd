@@ -585,12 +585,10 @@ impl TerminalRenderer {
                     }));
                     match result {
                         Ok(escaped) => {
-                            colored_output
-                                .push_str(&apply_code_block_background(&escaped));
+                            colored_output.push_str(&apply_code_block_background(&escaped));
                         }
                         Err(_) => {
-                            colored_output
-                                .push_str(&apply_code_block_background(line));
+                            colored_output.push_str(&apply_code_block_background(line));
                         }
                     }
                 }

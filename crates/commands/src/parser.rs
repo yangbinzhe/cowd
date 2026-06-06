@@ -176,7 +176,7 @@ pub fn validate_slash_command_input(
             SlashCommand::Cost
         }
         "resume" => SlashCommand::Resume {
-            session_path: Some(require_remainder(command, remainder, "<session-path>")?),
+            session_path: Some(require_remainder(command, remainder, "<session-id|latest>")?),
         },
         "config" => SlashCommand::Config {
             section: parse_config_section(&args)?,
@@ -731,7 +731,7 @@ fn slash_command_detail_lines(spec: &SlashCommandSpec) -> Vec<String> {
         ));
     }
     if spec.resume_supported {
-        lines.push("  Resume           Supported with --resume SESSION.jsonl".to_string());
+        lines.push("  Resume           Supported with --resume <session-id|latest>".to_string());
     }
     lines
 }
@@ -878,7 +878,7 @@ pub fn render_slash_command_help_filtered(exclude: &[&str]) -> String {
     let mut lines = vec![
         "Slash commands".to_string(),
         "  Start here        /status, /diff, /agents, /skills, /commit".to_string(),
-        "  [resume]          also works with --resume SESSION.jsonl".to_string(),
+        "  [resume]          also works with --resume <session-id|latest>".to_string(),
         String::new(),
     ];
 
@@ -911,7 +911,7 @@ pub fn render_slash_command_help() -> String {
     let mut lines = vec![
         "Slash commands".to_string(),
         "  Start here        /status, /diff, /agents, /skills, /commit".to_string(),
-        "  [resume]          also works with --resume SESSION.jsonl".to_string(),
+        "  [resume]          also works with --resume <session-id|latest>".to_string(),
         String::new(),
     ];
 

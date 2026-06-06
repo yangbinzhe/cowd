@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-use std::collections::VecDeque;
-use tui_textarea::TextArea;
+use crate::tui::layout::{LayoutState, LayoutTree, build_default_layout};
 use ratatui::widgets::{Block, Borders};
 use runtime::CowdEvent;
-use crate::tui::layout::{LayoutState, LayoutTree, build_default_layout};
+use std::collections::VecDeque;
+use tui_textarea::TextArea;
 
 const PAGE_SIZE: usize = 500;
 const SOFT_CAP: usize = 10000;
@@ -48,20 +48,41 @@ impl TimelineEntry {
     pub fn expanded_lines(&self) -> usize {
         match self {
             Self::Message { content, .. } => content.lines().count().max(1),
-            Self::Thinking { content, expanded, .. } => {
-                if *expanded { content.lines().count().max(1) + 2 } else { 1 }
+            Self::Thinking {
+                content, expanded, ..
+            } => {
+                if *expanded {
+                    content.lines().count().max(1) + 2
+                } else {
+                    1
+                }
             }
-            Self::ToolCall { output, expanded, .. } => {
-                if *expanded && !output.is_empty() { output.lines().count().max(1) + 2 } else { 1 }
+            Self::ToolCall {
+                output, expanded, ..
+            } => {
+                if *expanded && !output.is_empty() {
+                    output.lines().count().max(1) + 2
+                } else {
+                    1
+                }
             }
-            Self::SlashOutput { output, expanded, .. } => {
-                if *expanded && !output.is_empty() { output.lines().count().max(1) + 2 } else { 1 }
+            Self::SlashOutput {
+                output, expanded, ..
+            } => {
+                if *expanded && !output.is_empty() {
+                    output.lines().count().max(1) + 2
+                } else {
+                    1
+                }
             }
         }
     }
 
     pub fn is_collapsible(&self) -> bool {
-        matches!(self, Self::Thinking { .. } | Self::ToolCall { .. } | Self::SlashOutput { .. })
+        matches!(
+            self,
+            Self::Thinking { .. } | Self::ToolCall { .. } | Self::SlashOutput { .. }
+        )
     }
 
     pub fn is_expanded(&self) -> bool {
@@ -119,6 +140,8 @@ pub struct SessionSummary {
 pub struct App {
     pub model: String,
     pub session_id: String,
+    pub yolo_mode: bool,
+    pub current_task: Option<CurrentTaskSummary>,
     pub input: TextArea<'static>,
     pub is_loading: bool,
     pub spinner_idx: usize,
@@ -175,6 +198,8 @@ pub struct App {
     pub msg_version: u64,
     pub last_drawn_version: u64,
     pub context_window: u64,
+    pub latest_context_envelope: Option<runtime::ContextEnvelope>,
+    pub latest_workgraph_summary: Option<runtime::RuntimeWorkGraphSummary>,
     pub input_tokens: u64,
     pub output_tokens: u64,
 
@@ -207,7 +232,7 @@ pub struct App {
     pub notification: Option<String>,
     notification_ttl: u32,
 
-    pub sessions: Vec<(String, String, String)>,  // (id, name, created)
+    pub sessions: Vec<(String, String, String)>, // (id, name, created)
     pub active_session_name: String,
 
     pub layout_tree: LayoutTree,
@@ -251,6 +276,18 @@ pub struct DelegateTask {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentTaskSummary {
+    pub id: String,
+    pub objective: String,
+    pub status: String,
+    pub current_phase: Option<String>,
+    pub phase_status: Option<String>,
+    pub review_result: Option<String>,
+    pub artifact_count: usize,
+    pub blocker_reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
     pub tool_name: String,
@@ -259,33 +296,59 @@ pub struct ApprovalRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Theme { Dark, Light }
+pub enum Theme {
+    Dark,
+    Light,
+}
 
 impl Theme {
     pub fn bg(&self) -> ratatui::style::Color {
-        match self { Self::Dark => ratatui::style::Color::Black, Self::Light => ratatui::style::Color::White }
+        match self {
+            Self::Dark => ratatui::style::Color::Black,
+            Self::Light => ratatui::style::Color::White,
+        }
     }
     pub fn fg(&self) -> ratatui::style::Color {
-        match self { Self::Dark => ratatui::style::Color::White, Self::Light => ratatui::style::Color::Black }
+        match self {
+            Self::Dark => ratatui::style::Color::White,
+            Self::Light => ratatui::style::Color::Black,
+        }
     }
     pub fn accent(&self) -> ratatui::style::Color {
-        match self { Self::Dark => ratatui::style::Color::Cyan, Self::Light => ratatui::style::Color::Blue }
+        match self {
+            Self::Dark => ratatui::style::Color::Cyan,
+            Self::Light => ratatui::style::Color::Blue,
+        }
     }
     pub fn user_color(&self) -> ratatui::style::Color {
-        match self { Self::Dark => ratatui::style::Color::Green, Self::Light => ratatui::style::Color::DarkGray }
+        match self {
+            Self::Dark => ratatui::style::Color::Green,
+            Self::Light => ratatui::style::Color::DarkGray,
+        }
     }
-    pub fn toggle(&mut self) { *self = match self { Self::Dark => Self::Light, Self::Light => Self::Dark }; }
+    pub fn toggle(&mut self) {
+        *self = match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        };
+    }
 }
 
 impl App {
     pub fn new(model: &str, session_id: &str) -> Self {
         let mut input = TextArea::default();
-        input.set_block(Block::default().borders(Borders::ALL).title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "));
+        input.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+        );
         input.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
 
         Self {
             model: model.to_string(),
             session_id: session_id.to_string(),
+            yolo_mode: false,
+            current_task: None,
             input,
             is_loading: false,
             spinner_idx: 0,
@@ -332,6 +395,8 @@ impl App {
             msg_version: 0,
             last_drawn_version: u64::MAX,
             context_window: 0,
+            latest_context_envelope: None,
+            latest_workgraph_summary: None,
             input_tokens: 0,
             output_tokens: 0,
 
@@ -385,16 +450,6 @@ impl App {
         self.total_entries == 0
     }
 
-    fn timeline_has_recent_done(&self) -> bool {
-        let len = self.timeline_len();
-        if len == 0 {
-            return false;
-        }
-        self.timeline_get(len - 1).map_or(false, |e| {
-            matches!(e, TimelineEntry::Message { content, .. } if content == "✓ Done")
-        })
-    }
-
     pub fn timeline_get(&self, idx: usize) -> Option<&TimelineEntry> {
         if idx >= self.total_entries {
             return None;
@@ -424,15 +479,21 @@ impl App {
     }
 
     pub fn timeline_last_mut(&mut self) -> Option<&mut TimelineEntry> {
-        self.timeline_pages.back_mut()
+        self.timeline_pages
+            .back_mut()
             .and_then(|page| page.entries.last_mut())
     }
 
     pub fn timeline_push(&mut self, entry: TimelineEntry) {
         if self.timeline_pages.is_empty()
-            || self.timeline_pages.back().map_or(true, |p| p.entries.len() >= PAGE_SIZE)
+            || self
+                .timeline_pages
+                .back()
+                .map_or(true, |p| p.entries.len() >= PAGE_SIZE)
         {
-            let start = self.timeline_pages.back()
+            let start = self
+                .timeline_pages
+                .back()
                 .map_or(0, |p| p.start_index + p.entries.len());
             self.timeline_pages.push_back(TimelinePage {
                 entries: Vec::with_capacity(PAGE_SIZE),
@@ -446,16 +507,18 @@ impl App {
     }
 
     pub fn timeline_iter(&self) -> impl Iterator<Item = (usize, &TimelineEntry)> + '_ {
-        self.timeline_pages.iter()
-            .flat_map(|page| {
-                let start = page.start_index;
-                page.entries.iter().enumerate()
-                    .map(move |(i, e)| (start + i, e))
-            })
+        self.timeline_pages.iter().flat_map(|page| {
+            let start = page.start_index;
+            page.entries
+                .iter()
+                .enumerate()
+                .map(move |(i, e)| (start + i, e))
+        })
     }
 
     pub fn timeline_iter_mut(&mut self) -> impl Iterator<Item = &mut TimelineEntry> + '_ {
-        self.timeline_pages.iter_mut()
+        self.timeline_pages
+            .iter_mut()
             .flat_map(|page| page.entries.iter_mut())
     }
 
@@ -469,12 +532,18 @@ impl App {
 
     fn soft_evict(&mut self) {
         while self.total_entries > SOFT_CAP {
-            let Some(front) = self.timeline_pages.front() else { break };
+            let Some(front) = self.timeline_pages.front() else {
+                break;
+            };
             let evict_count = front.entries.len();
 
             let evicted_lines: u16 = if !self.entry_line_counts.is_empty() {
                 let count = evict_count.min(self.entry_line_counts.len());
-                self.entry_line_counts.iter().take(count).map(|&c| c + 1).sum()
+                self.entry_line_counts
+                    .iter()
+                    .take(count)
+                    .map(|&c| c + 1)
+                    .sum()
             } else {
                 0
             };
@@ -484,7 +553,9 @@ impl App {
             self.scroll_offset = self.scroll_offset.saturating_sub(evicted_lines);
             self.timeline_cursor = self.timeline_cursor.saturating_sub(evict_count);
             self.search_matches.retain(|&m| m >= evict_count);
-            self.search_matches.iter_mut().for_each(|m| *m -= evict_count);
+            self.search_matches
+                .iter_mut()
+                .for_each(|m| *m -= evict_count);
 
             self.timeline_pages.pop_front();
             self.total_entries -= evict_count;
@@ -499,12 +570,18 @@ impl App {
 
     fn hard_evict(&mut self) {
         while self.total_entries > HARD_CAP {
-            let Some(front) = self.timeline_pages.front() else { break };
+            let Some(front) = self.timeline_pages.front() else {
+                break;
+            };
             let evict_count = front.entries.len();
 
             let evicted_lines: u16 = if !self.entry_line_counts.is_empty() {
                 let count = evict_count.min(self.entry_line_counts.len());
-                self.entry_line_counts.iter().take(count).map(|&c| c + 1).sum()
+                self.entry_line_counts
+                    .iter()
+                    .take(count)
+                    .map(|&c| c + 1)
+                    .sum()
             } else {
                 0
             };
@@ -514,7 +591,9 @@ impl App {
             self.scroll_offset = self.scroll_offset.saturating_sub(evicted_lines);
             self.timeline_cursor = self.timeline_cursor.saturating_sub(evict_count);
             self.search_matches.retain(|&m| m >= evict_count);
-            self.search_matches.iter_mut().for_each(|m| *m -= evict_count);
+            self.search_matches
+                .iter_mut()
+                .for_each(|m| *m -= evict_count);
 
             self.timeline_pages.pop_front();
             self.total_entries -= evict_count;
@@ -528,7 +607,7 @@ impl App {
     }
 
     pub fn spinner_char(&self) -> &'static str {
-        const F: &[&str] = &["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+        const F: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         F[self.spinner_idx % F.len()]
     }
 
@@ -587,22 +666,32 @@ impl App {
     }
 
     pub fn picker_up(&mut self) {
-        if self.picker_idx > 0 { self.picker_idx -= 1; }
+        if self.picker_idx > 0 {
+            self.picker_idx -= 1;
+        }
     }
 
     pub fn picker_down(&mut self) {
-        if self.picker_idx + 1 < self.picker_sessions.len() { self.picker_idx += 1; }
+        if self.picker_idx + 1 < self.picker_sessions.len() {
+            self.picker_idx += 1;
+        }
     }
 
     pub fn picker_selected_id(&self) -> Option<&str> {
-        self.picker_sessions.get(self.picker_idx).map(|s| s.id.as_str())
+        self.picker_sessions
+            .get(self.picker_idx)
+            .map(|s| s.id.as_str())
     }
 
     pub fn cursor_up(&mut self) -> bool {
-        if self.timeline_is_empty() { return false; }
+        if self.timeline_is_empty() {
+            return false;
+        }
         let mut idx = self.timeline_cursor;
         loop {
-            if idx == 0 { break; }
+            if idx == 0 {
+                break;
+            }
             idx -= 1;
             if self.timeline_get(idx).map_or(false, |e| e.is_collapsible()) {
                 self.timeline_cursor = idx;
@@ -614,7 +703,9 @@ impl App {
     }
 
     pub fn cursor_down(&mut self) -> bool {
-        if self.timeline_is_empty() { return false; }
+        if self.timeline_is_empty() {
+            return false;
+        }
         let mut idx = self.timeline_cursor;
         while idx + 1 < self.timeline_len() {
             idx += 1;
@@ -646,7 +737,9 @@ impl App {
 
     pub fn add_slash_output(&mut self, command: &str, output: &str) {
         let trimmed = output.trim();
-        if trimmed.is_empty() { return; }
+        if trimmed.is_empty() {
+            return;
+        }
         let line_count = trimmed.lines().count();
         if line_count <= 3 {
             self.add_message("system", &format!("/{command}:"));
@@ -691,7 +784,9 @@ impl App {
     }
 
     pub fn search_next(&mut self) {
-        if self.search_matches.is_empty() { return; }
+        if self.search_matches.is_empty() {
+            return;
+        }
         let idx = if self.search_current + 1 < self.search_matches.len() {
             self.search_current + 1
         } else {
@@ -701,7 +796,9 @@ impl App {
     }
 
     pub fn search_prev(&mut self) {
-        if self.search_matches.is_empty() { return; }
+        if self.search_matches.is_empty() {
+            return;
+        }
         let idx = if self.search_current > 0 {
             self.search_current - 1
         } else {
@@ -732,16 +829,12 @@ impl App {
         for i in 0..entry_idx.min(self.entry_line_counts.len()) {
             offset += self.entry_line_counts[i] as usize + 1;
         }
-        let entry_h = self.entry_line_counts
-            .get(entry_idx)
-            .copied()
-            .unwrap_or(1) as usize;
+        let entry_h = self.entry_line_counts.get(entry_idx).copied().unwrap_or(1) as usize;
 
         let scroll = self.scroll_offset as usize;
         if offset < scroll {
             self.scroll_offset = offset as u16;
-        }
-        else if offset + entry_h > scroll + vh {
+        } else if offset + entry_h > scroll + vh {
             self.scroll_offset = offset.saturating_sub(vh.saturating_sub(entry_h)) as u16;
         }
     }
@@ -757,7 +850,9 @@ impl App {
     }
 
     pub fn history_prev(&mut self) -> Option<String> {
-        if self.input_history.is_empty() { return None; }
+        if self.input_history.is_empty() {
+            return None;
+        }
         let idx = match self.history_idx {
             Some(0) => return None,
             Some(i) => i - 1,
@@ -783,8 +878,10 @@ impl App {
         match event {
             CowdEvent::TextDelta { text } => {
                 self.streaming_received = true;
+                self.auto_scroll = true;
                 let mut found = false;
-                if let Some(TimelineEntry::Message { role, content, .. }) = self.timeline_last_mut() {
+                if let Some(TimelineEntry::Message { role, content, .. }) = self.timeline_last_mut()
+                {
                     if role == "assistant" && content != "✓ Done" {
                         content.push_str(&text);
                         found = true;
@@ -805,7 +902,10 @@ impl App {
 
             CowdEvent::ThinkingDelta { thinking } => {
                 let mut found = false;
-                if let Some(TimelineEntry::Thinking { content, complete, .. }) = self.timeline_last_mut() {
+                if let Some(TimelineEntry::Thinking {
+                    content, complete, ..
+                }) = self.timeline_last_mut()
+                {
                     if !*complete {
                         content.push_str(&thinking);
                         found = true;
@@ -828,7 +928,10 @@ impl App {
             }
 
             CowdEvent::ThinkingComplete => {
-                if let Some(TimelineEntry::Thinking { complete, expanded, .. }) = self.timeline_last_mut() {
+                if let Some(TimelineEntry::Thinking {
+                    complete, expanded, ..
+                }) = self.timeline_last_mut()
+                {
                     *complete = true;
                     *expanded = false;
                 }
@@ -850,10 +953,17 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            CowdEvent::ToolProgress { id, name: _, progress } => {
+            CowdEvent::ToolProgress {
+                id,
+                name: _,
+                progress,
+            } => {
                 let mut found_output: Option<&mut String> = None;
                 for entry in self.timeline_iter_mut() {
-                    if let TimelineEntry::ToolCall { id: tid, output, .. } = entry {
+                    if let TimelineEntry::ToolCall {
+                        id: tid, output, ..
+                    } = entry
+                    {
                         if tid == &id {
                             found_output = Some(output);
                         }
@@ -865,14 +975,26 @@ impl App {
                         *output = output[output.len() - 4096..].to_string();
                     }
                     self.lines_dirty = true;
-                    self.msg_version = self.msg_version.wrapping_add(1);
                 }
             }
 
-            CowdEvent::ToolComplete { id, name: _, summary, exit_code } => {
+            CowdEvent::ToolComplete {
+                id,
+                name: _,
+                summary,
+                exit_code,
+            } => {
                 let mut found: Option<(&mut String, &mut bool, &mut bool, &mut Option<i32>)> = None;
                 for entry in self.timeline_iter_mut() {
-                    if let TimelineEntry::ToolCall { id: tid, output, done, expanded, exit_code: ec, .. } = entry {
+                    if let TimelineEntry::ToolCall {
+                        id: tid,
+                        output,
+                        done,
+                        expanded,
+                        exit_code: ec,
+                        ..
+                    } = entry
+                    {
                         if tid == &id {
                             found = Some((output, done, expanded, ec));
                         }
@@ -887,7 +1009,12 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            CowdEvent::TokenUsage { input, output, cache_create, cache_read } => {
+            CowdEvent::TokenUsage {
+                input,
+                output,
+                cache_create,
+                cache_read,
+            } => {
                 self.input_tokens = input;
                 self.output_tokens = output;
                 self.token_count = input + output + cache_create + cache_read;
@@ -898,9 +1025,16 @@ impl App {
             CowdEvent::ContextWindow(ctx) => {
                 self.context_window = ctx;
             }
+            CowdEvent::ContextEnvelope { envelope } => {
+                self.latest_context_envelope = Some(envelope);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
+            CowdEvent::WorkGraphSummary { summary } => {
+                self.latest_workgraph_summary = Some(summary);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
 
             CowdEvent::TurnStarted => {
-                self.auto_scroll = true;
                 self.is_loading = true;
                 self.turn_active = true;
                 self.streaming_received = false;
@@ -912,8 +1046,10 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            CowdEvent::TurnComplete { assistant_text, iterations: _ } => {
-                self.auto_scroll = true;
+            CowdEvent::TurnComplete {
+                assistant_text,
+                iterations: _,
+            } => {
                 self.is_loading = false;
                 self.turn_active = false;
                 for entry in self.timeline_iter_mut() {
@@ -930,13 +1066,11 @@ impl App {
                         timestamp: App::format_timestamp(),
                     });
                 }
-                if !self.timeline_has_recent_done() {
-                    self.timeline_push(TimelineEntry::Message {
-                        role: "assistant".into(),
-                        content: "✓ Done".into(),
-                        timestamp: App::format_timestamp(),
-                    });
-                }
+                self.timeline_push(TimelineEntry::Message {
+                    role: "assistant".into(),
+                    content: "✓ Done".into(),
+                    timestamp: App::format_timestamp(),
+                });
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
@@ -964,7 +1098,11 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            CowdEvent::MemoryEntry { layer, content, relevance } => {
+            CowdEvent::MemoryEntry {
+                layer,
+                content,
+                relevance,
+            } => {
                 self.timeline_push(TimelineEntry::Message {
                     role: "system".into(),
                     content: format!("[Memory:{layer}] (rel={relevance:.2}) {content}"),
@@ -984,10 +1122,17 @@ impl App {
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
 
-            CowdEvent::MemoryStats { total_entries, vector_count, layers } => {
+            CowdEvent::MemoryStats {
+                total_entries,
+                vector_count,
+                layers,
+            } => {
                 self.timeline_push(TimelineEntry::Message {
                     role: "system".into(),
-                    content: format!("[Memory] total={total_entries}, vectors={vector_count}, layers={}", layers.join(", ")),
+                    content: format!(
+                        "[Memory] total={total_entries}, vectors={vector_count}, layers={}",
+                        layers.join(", ")
+                    ),
                     timestamp: App::format_timestamp(),
                 });
                 self.timeline_cursor = self.timeline_len().saturating_sub(1);
@@ -1063,6 +1208,38 @@ mod tests {
     }
 
     #[test]
+    fn context_envelope_event_updates_app_state() {
+        let identity = runtime::ContextIdentity::main("sess".to_string());
+        let envelope =
+            runtime::ContextRuntimeKernel::build_envelope(runtime::ContextEnvelopeRequest {
+                profile: runtime::ContextProfile::from(identity.mode),
+                identity,
+                intent: "inspect".to_string(),
+                stable_head: vec!["stable".to_string()],
+                runtime_header: vec!["runtime".to_string()],
+                dynamic_items: vec![runtime::ContextItem::new(
+                    "ctx-1",
+                    runtime::ContextSourceKind::Memory,
+                    runtime::ContextRole::Evidence,
+                    "durable context",
+                )],
+                omitted: Vec::new(),
+                total_budget_tokens: 8_000,
+            });
+        let expected_id = envelope.id.clone();
+        let mut app = App::new("test", "sess");
+
+        app.apply_event(CowdEvent::ContextEnvelope { envelope });
+
+        assert_eq!(
+            app.latest_context_envelope
+                .as_ref()
+                .map(|env| env.id.as_str()),
+            Some(expected_id.as_str())
+        );
+    }
+
+    #[test]
     fn page_boundary_seamless() {
         let mut app = App::new("test", "sess");
         for i in 0..PAGE_SIZE {
@@ -1076,8 +1253,18 @@ mod tests {
         assert_eq!(app.timeline_pages.len(), 2);
 
         assert!(app.timeline_get(0).unwrap().full_text().contains("msg 0"));
-        assert!(app.timeline_get(PAGE_SIZE - 1).unwrap().full_text().contains(&format!("msg {}", PAGE_SIZE - 1)));
-        assert!(app.timeline_get(PAGE_SIZE).unwrap().full_text().contains("overflow"));
+        assert!(
+            app.timeline_get(PAGE_SIZE - 1)
+                .unwrap()
+                .full_text()
+                .contains(&format!("msg {}", PAGE_SIZE - 1))
+        );
+        assert!(
+            app.timeline_get(PAGE_SIZE)
+                .unwrap()
+                .full_text()
+                .contains("overflow")
+        );
 
         let count = app.timeline_iter().count();
         assert_eq!(count, PAGE_SIZE + 1);
@@ -1123,8 +1310,18 @@ mod tests {
         }
         assert_eq!(app.timeline_len(), PAGE_SIZE * 3 + 200);
         assert!(app.timeline_get(0).unwrap().full_text().contains("entry 0"));
-        assert!(app.timeline_get(PAGE_SIZE).unwrap().full_text().contains(&format!("entry {}", PAGE_SIZE)));
-        assert!(app.timeline_get(PAGE_SIZE * 2 + 50).unwrap().full_text().contains(&format!("entry {}", PAGE_SIZE * 2 + 50)));
+        assert!(
+            app.timeline_get(PAGE_SIZE)
+                .unwrap()
+                .full_text()
+                .contains(&format!("entry {}", PAGE_SIZE))
+        );
+        assert!(
+            app.timeline_get(PAGE_SIZE * 2 + 50)
+                .unwrap()
+                .full_text()
+                .contains(&format!("entry {}", PAGE_SIZE * 2 + 50))
+        );
     }
 
     #[test]

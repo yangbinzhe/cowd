@@ -57,39 +57,147 @@ fn builtin_skill_categories() -> Vec<(&'static str, Vec<BuiltinSkill>)> {
         (
             "Tools",
             vec![
-                BuiltinSkill { name: "Bash", description: "Execute shell commands with sandboxing and approval flows", category: "Tools", enabled: true, version: None },
-                BuiltinSkill { name: "FileOps", description: "Read/write workspace files with permission checks", category: "Tools", enabled: true, version: None },
-                BuiltinSkill { name: "GitExpert", description: "Git operations: branch, commit, diff, rebase, bisect", category: "Tools", enabled: true, version: None },
-                BuiltinSkill { name: "LSP", description: "Language server diagnostics and code navigation", category: "Tools", enabled: true, version: None },
-                BuiltinSkill { name: "WebFetch", description: "Fetch and parse web content for research", category: "Tools", enabled: true, version: None },
-                BuiltinSkill { name: "GrepExpert", description: "Advanced codebase search with regex and AST patterns", category: "Tools", enabled: true, version: None },
+                BuiltinSkill {
+                    name: "Bash",
+                    description: "Execute shell commands with sandboxing and approval flows",
+                    category: "Tools",
+                    enabled: true,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "FileOps",
+                    description: "Read/write workspace files with permission checks",
+                    category: "Tools",
+                    enabled: true,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "GitExpert",
+                    description: "Git operations: branch, commit, diff, rebase, bisect",
+                    category: "Tools",
+                    enabled: true,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "LSP",
+                    description: "Language server diagnostics and code navigation",
+                    category: "Tools",
+                    enabled: true,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "WebFetch",
+                    description: "Fetch and parse web content for research",
+                    category: "Tools",
+                    enabled: true,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "GrepExpert",
+                    description: "Advanced codebase search with regex and AST patterns",
+                    category: "Tools",
+                    enabled: true,
+                    version: None,
+                },
             ],
         ),
         (
             "Memory",
             vec![
-                BuiltinSkill { name: "CognitiveContext", description: "5-layer memory: identity, essential, project, deep, shared", category: "Memory", enabled: true, version: None },
-                BuiltinSkill { name: "CrossStoreVerify", description: "Verify consistency across memory stores", category: "Memory", enabled: true, version: None },
-                BuiltinSkill { name: "SessionResume", description: "BM25-based session context restoration", category: "Memory", enabled: true, version: None },
-                BuiltinSkill { name: "CodeIndexer", description: "Index code for semantic vector search", category: "Memory", enabled: true, version: None },
-                BuiltinSkill { name: "FactChecker", description: "Fact validation and conflict detection", category: "Memory", enabled: true, version: None },
+                BuiltinSkill {
+                    name: "CognitiveContext",
+                    description: "5-layer memory: identity, essential, project, deep, shared",
+                    category: "Memory",
+                    enabled: true,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "CrossStoreVerify",
+                    description: "Verify consistency across memory stores",
+                    category: "Memory",
+                    enabled: true,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "SessionResume",
+                    description: "BM25-based session context restoration",
+                    category: "Memory",
+                    enabled: true,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "CodeIndexer",
+                    description: "Index code for semantic vector search",
+                    category: "Memory",
+                    enabled: true,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "FactChecker",
+                    description: "Fact validation and conflict detection",
+                    category: "Memory",
+                    enabled: true,
+                    version: None,
+                },
             ],
         ),
         (
             "Platform",
             vec![
-                BuiltinSkill { name: "Wecom", description: "WeChat Work (企业微信) integration", category: "Platform", enabled: false, version: None },
-                BuiltinSkill { name: "Email", description: "Email inbox monitoring and response", category: "Platform", enabled: false, version: None },
-                BuiltinSkill { name: "Feishu", description: "Lark/Feishu integration", category: "Platform", enabled: false, version: None },
+                BuiltinSkill {
+                    name: "Wecom",
+                    description: "WeChat Work (企业微信) integration",
+                    category: "Platform",
+                    enabled: false,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "Email",
+                    description: "Email inbox monitoring and response",
+                    category: "Platform",
+                    enabled: false,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "Feishu",
+                    description: "Lark/Feishu integration",
+                    category: "Platform",
+                    enabled: false,
+                    version: None,
+                },
             ],
         ),
         (
             "System",
             vec![
-                BuiltinSkill { name: "MCP", description: "Model Context Protocol server integration", category: "System", enabled: true, version: None },
-                BuiltinSkill { name: "Plugins", description: "Plugin lifecycle: install/enable/disable/uninstall", category: "System", enabled: true, version: Some("0.1.0") },
-                BuiltinSkill { name: "OAuth", description: "Auth provider integrations", category: "System", enabled: true, version: None },
-                BuiltinSkill { name: "Config", description: "Configuration management and validation", category: "System", enabled: true, version: None },
+                BuiltinSkill {
+                    name: "MCP",
+                    description: "Model Context Protocol server integration",
+                    category: "System",
+                    enabled: true,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "Plugins",
+                    description: "Plugin lifecycle: install/enable/disable/uninstall",
+                    category: "System",
+                    enabled: true,
+                    version: Some("0.1.0"),
+                },
+                BuiltinSkill {
+                    name: "OAuth",
+                    description: "Auth provider integrations",
+                    category: "System",
+                    enabled: true,
+                    version: None,
+                },
+                BuiltinSkill {
+                    name: "Config",
+                    description: "Configuration management and validation",
+                    category: "System",
+                    enabled: true,
+                    version: None,
+                },
             ],
         ),
     ]
@@ -222,11 +330,7 @@ impl SkillsPanel {
         self.categories
             .iter()
             .map(|cat| {
-                let count = self
-                    .entries
-                    .iter()
-                    .filter(|e| &e.category == cat)
-                    .count();
+                let count = self.entries.iter().filter(|e| &e.category == cat).count();
                 (cat.clone(), count)
             })
             .collect()
@@ -365,11 +469,15 @@ impl SkillsPanel {
         self.entries = matching;
         self.entries.append(&mut non_matching);
 
-        let match_count = self.entries.iter().filter(|e| {
-            e.name.to_lowercase().contains(&lower)
-                || e.description.to_lowercase().contains(&lower)
-                || e.category.to_lowercase().contains(&lower)
-        }).count();
+        let match_count = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.name.to_lowercase().contains(&lower)
+                    || e.description.to_lowercase().contains(&lower)
+                    || e.category.to_lowercase().contains(&lower)
+            })
+            .count();
 
         self.selected_index = if match_count > 0 { Some(0) } else { None };
         self.scroll_offset = 0;
@@ -439,15 +547,14 @@ impl SkillsPanel {
             for (i, (cat, count)) in cat_counts.iter().enumerate() {
                 let is_active = self.active_category == Some(i);
                 let style = if is_active {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
                 let prefix = if is_active { "▸ " } else { "  " };
-                header_spans.push(Span::styled(
-                    format!("{prefix}{cat}({count}) "),
-                    style,
-                ));
+                header_spans.push(Span::styled(format!("{prefix}{cat}({count}) "), style));
             }
             lines.push(Line::from(header_spans));
             lines.push(Line::styled(
@@ -493,7 +600,9 @@ impl SkillsPanel {
                 let (cursor_style, name_style, desc_style, status_style) = if is_selected {
                     (
                         Style::default().fg(Color::Green),
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                         Style::default().fg(Color::Gray),
                         // status icon inline
                         Style::default().fg(Color::White),
@@ -555,10 +664,16 @@ impl SkillsPanel {
         let mut lines: Vec<Line> = Vec::new();
 
         // Search input field
-        let cursor = if self.search_query.is_empty() { "▌" } else { "" };
+        let cursor = if self.search_query.is_empty() {
+            "▌"
+        } else {
+            ""
+        };
         lines.push(Line::from(Span::styled(
             format!(" Search: {}{}", self.search_query, cursor),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
@@ -579,9 +694,9 @@ impl SkillsPanel {
             KeyCode::Char('j') | KeyCode::Down => {
                 let filtered = self.filtered_entries();
                 if !filtered.is_empty() {
-                    let next = self.selected_index.map_or(0, |i| {
-                        (i + 1).min(filtered.len().saturating_sub(1))
-                    });
+                    let next = self
+                        .selected_index
+                        .map_or(0, |i| (i + 1).min(filtered.len().saturating_sub(1)));
                     self.selected_index = Some(next);
                     // Auto-scroll: ensure selected is visible
                     let max_visible = 10; // approximate
@@ -617,7 +732,10 @@ impl SkillsPanel {
                 EventResult::Consumed
             }
             KeyCode::Tab => {
-                if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                if key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::SHIFT)
+                {
                     self.prev_category();
                 } else {
                     self.next_category();
@@ -743,8 +861,8 @@ impl Component for SkillsPanel {
 mod tests {
     use super::*;
     use crate::tui::app::SkillSummary;
-    use crate::tui::test_utils::MockTerminal;
     use crate::tui::skin::SkinConfig;
+    use crate::tui::test_utils::MockTerminal;
     use crossterm::event::KeyCode;
 
     fn render_panel(panel: &mut SkillsPanel, width: u16, height: u16) -> Vec<String> {
@@ -761,7 +879,10 @@ mod tests {
     fn new_panel_has_categories() {
         let panel = SkillsPanel::new();
         assert!(!panel.categories.is_empty());
-        assert!(panel.entries.len() > 10, "should have built-in skill entries");
+        assert!(
+            panel.entries.len() > 10,
+            "should have built-in skill entries"
+        );
     }
 
     #[test]
@@ -858,13 +979,11 @@ mod tests {
     #[test]
     fn from_app_constructor() {
         let mut app = App::new("test-model", "test-session");
-        app.skill_list = vec![
-            SkillSummary {
-                name: "TestSkill".to_string(),
-                description: "A test skill".to_string(),
-                installed: true,
-            },
-        ];
+        app.skill_list = vec![SkillSummary {
+            name: "TestSkill".to_string(),
+            description: "A test skill".to_string(),
+            installed: true,
+        }];
         let panel = SkillsPanel::from_app(&app);
         assert!(!panel.using_builtins);
         assert_eq!(panel.entries.len(), 1);
@@ -884,7 +1003,10 @@ mod tests {
         let mut panel = SkillsPanel::new();
         let lines = render_panel(&mut panel, 60, 10);
         let joined = lines.join("\n");
-        assert!(joined.contains("Tools"), "should render category headers, got: {joined}");
+        assert!(
+            joined.contains("Tools"),
+            "should render category headers, got: {joined}"
+        );
     }
 
     #[test]
@@ -894,7 +1016,10 @@ mod tests {
         panel.entries.clear();
         panel.categories.clear();
 
-        let key_j = crossterm::event::KeyEvent::new(KeyCode::Char('j'), crossterm::event::KeyModifiers::NONE);
+        let key_j = crossterm::event::KeyEvent::new(
+            KeyCode::Char('j'),
+            crossterm::event::KeyModifiers::NONE,
+        );
         let result = panel.handle_list_key(&key_j);
         // Should not panic and should consume the event
         assert!(result.is_consumed());

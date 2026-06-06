@@ -34,10 +34,7 @@ struct Suggestion {
 impl Suggestion {
     /// Build a suggestion from an L4 Insert event.
     fn from_insert_event(event: &L4Event) -> Self {
-        let text = format!(
-            "{} just completed '{}'.",
-            event.agent_id, event.title
-        );
+        let text = format!("{} just completed '{}'.", event.agent_id, event.title);
         let action_label = " Review? [Enter]".to_string();
         Self {
             text,
@@ -154,7 +151,8 @@ impl ContextSuggestions {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
-        ctx.frame_mut().render_widget(Paragraph::new(line), bar_area);
+        ctx.frame_mut()
+            .render_widget(Paragraph::new(line), bar_area);
     }
 }
 
@@ -230,7 +228,10 @@ mod tests {
         tx.send(event_delete).ok();
         cs.tick();
 
-        assert!(!cs.is_active(), "Update/Delete should not trigger suggestions");
+        assert!(
+            !cs.is_active(),
+            "Update/Delete should not trigger suggestions"
+        );
     }
 
     // ── Auto-dismiss ────────────────────────────────────────────

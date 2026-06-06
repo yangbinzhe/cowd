@@ -201,7 +201,10 @@ mod tests {
         sessions.register("sess-1".into(), dummy_runtime()).unwrap();
         let removed = sessions.remove("sess-1");
         assert!(removed.is_some(), "remove should return the entry");
-        assert!(sessions.get("sess-1").is_none(), "should be gone after remove");
+        assert!(
+            sessions.get("sess-1").is_none(),
+            "should be gone after remove"
+        );
     }
 
     #[test]

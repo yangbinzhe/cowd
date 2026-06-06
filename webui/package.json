@@ -3,9 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:e2e": "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-/snap/bin/chromium} playwright test --browser=chromium"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "jsdom": "^25.0.0",
     "vitest": "^2.1.0"
   }

@@ -1,6 +1,6 @@
-use pulldown_cmark::{Event, Parser, Tag, TagEnd, CodeBlockKind, HeadingLevel, Options};
-use ratatui::text::{Line, Span};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Line, Span};
 use std::sync::LazyLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
@@ -8,7 +8,8 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use unicode_width::UnicodeWidthStr;
 
-pub(crate) static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+pub(crate) static SYNTAX_SET: LazyLock<SyntaxSet> =
+    LazyLock::new(SyntaxSet::load_defaults_newlines);
 pub(crate) static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 pub fn render_markdown_lines(text: &str, base_color: Color) -> Vec<Line<'static>> {
@@ -122,8 +123,10 @@ impl Renderer {
                 }
                 Event::End(TagEnd::CodeBlock) => {
                     self.in_code_block = false;
-                    self.lines
-                        .extend(code_block_lines(&self.code_content, self.code_language.as_deref()));
+                    self.lines.extend(code_block_lines(
+                        &self.code_content,
+                        self.code_language.as_deref(),
+                    ));
                     self.code_content.clear();
                     self.code_language = None;
                 }
@@ -194,8 +197,10 @@ impl Renderer {
                         HeadingLevel::H5 => "##### ",
                         HeadingLevel::H6 => "###### ",
                     };
-                    self.current_spans
-                        .push(Span::styled(prefix.to_string(), Style::default().fg(Color::Cyan).bold()));
+                    self.current_spans.push(Span::styled(
+                        prefix.to_string(),
+                        Style::default().fg(Color::Cyan).bold(),
+                    ));
                 }
                 Event::End(TagEnd::Heading(_)) => {
                     self.flush_paragraph();
@@ -214,8 +219,10 @@ impl Renderer {
                 // ---- Horizontal rule ----
                 Event::Rule => {
                     self.flush_paragraph();
-                    self.lines
-                        .push(Line::from(Span::styled("───", Style::default().fg(Color::DarkGray))));
+                    self.lines.push(Line::from(Span::styled(
+                        "───",
+                        Style::default().fg(Color::DarkGray),
+                    )));
                 }
 
                 // ---- Lists (ordered / unordered) ----
@@ -234,8 +241,7 @@ impl Renderer {
                 Event::Start(Tag::Item) => {
                     self.flush_paragraph();
                     let depth = self.list_stack.len().saturating_sub(1);
-                    self.current_spans
-                        .push(Span::raw(" ".repeat(depth * 4)));
+                    self.current_spans.push(Span::raw(" ".repeat(depth * 4)));
 
                     match self.list_stack.last_mut() {
                         Some(ListKind::Ordered { next }) => {
@@ -262,22 +268,20 @@ impl Renderer {
                     // Pop the bullet/number marker pushed by Start(Item)
                     self.current_spans.pop();
                     if checked {
-                        self.current_spans.push(Span::styled(
-                            "☑ ",
-                            Style::default().fg(Color::Green),
-                        ));
+                        self.current_spans
+                            .push(Span::styled("☑ ", Style::default().fg(Color::Green)));
                     } else {
-                        self.current_spans.push(Span::styled(
-                            "☐ ",
-                            Style::default().fg(Color::DarkGray),
-                        ));
+                        self.current_spans
+                            .push(Span::styled("☐ ", Style::default().fg(Color::DarkGray)));
                     }
                 }
 
                 // ---- Inline code ----
                 Event::Code(code) => {
-                    self.current_spans
-                        .push(Span::styled(code.to_string(), Style::default().fg(Color::Yellow)));
+                    self.current_spans.push(Span::styled(
+                        code.to_string(),
+                        Style::default().fg(Color::Yellow),
+                    ));
                 }
 
                 // ---- Plain text ----
@@ -388,7 +392,12 @@ impl Renderer {
         }
     }
 
-    fn render_table_row(&self, cells: &[String], widths: &[usize], is_header: bool) -> Line<'static> {
+    fn render_table_row(
+        &self,
+        cells: &[String],
+        widths: &[usize],
+        is_header: bool,
+    ) -> Line<'static> {
         let thin = Style::default().fg(Color::DarkGray);
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.push(Span::styled("│ ", thin));
@@ -436,7 +445,9 @@ fn code_block_lines(content: &str, language: Option<&str>) -> Vec<Line<'static>>
         let theme = &THEME_SET.themes["base16-ocean.dark"];
         let mut highlighter = HighlightLines::new(syntax, theme);
         for line in LinesWithEndings::from(content) {
-            let highlighted = highlighter.highlight_line(line, &SYNTAX_SET).unwrap_or_default();
+            let highlighted = highlighter
+                .highlight_line(line, &SYNTAX_SET)
+                .unwrap_or_default();
             let spans: Vec<Span> = highlighted
                 .into_iter()
                 .map(|(style, text)| {
@@ -509,7 +520,10 @@ mod tests {
         let lines = render_markdown_lines(md, Color::White);
         assert!(!lines.is_empty(), "should produce a line");
         let text = collect_text(&lines[0]);
-        assert!(text.contains("click here"), "link should show text: {text:?}");
+        assert!(
+            text.contains("click here"),
+            "link should show text: {text:?}"
+        );
         assert!(
             !text.contains("example.com"),
             "link should NOT show URL inline: {text:?}"
@@ -587,11 +601,7 @@ mod tests {
         let md = "| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |";
         let lines = render_markdown_lines(md, Color::White);
         // Header + separator + 2 data rows = 4 lines
-        assert!(
-            lines.len() >= 3,
-            "expected ≥3 lines, got {}",
-            lines.len()
-        );
+        assert!(lines.len() >= 3, "expected ≥3 lines, got {}", lines.len());
         assert!(
             collect_text(&lines[0]).starts_with('│'),
             "header line should start with │: {:?}",
@@ -608,10 +618,7 @@ mod tests {
             collect_text(&lines[1])
         );
         let row1 = collect_text(&lines[2]);
-        assert!(
-            row1.contains("Alice"),
-            "row should contain Alice: {row1:?}"
-        );
+        assert!(row1.contains("Alice"), "row should contain Alice: {row1:?}");
     }
 
     #[test]

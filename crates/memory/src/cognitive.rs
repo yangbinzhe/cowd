@@ -13,8 +13,10 @@
 //! 3. L3      – dynamically loaded deep memories (multi-signal relevance).
 //! 4. Seeds   – pre-authored fragments whose trigger condition fired.
 
+use parking_lot::Mutex;
 use std::{
     collections::HashSet,
+    hash::{Hash, Hasher},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -22,20 +24,18 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use chrono::Utc;
 
-use crate::{ MemoryScope, SessionResume,
+use crate::performance_monitor::{AutoTuner, PerformanceMonitor};
+use crate::{
     background_watcher::{BackgroundWatcher, BackgroundWatcherConfig, BackgroundWatcherHandle},
     closet::{Closet, ClosetManager},
     code_indexer::CodeSymbol,
     coherence,
     compression::{
-        budget::BudgetManager,
-        llm_summarizer::OpenAiSummarizer,
-        monitor::ContextWindowMonitor,
+        budget::BudgetManager, llm_summarizer::OpenAiSummarizer, monitor::ContextWindowMonitor,
         CompressionPipeline,
     },
     config::{BudgetCalculator, MemoryConfig},
@@ -47,23 +47,30 @@ use crate::{ MemoryScope, SessionResume,
     extractor::MemoryExtractor,
     fresh_context::FreshContextManager,
     handoff::HandoffManager,
+    maintenance::{
+        MaintenanceCandidate, MaintenanceCandidateFilter, MaintenanceCandidateStatus,
+        MaintenanceQueue, MaintenanceScanConfig, scan_maintenance_candidates,
+    },
+    memory_pulse::{MemoryPulseBatch, MemoryPulseConsumer, MemoryPulseReport},
     orchestrator::MemoryOrchestrator,
     project_scope::{build_project_kg, ProjectScopeManager},
     search::HybridSearcher,
     seeds::{DecisionThreadStore, SeedRegistry},
     state_rebuilder::StateRebuilder,
-    store::{FtsSearchOptions, FtsSearchResult},
     store::vector::VectorIndex,
+    store::{FtsSearchOptions, FtsSearchResult},
     tool_sandbox::ToolOutputSandbox,
     types::{
-        Blocker, Decision, DecisionEntry, HandoffData, MatchedKeyword, MemoryEntry, MemoryId,
-        MemoryLayer, MemoryCategory, MemorySource, Message, MessageRole, PreparedContext, Priority,
+        Blocker, Decision, DecisionEntry, HandoffData, MatchedKeyword, MemoryCategory, MemoryEntry,
+        MemoryId, MemoryLayer, MemorySource, Message, MessageRole, PreparedContext, Priority,
         SearchMemoriesRequest, SearchMemoriesResult, SearchMode, SearchSnippet, Seed, TokenBudget,
         WorkItem, WorkItemStatus,
     },
-    write_guard::{AuditLog, AuditOperation, AuditEntry, IntegrityChecker, MemoryWriteGuard, WriteSource},
+    write_guard::{
+        AuditEntry, AuditLog, AuditOperation, IntegrityChecker, MemoryWriteGuard, WriteSource,
+    },
+    MemoryScope, SessionResume,
 };
-use crate::performance_monitor::{AutoTuner, PerformanceMonitor};
 
 /// Result alias used throughout this module.
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -104,6 +111,13 @@ struct CachedLayer {
     entries: Vec<MemoryEntry>,
     knowledge_graph: String,
     code_context: String,
+    cached_at: Instant,
+}
+
+struct CachedPreparedContext {
+    key: u64,
+    revision: u64,
+    context: PreparedContext,
     cached_at: Instant,
 }
 
@@ -176,6 +190,8 @@ pub struct CognitiveContextManager {
     session_resume: Option<SessionResume>,
     /// Optional project scope manager for KG staleness detection.
     project_scope_mgr: Option<std::sync::Arc<ProjectScopeManager>>,
+    /// Reviewable lifecycle candidates for memory self-maintenance.
+    maintenance_queue: MaintenanceQueue,
     /// Path of the currently loaded project KG, used for auto-rebuild.
     project_kg_path: Mutex<Option<PathBuf>>,
     /// Tick counter for periodic KG rebuild (every 100 ticks).
@@ -198,6 +214,10 @@ pub struct CognitiveContextManager {
     l2_cache: Arc<Mutex<Option<CachedLayer>>>,
     /// Receiver for L4 push notifications from the event bus.
     l4_event_rx: Mutex<Option<tokio::sync::broadcast::Receiver<crate::layers::shared::L4Event>>>,
+    /// Short-lived cache for identical prepare_context requests.
+    prepare_context_cache: Mutex<Option<CachedPreparedContext>>,
+    /// Monotonic version for invalidating derived context after memory writes.
+    memory_revision: AtomicU64,
     /// Performance metrics collector (rolling window).
     perf_monitor: PerformanceMonitor,
     /// Auto-tuner that adjusts TuningConfig based on observed performance.
@@ -321,8 +341,16 @@ impl CognitiveContextManager {
 
         // Load knowledge graph from persistent store.
         let kg = {
-            let entities = orchestrator.store().load_entities().await.unwrap_or_default();
-            let triples = orchestrator.store().load_triples().await.unwrap_or_default();
+            let entities = orchestrator
+                .store()
+                .load_entities()
+                .await
+                .unwrap_or_default();
+            let triples = orchestrator
+                .store()
+                .load_triples()
+                .await
+                .unwrap_or_default();
             let mut graph = KnowledgeGraph::new();
             for e in entities {
                 graph.add_entity(e);
@@ -408,12 +436,11 @@ impl CognitiveContextManager {
 
         // Restore Closet from KV store and re-inject into orchestrator.
         let closet_json = orchestrator.store().kv_get("closet").await.unwrap_or(None);
-        let closet: Option<Closet> = closet_json
-            .and_then(|json| {
-                serde_json::from_str::<Vec<crate::closet::ClosetPointer>>(&json)
-                    .ok()
-                    .map(|pointers| Closet { pointers })
-            });
+        let closet: Option<Closet> = closet_json.and_then(|json| {
+            serde_json::from_str::<Vec<crate::closet::ClosetPointer>>(&json)
+                .ok()
+                .map(|pointers| Closet { pointers })
+        });
         if let Some(ref c) = closet {
             orchestrator.restore_closet(c.clone()).await?;
         }
@@ -453,14 +480,32 @@ impl CognitiveContextManager {
             }
         };
 
+        let audit_path = config.store.blob_dir.join("audit.jsonl");
+        let audit_log = match AuditLog::open(audit_path.clone()) {
+            Ok(log) => Some(log),
+            Err(e) => {
+                tracing::warn!("audit log: failed to open audit log: {e}");
+                None
+            }
+        };
         let integrity_checker = {
-            let audit_path = config.store.blob_dir.join("audit.jsonl");
             match AuditLog::open(audit_path) {
                 Ok(log) => Some(Arc::new(IntegrityChecker::new(log))),
                 Err(e) => {
                     tracing::warn!("integrity checker: failed to open audit log: {e}");
                     None
                 }
+            }
+        };
+
+        let maintenance_queue = match MaintenanceQueue::open_sqlite(&config.store.sqlite_path) {
+            Ok(queue) => queue,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "memory maintenance: durable queue unavailable, using in-memory fallback"
+                );
+                MaintenanceQueue::new()
             }
         };
 
@@ -472,6 +517,7 @@ impl CognitiveContextManager {
             delegation_results: Mutex::new(Vec::new()),
             session_resume,
             project_scope_mgr: None,
+            maintenance_queue,
             project_kg_path: Mutex::new(None),
             kg_rebuild_tick_counter: AtomicU64::new(0),
             cross_store_verify_counter: AtomicU64::new(0),
@@ -482,9 +528,9 @@ impl CognitiveContextManager {
             l0_cache: Mutex::new(None),
             l1_cache: Mutex::new(None),
             l2_cache,
-            l4_event_rx: Mutex::new(
-                orchestrator.l4_event_bus().map(|bus| bus.subscribe())
-            ),
+            l4_event_rx: Mutex::new(orchestrator.l4_event_bus().map(|bus| bus.subscribe())),
+            prepare_context_cache: Mutex::new(None),
+            memory_revision: AtomicU64::new(0),
             perf_monitor: PerformanceMonitor::default(),
             auto_tuner: AutoTuner::new(config.tuning.clone()),
             entity_registry: Mutex::new(None),
@@ -500,7 +546,7 @@ impl CognitiveContextManager {
             decisions: Mutex::new(DecisionThreadStore::new()),
             closet: Mutex::new(closet),
             write_guard: None,
-            audit_log: None,
+            audit_log,
             integrity_checker,
             integrity_check_counter: AtomicU64::new(0),
             embedding_capability,
@@ -602,6 +648,14 @@ impl CognitiveContextManager {
         self.orchestrator.active_session_id()
     }
 
+    pub(crate) async fn kernel_kv_put(&self, key: &str, value: &str) -> Result<()> {
+        self.orchestrator.store().kv_put(key, value).await
+    }
+
+    pub(crate) async fn kernel_kv_get(&self, key: &str) -> Result<Option<String>> {
+        self.orchestrator.store().kv_get(key).await
+    }
+
     /// Attach a [`ProjectScopeManager`] for KG staleness detection on turn end.
     ///
     /// When set, [`on_turn_end`] will check whether any indexed source files
@@ -612,10 +666,108 @@ impl CognitiveContextManager {
     }
 
     /// Check whether a write to `layer` is allowed under the current guard.
-    pub fn check_write_access(&self, layer: crate::types::MemoryLayer) -> crate::write_guard::WritePolicy {
+    pub fn check_write_access(
+        &self,
+        layer: crate::types::MemoryLayer,
+    ) -> crate::write_guard::WritePolicy {
         match &self.write_guard {
             Some(guard) => guard.check_write(layer),
             None => crate::write_guard::WritePolicy::Allow,
+        }
+    }
+
+    fn invalidate_prepare_context_cache(&self) {
+        self.memory_revision.fetch_add(1, Ordering::Relaxed);
+        self.prepare_context_cache.lock().take();
+    }
+
+    fn prepare_context_cache_key(
+        &self,
+        query: &str,
+        messages: &[Message],
+        session_id: Option<&str>,
+        active_session_id: Option<&str>,
+        current_agent: Option<&str>,
+        budget: &TokenBudget,
+    ) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        query.hash(&mut hasher);
+        session_id.hash(&mut hasher);
+        active_session_id.hash(&mut hasher);
+        current_agent.hash(&mut hasher);
+        budget.total.hash(&mut hasher);
+        budget.available.hash(&mut hasher);
+        self.config
+            .tuning
+            .freshness_trigger_ratio
+            .to_bits()
+            .hash(&mut hasher);
+        for msg in messages {
+            msg.turn_index.hash(&mut hasher);
+            msg.role.to_string().hash(&mut hasher);
+            msg.content.hash(&mut hasher);
+            msg.tool_use_id.hash(&mut hasher);
+            msg.tool_name.hash(&mut hasher);
+            msg.pinned.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn cached_prepared_context(&self, key: u64, revision: u64) -> Option<PreparedContext> {
+        let ttl = Duration::from_millis(self.config.tuning.prepare_context_cache_ttl_ms);
+        if ttl.is_zero() {
+            return None;
+        }
+        self.prepare_context_cache
+            .lock()
+            .as_ref()
+            .filter(|cached| {
+                cached.key == key && cached.revision == revision && cached.cached_at.elapsed() < ttl
+            })
+            .map(|cached| {
+                let mut context = cached.context.clone();
+                context.prepared_at = Utc::now();
+                context
+            })
+    }
+
+    fn store_prepared_context_cache(&self, key: u64, revision: u64, context: &PreparedContext) {
+        if self.config.tuning.prepare_context_cache_ttl_ms == 0 {
+            return;
+        }
+        *self.prepare_context_cache.lock() = Some(CachedPreparedContext {
+            key,
+            revision,
+            context: context.clone(),
+            cached_at: Instant::now(),
+        });
+    }
+
+    fn audit_source(&self) -> WriteSource {
+        self.write_guard
+            .as_ref()
+            .map(|guard| guard.source())
+            .unwrap_or(WriteSource::User)
+    }
+
+    fn log_memory_audit(
+        &self,
+        operation: AuditOperation,
+        entry_id: String,
+        layer: MemoryLayer,
+        summary_source: &str,
+    ) {
+        if let Some(ref log) = self.audit_log {
+            let _ = log.log(&AuditEntry {
+                timestamp: Utc::now(),
+                operation,
+                entry_id,
+                layer: format!("{layer:?}"),
+                source: self.audit_source(),
+                summary: truncate_summary(summary_source, self.config.tuning.audit_truncate_len),
+                agent_id: None,
+                session_id: None,
+            });
         }
     }
 
@@ -631,10 +783,7 @@ impl CognitiveContextManager {
     pub fn load_project_kg(&self, project_path: &PathBuf) -> Result<()> {
         let (kg, _mtimes) = build_project_kg(project_path);
         let entity_count = kg.list_entities().len();
-        let mut guard = self
-            .kg
-            .lock()
-            ;
+        let mut guard = self.kg.lock();
         *guard = kg;
         // Track path for auto-rebuild on staleness
         *self.project_kg_path.lock() = Some(project_path.clone());
@@ -643,6 +792,7 @@ impl CognitiveContextManager {
             path = %project_path.display(),
             "project knowledge graph loaded"
         );
+        self.invalidate_prepare_context_cache();
         Ok(())
     }
 
@@ -689,6 +839,32 @@ impl CognitiveContextManager {
             }
         }
 
+        let budget = self.compute_budget();
+        let current_agent = self.current_agent.lock().clone();
+        let current_session = self.orchestrator.active_session_id();
+        let cache_revision = self.memory_revision.load(Ordering::Relaxed);
+        let cache_key = self.prepare_context_cache_key(
+            query,
+            messages,
+            session_id,
+            current_session.as_deref(),
+            current_agent.as_deref(),
+            &budget,
+        );
+        if entries.is_empty() {
+            if let Some(context) = self.cached_prepared_context(cache_key, cache_revision) {
+                let elapsed = _prepare_start.elapsed();
+                self.perf_monitor.record_cache_hit();
+                self.perf_monitor.record_prepare_context(elapsed);
+                tracing::debug!(
+                    elapsed_ms = elapsed.as_millis(),
+                    entries = context.entries.len(),
+                    "prepare_context cache hit"
+                );
+                return Ok(context);
+            }
+        }
+
         // ═══════════════════════════════════════════════════════════════════
         // Step 0: L4 team query — pull shared entries from other agents
         //         before loading base layers (feature-gated).
@@ -702,17 +878,11 @@ impl CognitiveContextManager {
                 Ok(mut team_entries) => {
                     for entry in &mut team_entries {
                         entry.priority = Priority::High;
-                        entry
-                            .tags
-                            .push("l4_team_query".into());
+                        entry.tags.push("l4_team_query".into());
                     }
                     let count = team_entries.len();
                     entries.extend(team_entries);
-                    tracing::debug!(
-                        count,
-                        "prepare_context: injected {} L4 team entries",
-                        count
-                    );
+                    tracing::debug!(count, "prepare_context: injected {} L4 team entries", count);
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -741,10 +911,9 @@ impl CognitiveContextManager {
                         .collect()
                 };
                 for topic in hot_topics {
-                    let prefetch_set: HashSet<MemoryId> =
-                        entries.iter().map(|e| e.id).collect();
-                    let budget = (self.config.budget.available_tokens() / 4)
-                        .min(u64::from(u32::MAX)) as u32;
+                    let prefetch_set: HashSet<MemoryId> = entries.iter().map(|e| e.id).collect();
+                    let budget =
+                        (self.config.budget.available_tokens() / 4).min(u64::from(u32::MAX)) as u32;
                     match self
                         .orchestrator
                         .recall_relevant(&topic, None, &prefetch_set, budget)
@@ -752,8 +921,7 @@ impl CognitiveContextManager {
                     {
                         Ok(mut recalled) => {
                             for entry in &mut recalled {
-                                entry.content =
-                                    format!("[PREFETCH: {}] {}", topic, entry.content);
+                                entry.content = format!("[PREFETCH: {}] {}", topic, entry.content);
                                 entry.tags.push("prefetch".into());
                                 entry.source = MemorySource::Prefetch;
                                 entry.priority = Priority::High;
@@ -778,11 +946,23 @@ impl CognitiveContextManager {
 
         // L0 + L1: check cache first; reload both together if either expired.
         {
-            let l0_hit = self.l0_cache.lock().as_ref()
-                .filter(|c| c.cached_at.elapsed() < Duration::from_secs(self.config.tuning.l0_cache_ttl_secs))
+            let l0_hit = self
+                .l0_cache
+                .lock()
+                .as_ref()
+                .filter(|c| {
+                    c.cached_at.elapsed()
+                        < Duration::from_secs(self.config.tuning.l0_cache_ttl_secs)
+                })
                 .map(|c| c.entries.clone());
-            let l1_hit = self.l1_cache.lock().as_ref()
-                .filter(|c| c.cached_at.elapsed() < Duration::from_secs(self.config.tuning.l1_cache_ttl_secs))
+            let l1_hit = self
+                .l1_cache
+                .lock()
+                .as_ref()
+                .filter(|c| {
+                    c.cached_at.elapsed()
+                        < Duration::from_secs(self.config.tuning.l1_cache_ttl_secs)
+                })
                 .map(|c| c.entries.clone());
 
             if let (Some(l0), Some(l1)) = (l0_hit, l1_hit) {
@@ -792,11 +972,13 @@ impl CognitiveContextManager {
             } else {
                 self.perf_monitor.record_cache_miss();
                 let fixed = self.orchestrator.load_fixed_layers().await?;
-                let l0: Vec<_> = fixed.iter()
+                let l0: Vec<_> = fixed
+                    .iter()
                     .filter(|e| matches!(e.layer, MemoryLayer::L0))
                     .cloned()
                     .collect();
-                let l1: Vec<_> = fixed.iter()
+                let l1: Vec<_> = fixed
+                    .iter()
                     .filter(|e| matches!(e.layer, MemoryLayer::L1))
                     .cloned()
                     .collect();
@@ -820,8 +1002,14 @@ impl CognitiveContextManager {
 
         // L2: project context with cache
         {
-            let l2_hit = self.l2_cache.lock().as_ref()
-                .filter(|c| c.cached_at.elapsed() < Duration::from_secs(self.config.tuning.l2_cache_ttl_secs))
+            let l2_hit = self
+                .l2_cache
+                .lock()
+                .as_ref()
+                .filter(|c| {
+                    c.cached_at.elapsed()
+                        < Duration::from_secs(self.config.tuning.l2_cache_ttl_secs)
+                })
                 .map(|c| c.entries.clone());
             if let Some(l2) = l2_hit {
                 self.perf_monitor.record_cache_hit();
@@ -843,24 +1031,22 @@ impl CognitiveContextManager {
         let query_embedding = {
             if self.embedding_capability.supports_semantic() {
                 match &self.embedding_capability {
-                    EmbeddingCapability::Remote { client } => {
-                        match client.embed_one(query).await {
-                            Ok(embed) => {
-                                tracing::debug!(
-                                    dim = embed.len(),
-                                    "query embedding generated for hybrid search"
-                                );
-                                Some(embed)
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "embedding failed, falling back to FTS5 search"
-                                );
-                                None
-                            }
+                    EmbeddingCapability::Remote { client } => match client.embed_one(query).await {
+                        Ok(embed) => {
+                            tracing::debug!(
+                                dim = embed.len(),
+                                "query embedding generated for hybrid search"
+                            );
+                            Some(embed)
                         }
-                    }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "embedding failed, falling back to FTS5 search"
+                            );
+                            None
+                        }
+                    },
                     _ => None,
                 }
             } else {
@@ -883,7 +1069,10 @@ impl CognitiveContextManager {
                         priority: Priority::Normal,
                         source: MemorySource::AutoExtracted,
                         title: "Rebuilt Context Summary".into(),
-                        content: format!("[REBUILT STATE confidence={:.2}] {}", rebuilt.overall_confidence, summary.data),
+                        content: format!(
+                            "[REBUILT STATE confidence={:.2}] {}",
+                            rebuilt.overall_confidence, summary.data
+                        ),
                         embedding: None,
                         tags: vec!["rebuilt".into(), "state".into()],
                         relations: vec![],
@@ -933,14 +1122,9 @@ impl CognitiveContextManager {
 
         // ── Step 2b: P1 project knowledge graph query ───────────────────────
         {
-            let kg = self
-                .kg
-                .lock()
-                ;
-            let query_tokens: Vec<String> = query
-                .split_whitespace()
-                .map(str::to_lowercase)
-                .collect();
+            let kg = self.kg.lock();
+            let query_tokens: Vec<String> =
+                query.split_whitespace().map(str::to_lowercase).collect();
             let mut seen: HashSet<String> = HashSet::new();
             for token in &query_tokens {
                 if seen.contains(token) {
@@ -984,7 +1168,6 @@ impl CognitiveContextManager {
         }
 
         // Compute budget for L3 token-aware recall
-        let budget = self.compute_budget();
         let memory_budget = budget
             .available
             .saturating_sub(self.estimate_tokens_entries(&entries))
@@ -993,9 +1176,6 @@ impl CognitiveContextManager {
         // ═══════════════════════════════════════════════════════════════════
         // Group 2: Peer context + L4 recall + L3 recall + SessionResume — all independent
         // ═══════════════════════════════════════════════════════════════════
-        let current_agent = self.current_agent.lock().clone();
-        let current_session = self.orchestrator.active_session_id();
-
         let ((peers, realtime_peers), l4_project, l4_global, l3_result, resume_result) = tokio::join!(
             // Peer context: regular + realtime
             async {
@@ -1022,25 +1202,32 @@ impl CognitiveContextManager {
             async {
                 match self.orchestrator.recall_l4_project(query, 5).await {
                     Ok(r) => r,
-                    Err(e) => { tracing::warn!(error=%e, "L4 project recall failed"); Vec::new() }
+                    Err(e) => {
+                        tracing::warn!(error=%e, "L4 project recall failed");
+                        Vec::new()
+                    }
                 }
             },
             // L4 global-scoped recall
             async {
                 match self.orchestrator.recall_l4_global(query, 5).await {
                     Ok(r) => r,
-                    Err(e) => { tracing::warn!(error=%e, "L4 global recall failed"); Vec::new() }
+                    Err(e) => {
+                        tracing::warn!(error=%e, "L4 global recall failed");
+                        Vec::new()
+                    }
                 }
             },
             // L3 deep recall (hybrid semantic + BM25)
             async {
-                self.orchestrator.recall_relevant(
-                    query,
-                    query_embedding.as_deref(),
-                    &already_surfaced,
-                    memory_budget * 2, // over-fetch for hybrid re-ranking
-                )
-                .await
+                self.orchestrator
+                    .recall_relevant(
+                        query,
+                        query_embedding.as_deref(),
+                        &already_surfaced,
+                        memory_budget * 2, // over-fetch for hybrid re-ranking
+                    )
+                    .await
             },
             // Session resume from prior session context
             async {
@@ -1123,7 +1310,10 @@ impl CognitiveContextManager {
         // P10: Recall L4 collaboration synthesis results via MemorySyncProtocol
         if let Some(ref sync) = self.memory_sync {
             let agent_id = current_agent.as_deref().unwrap_or_default();
-            match sync.import_from_l4("collaboration-synthesis", agent_id).await {
+            match sync
+                .import_from_l4("collaboration-synthesis", agent_id)
+                .await
+            {
                 Ok(synthesis_entries) => {
                     for entry in synthesis_entries {
                         if !already_surfaced.contains(&entry.id) {
@@ -1201,19 +1391,16 @@ impl CognitiveContextManager {
         // ── Session isolation filter (via ContextFence) ──
         if let Some(sid) = session_id {
             let fence = crate::context_fence::fence_from_session(sid, None, None);
-            entries = crate::context_fence::filter_through_fence(&entries, &fence).into_iter().cloned().collect();
+            entries = crate::context_fence::filter_through_fence(&entries, &fence)
+                .into_iter()
+                .cloned()
+                .collect();
         }
 
         // ── Step 4: check seed triggers and inject as high-priority L1 entries ──
-        let query_words: Vec<String> = query
-            .split_whitespace()
-            .map(str::to_lowercase)
-            .collect();
+        let query_words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         let triggered = {
-            let mut reg = self
-                .seeds
-                .lock()
-                ;
+            let mut reg = self.seeds.lock();
             reg.check_triggers("default", &query_words, Utc::now())
         };
         for seed in triggered {
@@ -1244,10 +1431,8 @@ impl CognitiveContextManager {
         }
 
         // ── Step 5: sample context window pressure ───────────────────────────
-        let total_message_tokens: u64 = messages
-            .iter()
-            .map(|m| u64::from(m.token_estimate()))
-            .sum();
+        let total_message_tokens: u64 =
+            messages.iter().map(|m| u64::from(m.token_estimate())).sum();
         let total_entry_tokens: u64 = self.estimate_tokens_entries(&entries);
         let used_tokens = total_message_tokens + total_entry_tokens;
         let _monitor_snapshot = self.monitor.sample(used_tokens);
@@ -1360,10 +1545,7 @@ impl CognitiveContextManager {
 
         // Step 7: auto-inject relevant code symbols (when applicable)
         let code_context = if is_code_query(query) {
-            let symbols = self
-                .orchestrator
-                .find_relevant_symbols(query, 5)
-                .await;
+            let symbols = self.orchestrator.find_relevant_symbols(query, 5).await;
             if symbols.is_empty() {
                 None
             } else {
@@ -1386,7 +1568,10 @@ impl CognitiveContextManager {
                         category: MemoryCategory::Reference,
                         priority: Priority::Normal,
                         source: MemorySource::AutoExtracted,
-                        title: format!("[SANDBOX] tool output L{}-L{}", snip.line_start, snip.line_end),
+                        title: format!(
+                            "[SANDBOX] tool output L{}-L{}",
+                            snip.line_start, snip.line_end
+                        ),
                         content: format!("[TOOL OUTPUT] {}", snip.content),
                         embedding: None,
                         tags: vec!["sandbox".into(), "tool_output".into()],
@@ -1420,11 +1605,14 @@ impl CognitiveContextManager {
                 tags: vec!["hot_symbols".into(), "code".into()],
                 relations: vec![],
                 confidence: 0.9,
-                access_count: 0, staleness: 0.0,
-                created_at: Utc::now(), updated_at: Utc::now(),
+                access_count: 0,
+                staleness: 0.0,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
                 last_accessed_at: None,
                 scope: MemoryScope::default(),
-                session_id: None, source_agent: None,
+                session_id: None,
+                source_agent: None,
                 visibility: crate::types::AgentVisibility::default(),
             });
         }
@@ -1453,14 +1641,16 @@ impl CognitiveContextManager {
             "prepare_context complete"
         );
 
-        Ok(PreparedContext {
+        let context = PreparedContext {
             entries,
             total_tokens,
             budget,
             depth_scale,
             prepared_at: Utc::now(),
             code_context,
-        })
+        };
+        self.store_prepared_context_cache(cache_key, cache_revision, &context);
+        Ok(context)
     }
 
     /// Public entry point: prepare context with automatic code symbol injection.
@@ -1520,7 +1710,9 @@ impl CognitiveContextManager {
             tracing::debug!(
                 messages_count = messages.len(),
                 has_user = messages.iter().any(|m| matches!(m.role, MessageRole::User)),
-                has_assistant = messages.iter().any(|m| matches!(m.role, MessageRole::Assistant)),
+                has_assistant = messages
+                    .iter()
+                    .any(|m| matches!(m.role, MessageRole::Assistant)),
                 has_tool = messages.iter().any(|m| matches!(m.role, MessageRole::Tool)),
                 user_content_total = messages
                     .iter()
@@ -1605,17 +1797,24 @@ impl CognitiveContextManager {
                 // Queue LLM Pass 5 for background processing (non-blocking).
                 if self.extractor.llm_client().is_some() {
                     let _ = self.extract_tx.send(messages.to_vec());
-                    tracing::debug!("extract_and_remember: queued messages for background LLM extraction");
+                    tracing::debug!(
+                        "extract_and_remember: queued messages for background LLM extraction"
+                    );
                 }
             }
 
             // ── 0c. Index large tool outputs into sandbox ───────────────────
             let mut sandbox = self.tool_sandbox.lock();
-            for msg in messages.iter().filter(|m| matches!(m.role, MessageRole::Tool)) {
+            for msg in messages
+                .iter()
+                .filter(|m| matches!(m.role, MessageRole::Tool))
+            {
                 let call_id = msg.tool_use_id.as_deref().unwrap_or("unknown");
                 let tool_name = msg.tool_name.as_deref().unwrap_or("unknown_tool");
                 let threshold = self.config.tuning.sandbox_min_lines;
-                if let Some(summary) = sandbox.index_tool_output(call_id, tool_name, &msg.content, threshold) {
+                if let Some(summary) =
+                    sandbox.index_tool_output(call_id, tool_name, &msg.content, threshold)
+                {
                     tracing::info!(
                         call_id,
                         tool_name,
@@ -1636,10 +1835,8 @@ impl CognitiveContextManager {
         if !pending_embeddings.is_empty() {
             match &self.embedding_capability {
                 EmbeddingCapability::Remote { client } => {
-                    let texts: Vec<&str> = pending_embeddings
-                        .iter()
-                        .map(|(_, c)| c.as_str())
-                        .collect();
+                    let texts: Vec<&str> =
+                        pending_embeddings.iter().map(|(_, c)| c.as_str()).collect();
                     match client.embed(&texts).await {
                         Ok(embeddings) => {
                             tracing::info!(
@@ -1672,6 +1869,7 @@ impl CognitiveContextManager {
 
         let _extract_elapsed = _extract_start.elapsed();
         self.perf_monitor.record_extract(_extract_elapsed);
+        self.invalidate_prepare_context_cache();
 
         Ok(())
     }
@@ -1685,6 +1883,7 @@ impl CognitiveContextManager {
     ///
     /// Failures are logged and swallowed so they never abort the turn.
     pub async fn run_drift_and_seeds(&self, messages: &[Message]) -> Result<()> {
+        let mut pruned_any = false;
         // ── 3. Drift detection on L1 entries ────────────────────────────────
         let l1_entries = self.orchestrator.load_fixed_layers().await?;
         for entry in &l1_entries {
@@ -1696,6 +1895,7 @@ impl CognitiveContextManager {
                         "drift: pruning entry"
                     );
                     let _ = self.orchestrator.forget(&entry.id).await;
+                    pruned_any = true;
                 }
                 crate::drift::DriftVerdict::FlagForReview { reason } => {
                     tracing::debug!(
@@ -1721,16 +1921,17 @@ impl CognitiveContextManager {
             reg.check_triggers("turn_end", &turn_keywords, Utc::now());
         }
 
+        if pruned_any {
+            self.invalidate_prepare_context_cache();
+        }
+
         Ok(())
     }
 
     /// Run the full post-turn sequence.
     ///
-    /// Convenience wrapper that calls [`extract_and_remember`],
-    /// [`run_drift_and_seeds`], and [`run_memory_maintenance`] sequentially.
-    ///
-    /// For callers who want parallelism, combine the first two with
-    /// `tokio::join!` and still call [`run_memory_maintenance`] after.
+    /// Convenience wrapper that preserves full post-turn behavior while
+    /// running extraction and drift/seed checks in parallel.
     pub async fn on_turn_end(&self, messages: &mut Vec<Message>) -> Result<()> {
         // ── Delegation observation ────────────────────────────────────────────
         {
@@ -1739,13 +1940,30 @@ impl CognitiveContextManager {
                 delegation_queue.drain(..).collect()
             };
             for d in drained {
-                let title = format!("delegation:{}:{}", d.agent_role, &d.task[..d.task.len().min(40)]);
-                let content = format!("Agent: {}\nTask: {}\nResult: {}", d.agent_role, d.task, d.result);
+                let title = format!(
+                    "delegation:{}:{}",
+                    d.agent_role,
+                    &d.task[..d.task.len().min(40)]
+                );
+                let content = format!(
+                    "Agent: {}\nTask: {}\nResult: {}",
+                    d.agent_role, d.task, d.result
+                );
                 let tags = vec!["delegation".into(), d.agent_role.clone()];
-                if let Err(e) = self.orchestrator.write(
-                    MemoryLayer::L4, MemoryCategory::Shared, &title, &content,
-                    Priority::Normal, MemorySource::AutoExtracted, tags, MemoryScope::default(),
-                ).await {
+                if let Err(e) = self
+                    .orchestrator
+                    .write(
+                        MemoryLayer::L4,
+                        MemoryCategory::Shared,
+                        &title,
+                        &content,
+                        Priority::Normal,
+                        MemorySource::AutoExtracted,
+                        tags,
+                        MemoryScope::default(),
+                    )
+                    .await
+                {
                     tracing::warn!("delegation observation write failed: {e}");
                 } else {
                     tracing::info!(agent_role = %d.agent_role, "delegation result written to L4");
@@ -1759,9 +1977,17 @@ impl CognitiveContextManager {
             let _ = sync.import_from_l4("memory_update", &agent_id).await;
         }
 
-        // ── Extract ── Drift+Seeds ── Maintenance ──────────────────────
-        let _ = self.extract_and_remember(messages).await;
-        let _ = self.run_drift_and_seeds(messages).await;
+        // ── Extract ∥ Drift+Seeds ── Maintenance ──────────────────────
+        let (extract_result, drift_result) = tokio::join!(
+            async { self.extract_and_remember(messages).await },
+            async { self.run_drift_and_seeds(messages).await },
+        );
+        if let Err(error) = extract_result {
+            tracing::warn!(%error, "on_turn_end: extraction failed");
+        }
+        if let Err(error) = drift_result {
+            tracing::warn!(%error, "on_turn_end: drift and seeds failed");
+        }
         let result = self.run_memory_maintenance(messages).await;
 
         // ── Auto-tune evaluation ──────────────────────────────────────────
@@ -1795,8 +2021,10 @@ impl CognitiveContextManager {
             let report = fc.auto_correct();
             if report.corrected > 0 || report.pruned > 0 {
                 tracing::info!(
-                    corrected = report.corrected, pruned = report.pruned,
-                    flagged = report.flagged, "auto-correction applied"
+                    corrected = report.corrected,
+                    pruned = report.pruned,
+                    flagged = report.flagged,
+                    "auto-correction applied"
                 );
             }
         }
@@ -1810,7 +2038,9 @@ impl CognitiveContextManager {
 
         // ── 2. Session compact if threshold exceeded ─────────────────────────
         if self.pipeline.should_session_compact(messages) {
-            self.pipeline.session_compact(messages, &self.orchestrator).await?;
+            self.pipeline
+                .session_compact(messages, &self.orchestrator)
+                .await?;
         }
 
         // Record compression ratio (post / pre)
@@ -1853,12 +2083,21 @@ impl CognitiveContextManager {
 
         // ── 5a3. Cross-store consistency verification every 50 ticks (T2) ────
         {
-            let tick = self.cross_store_verify_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let tick = self
+                .cross_store_verify_counter
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
             if tick % 50 == 0 {
                 let warnings = self.cross_store_verify().await;
-                for w in &warnings { tracing::warn!("cross-store-verify: {w}"); }
+                for w in &warnings {
+                    tracing::warn!("cross-store-verify: {w}");
+                }
                 if !warnings.is_empty() {
-                    tracing::warn!(count = warnings.len(), "cross-store consistency check found {} issues", warnings.len());
+                    tracing::warn!(
+                        count = warnings.len(),
+                        "cross-store consistency check found {} issues",
+                        warnings.len()
+                    );
                 }
             }
         }
@@ -1874,7 +2113,11 @@ impl CognitiveContextManager {
                                 for anomaly in &report.anomalies {
                                     tracing::warn!("integrity anomaly detected: {:?}", anomaly);
                                 }
-                                tracing::warn!(count = report.anomalies.len(), "integrity check found {} anomaly(ies)", report.anomalies.len());
+                                tracing::warn!(
+                                    count = report.anomalies.len(),
+                                    "integrity check found {} anomaly(ies)",
+                                    report.anomalies.len()
+                                );
                             }
                         }
                         Err(e) => tracing::warn!("integrity check failed: {e}"),
@@ -2003,7 +2246,11 @@ impl CognitiveContextManager {
         if !policy.is_allowed() {
             return Err(MemoryError::WriteDenied {
                 layer: format!("{:?}", entry.layer),
-                write_source: self.write_guard.as_ref().map(|g| format!("{:?}", g.source())).unwrap_or_default(),
+                write_source: self
+                    .write_guard
+                    .as_ref()
+                    .map(|g| format!("{:?}", g.source()))
+                    .unwrap_or_default(),
             });
         }
 
@@ -2015,8 +2262,15 @@ impl CognitiveContextManager {
                     operation: AuditOperation::Create,
                     entry_id: entry.id.to_string(),
                     layer: format!("{:?}", entry.layer),
-                    source: self.write_guard.as_ref().map(|g| g.source()).unwrap_or(WriteSource::System),
-                    summary: truncate_summary(&entry.content, self.config.tuning.audit_truncate_len),
+                    source: self
+                        .write_guard
+                        .as_ref()
+                        .map(|g| g.source())
+                        .unwrap_or(WriteSource::System),
+                    summary: truncate_summary(
+                        &entry.content,
+                        self.config.tuning.audit_truncate_len,
+                    ),
                     agent_id: None,
                     session_id: None,
                 });
@@ -2024,6 +2278,7 @@ impl CognitiveContextManager {
         }
 
         self.orchestrator.remember(entry).await?;
+        self.invalidate_prepare_context_cache();
         Ok(())
     }
 
@@ -2048,6 +2303,169 @@ impl CognitiveContextManager {
         self.orchestrator.list_layer(layer).await
     }
 
+    /// List full memory entries in a specific layer for product surfaces.
+    pub async fn list_layer_full_entries(
+        &self,
+        layer: crate::types::MemoryLayer,
+    ) -> Result<Vec<crate::types::MemoryEntry>> {
+        self.orchestrator.store().search_by_layer(layer).await
+    }
+
+    /// Shared orchestrator handle for UI surfaces that need layer-level
+    /// snapshots or L4 event subscriptions.
+    pub fn orchestrator(&self) -> Arc<MemoryOrchestrator> {
+        Arc::clone(&self.orchestrator)
+    }
+
+    /// List all memory entries across layers.
+    pub async fn list_all_entries(&self) -> Result<Vec<crate::types::MemoryEntry>> {
+        self.orchestrator.store().list_all().await
+    }
+
+    /// Scan current memories and enqueue reviewable lifecycle maintenance
+    /// candidates. This never mutates or deletes memory entries.
+    pub async fn scan_memory_maintenance(
+        &self,
+        config: MaintenanceScanConfig,
+    ) -> Result<Vec<MaintenanceCandidate>> {
+        let entries = self.list_all_entries().await?;
+        let candidates = scan_maintenance_candidates(&entries, &config);
+        self.maintenance_queue.upsert_many(candidates.clone())?;
+        Ok(candidates)
+    }
+
+    /// List queued memory lifecycle candidates.
+    pub fn list_memory_maintenance(
+        &self,
+        filter: MaintenanceCandidateFilter,
+    ) -> Result<Vec<MaintenanceCandidate>> {
+        self.maintenance_queue.list(filter)
+    }
+
+    /// Move a maintenance candidate through the explicit review lifecycle.
+    pub fn transition_memory_maintenance(
+        &self,
+        id: &str,
+        status: MaintenanceCandidateStatus,
+    ) -> Result<Option<MaintenanceCandidate>> {
+        self.maintenance_queue.transition(id, status)
+    }
+
+    /// Consume reviewable maintenance candidates from a runtime event.
+    ///
+    /// Irrelevant events return `Ok(None)`. Candidate parsing failures are
+    /// treated as irrelevant so a malformed pulse cannot block the session.
+    pub fn process_memory_pulse_runtime_event(
+        &self,
+        event: &crate::RuntimeEvent,
+    ) -> Result<Option<MemoryPulseReport>> {
+        let Some(batch) = MemoryPulseBatch::from_runtime_event(event) else {
+            return Ok(None);
+        };
+        MemoryPulseConsumer::new(self.maintenance_queue.clone())
+            .process_batch(batch)
+            .map(Some)
+    }
+
+    /// List persisted knowledge-graph entities.
+    pub async fn list_entities(&self) -> Result<Vec<crate::entity::Entity>> {
+        self.orchestrator.store().load_entities().await
+    }
+
+    /// List persisted knowledge-graph triples.
+    pub async fn list_triples(&self) -> Result<Vec<crate::entity::Triple>> {
+        self.orchestrator.store().load_triples().await
+    }
+
+    /// Link a code symbol to a memory entry for impact analysis and symbol-
+    /// scoped recall.
+    pub async fn link_symbol_to_memory(
+        &self,
+        symbol_id: &str,
+        memory_id: MemoryId,
+        turn_index: Option<i32>,
+        reference_type: &str,
+    ) -> Result<()> {
+        self.orchestrator
+            .store()
+            .link_symbol_to_memory(
+                symbol_id,
+                &memory_id,
+                turn_index,
+                reference_type,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await?;
+        self.invalidate_prepare_context_cache();
+        Ok(())
+    }
+
+    /// Return full memory entries linked to a code symbol name or symbol ID.
+    pub async fn find_memories_by_symbol(
+        &self,
+        symbol_name: &str,
+    ) -> Result<Vec<crate::types::MemoryEntry>> {
+        let ids = self
+            .orchestrator
+            .store()
+            .find_memories_by_symbol(symbol_name)
+            .await?;
+        let mut entries = Vec::new();
+        for id in ids {
+            if let Some(entry) = self.orchestrator.store().get(&id).await? {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Return recent memory write audit entries for enterprise export.
+    pub fn audit_entries(&self, limit: usize) -> Result<Vec<AuditEntry>> {
+        let limit = limit.min(1000);
+        if let Some(ref log) = self.audit_log {
+            return log
+                .query_recent(limit)
+                .map_err(|e| MemoryError::Store(format!("query audit log: {e}")));
+        }
+        if let Some(ref checker) = self.integrity_checker {
+            return checker
+                .audit_log()
+                .query_recent(limit)
+                .map_err(|e| MemoryError::Store(format!("query audit log: {e}")));
+        }
+        Ok(Vec::new())
+    }
+
+    /// Create a user-authored memory entry through the same guarded write path
+    /// used by internal memory operations.
+    pub async fn create_entry(
+        &self,
+        layer: MemoryLayer,
+        category: MemoryCategory,
+        title: &str,
+        content: &str,
+        priority: Priority,
+        tags: Vec<String>,
+        scope: MemoryScope,
+    ) -> Result<MemoryId> {
+        let id = self
+            .orchestrator
+            .write(
+                layer,
+                category,
+                title,
+                content,
+                priority,
+                MemorySource::UserExplicit,
+                tags,
+                scope,
+            )
+            .await?;
+        self.log_memory_audit(AuditOperation::Create, id.to_string(), layer, content);
+        self.invalidate_prepare_context_cache();
+        Ok(id)
+    }
+
     /// Get a single memory entry by ID.
     pub async fn get_entry(&self, id: &str) -> Result<Option<crate::types::MemoryEntry>> {
         let mem_id = match uuid::Uuid::try_parse(id) {
@@ -2067,7 +2485,9 @@ impl CognitiveContextManager {
         let mem_id = match uuid::Uuid::try_parse(id) {
             Ok(id) => id,
             Err(_) => {
-                return Err(crate::MemoryError::InvalidArgument(format!("invalid memory id: {id}")));
+                return Err(crate::MemoryError::InvalidArgument(format!(
+                    "invalid memory id: {id}"
+                )));
             }
         };
 
@@ -2077,7 +2497,11 @@ impl CognitiveContextManager {
             if !policy.is_allowed() {
                 return Err(MemoryError::WriteDenied {
                     layer: format!("{:?}", entry.layer),
-                    write_source: self.write_guard.as_ref().map(|g| format!("{:?}", g.source())).unwrap_or_default(),
+                    write_source: self
+                        .write_guard
+                        .as_ref()
+                        .map(|g| format!("{:?}", g.source()))
+                        .unwrap_or_default(),
                 });
             }
             // Audit log for delete
@@ -2088,8 +2512,15 @@ impl CognitiveContextManager {
                         operation: AuditOperation::Delete,
                         entry_id: id.to_string(),
                         layer: format!("{:?}", entry.layer),
-                        source: self.write_guard.as_ref().map(|g| g.source()).unwrap_or(WriteSource::System),
-                    summary: truncate_summary(&entry.content, self.config.tuning.audit_truncate_len),
+                        source: self
+                            .write_guard
+                            .as_ref()
+                            .map(|g| g.source())
+                            .unwrap_or(WriteSource::System),
+                        summary: truncate_summary(
+                            &entry.content,
+                            self.config.tuning.audit_truncate_len,
+                        ),
 
                         agent_id: None,
                         session_id: None,
@@ -2098,7 +2529,9 @@ impl CognitiveContextManager {
             }
         }
 
-        self.orchestrator.forget(&mem_id).await
+        self.orchestrator.forget(&mem_id).await?;
+        self.invalidate_prepare_context_cache();
+        Ok(())
     }
 
     /// Update a memory entry's content, tags, and/or priority.
@@ -2112,11 +2545,16 @@ impl CognitiveContextManager {
         let mem_id = match uuid::Uuid::try_parse(id) {
             Ok(id) => id,
             Err(_) => {
-                return Err(crate::MemoryError::InvalidArgument(format!("invalid memory id: {id}")));
+                return Err(crate::MemoryError::InvalidArgument(format!(
+                    "invalid memory id: {id}"
+                )));
             }
         };
 
-        let mut entry = self.orchestrator.recall(&mem_id).await?
+        let mut entry = self
+            .orchestrator
+            .recall(&mem_id)
+            .await?
             .ok_or_else(|| crate::MemoryError::Store(format!("entry {} not found", id)))?;
 
         // Write guard check
@@ -2124,7 +2562,11 @@ impl CognitiveContextManager {
         if !policy.is_allowed() {
             return Err(MemoryError::WriteDenied {
                 layer: format!("{:?}", entry.layer),
-                write_source: self.write_guard.as_ref().map(|g| format!("{:?}", g.source())).unwrap_or_default(),
+                write_source: self
+                    .write_guard
+                    .as_ref()
+                    .map(|g| format!("{:?}", g.source()))
+                    .unwrap_or_default(),
             });
         }
 
@@ -2140,7 +2582,15 @@ impl CognitiveContextManager {
         entry.updated_at = chrono::Utc::now();
         entry.staleness = 0.0;
 
-        self.orchestrator.update(&entry).await
+        self.orchestrator.update(&entry).await?;
+        self.log_memory_audit(
+            AuditOperation::Update,
+            entry.id.to_string(),
+            entry.layer,
+            &entry.content,
+        );
+        self.invalidate_prepare_context_cache();
+        Ok(())
     }
 
     /// List all layers with their entry counts.
@@ -2155,7 +2605,11 @@ impl CognitiveContextManager {
         ];
         let mut result = Vec::new();
         for layer in layers {
-            let metas = self.orchestrator.list_layer(layer).await.unwrap_or_default();
+            let metas = self
+                .orchestrator
+                .list_layer(layer)
+                .await
+                .unwrap_or_default();
             result.push(serde_json::json!({
                 "layer": format!("{layer:?}"),
                 "entry_count": metas.len(),
@@ -2300,11 +2754,8 @@ impl CognitiveContextManager {
 
         // Collect unique categories found in results
         use std::collections::HashSet;
-        let categories_found_set: HashSet<_> = fts_result
-            .entries
-            .iter()
-            .map(|e| e.category)
-            .collect();
+        let categories_found_set: HashSet<_> =
+            fts_result.entries.iter().map(|e| e.category).collect();
         let categories_found: Vec<_> = categories_found_set.into_iter().collect();
 
         Ok(SearchMemoriesResult {
@@ -2396,10 +2847,7 @@ impl CognitiveContextManager {
         };
 
         // Build summary from last_action
-        let last_action = self
-            .last_action
-            .lock()
-            .clone();
+        let last_action = self.last_action.lock().clone();
         let context_notes = format!(
             "Last action: {}. Session has {} memories and {} decisions logged.",
             last_action.as_deref().unwrap_or("none"),
@@ -2411,7 +2859,7 @@ impl CognitiveContextManager {
             &session_id,
             None, // current_task — not tracked yet
             work_items,
-            vec![],      // remaining items
+            vec![], // remaining items
             decisions,
             blockers,
             last_action.as_deref().unwrap_or(""),
@@ -2460,12 +2908,11 @@ impl CognitiveContextManager {
         let messages: Vec<serde_json::Value> = if contents.trim().starts_with('{') {
             // Single JSON object
             match serde_json::from_str::<serde_json::Value>(&contents) {
-                Ok(v) if v.get("messages").is_some() => {
-                    v.get("messages")
-                        .and_then(|m: &serde_json::Value| m.as_array())
-                        .cloned()
-                        .unwrap_or_default()
-                }
+                Ok(v) if v.get("messages").is_some() => v
+                    .get("messages")
+                    .and_then(|m: &serde_json::Value| m.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
                 _ => Vec::new(),
             }
         } else {
@@ -2474,9 +2921,7 @@ impl CognitiveContextManager {
                 .lines()
                 .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
                 .filter_map(|v: serde_json::Value| {
-                    v.get("message")
-                        .or_else(|| v.get("content"))
-                        .cloned()
+                    v.get("message").or_else(|| v.get("content")).cloned()
                 })
                 .collect()
         };
@@ -2484,9 +2929,19 @@ impl CognitiveContextManager {
         // Extract memories from messages
         for msg in messages {
             // Try to extract content from message
-            let text_opt: Option<String> = msg.as_str().map(String::from)
-                .or_else(|| msg.get("text").and_then(|v: &serde_json::Value| v.as_str()).map(String::from))
-                .or_else(|| msg.get("content").and_then(|v: &serde_json::Value| v.as_str()).map(String::from));
+            let text_opt: Option<String> = msg
+                .as_str()
+                .map(String::from)
+                .or_else(|| {
+                    msg.get("text")
+                        .and_then(|v: &serde_json::Value| v.as_str())
+                        .map(String::from)
+                })
+                .or_else(|| {
+                    msg.get("content")
+                        .and_then(|v: &serde_json::Value| v.as_str())
+                        .map(String::from)
+                });
 
             if let Some(text) = text_opt {
                 // Skip very short messages
@@ -2534,7 +2989,10 @@ impl CognitiveContextManager {
             }
 
             // Try to extract decisions
-            if let Some(content_obj) = msg.get("content").and_then(|v: &serde_json::Value| v.as_object()) {
+            if let Some(content_obj) = msg
+                .get("content")
+                .and_then(|v: &serde_json::Value| v.as_object())
+            {
                 if content_obj.contains_key("decision") || content_obj.contains_key("rationale") {
                     stats.decisions_restored += 1;
                 }
@@ -2558,10 +3016,7 @@ impl CognitiveContextManager {
     ///
     /// If the thread does not yet exist it is created automatically.
     pub fn record_decision(&self, thread_id: &str, decision: DecisionEntry) -> Result<()> {
-        let mut store = self
-            .decisions
-            .lock()
-            ;
+        let mut store = self.decisions.lock();
 
         // Ensure the thread exists.
         store.create_thread(thread_id);
@@ -2837,19 +3292,17 @@ impl CognitiveContextManager {
     /// Return a snapshot of current performance metrics and auto-tuner state.
     #[must_use]
     pub fn performance_report(&self) -> crate::performance_monitor::PerformanceReport {
-        let last_tuning = self
-            .auto_tuner
-            .last_tuning_instant()
-            .map(|i| {
-                let elapsed = i.elapsed();
-                // Approximate wall-clock DateTime by subtracting from now
-                Utc::now()
-                    - chrono::Duration::from_std(elapsed)
-                        .unwrap_or_else(|_| chrono::Duration::seconds(0))
-            });
+        let last_tuning = self.auto_tuner.last_tuning_instant().map(|i| {
+            let elapsed = i.elapsed();
+            // Approximate wall-clock DateTime by subtracting from now
+            Utc::now()
+                - chrono::Duration::from_std(elapsed)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(0))
+        });
         let tuning_applied = self.auto_tuner.adjustments_applied() > 0;
         let tuning_config = self.auto_tuner.config();
-        self.perf_monitor.report(&tuning_config, tuning_applied, last_tuning)
+        self.perf_monitor
+            .report(&tuning_config, tuning_applied, last_tuning)
     }
 }
 
@@ -2902,12 +3355,40 @@ fn truncate_summary(content: &str, max_len: usize) -> String {
 /// or code-related keywords (`function`, `class`, `bug`, `fix`, `struct`, etc.).
 fn is_code_query(query: &str) -> bool {
     let lower = query.to_lowercase();
-    let code_extensions = [".rs", ".py", ".ts", ".tsx", ".go", ".java", ".js", ".cpp", ".h"];
+    let code_extensions = [
+        ".rs", ".py", ".ts", ".tsx", ".go", ".java", ".js", ".cpp", ".h",
+    ];
     let code_keywords = [
-        "function", "class", "bug", "fix", "struct", "interface", "enum",
-        "fn ", "impl", "trait", "module", "import", "def ", "async", "await",
-        "refactor", "compile", "compiler", "syntax", "type", "error", "warning",
-        "unwra", "panic", "debug", "trace", "cargo", "npm", "node", "runtime",
+        "function",
+        "class",
+        "bug",
+        "fix",
+        "struct",
+        "interface",
+        "enum",
+        "fn ",
+        "impl",
+        "trait",
+        "module",
+        "import",
+        "def ",
+        "async",
+        "await",
+        "refactor",
+        "compile",
+        "compiler",
+        "syntax",
+        "type",
+        "error",
+        "warning",
+        "unwra",
+        "panic",
+        "debug",
+        "trace",
+        "cargo",
+        "npm",
+        "node",
+        "runtime",
     ];
 
     code_extensions.iter().any(|ext| lower.contains(ext))
@@ -2959,7 +3440,12 @@ mod tests {
 
     fn test_config() -> MemoryConfig {
         MemoryConfig {
-            budget: BudgetConfig { context_window: 8000, reserved_system: 2000, reserved_response: 1000, ..Default::default() },
+            budget: BudgetConfig {
+                context_window: 8000,
+                reserved_system: 2000,
+                reserved_response: 1000,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -2996,7 +3482,9 @@ mod tests {
         let mut cfg = test_config();
         cfg.store.sqlite_path = tmp.path().join("test.db");
 
-        let mgr = CognitiveContextManager::new(cfg).await.unwrap()
+        let mgr = CognitiveContextManager::new(cfg)
+            .await
+            .unwrap()
             .with_write_source(WriteSource::System);
         let policy = mgr.check_write_access(MemoryLayer::L1);
         assert!(policy.is_allowed());

@@ -5,30 +5,30 @@
 //   - Platform adapters (feishu, wechat_ilink, email)
 // Shared state: ActiveSessions, CognitiveContextManager, GlobalToolRegistry, SessionEventBus
 
-pub mod commands;
-pub mod prompter;
-pub mod singletons;
-
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::{header, HeaderValue};
-use tokio::net::{TcpListener, UnixListener};
+use axum::http::{HeaderValue, header};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::api_routes;
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
-use memory::cognitive::CognitiveContextManager;
+use crate::session_kernel::SessionKernel;
 use memory::MemoryConfig;
 use memory::UnifiedSessionStore;
-use runtime::platform::{PlatformConfig, PlatformRuntime};
-use runtime::platform::config::PlatformRuntimeConfig;
+use memory::cognitive::CognitiveContextManager;
 use runtime::mirror::MessageMirror;
+use runtime::platform::config::PlatformRuntimeConfig;
+use runtime::platform::{PlatformConfig, PlatformRuntime};
 use tools::GlobalToolRegistry;
 
-use runtime::session_lifecycle::{EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus};
+use runtime::session_lifecycle::{
+    EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus,
+};
 
 // ── Background session cleanup task ────────────────────────────
 
@@ -53,7 +53,10 @@ fn spawn_session_cleanup_task(
             let ids = active_sessions.list();
             for id in &ids {
                 if let Some(status) = lifecycle.check_session(id).await {
-                    if matches!(status, SessionStatus::Expired | SessionStatus::Idle | SessionStatus::Evicted) {
+                    if matches!(
+                        status,
+                        SessionStatus::Expired | SessionStatus::Idle | SessionStatus::Evicted
+                    ) {
                         tracing::info!(session_id=%id, ?status, "cleanup: closing session");
                         if let Some(entry) = active_sessions.get(id) {
                             let entry = entry.clone();
@@ -120,47 +123,26 @@ impl Drop for PidFileGuard {
         let pid_path = crate::server::pid_file();
         if pid_path.exists() {
             std::fs::remove_file(&pid_path).ok();
+            let _ = std::fs::remove_file(crate::server::addr_file());
             tracing::info!(path = %pid_path.display(), "PID file removed");
         }
-        let _ = std::fs::remove_file(crate::server::addr_file());
     }
 }
 
 // ── Daemon entry point ─────────────────────────────────────────
 
-pub async fn run_daemon(
-    config: DaemonConfig,
-) -> Result<(), String> {
+pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     // 0. Write PID file (removed on drop via guard)
     let _pid_guard = PidFileGuard::new()?;
-
-    // 0.5. Initialize global singletons once (before any session state)
-    singletons::GLOBAL_PLUGIN.get_or_init(|| {
-        Arc::new(crate::build_runtime_plugin_state().expect("global plugin init"))
-    });
-    singletons::GLOBAL_MEMORY.get_or_init(|| {
-        let mem_cfg = config.memory_config.clone().unwrap_or_default();
-        // Use block_in_place to yield the current runtime thread before
-        // performing a nested block_on. This prevents tokio v1.52+ from
-        // rejecting same-runtime nested block_on.
-        let cognitive = tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(CognitiveContextManager::new(mem_cfg))
-        });
-        Arc::new(cognitive.expect("global memory init"))
-    });
-    singletons::GLOBAL_STORE.get_or_init(|| {
-        Arc::new(crate::get_unified_store().expect("global store init").clone())
-    });
 
     // 1. Initialise shared state
     let sessions = Arc::new(ActiveSessions::default());
     let tools = Arc::new(GlobalToolRegistry::builtin());
 
-    let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
+    let cognitive: Option<Arc<CognitiveContextManager>> = match config.memory_config {
         Some(mem_cfg) => {
             tracing::info!("initialising memory manager...");
-            CognitiveContextManager::new(mem_cfg.clone())
+            CognitiveContextManager::new(mem_cfg)
                 .await
                 .ok()
                 .map(Arc::new)
@@ -170,9 +152,46 @@ pub async fn run_daemon(
 
     let event_bus = SessionEventBus::new();
 
-    let unified_store = crate::get_unified_store()
-        .ok()
-        .map(|s| Arc::new(s.clone()));
+    let unified_store = crate::get_unified_store().ok().map(|s| Arc::new(s.clone()));
+    let session_kernel = Arc::new(SessionKernel::new(
+        sessions.clone(),
+        unified_store.clone(),
+        event_bus.clone(),
+    ));
+    let approval_dir = std::env::var_os("COWD_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".cowd"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
+    let approval_gate = Arc::new(runtime::approval_gate::SmartApprovalGate::new(
+        Arc::new(
+            runtime::permission_enforcer::DestructivePatternDetector::new(approval_dir.clone()),
+        ),
+        runtime::ApprovalConfig::default(),
+        Some(approval_dir.join("approval_history.json")),
+    ));
+    let profile_manager = Arc::new(runtime::ProfileManager::from_config_home(&approval_dir));
+    if let Err(e) = profile_manager.initialize() {
+        tracing::warn!("failed to initialize profile manager: {e}");
+    }
+    if let Ok(requested_profile) = std::env::var("COWD_PROFILE") {
+        if profile_manager.get_profile(&requested_profile).is_none() {
+            if let Err(e) = profile_manager.create_profile(&requested_profile) {
+                tracing::warn!("failed to create requested profile {requested_profile}: {e}");
+            }
+        }
+        if let Err(e) = profile_manager.switch_profile(&requested_profile) {
+            tracing::warn!("failed to activate requested profile {requested_profile}: {e}");
+        }
+    }
+    let profile_id = profile_manager.active_id();
+    let task_kernel = Arc::new(
+        crate::task_kernel::TaskKernel::open(approval_dir.join("tasks.json"))
+            .map_err(|e| format!("failed to initialize task kernel: {e}"))?,
+    );
 
     // Spawn background session cleanup (idle/expired session reaper)
     let lifecycle_config = SessionLifecycleConfig {
@@ -191,13 +210,20 @@ pub async fn run_daemon(
     );
 
     let app_state = Arc::new(api_routes::AppState {
+        session_kernel: session_kernel.clone(),
         sessions: sessions.clone(),
         memory_manager: cognitive.clone(),
-        unified_store,
+        unified_store: unified_store.clone(),
         tool_registry: tools.clone(),
         config: config.runtime_config.clone(),
         event_bus: event_bus.clone(),
+        approval_gate: Some(approval_gate),
         auth_token: config.auth_token.clone(),
+        workspace_root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        config_home: approval_dir.clone(),
+        profile_id,
+        profile_manager,
+        task_kernel,
     });
 
     // 2. Build HTTP router (reuse api_routes + SSE)
@@ -239,6 +265,7 @@ pub async fn run_daemon(
         .await
         .map_err(|e| format!("failed to bind HTTP {}: {}", config.http_addr, e))?;
     tracing::info!("HTTP + SSE on {}", config.http_addr);
+
     if let Err(e) = std::fs::write(
         crate::server::addr_file(),
         format!("http://{}", config.http_addr),
@@ -248,8 +275,12 @@ pub async fn run_daemon(
 
     // 4. Unix socket
     let _ = std::fs::remove_file(&config.unix_sock_path);
-    let unix_listener = UnixListener::bind(&config.unix_sock_path)
-        .map_err(|e| format!("failed to bind unix socket {}: {}", config.unix_sock_path, e))?;
+    let unix_listener = UnixListener::bind(&config.unix_sock_path).map_err(|e| {
+        format!(
+            "failed to bind unix socket {}: {}",
+            config.unix_sock_path, e
+        )
+    })?;
     tracing::info!("Unix socket on {}", config.unix_sock_path);
 
     // 5. Platform adapters via PlatformRuntime
@@ -286,9 +317,7 @@ pub async fn run_daemon(
                 }
             }
             "wechat_ilink" | "wechat" => {
-                match runtime::platform::wechat_ilink::create_wechat_ilink_adapter(
-                    &settings_json,
-                ) {
+                match runtime::platform::wechat_ilink::create_wechat_ilink_adapter(&settings_json) {
                     Ok(adapter) => {
                         tracing::info!("wechat_ilink adapter created");
                         if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
@@ -309,18 +338,18 @@ pub async fn run_daemon(
                     Err(e) => tracing::error!("failed to create email adapter: {e}"),
                 }
             }
-            "wecom" => {
-                match runtime::platform::wecom::create_wecom_adapter(&settings_json) {
-                    Ok(adapter) => {
-                        if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
-                            tracing::error!("failed to register wecom adapter: {e}");
-                        } else {
-                            tracing::info!("wecom adapter created and registered");
-                        }
+            "wecom" => match runtime::platform::wecom::create_wecom_adapter(&settings_json) {
+                Ok(adapter) => {
+                    if let Err(e) = platform_runtime.register_adapter(Box::new(adapter)).await {
+                        tracing::error!("failed to register wecom adapter: {e}");
+                    } else {
+                        tracing::info!("wecom adapter created and registered");
                     }
-                    Err(e) => { tracing::error!("wecom adapter init failed: {e}"); }
                 }
-            }
+                Err(e) => {
+                    tracing::error!("wecom adapter init failed: {e}");
+                }
+            },
             other => {
                 tracing::warn!("unknown platform type: {other}");
             }
@@ -332,25 +361,13 @@ pub async fn run_daemon(
         tracing::error!("failed to start platform runtime: {e}");
     }
 
-    // 6. SocketPrompter (bridges tool approval between daemon and TUI)
-    let (prompter_tx, mut prompter_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let prompter = Arc::new(prompter::SocketPrompter::new(prompter_tx));
-
-    // Drain prompter channel (approval requests forwarded to TUI in later phases)
-    tokio::spawn(async move {
-        while let Some(msg) = prompter_rx.recv().await {
-            tracing::debug!(%msg, "SocketPrompter approval request (no TUI attached yet)");
-            // Phase B: forward to active TUI connection
-        }
-    });
-
-    // 7. Unix socket accept loop (background)
+    // 6. Unix socket accept loop (background)
     // Use spawn_blocking — handle_unix_client internally calls run_turn_async
     // which holds std::sync::MutexGuard across .await, making its future !Send.
     {
         let sessions = sessions.clone();
         let event_bus = event_bus.clone();
-        let prompter = prompter.clone();
+        let unified_store = unified_store.clone();
         tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async move {
@@ -359,8 +376,8 @@ pub async fn run_daemon(
                         Ok((stream, _addr)) => {
                             let sessions = sessions.clone();
                             let event_bus = event_bus.clone();
-                            let prompter = prompter.clone();
-                            commands::handle_unix_client(stream, sessions, event_bus, Some(prompter)).await;
+                            let unified_store = unified_store.clone();
+                            handle_unix_client(stream, sessions, event_bus, unified_store).await;
                         }
                         Err(e) => {
                             tracing::warn!("unix socket accept error: {e}");
@@ -375,12 +392,12 @@ pub async fn run_daemon(
     let shutdown_signal = async {
         #[cfg(unix)]
         {
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate()
-            ).expect("failed to install SIGTERM handler");
-            let mut sigint = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::interrupt()
-            ).expect("failed to install SIGINT handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .expect("failed to install SIGINT handler");
             tokio::select! {
                 _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
                 _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
@@ -388,7 +405,9 @@ pub async fn run_daemon(
         }
         #[cfg(not(unix))]
         {
-            tokio::signal::ctrl_c().await.expect("failed to install ctrl_c handler");
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install ctrl_c handler");
             tracing::info!("shutdown signal received");
         }
     };
@@ -414,6 +433,235 @@ pub async fn run_daemon(
     Ok(())
 }
 
+// ── Unix client handler ─────────────────────────────────────────
+
+/// Handle a single Unix socket client connection.
+/// Reads newline-delimited JSON commands and writes JSON responses.
+/// Supported commands:
+///   {"cmd":"create_session","model":"..."}
+///   {"cmd":"chat","session_id":"...","content":"..."}
+///   {"cmd":"list_sessions"}
+async fn handle_unix_client(
+    stream: UnixStream,
+    sessions: Arc<ActiveSessions>,
+    event_bus: Arc<SessionEventBus>,
+    unified_store: Option<Arc<UnifiedSessionStore>>,
+) {
+    let (reader, mut writer) = stream.into_split();
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match buf_reader.read_line(&mut line).await {
+            Ok(0) => {
+                // EOF
+                break;
+            }
+            Ok(_n) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let response = match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(cmd) => match cmd.get("cmd").and_then(|c| c.as_str()) {
+                        Some("create_session") => {
+                            let model = cmd
+                                .get("model")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("claude-sonnet-4-6");
+                            let session_id = uuid::Uuid::new_v4().to_string();
+                            let session = runtime::Session::new();
+                            let runtime_result = if let Some(ref store) = unified_store {
+                                crate::build_runtime_with_session_store(
+                                    store.clone(),
+                                    session,
+                                    &session_id,
+                                    model.to_string(),
+                                    vec![],
+                                    true,
+                                    true,
+                                    None,
+                                    runtime::PermissionMode::WorkspaceWrite,
+                                    None,
+                                    None,
+                                )
+                            } else {
+                                crate::build_runtime(
+                                    session,
+                                    &session_id,
+                                    model.to_string(),
+                                    vec![],
+                                    true,
+                                    true,
+                                    None,
+                                    runtime::PermissionMode::WorkspaceWrite,
+                                    None,
+                                    None,
+                                )
+                            };
+                            match runtime_result {
+                                Ok(runtime) => {
+                                    if let Some(ref store) = unified_store {
+                                        let record = crate::api_routes::new_api_session_record(
+                                            &session_id,
+                                            Some(model.to_string()),
+                                        );
+                                        if let Err(e) = store.upsert_session(&record).await {
+                                            tracing::warn!(session_id = %session_id, error = %e, "failed to persist daemon session");
+                                        }
+                                    }
+                                    let _ = sessions.register(session_id.clone(), runtime);
+                                    serde_json::json!({
+                                        "ok": true,
+                                        "session_id": session_id,
+                                    })
+                                }
+                                Err(e) => {
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "error": format!("failed to build runtime: {e}"),
+                                    })
+                                }
+                            }
+                        }
+                        Some("chat") => {
+                            let session_id = cmd
+                                .get("session_id")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or_default();
+                            let content = cmd
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or_default();
+
+                            if session_id.is_empty() || content.is_empty() {
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error": "session_id and content are required",
+                                })
+                            } else {
+                                match sessions.get(session_id) {
+                                    Some(entry) => {
+                                        let mut guard = entry.lock().await;
+                                        match guard
+                                            .run_turn_async(
+                                                content,
+                                                &runtime::permissions::SharedPrompter::none(),
+                                            )
+                                            .await
+                                        {
+                                            Ok(summary) => {
+                                                if let Some(ref store) = unified_store {
+                                                    let session_snapshot = guard.session().clone();
+                                                    if let Err(e) = crate::api_routes::sync_runtime_session_metadata_to_store(
+                                                            store,
+                                                            session_id,
+                                                            &session_snapshot,
+                                                        ).await {
+                                                            tracing::warn!(session_id = %session_id, error = %e, "failed to sync daemon session metadata");
+                                                        }
+                                                }
+                                                let final_text = summary
+                                                    .assistant_messages
+                                                    .last()
+                                                    .map(|msg| {
+                                                        msg.blocks
+                                                            .iter()
+                                                            .filter_map(|block| match block {
+                                                                runtime::ContentBlock::Text {
+                                                                    text,
+                                                                } => Some(text.as_str()),
+                                                                _ => None,
+                                                            })
+                                                            .collect::<Vec<_>>()
+                                                            .join("")
+                                                    })
+                                                    .unwrap_or_default();
+
+                                                let sse_data = serde_json::json!({
+                                                    "type": "TurnComplete",
+                                                    "session_id": session_id,
+                                                    "response": final_text,
+                                                    "iterations": summary.iterations,
+                                                });
+                                                event_bus
+                                                    .broadcast(session_id, &sse_data.to_string())
+                                                    .await;
+
+                                                serde_json::json!({
+                                                    "ok": true,
+                                                    "response": final_text,
+                                                    "iterations": summary.iterations,
+                                                })
+                                            }
+                                            Err(e) => {
+                                                let err_msg = e.to_string();
+                                                let sse_data = serde_json::json!({
+                                                    "type": "TurnError",
+                                                    "session_id": session_id,
+                                                    "error": err_msg,
+                                                });
+                                                event_bus
+                                                    .broadcast(session_id, &sse_data.to_string())
+                                                    .await;
+                                                serde_json::json!({
+                                                    "ok": false,
+                                                    "error": err_msg,
+                                                })
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        serde_json::json!({
+                                            "ok": false,
+                                            "error": format!("session {session_id} not found"),
+                                        })
+                                    }
+                                }
+                            }
+                        }
+                        Some("list_sessions") => {
+                            let ids = sessions.list();
+                            serde_json::json!({ "ok": true, "sessions": ids })
+                        }
+                        Some(other) => {
+                            serde_json::json!({
+                                "ok": false,
+                                "error": format!("unknown command: {other}"),
+                            })
+                        }
+                        None => {
+                            serde_json::json!({
+                                "ok": false,
+                                "error": "missing 'cmd' field",
+                            })
+                        }
+                    },
+                    Err(e) => {
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("invalid JSON: {e}"),
+                        })
+                    }
+                };
+
+                let mut resp_bytes = serde_json::to_vec(&response).unwrap_or_default();
+                resp_bytes.push(b'\n');
+                if let Err(e) = writer.write_all(&resp_bytes).await {
+                    tracing::warn!("unix socket write error: {e}");
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("unix socket read error: {e}");
+                break;
+            }
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -425,7 +673,7 @@ mod tests {
     fn daemon_config_defaults() {
         let config = DaemonConfig {
             http_addr: "0.0.0.0:8642".into(),
-            unix_sock_path: crate::server::socket_file().to_string_lossy().to_string(),
+            unix_sock_path: "/tmp/cowd.sock".into(),
             memory_config: None,
             platform_configs: vec![],
             runtime_config: None,
@@ -434,7 +682,7 @@ mod tests {
             message_mirror: None,
         };
         assert_eq!(config.http_addr, "0.0.0.0:8642");
-        assert_eq!(config.unix_sock_path, crate::server::socket_file().to_string_lossy());
+        assert_eq!(config.unix_sock_path, "/tmp/cowd.sock");
         assert!(config.memory_config.is_none());
         assert!(config.platform_configs.is_empty());
         assert!(config.auth_token.is_none());
@@ -462,7 +710,7 @@ mod tests {
         let mem_cfg = MemoryConfig::default();
         let config = DaemonConfig {
             http_addr: "0.0.0.0:8642".into(),
-            unix_sock_path: crate::server::socket_file().to_string_lossy().to_string(),
+            unix_sock_path: "/tmp/cowd.sock".into(),
             memory_config: Some(mem_cfg),
             platform_configs: vec![],
             runtime_config: None,

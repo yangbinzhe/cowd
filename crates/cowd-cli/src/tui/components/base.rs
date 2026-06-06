@@ -118,10 +118,7 @@ pub struct RenderContext<'frame, 'buf, 'theme> {
 impl<'frame, 'buf, 'theme> RenderContext<'frame, 'buf, 'theme> {
     /// Create a new render context from a frame and theme reference.
     #[must_use]
-    pub fn new(
-        frame: &'frame mut Frame<'buf>,
-        theme: &'theme SkinConfig,
-    ) -> Self {
+    pub fn new(frame: &'frame mut Frame<'buf>, theme: &'theme SkinConfig) -> Self {
         Self {
             frame,
             theme,

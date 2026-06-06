@@ -31,22 +31,22 @@ fn build_ansi_palette() -> Vec<(u8, u8, u8)> {
 
     // Standard 16 colors (indices 0–15)
     let standard: [(u8, u8, u8); 16] = [
-        (0, 0, 0),         // 0  Black
-        (128, 0, 0),       // 1  Red
-        (0, 128, 0),       // 2  Green
-        (128, 128, 0),     // 3  Yellow
-        (0, 0, 128),       // 4  Blue
-        (128, 0, 128),     // 5  Magenta
-        (0, 128, 128),     // 6  Cyan
-        (192, 192, 192),   // 7  White
-        (128, 128, 128),   // 8  Bright Black (Gray)
-        (255, 0, 0),       // 9  Bright Red
-        (0, 255, 0),       // 10 Bright Green
-        (255, 255, 0),     // 11 Bright Yellow
-        (0, 0, 255),       // 12 Bright Blue
-        (255, 0, 255),     // 13 Bright Magenta
-        (0, 255, 255),     // 14 Bright Cyan
-        (255, 255, 255),   // 15 Bright White
+        (0, 0, 0),       // 0  Black
+        (128, 0, 0),     // 1  Red
+        (0, 128, 0),     // 2  Green
+        (128, 128, 0),   // 3  Yellow
+        (0, 0, 128),     // 4  Blue
+        (128, 0, 128),   // 5  Magenta
+        (0, 128, 128),   // 6  Cyan
+        (192, 192, 192), // 7  White
+        (128, 128, 128), // 8  Bright Black (Gray)
+        (255, 0, 0),     // 9  Bright Red
+        (0, 255, 0),     // 10 Bright Green
+        (255, 255, 0),   // 11 Bright Yellow
+        (0, 0, 255),     // 12 Bright Blue
+        (255, 0, 255),   // 13 Bright Magenta
+        (0, 255, 255),   // 14 Bright Cyan
+        (255, 255, 255), // 15 Bright White
     ];
     colors.extend_from_slice(&standard);
 
