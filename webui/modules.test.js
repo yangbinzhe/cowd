@@ -786,6 +786,22 @@ describe('API module', () => {
       if (path.includes('/api/channels/wechat-ilink/accounts')) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ accounts: [] }) });
       }
+      if (path.includes('/api/cross-plane/audit')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          records: [{
+            result: 'allow',
+            summary: 'matched_grant',
+            action: { requested_capability: 'service.feishu.drive.download' },
+            decision: { decision: 'allow' },
+            evidence: {
+              policy_version: 'cross-plane.v1',
+              matched_grant_id: 'grant-once',
+              consumed_grant_id: 'grant-once',
+              remaining_uses_after: 0,
+            },
+          }],
+        }) });
+      }
       if (path === '/api/platforms') {
         return Promise.resolve({ ok: true, json: () => Promise.resolve([
           {
@@ -814,6 +830,9 @@ describe('API module', () => {
     expect(text).toContain('degraded');
     expect(text).toContain('Missing app_secret');
     expect(text).toContain('Capabilities send_text · doc_ops');
+    expect(text).toContain('Recent Policy Evidence');
+    expect(text).toContain('service.feishu.drive.download');
+    expect(text).toContain('remaining 0');
     expect(text).not.toContain('cli_app_secret');
   });
 

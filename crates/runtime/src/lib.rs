@@ -130,8 +130,8 @@ pub use cowd_event::{
     CowdEvent, CowdEventBus, RuntimePolicyDecisionSummary, RuntimeWorkGraphSummary,
 };
 pub use cross_plane_policy::{
-    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneGrant,
-    CrossPlaneIdentityBinding, CrossPlanePolicyConfig, CrossPlanePolicyDecision,
+    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneDecisionEvidence,
+    CrossPlaneGrant, CrossPlaneIdentityBinding, CrossPlanePolicyConfig, CrossPlanePolicyDecision,
     CrossPlanePolicyEngine, CrossPlaneRisk, CrossPlaneSummary, DataClassification, GrantType,
     IdentityTrust, PolicyDecisionKind,
 };

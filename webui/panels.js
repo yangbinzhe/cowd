@@ -1647,6 +1647,33 @@ window.Panels = (()=>{
       const detail=UI.el('div','panel-empty');
       detail.textContent='Identities '+((identitiesData.identities||[]).length)+' · Grants '+((grantsData.grants||[]).length)+' · Audit records '+((auditData.records||[]).length);
       sec.appendChild(detail);
+      const recentAudit=(auditData.records||[]).slice(0,3);
+      if(recentAudit.length){
+        const auditList=UI.el('div','panel-section');
+        auditList.innerHTML='<h3>Recent Policy Evidence</h3>';
+        recentAudit.forEach(function(record){
+          const ev=record.evidence||{};
+          const row=UI.el('div','panel-item audit-record');
+          const source=UI.el('span','audit-source');
+          source.textContent=(record.decision&&record.decision.decision)||record.result||'policy';
+          const body=UI.el('span','pi-name audit-body');
+          const title=UI.el('span','audit-title');
+          title.textContent=(record.action&&record.action.requested_capability)||record.summary||'cross-plane action';
+          const meta=UI.el('span','audit-meta');
+          const parts=[];
+          if(ev.policy_version)parts.push(ev.policy_version);
+          if(ev.matched_grant_id)parts.push('grant '+ev.matched_grant_id);
+          if(ev.consumed_grant_id)parts.push('consumed');
+          if(ev.remaining_uses_after!==undefined&&ev.remaining_uses_after!==null)parts.push('remaining '+ev.remaining_uses_after);
+          meta.textContent=parts.join(' · ')||'no evidence';
+          body.appendChild(title);
+          body.appendChild(meta);
+          row.appendChild(source);
+          row.appendChild(body);
+          auditList.appendChild(row);
+        });
+        sec.appendChild(auditList);
+      }
       const sim=UI.el('button','btn-secondary');
       sim.textContent='Simulate verified Feishu send';
       sim.onclick=async function(){

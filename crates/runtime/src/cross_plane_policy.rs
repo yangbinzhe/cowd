@@ -166,8 +166,20 @@ pub struct CrossPlaneAuditRecord {
     pub timestamp: DateTime<Utc>,
     pub action: CrossPlaneAction,
     pub decision: CrossPlanePolicyDecision,
+    #[serde(default)]
+    pub evidence: CrossPlaneDecisionEvidence,
     pub result: String,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossPlaneDecisionEvidence {
+    pub policy_version: String,
+    pub evaluated_at: Option<DateTime<Utc>>,
+    pub active_grants_before: usize,
+    pub matched_grant_id: Option<String>,
+    pub consumed_grant_id: Option<String>,
+    pub remaining_uses_after: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,9 +226,16 @@ impl CrossPlaneAuditRecord {
             timestamp: Utc::now(),
             action,
             decision,
+            evidence: CrossPlaneDecisionEvidence::default(),
             result: result.into(),
             summary: summary.into(),
         }
+    }
+
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: CrossPlaneDecisionEvidence) -> Self {
+        self.evidence = evidence;
+        self
     }
 }
 
@@ -425,17 +444,63 @@ impl CrossPlaneControlPlane {
         action: CrossPlaneAction,
         now: DateTime<Utc>,
     ) -> CrossPlanePolicyDecision {
-        let grants = self.list_grants();
-        let engine =
-            CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default()).with_grants(grants);
+        let active_grants = self.active_grants(now);
+        let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default())
+            .with_grants(active_grants.clone());
         let decision = engine.decide(&action, now);
-        self.record_audit(CrossPlaneAuditRecord::new(
-            action,
-            decision.clone(),
-            format!("{:?}", decision.decision).to_lowercase(),
-            decision.reason.clone(),
-        ));
+        let consumed = self.consume_matched_grant_if_needed(&decision);
+        let evidence = CrossPlaneDecisionEvidence {
+            policy_version: "cross-plane.v1".to_string(),
+            evaluated_at: Some(now),
+            active_grants_before: active_grants.len(),
+            matched_grant_id: decision
+                .matched_grant
+                .as_ref()
+                .map(|grant| grant.id.clone()),
+            consumed_grant_id: consumed
+                .as_ref()
+                .map(|(grant_id, _remaining)| grant_id.clone()),
+            remaining_uses_after: consumed.as_ref().map(|(_grant_id, remaining)| *remaining),
+        };
+        self.record_audit(
+            CrossPlaneAuditRecord::new(
+                action,
+                decision.clone(),
+                format!("{:?}", decision.decision).to_lowercase(),
+                decision.reason.clone(),
+            )
+            .with_evidence(evidence),
+        );
         decision
+    }
+
+    fn active_grants(&self, now: DateTime<Utc>) -> Vec<CrossPlaneGrant> {
+        let state = self.inner.read().unwrap_or_else(|err| err.into_inner());
+        state
+            .grants
+            .iter()
+            .filter(|grant| grant.expires_at.is_none_or(|expires| expires > now))
+            .filter(|grant| grant.remaining_uses != Some(0))
+            .cloned()
+            .collect()
+    }
+
+    fn consume_matched_grant_if_needed(
+        &self,
+        decision: &CrossPlanePolicyDecision,
+    ) -> Option<(String, u32)> {
+        let grant = decision.matched_grant.as_ref()?;
+        if grant.grant_type != GrantType::SingleUse {
+            return None;
+        }
+        let mut state = self.inner.write().unwrap_or_else(|err| err.into_inner());
+        let stored = state
+            .grants
+            .iter_mut()
+            .find(|stored| stored.id == grant.id)?;
+        let remaining = stored.remaining_uses.unwrap_or(1).saturating_sub(1);
+        stored.remaining_uses = Some(remaining);
+        Some((stored.id.clone(), remaining))
     }
 
     #[must_use]
@@ -462,6 +527,7 @@ impl CrossPlaneControlPlane {
             .grants
             .iter()
             .filter(|grant| grant.expires_at.is_none_or(|expires| expires > now))
+            .filter(|grant| grant.remaining_uses != Some(0))
             .count();
         let allowed_actions = state
             .audit
@@ -689,6 +755,45 @@ mod tests {
         assert_eq!(decision.decision, PolicyDecisionKind::Allow);
         assert_eq!(decision.reason, "matched_grant");
         assert!(decision.matched_grant.is_some());
+    }
+
+    #[test]
+    fn control_plane_consumes_single_use_grant_and_audits_evidence() {
+        let control = CrossPlaneControlPlane::new();
+        let mut grant = CrossPlaneGrant::persistent("user:yi", "service.feishu.drive.download");
+        grant.grant_type = GrantType::SingleUse;
+        grant.remaining_uses = None;
+        let grant_id = grant.id.clone();
+        control.upsert_grant(grant);
+
+        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.drive.download");
+        action.identity_trust = IdentityTrust::Verified;
+        action.risk = CrossPlaneRisk::High;
+
+        let first_decision = control.decide_and_audit(action.clone(), now());
+        let second_decision = control.decide_and_audit(action, now());
+
+        assert_eq!(first_decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(
+            second_decision.decision,
+            PolicyDecisionKind::RequireSingleApproval
+        );
+        assert_eq!(control.summary(now()).active_grants, 0);
+
+        let audit = control.list_audit(10, 0);
+        let first_record = audit
+            .iter()
+            .find(|record| record.evidence.consumed_grant_id.as_deref() == Some(&grant_id))
+            .expect("single-use grant consumption should be auditable");
+        assert_eq!(
+            first_record.evidence.policy_version,
+            "cross-plane.v1".to_string()
+        );
+        assert_eq!(
+            first_record.evidence.matched_grant_id.as_deref(),
+            Some(grant_id.as_str())
+        );
+        assert_eq!(first_record.evidence.remaining_uses_after, Some(0));
     }
 
     #[test]

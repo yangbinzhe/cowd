@@ -2997,6 +2997,115 @@ providers:
     }
 
     #[tokio::test]
+    async fn cross_plane_single_use_grant_is_consumed_and_auditable() {
+        let app = api_router(test_state());
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:test-{suffix}");
+        let capability = format!("service.feishu.drive.download.{suffix}");
+        let grant_id = format!("grant-{suffix}");
+        let grant = serde_json::json!({
+            "id": grant_id,
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "single_use",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let action = serde_json::json!({
+            "actor_principal": principal,
+            "source_channel": "channel://wechat/chat/test",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": null,
+            "resource_ref": null,
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "verified"
+        });
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["decision"]["decision"], "allow");
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(
+            second_json["decision"]["decision"],
+            "require_single_approval"
+        );
+
+        let audit = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/audit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audit.status(), StatusCode::OK);
+        let audit_body = to_bytes(audit.into_body(), usize::MAX).await.unwrap();
+        let audit_json: serde_json::Value = serde_json::from_slice(&audit_body).unwrap();
+        let records = audit_json["records"].as_array().unwrap();
+        let consumed = records
+            .iter()
+            .find(|record| {
+                record["evidence"]["consumed_grant_id"].as_str() == Some(grant_id.as_str())
+            })
+            .expect("audit should include single-use grant consumption evidence");
+        assert_eq!(consumed["evidence"]["policy_version"], "cross-plane.v1");
+        assert_eq!(consumed["evidence"]["remaining_uses_after"], 0);
+    }
+
+    #[tokio::test]
     async fn context_current_returns_degraded_envelope_without_memory() {
         let app = api_router(test_state());
         let response = app
