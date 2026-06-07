@@ -3502,6 +3502,128 @@ providers:
     }
 
     #[tokio::test]
+    async fn cross_plane_execute_replays_idempotency_key_without_duplicate_audit() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [{
+                    "platformType": "feishu",
+                    "enabled": true,
+                    "app_id": "app-id",
+                    "app_secret": "app-secret"
+                }]
+            }
+        })));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:execute-idempotent-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-execute-idempotent-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "dry_run",
+            "idempotency_key": format!("idem-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/test",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": null,
+                "resource_ref": null,
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["idempotent_replay"], false);
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(second_json["idempotent_replay"], true);
+        assert_eq!(
+            second_json["execution_receipt"]["id"],
+            first_json["execution_receipt"]["id"]
+        );
+        assert_eq!(
+            second_json["audit_record_id"],
+            first_json["audit_record_id"]
+        );
+
+        let executions = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/action/executions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let executions_body = to_bytes(executions.into_body(), usize::MAX).await.unwrap();
+        let executions_json: serde_json::Value = serde_json::from_slice(&executions_body).unwrap();
+        let matching = executions_json["executions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|receipt| receipt["id"] == first_json["execution_receipt"]["id"])
+            .count();
+        assert_eq!(matching, 1);
+    }
+
+    #[tokio::test]
     async fn cross_plane_execute_commit_blocks_without_live_adapter_and_preserves_grant() {
         let app = api_router(test_state_with_config(serde_json::json!({
             "gateway": {

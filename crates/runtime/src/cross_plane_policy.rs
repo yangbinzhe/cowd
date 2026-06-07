@@ -13,6 +13,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use uuid::Uuid;
 
 const MAX_CROSS_PLANE_AUDIT_RECORDS: usize = 10_000;
+const MAX_CROSS_PLANE_EXECUTION_RECEIPTS: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +179,47 @@ pub struct CrossPlaneAuditRecord {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossPlaneExecutionReceipt {
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
+    pub idempotency_key: Option<String>,
+    pub mode: String,
+    pub status: String,
+    pub dispatch_status: String,
+    pub action: CrossPlaneAction,
+    pub decision: CrossPlanePolicyDecision,
+    pub blockers: Vec<String>,
+    pub audit_record_id: Option<String>,
+}
+
+impl CrossPlaneExecutionReceipt {
+    #[must_use]
+    pub fn new(
+        idempotency_key: Option<String>,
+        mode: impl Into<String>,
+        status: impl Into<String>,
+        dispatch_status: impl Into<String>,
+        action: CrossPlaneAction,
+        decision: CrossPlanePolicyDecision,
+        blockers: Vec<String>,
+        audit_record_id: Option<String>,
+    ) -> Self {
+        Self {
+            id: format!("cpx-{}", Uuid::new_v4()),
+            timestamp: Utc::now(),
+            idempotency_key,
+            mode: mode.into(),
+            status: status.into(),
+            dispatch_status: dispatch_status.into(),
+            action,
+            decision,
+            blockers,
+            audit_record_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossPlaneDecisionEvidence {
     pub policy_version: String,
@@ -318,6 +360,7 @@ struct CrossPlaneControlState {
     identities: Vec<CrossPlaneIdentityBinding>,
     grants: Vec<CrossPlaneGrant>,
     audit: Vec<CrossPlaneAuditRecord>,
+    executions: Vec<CrossPlaneExecutionReceipt>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +368,8 @@ pub struct CrossPlaneControlSnapshot {
     pub identities: Vec<CrossPlaneIdentityBinding>,
     pub grants: Vec<CrossPlaneGrant>,
     pub audit: Vec<CrossPlaneAuditRecord>,
+    #[serde(default)]
+    pub executions: Vec<CrossPlaneExecutionReceipt>,
 }
 
 impl CrossPlaneControlPlane {
@@ -348,6 +393,7 @@ impl CrossPlaneControlPlane {
             identities: state.identities.clone(),
             grants: state.grants.clone(),
             audit: state.audit.clone(),
+            executions: state.executions.clone(),
         }
     }
 
@@ -356,6 +402,7 @@ impl CrossPlaneControlPlane {
         state.identities = snapshot.identities;
         state.grants = snapshot.grants;
         state.audit = snapshot.audit;
+        state.executions = snapshot.executions;
     }
 
     pub fn load_from_path(&self, path: &Path) -> Result<(), String> {
@@ -524,6 +571,44 @@ impl CrossPlaneControlPlane {
             .saturating_sub(MAX_CROSS_PLANE_AUDIT_RECORDS);
         if overflow > 0 {
             state.audit.drain(0..overflow);
+        }
+    }
+
+    #[must_use]
+    pub fn list_executions(&self, limit: usize, offset: usize) -> Vec<CrossPlaneExecutionReceipt> {
+        let state = self.inner.read().unwrap_or_else(|err| err.into_inner());
+        let mut records = state.executions.clone();
+        records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        records.into_iter().skip(offset).take(limit).collect()
+    }
+
+    #[must_use]
+    pub fn find_execution_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Option<CrossPlaneExecutionReceipt> {
+        let key = idempotency_key.trim();
+        if key.is_empty() {
+            return None;
+        }
+        let state = self.inner.read().unwrap_or_else(|err| err.into_inner());
+        state
+            .executions
+            .iter()
+            .rev()
+            .find(|receipt| receipt.idempotency_key.as_deref() == Some(key))
+            .cloned()
+    }
+
+    pub fn record_execution(&self, receipt: CrossPlaneExecutionReceipt) {
+        let mut state = self.inner.write().unwrap_or_else(|err| err.into_inner());
+        state.executions.push(receipt);
+        let overflow = state
+            .executions
+            .len()
+            .saturating_sub(MAX_CROSS_PLANE_EXECUTION_RECEIPTS);
+        if overflow > 0 {
+            state.executions.drain(0..overflow);
         }
     }
 

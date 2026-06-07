@@ -10,8 +10,8 @@ use axum::{
     Json, Router,
 };
 use runtime::{
-    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneGrant,
-    CrossPlaneIdentityBinding, CrossPlanePolicyDecision, PolicyDecisionKind,
+    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneExecutionReceipt,
+    CrossPlaneGrant, CrossPlaneIdentityBinding, CrossPlanePolicyDecision, PolicyDecisionKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/cross-plane/action/adapters",
             get(cross_plane_action_adapters_handler),
+        )
+        .route(
+            "/api/cross-plane/action/executions",
+            get(cross_plane_action_executions_handler),
         )
         .route(
             "/api/cross-plane/policy/simulate",
@@ -257,6 +261,19 @@ async fn cross_plane_action_adapters_handler(
     }))
 }
 
+async fn cross_plane_action_executions_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    ensure_cross_plane_loaded(&state);
+    let executions = cross_plane_control().list_executions(100, 0);
+    let total = executions.len();
+    Json(serde_json::json!({
+        "kind": "cross_plane_action_executions",
+        "executions": executions,
+        "total": total,
+    }))
+}
+
 async fn cross_plane_policy_simulate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(action): Json<CrossPlaneAction>,
@@ -297,6 +314,35 @@ async fn cross_plane_action_execute_handler(
     ensure_cross_plane_loaded(&state);
     let now = chrono::Utc::now();
     let mode = normalize_execute_mode(&request.mode);
+    let idempotency_key = request
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string);
+    if let Some(key) = &idempotency_key {
+        if let Some(receipt) = cross_plane_control().find_execution_by_idempotency_key(key) {
+            let target_platform = target_platform_from_action(&receipt.action);
+            return Json(serde_json::json!({
+                "kind": "cross_plane_action_execution",
+                "mode": receipt.mode.clone(),
+                "status": receipt.status.clone(),
+                "dispatch_status": receipt.dispatch_status.clone(),
+                "idempotency_key": receipt.idempotency_key.clone(),
+                "action": receipt.action.clone(),
+                "decision": receipt.decision.clone(),
+                "target_platform": target_platform,
+                "platform_readiness": null,
+                "adapter_capability": null,
+                "executable": false,
+                "blockers": receipt.blockers.clone(),
+                "dispatched": false,
+                "audit_record_id": receipt.audit_record_id.clone(),
+                "execution_receipt": receipt,
+                "idempotent_replay": true,
+            }));
+        }
+    }
     let mut readiness = evaluate_action_readiness(&state, request.action, now);
     let mut status = "blocked";
     let mut dispatch_status = "not_started";
@@ -344,6 +390,17 @@ async fn cross_plane_action_execute_handler(
     );
     let audit_record_id = audit_record.id.clone();
     cross_plane_control().record_audit(audit_record);
+    let receipt = CrossPlaneExecutionReceipt::new(
+        idempotency_key.clone(),
+        mode.clone(),
+        status,
+        dispatch_status,
+        readiness.action.clone(),
+        readiness.decision.clone(),
+        readiness.blockers.clone(),
+        Some(audit_record_id.clone()),
+    );
+    cross_plane_control().record_execution(receipt.clone());
     save_cross_plane_state(&state);
 
     Json(serde_json::json!({
@@ -351,7 +408,7 @@ async fn cross_plane_action_execute_handler(
         "mode": mode,
         "status": status,
         "dispatch_status": dispatch_status,
-        "idempotency_key": request.idempotency_key,
+        "idempotency_key": idempotency_key,
         "action": readiness.action,
         "decision": readiness.decision,
         "target_platform": readiness.target_platform,
@@ -361,6 +418,8 @@ async fn cross_plane_action_execute_handler(
         "blockers": readiness.blockers,
         "dispatched": false,
         "audit_record_id": audit_record_id,
+        "execution_receipt": receipt,
+        "idempotent_replay": false,
     }))
 }
 
