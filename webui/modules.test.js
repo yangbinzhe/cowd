@@ -894,6 +894,14 @@ describe('API module', () => {
             dispatch_status: 'dry_run',
             idempotency_key: 'idem-demo',
             action: { requested_capability: 'channel.feishu.send_text' },
+            dispatch_target: {
+              ready: true,
+              platform: 'feishu',
+              operation: 'send_text',
+              session_key: 'feishu:open-id:chat-id',
+              blockers: [],
+              outbound_message: { text: 'hello from test' },
+            },
           }],
         }) });
       }
@@ -938,6 +946,9 @@ describe('API module', () => {
     expect(text).toContain('Execution Receipts');
     expect(text).toContain('channel.feishu.send_text');
     expect(text).toContain('idem idem-demo');
+    expect(text).toContain('Dispatch Target');
+    expect(text).toContain('session feishu:open-id:chat-id');
+    expect(text).toContain('payload hello from test');
     expect(text).not.toContain('cli_app_secret');
   });
 

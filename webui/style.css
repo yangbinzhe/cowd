@@ -275,6 +275,11 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .audit-body{display:flex!important;flex-direction:column;gap:2px;white-space:normal!important;min-width:0}
 .audit-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:210px}
 .audit-meta{font-size:11px;color:var(--text3)}
+.dispatch-target.ready .audit-source{color:var(--success)}
+.dispatch-target.blocked .audit-source{color:var(--warn)}
+.dispatch-target .audit-source:first-child{font-variant-numeric:tabular-nums}
+.dispatch-target-preview{margin-top:8px}
+.dispatch-target-preview:empty{display:none}
 .profile-create-row{display:flex;gap:8px;margin-bottom:10px}
 .profile-create-row input{flex:1;min-width:0;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:13px}
 .profile-active{font-size:11px;color:var(--success);padding:2px 6px;border:1px solid var(--border);border-radius:999px}

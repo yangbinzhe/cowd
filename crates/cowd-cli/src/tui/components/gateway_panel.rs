@@ -37,6 +37,8 @@ pub struct GatewayPanel {
     pub adapter_capabilities: Vec<GatewayAdapterCapability>,
     /// Recent cross-plane execution receipts.
     pub execution_receipts: Vec<GatewayExecutionReceipt>,
+    /// Recent dispatch target readiness summaries.
+    pub dispatch_targets: Vec<GatewayDispatchTarget>,
     /// Scroll offset for content overflow.
     pub scroll_offset: u16,
 }
@@ -58,6 +60,15 @@ pub struct GatewayExecutionReceipt {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayDispatchTarget {
+    pub platform: String,
+    pub operation: String,
+    pub session_key: Option<String>,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+}
+
 impl GatewayPanel {
     /// Create a new GatewayPanel in default stopped state.
     #[must_use]
@@ -69,6 +80,7 @@ impl GatewayPanel {
             active_sessions: 0,
             adapter_capabilities: Vec::new(),
             execution_receipts: Vec::new(),
+            dispatch_targets: Vec::new(),
             scroll_offset: 0,
         }
     }
@@ -121,6 +133,10 @@ impl GatewayPanel {
 
     pub fn set_execution_receipts(&mut self, receipts: Vec<GatewayExecutionReceipt>) {
         self.execution_receipts = receipts;
+    }
+
+    pub fn set_dispatch_targets(&mut self, targets: Vec<GatewayDispatchTarget>) {
+        self.dispatch_targets = targets;
     }
 
     // ── Rendering helpers ────────────────────────────────────────
@@ -281,6 +297,40 @@ impl Component for GatewayPanel {
                         format!("{} · {}{}", receipt.mode, receipt.capability, idem),
                         Style::default().fg(Color::DarkGray),
                     ),
+                ]));
+            }
+        }
+
+        if !self.dispatch_targets.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "─ Dispatch Targets ─",
+                Style::default().fg(Color::Cyan),
+            )));
+            for target in self.dispatch_targets.iter().take(3) {
+                let state = if target.ready { "ready" } else { "blocked" };
+                let detail = target
+                    .session_key
+                    .as_deref()
+                    .map(|key| format!("session {key}"))
+                    .or_else(|| target.blockers.first().map(|blocker| blocker.to_string()))
+                    .unwrap_or_else(|| "no target".to_string());
+                let state_color = if target.ready {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:8}", state), Style::default().fg(state_color)),
+                    Span::styled(
+                        format!("{:10}", target.platform),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(
+                        format!("{:12}", target.operation),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(detail, Style::default().fg(Color::DarkGray)),
                 ]));
             }
         }
@@ -573,6 +623,13 @@ mod tests {
             capability: "channel.feishu.send_text".to_string(),
             idempotency_key: Some("idem-demo".to_string()),
         }]);
+        panel.set_dispatch_targets(vec![GatewayDispatchTarget {
+            platform: "feishu".to_string(),
+            operation: "send_text".to_string(),
+            session_key: Some("feishu:open-id:chat-id".to_string()),
+            ready: true,
+            blockers: Vec::new(),
+        }]);
 
         let mut terminal = MockTerminal::new(96, 30);
         let skin = SkinConfig::default();
@@ -609,6 +666,14 @@ mod tests {
         assert!(
             joined.contains("channel.feishu.send_text") && joined.contains("idem-demo"),
             "Should show receipt capability and idempotency key, got: {joined}"
+        );
+        assert!(
+            joined.contains("Dispatch Targets"),
+            "Should show dispatch target section, got: {joined}"
+        );
+        assert!(
+            joined.contains("ready") && joined.contains("feishu:open-id:chat-id"),
+            "Should show target readiness and session key, got: {joined}"
         );
     }
 

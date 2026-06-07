@@ -247,6 +247,29 @@ window.Panels = (()=>{
     return row;
   }
 
+  function renderDispatchTarget(target){
+    const row=UI.el('div','panel-item audit-record dispatch-target '+(target&&target.ready?'ready':'blocked'));
+    const source=UI.el('span','audit-source');
+    source.textContent=target&&target.ready?'ready':'blocked';
+    const body=UI.el('span','pi-name audit-body');
+    const title=UI.el('span','audit-title');
+    const outbound=(target&&target.outbound_message)||{};
+    const targetName=[target&&target.platform,target&&target.operation].filter(Boolean).join(' · ');
+    title.textContent='Dispatch Target'+(targetName?' · '+targetName:'');
+    const meta=UI.el('span','audit-meta');
+    const parts=[];
+    if(target&&target.session_key)parts.push('session '+target.session_key);
+    if(outbound.text)parts.push('payload '+String(outbound.text).slice(0,48));
+    const blockers=(target&&target.blockers)||[];
+    if(blockers.length)parts.push(blockers.slice(0,2).join(' · '));
+    meta.textContent=parts.join(' · ')||'no target plan';
+    body.appendChild(title);
+    body.appendChild(meta);
+    row.appendChild(source);
+    row.appendChild(body);
+    return row;
+  }
+
   function latestPolicyDecision(events){
     const policyEvents=(events||[]).filter(function(item){return item&&item.kind==='runtime.policy.decided'});
     const latest=policyEvents[policyEvents.length-1]||null;
@@ -1743,29 +1766,34 @@ window.Panels = (()=>{
           row.appendChild(source);
           row.appendChild(body);
           executionList.appendChild(row);
+          if(receipt.dispatch_target)executionList.appendChild(renderDispatchTarget(receipt.dispatch_target));
         });
         sec.appendChild(executionList);
       }
       const sim=UI.el('button','btn-secondary');
-      sim.textContent='Simulate verified Feishu send';
+      sim.textContent='Preflight verified Feishu send';
+      const preflightBox=UI.el('div','dispatch-target-preview');
       sim.onclick=async function(){
         try{
-          const result=await Api.simulateCrossPlanePolicy({
+          const result=await Api.preflightCrossPlaneAction({
             actor_principal:'user:demo',
             source_channel:'local:tui',
             session_id:'demo',
             requested_capability:'channel.feishu.send_text',
             provider_account:'feishu-main',
             target_ref:'channel://feishu/chat/demo',
-            resource_ref:null,
+            resource_ref:'text://hello from cowd',
             risk:'low',
             data_classification:'internal',
             identity_trust:'verified'
           });
-          UI.showToast(JSON.stringify(result.decision||result,null,2));
-        }catch(e){UI.showToast('Policy simulation failed: '+e.message)}
+          preflightBox.innerHTML='<h3>Dispatch Target</h3>';
+          preflightBox.appendChild(renderDispatchTarget(result.dispatch_target||{}));
+          UI.showToast((result.dispatch_target&&result.dispatch_target.ready)?'Dispatch target ready':'Dispatch target blocked');
+        }catch(e){UI.showToast('Preflight failed: '+e.message,'error')}
       };
       sec.appendChild(sim);
+      sec.appendChild(preflightBox);
       c.appendChild(sec);
     }catch(e){
       c.appendChild(UI.el('div','panel-empty','Cross-plane policy unavailable'));
