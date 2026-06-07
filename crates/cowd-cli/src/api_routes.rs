@@ -2525,9 +2525,9 @@ providers:
                         ))
                         .body(Body::empty())
                         .unwrap(),
-            )
-            .await
-            .unwrap();
+                )
+                .await
+                .unwrap();
             assert_eq!(history_response.status(), StatusCode::OK);
             let history_body = to_bytes(history_response.into_body(), usize::MAX)
                 .await

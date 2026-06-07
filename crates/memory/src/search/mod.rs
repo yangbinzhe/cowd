@@ -6,6 +6,8 @@
 
 pub mod bm25;
 pub mod hybrid;
+pub mod semantic_bridge;
 
 pub use bm25::BM25Scorer;
 pub use hybrid::{HybridSearcher, SearchResult};
+pub use semantic_bridge::semantic_query_variants;

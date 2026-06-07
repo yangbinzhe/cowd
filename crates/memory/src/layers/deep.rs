@@ -18,6 +18,7 @@ use crate::{
     config::DriftConfig,
     layers::{LayerManager, Result},
     project_scope::MemoryScope,
+    search::semantic_query_variants,
     store::MemoryStore,
     types::{
         MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, PreparedContext,
@@ -85,11 +86,33 @@ impl DeepLayer {
             Vec::new()
         };
 
+        let semantic_results = if fts_results.len() + vec_results.len() < self.search_limit {
+            let mut bridged = Vec::new();
+            for variant in semantic_query_variants(query, 4) {
+                let results = self
+                    .store
+                    .search_fts(&variant, self.search_limit)
+                    .await
+                    .unwrap_or_default();
+                bridged.extend(results);
+                if bridged.len() >= self.search_limit {
+                    break;
+                }
+            }
+            bridged
+        } else {
+            Vec::new()
+        };
+
         // 3. Merge, restrict to L3, de-duplicate.
         let mut seen: HashSet<MemoryId> = already_surfaced.clone();
         let mut merged: Vec<MemoryEntry> = Vec::new();
 
-        for entry in fts_results.into_iter().chain(vec_results) {
+        for entry in fts_results
+            .into_iter()
+            .chain(vec_results)
+            .chain(semantic_results)
+        {
             if entry.layer != MemoryLayer::L3 {
                 continue;
             }
