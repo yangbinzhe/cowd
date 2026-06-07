@@ -69,6 +69,35 @@ pub struct GatewayDispatchTarget {
     pub blockers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GatewayActionTemplate {
+    operation: &'static str,
+    capability: &'static str,
+    resource_ref: &'static str,
+    risk: &'static str,
+}
+
+const GATEWAY_ACTION_TEMPLATES: [GatewayActionTemplate; 3] = [
+    GatewayActionTemplate {
+        operation: "send_text",
+        capability: "channel.feishu.send_text",
+        resource_ref: "text://hello",
+        risk: "low",
+    },
+    GatewayActionTemplate {
+        operation: "send_image",
+        capability: "channel.feishu.send_image",
+        resource_ref: "image://https://example.test/panel.png",
+        risk: "high",
+    },
+    GatewayActionTemplate {
+        operation: "send_file",
+        capability: "channel.feishu.send_file",
+        resource_ref: "workspace://file/reports/panel.txt",
+        risk: "high",
+    },
+];
+
 impl GatewayPanel {
     /// Create a new GatewayPanel in default stopped state.
     #[must_use]
@@ -395,6 +424,36 @@ impl Component for GatewayPanel {
             ]));
         }
 
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "─ Action Composer Contract ─",
+            Style::default().fg(Color::Cyan),
+        )));
+        lines.push(Line::from(Span::styled(
+            "POST /api/cross-plane/action/preflight  POST /api/cross-plane/action/execute",
+            Style::default().fg(Color::DarkGray),
+        )));
+        for template in GATEWAY_ACTION_TEMPLATES {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:10}", template.operation),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("{:26}", template.capability),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("{} · {}", template.risk, template.resource_ref),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            "source local:tui · principal user:demo · target channel://feishu/chat/demo",
+            Style::default().fg(Color::DarkGray),
+        )));
+
         // ── Keyboard hint bar ──────────────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -674,6 +733,39 @@ mod tests {
         assert!(
             joined.contains("ready") && joined.contains("feishu:open-id:chat-id"),
             "Should show target readiness and session key, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn render_shows_cross_plane_action_contracts() {
+        use crate::tui::skin::SkinConfig;
+        use crate::tui::test_utils::MockTerminal;
+
+        let mut panel = GatewayPanel::new();
+        let mut terminal = MockTerminal::new(118, 32);
+        let skin = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &skin);
+            panel.render(&mut ctx, Rect::new(0, 0, 118, 32));
+        });
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(
+            joined.contains("Action Composer Contract"),
+            "Should show action contract section, got: {joined}"
+        );
+        assert!(
+            joined.contains("channel.feishu.send_text")
+                && joined.contains("channel.feishu.send_image")
+                && joined.contains("channel.feishu.send_file"),
+            "Should show typed send capabilities, got: {joined}"
+        );
+        assert!(
+            joined.contains("workspace://file/reports/panel.txt"),
+            "Should show canonical workspace file reference, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/cross-plane/action/execute"),
+            "Should show execute endpoint, got: {joined}"
         );
     }
 
