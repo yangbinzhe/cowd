@@ -2570,6 +2570,11 @@ providers:
                 .await
                 .unwrap();
             assert_eq!(detail_response.status(), StatusCode::OK);
+            let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
+            assert_eq!(detail_json["context"]["envelope_id"], "env-log-1");
         }
         .with_subscriber(subscriber)
         .await;
@@ -3156,6 +3161,92 @@ providers:
         assert_eq!(json["resolved"]["principal_id"], principal);
         assert_eq!(json["resolved"]["trust"], "verified");
         assert_eq!(json["resolved"]["match_kind"], "contact_key");
+    }
+
+    #[tokio::test]
+    async fn cross_plane_policy_simulation_resolves_actor_identity_before_decision() {
+        let app = api_router(test_state());
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let email = format!("policy-{suffix}@example.com");
+        let principal = format!("user:policy-{suffix}");
+        let capability = format!("service.feishu.drive.download.{suffix}");
+
+        let identity = serde_json::json!({
+            "id": format!("idb-policy-{suffix}"),
+            "principal_id": principal,
+            "identity_ref": format!("channel://feishu/user/policy?email={email}"),
+            "trust": "verified",
+            "source": "test",
+            "created_at": "2026-06-07T00:00:00Z",
+            "expires_at": null
+        });
+        let grant = serde_json::json!({
+            "id": format!("grant-policy-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+
+        for (uri, body) in [
+            ("/api/cross-plane/identities", identity),
+            ("/api/cross-plane/grants", grant),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let action = serde_json::json!({
+            "actor_principal": "",
+            "actor_identity_ref": format!("channel://wechat/user/policy?email={email}"),
+            "source_channel": "channel://wechat/chat/test",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": null,
+            "resource_ref": null,
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "unknown"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["decision"]["decision"], "allow");
+        assert_eq!(json["action"]["actor_principal"], principal);
+        assert_eq!(
+            json["decision"]["matched_grant"]["principal_id"],
+            json["action"]["actor_principal"]
+        );
     }
 
     #[tokio::test]

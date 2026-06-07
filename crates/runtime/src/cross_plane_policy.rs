@@ -64,6 +64,8 @@ pub enum PolicyDecisionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossPlaneAction {
     pub actor_principal: String,
+    #[serde(default)]
+    pub actor_identity_ref: Option<String>,
     pub source_channel: Option<String>,
     pub session_id: Option<String>,
     pub requested_capability: String,
@@ -83,6 +85,7 @@ impl CrossPlaneAction {
     ) -> Self {
         Self {
             actor_principal: actor_principal.into(),
+            actor_identity_ref: None,
             source_channel: None,
             session_id: None,
             requested_capability: requested_capability.into(),
@@ -177,6 +180,7 @@ pub struct CrossPlaneAuditRecord {
 pub struct CrossPlaneDecisionEvidence {
     pub policy_version: String,
     pub evaluated_at: Option<DateTime<Utc>>,
+    pub resolved_identity: Option<CrossPlaneResolvedIdentity>,
     pub active_grants_before: usize,
     pub matched_grant_id: Option<String>,
     pub consumed_grant_id: Option<String>,
@@ -512,6 +516,16 @@ impl CrossPlaneControlPlane {
         action: CrossPlaneAction,
         now: DateTime<Utc>,
     ) -> CrossPlanePolicyDecision {
+        self.decide_and_audit_with_action(action, now).1
+    }
+
+    #[must_use]
+    pub fn decide_and_audit_with_action(
+        &self,
+        mut action: CrossPlaneAction,
+        now: DateTime<Utc>,
+    ) -> (CrossPlaneAction, CrossPlanePolicyDecision) {
+        let resolved_identity = self.resolve_action_identity(&mut action, now);
         let active_grants = self.active_grants(now);
         let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default())
             .with_grants(active_grants.clone());
@@ -520,6 +534,7 @@ impl CrossPlaneControlPlane {
         let evidence = CrossPlaneDecisionEvidence {
             policy_version: "cross-plane.v1".to_string(),
             evaluated_at: Some(now),
+            resolved_identity,
             active_grants_before: active_grants.len(),
             matched_grant_id: decision
                 .matched_grant
@@ -532,14 +547,31 @@ impl CrossPlaneControlPlane {
         };
         self.record_audit(
             CrossPlaneAuditRecord::new(
-                action,
+                action.clone(),
                 decision.clone(),
                 format!("{:?}", decision.decision).to_lowercase(),
                 decision.reason.clone(),
             )
             .with_evidence(evidence),
         );
-        decision
+        (action, decision)
+    }
+
+    fn resolve_action_identity(
+        &self,
+        action: &mut CrossPlaneAction,
+        now: DateTime<Utc>,
+    ) -> Option<CrossPlaneResolvedIdentity> {
+        let identity_ref = action.actor_identity_ref.as_deref()?;
+        let resolved = self.resolve_identity(identity_ref, now)?;
+        if action.actor_principal.trim().is_empty()
+            || action.actor_principal == identity_ref
+            || identity_trust_rank(resolved.trust) > identity_trust_rank(action.identity_trust)
+        {
+            action.actor_principal = resolved.principal_id.clone();
+            action.identity_trust = resolved.trust;
+        }
+        Some(resolved)
     }
 
     fn active_grants(&self, now: DateTime<Utc>) -> Vec<CrossPlaneGrant> {
@@ -968,6 +1000,38 @@ mod tests {
         assert_eq!(resolved.principal_id, "user:wechat");
         assert_eq!(resolved.trust, IdentityTrust::Claimed);
         assert_eq!(resolved.match_kind, "exact_ref");
+    }
+
+    #[test]
+    fn control_plane_decision_resolves_actor_identity_before_policy() {
+        let control = CrossPlaneControlPlane::new();
+        control.upsert_identity(CrossPlaneIdentityBinding::verified(
+            "user:yi",
+            "channel://feishu/user/u1?email=yi@example.com",
+        ));
+        control.upsert_grant(CrossPlaneGrant::persistent(
+            "user:yi",
+            "service.feishu.drive.download",
+        ));
+        let mut action = CrossPlaneAction::new("", "service.feishu.drive.download");
+        action.actor_identity_ref = Some("channel://wechat/user/wx1?email=yi@example.com".into());
+        action.identity_trust = IdentityTrust::Unknown;
+        action.risk = CrossPlaneRisk::High;
+
+        let decision = control.decide_and_audit(action, now());
+
+        assert_eq!(decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(decision.reason, "matched_grant");
+        let audit = control.list_audit(10, 0);
+        assert_eq!(audit[0].action.actor_principal, "user:yi");
+        assert_eq!(
+            audit[0]
+                .evidence
+                .resolved_identity
+                .as_ref()
+                .map(|resolved| resolved.match_kind.as_str()),
+            Some("contact_key")
+        );
     }
 
     #[test]

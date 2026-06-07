@@ -202,7 +202,8 @@ async fn cross_plane_policy_simulate_handler(
     Json(action): Json<CrossPlaneAction>,
 ) -> impl IntoResponse {
     ensure_cross_plane_loaded(&state);
-    let decision = cross_plane_control().decide_and_audit(action.clone(), chrono::Utc::now());
+    let (action, decision) =
+        cross_plane_control().decide_and_audit_with_action(action, chrono::Utc::now());
     save_cross_plane_state(&state);
     Json(serde_json::json!({
         "kind": "cross_plane_policy_simulation",
