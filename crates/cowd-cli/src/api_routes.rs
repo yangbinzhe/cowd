@@ -3949,6 +3949,11 @@ providers:
         let preflight_body = to_bytes(preflight.into_body(), usize::MAX).await.unwrap();
         let preflight_json: serde_json::Value = serde_json::from_slice(&preflight_body).unwrap();
         assert_eq!(preflight_json["adapter_capability"]["adapter_bound"], true);
+        assert_eq!(preflight_json["dispatch_target"]["ready"], false);
+        assert!(preflight_json["dispatch_target"]["blockers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("dispatch:target_ref_missing")));
 
         let execute = serde_json::json!({
             "mode": "commit",
@@ -3968,12 +3973,108 @@ providers:
             .unwrap();
         let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
         let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
-        assert_eq!(executed_json["dispatch_status"], "dispatch_not_implemented");
+        assert_eq!(
+            executed_json["dispatch_status"],
+            "dispatch_target_not_ready"
+        );
         assert_eq!(executed_json["adapter_capability"]["adapter_bound"], true);
         assert!(executed_json["blockers"]
             .as_array()
             .unwrap()
-            .contains(&serde_json::json!("dispatch:not_implemented")));
+            .contains(&serde_json::json!("dispatch:target_ref_missing")));
+
+        platform_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_plane_preflight_builds_dispatch_target_plan() {
+        let platform_runtime = test_platform_runtime_with_bound_adapter("feishu").await;
+        let app = api_router(test_state_with_config_and_runtime(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-target-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-target-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let action = serde_json::json!({
+            "actor_principal": principal,
+            "actor_identity_ref": null,
+            "source_channel": "channel://wechat/chat/source",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": "channel://feishu/user/open-id-1/thread/chat-id-1",
+            "resource_ref": "text://hello from cross plane",
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "verified"
+        });
+        let preflight = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/preflight")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        let body = to_bytes(preflight.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["dispatch_target"]["ready"], true);
+        assert_eq!(json["dispatch_target"]["platform"], "feishu");
+        assert_eq!(json["dispatch_target"]["operation"], "send_text");
+        assert_eq!(
+            json["dispatch_target"]["session_key"],
+            "feishu:open-id-1:chat-id-1"
+        );
+        assert_eq!(
+            json["dispatch_target"]["outbound_message"]["text"],
+            "hello from cross plane"
+        );
+        assert_eq!(
+            json["dispatch_target"]["outbound_message"]["metadata"]["requested_capability"],
+            capability
+        );
 
         platform_runtime.shutdown().await.unwrap();
     }
