@@ -14,9 +14,10 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
+use commands::slash_command_specs;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -159,94 +160,6 @@ impl Default for FrecencyTracker {
 // AutocompleteEngine
 // ═══════════════════════════════════════════════════════════════════
 
-/// Known slash commands for autocompletion.
-///
-/// TODO: This list should eventually be loaded dynamically from
-/// `commands::specs::SLASH_COMMAND_SPECS`. For now it is a static
-/// snapshot of the built-in slash commands.
-const KNOWN_COMMANDS: &[&str] = &[
-    "add-dir",
-    "advisor",
-    "agents",
-    "allowed-tools",
-    "api-key",
-    "approve",
-    "branch",
-    "brief",
-    "bughunter",
-    "clear",
-    "color",
-    "commit",
-    "compact",
-    "config",
-    "context",
-    "copy",
-    "cost",
-    "debug-tool-call",
-    "deny",
-    "desktop",
-    "diff",
-    "doctor",
-    "effort",
-    "exit",
-    "export",
-    "fast",
-    "feedback",
-    "files",
-    "handoff",
-    "help",
-    "hooks",
-    "ide",
-    "image",
-    "init",
-    "insights",
-    "issue",
-    "keybindings",
-    "listen",
-    "mcp",
-    "memory",
-    "model",
-    "output-style",
-    "paste",
-    "permissions",
-    "plan",
-    "plugin",
-    "pr",
-    "privacy-settings",
-    "release-notes",
-    "rename",
-    "resume",
-    "retry",
-    "review",
-    "rewind",
-    "sandbox",
-    "screenshot",
-    "search",
-    "security-review",
-    "session",
-    "share",
-    "skills",
-    "speak",
-    "stats",
-    "status",
-    "stickers",
-    "stop",
-    "summary",
-    "tag",
-    "tasks",
-    "teleport",
-    "terminal-setup",
-    "theme",
-    "thinkback",
-    "ultraplan",
-    "undo",
-    "upgrade",
-    "usage",
-    "version",
-    "vim",
-    "voice",
-];
-
 /// Engine that produces autocomplete suggestions based on a prefix.
 ///
 /// - If `prefix` starts with `@`: glob directory for matching file paths.
@@ -361,10 +274,13 @@ impl AutocompleteEngine {
     }
 
     fn command_suggestions(&self, prefix: &str) -> Vec<Suggestion> {
-        KNOWN_COMMANDS
+        slash_command_specs()
             .iter()
+            .flat_map(|spec| std::iter::once(spec.name).chain(spec.aliases.iter().copied()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .filter(|cmd| cmd.starts_with(prefix))
-            .map(|cmd| Suggestion::new(format!("/{}", cmd), SuggestionKind::Command))
+            .map(|cmd| Suggestion::new(format!("/{cmd}"), SuggestionKind::Command))
             .collect()
     }
 
@@ -1210,6 +1126,23 @@ mod tests {
         let mut engine = AutocompleteEngine::new("/tmp");
         let suggestions = engine.suggest("/zzz");
         assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn autocomplete_commands_include_registered_aliases() {
+        let mut engine = AutocompleteEngine::new("/tmp");
+        let suggestions = engine.suggest("/market");
+        assert!(
+            suggestions.iter().any(|s| s.text == "/marketplace"),
+            "should include slash command aliases from the registry"
+        );
+
+        let suggestions = engine.suggest("/skill");
+        assert!(
+            suggestions.iter().any(|s| s.text == "/skills")
+                && suggestions.iter().any(|s| s.text == "/skill"),
+            "should include canonical skill command and alias"
+        );
     }
 
     #[test]
