@@ -12,19 +12,19 @@ use std::{
 };
 
 use axum::{
-    Router,
     body::Body,
     extract::{Path, Query, State as AxumState},
-    http::{Request, StatusCode, header},
+    http::{header, Request, StatusCode},
     middleware::{self, Next},
     response::{
-        IntoResponse, Json,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse, Json,
     },
     routing::{get, post},
+    Router,
 };
-use futures::StreamExt;
 use futures::stream::Stream;
+use futures::StreamExt;
 use runtime::approval_gate::SmartApprovalGate;
 use runtime::permission_enforcer::{ApprovalPersistence, ApprovalVerdict};
 use runtime::{
@@ -34,7 +34,7 @@ use runtime::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, timeout};
+use tokio::time::{timeout, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 
 use runtime::ProfileManager;
@@ -44,13 +44,13 @@ use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use crate::session_kernel::SessionKernel;
 use crate::task_kernel::{TaskKernel, TaskRecord, TaskStatus};
-use memory::RotAlert;
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
 use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
+use memory::RotAlert;
 use memory::{
     MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
     MaintenanceScanConfig, MemoryKernel, MemoryScope, MemoryTurnContext, SearchMemoriesRequest,
@@ -3445,7 +3445,11 @@ fn runtime_run_tree_summary(runs: &[serde_json::Value]) -> serde_json::Value {
                 Some(parent_id) => !parents.contains_key(parent_id),
                 None => true,
             };
-            if is_root { Some(run_id.clone()) } else { None }
+            if is_root {
+                Some(run_id.clone())
+            } else {
+                None
+            }
         })
         .collect::<Vec<_>>();
     let root_count = roots.len();
@@ -4424,8 +4428,8 @@ async fn sse_stream_handler(
 mod tests {
     use super::*;
     use axum::{
-        body::Body,
         body::to_bytes,
+        body::Body,
         http::{Request, StatusCode},
     };
     use memory::config::{BudgetConfig, StoreConfig};
@@ -5019,13 +5023,11 @@ mod tests {
             .unwrap()
             .expect("stored session");
         assert_eq!(record.model.as_deref(), Some("patched-model"));
-        assert!(
-            record
-                .metadata_json
-                .as_deref()
-                .unwrap_or("")
-                .contains("Patch Session Title")
-        );
+        assert!(record
+            .metadata_json
+            .as_deref()
+            .unwrap_or("")
+            .contains("Patch Session Title"));
     }
 
     #[tokio::test]
@@ -5418,6 +5420,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_timeline_projects_health_summary() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "runtime-health-summary-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&memory::RuntimeEvent::new(
+                session_id,
+                0,
+                memory::RuntimeEventScope::Task,
+                "task.started",
+                serde_json::json!({"task_id": "task-health"}),
+                10,
+            ))
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&memory::RuntimeEvent::new(
+                session_id,
+                1,
+                memory::RuntimeEventScope::Policy,
+                "runtime.policy.decided",
+                serde_json::json!({
+                    "agent_mode": "Parallel",
+                    "requires_review": false,
+                    "complexity": {
+                        "level": "Complex",
+                        "score": 72,
+                        "signals": [{"name": "verification_required"}]
+                    }
+                }),
+                11,
+            ))
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&memory::RuntimeEvent::new(
+                session_id,
+                2,
+                memory::RuntimeEventScope::Workgraph,
+                "agent.workgraph.reviewed",
+                serde_json::json!({
+                    "value_verdict": {
+                        "positive_lift": true,
+                        "continue_multi_agent": true,
+                        "value_score": 73,
+                        "reasons": ["positive_multi_agent_lift"]
+                    }
+                }),
+                12,
+            ))
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&memory::RuntimeEvent::new(
+                session_id,
+                3,
+                memory::RuntimeEventScope::Task,
+                "task.completed",
+                serde_json::json!({"task_id": "task-health"}),
+                13,
+            ))
+            .await
+            .unwrap();
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["health_summary"]["status"], "healthy");
+        assert_eq!(json["health_summary"]["event_count"], 4);
+        assert_eq!(json["health_summary"]["failed_events"], 0);
+        assert_eq!(json["health_summary"]["degraded_events"], 0);
+        assert_eq!(json["health_summary"]["open_tasks"], 0);
+        assert_eq!(json["health_summary"]["positive_agent_lift"], true);
+        assert_eq!(json["health_summary"]["latest_value_score"], 73);
+        assert_eq!(
+            json["health_summary"]["latest_policy"]["agent_mode"],
+            "Parallel"
+        );
+        assert_eq!(json["health_summary"]["scope_counts"]["task"], 2);
+        assert_eq!(json["health_summary"]["scope_counts"]["policy"], 1);
+        assert_eq!(json["health_summary"]["scope_counts"]["workgraph"], 1);
+    }
+
+    #[tokio::test]
     async fn runtime_projection_degrades_missing_sources() {
         let app = api_router(test_state());
         let response = app
@@ -5436,6 +5542,13 @@ mod tests {
         assert_eq!(json["degraded"], true);
         assert_eq!(json["events"].as_array().unwrap().len(), 0);
         assert_eq!(json["workgraph_summary"]["count"], 0);
+        assert_eq!(json["health_summary"]["status"], "degraded");
+        assert_eq!(json["health_summary"]["score"], 35);
+        assert_eq!(json["health_summary"]["degraded_events"], 0);
+        assert_eq!(
+            json["health_summary"]["reasons"][0],
+            "session store not available"
+        );
     }
 
     #[tokio::test]
@@ -5798,18 +5911,14 @@ runtime:
 
         assert_eq!(packet.session_id, "session-task");
         assert_eq!(packet.source, ResumeContextSource::TaskRegistry);
-        assert!(
-            packet
-                .active_task
-                .as_deref()
-                .is_some_and(|task| task.contains("ship context runtime"))
-        );
-        assert!(
-            packet
-                .recent_decisions
-                .iter()
-                .any(|event| event.contains("artifact"))
-        );
+        assert!(packet
+            .active_task
+            .as_deref()
+            .is_some_and(|task| task.contains("ship context runtime")));
+        assert!(packet
+            .recent_decisions
+            .iter()
+            .any(|event| event.contains("artifact")));
         let _ = std::fs::remove_file(path);
     }
 
@@ -5862,12 +5971,10 @@ runtime:
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         let request_id = pending_json[0]["id"].as_str().unwrap().to_string();
-        assert!(
-            pending_json[0]["command"]
-                .as_str()
-                .unwrap()
-                .contains("rm -rf")
-        );
+        assert!(pending_json[0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("rm -rf"));
 
         let response = app
             .clone()
@@ -6026,12 +6133,10 @@ runtime:
         assert_eq!(json["envelope"]["profile"], "YoloGoal");
         assert_eq!(json["envelope"]["identity"]["mode"], "YoloGoal");
         assert_eq!(json["envelope"]["budget"]["leases"][0]["source"], "Task");
-        assert!(
-            json["envelope"]["assembled"]["runtime_header"][0]
-                .as_str()
-                .unwrap()
-                .contains("profile:YoloGoal")
-        );
+        assert!(json["envelope"]["assembled"]["runtime_header"][0]
+            .as_str()
+            .unwrap()
+            .contains("profile:YoloGoal"));
     }
 
     #[tokio::test]
@@ -6701,12 +6806,10 @@ runtime:
         assert_eq!(json["results"][0]["category"], "ProjectKnowledge");
         assert!(json["results"][0]["score"].as_f64().is_some());
         assert!(json["results"][0]["mode"].as_str().is_some());
-        assert!(
-            json["results"][0]["snippet"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("SessionKernel")
-        );
+        assert!(json["results"][0]["snippet"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("SessionKernel"));
 
         std::fs::remove_dir_all(tmp).unwrap();
     }
@@ -6877,11 +6980,9 @@ runtime:
         assert_eq!(status_json["context_health"]["level"], "healthy");
         assert_eq!(status_json["kernel_health"]["degraded"], false);
         assert_eq!(status_json["kernel_health"]["stale_pressure"], 0.0);
-        assert!(
-            status_json["kernel_health"]["evidence_coverage"]
-                .as_f64()
-                .is_some()
-        );
+        assert!(status_json["kernel_health"]["evidence_coverage"]
+            .as_f64()
+            .is_some());
 
         let layers_response = app
             .clone()

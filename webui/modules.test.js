@@ -954,6 +954,18 @@ describe('API module', () => {
             total: 3,
             next_seq: 12,
             degraded: false,
+            health_summary: {
+              status: 'healthy',
+              score: 100,
+              event_count: 3,
+              failed_events: 0,
+              degraded_events: 0,
+              open_tasks: 0,
+              positive_agent_lift: true,
+              latest_value_score: 72,
+              reasons: ['runtime event spine is coherent'],
+              scope_counts: { policy: 1, tool: 1, workgraph: 1 },
+            },
             workgraph_summary: {
               count: 1,
               latest: {
@@ -1126,6 +1138,10 @@ describe('API module', () => {
     expect(text).toContain('spans');
     expect(text).toContain('run-console-1');
     expect(text).toContain('Runtime Timeline');
+    expect(text).toContain('Runtime Health');
+    expect(text).toContain('healthy');
+    expect(text).toContain('agent lift');
+    expect(text).toContain('runtime event spine is coherent');
     expect(text).toContain('Runtime Control');
     expect(text).toContain('Complex');
     expect(text).toContain('Parallel');

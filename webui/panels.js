@@ -276,6 +276,27 @@ window.Panels = (()=>{
     return sec;
   }
 
+  function renderRuntimeHealthSummary(summary){
+    const sec=UI.el('div','runtime-workgraph-summary runtime-health-summary');
+    sec.innerHTML='<h4>Runtime Health</h4>';
+    const metrics=UI.el('div','memory-metrics');
+    const health=summary||{};
+    metrics.appendChild(renderMemoryMetric('status',health.status||'unknown','health'));
+    metrics.appendChild(renderMemoryMetric('score',fmtNumber(health.score),'quality'));
+    metrics.appendChild(renderMemoryMetric('failed',fmtNumber(health.failed_events),'events'));
+    metrics.appendChild(renderMemoryMetric('degraded',fmtNumber(health.degraded_events),'events'));
+    metrics.appendChild(renderMemoryMetric('open',fmtNumber(health.open_tasks),'tasks'));
+    metrics.appendChild(renderMemoryMetric('agent lift',health.positive_agent_lift?'yes':'no','value'));
+    sec.appendChild(metrics);
+    const reasons=health.reasons||[];
+    if(reasons.length){
+      const detail=UI.el('div','runtime-workgraph-detail');
+      detail.innerHTML='<b>'+UI.esc(reasons[0])+'</b><small>'+UI.esc('latest value '+fmtNumber(health.latest_value_score)+' · events '+fmtNumber(health.event_count))+'</small>';
+      sec.appendChild(detail);
+    }
+    return sec;
+  }
+
   async function renderContext(){
     const c=cont();c.innerHTML='';
     const hdr=UI.el('div','panel-section context-header');
@@ -917,6 +938,7 @@ window.Panels = (()=>{
           timelineSec.appendChild(metrics);
           if(timeline.degraded_reason)timelineSec.appendChild(UI.el('div','panel-empty',timeline.degraded_reason));
           if(!events.length)timelineSec.appendChild(UI.el('div','panel-empty','No runtime events'));
+          timelineSec.appendChild(renderRuntimeHealthSummary(timeline.health_summary));
           timelineSec.appendChild(renderWorkGraphSummary(events,timeline.workgraph_summary));
           const runtimePolicy=latestPolicyDecision(events);
           if(runtimePolicy.count){
