@@ -33,8 +33,29 @@ pub struct GatewayPanel {
     pub uptime_secs: Option<u64>,
     /// Number of active sessions.
     pub active_sessions: usize,
+    /// Cross-plane adapter capability summaries.
+    pub adapter_capabilities: Vec<GatewayAdapterCapability>,
+    /// Recent cross-plane execution receipts.
+    pub execution_receipts: Vec<GatewayExecutionReceipt>,
     /// Scroll offset for content overflow.
     pub scroll_offset: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayAdapterCapability {
+    pub platform: String,
+    pub operation: String,
+    pub live_supported: bool,
+    pub adapter_bound: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayExecutionReceipt {
+    pub status: String,
+    pub dispatch_status: String,
+    pub mode: String,
+    pub capability: String,
+    pub idempotency_key: Option<String>,
 }
 
 impl GatewayPanel {
@@ -46,6 +67,8 @@ impl GatewayPanel {
             health_status: None,
             uptime_secs: None,
             active_sessions: 0,
+            adapter_capabilities: Vec::new(),
+            execution_receipts: Vec::new(),
             scroll_offset: 0,
         }
     }
@@ -90,6 +113,14 @@ impl GatewayPanel {
     /// Set the active session count.
     pub fn set_active_sessions(&mut self, count: usize) {
         self.active_sessions = count;
+    }
+
+    pub fn set_adapter_capabilities(&mut self, capabilities: Vec<GatewayAdapterCapability>) {
+        self.adapter_capabilities = capabilities;
+    }
+
+    pub fn set_execution_receipts(&mut self, receipts: Vec<GatewayExecutionReceipt>) {
+        self.execution_receipts = receipts;
     }
 
     // ── Rendering helpers ────────────────────────────────────────
@@ -191,6 +222,69 @@ impl Component for GatewayPanel {
             }
         }
 
+        if !self.adapter_capabilities.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "─ Cross-Plane Adapters ─",
+                Style::default().fg(Color::Cyan),
+            )));
+            for capability in self.adapter_capabilities.iter().take(4) {
+                let support = if capability.live_supported {
+                    "live"
+                } else {
+                    "plan"
+                };
+                let binding = if capability.adapter_bound {
+                    "bound"
+                } else {
+                    "not-bound"
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:12}", capability.platform),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(
+                        format!("{:12}", capability.operation),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("{support} · {binding}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+
+        if !self.execution_receipts.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "─ Execution Receipts ─",
+                Style::default().fg(Color::Cyan),
+            )));
+            for receipt in self.execution_receipts.iter().take(3) {
+                let idem = receipt
+                    .idempotency_key
+                    .as_deref()
+                    .map(|key| format!(" · idem {key}"))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:8}", receipt.status),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(
+                        format!("{:16}", receipt.dispatch_status),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("{} · {}{}", receipt.mode, receipt.capability, idem),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+
         // ── API Endpoints ──────────────────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -199,7 +293,7 @@ impl Component for GatewayPanel {
         )));
         lines.push(Line::from(""));
 
-        let endpoints: [(&str, &str); 14] = [
+        let endpoints: [(&str, &str); 16] = [
             ("GET  /health", "Server health check"),
             ("GET  /api/sessions", "List sessions"),
             ("POST /api/sessions", "Create session"),
@@ -212,6 +306,14 @@ impl Component for GatewayPanel {
             ("GET  /api/platforms", "List platforms"),
             ("GET  /api/cross-plane/summary", "Interop policy summary"),
             ("GET  /api/cross-plane/grants", "List interop grants"),
+            (
+                "GET  /api/cross-plane/action/adapters",
+                "Interop dispatch capability",
+            ),
+            (
+                "GET  /api/cross-plane/action/executions",
+                "Interop execution receipts",
+            ),
             (
                 "POST /api/cross-plane/policy/simulate",
                 "Test policy decision",
@@ -441,6 +543,72 @@ mod tests {
         assert!(
             joined.contains("/api/platforms"),
             "Should show platforms endpoint, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/cross-plane/action/adapters"),
+            "Should show cross-plane adapter endpoint, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/cross-plane/action/executions"),
+            "Should show cross-plane execution endpoint, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn render_shows_cross_plane_adapter_and_execution_state() {
+        use crate::tui::skin::SkinConfig;
+        use crate::tui::test_utils::MockTerminal;
+
+        let mut panel = GatewayPanel::new();
+        panel.set_adapter_capabilities(vec![GatewayAdapterCapability {
+            platform: "feishu".to_string(),
+            operation: "send_text".to_string(),
+            live_supported: true,
+            adapter_bound: false,
+        }]);
+        panel.set_execution_receipts(vec![GatewayExecutionReceipt {
+            status: "planned".to_string(),
+            dispatch_status: "dry_run".to_string(),
+            mode: "dry_run".to_string(),
+            capability: "channel.feishu.send_text".to_string(),
+            idempotency_key: Some("idem-demo".to_string()),
+        }]);
+
+        let mut terminal = MockTerminal::new(96, 30);
+        let skin = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &skin);
+            panel.render(&mut ctx, Rect::new(0, 0, 96, 30));
+        });
+        let lines = terminal.buffer_lines();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Cross-Plane Adapters"),
+            "Should show adapter section, got: {joined}"
+        );
+        assert!(
+            joined.contains("feishu"),
+            "Should show platform, got: {joined}"
+        );
+        assert!(
+            joined.contains("send_text"),
+            "Should show operation, got: {joined}"
+        );
+        assert!(
+            joined.contains("live") && joined.contains("not-bound"),
+            "Should show adapter support and binding state, got: {joined}"
+        );
+        assert!(
+            joined.contains("Execution Receipts"),
+            "Should show execution section, got: {joined}"
+        );
+        assert!(
+            joined.contains("planned") && joined.contains("dry_run"),
+            "Should show receipt state, got: {joined}"
+        );
+        assert!(
+            joined.contains("channel.feishu.send_text") && joined.contains("idem-demo"),
+            "Should show receipt capability and idempotency key, got: {joined}"
         );
     }
 
