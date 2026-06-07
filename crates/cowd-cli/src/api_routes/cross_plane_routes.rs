@@ -10,10 +10,10 @@ use axum::{
     Json, Router,
 };
 use runtime::{
-    CrossPlaneAction, CrossPlaneControlPlane, CrossPlaneGrant, CrossPlaneIdentityBinding,
-    PolicyDecisionKind,
+    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneGrant,
+    CrossPlaneIdentityBinding, CrossPlanePolicyDecision, PolicyDecisionKind,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{channel_routes, AppState};
 
@@ -46,6 +46,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(cross_plane_action_preflight_handler),
         )
         .route(
+            "/api/cross-plane/action/execute",
+            post(cross_plane_action_execute_handler),
+        )
+        .route(
             "/api/cross-plane/identity/resolve",
             post(cross_plane_identity_resolve_handler),
         )
@@ -54,6 +58,29 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 #[derive(Debug, Deserialize)]
 struct CrossPlaneIdentityResolveRequest {
     identity_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrossPlaneActionExecuteRequest {
+    action: CrossPlaneAction,
+    #[serde(default = "default_execute_mode")]
+    mode: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CrossPlaneActionReadiness {
+    action: CrossPlaneAction,
+    decision: CrossPlanePolicyDecision,
+    target_platform: Option<String>,
+    platform_readiness: Option<channel_routes::PlatformReadiness>,
+    executable: bool,
+    blockers: Vec<String>,
+}
+
+fn default_execute_mode() -> String {
+    "dry_run".to_string()
 }
 
 static CROSS_PLANE_CONTROL: OnceLock<CrossPlaneControlPlane> = OnceLock::new();
@@ -222,35 +249,76 @@ async fn cross_plane_action_preflight_handler(
     Json(action): Json<CrossPlaneAction>,
 ) -> impl IntoResponse {
     ensure_cross_plane_loaded(&state);
-    let now = chrono::Utc::now();
-    let (action, decision) = cross_plane_control().decide_with_action(action, now);
-    let target_platform = target_platform_from_action(&action);
-    let platforms = channel_routes::configured_platforms(state.config.as_ref());
-    let platform_readiness = target_platform.as_ref().and_then(|target| {
-        platforms
-            .into_iter()
-            .find(|platform| platform.name == *target || platform.platform_type == *target)
-    });
-    let mut blockers = Vec::new();
-    if decision.decision != PolicyDecisionKind::Allow {
-        blockers.push(format!("policy:{}", decision.reason));
-    }
-    if let Some(readiness) = &platform_readiness {
-        if readiness.status != "ready" {
-            blockers.push(format!("platform:{}:{}", readiness.name, readiness.status));
-        }
-    } else if let Some(target) = &target_platform {
-        blockers.push(format!("platform:{target}:unconfigured"));
-    }
-    let executable = blockers.is_empty();
+    let readiness = evaluate_action_readiness(&state, action, chrono::Utc::now());
     Json(serde_json::json!({
         "kind": "cross_plane_action_preflight",
-        "action": action,
-        "decision": decision,
-        "target_platform": target_platform,
-        "platform_readiness": platform_readiness,
-        "executable": executable,
-        "blockers": blockers,
+        "action": readiness.action,
+        "decision": readiness.decision,
+        "target_platform": readiness.target_platform,
+        "platform_readiness": readiness.platform_readiness,
+        "executable": readiness.executable,
+        "blockers": readiness.blockers,
+    }))
+}
+
+async fn cross_plane_action_execute_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<CrossPlaneActionExecuteRequest>,
+) -> impl IntoResponse {
+    ensure_cross_plane_loaded(&state);
+    let now = chrono::Utc::now();
+    let mode = normalize_execute_mode(&request.mode);
+    let mut readiness = evaluate_action_readiness(&state, request.action, now);
+    let mut status = "blocked";
+    let mut dispatch_status = "not_started";
+    let mut audit_result = "blocked";
+    let mut audit_summary = readiness
+        .blockers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| readiness.decision.reason.clone());
+
+    if readiness.executable {
+        if mode == "dry_run" {
+            status = "planned";
+            dispatch_status = "dry_run";
+            audit_result = "dry_run";
+            audit_summary = "dry_run_execution_plan".to_string();
+        } else {
+            readiness
+                .blockers
+                .push("dispatch:adapter_not_bound".to_string());
+            readiness.executable = false;
+            dispatch_status = "adapter_not_bound";
+            audit_result = "blocked_dispatch";
+            audit_summary = "live_dispatch_adapter_not_bound".to_string();
+        }
+    }
+
+    let audit_record = CrossPlaneAuditRecord::new(
+        readiness.action.clone(),
+        readiness.decision.clone(),
+        audit_result,
+        audit_summary,
+    );
+    let audit_record_id = audit_record.id.clone();
+    cross_plane_control().record_audit(audit_record);
+    save_cross_plane_state(&state);
+
+    Json(serde_json::json!({
+        "kind": "cross_plane_action_execution",
+        "mode": mode,
+        "status": status,
+        "dispatch_status": dispatch_status,
+        "idempotency_key": request.idempotency_key,
+        "action": readiness.action,
+        "decision": readiness.decision,
+        "target_platform": readiness.target_platform,
+        "platform_readiness": readiness.platform_readiness,
+        "executable": readiness.executable,
+        "blockers": readiness.blockers,
+        "dispatched": false,
+        "audit_record_id": audit_record_id,
     }))
 }
 
@@ -280,6 +348,48 @@ fn target_platform_from_action(action: &CrossPlaneAction) -> Option<String> {
         }
     }
     None
+}
+
+fn evaluate_action_readiness(
+    state: &AppState,
+    action: CrossPlaneAction,
+    now: chrono::DateTime<chrono::Utc>,
+) -> CrossPlaneActionReadiness {
+    let (action, decision) = cross_plane_control().decide_with_action(action, now);
+    let target_platform = target_platform_from_action(&action);
+    let platforms = channel_routes::configured_platforms(state.config.as_ref());
+    let platform_readiness = target_platform.as_ref().and_then(|target| {
+        platforms
+            .into_iter()
+            .find(|platform| platform.name == *target || platform.platform_type == *target)
+    });
+    let mut blockers = Vec::new();
+    if decision.decision != PolicyDecisionKind::Allow {
+        blockers.push(format!("policy:{}", decision.reason));
+    }
+    if let Some(readiness) = &platform_readiness {
+        if readiness.status != "ready" {
+            blockers.push(format!("platform:{}:{}", readiness.name, readiness.status));
+        }
+    } else if let Some(target) = &target_platform {
+        blockers.push(format!("platform:{target}:unconfigured"));
+    }
+    let executable = blockers.is_empty();
+    CrossPlaneActionReadiness {
+        action,
+        decision,
+        target_platform,
+        platform_readiness,
+        executable,
+        blockers,
+    }
+}
+
+fn normalize_execute_mode(mode: &str) -> String {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "commit" | "live" | "execute" => "commit".to_string(),
+        _ => "dry_run".to_string(),
+    }
 }
 
 fn target_platform_from_ref(value: &str) -> Option<String> {

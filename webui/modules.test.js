@@ -458,6 +458,12 @@ describe('API module', () => {
           json: () => Promise.resolve({ kind: 'cross_plane_action_preflight', executable: true })
         });
       }
+      if (path.includes('/api/cross-plane/action/execute')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ kind: 'cross_plane_action_execution', status: 'planned', dispatch_status: 'dry_run' })
+        });
+      }
       if (path.includes('/api/cross-plane/identity/resolve')) {
         return Promise.resolve({
           ok: true,
@@ -505,6 +511,16 @@ describe('API module', () => {
       data_classification: 'internal',
       identity_trust: 'verified'
     });
+    const execution = await window.Api.executeCrossPlaneAction({
+      mode: 'dry_run',
+      action: {
+        actor_principal: 'user:demo',
+        requested_capability: 'channel.feishu.send_text',
+        risk: 'low',
+        data_classification: 'internal',
+        identity_trust: 'verified'
+      }
+    });
     const result = await window.Api.simulateCrossPlanePolicy({
       actor_principal: 'user:demo',
       requested_capability: 'channel.feishu.send_text',
@@ -529,10 +545,13 @@ describe('API module', () => {
     expect(JSON.parse(mockF.mock.calls[8][1].body).identity_ref).toContain('demo@example.com');
     expect(String(mockF.mock.calls[9][0])).toBe('/api/cross-plane/action/preflight');
     expect(JSON.parse(mockF.mock.calls[9][1].body).requested_capability).toBe('channel.feishu.send_text');
-    expect(String(mockF.mock.calls[10][0])).toBe('/api/cross-plane/policy/simulate');
-    expect(JSON.parse(mockF.mock.calls[10][1].body).requested_capability).toBe('channel.feishu.send_text');
+    expect(String(mockF.mock.calls[10][0])).toBe('/api/cross-plane/action/execute');
+    expect(JSON.parse(mockF.mock.calls[10][1].body).action.requested_capability).toBe('channel.feishu.send_text');
+    expect(String(mockF.mock.calls[11][0])).toBe('/api/cross-plane/policy/simulate');
+    expect(JSON.parse(mockF.mock.calls[11][1].body).requested_capability).toBe('channel.feishu.send_text');
     expect(resolved.resolved.principal_id).toBe('user:demo');
     expect(preflight.executable).toBe(true);
+    expect(execution.status).toBe('planned');
     expect(result.decision.decision).toBe('allow');
   });
 
