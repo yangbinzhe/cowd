@@ -142,6 +142,33 @@ window.Panels = (()=>{
     return sec;
   }
 
+  function renderModeCoverage(coverage,stability){
+    const sec=UI.el('div','context-mode-coverage');
+    if(!coverage)return sec;
+    sec.innerHTML='<h4>Mode Coverage</h4>';
+    const entries=coverage.entries||[];
+    const metrics=UI.el('div','memory-metrics');
+    metrics.appendChild(renderMemoryMetric('profiles',entries.length+'/'+((coverage.required_profiles||[]).length||entries.length),'covered'));
+    metrics.appendChild(renderMemoryMetric('stable head',coverage.all_stable_heads_reusable?'reused':'changed','cache'));
+    if(stability){
+      metrics.appendChild(renderMemoryMetric('cache',stability.prompt_cache_friendly?'friendly':'break','kv'));
+    }
+    sec.appendChild(metrics);
+    if(stability&&stability.reason){
+      const reason=UI.el('small','runtime-policy-reason');
+      reason.textContent=stability.reason;
+      sec.appendChild(reason);
+    }
+    const list=UI.el('div','context-mode-list');
+    entries.slice(0,8).forEach(function(entry){
+      const row=UI.el('div','context-mode-row');
+      row.innerHTML='<b>'+UI.esc(entry.profile||'profile')+'</b><small>'+UI.esc([entry.mode||'mode',entry.stable_head_reusable?'stable':'changed','pressure '+fmtPressure(entry.pressure_bp)].join(' · '))+'</small>';
+      list.appendChild(row);
+    });
+    sec.appendChild(list);
+    return sec;
+  }
+
   function renderContextHistoryItem(item,onSelect){
     const row=UI.el('button','context-history-item');
     const envelope=item.envelope||{};
@@ -494,6 +521,8 @@ window.Panels = (()=>{
         const envelope=(response&&response.envelope)||{};
         const leanProbe=(response&&response.lean_probe)||null;
         const policyDecision=(response&&response.policy_decision)||null;
+        const modeCoverage=(response&&response.mode_coverage)||null;
+        const cacheStability=(response&&response.cache_stability)||null;
         const diagnostics=envelope.diagnostics||{};
         const budget=envelope.budget||{};
         const assembled=envelope.assembled||{};
@@ -519,6 +548,7 @@ window.Panels = (()=>{
         metrics.appendChild(renderMemoryMetric('dynamic',shortHash(diagnostics.dynamic_tail_hash),'hash'));
         overview.appendChild(metrics);
         overview.appendChild(renderLeanProbe(leanProbe,policyDecision));
+        overview.appendChild(renderModeCoverage(modeCoverage,cacheStability));
         if((diagnostics.degraded_sources||[]).length){
           const degraded=UI.el('div','context-degraded');
           degraded.textContent='degraded: '+diagnostics.degraded_sources.join(', ');

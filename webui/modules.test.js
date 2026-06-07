@@ -1035,6 +1035,21 @@ describe('API module', () => {
             action: 'PreferOrientationPacket',
             reason: 'source fallback detected; prefer compact orientation before broad recall',
           },
+          cache_stability: {
+            prompt_cache_friendly: true,
+            reason: 'stable head and runtime header are reusable; only dynamic tail changed',
+          },
+          mode_coverage: {
+            required_profiles: ['MainTurn', 'SoloGoal', 'YoloGoal', 'SubAgent'],
+            all_profiles_covered: true,
+            all_stable_heads_reusable: true,
+            entries: [
+              { profile: 'MainTurn', mode: 'MainTurn', stable_head_reusable: true, pressure_bp: 150 },
+              { profile: 'SoloGoal', mode: 'SoloGoal', stable_head_reusable: true, pressure_bp: 180 },
+              { profile: 'YoloGoal', mode: 'YoloGoal', stable_head_reusable: true, pressure_bp: 200 },
+              { profile: 'SubAgent', mode: 'SubAgent', stable_head_reusable: true, pressure_bp: 90 },
+            ],
+          },
         })
       });
     }));
@@ -1046,8 +1061,11 @@ describe('API module', () => {
     const text = document.getElementById('panel-content').textContent;
     expect(text).toContain('Context Runtime');
     expect(text).toContain('Runtime Probe');
+    expect(text).toContain('Mode Coverage');
     expect(text).toContain('SourceFallback');
     expect(text).toContain('PreferOrientationPacket');
+    expect(text).toContain('friendly');
+    expect(text).toContain('SubAgent');
     expect(text).toContain('runtime');
     expect(text).toContain('SessionKernel owns durable sessions');
     expect(text).toContain('session://s1/memory/mem-1');

@@ -268,9 +268,10 @@ pub mod prompt_cache;
 pub use cached_prompt::CachedSystemPrompt;
 pub use context_runtime::{
     AgentContextLease, AgentReturnPacket, AgentReturnRequirement, AssembledContext,
-    ContextAuthority, ContextBudgetReport, ContextDegradationPath, ContextDiagnostics,
-    ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextLeanProbe,
-    ContextLease, ContextMode, ContextOmission, ContextPolicyAction, ContextPolicyDecision,
+    ContextAuthority, ContextBudgetReport, ContextCacheStabilityReport, ContextDegradationPath,
+    ContextDiagnostics, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
+    ContextLeanProbe, ContextLease, ContextMode, ContextModeCoverageEntry,
+    ContextModeCoverageReport, ContextOmission, ContextPolicyAction, ContextPolicyDecision,
     ContextPolicyProposal, ContextPressureLevel, ContextProfile, ContextRole, ContextRuntimeKernel,
     ContextSourceKind, ContextVisibility, ResumeContextPacket, ResumeContextSource,
     StableHeadComparison, ToolTracePacket, ToolTraceStatus, WorkspacePacket,

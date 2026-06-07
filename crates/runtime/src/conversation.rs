@@ -43,8 +43,8 @@ use crate::compact::{
 use crate::config::RuntimeFeatureConfig;
 use crate::context_runtime::{
     ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
-    ContextMode, ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel,
-    ContextSourceKind, ContextVisibility, ResumeContextPacket, ToolTracePacket, ToolTraceStatus,
+    ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
+    ContextVisibility, ResumeContextPacket, ToolTracePacket, ToolTraceStatus,
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::joint_problem_solving::{JpsOps, ProblemStatement};
@@ -175,19 +175,6 @@ pub trait MemoryCallback: Send + Sync {
     /// Called after post-turn memory housekeeping completes
     /// (micro-compact, drift, seeds).
     fn on_memory_stats(&self, total_entries: usize, vector_count: usize, layers: Vec<String>);
-}
-
-fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
-    match profile {
-        ContextProfile::MainTurn => ContextMode::MainTurn,
-        ContextProfile::SoloGoal => ContextMode::SoloGoal,
-        ContextProfile::YoloGoal => ContextMode::YoloGoal,
-        ContextProfile::SubAgent => ContextMode::SubAgent,
-        ContextProfile::Collaboration => ContextMode::Collaboration,
-        ContextProfile::Review => ContextMode::Review,
-        ContextProfile::Resume => ContextMode::Resume,
-        ContextProfile::Cron => ContextMode::Cron,
-    }
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -779,18 +766,16 @@ where
         let session_id = self.session().session_id;
         let profile = self.context_profile();
         let mut identity = ContextIdentity::main(session_id.clone());
-        identity.mode = context_mode_for_profile(profile);
+        identity.mode = ContextRuntimeKernel::mode_for_profile(profile);
         let mut selected_items = self.external_context_items();
         selected_items.extend(self.tool_trace_context_items());
         selected_items.extend(dynamic_items);
         let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
             profile,
+            runtime_header: ContextRuntimeKernel::runtime_header(&identity, profile),
             identity,
             intent: user_input.to_string(),
             stable_head: self.system_prompt.clone(),
-            runtime_header: vec![format!(
-                "session:{session_id} agent:primary profile:{profile:?}"
-            )],
             dynamic_items: selected_items,
             omitted,
             total_budget_tokens: self.context_budget_tokens(),

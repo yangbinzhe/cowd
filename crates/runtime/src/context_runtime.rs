@@ -359,6 +359,41 @@ pub struct StableHeadComparison {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCacheStabilityReport {
+    pub previous_envelope_id: String,
+    pub next_envelope_id: String,
+    pub stable_head_reusable: bool,
+    pub runtime_header_changed: bool,
+    pub dynamic_tail_changed: bool,
+    pub prompt_cache_friendly: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextModeCoverageEntry {
+    pub profile: ContextProfile,
+    pub mode: ContextMode,
+    pub envelope_id: String,
+    pub stable_head_hash: String,
+    pub runtime_header_hash: String,
+    pub dynamic_tail_hash: String,
+    pub stable_head_reusable: bool,
+    pub selected_count: usize,
+    pub omitted_count: usize,
+    pub pressure_bp: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextModeCoverageReport {
+    pub required_profiles: Vec<ContextProfile>,
+    pub covered_profiles: Vec<ContextProfile>,
+    pub stable_head_hash: String,
+    pub all_profiles_covered: bool,
+    pub all_stable_heads_reusable: bool,
+    pub entries: Vec<ContextModeCoverageEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssembledContext {
     pub stable_head: Vec<String>,
     pub runtime_header: Vec<String>,
@@ -406,6 +441,50 @@ pub struct ContextEnvelopeRequest {
 pub struct ContextRuntimeKernel;
 
 impl ContextRuntimeKernel {
+    pub fn mode_for_profile(profile: ContextProfile) -> ContextMode {
+        match profile {
+            ContextProfile::MainTurn => ContextMode::MainTurn,
+            ContextProfile::SoloGoal => ContextMode::SoloGoal,
+            ContextProfile::YoloGoal => ContextMode::YoloGoal,
+            ContextProfile::SubAgent => ContextMode::SubAgent,
+            ContextProfile::Collaboration => ContextMode::Collaboration,
+            ContextProfile::Review => ContextMode::Review,
+            ContextProfile::Resume => ContextMode::Resume,
+            ContextProfile::Cron => ContextMode::Cron,
+        }
+    }
+
+    pub fn required_profiles() -> Vec<ContextProfile> {
+        vec![
+            ContextProfile::MainTurn,
+            ContextProfile::SoloGoal,
+            ContextProfile::YoloGoal,
+            ContextProfile::SubAgent,
+            ContextProfile::Collaboration,
+            ContextProfile::Review,
+            ContextProfile::Resume,
+            ContextProfile::Cron,
+        ]
+    }
+
+    pub fn runtime_header(identity: &ContextIdentity, profile: ContextProfile) -> Vec<String> {
+        let project = identity.project_id.as_deref().unwrap_or("none");
+        let task = identity.task_id.as_deref().unwrap_or("none");
+        let parent = identity.parent_agent_id.as_deref().unwrap_or("none");
+        let team = identity.team_id.as_deref().unwrap_or("none");
+        vec![format!(
+            "session:{} agent:{} parent:{} project:{} task:{} team:{} mode:{:?} profile:{:?}",
+            identity.session_id,
+            identity.agent_id,
+            parent,
+            project,
+            task,
+            team,
+            identity.mode,
+            profile
+        )]
+    }
+
     pub fn build_envelope(request: ContextEnvelopeRequest) -> ContextEnvelope {
         let profile = request.profile;
         let leases = Self::default_leases(profile, request.total_budget_tokens);
@@ -535,6 +614,105 @@ impl ContextRuntimeKernel {
                 != next.diagnostics.runtime_header_hash,
             dynamic_tail_changed: previous.diagnostics.dynamic_tail_hash
                 != next.diagnostics.dynamic_tail_hash,
+        }
+    }
+
+    pub fn cache_stability_report(
+        previous: &ContextEnvelope,
+        next: &ContextEnvelope,
+    ) -> ContextCacheStabilityReport {
+        let comparison = Self::compare_stable_head(previous, next);
+        let prompt_cache_friendly = comparison.reusable;
+        let reason = if !comparison.reusable {
+            "stable head changed; provider prompt cache cannot safely reuse the prefix"
+        } else if comparison.runtime_header_changed {
+            "stable head is reusable; runtime header changed because identity or mode changed"
+        } else if comparison.dynamic_tail_changed {
+            "stable head and runtime header are reusable; only dynamic tail changed"
+        } else {
+            "stable head, runtime header, and dynamic tail are unchanged"
+        }
+        .to_string();
+        ContextCacheStabilityReport {
+            previous_envelope_id: previous.id.clone(),
+            next_envelope_id: next.id.clone(),
+            stable_head_reusable: comparison.reusable,
+            runtime_header_changed: comparison.runtime_header_changed,
+            dynamic_tail_changed: comparison.dynamic_tail_changed,
+            prompt_cache_friendly,
+            reason,
+        }
+    }
+
+    pub fn mode_coverage_report(
+        session_id: impl Into<String>,
+        intent: impl Into<String>,
+        stable_head: Vec<String>,
+        dynamic_items: Vec<ContextItem>,
+        total_budget_tokens: u64,
+    ) -> ContextModeCoverageReport {
+        let session_id = session_id.into();
+        let intent = intent.into();
+        let required_profiles = Self::required_profiles();
+        let mut entries = Vec::with_capacity(required_profiles.len());
+        let mut reference_stable_hash = None::<String>;
+
+        for profile in &required_profiles {
+            let mut identity = ContextIdentity::main(session_id.clone());
+            identity.mode = Self::mode_for_profile(*profile);
+            if matches!(profile, ContextProfile::SubAgent) {
+                identity.agent_id = "sub-agent".to_string();
+                identity.parent_agent_id = Some("primary".to_string());
+            }
+            let envelope = Self::build_envelope(ContextEnvelopeRequest {
+                profile: *profile,
+                runtime_header: Self::runtime_header(&identity, *profile),
+                identity,
+                intent: intent.clone(),
+                stable_head: stable_head.clone(),
+                dynamic_items: dynamic_items.clone(),
+                omitted: Vec::new(),
+                total_budget_tokens,
+            });
+            let stable_head_hash = envelope.diagnostics.stable_head_hash.clone();
+            let reference_hash =
+                reference_stable_hash.get_or_insert_with(|| stable_head_hash.clone());
+            let envelope_id = envelope.id.clone();
+            let runtime_header_hash = envelope.diagnostics.runtime_header_hash.clone();
+            let dynamic_tail_hash = envelope.diagnostics.dynamic_tail_hash.clone();
+            let selected_count = envelope.selected.len();
+            let omitted_count = envelope.omitted.len();
+            let pressure_bp = envelope.diagnostics.pressure_bp;
+            entries.push(ContextModeCoverageEntry {
+                profile: *profile,
+                mode: Self::mode_for_profile(*profile),
+                envelope_id,
+                stable_head_hash,
+                runtime_header_hash,
+                dynamic_tail_hash,
+                stable_head_reusable: *reference_hash == envelope.diagnostics.stable_head_hash,
+                selected_count,
+                omitted_count,
+                pressure_bp,
+            });
+        }
+
+        let covered_profiles = entries
+            .iter()
+            .map(|entry| entry.profile)
+            .collect::<Vec<_>>();
+        let all_profiles_covered = required_profiles
+            .iter()
+            .all(|profile| covered_profiles.contains(profile));
+        let all_stable_heads_reusable = entries.iter().all(|entry| entry.stable_head_reusable);
+
+        ContextModeCoverageReport {
+            required_profiles,
+            covered_profiles,
+            stable_head_hash: reference_stable_hash.unwrap_or_default(),
+            all_profiles_covered,
+            all_stable_heads_reusable,
+            entries,
         }
     }
 
@@ -1276,6 +1454,61 @@ mod tests {
         let changed = ContextRuntimeKernel::build_envelope(changed_request);
         let changed_comparison = ContextRuntimeKernel::compare_stable_head(&a, &changed);
         assert!(!changed_comparison.reusable);
+    }
+
+    #[test]
+    fn cache_stability_report_marks_dynamic_only_changes_cache_friendly() {
+        let a = ContextRuntimeKernel::build_envelope(request_with_dynamic("memory alpha"));
+        let b = ContextRuntimeKernel::build_envelope(request_with_dynamic("memory beta"));
+
+        let report = ContextRuntimeKernel::cache_stability_report(&a, &b);
+
+        assert!(report.stable_head_reusable);
+        assert!(!report.runtime_header_changed);
+        assert!(report.dynamic_tail_changed);
+        assert!(report.prompt_cache_friendly);
+        assert!(report.reason.contains("dynamic tail"));
+    }
+
+    #[test]
+    fn mode_coverage_report_proves_all_profiles_share_stable_head() {
+        let report = ContextRuntimeKernel::mode_coverage_report(
+            "session-coverage",
+            "continue safely",
+            vec!["system stable contract".to_string()],
+            vec![
+                ContextItem::new(
+                    "task-1",
+                    ContextSourceKind::Task,
+                    ContextRole::TaskState,
+                    "active task",
+                ),
+                ContextItem::new(
+                    "memory-1",
+                    ContextSourceKind::Memory,
+                    ContextRole::Orientation,
+                    "project memory",
+                ),
+            ],
+            10_000,
+        );
+
+        assert_eq!(
+            report.covered_profiles.len(),
+            ContextRuntimeKernel::required_profiles().len()
+        );
+        assert!(report.all_profiles_covered);
+        assert!(report.all_stable_heads_reusable);
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.profile == ContextProfile::YoloGoal
+                && entry.mode == ContextMode::YoloGoal));
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.profile == ContextProfile::SubAgent
+                && entry.mode == ContextMode::SubAgent));
     }
 
     #[test]

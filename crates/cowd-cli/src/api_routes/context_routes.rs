@@ -10,9 +10,8 @@ use axum::{
 use memory::store::session::SessionEvent;
 use memory::{MemoryKernel, MemoryTurnContext};
 use runtime::{
-    ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextMode,
-    ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
-    ContextVisibility,
+    ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextOmission,
+    ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind, ContextVisibility,
 };
 use serde::Deserialize;
 
@@ -88,18 +87,29 @@ async fn context_current_handler(
         if let Some(envelope) = runtime.last_context_envelope() {
             let lean_probe = ContextRuntimeKernel::lean_probe(&envelope);
             let policy_decision = ContextRuntimeKernel::policy_decision(&lean_probe);
+            let mode_coverage = ContextRuntimeKernel::mode_coverage_report(
+                envelope.identity.session_id.clone(),
+                envelope.intent.clone(),
+                envelope.assembled.stable_head.clone(),
+                envelope.selected.clone(),
+                envelope.budget.total_tokens,
+            );
+            let cache_stability =
+                ContextRuntimeKernel::cache_stability_report(&envelope, &envelope);
             return Json(serde_json::json!({
                 "enabled": true,
                 "source": "runtime",
                 "envelope": envelope,
                 "lean_probe": lean_probe,
                 "policy_decision": policy_decision,
+                "cache_stability": cache_stability,
+                "mode_coverage": mode_coverage,
             }));
         }
     }
 
     let mut identity = ContextIdentity::main(session_id.clone());
-    identity.mode = context_mode_for_profile(profile);
+    identity.mode = ContextRuntimeKernel::mode_for_profile(profile);
     let mut dynamic_items = Vec::new();
     let mut omitted_items = Vec::new();
     let mut degraded = Vec::new();
@@ -166,12 +176,10 @@ async fn context_current_handler(
 
     let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
         profile,
+        runtime_header: ContextRuntimeKernel::runtime_header(&identity, profile),
         identity,
         intent: query,
         stable_head: vec!["cowd-context-runtime:v0.8.13".to_string()],
-        runtime_header: vec![format!(
-            "session:{session_id} agent:api profile:{profile:?}"
-        )],
         dynamic_items,
         omitted: omitted_items,
         total_budget_tokens: 8_000,
@@ -179,12 +187,22 @@ async fn context_current_handler(
     envelope.diagnostics.degraded_sources = degraded;
     let lean_probe = ContextRuntimeKernel::lean_probe(&envelope);
     let policy_decision = ContextRuntimeKernel::policy_decision(&lean_probe);
+    let mode_coverage = ContextRuntimeKernel::mode_coverage_report(
+        session_id,
+        envelope.intent.clone(),
+        envelope.assembled.stable_head.clone(),
+        envelope.selected.clone(),
+        envelope.budget.total_tokens,
+    );
+    let cache_stability = ContextRuntimeKernel::cache_stability_report(&envelope, &envelope);
 
     Json(serde_json::json!({
         "enabled": true,
         "source": "synthetic",
         "lean_probe": lean_probe,
         "policy_decision": policy_decision,
+        "cache_stability": cache_stability,
+        "mode_coverage": mode_coverage,
         "envelope": envelope,
     }))
 }
@@ -200,19 +218,6 @@ fn parse_context_profile(value: &str) -> Option<ContextProfile> {
         "resume" => Some(ContextProfile::Resume),
         "cron" => Some(ContextProfile::Cron),
         _ => None,
-    }
-}
-
-fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
-    match profile {
-        ContextProfile::MainTurn => ContextMode::MainTurn,
-        ContextProfile::SoloGoal => ContextMode::SoloGoal,
-        ContextProfile::YoloGoal => ContextMode::YoloGoal,
-        ContextProfile::SubAgent => ContextMode::SubAgent,
-        ContextProfile::Collaboration => ContextMode::Collaboration,
-        ContextProfile::Review => ContextMode::Review,
-        ContextProfile::Resume => ContextMode::Resume,
-        ContextProfile::Cron => ContextMode::Cron,
     }
 }
 

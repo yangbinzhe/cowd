@@ -355,6 +355,13 @@ mod tests {
         events: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
+    static TRACE_CAPTURE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn trace_capture_lock() -> &'static tokio::sync::Mutex<()> {
+        TRACE_CAPTURE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     impl CapturedTraceEvents {
         fn lines(&self) -> Vec<String> {
             self.events.lock().unwrap().clone()
@@ -2119,6 +2126,7 @@ providers:
             .task_kernel
             .start_goal("trace control plane", false)
             .unwrap();
+        let _trace_guard = trace_capture_lock().lock().await;
         let capture = CapturedTraceEvents::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
 
@@ -2501,6 +2509,7 @@ providers:
             .await
             .unwrap();
 
+        let _trace_guard = trace_capture_lock().lock().await;
         let capture = CapturedTraceEvents::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
 
@@ -2516,10 +2525,18 @@ providers:
                         ))
                         .body(Body::empty())
                         .unwrap(),
-                )
+            )
+            .await
+            .unwrap();
+            assert_eq!(history_response.status(), StatusCode::OK);
+            let history_body = to_bytes(history_response.into_body(), usize::MAX)
                 .await
                 .unwrap();
-            assert_eq!(history_response.status(), StatusCode::OK);
+            let history_json: serde_json::Value = serde_json::from_slice(&history_body).unwrap();
+            assert_eq!(history_json["session_id"], session_id);
+            assert_eq!(history_json["include_envelopes"], false);
+            assert_eq!(history_json["total"], 1);
+            assert_eq!(history_json["summaries"].as_array().unwrap().len(), 1);
 
             let detail_response = app
                 .oneshot(
@@ -2928,6 +2945,13 @@ providers:
             json["policy_decision"]["stable_head_hash"],
             json["lean_probe"]["stable_head_hash"]
         );
+        assert_eq!(json["cache_stability"]["stable_head_reusable"], true);
+        assert_eq!(json["mode_coverage"]["all_profiles_covered"], true);
+        assert_eq!(json["mode_coverage"]["all_stable_heads_reusable"], true);
+        assert_eq!(
+            json["mode_coverage"]["entries"].as_array().unwrap().len(),
+            8
+        );
     }
 
     #[tokio::test]
@@ -2953,6 +2977,15 @@ providers:
             .as_str()
             .unwrap()
             .contains("profile:YoloGoal"));
+        assert!(json["envelope"]["assembled"]["runtime_header"][0]
+            .as_str()
+            .unwrap()
+            .contains("mode:YoloGoal"));
+        assert!(json["mode_coverage"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["profile"] == "SubAgent" && entry["mode"] == "SubAgent"));
     }
 
     #[tokio::test]
