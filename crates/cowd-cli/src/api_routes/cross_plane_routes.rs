@@ -442,6 +442,10 @@ async fn cross_plane_action_execute_handler(
     );
     let audit_record_id = audit_record.id.clone();
     cross_plane_control().record_audit(audit_record);
+    let dispatch_target_snapshot = readiness
+        .dispatch_target
+        .as_ref()
+        .and_then(|target| serde_json::to_value(target).ok());
     let receipt = CrossPlaneExecutionReceipt::new(
         idempotency_key.clone(),
         mode.clone(),
@@ -451,7 +455,8 @@ async fn cross_plane_action_execute_handler(
         readiness.decision.clone(),
         readiness.blockers.clone(),
         Some(audit_record_id.clone()),
-    );
+    )
+    .with_dispatch_target(dispatch_target_snapshot);
     cross_plane_control().record_execution(receipt.clone());
     save_cross_plane_state(&state);
 

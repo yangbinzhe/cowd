@@ -4080,6 +4080,114 @@ providers:
     }
 
     #[tokio::test]
+    async fn cross_plane_execute_persists_dispatch_target_snapshot() {
+        let platform_runtime = test_platform_runtime_with_bound_adapter("feishu").await;
+        let app = api_router(test_state_with_config_and_runtime(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-receipt-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-receipt-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "dry_run",
+            "idempotency_key": format!("idem-dispatch-receipt-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/source",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": "channel://feishu/chat/demo-chat",
+                "resource_ref": "text://receipt payload",
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+        let executed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_target"]["ready"],
+            true
+        );
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_target"]["session_key"],
+            "feishu:demo-chat"
+        );
+
+        let executions = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/action/executions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let executions_body = to_bytes(executions.into_body(), usize::MAX).await.unwrap();
+        let executions_json: serde_json::Value = serde_json::from_slice(&executions_body).unwrap();
+        assert!(executions_json["executions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|receipt| receipt["dispatch_target"]["session_key"] == "feishu:demo-chat"));
+
+        platform_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn context_current_returns_degraded_envelope_without_memory() {
         let app = api_router(test_state());
         let response = app

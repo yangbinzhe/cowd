@@ -191,6 +191,8 @@ pub struct CrossPlaneExecutionReceipt {
     pub decision: CrossPlanePolicyDecision,
     pub blockers: Vec<String>,
     pub audit_record_id: Option<String>,
+    #[serde(default)]
+    pub dispatch_target: Option<serde_json::Value>,
 }
 
 impl CrossPlaneExecutionReceipt {
@@ -216,7 +218,14 @@ impl CrossPlaneExecutionReceipt {
             decision,
             blockers,
             audit_record_id,
+            dispatch_target: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_dispatch_target(mut self, dispatch_target: Option<serde_json::Value>) -> Self {
+        self.dispatch_target = dispatch_target;
+        self
     }
 }
 
