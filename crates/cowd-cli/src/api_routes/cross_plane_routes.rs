@@ -12,6 +12,7 @@ use axum::{
 use runtime::{
     CrossPlaneAction, CrossPlaneControlPlane, CrossPlaneGrant, CrossPlaneIdentityBinding,
 };
+use serde::Deserialize;
 
 use super::AppState;
 
@@ -39,6 +40,15 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/cross-plane/policy/simulate",
             post(cross_plane_policy_simulate_handler),
         )
+        .route(
+            "/api/cross-plane/identity/resolve",
+            post(cross_plane_identity_resolve_handler),
+        )
+}
+
+#[derive(Debug, Deserialize)]
+struct CrossPlaneIdentityResolveRequest {
+    identity_ref: String,
 }
 
 static CROSS_PLANE_CONTROL: OnceLock<CrossPlaneControlPlane> = OnceLock::new();
@@ -198,5 +208,19 @@ async fn cross_plane_policy_simulate_handler(
         "kind": "cross_plane_policy_simulation",
         "action": action,
         "decision": decision,
+    }))
+}
+
+async fn cross_plane_identity_resolve_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<CrossPlaneIdentityResolveRequest>,
+) -> impl IntoResponse {
+    ensure_cross_plane_loaded(&state);
+    let resolved =
+        cross_plane_control().resolve_identity(&request.identity_ref, chrono::Utc::now());
+    Json(serde_json::json!({
+        "kind": "cross_plane_identity_resolution",
+        "identity_ref": request.identity_ref,
+        "resolved": resolved,
     }))
 }

@@ -346,6 +346,7 @@ window.Api = (()=>{
     async crossPlaneIdentities(){return req('GET','/api/cross-plane/identities')},
     async createCrossPlaneIdentity(identity){return req('POST','/api/cross-plane/identities',identity)},
     async revokeCrossPlaneIdentity(id){return req('DELETE','/api/cross-plane/identities/'+encodeURIComponent(id))},
+    async resolveCrossPlaneIdentity(identityRef){return req('POST','/api/cross-plane/identity/resolve',{identity_ref:identityRef})},
     async crossPlaneGrants(){return req('GET','/api/cross-plane/grants')},
     async createCrossPlaneGrant(grant){return req('POST','/api/cross-plane/grants',grant)},
     async revokeCrossPlaneGrant(id){return req('DELETE','/api/cross-plane/grants/'+encodeURIComponent(id))},

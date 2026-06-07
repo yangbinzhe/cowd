@@ -5,10 +5,11 @@
 //! returns a stable decision that UI, audit, and runtime routing can consume.
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +194,16 @@ pub struct CrossPlaneIdentityBinding {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossPlaneResolvedIdentity {
+    pub input_ref: String,
+    pub principal_id: String,
+    pub trust: IdentityTrust,
+    pub binding_id: String,
+    pub matched_ref: String,
+    pub match_kind: String,
+}
+
 impl CrossPlaneIdentityBinding {
     #[must_use]
     pub fn verified(principal_id: impl Into<String>, identity_ref: impl Into<String>) -> Self {
@@ -369,6 +380,63 @@ impl CrossPlaneControlPlane {
             .read()
             .map(|state| state.identities.clone())
             .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn resolve_identity(
+        &self,
+        identity_ref: &str,
+        now: DateTime<Utc>,
+    ) -> Option<CrossPlaneResolvedIdentity> {
+        let input_ref = identity_ref.trim();
+        if input_ref.is_empty() {
+            return None;
+        }
+        let input_normalized = normalize_identity_ref(input_ref);
+        let input_contact_keys = identity_contact_keys(input_ref);
+        let state = self.inner.read().unwrap_or_else(|err| err.into_inner());
+        let active = state
+            .identities
+            .iter()
+            .filter(|binding| binding.is_active(now))
+            .collect::<Vec<_>>();
+
+        if let Some(binding) = active
+            .iter()
+            .filter(|binding| normalize_identity_ref(&binding.identity_ref) == input_normalized)
+            .max_by_key(|binding| identity_trust_rank(binding.trust))
+        {
+            return Some(CrossPlaneResolvedIdentity {
+                input_ref: input_ref.to_string(),
+                principal_id: binding.principal_id.clone(),
+                trust: binding.trust,
+                binding_id: binding.id.clone(),
+                matched_ref: binding.identity_ref.clone(),
+                match_kind: "exact_ref".to_string(),
+            });
+        }
+
+        if input_contact_keys.is_empty() {
+            return None;
+        }
+        active
+            .iter()
+            .filter_map(|binding| {
+                let binding_keys = identity_contact_keys(&binding.identity_ref);
+                let matched = input_contact_keys
+                    .iter()
+                    .any(|key| binding_keys.iter().any(|candidate| candidate == key));
+                matched.then_some(binding)
+            })
+            .max_by_key(|binding| identity_trust_rank(binding.trust))
+            .map(|binding| CrossPlaneResolvedIdentity {
+                input_ref: input_ref.to_string(),
+                principal_id: binding.principal_id.clone(),
+                trust: binding.trust,
+                binding_id: binding.id.clone(),
+                matched_ref: binding.identity_ref.clone(),
+                match_kind: "contact_key".to_string(),
+            })
     }
 
     pub fn upsert_identity(
@@ -689,6 +757,60 @@ fn optional_matches(expected: &Option<String>, actual: &Option<String>) -> bool 
         .is_none_or(|expected| actual.as_ref().is_some_and(|actual| actual == expected))
 }
 
+fn normalize_identity_ref(identity_ref: &str) -> String {
+    identity_ref.trim().to_ascii_lowercase()
+}
+
+fn identity_trust_rank(trust: IdentityTrust) -> u8 {
+    match trust {
+        IdentityTrust::Verified => 3,
+        IdentityTrust::Claimed => 2,
+        IdentityTrust::Observed => 1,
+        IdentityTrust::Unknown => 0,
+    }
+}
+
+fn identity_contact_keys(identity_ref: &str) -> Vec<String> {
+    static EMAIL_RE: OnceLock<Regex> = OnceLock::new();
+    let email_re = EMAIL_RE.get_or_init(|| {
+        Regex::new(r"(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}").expect("valid email regex")
+    });
+    let mut keys = Vec::new();
+    for matched in email_re.find_iter(identity_ref) {
+        keys.push(format!("email:{}", matched.as_str().to_ascii_lowercase()));
+    }
+
+    let lower = identity_ref.to_ascii_lowercase();
+    for part in lower.split(['?', '&', ';', ',', '|', ' ']) {
+        let Some(value) = part
+            .strip_prefix("phone=")
+            .or_else(|| part.strip_prefix("mobile="))
+            .or_else(|| part.strip_prefix("tel="))
+            .or_else(|| part.strip_prefix("phone:"))
+            .or_else(|| part.strip_prefix("mobile:"))
+            .or_else(|| part.strip_prefix("tel:"))
+        else {
+            continue;
+        };
+        let mut normalized = String::new();
+        for (idx, ch) in value.chars().enumerate() {
+            if ch == '+' && idx == 0 {
+                normalized.push(ch);
+            } else if ch.is_ascii_digit() {
+                normalized.push(ch);
+            }
+        }
+        let digit_count = normalized.chars().filter(char::is_ascii_digit).count();
+        if digit_count >= 7 {
+            keys.push(format!("phone:{normalized}"));
+        }
+    }
+
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,6 +916,58 @@ mod tests {
             Some(grant_id.as_str())
         );
         assert_eq!(first_record.evidence.remaining_uses_after, Some(0));
+    }
+
+    #[test]
+    fn control_plane_resolves_cross_channel_identity_by_contact_key() {
+        let control = CrossPlaneControlPlane::new();
+        control.upsert_identity(CrossPlaneIdentityBinding::verified(
+            "user:yi",
+            "channel://feishu/user/u1?email=Yi@Example.COM",
+        ));
+        control.upsert_identity(CrossPlaneIdentityBinding {
+            id: "idb-observed".to_string(),
+            principal_id: "user:other".to_string(),
+            identity_ref: "channel://wechat/user/wx1?email=yi@example.com".to_string(),
+            trust: IdentityTrust::Observed,
+            source: "observed".to_string(),
+            created_at: now(),
+            expires_at: None,
+        });
+
+        let resolved = control
+            .resolve_identity("channel://wechat/user/wx-new?email=yi@example.com", now())
+            .expect("shared email should resolve to a principal");
+
+        assert_eq!(resolved.principal_id, "user:yi");
+        assert_eq!(resolved.trust, IdentityTrust::Verified);
+        assert_eq!(resolved.match_kind, "contact_key");
+    }
+
+    #[test]
+    fn control_plane_resolves_exact_ref_before_contact_key() {
+        let control = CrossPlaneControlPlane::new();
+        control.upsert_identity(CrossPlaneIdentityBinding::verified(
+            "user:yi",
+            "channel://feishu/user/u1?email=yi@example.com",
+        ));
+        control.upsert_identity(CrossPlaneIdentityBinding {
+            id: "idb-exact".to_string(),
+            principal_id: "user:wechat".to_string(),
+            identity_ref: "channel://wechat/user/wx1?email=yi@example.com".to_string(),
+            trust: IdentityTrust::Claimed,
+            source: "manual".to_string(),
+            created_at: now(),
+            expires_at: None,
+        });
+
+        let resolved = control
+            .resolve_identity("channel://wechat/user/wx1?email=yi@example.com", now())
+            .expect("exact ref should resolve");
+
+        assert_eq!(resolved.principal_id, "user:wechat");
+        assert_eq!(resolved.trust, IdentityTrust::Claimed);
+        assert_eq!(resolved.match_kind, "exact_ref");
     }
 
     #[test]

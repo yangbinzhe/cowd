@@ -1647,6 +1647,27 @@ window.Panels = (()=>{
       const detail=UI.el('div','panel-empty');
       detail.textContent='Identities '+((identitiesData.identities||[]).length)+' · Grants '+((grantsData.grants||[]).length)+' · Audit records '+((auditData.records||[]).length);
       sec.appendChild(detail);
+      const identityRows=(identitiesData.identities||[]).slice(0,4);
+      if(identityRows.length){
+        const identityList=UI.el('div','panel-section');
+        identityList.innerHTML='<h3>Identity Bindings</h3>';
+        identityRows.forEach(function(binding){
+          const row=UI.el('div','panel-item audit-record');
+          const trust=UI.el('span','audit-source');
+          trust.textContent=binding.trust||'unknown';
+          const body=UI.el('span','pi-name audit-body');
+          const title=UI.el('span','audit-title');
+          title.textContent=binding.principal_id||binding.id||'identity';
+          const meta=UI.el('span','audit-meta');
+          meta.textContent=binding.identity_ref||'';
+          body.appendChild(title);
+          body.appendChild(meta);
+          row.appendChild(trust);
+          row.appendChild(body);
+          identityList.appendChild(row);
+        });
+        sec.appendChild(identityList);
+      }
       const recentAudit=(auditData.records||[]).slice(0,3);
       if(recentAudit.length){
         const auditList=UI.el('div','panel-section');

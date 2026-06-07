@@ -452,6 +452,12 @@ describe('API module', () => {
           json: () => Promise.resolve({ kind: 'cross_plane_policy_simulation', decision: { decision: 'allow' } })
         });
       }
+      if (path.includes('/api/cross-plane/identity/resolve')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ kind: 'cross_plane_identity_resolution', resolved: { principal_id: 'user:demo' } })
+        });
+      }
       if (path.includes('/api/cross-plane/identities')) {
         if ((opts && opts.method) === 'POST') {
           return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'cross_plane_identity', identity: { id: 'idb-1' } }) });
@@ -485,6 +491,7 @@ describe('API module', () => {
     await window.Api.createCrossPlaneGrant({ id: 'grant-1', principal_id: 'user:demo', capability: 'channel.feishu.send_text' });
     await window.Api.revokeCrossPlaneGrant('grant-1');
     await window.Api.crossPlaneAudit();
+    const resolved = await window.Api.resolveCrossPlaneIdentity('channel://wechat/user/demo?email=demo@example.com');
     const result = await window.Api.simulateCrossPlanePolicy({
       actor_principal: 'user:demo',
       requested_capability: 'channel.feishu.send_text',
@@ -505,8 +512,11 @@ describe('API module', () => {
     expect(String(mockF.mock.calls[6][0])).toBe('/api/cross-plane/grants/grant-1');
     expect(mockF.mock.calls[6][1].method).toBe('DELETE');
     expect(String(mockF.mock.calls[7][0])).toBe('/api/cross-plane/audit');
-    expect(String(mockF.mock.calls[8][0])).toBe('/api/cross-plane/policy/simulate');
-    expect(JSON.parse(mockF.mock.calls[8][1].body).requested_capability).toBe('channel.feishu.send_text');
+    expect(String(mockF.mock.calls[8][0])).toBe('/api/cross-plane/identity/resolve');
+    expect(JSON.parse(mockF.mock.calls[8][1].body).identity_ref).toContain('demo@example.com');
+    expect(String(mockF.mock.calls[9][0])).toBe('/api/cross-plane/policy/simulate');
+    expect(JSON.parse(mockF.mock.calls[9][1].body).requested_capability).toBe('channel.feishu.send_text');
+    expect(resolved.resolved.principal_id).toBe('user:demo');
     expect(result.decision.decision).toBe('allow');
   });
 
@@ -786,6 +796,16 @@ describe('API module', () => {
       if (path.includes('/api/channels/wechat-ilink/accounts')) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ accounts: [] }) });
       }
+      if (path.includes('/api/cross-plane/identities')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          identities: [{
+            id: 'idb-demo',
+            principal_id: 'user:demo',
+            identity_ref: 'channel://feishu/user/demo?email=demo@example.com',
+            trust: 'verified',
+          }],
+        }) });
+      }
       if (path.includes('/api/cross-plane/audit')) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({
           records: [{
@@ -830,6 +850,9 @@ describe('API module', () => {
     expect(text).toContain('degraded');
     expect(text).toContain('Missing app_secret');
     expect(text).toContain('Capabilities send_text · doc_ops');
+    expect(text).toContain('Identity Bindings');
+    expect(text).toContain('user:demo');
+    expect(text).toContain('demo@example.com');
     expect(text).toContain('Recent Policy Evidence');
     expect(text).toContain('service.feishu.drive.download');
     expect(text).toContain('remaining 0');

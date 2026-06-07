@@ -3106,6 +3106,59 @@ providers:
     }
 
     #[tokio::test]
+    async fn cross_plane_identity_resolve_matches_cross_channel_contact_key() {
+        let app = api_router(test_state());
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let email = format!("demo-{suffix}@example.com");
+        let principal = format!("user:demo-{suffix}");
+        let identity = serde_json::json!({
+            "id": format!("idb-{suffix}"),
+            "principal_id": principal,
+            "identity_ref": format!("channel://feishu/user/demo?email={email}"),
+            "trust": "verified",
+            "source": "test",
+            "created_at": "2026-06-07T00:00:00Z",
+            "expires_at": null
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/identities")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(identity.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = serde_json::json!({
+            "identity_ref": format!("channel://wechat/user/demo?email={email}")
+        });
+        let resolved = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/identity/resolve")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK);
+        let body = to_bytes(resolved.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "cross_plane_identity_resolution");
+        assert_eq!(json["resolved"]["principal_id"], principal);
+        assert_eq!(json["resolved"]["trust"], "verified");
+        assert_eq!(json["resolved"]["match_kind"], "contact_key");
+    }
+
+    #[tokio::test]
     async fn context_current_returns_degraded_envelope_without_memory() {
         let app = api_router(test_state());
         let response = app
