@@ -1633,6 +1633,8 @@ window.Panels = (()=>{
       const identitiesData=await Api.crossPlaneIdentities().catch(function(){return {identities:[]}});
       const grantsData=await Api.crossPlaneGrants().catch(function(){return {grants:[]}});
       const auditData=await Api.crossPlaneAudit().catch(function(){return {records:[]}});
+      const adapterData=await Api.crossPlaneActionAdapters().catch(function(){return {capabilities:[]}});
+      const executionData=await Api.crossPlaneActionExecutions().catch(function(){return {executions:[]}});
       const sec=UI.el('div','panel-section');
       sec.innerHTML='<h3>Cross-Plane Control</h3>';
       const identities=summary.identity_bindings||{};
@@ -1694,6 +1696,55 @@ window.Panels = (()=>{
           auditList.appendChild(row);
         });
         sec.appendChild(auditList);
+      }
+      const capabilities=(adapterData.capabilities||[]).slice(0,4);
+      if(capabilities.length){
+        const adapterList=UI.el('div','panel-section');
+        adapterList.innerHTML='<h3>Adapter Capability</h3>';
+        capabilities.forEach(function(capability){
+          const row=UI.el('div','panel-item audit-record');
+          const source=UI.el('span','audit-source');
+          source.textContent=capability.platform||'adapter';
+          const body=UI.el('span','pi-name audit-body');
+          const title=UI.el('span','audit-title');
+          title.textContent=capability.operation||capability.capability||'operation';
+          const meta=UI.el('span','audit-meta');
+          const parts=[];
+          parts.push(capability.live_supported?'live supported':'plan only');
+          parts.push(capability.adapter_bound?'bound':'not bound');
+          meta.textContent=parts.join(' · ');
+          body.appendChild(title);
+          body.appendChild(meta);
+          row.appendChild(source);
+          row.appendChild(body);
+          adapterList.appendChild(row);
+        });
+        sec.appendChild(adapterList);
+      }
+      const executions=(executionData.executions||[]).slice(0,3);
+      if(executions.length){
+        const executionList=UI.el('div','panel-section');
+        executionList.innerHTML='<h3>Execution Receipts</h3>';
+        executions.forEach(function(receipt){
+          const row=UI.el('div','panel-item audit-record');
+          const source=UI.el('span','audit-source');
+          source.textContent=receipt.status||'receipt';
+          const body=UI.el('span','pi-name audit-body');
+          const title=UI.el('span','audit-title');
+          title.textContent=(receipt.action&&receipt.action.requested_capability)||receipt.id||'execution';
+          const meta=UI.el('span','audit-meta');
+          const parts=[];
+          if(receipt.dispatch_status)parts.push(receipt.dispatch_status);
+          if(receipt.mode)parts.push(receipt.mode);
+          if(receipt.idempotency_key)parts.push('idem '+receipt.idempotency_key);
+          meta.textContent=parts.join(' · ')||receipt.id||'';
+          body.appendChild(title);
+          body.appendChild(meta);
+          row.appendChild(source);
+          row.appendChild(body);
+          executionList.appendChild(row);
+        });
+        sec.appendChild(executionList);
       }
       const sim=UI.el('button','btn-secondary');
       sim.textContent='Simulate verified Feishu send';

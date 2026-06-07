@@ -875,6 +875,28 @@ describe('API module', () => {
           }],
         }) });
       }
+      if (path.includes('/api/cross-plane/action/adapters')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          capabilities: [{
+            platform: 'feishu',
+            operation: 'send_text',
+            live_supported: true,
+            adapter_bound: false,
+          }],
+        }) });
+      }
+      if (path.includes('/api/cross-plane/action/executions')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          executions: [{
+            id: 'cpx-demo',
+            mode: 'dry_run',
+            status: 'planned',
+            dispatch_status: 'dry_run',
+            idempotency_key: 'idem-demo',
+            action: { requested_capability: 'channel.feishu.send_text' },
+          }],
+        }) });
+      }
       if (path === '/api/platforms') {
         return Promise.resolve({ ok: true, json: () => Promise.resolve([
           {
@@ -909,6 +931,13 @@ describe('API module', () => {
     expect(text).toContain('Recent Policy Evidence');
     expect(text).toContain('service.feishu.drive.download');
     expect(text).toContain('remaining 0');
+    expect(text).toContain('Adapter Capability');
+    expect(text).toContain('send_text');
+    expect(text).toContain('live supported');
+    expect(text).toContain('not bound');
+    expect(text).toContain('Execution Receipts');
+    expect(text).toContain('channel.feishu.send_text');
+    expect(text).toContain('idem idem-demo');
     expect(text).not.toContain('cli_app_secret');
   });
 
