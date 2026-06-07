@@ -12,6 +12,8 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock, RwLock};
 use uuid::Uuid;
 
+const MAX_CROSS_PLANE_AUDIT_RECORDS: usize = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityTrust {
@@ -375,7 +377,18 @@ impl CrossPlaneControlPlane {
         }
         let text = serde_json::to_string_pretty(&self.snapshot())
             .map_err(|err| format!("failed to encode cross-plane state: {err}"))?;
-        fs::write(path, text).map_err(|err| format!("failed to write cross-plane state: {err}"))
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("control-state.json");
+        let tmp_path = path.with_file_name(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
+        fs::write(&tmp_path, text)
+            .map_err(|err| format!("failed to write cross-plane state temp file: {err}"))?;
+        if let Err(err) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("failed to replace cross-plane state: {err}"));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -503,11 +516,15 @@ impl CrossPlaneControlPlane {
     }
 
     pub fn record_audit(&self, record: CrossPlaneAuditRecord) {
-        self.inner
-            .write()
-            .unwrap_or_else(|err| err.into_inner())
+        let mut state = self.inner.write().unwrap_or_else(|err| err.into_inner());
+        state.audit.push(record);
+        let overflow = state
             .audit
-            .push(record);
+            .len()
+            .saturating_sub(MAX_CROSS_PLANE_AUDIT_RECORDS);
+        if overflow > 0 {
+            state.audit.drain(0..overflow);
+        }
     }
 
     #[must_use]
@@ -1106,5 +1123,58 @@ mod tests {
         assert_eq!(restored.list_identities().len(), 1);
         assert_eq!(restored.list_grants().len(), 1);
         assert_eq!(restored.list_audit(10, 0).len(), 1);
+    }
+
+    #[test]
+    fn control_plane_audit_is_bounded_to_recent_records() {
+        let control = CrossPlaneControlPlane::new();
+        for idx in 0..(MAX_CROSS_PLANE_AUDIT_RECORDS + 3) {
+            let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_text");
+            action.session_id = Some(format!("session-{idx}"));
+            control.record_audit(CrossPlaneAuditRecord::new(
+                action,
+                CrossPlanePolicyDecision {
+                    decision: PolicyDecisionKind::Allow,
+                    reason: "test".to_string(),
+                    matched_grant: None,
+                    required_approval: None,
+                    degrade_to: None,
+                },
+                "allow",
+                "test",
+            ));
+        }
+
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.audit.len(), MAX_CROSS_PLANE_AUDIT_RECORDS);
+        assert_eq!(
+            snapshot.audit[0].action.session_id.as_deref(),
+            Some("session-3")
+        );
+    }
+
+    #[test]
+    fn control_plane_save_is_atomic_and_cleans_temp_files() {
+        let control = CrossPlaneControlPlane::new();
+        control.upsert_identity(CrossPlaneIdentityBinding::verified(
+            "user:yi",
+            "channel://wechat/user/u1",
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-state.json");
+
+        control.save_to_path(&path).unwrap();
+
+        assert!(path.exists());
+        let temp_files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(temp_files, 0);
+
+        let restored = CrossPlaneControlPlane::new();
+        restored.load_from_path(&path).unwrap();
+        assert_eq!(restored.list_identities().len(), 1);
     }
 }
