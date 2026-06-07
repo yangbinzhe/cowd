@@ -444,6 +444,7 @@ mod tests {
     struct MockPlatformAdapter {
         name: String,
         connected: bool,
+        sent: Arc<std::sync::Mutex<Vec<OutboundMessage>>>,
     }
 
     impl MockPlatformAdapter {
@@ -451,6 +452,15 @@ mod tests {
             Self {
                 name: name.to_string(),
                 connected: false,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn new_with_sent(name: &str, sent: Arc<std::sync::Mutex<Vec<OutboundMessage>>>) -> Self {
+            Self {
+                name: name.to_string(),
+                connected: false,
+                sent,
             }
         }
     }
@@ -483,7 +493,8 @@ mod tests {
             Ok(None)
         }
 
-        async fn send(&self, _msg: &OutboundMessage) -> Result<(), PlatformError> {
+        async fn send(&self, msg: &OutboundMessage) -> Result<(), PlatformError> {
+            self.sent.lock().unwrap().push(msg.clone());
             Ok(())
         }
     }
@@ -496,6 +507,25 @@ mod tests {
             .unwrap();
         runtime.start().await.unwrap();
         runtime
+    }
+
+    async fn test_platform_runtime_with_sent_adapter(
+        name: &str,
+    ) -> (
+        Arc<PlatformRuntime>,
+        Arc<std::sync::Mutex<Vec<OutboundMessage>>>,
+    ) {
+        let runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime
+            .register_adapter(Box::new(MockPlatformAdapter::new_with_sent(
+                name,
+                sent.clone(),
+            )))
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+        (runtime, sent)
     }
 
     fn test_state() -> Arc<AppState> {
@@ -4183,6 +4213,106 @@ providers:
             .unwrap()
             .iter()
             .any(|receipt| receipt["dispatch_target"]["session_key"] == "feishu:demo-chat"));
+
+        platform_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_commit_dispatches_ready_text_target() {
+        let (platform_runtime, sent) = test_platform_runtime_with_sent_adapter("feishu").await;
+        let app = api_router(test_state_with_config_and_runtime(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-live-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-live-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "commit",
+            "idempotency_key": format!("idem-dispatch-live-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/source",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": "channel://feishu/chat/live-chat",
+                "resource_ref": "text://live payload",
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+        let executed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+
+        assert_eq!(executed_json["status"], "dispatched");
+        assert_eq!(executed_json["dispatch_status"], "sent");
+        assert_eq!(executed_json["dispatched"], true);
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_status"],
+            "sent"
+        );
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_target"]["session_key"],
+            "feishu:live-chat"
+        );
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].session_key.as_str(), "feishu:live-chat");
+        assert_eq!(sent[0].text, "live payload");
+        drop(sent);
 
         platform_runtime.shutdown().await.unwrap();
     }

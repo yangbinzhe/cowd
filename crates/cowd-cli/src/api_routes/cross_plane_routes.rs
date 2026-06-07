@@ -10,6 +10,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use runtime::platform::{OutboundMessage, SessionKey};
 use runtime::{
     CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneDispatchTarget,
     CrossPlaneExecutionReceipt, CrossPlaneGrant, CrossPlaneIdentityBinding,
@@ -358,6 +359,7 @@ async fn cross_plane_action_execute_handler(
         .first()
         .cloned()
         .unwrap_or_else(|| readiness.decision.reason.clone());
+    let mut dispatched = false;
 
     if readiness.executable {
         if mode == "dry_run" {
@@ -387,11 +389,24 @@ async fn cross_plane_action_execute_handler(
                 .as_ref()
                 .is_some_and(|target| target.ready)
             {
-                readiness
-                    .blockers
-                    .push("dispatch:not_implemented".to_string());
-                dispatch_status = "dispatch_not_implemented";
-                audit_summary = "live_dispatch_not_implemented".to_string();
+                match dispatch_ready_target(&state, readiness.dispatch_target.as_ref().unwrap())
+                    .await
+                {
+                    Ok(()) => {
+                        status = "dispatched";
+                        dispatch_status = "sent";
+                        audit_result = "dispatched";
+                        audit_summary = "live_dispatch_sent".to_string();
+                        dispatched = true;
+                    }
+                    Err(blocker) => {
+                        readiness.blockers.push(blocker);
+                        readiness.executable = false;
+                        dispatch_status = "dispatch_failed";
+                        audit_result = "blocked_dispatch";
+                        audit_summary = "live_dispatch_failed".to_string();
+                    }
+                }
             } else {
                 let target_blockers = readiness
                     .dispatch_target
@@ -402,8 +417,12 @@ async fn cross_plane_action_execute_handler(
                 dispatch_status = "dispatch_target_not_ready";
                 audit_summary = "live_dispatch_target_not_ready".to_string();
             }
-            readiness.executable = false;
-            audit_result = "blocked_dispatch";
+            if !dispatched {
+                readiness.executable = false;
+                if audit_result != "blocked_dispatch" {
+                    audit_result = "blocked_dispatch";
+                }
+            }
         } else {
             readiness
                 .blockers
@@ -451,7 +470,7 @@ async fn cross_plane_action_execute_handler(
         "dispatch_target": readiness.dispatch_target,
         "executable": readiness.executable,
         "blockers": readiness.blockers,
-        "dispatched": false,
+        "dispatched": dispatched,
         "audit_record_id": audit_record_id,
         "execution_receipt": receipt,
         "idempotent_replay": false,
@@ -622,6 +641,43 @@ fn build_dispatch_target(
         .map(|capability| capability.operation.clone())
         .or_else(|| operation_from_capability(&action.requested_capability));
     CrossPlaneDispatchTarget::from_action(action, target_platform, operation.as_deref())
+}
+
+async fn dispatch_ready_target(
+    state: &AppState,
+    target: &CrossPlaneDispatchTarget,
+) -> Result<(), String> {
+    if !target.ready {
+        return Err("dispatch:target_not_ready".to_string());
+    }
+    if target.operation.as_deref() != Some("send_text") {
+        return Err("dispatch:not_implemented".to_string());
+    }
+    let platform = target
+        .platform
+        .as_deref()
+        .ok_or_else(|| "dispatch:target_platform_missing".to_string())?;
+    let outbound = target
+        .outbound_message
+        .as_ref()
+        .ok_or_else(|| "dispatch:outbound_message_missing".to_string())?;
+    let runtime = state
+        .platform_runtime
+        .as_ref()
+        .ok_or_else(|| "dispatch:runtime_unavailable".to_string())?;
+
+    runtime
+        .dispatch_outbound(
+            platform,
+            OutboundMessage {
+                session_key: SessionKey::from(outbound.session_key.as_str()),
+                text: outbound.text.clone(),
+                reply_to: outbound.reply_to.clone(),
+                metadata: outbound.metadata.clone(),
+            },
+        )
+        .await
+        .map_err(|err| format!("dispatch:send_failed:{err}"))
 }
 
 fn operation_from_capability(capability: &str) -> Option<String> {

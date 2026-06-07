@@ -12,7 +12,15 @@ use tracing::{debug, error, info, warn};
 /// Handle to a running adapter loop, allowing responses to be sent back.
 struct AdapterHandle {
     /// Channel for sending outbound messages to this adapter's loop.
-    outbound_tx: mpsc::Sender<OutboundMessage>,
+    outbound_tx: mpsc::Sender<RuntimeOutboundCommand>,
+}
+
+enum RuntimeOutboundCommand {
+    Enqueue(OutboundMessage),
+    Dispatch {
+        msg: OutboundMessage,
+        ack: tokio::sync::oneshot::Sender<Result<(), PlatformError>>,
+    },
 }
 
 /// Platform runtime that manages all registered adapters.
@@ -26,7 +34,7 @@ pub struct PlatformRuntime {
     /// Channel for receiving inbound messages.
     message_rx: RwLock<Option<mpsc::Receiver<InboundMessage>>>,
     /// Shutdown signal.
-    shutdown_tx: RwLock<Option<tokio::sync::oneshot::Sender<()>>>,
+    shutdown_tx: RwLock<Option<tokio::sync::broadcast::Sender<()>>>,
     /// Handles to running adapter loops for sending responses.
     adapter_handles: RwLock<HashMap<String, AdapterHandle>>,
     /// Optional message mirror for cross-platform session synchronization.
@@ -173,15 +181,16 @@ impl PlatformRuntime {
         }
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        *self.shutdown_tx.write().await = Some(shutdown_tx.clone());
 
         let mirror = self.message_mirror.read().await.clone();
         let outbound_senders: Arc<
-            std::sync::Mutex<HashMap<String, mpsc::Sender<OutboundMessage>>>,
+            std::sync::Mutex<HashMap<String, mpsc::Sender<RuntimeOutboundCommand>>>,
         > = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         for (platform_name, adapter) in connected_adapters {
             let (outbound_tx, outbound_rx) =
-                mpsc::channel::<OutboundMessage>(self.config.channel_capacity);
+                mpsc::channel::<RuntimeOutboundCommand>(self.config.channel_capacity);
             self.adapter_handles.write().await.insert(
                 platform_name.clone(),
                 AdapterHandle {
@@ -243,9 +252,31 @@ impl PlatformRuntime {
 
         handle
             .outbound_tx
-            .send(msg)
+            .send(RuntimeOutboundCommand::Enqueue(msg))
             .await
             .map_err(|e| PlatformError::SendFailed(format!("outbound channel closed: {e}")))
+    }
+
+    /// Dispatch a message and wait until the adapter send call completes.
+    pub async fn dispatch_outbound(
+        &self,
+        platform_name: &str,
+        msg: OutboundMessage,
+    ) -> Result<(), PlatformError> {
+        let handles = self.adapter_handles.read().await;
+        let handle = handles.get(platform_name).ok_or_else(|| {
+            PlatformError::Unknown(format!("no adapter handle for platform: {platform_name}"))
+        })?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+        handle
+            .outbound_tx
+            .send(RuntimeOutboundCommand::Dispatch { msg, ack: ack_tx })
+            .await
+            .map_err(|e| PlatformError::SendFailed(format!("outbound channel closed: {e}")))?;
+        ack_rx
+            .await
+            .map_err(|e| PlatformError::SendFailed(format!("dispatch ack closed: {e}")))?
     }
 
     /// Get or create a session.
@@ -318,11 +349,11 @@ async fn run_adapter_loop(
     platform_name: String,
     mut adapter: Box<dyn PlatformAdapter>,
     inbound_tx: mpsc::Sender<InboundMessage>,
-    mut outbound_rx: mpsc::Receiver<OutboundMessage>,
+    mut outbound_rx: mpsc::Receiver<RuntimeOutboundCommand>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     retry_config: RetryConfig,
     mirror: Option<Arc<MessageMirror>>,
-    outbound_senders: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<OutboundMessage>>>>,
+    outbound_senders: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<RuntimeOutboundCommand>>>>,
 ) {
     loop {
         tokio::select! {
@@ -349,7 +380,9 @@ async fn run_adapter_loop(
                                             reply_to: None,
                                             metadata: serde_json::json!({"mirror": true}),
                                         };
-                                        let _ = tx.send(out_msg).await;
+                                        let _ = tx
+                                            .send(RuntimeOutboundCommand::Enqueue(out_msg))
+                                            .await;
                                     }
                                 }
                             }
@@ -378,9 +411,20 @@ async fn run_adapter_loop(
                     }
                 }
             }
-            Some(out_msg) = outbound_rx.recv() => {
-                if let Err(e) = adapter.send(&out_msg).await {
-                    warn!(platform = %platform_name, error = %e, "failed to send outbound message");
+            Some(command) = outbound_rx.recv() => {
+                match command {
+                    RuntimeOutboundCommand::Enqueue(out_msg) => {
+                        if let Err(e) = adapter.send(&out_msg).await {
+                            warn!(platform = %platform_name, error = %e, "failed to send outbound message");
+                        }
+                    }
+                    RuntimeOutboundCommand::Dispatch { msg, ack } => {
+                        let result = adapter.send(&msg).await;
+                        if let Err(e) = &result {
+                            warn!(platform = %platform_name, error = %e, "failed to dispatch outbound message");
+                        }
+                        let _ = ack.send(result);
+                    }
                 }
             }
         }
@@ -402,6 +446,7 @@ mod tests {
     struct MockAdapter {
         name: String,
         connected: bool,
+        sent: Arc<std::sync::Mutex<Vec<OutboundMessage>>>,
     }
 
     impl MockAdapter {
@@ -409,6 +454,15 @@ mod tests {
             Self {
                 name: name.to_string(),
                 connected: false,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn new_with_sent(name: &str, sent: Arc<std::sync::Mutex<Vec<OutboundMessage>>>) -> Self {
+            Self {
+                name: name.to_string(),
+                connected: false,
+                sent,
             }
         }
     }
@@ -441,7 +495,8 @@ mod tests {
             Ok(None)
         }
 
-        async fn send(&self, _msg: &OutboundMessage) -> Result<(), PlatformError> {
+        async fn send(&self, msg: &OutboundMessage) -> Result<(), PlatformError> {
+            self.sent.lock().unwrap().push(msg.clone());
             Ok(())
         }
     }
@@ -464,5 +519,37 @@ mod tests {
         runtime.shutdown().await.unwrap();
         assert!(!runtime.has_bound_adapter("feishu").await);
         assert!(runtime.list_bound_adapters().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_outbound_waits_for_adapter_send() {
+        let runtime = PlatformRuntime::new(PlatformRuntimeConfig::default());
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime
+            .register_adapter(Box::new(MockAdapter::new_with_sent("feishu", sent.clone())))
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+
+        runtime
+            .dispatch_outbound(
+                "feishu",
+                OutboundMessage {
+                    session_key: SessionKey::new("feishu", "open-id"),
+                    text: "hello live".to_string(),
+                    reply_to: None,
+                    metadata: serde_json::json!({"test": true}),
+                },
+            )
+            .await
+            .unwrap();
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].session_key.as_str(), "feishu:open-id");
+        assert_eq!(sent[0].text, "hello live");
+
+        drop(sent);
+        runtime.shutdown().await.unwrap();
     }
 }
