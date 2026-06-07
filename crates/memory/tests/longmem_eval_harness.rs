@@ -5,9 +5,10 @@
 
 use cowd_memory::config::{BudgetConfig, StoreConfig};
 use cowd_memory::{
-    CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
-    MemorySource, Priority,
+    evaluate_retrieval, CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry,
+    MemoryEvalCase, MemoryEvalOptions, MemoryLayer, MemoryScope, MemorySource, Priority,
 };
+use std::time::Duration;
 
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
@@ -28,9 +29,48 @@ fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     }
 }
 
-/// Simulated LongMemEval benchmark: stores N entries, then tests R@5 recall.
-/// Each entry has a unique fact embedded in its content; retrieval queries
-/// target specific facts and we score whether the correct entry is in top-5.
+fn fact_entry(i: usize, fact: &str) -> MemoryEntry {
+    MemoryEntry {
+        id: uuid::Uuid::new_v4(),
+        layer: MemoryLayer::L3,
+        category: MemoryCategory::Reference,
+        priority: Priority::Normal,
+        source: MemorySource::Import,
+        title: format!("Fact entry {}", i),
+        content: format!(
+            "Memory entry containing fact: {fact}. The verification code is VERIFY-{i}. \
+             Project shard alpha-{i} owns the durable recall marker {fact}."
+        ),
+        embedding: None,
+        tags: vec!["lme-test".to_string(), format!("VERIFY-{i}")],
+        relations: vec![],
+        confidence: 1.0,
+        access_count: 0,
+        staleness: 0.0,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        last_accessed_at: None,
+        scope: MemoryScope::default(),
+        session_id: None,
+        source_agent: None,
+        visibility: cowd_memory::AgentVisibility::default(),
+    }
+}
+
+fn distractor_entry(i: usize) -> MemoryEntry {
+    let mut entry = fact_entry(i, &format!("distractor_fact_{i}"));
+    entry.title = format!("Distractor entry {i}");
+    entry.content = format!(
+        "Distractor memory {i} discusses generic rust async session memory routing \
+         without the target verification code. It should not outrank exact fact markers."
+    );
+    entry.tags = vec!["lme-distractor".to_string()];
+    entry
+}
+
+/// Simulated LongMemEval benchmark: stores target facts plus distractors, then
+/// tests real search R@5 and latency. Each query targets a specific fact and
+/// passes only if the expected memory is in the top-k results.
 #[tokio::test]
 async fn test_longmem_eval_recall_at_5() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -38,65 +78,47 @@ async fn test_longmem_eval_recall_at_5() {
         .await
         .unwrap();
 
-    // Store 100 fact entries with unique identifiers
     let n_entries = 100;
-    let mut entry_ids = Vec::new();
-    let mut facts = Vec::new();
+    let n_distractors = 400;
+    let mut cases = Vec::new();
 
     for i in 0..n_entries {
         let fact = format!("unique_fact_{}", uuid::Uuid::new_v4().as_simple());
-        let content = format!(
-            "Memory entry containing fact: {}. The verification code is VERIFY-{}",
-            fact, i
-        );
-        let entry = MemoryEntry {
-            id: uuid::Uuid::new_v4(),
-            layer: MemoryLayer::L3,
-            category: MemoryCategory::Reference,
-            priority: Priority::Normal,
-            source: MemorySource::Import,
-            title: format!("Fact entry {}", i),
-            content,
-            embedding: None,
-            tags: vec!["lme-test".to_string()],
-            relations: vec![],
-            confidence: 1.0,
-            access_count: 0,
-            staleness: 0.0,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            last_accessed_at: None,
-            scope: MemoryScope::default(),
-            session_id: None,
-            source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
-        };
-        entry_ids.push(entry.id);
-        facts.push(fact);
+        let entry = fact_entry(i, &fact);
+        cases.push(MemoryEvalCase {
+            id: format!("case-{i}"),
+            query: format!("{fact} VERIFY-{i}"),
+            expected_memory_id: entry.id,
+        });
         mgr.remember(entry).await.unwrap();
     }
 
-    // Test R@1: for each entry, try direct get_entry
-    let mut recall_hits = 0u32;
-    for (i, _fact) in facts.iter().enumerate() {
-        let target_id = entry_ids[i];
-        if let Ok(Some(_)) = mgr.get_entry(&target_id.to_string()).await {
-            recall_hits += 1;
-        }
+    for i in 0..n_distractors {
+        mgr.remember(distractor_entry(i)).await.unwrap();
     }
 
-    let r1 = recall_hits as f32 / n_entries as f32;
+    let report = evaluate_retrieval(
+        &mgr,
+        &cases,
+        MemoryEvalOptions {
+            top_k: 5,
+            min_recall_at_k: 0.98,
+            max_p95_latency: Duration::from_millis(500),
+        },
+    )
+    .await
+    .unwrap();
+
     eprintln!(
-        "LongMemEval R@1 (direct lookup): {:.2}% ({}/{})",
-        r1 * 100.0,
-        recall_hits,
-        n_entries
+        "LongMemEval R@5: {:.2}% MRR {:.3} p95 {:.3}ms misses {} total {:.3}ms",
+        report.recall_at_k * 100.0,
+        report.mrr,
+        report.p95_latency_ms,
+        report.misses.len(),
+        report.total_latency_ms
     );
 
-    assert!(
-        r1 > 0.9,
-        "R@1 must be >90% for direct lookup — entries should be retrievable"
-    );
+    assert!(report.passed, "R@5/p95 quality gate failed: {report:?}");
 }
 
 /// Stress: verifies that entries survive restart and remain retrievable.

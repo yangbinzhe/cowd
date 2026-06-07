@@ -43,6 +43,7 @@ pub mod embedding;
 pub mod entity;
 pub mod entity_registry;
 pub mod error;
+pub mod eval;
 pub mod extractor;
 pub mod fact_checker;
 pub mod fresh_context;
@@ -99,6 +100,9 @@ pub use context_fence::{
 pub use context_rot::{ContextRotMonitor, RotAlert, RotMetrics};
 pub use embedding::{EmbeddingCapability, EmbeddingClient};
 pub use error::MemoryError;
+pub use eval::{
+    evaluate_retrieval, MemoryEvalCase, MemoryEvalMiss, MemoryEvalOptions, MemoryEvalReport,
+};
 pub use fact_checker::{FactCheckResult, FactChecker};
 pub use fresh_context::{FreshContextManager, FreshEntry, SessionBudgetStatus, SessionTokenBudget};
 pub use handoff::HandoffManager;
