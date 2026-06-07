@@ -352,6 +352,7 @@ window.Api = (()=>{
     async revokeCrossPlaneGrant(id){return req('DELETE','/api/cross-plane/grants/'+encodeURIComponent(id))},
     async crossPlaneAudit(){return req('GET','/api/cross-plane/audit')},
     async simulateCrossPlanePolicy(action){return req('POST','/api/cross-plane/policy/simulate',action)},
+    async preflightCrossPlaneAction(action){return req('POST','/api/cross-plane/action/preflight',action)},
     async wechatIlinkAccounts(){return req('GET','/api/channels/wechat-ilink/accounts')},
     async startWechatIlinkQr(body){return req('POST','/api/channels/wechat-ilink/qr',body||{})},
     async pollWechatIlinkQr(body){return req('POST','/api/channels/wechat-ilink/qr/poll',body)},

@@ -43,16 +43,16 @@ struct WechatQrPollRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct PlatformReadiness {
-    name: String,
-    platform_type: String,
-    enabled: bool,
-    status: &'static str,
-    configured: bool,
-    credential_present: bool,
-    missing_required: Vec<String>,
-    capabilities: Vec<&'static str>,
-    diagnostics: Vec<String>,
+pub(super) struct PlatformReadiness {
+    pub(super) name: String,
+    pub(super) platform_type: String,
+    pub(super) enabled: bool,
+    pub(super) status: &'static str,
+    pub(super) configured: bool,
+    pub(super) credential_present: bool,
+    pub(super) missing_required: Vec<String>,
+    pub(super) capabilities: Vec<&'static str>,
+    pub(super) diagnostics: Vec<String>,
 }
 
 fn default_wechat_bot_type() -> String {
@@ -79,7 +79,7 @@ async fn get_platform_handler(
     }))
 }
 
-fn configured_platforms(config: Option<&serde_json::Value>) -> Vec<PlatformReadiness> {
+pub(super) fn configured_platforms(config: Option<&serde_json::Value>) -> Vec<PlatformReadiness> {
     let Some(config) = config else {
         return vec![
             disabled_platform("feishu"),

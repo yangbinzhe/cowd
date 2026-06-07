@@ -452,6 +452,12 @@ describe('API module', () => {
           json: () => Promise.resolve({ kind: 'cross_plane_policy_simulation', decision: { decision: 'allow' } })
         });
       }
+      if (path.includes('/api/cross-plane/action/preflight')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ kind: 'cross_plane_action_preflight', executable: true })
+        });
+      }
       if (path.includes('/api/cross-plane/identity/resolve')) {
         return Promise.resolve({
           ok: true,
@@ -492,6 +498,13 @@ describe('API module', () => {
     await window.Api.revokeCrossPlaneGrant('grant-1');
     await window.Api.crossPlaneAudit();
     const resolved = await window.Api.resolveCrossPlaneIdentity('channel://wechat/user/demo?email=demo@example.com');
+    const preflight = await window.Api.preflightCrossPlaneAction({
+      actor_principal: 'user:demo',
+      requested_capability: 'channel.feishu.send_text',
+      risk: 'low',
+      data_classification: 'internal',
+      identity_trust: 'verified'
+    });
     const result = await window.Api.simulateCrossPlanePolicy({
       actor_principal: 'user:demo',
       requested_capability: 'channel.feishu.send_text',
@@ -514,9 +527,12 @@ describe('API module', () => {
     expect(String(mockF.mock.calls[7][0])).toBe('/api/cross-plane/audit');
     expect(String(mockF.mock.calls[8][0])).toBe('/api/cross-plane/identity/resolve');
     expect(JSON.parse(mockF.mock.calls[8][1].body).identity_ref).toContain('demo@example.com');
-    expect(String(mockF.mock.calls[9][0])).toBe('/api/cross-plane/policy/simulate');
+    expect(String(mockF.mock.calls[9][0])).toBe('/api/cross-plane/action/preflight');
     expect(JSON.parse(mockF.mock.calls[9][1].body).requested_capability).toBe('channel.feishu.send_text');
+    expect(String(mockF.mock.calls[10][0])).toBe('/api/cross-plane/policy/simulate');
+    expect(JSON.parse(mockF.mock.calls[10][1].body).requested_capability).toBe('channel.feishu.send_text');
     expect(resolved.resolved.principal_id).toBe('user:demo');
+    expect(preflight.executable).toBe(true);
     expect(result.decision.decision).toBe('allow');
   });
 

@@ -11,10 +11,11 @@ use axum::{
 };
 use runtime::{
     CrossPlaneAction, CrossPlaneControlPlane, CrossPlaneGrant, CrossPlaneIdentityBinding,
+    PolicyDecisionKind,
 };
 use serde::Deserialize;
 
-use super::AppState;
+use super::{channel_routes, AppState};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -39,6 +40,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/cross-plane/policy/simulate",
             post(cross_plane_policy_simulate_handler),
+        )
+        .route(
+            "/api/cross-plane/action/preflight",
+            post(cross_plane_action_preflight_handler),
         )
         .route(
             "/api/cross-plane/identity/resolve",
@@ -212,6 +217,43 @@ async fn cross_plane_policy_simulate_handler(
     }))
 }
 
+async fn cross_plane_action_preflight_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(action): Json<CrossPlaneAction>,
+) -> impl IntoResponse {
+    ensure_cross_plane_loaded(&state);
+    let now = chrono::Utc::now();
+    let (action, decision) = cross_plane_control().decide_with_action(action, now);
+    let target_platform = target_platform_from_action(&action);
+    let platforms = channel_routes::configured_platforms(state.config.as_ref());
+    let platform_readiness = target_platform.as_ref().and_then(|target| {
+        platforms
+            .into_iter()
+            .find(|platform| platform.name == *target || platform.platform_type == *target)
+    });
+    let mut blockers = Vec::new();
+    if decision.decision != PolicyDecisionKind::Allow {
+        blockers.push(format!("policy:{}", decision.reason));
+    }
+    if let Some(readiness) = &platform_readiness {
+        if readiness.status != "ready" {
+            blockers.push(format!("platform:{}:{}", readiness.name, readiness.status));
+        }
+    } else if let Some(target) = &target_platform {
+        blockers.push(format!("platform:{target}:unconfigured"));
+    }
+    let executable = blockers.is_empty();
+    Json(serde_json::json!({
+        "kind": "cross_plane_action_preflight",
+        "action": action,
+        "decision": decision,
+        "target_platform": target_platform,
+        "platform_readiness": platform_readiness,
+        "executable": executable,
+        "blockers": blockers,
+    }))
+}
+
 async fn cross_plane_identity_resolve_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<CrossPlaneIdentityResolveRequest>,
@@ -224,4 +266,37 @@ async fn cross_plane_identity_resolve_handler(
         "identity_ref": request.identity_ref,
         "resolved": resolved,
     }))
+}
+
+fn target_platform_from_action(action: &CrossPlaneAction) -> Option<String> {
+    for value in [
+        action.requested_capability.as_str(),
+        action.provider_account.as_deref().unwrap_or_default(),
+        action.target_ref.as_deref().unwrap_or_default(),
+        action.resource_ref.as_deref().unwrap_or_default(),
+    ] {
+        if let Some(platform) = target_platform_from_ref(value) {
+            return Some(platform);
+        }
+    }
+    None
+}
+
+fn target_platform_from_ref(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    let mut dotted = value.split('.');
+    let first = dotted.next()?;
+    if matches!(first, "channel" | "service") {
+        return dotted.next().map(str::to_string);
+    }
+    if let Some(rest) = value
+        .strip_prefix("channel://")
+        .or_else(|| value.strip_prefix("service://"))
+    {
+        return rest.split('/').next().map(str::to_string);
+    }
+    None
 }

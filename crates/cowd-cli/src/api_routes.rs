@@ -3250,6 +3250,135 @@ providers:
     }
 
     #[tokio::test]
+    async fn cross_plane_preflight_combines_identity_policy_and_platform_without_consuming_grant() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [{
+                    "platformType": "feishu",
+                    "enabled": true,
+                    "app_id": "app-id",
+                    "app_secret": "app-secret"
+                }]
+            }
+        })));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let email = format!("preflight-{suffix}@example.com");
+        let principal = format!("user:preflight-{suffix}");
+        let capability = format!("service.feishu.drive.download.{suffix}");
+        let identity = serde_json::json!({
+            "id": format!("idb-preflight-{suffix}"),
+            "principal_id": principal,
+            "identity_ref": format!("channel://feishu/user/preflight?email={email}"),
+            "trust": "verified",
+            "source": "test",
+            "created_at": "2026-06-07T00:00:00Z",
+            "expires_at": null
+        });
+        let grant = serde_json::json!({
+            "id": format!("grant-preflight-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "single_use",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+
+        for (uri, body) in [
+            ("/api/cross-plane/identities", identity),
+            ("/api/cross-plane/grants", grant),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let action = serde_json::json!({
+            "actor_principal": "",
+            "actor_identity_ref": format!("channel://wechat/user/preflight?email={email}"),
+            "source_channel": "channel://wechat/chat/test",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": null,
+            "resource_ref": null,
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "unknown"
+        });
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/preflight")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        let preflight_body = to_bytes(preflight.into_body(), usize::MAX).await.unwrap();
+        let preflight_json: serde_json::Value = serde_json::from_slice(&preflight_body).unwrap();
+        assert_eq!(preflight_json["kind"], "cross_plane_action_preflight");
+        assert_eq!(preflight_json["executable"], true);
+        assert_eq!(preflight_json["target_platform"], "feishu");
+        assert_eq!(preflight_json["platform_readiness"]["status"], "ready");
+        assert_eq!(preflight_json["decision"]["decision"], "allow");
+        assert_eq!(preflight_json["action"]["actor_principal"], principal);
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["decision"]["decision"], "allow");
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(
+            second_json["decision"]["decision"],
+            "require_single_approval"
+        );
+    }
+
+    #[tokio::test]
     async fn context_current_returns_degraded_envelope_without_memory() {
         let app = api_router(test_state());
         let response = app

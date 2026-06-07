@@ -537,6 +537,20 @@ impl CrossPlaneControlPlane {
     }
 
     #[must_use]
+    pub fn decide_with_action(
+        &self,
+        mut action: CrossPlaneAction,
+        now: DateTime<Utc>,
+    ) -> (CrossPlaneAction, CrossPlanePolicyDecision) {
+        self.resolve_action_identity(&mut action, now);
+        let active_grants = self.active_grants(now);
+        let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default())
+            .with_grants(active_grants);
+        let decision = engine.decide(&action, now);
+        (action, decision)
+    }
+
+    #[must_use]
     pub fn decide_and_audit_with_action(
         &self,
         mut action: CrossPlaneAction,
@@ -1049,6 +1063,24 @@ mod tests {
                 .map(|resolved| resolved.match_kind.as_str()),
             Some("contact_key")
         );
+    }
+
+    #[test]
+    fn control_plane_pure_decision_does_not_consume_single_use_grant_or_audit() {
+        let control = CrossPlaneControlPlane::new();
+        let mut grant = CrossPlaneGrant::persistent("user:yi", "service.feishu.drive.download");
+        grant.grant_type = GrantType::SingleUse;
+        grant.remaining_uses = None;
+        control.upsert_grant(grant);
+        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.drive.download");
+        action.identity_trust = IdentityTrust::Verified;
+        action.risk = CrossPlaneRisk::High;
+
+        let (_action, decision) = control.decide_with_action(action, now());
+
+        assert_eq!(decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(control.summary(now()).active_grants, 1);
+        assert!(control.list_audit(10, 0).is_empty());
     }
 
     #[test]
