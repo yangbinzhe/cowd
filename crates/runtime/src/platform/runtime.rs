@@ -1,7 +1,9 @@
 //! Platform runtime for managing multiple platform adapters.
 
 use crate::mirror::MessageMirror;
-use crate::platform::adapter::{InboundMessage, OutboundMessage, PlatformAdapter, PlatformError};
+use crate::platform::adapter::{
+    InboundMessage, OutboundDispatch, OutboundMessage, PlatformAdapter, PlatformError,
+};
 use crate::platform::config::{PlatformRuntimeConfig, RetryConfig, SessionResetPolicy};
 use crate::platform::types::{PlatformSession, SendResult, SessionKey};
 use std::collections::HashMap;
@@ -18,7 +20,7 @@ struct AdapterHandle {
 enum RuntimeOutboundCommand {
     Enqueue(OutboundMessage),
     Dispatch {
-        msg: OutboundMessage,
+        dispatch: OutboundDispatch,
         ack: tokio::sync::oneshot::Sender<Result<SendResult, PlatformError>>,
     },
 }
@@ -257,11 +259,21 @@ impl PlatformRuntime {
             .map_err(|e| PlatformError::SendFailed(format!("outbound channel closed: {e}")))
     }
 
-    /// Dispatch a message and wait until the adapter send call completes.
+    /// Dispatch a text message and wait until the adapter send call completes.
     pub async fn dispatch_outbound(
         &self,
         platform_name: &str,
         msg: OutboundMessage,
+    ) -> Result<SendResult, PlatformError> {
+        self.dispatch_payload(platform_name, OutboundDispatch::text(msg))
+            .await
+    }
+
+    /// Dispatch a typed payload and wait until the adapter send call completes.
+    pub async fn dispatch_payload(
+        &self,
+        platform_name: &str,
+        dispatch: OutboundDispatch,
     ) -> Result<SendResult, PlatformError> {
         let handles = self.adapter_handles.read().await;
         let handle = handles.get(platform_name).ok_or_else(|| {
@@ -271,7 +283,10 @@ impl PlatformRuntime {
 
         handle
             .outbound_tx
-            .send(RuntimeOutboundCommand::Dispatch { msg, ack: ack_tx })
+            .send(RuntimeOutboundCommand::Dispatch {
+                dispatch,
+                ack: ack_tx,
+            })
             .await
             .map_err(|e| PlatformError::SendFailed(format!("outbound channel closed: {e}")))?;
         ack_rx
@@ -418,8 +433,8 @@ async fn run_adapter_loop(
                             warn!(platform = %platform_name, error = %e, "failed to send outbound message");
                         }
                     }
-                    RuntimeOutboundCommand::Dispatch { msg, ack } => {
-                        let result = adapter.send(&msg).await;
+                    RuntimeOutboundCommand::Dispatch { dispatch, ack } => {
+                        let result = dispatch_adapter_payload(adapter.as_ref(), &dispatch).await;
                         if let Err(e) = &result {
                             warn!(platform = %platform_name, error = %e, "failed to dispatch outbound message");
                         }
@@ -437,6 +452,54 @@ async fn run_adapter_loop(
     info!(platform = %platform_name, "adapter loop exited");
 }
 
+async fn dispatch_adapter_payload(
+    adapter: &dyn PlatformAdapter,
+    dispatch: &OutboundDispatch,
+) -> Result<SendResult, PlatformError> {
+    let chat_id = dispatch
+        .session_key
+        .thread_id
+        .as_deref()
+        .unwrap_or(&dispatch.session_key.user_id);
+    match dispatch.kind {
+        crate::platform::types::OutboundPayloadKind::Text => {
+            adapter
+                .send(&OutboundMessage {
+                    session_key: dispatch.session_key.clone(),
+                    text: dispatch.payload_ref.clone(),
+                    reply_to: dispatch.reply_to.clone(),
+                    metadata: dispatch.metadata.clone(),
+                })
+                .await
+        }
+        crate::platform::types::OutboundPayloadKind::Image => {
+            if dispatch.payload_ref.starts_with("http://")
+                || dispatch.payload_ref.starts_with("https://")
+            {
+                adapter
+                    .send_image(chat_id, &dispatch.payload_ref, dispatch.caption.as_deref())
+                    .await?;
+            } else {
+                adapter
+                    .send_image_file(chat_id, &dispatch.payload_ref, dispatch.caption.as_deref())
+                    .await?;
+            }
+            Ok(SendResult::success(None))
+        }
+        crate::platform::types::OutboundPayloadKind::File => {
+            adapter
+                .send_document(
+                    chat_id,
+                    &dispatch.payload_ref,
+                    dispatch.file_name.as_deref(),
+                    dispatch.caption.as_deref(),
+                )
+                .await?;
+            Ok(SendResult::success(None))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +510,7 @@ mod tests {
         name: String,
         connected: bool,
         sent: Arc<std::sync::Mutex<Vec<OutboundMessage>>>,
+        media_sent: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl MockAdapter {
@@ -455,6 +519,7 @@ mod tests {
                 name: name.to_string(),
                 connected: false,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                media_sent: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -463,6 +528,16 @@ mod tests {
                 name: name.to_string(),
                 connected: false,
                 sent,
+                media_sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn new_with_media(name: &str, media_sent: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self {
+                name: name.to_string(),
+                connected: false,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                media_sent,
             }
         }
     }
@@ -501,6 +576,47 @@ mod tests {
                 "mock-{}",
                 msg.session_key.user_id
             ))))
+        }
+
+        async fn send_image(
+            &self,
+            chat_id: &str,
+            image_url: &str,
+            caption: Option<&str>,
+        ) -> Result<(), PlatformError> {
+            self.media_sent.lock().unwrap().push(format!(
+                "image-url:{chat_id}:{image_url}:{}",
+                caption.unwrap_or("")
+            ));
+            Ok(())
+        }
+
+        async fn send_image_file(
+            &self,
+            chat_id: &str,
+            image_path: &str,
+            caption: Option<&str>,
+        ) -> Result<(), PlatformError> {
+            self.media_sent.lock().unwrap().push(format!(
+                "image-file:{chat_id}:{image_path}:{}",
+                caption.unwrap_or("")
+            ));
+            Ok(())
+        }
+
+        async fn send_document(
+            &self,
+            chat_id: &str,
+            file_path: &str,
+            file_name: Option<&str>,
+            caption: Option<&str>,
+        ) -> Result<(), PlatformError> {
+            self.media_sent.lock().unwrap().push(format!(
+                "file:{chat_id}:{file_path}:{}:{}",
+                file_name.unwrap_or(""),
+                caption.unwrap_or("")
+            ));
+            Ok(())
         }
     }
 
@@ -554,6 +670,62 @@ mod tests {
         assert_eq!(sent[0].text, "hello live");
 
         drop(sent);
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_payload_routes_image_and_file_to_adapter_methods() {
+        let runtime = PlatformRuntime::new(PlatformRuntimeConfig::default());
+        let media_sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime
+            .register_adapter(Box::new(MockAdapter::new_with_media(
+                "feishu",
+                media_sent.clone(),
+            )))
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+
+        runtime
+            .dispatch_payload(
+                "feishu",
+                OutboundDispatch {
+                    session_key: SessionKey::with_thread("feishu", "open-id", "chat-id"),
+                    kind: crate::platform::types::OutboundPayloadKind::Image,
+                    payload_ref: "https://example.test/image.png".to_string(),
+                    caption: Some("diagram".to_string()),
+                    file_name: None,
+                    reply_to: None,
+                    metadata: serde_json::json!({"test": true}),
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .dispatch_payload(
+                "feishu",
+                OutboundDispatch {
+                    session_key: SessionKey::new("feishu", "open-id"),
+                    kind: crate::platform::types::OutboundPayloadKind::File,
+                    payload_ref: "/tmp/report.pdf".to_string(),
+                    caption: None,
+                    file_name: Some("report.pdf".to_string()),
+                    reply_to: None,
+                    metadata: serde_json::json!({"test": true}),
+                },
+            )
+            .await
+            .unwrap();
+
+        let media_sent = media_sent.lock().unwrap();
+        assert_eq!(
+            media_sent.as_slice(),
+            [
+                "image-url:chat-id:https://example.test/image.png:diagram",
+                "file:open-id:/tmp/report.pdf:report.pdf:"
+            ]
+        );
+        drop(media_sent);
         runtime.shutdown().await.unwrap();
     }
 }

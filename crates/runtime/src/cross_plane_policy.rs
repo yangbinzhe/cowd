@@ -309,6 +309,10 @@ impl CrossPlaneDispatchOutcome {
 pub struct CrossPlaneOutboundMessagePlan {
     pub session_key: String,
     pub text: String,
+    pub payload_kind: String,
+    pub payload_ref: String,
+    pub caption: Option<String>,
+    pub file_name: Option<String>,
     pub reply_to: Option<String>,
     pub metadata: serde_json::Value,
 }
@@ -349,13 +353,19 @@ impl CrossPlaneDispatchTarget {
             }
         };
 
-        let text = operation.as_deref().and_then(|operation| {
-            cross_plane_outbound_text_for_operation(operation, action, &mut blockers)
+        let payload = operation.as_deref().and_then(|operation| {
+            cross_plane_outbound_payload_for_operation(operation, action, &mut blockers)
         });
-        let outbound_message = session_key.as_ref().zip(text).map(|(session_key, text)| {
-            CrossPlaneOutboundMessagePlan {
+        let outbound_message = session_key
+            .as_ref()
+            .zip(payload)
+            .map(|(session_key, payload)| CrossPlaneOutboundMessagePlan {
                 session_key: session_key.clone(),
-                text,
+                text: payload.text.clone(),
+                payload_kind: payload.kind.to_string(),
+                payload_ref: payload.payload_ref,
+                caption: payload.caption,
+                file_name: payload.file_name,
                 reply_to: None,
                 metadata: serde_json::json!({
                     "cross_plane": true,
@@ -365,8 +375,7 @@ impl CrossPlaneDispatchTarget {
                     "source_channel": action.source_channel,
                     "session_id": action.session_id,
                 }),
-            }
-        });
+            });
         let ready = blockers.is_empty() && outbound_message.is_some();
 
         Some(Self {
@@ -380,6 +389,14 @@ impl CrossPlaneDispatchTarget {
             blockers,
         })
     }
+}
+
+struct CrossPlaneOutboundPayload {
+    kind: &'static str,
+    text: String,
+    payload_ref: String,
+    caption: Option<String>,
+    file_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1179,11 +1196,11 @@ fn cross_plane_session_key_from_path_parts(platform: &str, parts: &[&str]) -> Op
     })
 }
 
-fn cross_plane_outbound_text_for_operation(
+fn cross_plane_outbound_payload_for_operation(
     operation: &str,
     action: &CrossPlaneAction,
     blockers: &mut Vec<String>,
-) -> Option<String> {
+) -> Option<CrossPlaneOutboundPayload> {
     match operation {
         "send_text" => {
             let text = action
@@ -1193,7 +1210,13 @@ fn cross_plane_outbound_text_for_operation(
             if text.as_deref().is_none_or(str::is_empty) {
                 blockers.push("dispatch:payload_text_missing".to_string());
             }
-            text
+            text.map(|text| CrossPlaneOutboundPayload {
+                kind: "text",
+                payload_ref: text.clone(),
+                text,
+                caption: None,
+                file_name: None,
+            })
         }
         "send_image" | "send_file" => {
             let Some(resource_ref) = action.resource_ref.as_deref().map(str::trim) else {
@@ -1204,7 +1227,29 @@ fn cross_plane_outbound_text_for_operation(
                 blockers.push("dispatch:resource_ref_missing".to_string());
                 None
             } else {
-                Some(resource_ref.to_string())
+                let payload_ref = resource_ref
+                    .strip_prefix("image://")
+                    .or_else(|| resource_ref.strip_prefix("file://"))
+                    .unwrap_or(resource_ref)
+                    .to_string();
+                let file_name = (operation == "send_file").then(|| {
+                    std::path::Path::new(&payload_ref)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("document")
+                        .to_string()
+                });
+                Some(CrossPlaneOutboundPayload {
+                    kind: if operation == "send_image" {
+                        "image"
+                    } else {
+                        "file"
+                    },
+                    text: payload_ref.clone(),
+                    payload_ref,
+                    caption: None,
+                    file_name,
+                })
             }
         }
         _ => {
@@ -1495,10 +1540,46 @@ mod tests {
             .expect("ready target should include outbound message");
         assert_eq!(outbound.session_key, "feishu:open-id:chat-id");
         assert_eq!(outbound.text, "hello runtime");
+        assert_eq!(outbound.payload_kind, "text");
+        assert_eq!(outbound.payload_ref, "hello runtime");
         assert_eq!(
             outbound.metadata["requested_capability"],
             "channel.feishu.send_text"
         );
+    }
+
+    #[test]
+    fn dispatch_target_builds_ready_media_plan_without_text_smuggling() {
+        let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_image");
+        action.target_ref = Some("channel://feishu/chat/open-chat".to_string());
+        action.resource_ref = Some("image://https://example.test/diagram.png".to_string());
+
+        let target = CrossPlaneDispatchTarget::from_action(&action, Some("feishu"), None)
+            .expect("dispatchable image action should produce a target contract");
+
+        assert!(target.ready);
+        assert_eq!(target.operation.as_deref(), Some("send_image"));
+        let outbound = target.outbound_message.as_ref().unwrap();
+        assert_eq!(outbound.payload_kind, "image");
+        assert_eq!(outbound.payload_ref, "https://example.test/diagram.png");
+        assert_eq!(outbound.text, "https://example.test/diagram.png");
+        assert!(outbound.file_name.is_none());
+    }
+
+    #[test]
+    fn dispatch_target_builds_ready_file_plan_with_file_name() {
+        let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_file");
+        action.target_ref = Some("channel://feishu/chat/open-chat".to_string());
+        action.resource_ref = Some("file:///tmp/runtime-report.pdf".to_string());
+
+        let target = CrossPlaneDispatchTarget::from_action(&action, Some("feishu"), None)
+            .expect("dispatchable file action should produce a target contract");
+
+        assert!(target.ready);
+        let outbound = target.outbound_message.as_ref().unwrap();
+        assert_eq!(outbound.payload_kind, "file");
+        assert_eq!(outbound.payload_ref, "/tmp/runtime-report.pdf");
+        assert_eq!(outbound.file_name.as_deref(), Some("runtime-report.pdf"));
     }
 
     #[test]

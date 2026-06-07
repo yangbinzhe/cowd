@@ -90,6 +90,26 @@ impl SendResult {
     }
 }
 
+/// Typed payload kind for runtime dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundPayloadKind {
+    Text,
+    Image,
+    File,
+}
+
+impl OutboundPayloadKind {
+    #[must_use]
+    pub fn operation(self) -> &'static str {
+        match self {
+            Self::Text => "send_text",
+            Self::Image => "send_image",
+            Self::File => "send_file",
+        }
+    }
+}
+
 /// Basic chat/group information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatInfo {

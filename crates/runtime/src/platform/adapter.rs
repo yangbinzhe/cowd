@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 // Re-export types for backward compatibility.
-pub use crate::platform::types::{ChatInfo, MessageType, Platform, PlatformEvent, SendResult};
+pub use crate::platform::types::{
+    ChatInfo, MessageType, OutboundPayloadKind, Platform, PlatformEvent, SendResult,
+};
 
 /// Errors that can occur during platform operations.
 #[derive(Error, Debug)]
@@ -76,6 +78,33 @@ pub struct OutboundMessage {
     pub reply_to: Option<String>,
     /// Additional metadata.
     pub metadata: serde_json::Value,
+}
+
+/// Typed outbound dispatch request.
+#[derive(Debug, Clone)]
+pub struct OutboundDispatch {
+    pub session_key: SessionKey,
+    pub kind: OutboundPayloadKind,
+    pub payload_ref: String,
+    pub caption: Option<String>,
+    pub file_name: Option<String>,
+    pub reply_to: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+impl OutboundDispatch {
+    #[must_use]
+    pub fn text(msg: OutboundMessage) -> Self {
+        Self {
+            session_key: msg.session_key,
+            kind: OutboundPayloadKind::Text,
+            payload_ref: msg.text,
+            caption: None,
+            file_name: None,
+            reply_to: msg.reply_to,
+            metadata: msg.metadata,
+        }
+    }
 }
 
 /// Trait for platform adapters.

@@ -39,7 +39,8 @@ pub mod wecom;
 
 pub use adapter::{ChatInfo, MessageType, PlatformEvent, SendResult};
 pub use adapter::{
-    InboundMessage, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformResult,
+    InboundMessage, OutboundDispatch, OutboundMessage, OutboundPayloadKind, Platform,
+    PlatformAdapter, PlatformError, PlatformResult,
 };
 pub use config::PlatformConfig;
 pub use runtime::PlatformRuntime;

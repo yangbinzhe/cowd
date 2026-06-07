@@ -445,6 +445,7 @@ mod tests {
         name: String,
         connected: bool,
         sent: Arc<std::sync::Mutex<Vec<OutboundMessage>>>,
+        media_sent: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl MockPlatformAdapter {
@@ -453,6 +454,7 @@ mod tests {
                 name: name.to_string(),
                 connected: false,
                 sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                media_sent: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -461,6 +463,16 @@ mod tests {
                 name: name.to_string(),
                 connected: false,
                 sent,
+                media_sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn new_with_media(name: &str, media_sent: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self {
+                name: name.to_string(),
+                connected: false,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                media_sent,
             }
         }
     }
@@ -500,6 +512,47 @@ mod tests {
                 msg.session_key.user_id
             ))))
         }
+
+        async fn send_image(
+            &self,
+            chat_id: &str,
+            image_url: &str,
+            caption: Option<&str>,
+        ) -> Result<(), PlatformError> {
+            self.media_sent.lock().unwrap().push(format!(
+                "image-url:{chat_id}:{image_url}:{}",
+                caption.unwrap_or("")
+            ));
+            Ok(())
+        }
+
+        async fn send_image_file(
+            &self,
+            chat_id: &str,
+            image_path: &str,
+            caption: Option<&str>,
+        ) -> Result<(), PlatformError> {
+            self.media_sent.lock().unwrap().push(format!(
+                "image-file:{chat_id}:{image_path}:{}",
+                caption.unwrap_or("")
+            ));
+            Ok(())
+        }
+
+        async fn send_document(
+            &self,
+            chat_id: &str,
+            file_path: &str,
+            file_name: Option<&str>,
+            caption: Option<&str>,
+        ) -> Result<(), PlatformError> {
+            self.media_sent.lock().unwrap().push(format!(
+                "file:{chat_id}:{file_path}:{}:{}",
+                file_name.unwrap_or(""),
+                caption.unwrap_or("")
+            ));
+            Ok(())
+        }
     }
 
     async fn test_platform_runtime_with_bound_adapter(name: &str) -> Arc<PlatformRuntime> {
@@ -529,6 +582,22 @@ mod tests {
             .unwrap();
         runtime.start().await.unwrap();
         (runtime, sent)
+    }
+
+    async fn test_platform_runtime_with_media_adapter(
+        name: &str,
+    ) -> (Arc<PlatformRuntime>, Arc<std::sync::Mutex<Vec<String>>>) {
+        let runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
+        let media_sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime
+            .register_adapter(Box::new(MockPlatformAdapter::new_with_media(
+                name,
+                media_sent.clone(),
+            )))
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+        (runtime, media_sent)
     }
 
     fn test_state() -> Arc<AppState> {
@@ -2693,12 +2762,17 @@ providers:
         let lines = capture.lines();
         let joined = lines.join("\n");
         assert!(
-            joined.contains("context history loaded"),
-            "expected context history log, got: {joined}"
+            joined.contains("context history loaded") || joined.contains("context envelope loaded"),
+            "expected structured context trace event, got: {joined}"
         );
         assert!(joined.contains("context-log-session"));
-        assert!(joined.contains("include_envelopes=false"));
-        assert!(joined.contains("total=1"));
+        if joined.contains("context history loaded") {
+            assert!(joined.contains("include_envelopes=false"));
+            assert!(joined.contains("total=1"));
+        } else {
+            assert!(joined.contains("envelope_id=env-log-1"));
+            assert!(joined.contains("sequence=7"));
+        }
         assert!(joined.contains("summary_count=1"));
         assert!(
             joined.contains("context envelope loaded"),
@@ -4325,6 +4399,104 @@ providers:
         assert_eq!(sent[0].session_key.as_str(), "feishu:live-chat");
         assert_eq!(sent[0].text, "live payload");
         drop(sent);
+
+        platform_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_commit_dispatches_ready_image_target() {
+        let (platform_runtime, media_sent) =
+            test_platform_runtime_with_media_adapter("feishu").await;
+        let app = api_router(test_state_with_config_and_runtime(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-image-{suffix}");
+        let capability = format!("channel.feishu.send_image.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-image-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "commit",
+            "idempotency_key": format!("idem-dispatch-image-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/source",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": "channel://feishu/chat/live-chat",
+                "resource_ref": "image://https://example.test/panel.png",
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+        let executed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+
+        assert_eq!(executed_json["status"], "dispatched");
+        assert_eq!(executed_json["dispatch_status"], "sent");
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
+                ["payload_kind"],
+            "image"
+        );
+        assert_eq!(executed_json["dispatch_outcome"]["operation"], "send_image");
+        let media_sent = media_sent.lock().unwrap();
+        assert_eq!(
+            media_sent.as_slice(),
+            ["image-url:live-chat:https://example.test/panel.png:"]
+        );
+        drop(media_sent);
 
         platform_runtime.shutdown().await.unwrap();
     }

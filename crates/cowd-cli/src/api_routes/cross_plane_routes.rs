@@ -10,7 +10,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use runtime::platform::{OutboundMessage, SessionKey};
+use runtime::platform::{OutboundDispatch, OutboundPayloadKind, SessionKey};
 use runtime::{
     CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneDispatchOutcome,
     CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt, CrossPlaneGrant,
@@ -655,9 +655,6 @@ async fn dispatch_ready_target(
     if !target.ready {
         return Err(("dispatch:target_not_ready".to_string(), None));
     }
-    if target.operation.as_deref() != Some("send_text") {
-        return Err(("dispatch:not_implemented".to_string(), None));
-    }
     let platform = target
         .platform
         .as_deref()
@@ -670,13 +667,33 @@ async fn dispatch_ready_target(
         .platform_runtime
         .as_ref()
         .ok_or_else(|| ("dispatch:runtime_unavailable".to_string(), None))?;
+    let operation = target.operation.as_deref().unwrap_or("send_text");
+    let kind = match outbound.payload_kind.as_str() {
+        "text" => OutboundPayloadKind::Text,
+        "image" => OutboundPayloadKind::Image,
+        "file" => OutboundPayloadKind::File,
+        other => {
+            return Err((
+                format!("dispatch:payload_kind_unsupported:{other}"),
+                Some(CrossPlaneDispatchOutcome::failed(
+                    platform,
+                    operation,
+                    outbound.session_key.clone(),
+                    format!("unsupported payload kind: {other}"),
+                )),
+            ));
+        }
+    };
 
     match runtime
-        .dispatch_outbound(
+        .dispatch_payload(
             platform,
-            OutboundMessage {
+            OutboundDispatch {
                 session_key: SessionKey::from(outbound.session_key.as_str()),
-                text: outbound.text.clone(),
+                kind,
+                payload_ref: outbound.payload_ref.clone(),
+                caption: outbound.caption.clone(),
+                file_name: outbound.file_name.clone(),
                 reply_to: outbound.reply_to.clone(),
                 metadata: outbound.metadata.clone(),
             },
@@ -685,7 +702,7 @@ async fn dispatch_ready_target(
     {
         Ok(result) if result.success => Ok(CrossPlaneDispatchOutcome::sent(
             platform,
-            "send_text",
+            operation,
             outbound.session_key.clone(),
             result.message_id,
         )),
@@ -697,7 +714,7 @@ async fn dispatch_ready_target(
                 format!("dispatch:send_failed:{error}"),
                 Some(CrossPlaneDispatchOutcome::failed(
                     platform,
-                    "send_text",
+                    operation,
                     outbound.session_key.clone(),
                     error,
                 )),
@@ -709,7 +726,7 @@ async fn dispatch_ready_target(
                 format!("dispatch:send_failed:{error}"),
                 Some(CrossPlaneDispatchOutcome::failed(
                     platform,
-                    "send_text",
+                    operation,
                     outbound.session_key.clone(),
                     error,
                 )),
