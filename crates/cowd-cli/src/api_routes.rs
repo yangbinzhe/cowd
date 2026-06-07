@@ -17,6 +17,7 @@ use axum::{
     Router,
 };
 use runtime::approval_gate::SmartApprovalGate;
+use runtime::platform::PlatformRuntime;
 #[cfg(test)]
 use runtime::ApprovalConfig;
 #[cfg(test)]
@@ -69,6 +70,7 @@ pub struct AppState {
     pub unified_store: Option<Arc<UnifiedSessionStore>>,
     pub tool_registry: Arc<GlobalToolRegistry>,
     pub config: Option<serde_json::Value>,
+    pub platform_runtime: Option<Arc<PlatformRuntime>>,
     pub event_bus: Arc<SessionEventBus>,
     pub approval_gate: Option<Arc<SmartApprovalGate>>,
     pub auth_token: Option<String>,
@@ -345,6 +347,11 @@ mod tests {
     };
     use memory::config::{BudgetConfig, StoreConfig};
     use runtime::permission_enforcer::DestructivePatternDetector;
+    use runtime::platform::adapter::{
+        InboundMessage, OutboundMessage, PlatformAdapter, PlatformError,
+    };
+    use runtime::platform::config::PlatformRuntimeConfig;
+    use runtime::platform::types::Platform;
     use runtime::{ContextProfile, ResumeContextSource};
     use std::sync::Arc;
     use tokio::time::Duration;
@@ -434,6 +441,63 @@ mod tests {
         Arc::new(TaskKernel::open(path).expect("task kernel should open"))
     }
 
+    struct MockPlatformAdapter {
+        name: String,
+        connected: bool,
+    }
+
+    impl MockPlatformAdapter {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                connected: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PlatformAdapter for MockPlatformAdapter {
+        fn platform(&self) -> Platform {
+            Platform::Custom(self.name.clone())
+        }
+
+        fn platform_name(&self) -> &str {
+            &self.name
+        }
+
+        async fn connect(&mut self) -> Result<(), PlatformError> {
+            self.connected = true;
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> Result<(), PlatformError> {
+            self.connected = false;
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+
+        async fn receive(&mut self) -> Result<Option<InboundMessage>, PlatformError> {
+            Ok(None)
+        }
+
+        async fn send(&self, _msg: &OutboundMessage) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    async fn test_platform_runtime_with_bound_adapter(name: &str) -> Arc<PlatformRuntime> {
+        let runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
+        runtime
+            .register_adapter(Box::new(MockPlatformAdapter::new(name)))
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+        runtime
+    }
+
     fn test_state() -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
@@ -445,6 +509,7 @@ mod tests {
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: None,
@@ -457,6 +522,13 @@ mod tests {
     }
 
     fn test_state_with_config(config: serde_json::Value) -> Arc<AppState> {
+        test_state_with_config_and_runtime(config, None)
+    }
+
+    fn test_state_with_config_and_runtime(
+        config: serde_json::Value,
+        platform_runtime: Option<Arc<PlatformRuntime>>,
+    ) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
@@ -467,6 +539,7 @@ mod tests {
             unified_store: None,
             tool_registry: tools,
             config: Some(config),
+            platform_runtime,
             event_bus,
             approval_gate: None,
             auth_token: None,
@@ -493,6 +566,7 @@ mod tests {
             unified_store: Some(store),
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: None,
@@ -523,6 +597,7 @@ mod tests {
             unified_store: Some(store),
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: None,
@@ -562,6 +637,7 @@ mod tests {
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: None,
@@ -592,6 +668,7 @@ mod tests {
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: Some(gate),
             auth_token: None,
@@ -614,6 +691,7 @@ mod tests {
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: None,
@@ -3774,6 +3852,133 @@ providers:
     }
 
     #[tokio::test]
+    async fn cross_plane_adapter_registry_and_preflight_use_bound_runtime_snapshot() {
+        let platform_runtime = test_platform_runtime_with_bound_adapter("feishu").await;
+        let app = api_router(test_state_with_config_and_runtime(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:bound-runtime-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-bound-runtime-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let adapters = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/action/adapters")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let adapters_body = to_bytes(adapters.into_body(), usize::MAX).await.unwrap();
+        let adapters_json: serde_json::Value = serde_json::from_slice(&adapters_body).unwrap();
+        assert!(adapters_json["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item["platform"] == "feishu"
+                    && item["operation"] == "send_text"
+                    && item["adapter_bound"] == true
+            }));
+
+        let action = serde_json::json!({
+            "actor_principal": principal,
+            "actor_identity_ref": null,
+            "source_channel": "channel://wechat/chat/test",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": null,
+            "resource_ref": null,
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "verified"
+        });
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/preflight")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let preflight_body = to_bytes(preflight.into_body(), usize::MAX).await.unwrap();
+        let preflight_json: serde_json::Value = serde_json::from_slice(&preflight_body).unwrap();
+        assert_eq!(preflight_json["adapter_capability"]["adapter_bound"], true);
+
+        let execute = serde_json::json!({
+            "mode": "commit",
+            "idempotency_key": format!("idem-bound-runtime-{suffix}"),
+            "action": action
+        });
+        let executed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+        assert_eq!(executed_json["dispatch_status"], "dispatch_not_implemented");
+        assert_eq!(executed_json["adapter_capability"]["adapter_bound"], true);
+        assert!(executed_json["blockers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("dispatch:not_implemented")));
+
+        platform_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn context_current_returns_degraded_envelope_without_memory() {
         let app = api_router(test_state());
         let response = app
@@ -5234,6 +5439,7 @@ providers:
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: Some("test-token".into()),
@@ -5269,6 +5475,7 @@ providers:
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: Some("test-token".into()),
@@ -5304,6 +5511,7 @@ providers:
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: Some("test-token".into()),
@@ -5348,6 +5556,7 @@ providers:
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: Some("test-token".into()),

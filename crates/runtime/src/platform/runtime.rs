@@ -69,6 +69,20 @@ impl PlatformRuntime {
         adapters.keys().cloned().collect()
     }
 
+    /// List adapter names that are currently bound to a running adapter loop.
+    pub async fn list_bound_adapters(&self) -> Vec<String> {
+        let handles = self.adapter_handles.read().await;
+        let mut names = handles.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// Check whether a platform has a running adapter handle.
+    pub async fn has_bound_adapter(&self, platform_name: &str) -> bool {
+        let handles = self.adapter_handles.read().await;
+        handles.contains_key(platform_name)
+    }
+
     /// Get platform info by name.
     pub async fn get_platform_info(&self, name: &str) -> Option<serde_json::Value> {
         let adapters = self.adapters.read().await;
@@ -377,4 +391,78 @@ async fn run_adapter_loop(
         warn!(platform = %platform_name, error = %e, "error disconnecting adapter on loop exit");
     }
     info!(platform = %platform_name, "adapter loop exited");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::types::Platform;
+    use async_trait::async_trait;
+
+    struct MockAdapter {
+        name: String,
+        connected: bool,
+    }
+
+    impl MockAdapter {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                connected: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for MockAdapter {
+        fn platform(&self) -> Platform {
+            Platform::Custom(self.name.clone())
+        }
+
+        fn platform_name(&self) -> &str {
+            &self.name
+        }
+
+        async fn connect(&mut self) -> Result<(), PlatformError> {
+            self.connected = true;
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> Result<(), PlatformError> {
+            self.connected = false;
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+
+        async fn receive(&mut self) -> Result<Option<InboundMessage>, PlatformError> {
+            Ok(None)
+        }
+
+        async fn send(&self, _msg: &OutboundMessage) -> Result<(), PlatformError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_adapter_snapshot_tracks_started_and_shutdown_runtime() {
+        let runtime = PlatformRuntime::new(PlatformRuntimeConfig::default());
+        runtime
+            .register_adapter(Box::new(MockAdapter::new("feishu")))
+            .await
+            .unwrap();
+
+        assert!(!runtime.has_bound_adapter("feishu").await);
+        assert!(runtime.list_bound_adapters().await.is_empty());
+
+        runtime.start().await.unwrap();
+        assert!(runtime.has_bound_adapter("feishu").await);
+        assert_eq!(runtime.list_bound_adapters().await, vec!["feishu"]);
+
+        runtime.shutdown().await.unwrap();
+        assert!(!runtime.has_bound_adapter("feishu").await);
+        assert!(runtime.list_bound_adapters().await.is_empty());
+    }
 }

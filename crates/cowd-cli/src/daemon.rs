@@ -358,6 +358,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     );
     emit_startup_diagnostics(&startup_diagnostics);
 
+    let platform_runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
+
     let app_state = Arc::new(api_routes::AppState {
         session_kernel: session_kernel.clone(),
         sessions: sessions.clone(),
@@ -365,6 +367,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         unified_store: unified_store.clone(),
         tool_registry: tools.clone(),
         config: config.runtime_config.clone(),
+        platform_runtime: Some(platform_runtime.clone()),
         event_bus: event_bus.clone(),
         approval_gate: Some(approval_gate),
         auth_token: config.auth_token.clone(),
@@ -433,7 +436,6 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     tracing::info!("Unix socket on {}", config.unix_sock_path);
 
     // 5. Platform adapters via PlatformRuntime
-    let platform_runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
 
     // Initialise the message mirror with default rules from daemon config
     if let Some(mirror) = config.message_mirror {

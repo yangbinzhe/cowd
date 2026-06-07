@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{Arc, OnceLock},
 };
@@ -251,9 +252,10 @@ async fn cross_plane_action_adapters_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
     let platforms = channel_routes::configured_platforms(state.config.as_ref());
+    let bound_adapters = bound_adapter_snapshot(&state).await;
     let capabilities = platforms
         .iter()
-        .flat_map(adapter_capabilities_for_platform)
+        .flat_map(|platform| adapter_capabilities_for_platform(platform, &bound_adapters))
         .collect::<Vec<_>>();
     Json(serde_json::json!({
         "kind": "cross_plane_action_adapters",
@@ -294,7 +296,7 @@ async fn cross_plane_action_preflight_handler(
     Json(action): Json<CrossPlaneAction>,
 ) -> impl IntoResponse {
     ensure_cross_plane_loaded(&state);
-    let readiness = evaluate_action_readiness(&state, action, chrono::Utc::now());
+    let readiness = evaluate_action_readiness(&state, action, chrono::Utc::now()).await;
     Json(serde_json::json!({
         "kind": "cross_plane_action_preflight",
         "action": readiness.action,
@@ -343,7 +345,7 @@ async fn cross_plane_action_execute_handler(
             }));
         }
     }
-    let mut readiness = evaluate_action_readiness(&state, request.action, now);
+    let mut readiness = evaluate_action_readiness(&state, request.action, now).await;
     let mut status = "blocked";
     let mut dispatch_status = "not_started";
     let mut audit_result = "blocked";
@@ -362,7 +364,7 @@ async fn cross_plane_action_execute_handler(
         } else if readiness
             .adapter_capability
             .as_ref()
-            .is_some_and(|capability| capability.live_supported)
+            .is_some_and(|capability| capability.live_supported && !capability.adapter_bound)
         {
             readiness
                 .blockers
@@ -371,6 +373,18 @@ async fn cross_plane_action_execute_handler(
             dispatch_status = "adapter_not_bound";
             audit_result = "blocked_dispatch";
             audit_summary = "live_dispatch_adapter_not_bound".to_string();
+        } else if readiness
+            .adapter_capability
+            .as_ref()
+            .is_some_and(|capability| capability.live_supported && capability.adapter_bound)
+        {
+            readiness
+                .blockers
+                .push("dispatch:not_implemented".to_string());
+            readiness.executable = false;
+            dispatch_status = "dispatch_not_implemented";
+            audit_result = "blocked_dispatch";
+            audit_summary = "live_dispatch_not_implemented".to_string();
         } else {
             readiness
                 .blockers
@@ -451,7 +465,7 @@ fn target_platform_from_action(action: &CrossPlaneAction) -> Option<String> {
     None
 }
 
-fn evaluate_action_readiness(
+async fn evaluate_action_readiness(
     state: &AppState,
     action: CrossPlaneAction,
     now: chrono::DateTime<chrono::Utc>,
@@ -464,9 +478,10 @@ fn evaluate_action_readiness(
             .into_iter()
             .find(|platform| platform.name == *target || platform.platform_type == *target)
     });
+    let bound_adapters = bound_adapter_snapshot(state).await;
     let adapter_capability = platform_readiness
         .as_ref()
-        .and_then(|platform| adapter_capability_for_action(platform, &action));
+        .and_then(|platform| adapter_capability_for_action(platform, &action, &bound_adapters));
     let mut blockers = Vec::new();
     if decision.decision != PolicyDecisionKind::Allow {
         blockers.push(format!("policy:{}", decision.reason));
@@ -519,17 +534,21 @@ fn target_platform_from_ref(value: &str) -> Option<String> {
 fn adapter_capability_for_action(
     platform: &channel_routes::PlatformReadiness,
     action: &CrossPlaneAction,
+    bound_adapters: &HashSet<String>,
 ) -> Option<CrossPlaneAdapterCapability> {
     let operation = operation_from_capability(&action.requested_capability)?;
-    adapter_capabilities_for_platform(platform)
+    adapter_capabilities_for_platform(platform, bound_adapters)
         .into_iter()
         .find(|capability| capability.operation == operation)
 }
 
 fn adapter_capabilities_for_platform(
     platform: &channel_routes::PlatformReadiness,
+    bound_adapters: &HashSet<String>,
 ) -> Vec<CrossPlaneAdapterCapability> {
-    let adapter_bound = false;
+    let adapter_bound = platform_binding_keys(platform)
+        .iter()
+        .any(|key| bound_adapters.contains(key));
     platform
         .capabilities
         .iter()
@@ -547,6 +566,24 @@ fn adapter_capabilities_for_platform(
             }
         })
         .collect()
+}
+
+async fn bound_adapter_snapshot(state: &AppState) -> HashSet<String> {
+    let Some(runtime) = &state.platform_runtime else {
+        return HashSet::new();
+    };
+    runtime.list_bound_adapters().await.into_iter().collect()
+}
+
+fn platform_binding_keys(platform: &channel_routes::PlatformReadiness) -> Vec<String> {
+    let mut keys = vec![
+        platform.name.to_ascii_lowercase(),
+        platform.platform_type.to_ascii_lowercase(),
+    ];
+    keys.extend(keys.clone().into_iter().map(|key| key.replace('-', "_")));
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 fn operation_from_capability(capability: &str) -> Option<String> {
