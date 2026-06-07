@@ -250,11 +250,11 @@ impl CodeIndexer {
     // -----------------------------------------------------------------------
 
     /// Index a single source file, returning extracted symbols and edges.
-    pub fn index_file(&mut self, path: &Path) -> Result<(Vec<CodeSymbol>, Vec<SymbolEdge>), MemoryError> {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+    pub fn index_file(
+        &mut self,
+        path: &Path,
+    ) -> Result<(Vec<CodeSymbol>, Vec<SymbolEdge>), MemoryError> {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let lang = IndexLanguage::from_extension(ext).ok_or_else(|| {
             MemoryError::InvalidArgument(format!("unsupported file extension: {ext}"))
         })?;
@@ -306,10 +306,7 @@ impl CodeIndexer {
         content: &str,
         path: &Path,
     ) -> Result<(Vec<CodeSymbol>, Vec<SymbolEdge>), MemoryError> {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let lang = IndexLanguage::from_extension(ext).ok_or_else(|| {
             MemoryError::InvalidArgument(format!("unsupported file extension: {ext}"))
         })?;
@@ -507,7 +504,10 @@ impl CodeIndexer {
         };
 
         // Find the symbol by name via FTS5 search
-        let symbols = store.search_symbols(symbol_name, 1).await.unwrap_or_default();
+        let symbols = store
+            .search_symbols(symbol_name, 1)
+            .await
+            .unwrap_or_default();
         let target = match symbols.first() {
             Some(s) => s.clone(),
             None => {
@@ -570,11 +570,19 @@ impl CodeIndexer {
         let kind = node.kind();
 
         match lang {
-            IndexLanguage::Rust => self.handle_rust_node(node, kind, source, file_path, symbols, edges),
-            IndexLanguage::Python => self.handle_python_node(node, kind, source, file_path, symbols, edges),
-            IndexLanguage::TypeScript => self.handle_ts_node(node, kind, source, file_path, symbols, edges),
+            IndexLanguage::Rust => {
+                self.handle_rust_node(node, kind, source, file_path, symbols, edges)
+            }
+            IndexLanguage::Python => {
+                self.handle_python_node(node, kind, source, file_path, symbols, edges)
+            }
+            IndexLanguage::TypeScript => {
+                self.handle_ts_node(node, kind, source, file_path, symbols, edges)
+            }
             IndexLanguage::Go => self.handle_go_node(node, kind, source, file_path, symbols, edges),
-            IndexLanguage::Java => self.handle_java_node(node, kind, source, file_path, symbols, edges),
+            IndexLanguage::Java => {
+                self.handle_java_node(node, kind, source, file_path, symbols, edges)
+            }
         }
 
         // Walk children recursively
@@ -607,7 +615,9 @@ impl CodeIndexer {
 
         match kind {
             "function_item" => {
-                let name = self.find_child_text(node, "identifier", source).unwrap_or("unknown");
+                let name = self
+                    .find_child_text(node, "identifier", source)
+                    .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -620,7 +630,9 @@ impl CodeIndexer {
                 });
             }
             "struct_item" => {
-                let name = self.find_child_text(node, "type_identifier", source).unwrap_or("unknown");
+                let name = self
+                    .find_child_text(node, "type_identifier", source)
+                    .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -633,7 +645,9 @@ impl CodeIndexer {
                 });
             }
             "enum_item" => {
-                let name = self.find_child_text(node, "type_identifier", source).unwrap_or("unknown");
+                let name = self
+                    .find_child_text(node, "type_identifier", source)
+                    .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -646,7 +660,9 @@ impl CodeIndexer {
                 });
             }
             "trait_item" => {
-                let name = self.find_child_text(node, "type_identifier", source).unwrap_or("unknown");
+                let name = self
+                    .find_child_text(node, "type_identifier", source)
+                    .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -680,7 +696,11 @@ impl CodeIndexer {
             }
             "use_declaration" => {
                 // Extract imported module path
-                let import_path = node_source.replace("use ", "").replace(';', "").trim().to_string();
+                let import_path = node_source
+                    .replace("use ", "")
+                    .replace(';', "")
+                    .trim()
+                    .to_string();
                 if let Some(enclosing) = self.find_enclosing_symbol(node, symbols) {
                     edges.push(SymbolEdge {
                         source_id: enclosing,
@@ -700,7 +720,11 @@ impl CodeIndexer {
         None
     }
 
-    fn extract_rust_method_call(&self, node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    fn extract_rust_method_call(
+        &self,
+        node: tree_sitter::Node<'_>,
+        source: &str,
+    ) -> Option<String> {
         // For field_expression like foo.bar() or method calls like self.bar()
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
@@ -709,7 +733,10 @@ impl CodeIndexer {
                     for j in 0..child.child_count() {
                         if let Some(field_child) = child.child(j) {
                             if field_child.kind() == "field_identifier" {
-                                return field_child.utf8_text(source.as_bytes()).ok().map(|s| s.to_string());
+                                return field_child
+                                    .utf8_text(source.as_bytes())
+                                    .ok()
+                                    .map(|s| s.to_string());
                             }
                         }
                     }
@@ -735,7 +762,9 @@ impl CodeIndexer {
 
         match kind {
             "function_definition" => {
-                let name = self.find_child_text(node, "identifier", source).unwrap_or("unknown");
+                let name = self
+                    .find_child_text(node, "identifier", source)
+                    .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -748,7 +777,9 @@ impl CodeIndexer {
                 });
             }
             "class_definition" => {
-                let name = self.find_child_text(node, "identifier", source).unwrap_or("unknown");
+                let name = self
+                    .find_child_text(node, "identifier", source)
+                    .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -764,7 +795,8 @@ impl CodeIndexer {
                 let func_name = self.find_child_text(node, "identifier", source);
                 // For attribute access like self.method()
                 let callee = if func_name.is_none() {
-                    self.find_child_text_attr(node, "attribute", source).map(|s| s.to_string())
+                    self.find_child_text_attr(node, "attribute", source)
+                        .map(|s| s.to_string())
                 } else {
                     func_name.map(|s| s.to_string())
                 };
@@ -810,7 +842,9 @@ impl CodeIndexer {
 
         match kind {
             "function_declaration" => {
-                let name = self.find_child_text(node, "identifier", source).unwrap_or("unknown");
+                let name = self
+                    .find_child_text(node, "identifier", source)
+                    .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -823,7 +857,9 @@ impl CodeIndexer {
                 });
             }
             "method_definition" => {
-                let name = self.find_child_text(node, "property_identifier", source).unwrap_or("unknown");
+                let name = self
+                    .find_child_text(node, "property_identifier", source)
+                    .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -836,7 +872,8 @@ impl CodeIndexer {
                 });
             }
             "class_declaration" => {
-                let name = self.find_child_text(node, "identifier", source)
+                let name = self
+                    .find_child_text(node, "identifier", source)
                     .or_else(|| self.find_child_text(node, "type_identifier", source))
                     .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
@@ -851,7 +888,8 @@ impl CodeIndexer {
                 });
             }
             "interface_declaration" => {
-                let name = self.find_child_text(node, "type_identifier", source)
+                let name = self
+                    .find_child_text(node, "type_identifier", source)
                     .or_else(|| self.find_child_text(node, "identifier", source))
                     .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
@@ -897,13 +935,21 @@ impl CodeIndexer {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 match child.kind() {
-                    "identifier" => return child.utf8_text(source.as_bytes()).ok().map(|s| s.to_string()),
+                    "identifier" => {
+                        return child
+                            .utf8_text(source.as_bytes())
+                            .ok()
+                            .map(|s| s.to_string())
+                    }
                     "member_expression" => {
                         // foo.bar() → get "bar" (property)
                         for j in 0..child.child_count() {
                             if let Some(mc) = child.child(j) {
                                 if mc.kind() == "property_identifier" {
-                                    return mc.utf8_text(source.as_bytes()).ok().map(|s| s.to_string());
+                                    return mc
+                                        .utf8_text(source.as_bytes())
+                                        .ok()
+                                        .map(|s| s.to_string());
                                 }
                             }
                         }
@@ -932,9 +978,13 @@ impl CodeIndexer {
         match kind {
             "function_declaration" | "method_declaration" => {
                 let name = self.find_go_func_name(node, source).unwrap_or("unknown");
-                let has_receiver = node_source.contains(") ")
-                    && node_source.matches('(').count() >= 2;
-                let sym_kind = if has_receiver { SymbolKind::Method } else { SymbolKind::Function };
+                let has_receiver =
+                    node_source.contains(") ") && node_source.matches('(').count() >= 2;
+                let sym_kind = if has_receiver {
+                    SymbolKind::Method
+                } else {
+                    SymbolKind::Function
+                };
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -950,10 +1000,15 @@ impl CodeIndexer {
                 let spec_node = (0..node.child_count())
                     .find_map(|i| {
                         let c = node.child(i)?;
-                        if c.kind() == "type_spec" { Some(c) } else { None }
+                        if c.kind() == "type_spec" {
+                            Some(c)
+                        } else {
+                            None
+                        }
                     })
                     .unwrap_or(node);
-                let name = self.find_child_text(spec_node, "type_identifier", source)
+                let name = self
+                    .find_child_text(spec_node, "type_identifier", source)
                     .unwrap_or("unknown");
                 let typ = self.detect_go_type_kind(spec_node, source);
                 let id = Self::make_symbol_id(file_path, name, spec_node.start_position().row + 1);
@@ -963,7 +1018,10 @@ impl CodeIndexer {
                     kind: typ,
                     file_path: file_path.to_string(),
                     line: spec_node.start_position().row + 1,
-                    signature: spec_node.utf8_text(source.as_bytes()).unwrap_or("").to_string(),
+                    signature: spec_node
+                        .utf8_text(source.as_bytes())
+                        .unwrap_or("")
+                        .to_string(),
                     doc: None,
                 });
             }
@@ -994,10 +1052,18 @@ impl CodeIndexer {
         }
     }
 
-    fn detect_go_type_kind(&self, type_spec_node: tree_sitter::Node<'_>, source: &str) -> SymbolKind {
+    fn detect_go_type_kind(
+        &self,
+        type_spec_node: tree_sitter::Node<'_>,
+        source: &str,
+    ) -> SymbolKind {
         let text = type_spec_node.utf8_text(source.as_bytes()).unwrap_or("");
-        if text.contains("struct {") { return SymbolKind::Struct; }
-        if text.contains("interface {") { return SymbolKind::Interface; }
+        if text.contains("struct {") {
+            return SymbolKind::Struct;
+        }
+        if text.contains("interface {") {
+            return SymbolKind::Interface;
+        }
         for i in 0..type_spec_node.child_count() {
             if let Some(child) = type_spec_node.child(i) {
                 match child.kind() {
@@ -1025,13 +1091,21 @@ impl CodeIndexer {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 match child.kind() {
-                    "identifier" => return child.utf8_text(source.as_bytes()).ok().map(|s| s.to_string()),
+                    "identifier" => {
+                        return child
+                            .utf8_text(source.as_bytes())
+                            .ok()
+                            .map(|s| s.to_string())
+                    }
                     "selector_expression" => {
                         // pkg.Func() → get field name
                         for j in 0..child.child_count() {
                             if let Some(sc) = child.child(j) {
                                 if sc.kind() == "field_identifier" {
-                                    return sc.utf8_text(source.as_bytes()).ok().map(|s| s.to_string());
+                                    return sc
+                                        .utf8_text(source.as_bytes())
+                                        .ok()
+                                        .map(|s| s.to_string());
                                 }
                             }
                         }
@@ -1059,7 +1133,9 @@ impl CodeIndexer {
 
         match kind {
             "method_declaration" => {
-                let name = self.find_child_text(node, "identifier", source).unwrap_or("unknown");
+                let name = self
+                    .find_child_text(node, "identifier", source)
+                    .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -1072,7 +1148,9 @@ impl CodeIndexer {
                 });
             }
             "class_declaration" => {
-                let name = self.find_child_text(node, "identifier", source).unwrap_or("unknown");
+                let name = self
+                    .find_child_text(node, "identifier", source)
+                    .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -1085,7 +1163,9 @@ impl CodeIndexer {
                 });
             }
             "interface_declaration" => {
-                let name = self.find_child_text(node, "identifier", source).unwrap_or("unknown");
+                let name = self
+                    .find_child_text(node, "identifier", source)
+                    .unwrap_or("unknown");
                 let id = Self::make_symbol_id(file_path, name, line);
                 symbols.push(CodeSymbol {
                     id: id.clone(),
@@ -1129,7 +1209,12 @@ impl CodeIndexer {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 match child.kind() {
-                    "identifier" => return child.utf8_text(source.as_bytes()).ok().map(|s| s.to_string()),
+                    "identifier" => {
+                        return child
+                            .utf8_text(source.as_bytes())
+                            .ok()
+                            .map(|s| s.to_string())
+                    }
                     _ => {}
                 }
             }
@@ -1250,14 +1335,26 @@ pub struct MyStruct {
         let mut indexer = CodeIndexer::new(dir.path()).expect("failed to create indexer");
         let (symbols, _edges) = indexer.index_file(&path).expect("failed to index");
 
-        let functions: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Function).collect();
+        let functions: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
         assert!(!functions.is_empty(), "should find at least one function");
 
-        let hello = functions.iter().find(|s| s.name == "hello").expect("should find 'hello' function");
+        let hello = functions
+            .iter()
+            .find(|s| s.name == "hello")
+            .expect("should find 'hello' function");
         assert_eq!(hello.kind, SymbolKind::Function);
-        assert!(hello.signature.contains("fn hello"), "signature should contain 'fn hello'");
+        assert!(
+            hello.signature.contains("fn hello"),
+            "signature should contain 'fn hello'"
+        );
 
-        let structs: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Struct).collect();
+        let structs: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Struct)
+            .collect();
         assert!(!structs.is_empty(), "should find struct");
         assert!(structs.iter().any(|s| s.name == "MyStruct"));
     }
@@ -1285,12 +1382,21 @@ def standalone_func():
         let mut indexer = CodeIndexer::new(dir.path()).expect("failed to create indexer");
         let (symbols, _edges) = indexer.index_file(&path).expect("failed to index");
 
-        let classes: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+        let classes: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
         assert!(!classes.is_empty(), "should find MyClass");
         assert!(classes.iter().any(|s| s.name == "MyClass"));
 
-        let functions: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Function).collect();
-        assert!(functions.len() >= 3, "should find at least 3 functions (2 methods + 1 standalone)");
+        let functions: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.len() >= 3,
+            "should find at least 3 functions (2 methods + 1 standalone)"
+        );
         assert!(functions.iter().any(|s| s.name == "method_one"));
         assert!(functions.iter().any(|s| s.name == "standalone_func"));
     }
@@ -1317,16 +1423,23 @@ fn bar() {
         let (symbols, edges) = indexer.index_file(&path).expect("failed to index");
 
         // Should have foo and bar as functions
-        assert!(symbols.iter().any(|s| s.name == "foo" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "bar" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "foo" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "bar" && s.kind == SymbolKind::Function));
 
         // Should have call edges from bar to foo
-        let call_edges: Vec<_> = edges.iter().filter(|e| e.edge_type == SymbolEdgeType::Calls).collect();
+        let call_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == SymbolEdgeType::Calls)
+            .collect();
         assert!(!call_edges.is_empty(), "should have call edges");
         // bar calls foo at least once
-        let bar_calls_foo = call_edges.iter().any(|e| {
-            e.source_id.contains("bar") && e.target_id.contains("foo")
-        });
+        let bar_calls_foo = call_edges
+            .iter()
+            .any(|e| e.source_id.contains("bar") && e.target_id.contains("foo"));
         assert!(bar_calls_foo, "bar should call foo");
     }
 
@@ -1357,14 +1470,32 @@ interface Config {
         let mut indexer = CodeIndexer::new(dir.path()).expect("failed to create indexer");
         let (symbols, _edges) = indexer.index_file(&path).expect("failed to index");
 
-        let functions: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Function).collect();
-        assert!(functions.iter().any(|s| s.name == "greet"), "should find greet function");
+        let functions: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "greet"),
+            "should find greet function"
+        );
 
-        let classes: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
-        assert!(classes.iter().any(|s| s.name == "MyService"), "should find MyService class");
+        let classes: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
+        assert!(
+            classes.iter().any(|s| s.name == "MyService"),
+            "should find MyService class"
+        );
 
-        let interfaces: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Interface).collect();
-        assert!(interfaces.iter().any(|s| s.name == "Config"), "should find Config interface");
+        let interfaces: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Interface)
+            .collect();
+        assert!(
+            interfaces.iter().any(|s| s.name == "Config"),
+            "should find Config interface"
+        );
     }
 
     #[test]
@@ -1396,14 +1527,32 @@ func (s *Server) Start() error {
         let mut indexer = CodeIndexer::new(dir.path()).expect("failed to create indexer");
         let (symbols, _edges) = indexer.index_file(&path).expect("failed to index");
 
-        let functions: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Function).collect();
-        assert!(functions.iter().any(|s| s.name == "NewServer"), "should find NewServer function");
+        let functions: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            functions.iter().any(|s| s.name == "NewServer"),
+            "should find NewServer function"
+        );
 
-        let methods: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Method).collect();
-        assert!(methods.iter().any(|s| s.name == "Start"), "should find Start method");
+        let methods: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
+        assert!(
+            methods.iter().any(|s| s.name == "Start"),
+            "should find Start method"
+        );
 
-        let structs: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Struct).collect();
-        assert!(structs.iter().any(|s| s.name == "Server"), "should find Server struct");
+        let structs: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Struct)
+            .collect();
+        assert!(
+            structs.iter().any(|s| s.name == "Server"),
+            "should find Server struct"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1443,35 +1592,41 @@ fn foo() -> i32 {
         // Modify the file
         std::thread::sleep(std::time::Duration::from_millis(10));
         let mut f = fs::File::create(&path).unwrap();
-        f.write_all(b"fn foo() -> i32 { 99 }\nfn bar() {}\n").unwrap();
+        f.write_all(b"fn foo() -> i32 { 99 }\nfn bar() {}\n")
+            .unwrap();
 
         // Reindex after modification — should process again
         let result3 = indexer.reindex_if_changed(&path).expect("reindex failed");
         assert!(result3.is_some(), "changed file should be re-indexed");
         let (symbols3, _) = result3.unwrap();
-        assert!(symbols3.iter().any(|s| s.name == "bar"), "should find new function bar");
+        assert!(
+            symbols3.iter().any(|s| s.name == "bar"),
+            "should find new function bar"
+        );
     }
 
     #[test]
     fn test_unchanged_skipped() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = write_temp_file(
-            &dir,
-            "src/lib.rs",
-            "fn always_here() {}",
-        );
+        let path = write_temp_file(&dir, "src/lib.rs", "fn always_here() {}");
 
         let mut indexer = CodeIndexer::new(dir.path()).expect("failed to create indexer");
 
         // First pass — file is new
-        assert!(indexer.has_changed(&path).unwrap(), "new file should be detected as changed");
+        assert!(
+            indexer.has_changed(&path).unwrap(),
+            "new file should be detected as changed"
+        );
 
         // Index and fingerprint
         let result = indexer.reindex_if_changed(&path).expect("reindex failed");
         assert!(result.is_some());
 
         // Second pass — unchanged
-        assert!(!indexer.has_changed(&path).unwrap(), "unchanged file should not be detected as changed");
+        assert!(
+            !indexer.has_changed(&path).unwrap(),
+            "unchanged file should not be detected as changed"
+        );
 
         let result2 = indexer.reindex_if_changed(&path).expect("reindex failed");
         assert!(result2.is_none(), "unchanged file should be skipped");
@@ -1488,7 +1643,10 @@ fn foo() -> i32 {
 
         // Create second file — should be detected as new
         let path2 = write_temp_file(&dir, "src/b.rs", "fn second() {}");
-        assert!(indexer.has_changed(&path2).unwrap(), "new file should be detected as changed");
+        assert!(
+            indexer.has_changed(&path2).unwrap(),
+            "new file should be detected as changed"
+        );
         let result = indexer.reindex_if_changed(&path2).expect("reindex failed");
         assert!(result.is_some(), "new file should be indexed");
         let (symbols, _) = result.unwrap();
@@ -1497,12 +1655,27 @@ fn foo() -> i32 {
 
     #[test]
     fn test_language_detection() {
-        assert_eq!(IndexLanguage::from_extension("rs"), Some(IndexLanguage::Rust));
-        assert_eq!(IndexLanguage::from_extension("py"), Some(IndexLanguage::Python));
-        assert_eq!(IndexLanguage::from_extension("ts"), Some(IndexLanguage::TypeScript));
-        assert_eq!(IndexLanguage::from_extension("tsx"), Some(IndexLanguage::TypeScript));
+        assert_eq!(
+            IndexLanguage::from_extension("rs"),
+            Some(IndexLanguage::Rust)
+        );
+        assert_eq!(
+            IndexLanguage::from_extension("py"),
+            Some(IndexLanguage::Python)
+        );
+        assert_eq!(
+            IndexLanguage::from_extension("ts"),
+            Some(IndexLanguage::TypeScript)
+        );
+        assert_eq!(
+            IndexLanguage::from_extension("tsx"),
+            Some(IndexLanguage::TypeScript)
+        );
         assert_eq!(IndexLanguage::from_extension("go"), Some(IndexLanguage::Go));
-        assert_eq!(IndexLanguage::from_extension("java"), Some(IndexLanguage::Java));
+        assert_eq!(
+            IndexLanguage::from_extension("java"),
+            Some(IndexLanguage::Java)
+        );
         assert_eq!(IndexLanguage::from_extension("txt"), None);
         assert_eq!(IndexLanguage::from_extension("md"), None);
     }
@@ -1547,18 +1720,21 @@ fn foo() -> i32 {
             edge_type: SymbolEdgeType::Calls,
             file_path: "a.rs".into(),
         };
-        sqlite.index_file_symbols("a.rs", &[caller.clone(), callee.clone()], &[edge]).unwrap();
+        sqlite
+            .index_file_symbols("a.rs", &[caller.clone(), callee.clone()], &[edge])
+            .unwrap();
 
         // Wrap in Arc<dyn MemoryStore> for CodeIndexer
         let store: std::sync::Arc<dyn MemoryStore> = std::sync::Arc::new(sqlite);
 
         let dir = tempfile::TempDir::new().unwrap();
-        let indexer = CodeIndexer::new(dir.path())
-            .unwrap()
-            .with_store(store);
+        let indexer = CodeIndexer::new(dir.path()).unwrap().with_store(store);
 
         let report = indexer.get_impact("target_fn", 2).await;
-        assert!(!report.direct_callers.is_empty(), "should have direct callers");
+        assert!(
+            !report.direct_callers.is_empty(),
+            "should have direct callers"
+        );
         assert!(report.direct_callers.contains(&"caller_fn".to_string()));
         assert!(report.affected_files.contains(&"a.rs".to_string()));
         assert!(report.affected_files.contains(&"b.rs".to_string()));

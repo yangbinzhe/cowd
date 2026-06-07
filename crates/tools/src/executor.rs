@@ -5,18 +5,13 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    ApiError, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock, max_tokens_for_model,
+    max_tokens_for_model, ApiError, ContentBlockDelta, InputContentBlock, InputMessage,
+    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use base64::Engine;
 use reqwest::blocking::Client;
 use runtime::{
-    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput, BranchFreshness,
-    ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput,
-    LaneCommitProvenance, LaneContext, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
-    LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy,
-    PromptCacheEvent, RuntimeError, Session, SharedPrompter, TaskPacket, ToolError, ToolExecutor,
     check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash,
     gates::{GateContext, GateEvaluator},
     glob_search, grep_search, load_system_prompt,
@@ -24,15 +19,20 @@ use runtime::{
     read_file,
     summary_compression::compress_summary_text,
     worker_boot::{Worker, WorkerReadySnapshot, WorkerStatus, WorkerTaskReceipt},
-    write_file,
+    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
+    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
+    GrepSearchInput, LaneCommitProvenance, LaneContext, LaneEvent, LaneEventBlocker, LaneEventName,
+    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
+    PermissionPolicy, PromptCacheEvent, RuntimeError, Session, SharedPrompter, TaskPacket,
+    ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use crate::tool_specs::{ToolSpec, mvp_tool_specs};
+use crate::tool_specs::{mvp_tool_specs, ToolSpec};
 use crate::{
-    GlobalToolRegistry, global_cron_registry, global_lsp_registry, global_mcp_registry,
-    global_task_registry, global_team_registry, global_worker_registry,
+    global_cron_registry, global_lsp_registry, global_mcp_registry, global_task_registry,
+    global_team_registry, global_worker_registry, GlobalToolRegistry,
 };
 
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
@@ -3308,7 +3308,7 @@ impl ProviderRuntimeClient {
 fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
     let resolved = model.trim().to_string();
     let client = match runtime::resolve_global_provider(&resolved) {
-        Some(provider) => ProviderClient::from_config(provider).map_err(|e| e.to_string())?,
+        Some(provider) => ProviderClient::from_config(&provider).map_err(|e| e.to_string())?,
         None => {
             tracing::warn!(
                 "model '{resolved}' not in providers config, falling back to environment variables"
@@ -4935,17 +4935,17 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AgentInput, AgentJob, ProviderRuntimeClient, SubagentToolExecutor, agent_permission_policy,
-        allowed_tools_for_subagent, classify_lane_failure, derive_agent_state,
-        execute_agent_with_spawn, execute_tool, final_assistant_text, maybe_commit_provenance,
-        persist_agent_terminal_state, push_output_block, run_task_packet,
+        agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
+        derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
+        maybe_commit_provenance, persist_agent_terminal_state, push_output_block, run_task_packet,
+        AgentInput, AgentJob, ProviderRuntimeClient, SubagentToolExecutor,
     };
-    use crate::{GlobalToolRegistry, mvp_tool_specs, permission_mode_from_plugin};
+    use crate::{mvp_tool_specs, permission_mode_from_plugin, GlobalToolRegistry};
     use api::OutputContentBlock;
     use runtime::{
-        ApiRequest, AssistantEvent, ConversationRuntime, LaneEventName, LaneFailureClass,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, SharedPrompter, TaskPacket,
-        TaskScope, ToolExecutor, permission_enforcer::PermissionEnforcer,
+        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
+        LaneEventName, LaneFailureClass, PermissionMode, PermissionPolicy, RuntimeError, Session,
+        SharedPrompter, TaskPacket, TaskScope, ToolExecutor,
     };
     use serde_json::json;
 
@@ -5663,11 +5663,9 @@ mod tests {
             .expect_err("subagent write tool should be denied before dispatch");
 
         // then
-        assert!(
-            error
-                .to_string()
-                .contains("requires workspace-write permission")
-        );
+        assert!(error
+            .to_string()
+            .contains("requires workspace-write permission"));
     }
 
     #[test]
@@ -5805,12 +5803,10 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["url"], format!("http://{}/plain", server.addr()));
-        assert!(
-            output["result"]
-                .as_str()
-                .expect("result")
-                .contains("plain text response")
-        );
+        assert!(output["result"]
+            .as_str()
+            .expect("result")
+            .contains("plain text response"));
 
         let error = execute_tool(
             "WebFetch",
@@ -6108,18 +6104,14 @@ mod tests {
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["skill"], "help");
-        assert!(
-            output["path"]
-                .as_str()
-                .expect("path")
-                .ends_with("/help/SKILL.md")
-        );
-        assert!(
-            output["prompt"]
-                .as_str()
-                .expect("prompt")
-                .contains("Guide on using oh-my-codex plugin")
-        );
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("/help/SKILL.md"));
+        assert!(output["prompt"]
+            .as_str()
+            .expect("prompt")
+            .contains("Guide on using oh-my-codex plugin"));
 
         let dollar_result = execute_tool(
             "Skill",
@@ -6131,12 +6123,10 @@ mod tests {
         let dollar_output: serde_json::Value =
             serde_json::from_str(&dollar_result).expect("valid json");
         assert_eq!(dollar_output["skill"], "$help");
-        assert!(
-            dollar_output["path"]
-                .as_str()
-                .expect("path")
-                .ends_with("/help/SKILL.md")
-        );
+        assert!(dollar_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("/help/SKILL.md"));
 
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -6172,23 +6162,19 @@ mod tests {
             .expect("project-local skill should resolve");
         let skill_output: serde_json::Value =
             serde_json::from_str(&skill_result).expect("valid json");
-        assert!(
-            skill_output["path"]
-                .as_str()
-                .expect("path")
-                .ends_with(".cowd/skills/plan/SKILL.md")
-        );
+        assert!(skill_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".cowd/skills/plan/SKILL.md"));
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
             .expect("legacy command should resolve");
         let command_output: serde_json::Value =
             serde_json::from_str(&command_result).expect("valid json");
-        assert!(
-            command_output["path"]
-                .as_str()
-                .expect("path")
-                .ends_with(".cowd/commands/handoff.md")
-        );
+        assert!(command_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".cowd/commands/handoff.md"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         fs::remove_dir_all(root).expect("temp project should clean up");
@@ -6223,12 +6209,10 @@ mod tests {
             .expect("project-local skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(
-            output["path"]
-                .as_str()
-                .expect("path")
-                .ends_with(".claude/skills/trace/SKILL.md")
-        );
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".claude/skills/trace/SKILL.md"));
         assert_eq!(output["description"], "Project-local trace helper");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -6287,19 +6271,15 @@ mod tests {
         let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
         let agents_output: serde_json::Value =
             serde_json::from_str(&agents_result).expect("valid json");
-        assert!(
-            omc_output["path"]
-                .as_str()
-                .expect("path")
-                .ends_with(".cowd/skills/hud/SKILL.md")
-        );
+        assert!(omc_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".cowd/skills/hud/SKILL.md"));
         assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
-        assert!(
-            agents_output["path"]
-                .as_str()
-                .expect("path")
-                .ends_with(".agents/skills/trace/SKILL.md")
-        );
+        assert!(agents_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".agents/skills/trace/SKILL.md"));
         assert_eq!(
             agents_output["description"],
             "Project-local agents compatibility helper"
@@ -6351,12 +6331,10 @@ mod tests {
             .expect("learned skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(
-            output["path"]
-                .as_str()
-                .expect("path")
-                .ends_with("skills/omc-learned/learned/SKILL.md")
-        );
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("skills/omc-learned/learned/SKILL.md"));
         assert_eq!(output["description"], "Learned OMC skill");
 
         match original_home {
@@ -6412,24 +6390,20 @@ mod tests {
             execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
         let direct_skill_output: serde_json::Value =
             serde_json::from_str(&direct_skill).expect("valid skill json");
-        assert!(
-            direct_skill_output["path"]
-                .as_str()
-                .expect("path")
-                .ends_with("skills/statusline/SKILL.md")
-        );
+        assert!(direct_skill_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("skills/statusline/SKILL.md"));
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
         let legacy_command =
             execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
         let legacy_command_output: serde_json::Value =
             serde_json::from_str(&legacy_command).expect("valid command json");
-        assert!(
-            legacy_command_output["path"]
-                .as_str()
-                .expect("path")
-                .ends_with("commands/doctor-check.md")
-        );
+        assert!(legacy_command_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("commands/doctor-check.md"));
         assert_eq!(
             legacy_command_output["description"],
             "Claude config command"
@@ -6483,12 +6457,10 @@ mod tests {
             .expect("legacy command markdown should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        assert!(
-            output["path"]
-                .as_str()
-                .expect("path")
-                .ends_with(".claude/commands/team.md")
-        );
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".claude/commands/team.md"));
         assert_eq!(output["description"], "Legacy team workflow");
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -7049,18 +7021,16 @@ mod tests {
             final_assistant_text(&summary),
             "Scope: completed mock review"
         );
-        assert!(
-            runtime
-                .session()
-                .messages
-                .iter()
-                .flat_map(|message| message.blocks.iter())
-                .any(|block| matches!(
-                    block,
-                    runtime::ContentBlock::ToolResult { output, .. }
-                        if output.contains("hello from child")
-                ))
-        );
+        assert!(runtime
+            .session()
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .any(|block| matches!(
+                block,
+                runtime::ContentBlock::ToolResult { output, .. }
+                    if output.contains("hello from child")
+            )));
 
         let _ = std::fs::remove_file(path);
     }
@@ -7224,24 +7194,20 @@ mod tests {
             .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
-        assert!(
-            failure_output["stderr"]
-                .as_str()
-                .expect("stderr")
-                .contains("oops")
-        );
+        assert!(failure_output["stderr"]
+            .as_str()
+            .expect("stderr")
+            .contains("oops"));
 
         let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
             .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
         assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
-        assert!(
-            timeout_output["stderr"]
-                .as_str()
-                .expect("stderr")
-                .contains("Command exceeded timeout")
-        );
+        assert!(timeout_output["stderr"]
+            .as_str()
+            .expect("stderr")
+            .contains("Command exceeded timeout"));
 
         let background = execute_tool(
             "bash",
@@ -7282,12 +7248,10 @@ mod tests {
             output_json["returnCodeInterpretation"],
             "preflight_blocked:branch_divergence"
         );
-        assert!(
-            output_json["stderr"]
-                .as_str()
-                .expect("stderr")
-                .contains("branch divergence detected before workspace tests")
-        );
+        assert!(output_json["stderr"]
+            .as_str()
+            .expect("stderr")
+            .contains("branch divergence detected before workspace tests"));
         assert_eq!(
             output_json["structuredContent"][0]["event"],
             "branch.stale_against_main"
@@ -7471,12 +7435,10 @@ mod tests {
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
-        assert!(
-            globbed_output["filenames"][0]
-                .as_str()
-                .expect("filename")
-                .ends_with("nested/lib.rs")
-        );
+        assert!(globbed_output["filenames"][0]
+            .as_str()
+            .expect("filename")
+            .ends_with("nested/lib.rs"));
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
@@ -7500,12 +7462,10 @@ mod tests {
         assert_eq!(grep_content_output["numFiles"], 0);
         assert!(grep_content_output["appliedLimit"].is_null());
         assert_eq!(grep_content_output["appliedOffset"], 1);
-        assert!(
-            grep_content_output["content"]
-                .as_str()
-                .expect("content")
-                .contains("let alpha = 2;")
-        );
+        assert!(grep_content_output["content"]
+            .as_str()
+            .expect("content")
+            .contains("let alpha = 2;"));
 
         let grep_count = execute_tool(
             "grep_search",
@@ -7534,12 +7494,10 @@ mod tests {
         let elapsed = started.elapsed();
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["duration_ms"], 20);
-        assert!(
-            output["message"]
-                .as_str()
-                .expect("message")
-                .contains("Slept for 20ms")
-        );
+        assert!(output["message"]
+            .as_str()
+            .expect("message")
+            .contains("Slept for 20ms"));
         assert!(elapsed >= Duration::from_millis(15));
     }
 
@@ -7707,12 +7665,11 @@ mod tests {
         let local_settings = std::fs::read_to_string(cwd.join(".cowd").join("config.local.yaml"))
             .expect("local settings after exit");
         assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
-        assert!(
-            !cwd.join(".cowd")
-                .join("tool-state")
-                .join("plan-mode.json")
-                .exists()
-        );
+        assert!(!cwd
+            .join(".cowd")
+            .join("tool-state")
+            .join("plan-mode.json")
+            .exists());
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
@@ -7769,12 +7726,11 @@ mod tests {
             None,
             "permissions override should be removed on exit"
         );
-        assert!(
-            !cwd.join(".cowd")
-                .join("tool-state")
-                .join("plan-mode.json")
-                .exists()
-        );
+        assert!(!cwd
+            .join(".cowd")
+            .join("tool-state")
+            .join("plan-mode.json")
+            .exists());
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
@@ -7931,8 +7887,8 @@ printf 'pwsh:%s' "$1"
     }
 
     fn read_only_registry() -> super::GlobalToolRegistry {
-        use runtime::PermissionPolicy;
         use runtime::permission_enforcer::PermissionEnforcer;
+        use runtime::PermissionPolicy;
 
         let policy = mvp_tool_specs().into_iter().fold(
             PermissionPolicy::new(runtime::PermissionMode::ReadOnly),
@@ -8284,29 +8240,26 @@ printf 'pwsh:%s' "$1"
             let addr = listener.local_addr().expect("local addr");
             let (tx, rx) = std::sync::mpsc::channel::<()>();
 
-            let handle = thread::spawn(move || {
-                loop {
-                    if rx.try_recv().is_ok() {
-                        break;
-                    }
+            let handle = thread::spawn(move || loop {
+                if rx.try_recv().is_ok() {
+                    break;
+                }
 
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let mut buffer = [0_u8; 4096];
-                            let size = stream.read(&mut buffer).expect("read request");
-                            let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
-                            let request_line =
-                                request.lines().next().unwrap_or_default().to_string();
-                            let response = handler(&request_line);
-                            stream
-                                .write_all(response.to_bytes().as_slice())
-                                .expect("write response");
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(error) => panic!("server accept failed: {error}"),
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0_u8; 4096];
+                        let size = stream.read(&mut buffer).expect("read request");
+                        let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
+                        let request_line = request.lines().next().unwrap_or_default().to_string();
+                        let response = handler(&request_line);
+                        stream
+                            .write_all(response.to_bytes().as_slice())
+                            .expect("write response");
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("server accept failed: {error}"),
                 }
             });
 

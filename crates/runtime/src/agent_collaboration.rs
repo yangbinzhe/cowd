@@ -1429,51 +1429,33 @@ Retire: stale local jsonl resume assumptions"
         let candidates = board.memory_maintenance_candidates();
 
         assert_eq!(candidates.len(), 4);
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate.kind == MaintenanceCandidateKind::Conflict)
-        );
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate.kind == MaintenanceCandidateKind::AuthorityPromotion)
-        );
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate.kind == MaintenanceCandidateKind::Stale)
-        );
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate.kind == MaintenanceCandidateKind::RelationshipRefresh)
-        );
-        assert!(
-            candidates
-                .iter()
-                .all(|candidate| candidate.status == MaintenanceCandidateStatus::Open)
-        );
-        assert!(
-            candidates
-                .iter()
-                .all(|candidate| candidate.entry_ids.is_empty())
-        );
-        assert!(
-            candidates
-                .iter()
-                .all(|candidate| candidate.source.as_deref() == Some("collaboration_board"))
-        );
-        assert!(
-            candidates
-                .iter()
-                .all(|candidate| candidate.source_ref.as_deref() == Some(board.board_id.as_str()))
-        );
-        assert!(
-            candidates
-                .iter()
-                .all(|candidate| candidate.reason.contains("multi-agent collaboration pulse"))
-        );
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == MaintenanceCandidateKind::Conflict));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == MaintenanceCandidateKind::AuthorityPromotion));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == MaintenanceCandidateKind::Stale));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.kind == MaintenanceCandidateKind::RelationshipRefresh));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.status == MaintenanceCandidateStatus::Open));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.entry_ids.is_empty()));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.source.as_deref() == Some("collaboration_board")));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.source_ref.as_deref() == Some(board.board_id.as_str())));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.reason.contains("multi-agent collaboration pulse")));
     }
 
     #[test]

@@ -144,7 +144,11 @@ impl ContextPanel {
         envelope
             .selected
             .iter()
-            .find(|item| item.evidence.iter().any(|candidate| candidate == evidence_ref))
+            .find(|item| {
+                item.evidence
+                    .iter()
+                    .any(|candidate| candidate == evidence_ref)
+            })
             .map(|item| Self::preview(&item.content, 96))
     }
 
@@ -677,7 +681,10 @@ mod tests {
         ));
 
         assert!(panel.handle_event(&next).is_consumed());
-        assert_eq!(panel.selected_evidence_ref().as_deref(), Some("tool://tool-1"));
+        assert_eq!(
+            panel.selected_evidence_ref().as_deref(),
+            Some("tool://tool-1")
+        );
         assert!(panel.handle_event(&close).is_consumed());
         assert!(!panel.evidence_detail_open);
     }

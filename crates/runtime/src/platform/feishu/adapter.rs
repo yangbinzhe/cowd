@@ -19,21 +19,27 @@
 //! - The `receive()` trait method returns `Ok(None)` — events arrive through
 //!   the WebSocket client, not polling.
 
-use crate::platform::adapter::{ChatInfo, InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformEvent, PlatformResult};
-use crate::platform::types::SessionKey;
 use super::auth::AccessControl;
 use super::batch::{BatchSender, TextBatchManager};
+use super::card_handler::CardActionHandler;
 use super::markdown::{build_post_payload, build_text_payload, strip_markdown};
 use super::processing::{ChatProcessingQueue, ProcessingDecision};
-use super::card_handler::CardActionHandler;
 use super::reactions::ProcessingReactions;
-use super::types::{GetChatResponse, SendMessageRequest, SendMessageResponse, UpdateMessageRequest, UpdateMessageResponse, ReplyMessageRequest, ReplyMessageResponse};
+use super::types::{
+    GetChatResponse, ReplyMessageRequest, ReplyMessageResponse, SendMessageRequest,
+    SendMessageResponse, UpdateMessageRequest, UpdateMessageResponse,
+};
+use crate::platform::adapter::{
+    ChatInfo, InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter,
+    PlatformError, PlatformEvent, PlatformResult,
+};
+use crate::platform::types::SessionKey;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 
@@ -117,8 +123,12 @@ impl FeishuAdapter {
     /// `batch_manager` defaults to `None`. The `send()` method sends directly
     /// when `batch_manager` is `None`. This method is retained as a future extension point.
     pub fn enable_batching(&mut self, delay_ms: u64, max_messages: usize, max_chars: usize) {
-        tracing::info!("feishu: batch manager configured (delay={}ms, max_msg={}, max_chars={})",
-            delay_ms, max_messages, max_chars);
+        tracing::info!(
+            "feishu: batch manager configured (delay={}ms, max_msg={}, max_chars={})",
+            delay_ms,
+            max_messages,
+            max_chars
+        );
     }
 
     /// Check if the token needs refresh (expires within 5 minutes).
@@ -167,13 +177,14 @@ impl FeishuAdapter {
             return Err(PlatformError::AuthenticationFailed(token_resp.msg));
         }
 
-        let token = token_resp
-            .tenant_access_token
-            .ok_or_else(|| PlatformError::AuthenticationFailed("no token in response".to_string()))?;
+        let token = token_resp.tenant_access_token.ok_or_else(|| {
+            PlatformError::AuthenticationFailed("no token in response".to_string())
+        })?;
 
         // Store token expiry
         if let Some(expire) = token_resp.expire {
-            *self.token_expires_at.write().await = Some(Utc::now() + chrono::Duration::seconds(expire));
+            *self.token_expires_at.write().await =
+                Some(Utc::now() + chrono::Duration::seconds(expire));
         }
 
         Ok(token)
@@ -302,28 +313,34 @@ impl FeishuAdapter {
         // Handle different event types
         match event.header.event_type.as_str() {
             "im.message.receive_v1" => {
-                let content = event.message_data.as_ref()
+                let content = event
+                    .message_data
+                    .as_ref()
                     .ok_or_else(|| PlatformError::Unknown("missing message data".to_string()))?;
 
-                let msg_content: MessageContent = serde_json::from_value(content.clone())
-                    .map_err(|e| PlatformError::Unknown(format!("failed to parse message: {}", e)))?;
+                let msg_content: MessageContent =
+                    serde_json::from_value(content.clone()).map_err(|e| {
+                        PlatformError::Unknown(format!("failed to parse message: {}", e))
+                    })?;
 
                 // Parse the message body (it's a JSON string)
                 let text = serde_json::from_str::<serde_json::Value>(&msg_content.body.content)
                     .ok()
-                    .and_then(|v| v.get("text").and_then(|t| t.as_str().map(|s| s.to_string())))
+                    .and_then(|v| {
+                        v.get("text")
+                            .and_then(|t| t.as_str().map(|s| s.to_string()))
+                    })
                     .unwrap_or_default();
 
-                let open_id = msg_content.sender.sender_id.open_id
+                let open_id = msg_content
+                    .sender
+                    .sender_id
+                    .open_id
                     .as_ref()
                     .or_else(|| msg_content.sender.sender_id.user_id.as_ref())
                     .ok_or_else(|| PlatformError::Unknown("missing sender open_id".to_string()))?;
 
-                let session_key = SessionKey::with_thread(
-                    "feishu",
-                    open_id,
-                    &msg_content.chat_id,
-                );
+                let session_key = SessionKey::with_thread("feishu", open_id, &msg_content.chat_id);
 
                 return Ok(Some(InboundMessage {
                     platform: Platform::Feishu,
@@ -343,16 +360,27 @@ impl FeishuAdapter {
                 }));
             }
             "card.action.trigger" => {
-                let action_data = event.event_data.as_ref()
+                let action_data = event
+                    .event_data
+                    .as_ref()
                     .ok_or_else(|| PlatformError::Unknown("missing card action data".into()))?;
-                let message_id = action_data.get("open_message_id")
-                    .and_then(|v| v.as_str()).unwrap_or("");
-                let chat_id = action_data.get("open_chat_id")
-                    .and_then(|v| v.as_str()).unwrap_or("");
-                let operator_open_id = action_data.get("open_id")
-                    .and_then(|v| v.as_str()).unwrap_or("");
+                let message_id = action_data
+                    .get("open_message_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let chat_id = action_data
+                    .get("open_chat_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let operator_open_id = action_data
+                    .get("open_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 return Ok(CardActionHandler::handle_card_action(
-                    action_data, message_id, chat_id, operator_open_id,
+                    action_data,
+                    message_id,
+                    chat_id,
+                    operator_open_id,
                 ));
             }
             _ => {
@@ -435,9 +463,7 @@ impl FeishuAdapter {
             return Err(PlatformError::SendFailed(resp.msg));
         }
 
-        let msg_id = resp.data
-            .and_then(|d| d.message_id)
-            .unwrap_or_default();
+        let msg_id = resp.data.and_then(|d| d.message_id).unwrap_or_default();
 
         tracing::debug!(to = %session_key.user_id, %msg_id, "feishu card message sent");
         Ok(msg_id)
@@ -462,7 +488,10 @@ impl FeishuAdapter {
             match f().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    if matches!(e, PlatformError::RateLimited(_) | PlatformError::SendFailed(_)) {
+                    if matches!(
+                        e,
+                        PlatformError::RateLimited(_) | PlatformError::SendFailed(_)
+                    ) {
                         last_err = Some(e);
                         continue;
                     }
@@ -711,7 +740,6 @@ impl CardAction {
         self.style = Some(style.into());
         self
     }
-
 }
 
 impl FeishuAdapter {
@@ -795,7 +823,8 @@ impl PlatformAdapter for FeishuAdapter {
         *self.access_token.write().await = Some(token);
         *self.connected.write().await = true;
 
-        let ws_client = super::ws::FeishuWsClient::new(&self.config.app_id, &self.config.app_secret);
+        let ws_client =
+            super::ws::FeishuWsClient::new(&self.config.app_id, &self.config.app_secret);
         match ws_client.connect().await {
             Ok(rx) => {
                 *self.ws_events.lock().await = Some(rx);
@@ -843,32 +872,50 @@ impl PlatformAdapter for FeishuAdapter {
                 };
 
                 // 2. Access control filter
-                let chat_id = msg.session_key.thread_id.as_deref()
+                let chat_id = msg
+                    .session_key
+                    .thread_id
+                    .as_deref()
                     .unwrap_or(&msg.session_key.user_id);
-                let chat_type = event.get("event")
+                let chat_type = event
+                    .get("event")
                     .and_then(|e| e.get("message"))
                     .and_then(|m| m.get("chat_type"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("p2p");
                 let sender_open_id = &msg.session_key.user_id;
-                let is_bot = event.get("event")
+                let is_bot = event
+                    .get("event")
                     .and_then(|e| e.get("sender"))
                     .and_then(|s| s.get("sender_type"))
                     .and_then(|v| v.as_str())
                     .map(|t| t == "app" || t == "bot")
                     .unwrap_or(false);
-                let bot_mentioned = msg.text.contains(&format!("@{}", self.access_control.bot_name));
+                let bot_mentioned = msg
+                    .text
+                    .contains(&format!("@{}", self.access_control.bot_name));
 
-                let admit_result = self.access_control.admit(
-                    chat_id, chat_type, sender_open_id, None, is_bot, bot_mentioned,
-                ).await;
+                let admit_result = self
+                    .access_control
+                    .admit(
+                        chat_id,
+                        chat_type,
+                        sender_open_id,
+                        None,
+                        is_bot,
+                        bot_mentioned,
+                    )
+                    .await;
                 if !admit_result.admitted {
                     tracing::debug!("feishu: message filtered: {:?}", admit_result.reason);
                     return Ok(None);
                 }
 
                 // 3. Per-chat serial processing
-                let decision = self.processing_queue.try_process(chat_id, event.clone()).await;
+                let decision = self
+                    .processing_queue
+                    .try_process(chat_id, event.clone())
+                    .await;
                 match decision {
                     ProcessingDecision::Queued | ProcessingDecision::Dropped => {
                         return Ok(None);
@@ -918,12 +965,21 @@ impl PlatformAdapter for FeishuAdapter {
         Ok(())
     }
 
-    async fn send_image(&self, chat_id: &str, image_url: &str, caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_image(
+        &self,
+        chat_id: &str,
+        image_url: &str,
+        caption: Option<&str>,
+    ) -> PlatformResult<()> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
-        let image_bytes = client.get(image_url).send().await
+        let image_bytes = client
+            .get(image_url)
+            .send()
+            .await
             .map_err(|e| PlatformError::SendFailed(format!("download image: {e}")))?
-            .bytes().await
+            .bytes()
+            .await
             .map_err(|e| PlatformError::SendFailed(format!("read image bytes: {e}")))?;
         let image_key = super::media::upload_image(&token, &image_bytes, "message").await?;
         let content = if let Some(cap) = caption {
@@ -931,10 +987,16 @@ impl PlatformAdapter for FeishuAdapter {
         } else {
             serde_json::json!({"image_key": image_key}).to_string()
         };
-        self.send_feishu_typed_message(chat_id, "image", &content).await
+        self.send_feishu_typed_message(chat_id, "image", &content)
+            .await
     }
 
-    async fn send_image_file(&self, chat_id: &str, image_path: &str, caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_image_file(
+        &self,
+        chat_id: &str,
+        image_path: &str,
+        caption: Option<&str>,
+    ) -> PlatformResult<()> {
         let token = self.ensure_token().await?;
         let image_bytes = std::fs::read(image_path)
             .map_err(|e| PlatformError::SendFailed(format!("read file: {e}")))?;
@@ -944,50 +1006,85 @@ impl PlatformAdapter for FeishuAdapter {
         } else {
             serde_json::json!({"image_key": image_key}).to_string()
         };
-        self.send_feishu_typed_message(chat_id, "image", &content).await
+        self.send_feishu_typed_message(chat_id, "image", &content)
+            .await
     }
 
-    async fn send_voice(&self, chat_id: &str, audio_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_voice(
+        &self,
+        chat_id: &str,
+        audio_path: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         let token = self.ensure_token().await?;
         let audio_bytes = std::fs::read(audio_path)
             .map_err(|e| PlatformError::SendFailed(format!("read audio: {e}")))?;
-        let file_name = std::path::Path::new(audio_path).file_name()
-            .and_then(|n| n.to_str()).unwrap_or("audio.opus");
+        let file_name = std::path::Path::new(audio_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("audio.opus");
         let file_key = super::media::upload_file(&token, &audio_bytes, file_name, "opus").await?;
         let content = serde_json::json!({"file_key": file_key}).to_string();
-        self.send_feishu_typed_message(chat_id, "audio", &content).await
+        self.send_feishu_typed_message(chat_id, "audio", &content)
+            .await
     }
 
-    async fn send_document(&self, chat_id: &str, file_path: &str, file_name: Option<&str>, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_document(
+        &self,
+        chat_id: &str,
+        file_path: &str,
+        file_name: Option<&str>,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         let token = self.ensure_token().await?;
         let file_bytes = std::fs::read(file_path)
             .map_err(|e| PlatformError::SendFailed(format!("read file: {e}")))?;
         let name = file_name.unwrap_or_else(|| {
-            std::path::Path::new(file_path).file_name()
-                .and_then(|n| n.to_str()).unwrap_or("document")
+            std::path::Path::new(file_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("document")
         });
         let file_key = super::media::upload_file(&token, &file_bytes, name, "stream").await?;
         let content = serde_json::json!({"file_key": file_key}).to_string();
-        self.send_feishu_typed_message(chat_id, "file", &content).await
+        self.send_feishu_typed_message(chat_id, "file", &content)
+            .await
     }
 
-    async fn send_video(&self, chat_id: &str, video_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_video(
+        &self,
+        chat_id: &str,
+        video_path: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         let token = self.ensure_token().await?;
         let video_bytes = std::fs::read(video_path)
             .map_err(|e| PlatformError::SendFailed(format!("read video: {e}")))?;
-        let file_name = std::path::Path::new(video_path).file_name()
-            .and_then(|n| n.to_str()).unwrap_or("video.mp4");
+        let file_name = std::path::Path::new(video_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("video.mp4");
         let file_key = super::media::upload_file(&token, &video_bytes, file_name, "mp4").await?;
         let content = serde_json::json!({"file_key": file_key}).to_string();
-        self.send_feishu_typed_message(chat_id, "media", &content).await
+        self.send_feishu_typed_message(chat_id, "media", &content)
+            .await
     }
 
-    async fn send_animation(&self, chat_id: &str, animation_url: &str, caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_animation(
+        &self,
+        chat_id: &str,
+        animation_url: &str,
+        caption: Option<&str>,
+    ) -> PlatformResult<()> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
-        let gif_bytes = client.get(animation_url).send().await
+        let gif_bytes = client
+            .get(animation_url)
+            .send()
+            .await
             .map_err(|e| PlatformError::SendFailed(format!("download gif: {e}")))?
-            .bytes().await
+            .bytes()
+            .await
             .map_err(|e| PlatformError::SendFailed(format!("read gif bytes: {e}")))?;
         let image_key = super::media::upload_image(&token, &gif_bytes, "message").await?;
         let content = if let Some(cap) = caption {
@@ -995,10 +1092,16 @@ impl PlatformAdapter for FeishuAdapter {
         } else {
             serde_json::json!({"image_key": image_key}).to_string()
         };
-        self.send_feishu_typed_message(chat_id, "image", &content).await
+        self.send_feishu_typed_message(chat_id, "image", &content)
+            .await
     }
 
-    async fn edit_message(&self, _chat_id: &str, message_id: &str, content: &str) -> PlatformResult<()> {
+    async fn edit_message(
+        &self,
+        _chat_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> PlatformResult<()> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
         let url = format!(
@@ -1114,10 +1217,7 @@ impl PlatformAdapter for FeishuAdapter {
     async fn get_chat_info(&self, chat_id: &str) -> PlatformResult<ChatInfo> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
-        let url = format!(
-            "https://open.feishu.cn/open-apis/im/v1/chats/{}",
-            chat_id
-        );
+        let url = format!("https://open.feishu.cn/open-apis/im/v1/chats/{}", chat_id);
 
         let response = client
             .get(&url)
@@ -1151,18 +1251,25 @@ impl PlatformAdapter for FeishuAdapter {
             .map_err(|e| PlatformError::SendFailed(format!("invalid card JSON: {e}")))?;
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
-        let url = format!("{}/im/v1/messages?receive_id_type=open_id", self.api_base_url());
+        let url = format!(
+            "{}/im/v1/messages?receive_id_type=open_id",
+            self.api_base_url()
+        );
         let request = serde_json::json!({
             "receive_id": chat_id,
             "msg_type": "interactive",
             "content": card_json
         });
-        let response = client.post(&url)
+        let response = client
+            .post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .json(&request)
-            .send().await
+            .send()
+            .await
             .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
-        let resp: super::types::SendMessageResponse = response.json().await
+        let resp: super::types::SendMessageResponse = response
+            .json()
+            .await
             .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
         if resp.code != 0 {
             return Err(PlatformError::SendFailed(resp.msg));
@@ -1383,7 +1490,10 @@ mod tests {
                 "sender": {"sender_id": {"open_id": "ou_001"}}
             }
         });
-        assert_eq!(extract_chat_id(&event), Some("oc_test_chat_123".to_string()));
+        assert_eq!(
+            extract_chat_id(&event),
+            Some("oc_test_chat_123".to_string())
+        );
     }
 
     #[test]

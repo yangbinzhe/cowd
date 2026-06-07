@@ -971,11 +971,10 @@ mod tests {
     #[tokio::test]
     async fn sync_reads_l4_entries_inside_tokio_runtime() {
         let dir = unique_temp_dir("cowd-l4-component");
-        let manager = memory::CognitiveContextManager::new(test_memory_config(
-            &dir.join("memory.db"),
-        ))
-        .await
-        .unwrap();
+        let manager =
+            memory::CognitiveContextManager::new(test_memory_config(&dir.join("memory.db")))
+                .await
+                .unwrap();
         manager
             .create_entry(
                 memory::MemoryLayer::L4,

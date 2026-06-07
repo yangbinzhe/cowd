@@ -138,8 +138,7 @@ fn write_minimal_config(config_home: &std::path::Path) {
         permissions:\n  defaultMode: \"acceptEdits\"\n  allow: []\n  deny: []\n  ask: []\n\
         memory:\n  enabled: false\n\
         gateway:\n  enabled: false\n";
-    fs::write(config_dir.join("config.yaml"), config_content)
-        .expect("minimal config should write");
+    fs::write(config_dir.join("config.yaml"), config_content).expect("minimal config should write");
 }
 
 fn run_cowd(

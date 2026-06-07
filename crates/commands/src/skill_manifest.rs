@@ -37,8 +37,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Supported platform types
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,18 +240,19 @@ pub fn parse_skill_content(contents: &str) -> Result<ParsedSkill, SkillParseErro
         match serde_yaml::from_str::<serde_yaml::Value>(&yaml_str) {
             Ok(yaml) => {
                 let manifest = parse_enhanced_manifest(&yaml)?;
-                let legacy = LegacyFrontmatter {
-                    name: manifest.as_ref().map(|m| m.name.clone()).or_else(|| {
-                        yaml.get("name")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    }),
-                    description: manifest.as_ref().map(|m| m.description.clone()).or_else(|| {
-                        yaml.get("description")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                    }),
-                };
+                let legacy =
+                    LegacyFrontmatter {
+                        name: manifest.as_ref().map(|m| m.name.clone()).or_else(|| {
+                            yaml.get("name").and_then(|v| v.as_str()).map(String::from)
+                        }),
+                        description: manifest.as_ref().map(|m| m.description.clone()).or_else(
+                            || {
+                                yaml.get("description")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from)
+                            },
+                        ),
+                    };
                 (manifest, legacy, body.to_string())
             }
             Err(_e) => {
@@ -303,7 +304,13 @@ fn extract_frontmatter(content: &str) -> Option<(String, String)> {
 
     let yaml_str = yaml_lines.join("\n");
     let body = if let Some(start) = body_start {
-        content.lines().skip(start).collect::<Vec<_>>().join("\n").trim_start_matches('\n').to_string()
+        content
+            .lines()
+            .skip(start)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_start_matches('\n')
+            .to_string()
     } else {
         String::new()
     };
@@ -312,7 +319,9 @@ fn extract_frontmatter(content: &str) -> Option<(String, String)> {
 }
 
 /// Parse enhanced manifest from YAML value
-fn parse_enhanced_manifest(yaml: &serde_yaml::Value) -> Result<Option<SkillManifest>, SkillParseError> {
+fn parse_enhanced_manifest(
+    yaml: &serde_yaml::Value,
+) -> Result<Option<SkillManifest>, SkillParseError> {
     let obj = match yaml {
         serde_yaml::Value::Mapping(m) => m,
         _ => return Ok(None),
@@ -350,9 +359,9 @@ fn parse_enhanced_manifest(yaml: &serde_yaml::Value) -> Result<Option<SkillManif
         .map(|seq| {
             seq.iter()
                 .map(|p| {
-                    let s = p.as_str().ok_or_else(|| SkillParseError::InvalidPlatform(
-                        format!("{:?}", p)
-                    ))?;
+                    let s = p
+                        .as_str()
+                        .ok_or_else(|| SkillParseError::InvalidPlatform(format!("{:?}", p)))?;
                     match s.to_lowercase().as_str() {
                         "macos" | "darwin" => Ok(Platform::Macos),
                         "linux" => Ok(Platform::Linux),
@@ -414,7 +423,8 @@ fn parse_enhanced_manifest(yaml: &serde_yaml::Value) -> Result<Option<SkillManif
         .map(|m| SkillHermesMetadata {
             tags: get_string_list_from_map(m, "tags"),
             related_skills: get_string_list_from_map(m, "related_skills"),
-            config: m.get(&serde_yaml::Value::String("config".into()))
+            config: m
+                .get(&serde_yaml::Value::String("config".into()))
                 .and_then(|v| v.as_sequence())
                 .map(|seq| {
                     seq.iter()
@@ -431,7 +441,8 @@ fn parse_enhanced_manifest(yaml: &serde_yaml::Value) -> Result<Option<SkillManif
                         })
                         .collect()
                 }),
-            conditions: m.get(&serde_yaml::Value::String("conditions".into()))
+            conditions: m
+                .get(&serde_yaml::Value::String("conditions".into()))
                 .and_then(|v| v.as_mapping())
                 .map(|m| SkillConditions {
                     fallback_for_tools: get_string_list_from_map(m, "fallback_for_tools"),
@@ -488,9 +499,7 @@ fn unquote_value(value: &str) -> String {
 /// Get a required string field from YAML mapping
 fn get_required_string(obj: &serde_yaml::Mapping, key: &str) -> Result<String, SkillParseError> {
     match obj.get(&serde_yaml::Value::String(key.into())) {
-        Some(serde_yaml::Value::Null) | None => {
-            Err(SkillParseError::MissingField(key.to_string()))
-        }
+        Some(serde_yaml::Value::Null) | None => Err(SkillParseError::MissingField(key.to_string())),
         Some(v) => Ok(v
             .as_str()
             .map(String::from)

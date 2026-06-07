@@ -269,7 +269,10 @@ impl<'m> TransactionGuard<'m> {
     ///
     /// The effect's `apply()` is called immediately. If it fails, the
     /// error is returned and the effect is not added to the transaction.
-    pub fn record(&mut self, effect: impl ReversibleEffect + 'static) -> Result<(), TransactionError> {
+    pub fn record(
+        &mut self,
+        effect: impl ReversibleEffect + 'static,
+    ) -> Result<(), TransactionError> {
         let boxed: Box<dyn ReversibleEffect> = Box::new(effect);
         boxed.apply()?;
         self.effects.push(boxed);
@@ -454,8 +457,12 @@ mod tests {
         let manager = TransactionManager::new();
         {
             let mut guard = manager.begin();
-            guard.record_file_edit(FileEditEffect::prepare(&path_a, "a_new").unwrap()).unwrap();
-            guard.record_file_edit(FileEditEffect::prepare(&path_b, "b_new").unwrap()).unwrap();
+            guard
+                .record_file_edit(FileEditEffect::prepare(&path_a, "a_new").unwrap())
+                .unwrap();
+            guard
+                .record_file_edit(FileEditEffect::prepare(&path_b, "b_new").unwrap())
+                .unwrap();
             // Both applied
             assert_eq!(fs::read_to_string(&path_a).unwrap(), "a_new");
             assert_eq!(fs::read_to_string(&path_b).unwrap(), "b_new");
@@ -491,7 +498,9 @@ mod tests {
         let manager = TransactionManager::new();
         {
             let mut guard = manager.begin();
-            guard.record_file_edit(FileEditEffect::prepare(&path, "after").unwrap()).unwrap();
+            guard
+                .record_file_edit(FileEditEffect::prepare(&path, "after").unwrap())
+                .unwrap();
             guard.commit();
         }
         assert_eq!(manager.effect_count(), 1);

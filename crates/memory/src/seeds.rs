@@ -15,9 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     error::MemoryError,
-    types::{
-        DecisionEntry, DecisionStatus, DecisionThread, Priority, Seed, SeedId, SeedTrigger,
-    },
+    types::{DecisionEntry, DecisionStatus, DecisionThread, Priority, Seed, SeedId, SeedTrigger},
 };
 
 /// Result alias used throughout this module.
@@ -430,7 +428,12 @@ mod tests {
     #[test]
     fn plant_and_check_phase_trigger() {
         let mut reg = SeedRegistry::new();
-        reg.plant("test", "content", SeedTrigger::Phase("build".into()), Priority::Normal);
+        reg.plant(
+            "test",
+            "content",
+            SeedTrigger::Phase("build".into()),
+            Priority::Normal,
+        );
         let hits = reg.check_triggers("build", &[], Utc::now());
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "test");

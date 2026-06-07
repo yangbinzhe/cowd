@@ -125,9 +125,7 @@ impl HandoffManager {
         let json_path = self
             .handoff_dir
             .join(format!("{}.json", handoff.session_id));
-        let md_path = self
-            .handoff_dir
-            .join(format!("{}.md", handoff.session_id));
+        let md_path = self.handoff_dir.join(format!("{}.md", handoff.session_id));
 
         let json = serde_json::to_string_pretty(handoff).map_err(MemoryError::Serialisation)?;
         let markdown = self.to_markdown(handoff);
@@ -143,9 +141,7 @@ impl HandoffManager {
     /// Load the handoff for `session_id`.  Returns `Ok(None)` if no such file
     /// exists.
     pub fn load(&self, session_id: &str) -> Result<Option<HandoffData>> {
-        let path = self
-            .handoff_dir
-            .join(format!("{session_id}.json"));
+        let path = self.handoff_dir.join(format!("{session_id}.json"));
 
         if !path.exists() {
             return Ok(None);
@@ -154,8 +150,7 @@ impl HandoffManager {
         let text = fs::read_to_string(&path)
             .map_err(|e| MemoryError::Store(format!("read handoff {}: {e}", path.display())))?;
 
-        let data: HandoffData =
-            serde_json::from_str(&text).map_err(MemoryError::Serialisation)?;
+        let data: HandoffData = serde_json::from_str(&text).map_err(MemoryError::Serialisation)?;
 
         Ok(Some(data))
     }
@@ -330,9 +325,8 @@ impl HandoffManager {
     fn atomic_write(&self, path: &Path, content: &str) -> Result<()> {
         // Ensure parent dir exists.
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                MemoryError::Store(format!("create dir {}: {e}", parent.display()))
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|e| MemoryError::Store(format!("create dir {}: {e}", parent.display())))?;
         }
 
         let tmp_path = path.with_extension("tmp");
@@ -343,9 +337,7 @@ impl HandoffManager {
                 .create(true)
                 .truncate(true)
                 .open(&tmp_path)
-                .map_err(|e| {
-                    MemoryError::Store(format!("open tmp {}: {e}", tmp_path.display()))
-                })?;
+                .map_err(|e| MemoryError::Store(format!("open tmp {}: {e}", tmp_path.display())))?;
 
             tmp.write_all(content.as_bytes()).map_err(|e| {
                 MemoryError::Store(format!("write tmp {}: {e}", tmp_path.display()))
@@ -425,11 +417,7 @@ impl HandoffManager {
             let _ = writeln!(md, "## Key Decisions");
             let _ = writeln!(md);
             for d in &handoff.decisions {
-                let _ = writeln!(
-                    md,
-                    "### {} (`{:?}`)",
-                    d.summary, d.status
-                );
+                let _ = writeln!(md, "### {} (`{:?}`)", d.summary, d.status);
                 let _ = writeln!(md, "> {}", d.rationale);
                 let _ = writeln!(md);
             }
@@ -440,10 +428,7 @@ impl HandoffManager {
             let _ = writeln!(md, "## Blockers");
             let _ = writeln!(md);
             for b in &handoff.blockers {
-                let hint = b
-                    .resolution_hint
-                    .as_deref()
-                    .unwrap_or("no hint available");
+                let hint = b.resolution_hint.as_deref().unwrap_or("no hint available");
                 let _ = writeln!(md, "- **Blocker:** {} *(hint: {})*", b.description, hint);
             }
             let _ = writeln!(md);
@@ -586,10 +571,7 @@ mod tests {
         let h = sample_handoff("resume-test");
         mgr.resume(h).await.unwrap();
 
-        let resumed_path = tmp
-            .path()
-            .join("handoffs")
-            .join("resume-test.resumed.json");
+        let resumed_path = tmp.path().join("handoffs").join("resume-test.resumed.json");
         assert!(resumed_path.exists(), "resumed.json should be written");
     }
 

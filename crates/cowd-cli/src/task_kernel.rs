@@ -4,7 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -642,12 +642,10 @@ mod tests {
             reviewed_phase.review_result.as_deref(),
             Some("accepted after gate")
         );
-        assert!(
-            reviewed
-                .audit
-                .iter()
-                .any(|event| event.event_type == "phase_reviewed")
-        );
+        assert!(reviewed
+            .audit
+            .iter()
+            .any(|event| event.event_type == "phase_reviewed"));
 
         let restored = TaskKernel::open(path.clone()).unwrap();
         let restored_task = restored

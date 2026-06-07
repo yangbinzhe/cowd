@@ -146,9 +146,12 @@ window.Panels = (()=>{
     const row=UI.el('button','context-history-item');
     const envelope=item.envelope||{};
     const diagnostics=envelope.diagnostics||{};
+    const profile=envelope.profile||item.profile||'Context';
+    const intent=envelope.intent||item.intent||'';
+    const pressure=diagnostics.pressure_bp??item.pressure_bp;
     const stamp=item.created_at_ms?new Date(item.created_at_ms).toLocaleTimeString():'n/a';
     row.type='button';
-    row.innerHTML='<b>'+UI.esc(envelope.profile||'Context')+'</b><small>'+UI.esc([item.envelope_id||envelope.id||'no-id',item.run_id||'no-run','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(envelope.intent||''))+'</em><span>'+UI.esc(fmtPressure(diagnostics.pressure_bp))+'</span>';
+    row.innerHTML='<b>'+UI.esc(profile)+'</b><small>'+UI.esc([item.envelope_id||envelope.id||'no-id',item.run_id||'no-run','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(intent))+'</em><span>'+UI.esc(fmtPressure(pressure))+'</span>';
     row.onclick=function(){if(onSelect)onSelect(item)};
     return row;
   }
@@ -167,18 +170,31 @@ window.Panels = (()=>{
     return detail;
   }
 
-  function renderRuntimeRunItem(item){
+  function contextHistoryRows(timeline){
+    if(timeline&&timeline.summaries&&timeline.summaries.length)return timeline.summaries;
+    return (timeline&&timeline.envelopes)||[];
+  }
+
+  function renderRuntimeRunItem(item,onContextSelect){
     const row=UI.el('div','runtime-run-item');
     const run=(item&&item.run)||{};
     const stamp=item.created_at_ms?new Date(item.created_at_ms).toLocaleTimeString():'n/a';
     row.innerHTML='<b>'+UI.esc(run.status||run.phase||'run')+'</b><small>'+UI.esc([run.profile||'MainTurn',run.run_id||'no-run-id','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(run.intent_preview||run.error||run.context_envelope_id||''))+'</em>';
+    if(run.context_envelope_id&&onContextSelect){
+      const link=UI.el('button','runtime-context-link');
+      link.type='button';
+      link.textContent='context '+run.context_envelope_id;
+      link.onclick=function(){onContextSelect({envelope_id:run.context_envelope_id,run_id:run.run_id,sequence:item.sequence,created_at_ms:item.created_at_ms})};
+      row.appendChild(link);
+    }
     return row;
   }
 
-  function renderRuntimeTimelineItem(item){
+  function renderRuntimeTimelineItem(item,onContextSelect){
     const row=UI.el('div','runtime-run-item runtime-timeline-item');
     const stamp=item.created_at_ms?new Date(item.created_at_ms).toLocaleTimeString():'n/a';
-    const refs=(item.refs||[]).map(function(ref){return (ref.type||ref.ref_type||'ref')+':'+(ref.id||'')}).filter(Boolean).slice(0,3).join(' · ');
+    const refsList=(item.refs||[]).filter(function(ref){return ref&&ref.id});
+    const refs=refsList.map(function(ref){return (ref.type||ref.ref_type||'ref')+':'+(ref.id||'')}).filter(Boolean).slice(0,3).join(' · ');
     const payload=item.payload||{};
     const score=payload.scorecard||{};
     const complexity=(payload.complexity)||{};
@@ -189,6 +205,18 @@ window.Panels = (()=>{
       ? 'board '+payload.board_id+' · complete '+fmtPct(score.completion_rate)+' · conflicts '+fmtNumber(score.conflict_count)+' · candidates '+((payload.maintenance_candidates||[]).length)
       : '';
     row.innerHTML='<b>'+UI.esc(item.kind||'event')+'</b><small>'+UI.esc([item.scope||'runtime','seq '+(item.sequence??'n/a'),stamp].join(' · '))+'</small><em>'+UI.esc(contextTextPreview(policyText||refs||scoreText||payload.summary||payload.error||payload.intent_preview||''))+'</em>';
+    const contextRefs=refsList.filter(function(ref){return (ref.type||ref.ref_type)==='context_envelope'});
+    if(contextRefs.length&&onContextSelect){
+      const refRow=UI.el('div','runtime-ref-actions');
+      contextRefs.slice(0,2).forEach(function(ref){
+        const btn=UI.el('button','runtime-context-link');
+        btn.type='button';
+        btn.textContent='context '+ref.id;
+        btn.onclick=function(){onContextSelect(ref.id)};
+        refRow.appendChild(btn);
+      });
+      row.appendChild(refRow);
+    }
     return row;
   }
 
@@ -293,6 +321,147 @@ window.Panels = (()=>{
       const detail=UI.el('div','runtime-workgraph-detail');
       detail.innerHTML='<b>'+UI.esc(reasons[0])+'</b><small>'+UI.esc('latest value '+fmtNumber(health.latest_value_score)+' · events '+fmtNumber(health.event_count))+'</small>';
       sec.appendChild(detail);
+    }
+    return sec;
+  }
+
+  function renderValueLoopSummary(summary){
+    const loop=summary||{};
+    const sec=UI.el('div','runtime-workgraph-summary runtime-value-loop-summary');
+    sec.innerHTML='<h4>Value Loop</h4>';
+    const metrics=UI.el('div','memory-metrics');
+    metrics.appendChild(renderMemoryMetric('status',loop.status||'unknown','loop'));
+    metrics.appendChild(renderMemoryMetric('score',fmtNumber(loop.score),'closure'));
+    metrics.appendChild(renderMemoryMetric('covered',fmtNumber(loop.required_observed)+'/'+fmtNumber(loop.required_total),'stages'));
+    metrics.appendChild(renderMemoryMetric('missing',fmtNumber(loop.missing_required_count),'required'));
+    metrics.appendChild(renderMemoryMetric('failed',fmtNumber(loop.failed_events),'events'));
+    metrics.appendChild(renderMemoryMetric('open',fmtNumber(loop.open_tasks),'tasks'));
+    sec.appendChild(metrics);
+    const stages=loop.stages||[];
+    if(stages.length){
+      const grid=UI.el('div','runtime-value-loop-stages');
+      stages.forEach(function(stage){
+        const item=UI.el('span','runtime-value-loop-stage runtime-value-loop-stage-'+(stage.status||'unknown'));
+        item.textContent=(stage.label||stage.id||'stage')+' · '+(stage.status||'unknown');
+        item.title=[stage.id,stage.latest_kind||'',stage.latest_sequence!==undefined?'seq '+stage.latest_sequence:''].filter(Boolean).join(' · ');
+        grid.appendChild(item);
+      });
+      sec.appendChild(grid);
+    }
+    const reasons=loop.reasons||loop.next_actions||[];
+    if(reasons.length){
+      const detail=UI.el('div','runtime-workgraph-detail');
+      detail.innerHTML='<b>'+UI.esc(reasons[0])+'</b><small>'+UI.esc((loop.next_actions||[]).slice(0,2).join(' · '))+'</small>';
+      sec.appendChild(detail);
+    }
+    return sec;
+  }
+
+  function renderAgentValueSummary(summary){
+    const agent=summary||{};
+    const latest=agent.latest||{};
+    const policy=agent.policy||{};
+    const sec=UI.el('div','runtime-workgraph-summary runtime-agent-value-summary');
+    sec.innerHTML='<h4>Agent Value</h4>';
+    const metrics=UI.el('div','memory-metrics');
+    metrics.appendChild(renderMemoryMetric('status',agent.status||'unknown','agent'));
+    metrics.appendChild(renderMemoryMetric('decision',agent.recommendation||'n/a','next'));
+    metrics.appendChild(renderMemoryMetric('score',fmtNumber(latest.value_score),'value'));
+    metrics.appendChild(renderMemoryMetric('threshold',fmtNumber(policy.min_collaboration_score),'policy'));
+    metrics.appendChild(renderMemoryMetric('lift',latest.positive_lift?'yes':'no','proven'));
+    metrics.appendChild(renderMemoryMetric('conflicts',fmtNumber(latest.conflict_count),'review'));
+    sec.appendChild(metrics);
+    const reasons=agent.reasons||[];
+    if(reasons.length){
+      const detail=UI.el('div','runtime-workgraph-detail');
+      detail.innerHTML='<b>'+UI.esc(reasons[0])+'</b><small>'+UI.esc(['agents '+fmtNumber(latest.agent_tasks),'synthesis '+fmtPct(latest.synthesis_lift),'complement '+fmtPct(latest.complementarity_score)].join(' · '))+'</small>';
+      sec.appendChild(detail);
+    }
+    return sec;
+  }
+
+  function renderRuntimeControlPlane(plane){
+    const sec=UI.el('div','runtime-control-plane');
+    sec.innerHTML='<h4>Control Plane</h4>';
+    if(!plane){
+      sec.appendChild(UI.el('div','panel-empty','Control plane unavailable'));
+      return sec;
+    }
+    const components=plane.components||{};
+    const session=components.session||{};
+    const memory=components.memory||{};
+    const context=components.context||{};
+    const agent=components.agent||{};
+    const task=components.task||{};
+    const permissions=components.permissions||{};
+    const provider=components.provider||{};
+    const channels=components.channels||{};
+    const config=plane.config||{};
+    const diagnostics=plane.diagnostics||{};
+    const readiness=plane.readiness||{};
+    const head=UI.el('div','runtime-control-plane-head');
+    head.innerHTML='<span class="'+memoryHealthClass({status:plane.status,degraded:plane.degraded})+'">'+UI.esc(plane.status||'unknown')+'</span><small>'+UI.esc([config.scenario,config.source,plane.profile_id].filter(Boolean).join(' · '))+'</small>';
+    const reloadBtn=UI.el('button','btn-secondary btn-xs','Reload providers');
+    reloadBtn.type='button';
+    reloadBtn.onclick=async function(){
+      reloadBtn.disabled=true;
+      try{
+        const result=await Api.runtimeReloadProviders();
+        UI.showToast('Providers '+(result.status||'reloaded'),'success');
+        sec.dataset.providerReloadStatus=result.status||'unknown';
+        sec.dataset.providerReloadApplied=result.applied?'true':'false';
+        await renderRuntimeConsole();
+      }catch(err){
+        UI.showToast(err.message,'error');
+      }finally{
+        reloadBtn.disabled=false;
+      }
+    };
+    head.appendChild(reloadBtn);
+    sec.appendChild(head);
+    const metrics=UI.el('div','memory-metrics');
+    metrics.appendChild(renderMemoryMetric('store',session.source_of_truth||'n/a','session'));
+    metrics.appendChild(renderMemoryMetric('active',session.active_count??0,'sessions'));
+    metrics.appendChild(renderMemoryMetric('memory',memory.status||'n/a',memory.search_mode||'mode'));
+    metrics.appendChild(renderMemoryMetric('history',context.durable_history?'on':'off','context'));
+    metrics.appendChild(renderMemoryMetric('agents',agent.max_parallel_agents??0,agent.status||'policy'));
+    metrics.appendChild(renderMemoryMetric('tasks',task.open??0,'open'));
+    metrics.appendChild(renderMemoryMetric('auth',permissions.auth_required?'on':'off','permission'));
+    metrics.appendChild(renderMemoryMetric('gate',permissions.approval_gate?'on':'off','approval'));
+    metrics.appendChild(renderMemoryMetric('provider',provider.status||'n/a','model'));
+    metrics.appendChild(renderMemoryMetric('models',provider.model_count??diagnostics.provider_model_count??0,'provider'));
+    metrics.appendChild(renderMemoryMetric('route',provider.configured_model_resolved?'ok':'miss','model'));
+    metrics.appendChild(renderMemoryMetric('channels',(channels.adapters||[]).length,'adapters'));
+    metrics.appendChild(renderMemoryMetric('stored',diagnostics.stored_sessions??'n/a','sessions'));
+    metrics.appendChild(renderMemoryMetric('latency',(diagnostics.elapsed_ms??0)+'ms','control'));
+    metrics.appendChild(renderMemoryMetric('perf',diagnostics.performance_status||'n/a','control'));
+    metrics.appendChild(renderMemoryMetric('ready',(readiness.score??diagnostics.readiness_score??0)+'%','runtime'));
+    metrics.appendChild(renderMemoryMetric('blocked',readiness.required_blocked??diagnostics.blocked_required_count??0,'required'));
+    metrics.appendChild(renderMemoryMetric('components',diagnostics.component_count??0,'diag'));
+    metrics.appendChild(renderMemoryMetric('caps',diagnostics.capability_count??(plane.capabilities||[]).length,'diag'));
+    sec.appendChild(metrics);
+    if((plane.degraded_reasons||[]).length){
+      const reasons=UI.el('div','runtime-control-plane-reasons');
+      reasons.textContent='degraded: '+plane.degraded_reasons.slice(0,3).join(' · ');
+      sec.appendChild(reasons);
+    }
+    const blocked=(readiness.blocked||[]).slice(0,3);
+    if(blocked.length){
+      const blockedRow=UI.el('div','runtime-control-plane-reasons');
+      blockedRow.textContent='blocked: '+blocked.map(function(check){return check.id||check.label||'required';}).join(' · ');
+      sec.appendChild(blockedRow);
+    }
+    const next=(plane.next_actions||[]).slice(0,3);
+    if(next.length){
+      const nextRow=UI.el('div','runtime-control-plane-reasons');
+      nextRow.textContent='next: '+next.join(' · ');
+      sec.appendChild(nextRow);
+    }
+    const caps=(plane.capabilities||[]).slice(0,5);
+    if(caps.length){
+      const capRow=UI.el('div','runtime-control-plane-caps');
+      caps.forEach(function(cap){capRow.appendChild(UI.el('span','memory-chip',UI.esc(cap)))});
+      sec.appendChild(capRow);
     }
     return sec;
   }
@@ -420,32 +589,20 @@ window.Panels = (()=>{
         segments.appendChild(renderContextSegment('dynamic tail',assembled.dynamic_tail));
         mount.appendChild(segments);
 
-        const runs=UI.el('div','panel-section runtime-runs');
-        runs.innerHTML='<h3>Runtime Runs</h3>';
-        if(!Api.sid){
-          runs.appendChild(UI.el('div','panel-empty','No active session'));
-        }else{
-          try{
-            const runTimeline=await Api.runtimeRuns(Api.sid,{limit:8});
-            const rows=runTimeline.runs||[];
-            if(!rows.length)runs.appendChild(UI.el('div','panel-empty','No runtime runs'));
-            rows.slice(-8).reverse().forEach(function(item){
-              runs.appendChild(renderRuntimeRunItem(item));
-            });
-          }catch(runError){
-            runs.appendChild(UI.el('div','panel-empty','Runtime runs unavailable'));
-          }
-        }
-        mount.appendChild(runs);
-
         const history=UI.el('div','panel-section context-history');
         history.innerHTML='<h3>Context Timeline</h3>';
+        let showHistoryItem=null;
         if(!Api.sid){
           history.appendChild(UI.el('div','panel-empty','No active session'));
         }else{
           try{
             const detailMount=UI.el('div','context-history-detail-mount');
-            async function showHistoryItem(item){
+            const rowsMount=UI.el('div','context-history-rows');
+            const controls=UI.el('div','context-history-controls');
+            let nextSeq=null;
+            let hasMore=false;
+            let loaded=0;
+            showHistoryItem=async function(item){
               detailMount.innerHTML='';
               let selected=item;
               const envelopeId=item.envelope_id||(item.envelope||{}).id;
@@ -456,21 +613,70 @@ window.Panels = (()=>{
                 }catch(detailError){}
               }
               detailMount.appendChild(renderContextHistoryDetail(selected));
+            };
+            function appendHistoryRows(rows){
+              rows.forEach(function(item){
+                rowsMount.appendChild(renderContextHistoryItem(item,showHistoryItem));
+              });
+              loaded+=rows.length;
+            }
+            function renderHistoryControls(){
+              controls.innerHTML='';
+              if(!hasMore)return;
+              const more=UI.el('button','context-history-more');
+              more.type='button';
+              more.textContent='Load more ('+loaded+')';
+              more.onclick=async function(){
+                more.disabled=true;
+                more.textContent='Loading...';
+                try{
+                  const page=await Api.contextHistory(Api.sid,{from_seq:nextSeq,limit:8});
+                  const rows=contextHistoryRows(page);
+                  appendHistoryRows(rows);
+                  nextSeq=page.next_seq;
+                  hasMore=!!page.has_more&&rows.length>0;
+                }catch(e){
+                  controls.appendChild(UI.el('div','panel-empty','More context unavailable'));
+                  hasMore=false;
+                }
+                renderHistoryControls();
+              };
+              controls.appendChild(more);
             }
             const timeline=await Api.contextHistory(Api.sid,{limit:8});
-            const rows=timeline.envelopes||[];
-            if(!rows.length)history.appendChild(UI.el('div','panel-empty','No persisted envelopes'));
-            const visibleRows=rows.slice(-8).reverse();
-            visibleRows.forEach(function(item){
-              history.appendChild(renderContextHistoryItem(item,showHistoryItem));
-            });
+            const rows=contextHistoryRows(timeline);
+            if(!rows.length)rowsMount.appendChild(UI.el('div','panel-empty','No persisted envelopes'));
+            appendHistoryRows(rows);
+            nextSeq=timeline.next_seq;
+            hasMore=!!timeline.has_more&&rows.length>0;
+            history.appendChild(rowsMount);
+            renderHistoryControls();
+            history.appendChild(controls);
             history.appendChild(detailMount);
-            if(visibleRows[0])showHistoryItem(visibleRows[0]);
+            if(rows[0])showHistoryItem(rows[0]);
           }catch(historyError){
             history.appendChild(UI.el('div','panel-empty','Context timeline unavailable'));
           }
         }
         mount.appendChild(history);
+
+        const runs=UI.el('div','panel-section runtime-runs');
+        runs.innerHTML='<h3>Runtime Runs</h3>';
+        if(!Api.sid){
+          runs.appendChild(UI.el('div','panel-empty','No active session'));
+        }else{
+          try{
+            const runTimeline=await Api.runtimeRuns(Api.sid,{limit:8});
+            const rows=runTimeline.runs||[];
+            if(!rows.length)runs.appendChild(UI.el('div','panel-empty','No runtime runs'));
+            rows.slice(-8).reverse().forEach(function(item){
+              runs.appendChild(renderRuntimeRunItem(item,showHistoryItem));
+            });
+          }catch(runError){
+            runs.appendChild(UI.el('div','panel-empty','Runtime runs unavailable'));
+          }
+        }
+        mount.appendChild(runs);
       }catch(e){
         mount.appendChild(UI.el('div','panel-empty','Context unavailable: '+e.message));
       }
@@ -852,6 +1058,7 @@ window.Panels = (()=>{
     const timelineSec=UI.el('div','panel-section runtime-timeline');
     const contextSec=UI.el('div','panel-section context-list');
     const maintSec=UI.el('div','panel-section memory-maintenance');
+    const runtimeDetailMount=UI.el('div','context-history-detail-mount runtime-context-detail-mount');
     grid.appendChild(summary);
     grid.appendChild(runsSec);
     grid.appendChild(timelineSec);
@@ -865,8 +1072,20 @@ window.Panels = (()=>{
       timelineSec.innerHTML='<h3>Runtime Timeline</h3>';
       contextSec.innerHTML='<h3>Active Context</h3>';
       maintSec.innerHTML='<h3>Memory Maintenance</h3>';
+      runtimeDetailMount.innerHTML='';
       const opts={q:input.value||'',profile:profile.value};
       if(Api.sid)opts.session_id=Api.sid;
+
+      async function showRuntimeContext(envelopeId){
+        runtimeDetailMount.innerHTML='';
+        if(!envelopeId)return;
+        try{
+          const detail=await Api.contextEnvelope(envelopeId);
+          runtimeDetailMount.appendChild(renderContextHistoryDetail(detail.context||{envelope_id:envelopeId}));
+        }catch(e){
+          runtimeDetailMount.appendChild(UI.el('div','panel-empty','Context detail unavailable'));
+        }
+      }
 
       let envelope={};
       let leanProbe=null;
@@ -874,6 +1093,7 @@ window.Panels = (()=>{
       let diagnostics={};
       let budget={};
       let controlPolicy=null;
+      let controlPlane=null;
       try{
         const ctx=await Api.currentContext(opts);
         envelope=(ctx&&ctx.envelope)||{};
@@ -888,6 +1108,9 @@ window.Panels = (()=>{
         const cfg=await Api.runtimeEffectiveConfig();
         controlPolicy=(cfg&&cfg.control_policy)||null;
       }catch(e){}
+      try{
+        controlPlane=await Api.runtimeControlPlane();
+      }catch(e){}
 
       const metrics=UI.el('div','memory-metrics');
       metrics.appendChild(renderMemoryMetric('profile',envelope.profile||profile.value,'mode'));
@@ -901,6 +1124,7 @@ window.Panels = (()=>{
         metrics.appendChild(renderMemoryMetric('agents',agent.max_parallel_agents??0,'max'));
       }
       summary.appendChild(metrics);
+      summary.appendChild(renderRuntimeControlPlane(controlPlane));
       summary.appendChild(renderLeanProbe(leanProbe,policyDecision));
       if((diagnostics.degraded_sources||[]).length){
         const degraded=UI.el('div','context-degraded');
@@ -939,7 +1163,9 @@ window.Panels = (()=>{
           if(timeline.degraded_reason)timelineSec.appendChild(UI.el('div','panel-empty',timeline.degraded_reason));
           if(!events.length)timelineSec.appendChild(UI.el('div','panel-empty','No runtime events'));
           timelineSec.appendChild(renderRuntimeHealthSummary(timeline.health_summary));
+          timelineSec.appendChild(renderValueLoopSummary(timeline.value_loop));
           timelineSec.appendChild(renderWorkGraphSummary(events,timeline.workgraph_summary));
+          timelineSec.appendChild(renderAgentValueSummary(timeline.agent_value));
           const runtimePolicy=latestPolicyDecision(events);
           if(runtimePolicy.count){
             const policyBox=UI.el('div','agent-workgraph-summary');
@@ -949,7 +1175,8 @@ window.Panels = (()=>{
             policyMetrics.appendChild(renderMemoryMetric('score',runtimePolicy.score,'complexity'));
             timelineSec.appendChild(policyBox);
           }
-          events.slice(-12).reverse().forEach(function(item){timelineSec.appendChild(renderRuntimeTimelineItem(item))});
+          events.slice(-12).reverse().forEach(function(item){timelineSec.appendChild(renderRuntimeTimelineItem(item,showRuntimeContext))});
+          timelineSec.appendChild(runtimeDetailMount);
         }catch(e){timelineSec.appendChild(UI.el('div','panel-empty','Runtime timeline unavailable'))}
       }
 
@@ -1370,11 +1597,133 @@ window.Panels = (()=>{
   }
 
   async function renderGateway(){
-    const c=cont();c.innerHTML='<h3>Gateway Platforms</h3>';
+    const c=cont();c.innerHTML='<h3>Connectivity & Policy</h3>';
+    try{
+      const summary=await Api.crossPlaneSummary();
+      const identitiesData=await Api.crossPlaneIdentities().catch(function(){return {identities:[]}});
+      const grantsData=await Api.crossPlaneGrants().catch(function(){return {grants:[]}});
+      const auditData=await Api.crossPlaneAudit().catch(function(){return {records:[]}});
+      const sec=UI.el('div','panel-section');
+      sec.innerHTML='<h3>Cross-Plane Control</h3>';
+      const identities=summary.identity_bindings||{};
+      const grants=summary.grants||{};
+      const interop=summary.interop||{};
+      sec.innerHTML+='<div class="audit-metrics">'
+        +'<span><b>'+UI.esc(identities.verified??0)+'</b><small>verified ids</small></span>'
+        +'<span><b>'+UI.esc((identities.claimed??0)+(identities.observed??0))+'</b><small>pending ids</small></span>'
+        +'<span><b>'+UI.esc(grants.active??0)+'</b><small>active grants</small></span>'
+        +'<span><b>'+UI.esc(interop.actions_24h??0)+'</b><small>interop 24h</small></span>'
+        +'</div>';
+      const detail=UI.el('div','panel-empty');
+      detail.textContent='Identities '+((identitiesData.identities||[]).length)+' · Grants '+((grantsData.grants||[]).length)+' · Audit records '+((auditData.records||[]).length);
+      sec.appendChild(detail);
+      const sim=UI.el('button','btn-secondary');
+      sim.textContent='Simulate verified Feishu send';
+      sim.onclick=async function(){
+        try{
+          const result=await Api.simulateCrossPlanePolicy({
+            actor_principal:'user:demo',
+            source_channel:'local:tui',
+            session_id:'demo',
+            requested_capability:'channel.feishu.send_text',
+            provider_account:'feishu-main',
+            target_ref:'channel://feishu/chat/demo',
+            resource_ref:null,
+            risk:'low',
+            data_classification:'internal',
+            identity_trust:'verified'
+          });
+          UI.showToast(JSON.stringify(result.decision||result,null,2));
+        }catch(e){UI.showToast('Policy simulation failed: '+e.message)}
+      };
+      sec.appendChild(sim);
+      c.appendChild(sec);
+    }catch(e){
+      c.appendChild(UI.el('div','panel-empty','Cross-plane policy unavailable'));
+    }
+
+    const wechatSec=UI.el('div','panel-section');
+    wechatSec.innerHTML='<h3>WeChat iLink</h3>';
+    c.appendChild(wechatSec);
+    try{
+      const accounts=await Api.wechatIlinkAccounts().catch(function(){return {accounts:[]}});
+      const accountList=accounts.accounts||[];
+      const meta=UI.el('div','panel-empty');
+      meta.textContent=accountList.length
+        ? 'Authorized accounts '+accountList.length+' · active '+(accountList[0].account_id||'').slice(0,18)
+        : 'No authorized personal WeChat account';
+      wechatSec.appendChild(meta);
+
+      const qrBox=UI.el('div','panel-empty');
+      qrBox.style.display='none';
+      qrBox.style.alignItems='center';
+      qrBox.style.justifyContent='center';
+      qrBox.style.background='var(--panel2)';
+      qrBox.style.padding='12px';
+      wechatSec.appendChild(qrBox);
+
+      const status=UI.el('div','panel-empty','');
+      wechatSec.appendChild(status);
+
+      const btn=UI.el('button','btn-secondary');
+      btn.textContent='Authorize WeChat';
+      btn.onclick=async function(){
+        btn.disabled=true;
+        status.textContent='Creating QR code...';
+        try{
+          const qr=await Api.startWechatIlinkQr({bot_type:'3'});
+          qrBox.style.display='flex';
+          qrBox.innerHTML=qr.qrcode_svg||UI.esc(qr.scan_data||'');
+          status.textContent='Scan with WeChat and confirm on phone.';
+          const started=Date.now();
+          const timer=setInterval(async function(){
+            if(Date.now()-started>480000){
+              clearInterval(timer);
+              btn.disabled=false;
+              status.textContent='QR login timed out. Start again.';
+              return;
+            }
+            try{
+              const next=await Api.pollWechatIlinkQr({qrcode:qr.qrcode,base_url:qr.base_url});
+              if(next.status==='wait') status.textContent='Waiting for scan...';
+              else if(next.status==='scaned') status.textContent='Scanned. Confirm in WeChat.';
+              else if(next.status==='scaned_but_redirect') status.textContent='Redirecting iLink host...';
+              else if(next.status==='confirmed'){
+                clearInterval(timer);
+                btn.disabled=false;
+                status.textContent='Authorized '+((next.account&&next.account.account_id)||'WeChat');
+                UI.showToast('WeChat authorized');
+                renderGateway();
+              }else if(next.status==='expired'){
+                clearInterval(timer);
+                btn.disabled=false;
+                status.textContent='QR expired. Start again.';
+              }else{
+                status.textContent='Status '+next.status;
+              }
+            }catch(e){
+              clearInterval(timer);
+              btn.disabled=false;
+              status.textContent='QR poll failed: '+e.message;
+            }
+          },2000);
+        }catch(e){
+          btn.disabled=false;
+          status.textContent='QR start failed: '+e.message;
+        }
+      };
+      wechatSec.appendChild(btn);
+    }catch(e){
+      wechatSec.appendChild(UI.el('div','panel-empty','WeChat authorization unavailable'));
+    }
+
+    const gatewayTitle=UI.el('div','panel-section');
+    gatewayTitle.innerHTML='<h3>Gateway Platforms</h3>';
+    c.appendChild(gatewayTitle);
     try{
       const platforms=await Api.listPlatforms();
       if(!platforms||!platforms.length){
-        c.appendChild(UI.el('div','panel-empty','No platforms configured.\nEnable feishu/wechat/email in config.yaml'));
+        gatewayTitle.appendChild(UI.el('div','panel-empty','No platforms configured.\nEnable feishu/wechat/email in config.yaml'));
         return;
       }
       platforms.forEach(async function(p){
@@ -1392,7 +1741,7 @@ window.Panels = (()=>{
           }
         }catch(e){sec.appendChild(UI.el('div','panel-empty','Sessions unavailable'))}
       });
-    }catch(e){c.appendChild(UI.el('div','panel-empty','Gateway info unavailable'))}
+    }catch(e){gatewayTitle.appendChild(UI.el('div','panel-empty','Gateway info unavailable'))}
   }
 
   function auditRecordSummary(record){

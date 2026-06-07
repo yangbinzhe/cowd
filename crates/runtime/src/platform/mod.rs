@@ -30,19 +30,21 @@
 pub mod adapter;
 pub mod config;
 pub mod dedup;
-pub mod feishu;
 pub mod email;
-pub mod wechat_ilink;
-pub mod wecom;
+pub mod feishu;
 pub mod runtime;
 pub mod types;
+pub mod wechat_ilink;
+pub mod wecom;
 
-pub use adapter::{InboundMessage, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformResult};
-pub use adapter::{MessageType, SendResult, ChatInfo, PlatformEvent};
+pub use adapter::{ChatInfo, MessageType, PlatformEvent, SendResult};
+pub use adapter::{
+    InboundMessage, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformResult,
+};
 pub use config::PlatformConfig;
 pub use runtime::PlatformRuntime;
-pub use types::{SessionKey, PlatformSession};
+pub use types::{PlatformSession, SessionKey};
 
-pub use feishu::FeishuAdapter;
 pub use email::EmailAdapter;
+pub use feishu::FeishuAdapter;
 pub use wechat_ilink::{WeChatLinkAdapter, WeChatLinkConfig};

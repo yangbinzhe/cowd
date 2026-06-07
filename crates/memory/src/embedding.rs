@@ -169,9 +169,7 @@ impl EmbeddingClient {
     /// Note: this does **not** perform a connectivity check.
     #[must_use]
     pub fn is_remote_available(&self) -> bool {
-        self.config.enabled
-            && !self.config.model.is_empty()
-            && !self.config.api_url.is_empty()
+        self.config.enabled && !self.config.model.is_empty() && !self.config.api_url.is_empty()
     }
 
     /// Embed a batch of texts, returning one vector per input string.
@@ -274,10 +272,7 @@ impl EmbeddingClient {
     ///
     /// Retries up to [`EMBED_MAX_RETRIES`] times with exponential backoff on
     /// transient HTTP failures.
-    async fn embed_batch(
-        &self,
-        texts: &[&str],
-    ) -> Result<Vec<(usize, Vec<f32>)>, MemoryError> {
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<(usize, Vec<f32>)>, MemoryError> {
         let model = self.config.model.clone();
         let api_url = self.config.api_url.clone();
         let api_key = self.config.api_key.clone();
@@ -300,10 +295,7 @@ impl EmbeddingClient {
                     .header("Content-Type", "application/json");
 
                 if !api_key.is_empty() {
-                    req = req.header(
-                        "Authorization",
-                        format!("Bearer {api_key}"),
-                    );
+                    req = req.header("Authorization", format!("Bearer {api_key}"));
                 }
 
                 let response = req.json(&body).send().await.map_err(|e| {
@@ -340,7 +332,8 @@ impl EmbeddingClient {
                     .map(|item| (item.index, item.embedding))
                     .collect())
             }
-        }).await
+        })
+        .await
     }
 }
 

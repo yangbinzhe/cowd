@@ -102,9 +102,10 @@ impl StartupEvidenceBundle {
     pub fn collect_from_worker(worker: &Worker) -> Self {
         let elapsed = now_secs().saturating_sub(worker.created_at);
         Self {
-            last_lifecycle_state: worker.events.last().map(|event| {
-                format!("{:?}", event.kind)
-            }),
+            last_lifecycle_state: worker
+                .events
+                .last()
+                .map(|event| format!("{:?}", event.kind)),
             pane_command: None,
             prompt_sent_at: worker.last_prompt.as_ref().map(|_| worker.updated_at),
             prompt_acceptance_state: if worker.prompt_in_flight {
@@ -779,11 +780,13 @@ struct StateSnapshot<'a> {
 
 fn emit_state_file(worker: &Worker) {
     let state_path = crate::cowd_dirs::worker_state_path();
-    let state_dir = state_path.parent()
-        .unwrap_or_else(|| {
-            tracing::error!("state path has no parent directory: {}", state_path.display());
-            std::process::exit(1);
-        });
+    let state_dir = state_path.parent().unwrap_or_else(|| {
+        tracing::error!(
+            "state path has no parent directory: {}",
+            state_path.display()
+        );
+        std::process::exit(1);
+    });
     if std::fs::create_dir_all(state_dir).is_err() {
         return;
     }

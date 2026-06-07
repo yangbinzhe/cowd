@@ -448,24 +448,20 @@ mod tests {
             AgentWorkGraph::from_collaboration_task("session-1", &task).with_review_packet(&packet);
         assert_eq!(graph.status, WorkGraphStatus::Completed);
         assert_eq!(graph.board_id.as_deref(), Some("board-1"));
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == WorkGraphNodeKind::Synthesis)
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == WorkGraphNodeKind::Synthesis));
         let review_node = graph
             .nodes
             .iter()
             .find(|node| node.node_id == "review-node")
             .expect("review node");
-        assert!(
-            review_node
-                .refs
-                .iter()
-                .any(|reference| reference.ref_type == "agent_runtime_run"
-                    && reference.id == "agent-run")
-        );
+        assert!(review_node
+            .refs
+            .iter()
+            .any(|reference| reference.ref_type == "agent_runtime_run"
+                && reference.id == "agent-run"));
     }
 
     #[test]
@@ -527,11 +523,10 @@ mod tests {
         assert_eq!(event.kind, "agent.workgraph.planned");
         assert_eq!(event.scope, RuntimeEventScope::Workgraph);
         assert_eq!(event.status.as_deref(), Some("planned"));
-        assert!(
-            event.refs.iter().any(
-                |reference| reference.ref_type == "workgraph" && reference.id == graph.graph_id
-            )
-        );
+        assert!(event
+            .refs
+            .iter()
+            .any(|reference| reference.ref_type == "workgraph" && reference.id == graph.graph_id));
         assert_eq!(
             event.payload["graph"]["objective"],
             "parallel implementation"
@@ -597,17 +592,14 @@ mod tests {
             event.payload["maintenance_candidates"][0]["id"],
             "candidate-1"
         );
-        assert!(
-            event
-                .refs
-                .iter()
-                .any(|reference| reference.ref_type == "agent_runtime_run"
-                    && reference.id == "agent-run")
-        );
-        assert!(
-            event.refs.iter().any(
-                |reference| reference.ref_type == "context_envelope" && reference.id == "env-1"
-            )
-        );
+        assert!(event
+            .refs
+            .iter()
+            .any(|reference| reference.ref_type == "agent_runtime_run"
+                && reference.id == "agent-run"));
+        assert!(event
+            .refs
+            .iter()
+            .any(|reference| reference.ref_type == "context_envelope" && reference.id == "env-1"));
     }
 }

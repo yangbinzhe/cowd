@@ -88,7 +88,12 @@ impl WebSearchTool {
             urlencoding::encode(query)
         );
 
-        let response = self.http.get(&url).send().await.map_err(WebToolError::Http)?;
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(WebToolError::Http)?;
 
         if !response.status().is_success() {
             return Err(WebToolError::Api(format!(
@@ -234,7 +239,12 @@ impl WebFetchTool {
 
     /// Fetch a URL and convert the response body to readable text.
     pub async fn fetch(&self, url: &str) -> Result<String, WebToolError> {
-        let response = self.http.get(url).send().await.map_err(WebToolError::Http)?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(WebToolError::Http)?;
 
         if !response.status().is_success() {
             return Err(WebToolError::Api(format!(
@@ -400,13 +410,11 @@ mod tests {
     #[test]
     fn format_results_with_items() {
         let tool = WebSearchTool::new();
-        let results = vec![
-            SearchResult {
-                title: "Test".to_string(),
-                url: "https://example.com".to_string(),
-                snippet: "A test result".to_string(),
-            },
-        ];
+        let results = vec![SearchResult {
+            title: "Test".to_string(),
+            url: "https://example.com".to_string(),
+            snippet: "A test result".to_string(),
+        }];
         let output = tool.format_results(&results);
         assert!(output.contains("Test"));
         assert!(output.contains("example.com"));

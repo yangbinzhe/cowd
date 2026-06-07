@@ -2,14 +2,17 @@
 //!
 //! Provides SMTP email sending and IMAP email receiving with attachment handling.
 
-use crate::platform::adapter::{InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformResult};
+use crate::platform::adapter::{
+    InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter, PlatformError,
+    PlatformResult,
+};
 use crate::platform::types::SessionKey;
 use async_trait::async_trait;
 use chrono::Utc;
 use lettre::Transport;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
@@ -53,11 +56,15 @@ impl EmailConfig {
     }
 
     pub fn is_imap_configured(&self) -> bool {
-        self.imap_host.as_ref().map_or(false, |h| !h.is_empty())
-            && self.imap_username.is_some()
+        self.imap_host.as_ref().map_or(false, |h| !h.is_empty()) && self.imap_username.is_some()
     }
 
-    pub fn new(smtp_host: impl Into<String>, smtp_username: impl Into<String>, smtp_password: impl Into<String>, from_address: impl Into<String>) -> Self {
+    pub fn new(
+        smtp_host: impl Into<String>,
+        smtp_username: impl Into<String>,
+        smtp_password: impl Into<String>,
+        from_address: impl Into<String>,
+    ) -> Self {
         Self {
             smtp_host: smtp_host.into(),
             smtp_port: 587,
@@ -73,7 +80,12 @@ impl EmailConfig {
         }
     }
 
-    pub fn with_imap(mut self, host: impl Into<String>, username: impl Into<String>, password: impl Into<String>) -> Self {
+    pub fn with_imap(
+        mut self,
+        host: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
         self.imap_host = Some(host.into());
         self.imap_port = Some(993);
         self.imap_username = Some(username.into());
@@ -110,13 +122,19 @@ impl EmailAdapter {
         }
 
         let to_address = &msg.session_key.user_id;
-        let subject = msg.metadata.get("subject")
+        let subject = msg
+            .metadata
+            .get("subject")
             .and_then(|v| v.as_str())
             .unwrap_or("Message from AI");
 
-        let from = self.config.from_address.parse::<lettre::message::Mailbox>()
+        let from = self
+            .config
+            .from_address
+            .parse::<lettre::message::Mailbox>()
             .map_err(|e| PlatformError::SendFailed(format!("invalid from address: {}", e)))?;
-        let to = to_address.parse::<lettre::message::Mailbox>()
+        let to = to_address
+            .parse::<lettre::message::Mailbox>()
             .map_err(|e| PlatformError::SendFailed(format!("invalid to address: {}", e)))?;
 
         let email = lettre::Message::builder()
@@ -124,12 +142,11 @@ impl EmailAdapter {
             .to(to)
             .subject(subject)
             .multipart(
-                lettre::message::MultiPart::alternative()
-                    .singlepart(
-                        lettre::message::SinglePart::builder()
-                            .header(lettre::message::header::ContentType::TEXT_PLAIN)
-                            .body(msg.text.clone())
-                    )
+                lettre::message::MultiPart::alternative().singlepart(
+                    lettre::message::SinglePart::builder()
+                        .header(lettre::message::header::ContentType::TEXT_PLAIN)
+                        .body(msg.text.clone()),
+                ),
             )
             .map_err(|e| PlatformError::SendFailed(format!("failed to build email: {}", e)))?;
 
@@ -152,8 +169,10 @@ impl EmailAdapter {
         };
 
         // lettre send is blocking, so we run it in a spawn_blocking context
-        let result: Result<lettre::transport::smtp::response::Response, lettre::transport::smtp::Error> =
-            tokio::task::spawn_blocking(move || mailer.send(&email))
+        let result: Result<
+            lettre::transport::smtp::response::Response,
+            lettre::transport::smtp::Error,
+        > = tokio::task::spawn_blocking(move || mailer.send(&email))
             .await
             .map_err(|e| PlatformError::SendFailed(format!("send task error: {}", e)))?;
 
@@ -162,7 +181,10 @@ impl EmailAdapter {
                 tracing::info!(to = %to_address, "email sent successfully via SMTP");
                 Ok(())
             }
-            Err(e) => Err(PlatformError::SendFailed(format!("SMTP send failed: {}", e))),
+            Err(e) => Err(PlatformError::SendFailed(format!(
+                "SMTP send failed: {}",
+                e
+            ))),
         }
     }
 
@@ -172,10 +194,21 @@ impl EmailAdapter {
             return Ok(Vec::new());
         }
 
-        let imap_host = self.config.imap_host.clone().ok_or_else(|| PlatformError::ConfigError("missing imap_host".into()))?;
+        let imap_host = self
+            .config
+            .imap_host
+            .clone()
+            .ok_or_else(|| PlatformError::ConfigError("missing imap_host".into()))?;
         let imap_port = self.config.imap_port.unwrap_or(993);
-        let imap_user = self.config.imap_username.clone().ok_or_else(|| PlatformError::ConfigError("missing imap_username".into()))?;
-        let imap_pass = self.config.imap_password.clone()
+        let imap_user = self
+            .config
+            .imap_username
+            .clone()
+            .ok_or_else(|| PlatformError::ConfigError("missing imap_username".into()))?;
+        let imap_pass = self
+            .config
+            .imap_password
+            .clone()
             .ok_or_else(|| PlatformError::ConfigError("missing imap_password".into()))?;
 
         // IMAP is blocking, run in spawn_blocking
@@ -184,31 +217,41 @@ impl EmailAdapter {
                 .connect()
                 .map_err(|e| PlatformError::ReceiveFailed(format!("IMAP connect error: {}", e)))?;
 
-            let mut session = client
-                .login(&imap_user, &imap_pass)
-                .map_err(|e| PlatformError::AuthenticationFailed(format!("IMAP login error: {}", e.0)))?;
+            let mut session = client.login(&imap_user, &imap_pass).map_err(|e| {
+                PlatformError::AuthenticationFailed(format!("IMAP login error: {}", e.0))
+            })?;
 
-            session.select("INBOX")
-                .map_err(|e| PlatformError::ReceiveFailed(format!("IMAP select INBOX error: {}", e)))?;
+            session.select("INBOX").map_err(|e| {
+                PlatformError::ReceiveFailed(format!("IMAP select INBOX error: {}", e))
+            })?;
 
             // Search for unseen messages
-            let uids = session.uid_search("UNSEEN")
+            let uids = session
+                .uid_search("UNSEEN")
                 .map_err(|e| PlatformError::ReceiveFailed(format!("IMAP search error: {}", e)))?;
 
             let mut messages = Vec::new();
 
-            for uid in uids.iter().take(50) {  // Limit to 50 messages per poll
-                let msg_data = session.uid_fetch(&uid.to_string(), "RFC822")
-                    .map_err(|e| PlatformError::ReceiveFailed(format!("IMAP fetch error: {}", e)))?;
+            for uid in uids.iter().take(50) {
+                // Limit to 50 messages per poll
+                let msg_data = session.uid_fetch(&uid.to_string(), "RFC822").map_err(|e| {
+                    PlatformError::ReceiveFailed(format!("IMAP fetch error: {}", e))
+                })?;
 
                 if let Some(msg) = msg_data.iter().next() {
                     if let Some(body) = msg.body() {
                         if let Some(parsed) = mail_parser::MessageParser::default().parse(body) {
                             let subject = parsed.subject().unwrap_or("(No Subject)");
-                            let from = parsed.from().and_then(|addr| addr.first())
+                            let from = parsed
+                                .from()
+                                .and_then(|addr| addr.first())
                                 .and_then(|a| a.address.as_deref().or(a.name.as_deref()))
-                                .unwrap_or("unknown").to_string();
-                            let text = parsed.body_text(0).map(|t| t.to_string()).unwrap_or_default();
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let text = parsed
+                                .body_text(0)
+                                .map(|t| t.to_string())
+                                .unwrap_or_default();
 
                             // Extract attachment count for metadata
                             let attachment_count = parsed.attachment_count();
@@ -273,8 +316,12 @@ pub fn create_email_adapter(settings: &serde_json::Value) -> PlatformResult<Emai
 
 #[async_trait]
 impl PlatformAdapter for EmailAdapter {
-    fn platform(&self) -> Platform { Platform::Email }
-    fn platform_name(&self) -> &str { "email" }
+    fn platform(&self) -> Platform {
+        Platform::Email
+    }
+    fn platform_name(&self) -> &str {
+        "email"
+    }
 
     async fn connect(&mut self) -> PlatformResult<()> {
         if self.config.is_smtp_configured() {

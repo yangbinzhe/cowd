@@ -36,6 +36,14 @@ pub struct RuntimeActivityPanel {
     recent_activity: Vec<String>,
     yolo_mode: bool,
     session_id: String,
+    model: String,
+    provider_status: String,
+    provider_count: usize,
+    provider_model_count: usize,
+    provider_route: String,
+    provider_names: String,
+    control_plane_status: String,
+    control_plane_reason: String,
 }
 
 impl RuntimeActivityPanel {
@@ -46,6 +54,33 @@ impl RuntimeActivityPanel {
     pub fn sync_from_app(&mut self, app: &App) {
         self.yolo_mode = app.yolo_mode;
         self.session_id = app.session_id.clone();
+        self.model = app.model.clone();
+        let mut provider_names = runtime::list_all_providers();
+        provider_names.sort();
+        self.provider_count = provider_names.len();
+        self.provider_model_count = runtime::list_all_models().len();
+        self.provider_names = if provider_names.is_empty() {
+            "none".to_string()
+        } else {
+            preview(&provider_names.join(","), 40)
+        };
+        self.provider_route = runtime::resolve_global_provider(&app.model)
+            .map(|provider| {
+                format!(
+                    "{} ({})",
+                    provider.name,
+                    provider.protocol.as_deref().unwrap_or("openai-compat")
+                )
+            })
+            .unwrap_or_else(|| "unresolved".to_string());
+        self.provider_status = if self.provider_count == 0 {
+            "unconfigured".to_string()
+        } else if self.provider_route == "unresolved" {
+            "degraded".to_string()
+        } else {
+            "available".to_string()
+        };
+        let has_context = app.latest_context_envelope.is_some();
         if let Some(envelope) = &app.latest_context_envelope {
             let probe = runtime::ContextRuntimeKernel::lean_probe(envelope);
             let policy = runtime::ContextRuntimeKernel::policy_decision(&probe);
@@ -125,6 +160,28 @@ impl RuntimeActivityPanel {
             .take(8)
             .map(activity_label)
             .collect();
+        self.control_plane_status = if self.session_id.trim().is_empty() {
+            "degraded".to_string()
+        } else if self.provider_status == "degraded" {
+            "degraded".to_string()
+        } else if !has_context || self.runtime_policy_agent == "Off" {
+            "attention".to_string()
+        } else {
+            "healthy".to_string()
+        };
+        self.control_plane_reason = format!(
+            "session {} context {} agent {} graph-agents {} provider {} yolo {}",
+            if self.session_id.trim().is_empty() {
+                "missing"
+            } else {
+                "active"
+            },
+            if has_context { "ready" } else { "pending" },
+            self.runtime_policy_agent,
+            self.workgraph_agent_tasks,
+            self.provider_status,
+            if self.yolo_mode { "on" } else { "off" }
+        );
     }
 }
 
@@ -217,6 +274,45 @@ impl Component for RuntimeActivityPanel {
                 } else {
                     Color::White
                 }),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Kernel:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} - {}",
+                    self.control_plane_status,
+                    preview(&self.control_plane_reason, 72)
+                ),
+                Style::default().fg(match self.control_plane_status.as_str() {
+                    "healthy" => Color::Green,
+                    "degraded" => Color::Red,
+                    _ => Color::Yellow,
+                }),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Provider: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} providers {} models {} route {}",
+                    self.provider_status,
+                    self.provider_count,
+                    self.provider_model_count,
+                    preview(&self.provider_route, 36)
+                ),
+                Style::default().fg(match self.provider_status.as_str() {
+                    "available" => Color::Green,
+                    "degraded" => Color::Red,
+                    _ => Color::Yellow,
+                }),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Model:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} via {}", preview(&self.model, 42), self.provider_names),
+                Style::default().fg(Color::White),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -380,6 +476,7 @@ mod tests {
     use super::*;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
+    use std::collections::HashMap;
 
     fn render_panel(panel: &mut RuntimeActivityPanel, width: u16, height: u16) -> String {
         let mut terminal = MockTerminal::new(width, height);
@@ -393,6 +490,18 @@ mod tests {
 
     #[test]
     fn syncs_runtime_activity_from_app() {
+        runtime::init_global_providers(runtime::ProvidersConfig {
+            providers: HashMap::from([(
+                "anthropic".to_string(),
+                runtime::ProviderConfig {
+                    name: "anthropic".to_string(),
+                    base_url: "https://anthropic.example/v1".to_string(),
+                    api_key: "secret".to_string(),
+                    models: vec!["m".to_string(), "m-fast".to_string()],
+                    protocol: Some("anthropic".to_string()),
+                },
+            )]),
+        });
         let mut app = App::new("m", "session-runtime-123456789");
         app.yolo_mode = true;
         app.add_message("user", "ship the runtime console");
@@ -452,13 +561,20 @@ mod tests {
 
         let mut panel = RuntimeActivityPanel::new();
         panel.sync_from_app(&app);
-        let rendered = render_panel(&mut panel, 88, 24);
+        let rendered = render_panel(&mut panel, 96, 27);
 
         assert!(rendered.contains("Runtime Activity"));
         assert!(rendered.contains("YoloGoal"));
         assert!(rendered.contains("Nominal"));
         assert!(rendered.contains("None"));
         assert!(rendered.contains("Complex score 70 agent Parallel"));
+        assert!(rendered.contains("Kernel"));
+        assert!(rendered.contains("healthy"));
+        assert!(rendered.contains("session active context ready agent Parallel"));
+        assert!(rendered.contains("Provider"));
+        assert!(rendered.contains("available providers 1 models 2 route anthropic"));
+        assert!(rendered.contains("Model"));
+        assert!(rendered.contains("m via anthropic"));
         assert!(rendered.contains("selected 1 omitted 0"));
         assert!(rendered.contains("WorkGraph"));
         assert!(rendered.contains("completed 100% agents 2"));
@@ -467,5 +583,6 @@ mod tests {
         assert!(rendered.contains("board-run"));
         assert!(rendered.contains("tool bash exit 0"));
         assert!(rendered.contains("user: ship the runtime console"));
+        runtime::init_global_providers(runtime::ProvidersConfig::default());
     }
 }

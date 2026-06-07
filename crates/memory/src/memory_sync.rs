@@ -221,9 +221,9 @@ mod tests {
     use super::*;
     use crate::config::MemoryConfig;
     use crate::layers::shared::L4Operation;
+    use crate::project_scope::MemoryScope;
     use crate::store::sqlite::SqliteStore;
     use crate::types::{MemoryCategory, Priority};
-    use crate::project_scope::MemoryScope;
 
     fn in_memory_store() -> Arc<dyn crate::store::MemoryStore> {
         let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
@@ -232,9 +232,8 @@ mod tests {
 
     async fn build_protocol() -> MemorySyncProtocol {
         let store = in_memory_store();
-        let orch = Arc::new(
-            MemoryOrchestrator::from_store(MemoryConfig::default(), store, None).unwrap(),
-        );
+        let orch =
+            Arc::new(MemoryOrchestrator::from_store(MemoryConfig::default(), store, None).unwrap());
         let bus = orch.l4_event_bus().cloned().unwrap();
         MemorySyncProtocol::new(orch, bus)
     }

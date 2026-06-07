@@ -1,9 +1,9 @@
 //! Platform runtime for managing multiple platform adapters.
 
+use crate::mirror::MessageMirror;
 use crate::platform::adapter::{InboundMessage, OutboundMessage, PlatformAdapter, PlatformError};
 use crate::platform::config::{PlatformRuntimeConfig, RetryConfig, SessionResetPolicy};
 use crate::platform::types::{PlatformSession, SessionKey};
-use crate::mirror::MessageMirror;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -48,7 +48,10 @@ impl PlatformRuntime {
     }
 
     /// Register a platform adapter.
-    pub async fn register_adapter(&self, adapter: Box<dyn PlatformAdapter>) -> Result<(), PlatformError> {
+    pub async fn register_adapter(
+        &self,
+        adapter: Box<dyn PlatformAdapter>,
+    ) -> Result<(), PlatformError> {
         let platform_name = adapter.platform_name().to_string();
         let mut adapters = self.adapters.write().await;
         adapters.insert(platform_name, adapter);
@@ -79,22 +82,28 @@ impl PlatformRuntime {
     /// List active sessions.
     pub async fn list_sessions(&self) -> Vec<serde_json::Value> {
         let sessions = self.sessions.read().await;
-        sessions.values().map(|s| {
-            serde_json::json!({
-                "session_key": s.key.as_str(),
-                "platform": &s.key.platform,
-                "user_id": &s.key.user_id,
-                "thread_id": &s.key.thread_id,
-                "created_at": s.created_at.to_rfc3339(),
-                "last_activity": s.last_activity.to_rfc3339(),
+        sessions
+            .values()
+            .map(|s| {
+                serde_json::json!({
+                    "session_key": s.key.as_str(),
+                    "platform": &s.key.platform,
+                    "user_id": &s.key.user_id,
+                    "thread_id": &s.key.thread_id,
+                    "created_at": s.created_at.to_rfc3339(),
+                    "last_activity": s.last_activity.to_rfc3339(),
+                })
             })
-        }).collect()
+            .collect()
     }
 
     /// Get session count for a specific platform.
     pub async fn platform_session_count(&self, platform: &str) -> usize {
         let sessions = self.sessions.read().await;
-        sessions.values().filter(|s| s.key.platform == platform).count()
+        sessions
+            .values()
+            .filter(|s| s.key.platform == platform)
+            .count()
     }
 
     /// Delete a session.
@@ -110,7 +119,8 @@ impl PlatformRuntime {
     /// After start, adapters are moved into spawned tasks; use `send_response`
     /// to reply through the adapter's outbound channel.
     pub async fn start(&self) -> Result<(), PlatformError> {
-        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(self.config.channel_capacity);
+        let (inbound_tx, inbound_rx) =
+            mpsc::channel::<InboundMessage>(self.config.channel_capacity);
         *self.message_rx.write().await = Some(inbound_rx);
 
         // Connect all adapters in parallel
@@ -151,16 +161,23 @@ impl PlatformRuntime {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
         let mirror = self.message_mirror.read().await.clone();
-        let outbound_senders: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<OutboundMessage>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let outbound_senders: Arc<
+            std::sync::Mutex<HashMap<String, mpsc::Sender<OutboundMessage>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         for (platform_name, adapter) in connected_adapters {
-            let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(self.config.channel_capacity);
+            let (outbound_tx, outbound_rx) =
+                mpsc::channel::<OutboundMessage>(self.config.channel_capacity);
             self.adapter_handles.write().await.insert(
                 platform_name.clone(),
-                AdapterHandle { outbound_tx: outbound_tx.clone() },
+                AdapterHandle {
+                    outbound_tx: outbound_tx.clone(),
+                },
             );
-            outbound_senders.lock().unwrap().insert(platform_name.clone(), outbound_tx);
+            outbound_senders
+                .lock()
+                .unwrap()
+                .insert(platform_name.clone(), outbound_tx);
 
             let inbound_tx_clone = inbound_tx.clone();
             let shutdown_rx = shutdown_tx.subscribe();
@@ -178,7 +195,8 @@ impl PlatformRuntime {
                     retry_config,
                     mirror,
                     outbound_senders,
-                ).await;
+                )
+                .await;
             });
         }
 
@@ -199,21 +217,34 @@ impl PlatformRuntime {
     }
 
     /// Send a response to a platform via its outbound channel.
-    pub async fn send_response(&self, platform_name: &str, msg: OutboundMessage) -> Result<(), PlatformError> {
+    pub async fn send_response(
+        &self,
+        platform_name: &str,
+        msg: OutboundMessage,
+    ) -> Result<(), PlatformError> {
         let handles = self.adapter_handles.read().await;
-        let handle = handles
-            .get(platform_name)
-            .ok_or_else(|| PlatformError::Unknown(format!("no adapter handle for platform: {platform_name}")))?;
+        let handle = handles.get(platform_name).ok_or_else(|| {
+            PlatformError::Unknown(format!("no adapter handle for platform: {platform_name}"))
+        })?;
 
-        handle.outbound_tx.send(msg).await
+        handle
+            .outbound_tx
+            .send(msg)
+            .await
             .map_err(|e| PlatformError::SendFailed(format!("outbound channel closed: {e}")))
     }
 
     /// Get or create a session.
-    pub async fn get_session(&self, key: SessionKey) -> Arc<RwLock<crate::platform::types::PlatformSession>> {
+    pub async fn get_session(
+        &self,
+        key: SessionKey,
+    ) -> Arc<RwLock<crate::platform::types::PlatformSession>> {
         let mut sessions = self.sessions.write().await;
         if !sessions.contains_key(&key) {
-            sessions.insert(key.clone(), crate::platform::types::PlatformSession::new(key.clone()));
+            sessions.insert(
+                key.clone(),
+                crate::platform::types::PlatformSession::new(key.clone()),
+            );
         }
         Arc::new(RwLock::new(sessions.get(&key).unwrap().clone()))
     }
@@ -235,21 +266,15 @@ impl PlatformRuntime {
         let now = chrono::Utc::now();
         let idle_duration = chrono::Duration::minutes(self.config.idle_timeout_minutes);
 
-        sessions.retain(|_key, session| {
-            match policy {
-                SessionResetPolicy::Always => false,
-                SessionResetPolicy::Daily => {
-                    session.created_at.date_naive() == now.date_naive()
-                }
-                SessionResetPolicy::Idle => {
-                    (now - session.last_activity) < idle_duration
-                }
-                SessionResetPolicy::Both => {
-                    session.created_at.date_naive() == now.date_naive()
-                        && (now - session.last_activity) < idle_duration
-                }
-                SessionResetPolicy::None => true,
+        sessions.retain(|_key, session| match policy {
+            SessionResetPolicy::Always => false,
+            SessionResetPolicy::Daily => session.created_at.date_naive() == now.date_naive(),
+            SessionResetPolicy::Idle => (now - session.last_activity) < idle_duration,
+            SessionResetPolicy::Both => {
+                session.created_at.date_naive() == now.date_naive()
+                    && (now - session.last_activity) < idle_duration
             }
+            SessionResetPolicy::None => true,
         });
     }
 

@@ -25,7 +25,7 @@ use crate::{
     compression::{
         deep::DeepCompactor,
         guard::CompressionGuard,
-        llm_summarizer::{OpenAiSummarizer, LlmSummarizer},
+        llm_summarizer::{LlmSummarizer, OpenAiSummarizer},
         micro::MicroCompactor,
         session::SessionCompactor,
     },
@@ -42,9 +42,8 @@ pub type Result<T> = std::result::Result<T, MemoryError>;
 
 /// Code markers used to estimate how "code-heavy" a set of messages is.
 const CODE_MARKERS: &[&str] = &[
-    "fn ", "let ", "impl ", "pub ", "use ", "struct ", "enum ", "mod ",
-    "def ", "class ", "import ", "const ", "trait ", "async fn",
-    "=>", "->", "::", "();",
+    "fn ", "let ", "impl ", "pub ", "use ", "struct ", "enum ", "mod ", "def ", "class ",
+    "import ", "const ", "trait ", "async fn", "=>", "->", "::", "();",
 ];
 
 /// Estimate the ratio of code lines to total lines in the given messages.
@@ -53,7 +52,11 @@ const CODE_MARKERS: &[&str] = &[
 /// (lossless, entity-aware) compression would be more effective than the
 /// default micro-compaction.
 fn code_ratio(messages: &[Message]) -> f32 {
-    let content: String = messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
+    let content: String = messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let total_lines = content.lines().count().max(1);
     let code_lines = content
         .lines()
@@ -118,10 +121,7 @@ impl CompressionPipeline {
                 config.llm.api_key.clone(),
                 config.llm.model.clone(),
             );
-            tracing::info!(
-                "LLM summarization enabled: {}",
-                config.llm.model
-            );
+            tracing::info!("LLM summarization enabled: {}", config.llm.model);
             Some(Arc::new(summarizer))
         } else {
             tracing::debug!("LLM summarization not configured, using template fallback");
@@ -205,11 +205,20 @@ impl CompressionPipeline {
     #[must_use]
     pub fn should_session_compact(&self, messages: &[Message]) -> bool {
         // Anti-thrashing: skip if too many recent compressions were ineffective
-        if *self.ineffective_compression_count.lock().unwrap_or_else(|e| e.into_inner()) >= 2 {
+        if *self
+            .ineffective_compression_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            >= 2
+        {
             return false;
         }
         // Cooldown: skip if LLM summarizer recently failed
-        if let Some(cooldown) = *self.summary_cooldown_until.lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(cooldown) = *self
+            .summary_cooldown_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
             if std::time::Instant::now() < cooldown {
                 return false;
             }
@@ -232,7 +241,11 @@ impl CompressionPipeline {
         orchestrator: &MemoryOrchestrator,
     ) -> Result<CompactionResult> {
         let _scope = self.guard.enter()?;
-        let prev = self.previous_summary.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let prev = self
+            .previous_summary
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let result = self
             .session
             .compact(messages, orchestrator, prev.as_deref())
@@ -242,7 +255,10 @@ impl CompressionPipeline {
         // The first message after compaction is the pinned summary message.
         if let Some(summary_msg) = messages.first() {
             if summary_msg.pinned {
-                *self.previous_summary.lock().unwrap_or_else(|e| e.into_inner()) = Some(summary_msg.content.clone());
+                *self
+                    .previous_summary
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(summary_msg.content.clone());
             }
         }
 
@@ -403,7 +419,10 @@ mod tests {
 
         // Add more conversation
         msgs.push(msg(MessageRole::User, "Add logging support"));
-        msgs.push(msg(MessageRole::Assistant, "Added log4rs with rolling file appender"));
+        msgs.push(msg(
+            MessageRole::Assistant,
+            "Added log4rs with rolling file appender",
+        ));
 
         let _len_after = msgs.iter().map(|m| m.content.len()).sum::<usize>();
         pipeline.micro_compact(&mut msgs);
@@ -426,14 +445,20 @@ mod tests {
         let pipeline = CompressionPipeline::new(true);
         let mut msgs = vec![
             msg(MessageRole::User, "Implement auth module"),
-            msg(MessageRole::Assistant, "Added JWT-based authentication with refresh tokens"),
+            msg(
+                MessageRole::Assistant,
+                "Added JWT-based authentication with refresh tokens",
+            ),
         ];
 
         pipeline.micro_compact(&mut msgs);
 
         // Second exchange
         msgs.push(msg(MessageRole::User, "Add rate limiting"));
-        msgs.push(msg(MessageRole::Assistant, "Added token bucket rate limiter"));
+        msgs.push(msg(
+            MessageRole::Assistant,
+            "Added token bucket rate limiter",
+        ));
 
         pipeline.micro_compact(&mut msgs);
 

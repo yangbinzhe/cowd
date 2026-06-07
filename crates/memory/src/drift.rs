@@ -28,10 +28,7 @@ pub enum DriftVerdict {
 }
 
 /// Compute the decay delta for an entry based on elapsed wall-clock time.
-fn compute_decay_delta(
-    created_at: &chrono::DateTime<chrono::Utc>,
-    decay_per_day: f32,
-) -> f32 {
+fn compute_decay_delta(created_at: &chrono::DateTime<chrono::Utc>, decay_per_day: f32) -> f32 {
     let elapsed = Utc::now() - *created_at;
     let days = elapsed.num_hours() as f32 / 24.0;
     decay_per_day * days.max(0.0)
@@ -135,8 +132,8 @@ impl DriftDetector {
 mod tests {
     use super::*;
     use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
-    use chrono::Utc;
     use crate::MemoryScope;
+    use chrono::Utc;
     use uuid::Uuid;
 
     fn make_entry(content: &str, layer: MemoryLayer, staleness: f32) -> MemoryEntry {
@@ -199,7 +196,11 @@ mod tests {
         };
         let detector = DriftDetector::new(cfg);
         let e1 = make_entry("the tokio runtime is stable and fast", MemoryLayer::L1, 0.0);
-        let e2 = make_entry("the tokio runtime has serious stability issues", MemoryLayer::L1, 0.0);
+        let e2 = make_entry(
+            "the tokio runtime has serious stability issues",
+            MemoryLayer::L1,
+            0.0,
+        );
         let result = detector.check_contradictions(&e1, &[e2]);
         assert!(result.is_some(), "should detect contradiction");
     }

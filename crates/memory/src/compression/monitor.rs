@@ -133,13 +133,10 @@ impl ContextWindowMonitor {
         let level = self.classify(remaining_pct);
 
         // Fetch the previous level (acquire the lock briefly).
-        let mut last_guard = self
-            .last_level
-            .write()
-            .unwrap_or_else(|poisoned| {
-                tracing::warn!("ContextWindowMonitor last_level lock poisoned; recovering");
-                poisoned.into_inner()
-            });
+        let mut last_guard = self.last_level.write().unwrap_or_else(|poisoned| {
+            tracing::warn!("ContextWindowMonitor last_level lock poisoned; recovering");
+            poisoned.into_inner()
+        });
 
         if level > *last_guard {
             // Level upgraded – fire immediately.
@@ -149,9 +146,7 @@ impl ContextWindowMonitor {
         }
 
         // Same or lower level – apply debounce.
-        let calls = self
-            .tool_calls_since_alert
-            .fetch_add(1, Ordering::Relaxed);
+        let calls = self.tool_calls_since_alert.fetch_add(1, Ordering::Relaxed);
         if calls >= self.debounce_interval {
             self.tool_calls_since_alert.store(0, Ordering::Relaxed);
             *last_guard = level;
@@ -214,10 +209,7 @@ impl ContextWindowMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        compression::budget::BudgetManager,
-        config::BudgetConfig,
-    };
+    use crate::{compression::budget::BudgetManager, config::BudgetConfig};
 
     fn make_monitor() -> ContextWindowMonitor {
         let cfg = BudgetConfig {
@@ -345,13 +337,22 @@ impl AdaptiveThreshold {
         let lower = model.to_ascii_lowercase();
 
         // Claude models
-        if lower.contains("claude-3-opus") || lower.contains("claude-3.5-opus") || lower.contains("claude-opus-4") {
+        if lower.contains("claude-3-opus")
+            || lower.contains("claude-3.5-opus")
+            || lower.contains("claude-opus-4")
+        {
             return 200_000;
         }
-        if lower.contains("claude-3.5-sonnet") || lower.contains("claude-3-sonnet") || lower.contains("claude-sonnet-4") {
+        if lower.contains("claude-3.5-sonnet")
+            || lower.contains("claude-3-sonnet")
+            || lower.contains("claude-sonnet-4")
+        {
             return 200_000;
         }
-        if lower.contains("claude-3-haiku") || lower.contains("claude-3.5-haiku") || lower.contains("claude-haiku") {
+        if lower.contains("claude-3-haiku")
+            || lower.contains("claude-3.5-haiku")
+            || lower.contains("claude-haiku")
+        {
             return 200_000;
         }
 
@@ -433,12 +434,18 @@ mod adaptive_tests {
 
     #[test]
     fn claude_opus_200k() {
-        assert_eq!(AdaptiveThreshold::context_window_for_model("claude-3-opus"), 200_000);
+        assert_eq!(
+            AdaptiveThreshold::context_window_for_model("claude-3-opus"),
+            200_000
+        );
     }
 
     #[test]
     fn gpt4o_128k() {
-        assert_eq!(AdaptiveThreshold::context_window_for_model("gpt-4o"), 128_000);
+        assert_eq!(
+            AdaptiveThreshold::context_window_for_model("gpt-4o"),
+            128_000
+        );
     }
 
     #[test]
@@ -448,7 +455,10 @@ mod adaptive_tests {
 
     #[test]
     fn unknown_defaults_128k() {
-        assert_eq!(AdaptiveThreshold::context_window_for_model("unknown-model"), 128_000);
+        assert_eq!(
+            AdaptiveThreshold::context_window_for_model("unknown-model"),
+            128_000
+        );
     }
 
     #[test]

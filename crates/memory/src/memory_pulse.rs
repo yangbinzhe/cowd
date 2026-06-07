@@ -184,7 +184,7 @@ mod tests {
     use crate::maintenance::{
         MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
     };
-    use crate::runtime_event::{RuntimeRef, RuntimeEventScope};
+    use crate::runtime_event::{RuntimeEventScope, RuntimeRef};
 
     fn candidate(id: &str) -> MaintenanceCandidate {
         MaintenanceCandidate {

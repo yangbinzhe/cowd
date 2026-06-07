@@ -370,16 +370,14 @@ impl AutoTuner {
         if avg_compression > self.target_compression_ratio && avg_compression > 0.0 {
             let mut cfg = self.tuning_config.lock();
             if cfg.freshness_trigger_ratio > 0.3 {
-                cfg.freshness_trigger_ratio =
-                    (cfg.freshness_trigger_ratio - 0.05).max(0.3);
+                cfg.freshness_trigger_ratio = (cfg.freshness_trigger_ratio - 0.05).max(0.3);
                 adjusted = true;
             }
         } else if avg_compression > 0.0 && avg_compression < self.target_compression_ratio * 0.5 {
             // Excessively good compression → relax trigger
             let mut cfg = self.tuning_config.lock();
             if cfg.freshness_trigger_ratio < 0.9 {
-                cfg.freshness_trigger_ratio =
-                    (cfg.freshness_trigger_ratio + 0.05).min(0.9);
+                cfg.freshness_trigger_ratio = (cfg.freshness_trigger_ratio + 0.05).min(0.9);
                 adjusted = true;
             }
         }
@@ -441,7 +439,10 @@ mod tests {
         pm.record_cache_hit();
         pm.record_cache_miss();
         let rate = pm.cache_hit_rate();
-        assert!((rate - 2.0 / 3.0).abs() < 1e-6, "expected 0.666, got {rate}");
+        assert!(
+            (rate - 2.0 / 3.0).abs() < 1e-6,
+            "expected 0.666, got {rate}"
+        );
     }
 
     #[test]
@@ -509,7 +510,10 @@ mod tests {
         // Well within targets
         pm.record_prepare_context(Duration::from_millis(50));
         pm.record_extract(Duration::from_millis(30));
-        assert!(!tuner.evaluate(&pm), "should not tune when performance is good");
+        assert!(
+            !tuner.evaluate(&pm),
+            "should not tune when performance is good"
+        );
     }
 
     #[test]
@@ -521,7 +525,10 @@ mod tests {
         }
         assert!(tuner.evaluate(&pm), "expected tuning on poor compression");
         let cfg = tuner.config();
-        assert!(cfg.freshness_trigger_ratio < 0.8, "freshness_trigger should decrease");
+        assert!(
+            cfg.freshness_trigger_ratio < 0.8,
+            "freshness_trigger should decrease"
+        );
     }
 
     #[test]

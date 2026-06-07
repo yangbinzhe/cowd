@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::types::{MemoryId, Relation, RelationKind, TemporalMarker};
 use crate::store::MemoryStore;
+use crate::types::{MemoryId, Relation, RelationKind, TemporalMarker};
 
 // ─── Entity Types ─────────────────────────────────────────────────────────────
 
@@ -104,8 +104,8 @@ impl Default for EntityFacts {
 /// Query direction for entity traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryDirection {
-    Outgoing,  // entity → ?
-    Incoming,  // ? → entity
+    Outgoing, // entity → ?
+    Incoming, // ? → entity
     Both,
 }
 
@@ -253,7 +253,15 @@ impl KnowledgeGraph {
         valid_from: Option<DateTime<Utc>>,
         valid_until: Option<DateTime<Utc>>,
     ) -> String {
-        self.add_triple(subject, predicate, object, valid_from, valid_until, None, None)
+        self.add_triple(
+            subject,
+            predicate,
+            object,
+            valid_from,
+            valid_until,
+            None,
+            None,
+        )
     }
 
     /// Invalidate a relationship (set valid_until).
@@ -316,7 +324,10 @@ impl KnowledgeGraph {
             QueryDirection::Incoming => {}
         }
 
-        if matches!(options.direction, QueryDirection::Both | QueryDirection::Incoming) {
+        if matches!(
+            options.direction,
+            QueryDirection::Both | QueryDirection::Incoming
+        ) {
             for triple in &self.triples {
                 if triple.object == eid && self.triple_is_valid(triple, options) {
                     let sub_name = self
@@ -394,7 +405,11 @@ impl KnowledgeGraph {
     ///
     /// Similar to MemPalace's `query_relationship()`:
     ///     kg.query_relationship("child_of", as_of="2026-01-15")
-    pub fn query_relationship(&self, predicate: &str, as_of: Option<DateTime<Utc>>) -> Vec<EntityQueryResult> {
+    pub fn query_relationship(
+        &self,
+        predicate: &str,
+        as_of: Option<DateTime<Utc>>,
+    ) -> Vec<EntityQueryResult> {
         let pred = predicate.to_lowercase().replace(' ', "_");
         let mut results = Vec::new();
 
@@ -462,7 +477,11 @@ impl KnowledgeGraph {
 
     /// Get graph statistics.
     pub fn stats(&self) -> KnowledgeGraphStats {
-        let current_triples = self.triples.iter().filter(|t| t.valid_until.is_none()).count();
+        let current_triples = self
+            .triples
+            .iter()
+            .filter(|t| t.valid_until.is_none())
+            .count();
         let historical_triples = self.triples.len() - current_triples;
 
         KnowledgeGraphStats {
@@ -580,15 +599,24 @@ impl TimeRange {
     }
 
     pub fn before(until: DateTime<Utc>) -> Self {
-        Self { start: None, end: Some(until) }
+        Self {
+            start: None,
+            end: Some(until),
+        }
     }
 
     pub fn after(start: DateTime<Utc>) -> Self {
-        Self { start: Some(start), end: None }
+        Self {
+            start: Some(start),
+            end: None,
+        }
     }
 
     pub fn between(start: DateTime<Utc>, end: DateTime<Utc>) -> Self {
-        Self { start: Some(start), end: Some(end) }
+        Self {
+            start: Some(start),
+            end: Some(end),
+        }
     }
 
     /// Check if this range contains the given time.
@@ -616,11 +644,7 @@ impl TimeRange {
 }
 
 /// Helper to create a temporal relation.
-pub fn temporal_relation(
-    target_id: MemoryId,
-    kind: RelationKind,
-    strength: f32,
-) -> Relation {
+pub fn temporal_relation(target_id: MemoryId, kind: RelationKind, strength: f32) -> Relation {
     Relation {
         target_id,
         kind,
@@ -816,4 +840,3 @@ mod tests {
         assert_eq!(triple.source_file.unwrap(), "/path/to/file.md");
     }
 }
-

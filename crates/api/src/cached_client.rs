@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 use runtime::prompt_cache::{
-    CacheUsage, PromptCache, PromptCacheRecord, RequestFingerprintHashes, hash_serializable,
+    hash_serializable, CacheUsage, PromptCache, PromptCacheRecord, RequestFingerprintHashes,
 };
 
 /// Wraps a [`ProviderClient`](crate::ProviderClient) with deterministic
@@ -103,9 +103,8 @@ impl CachedProviderClient {
                 self.session_id,
                 &cache_key[..32.min(cache_key.len())]
             );
-            let response: MessageResponse = serde_json::from_value(cached_json).map_err(|e| {
-                ApiError::json_deserialize("cache", &request.model, "", e)
-            })?;
+            let response: MessageResponse = serde_json::from_value(cached_json)
+                .map_err(|e| ApiError::json_deserialize("cache", &request.model, "", e))?;
             return Ok((response, None));
         }
 
@@ -122,14 +121,10 @@ impl CachedProviderClient {
         };
 
         // 4. Store in cache
-        let response_json =
-            serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
-        let record = self.cache.record_response(
-            &cache_key,
-            &response_json,
-            &cache_usage,
-            &fingerprints,
-        );
+        let response_json = serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
+        let record =
+            self.cache
+                .record_response(&cache_key, &response_json, &cache_usage, &fingerprints);
 
         tracing::debug!(
             "prompt cache miss for session {} (key={}), stored",
@@ -183,17 +178,15 @@ impl CachedProviderClient {
                 .iter()
                 .map(|t| {
                     let mut map = serde_json::Map::new();
-                    map.insert("name".to_string(), serde_json::Value::String(t.name.clone()));
+                    map.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(t.name.clone()),
+                    );
                     map.insert(
                         "description".to_string(),
-                        serde_json::Value::String(
-                            t.description.clone().unwrap_or_default(),
-                        ),
+                        serde_json::Value::String(t.description.clone().unwrap_or_default()),
                     );
-                    map.insert(
-                        "input_schema".to_string(),
-                        t.input_schema.clone(),
-                    );
+                    map.insert("input_schema".to_string(), t.input_schema.clone());
                     serde_json::Value::Object(map)
                 })
                 .collect();

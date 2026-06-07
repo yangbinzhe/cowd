@@ -41,17 +41,15 @@ fn status_command_applies_model_and_permission_mode_flags() {
 fn resume_flag_loads_a_saved_session_and_dispatches_status() {
     // given
     let temp_dir = unique_temp_dir("resume-status");
+    let config_home = temp_dir.join("home").join(".cowd");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
-    let session_path = write_session(&temp_dir, "resume-status");
+    write_session(&config_home, &temp_dir, "resume-status");
 
     // when
     let output = Command::new(env!("CARGO_BIN_EXE_cowd"))
         .current_dir(&temp_dir)
-        .args([
-            "--resume",
-            session_path.to_str().expect("utf8 path"),
-            "/status",
-        ])
+        .env("COWD_CONFIG_HOME", &config_home)
+        .args(["--resume", "resume-status", "/status"])
         .output()
         .expect("cowd should launch");
 
@@ -61,7 +59,9 @@ fn resume_flag_loads_a_saved_session_and_dispatches_status() {
     assert!(stdout.contains("Status"));
     assert!(stdout.contains("Messages         1"));
     assert!(stdout.contains("Session          "));
-    assert!(stdout.contains(session_path.to_str().expect("utf8 path")));
+    assert!(stdout.contains("sessions.db"));
+    assert!(stdout.contains("Session id       resume-status"));
+    assert!(stdout.contains("Session store    SQLite session store"));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
@@ -139,24 +139,22 @@ fn config_command_loads_defaults_from_standard_config_locations() {
 
     fs::write(config_home.join("config.yaml"), r#"{"model":"haiku"}"#)
         .expect("write user settings");
-    fs::write(temp_dir.join(".cowd").join("config.yaml"), r#"{"model":"sonnet"}"#)
-        .expect("write project settings");
+    fs::write(
+        temp_dir.join(".cowd").join("config.yaml"),
+        r#"{"model":"sonnet"}"#,
+    )
+    .expect("write project settings");
     fs::write(
         temp_dir.join(".cowd").join("config.local.yaml"),
         r#"{"model":"opus"}"#,
     )
     .expect("write local settings");
-    let session_path = write_session(&temp_dir, "config-defaults");
+    write_session(&config_home, &temp_dir, "config-defaults");
 
     // when
     let output = command_in(&temp_dir)
         .env("COWD_CONFIG_HOME", &config_home)
-        .args([
-            "--resume",
-            session_path.to_str().expect("utf8 path"),
-            "/config",
-            "model",
-        ])
+        .args(["--resume", "config-defaults", "/config", "model"])
         .output()
         .expect("cowd should launch");
 
@@ -167,13 +165,14 @@ fn config_command_loads_defaults_from_standard_config_locations() {
     assert!(stdout.contains("Loaded files      3"));
     assert!(stdout.contains("Merged section: model"));
     assert!(stdout.contains("opus"));
+    assert!(stdout.contains(config_home.join("config.yaml").to_str().expect("utf8 path")));
     assert!(stdout.contains(
-        config_home
+        temp_dir
+            .join(".cowd")
             .join("config.yaml")
             .to_str()
             .expect("utf8 path")
     ));
-    assert!(stdout.contains(temp_dir.join(".cowd").join("config.yaml").to_str().expect("utf8 path")));
     assert!(stdout.contains(
         temp_dir
             .join(".cowd")
@@ -264,16 +263,54 @@ fn command_in(cwd: &Path) -> Command {
     command
 }
 
-fn write_session(root: &Path, label: &str) -> PathBuf {
-    let session_path = root.join(format!("{label}.jsonl"));
+fn write_session(config_home: &Path, root: &Path, label: &str) {
+    fs::create_dir_all(config_home).expect("config home should exist");
     let mut session = Session::new().with_workspace_root(root.to_path_buf());
+    session.session_id = label.to_string();
     session
         .push_user_text(format!("session fixture for {label}"))
         .expect("session write should succeed");
-    session
-        .save_to_path(&session_path)
-        .expect("session should persist");
-    session_path
+
+    let store = memory::UnifiedSessionStore::open(&config_home.join("sessions.db"))
+        .expect("unified session store should open");
+    let record = memory::SessionRecord {
+        session_id: session.session_id.clone(),
+        platform: "cli".to_string(),
+        chat_id: session.session_id.clone(),
+        user_id: None,
+        model: session.model.clone(),
+        created_at: "2026-06-05T00:00:00Z".to_string(),
+        last_activity: "2026-06-05T00:00:00Z".to_string(),
+        message_count: session.messages.len() as i64,
+        reset_policy: "none".to_string(),
+        metadata_json: Some(
+            serde_json::json!({
+                "workspace_root": session.workspace_root().map(|path| path.display().to_string()),
+                "session_path": config_home.join("sessions.db").display().to_string(),
+            })
+            .to_string(),
+        ),
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0.0,
+        status: "active".to_string(),
+    };
+    let messages = session
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(sequence, message)| message.to_session_message(&session.session_id, sequence))
+        .collect::<Vec<_>>();
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should create");
+    runtime
+        .block_on(async {
+            store.upsert_session(&record).await?;
+            store.delete_messages_from(&session.session_id, 0).await?;
+            store.insert_messages_batch(&messages).await?;
+            Ok::<(), memory::MemoryError>(())
+        })
+        .expect("fixture should persist to unified store");
 }
 
 fn assert_success(output: &Output) {

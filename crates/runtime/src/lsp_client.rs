@@ -281,9 +281,9 @@ impl LspRegistry {
             }
             // All diagnostics across all servers
             let inner = self.inner.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("lsp registry lock poisoned; recovering");
-            poisoned.into_inner()
-        });
+                tracing::warn!("lsp registry lock poisoned; recovering");
+                poisoned.into_inner()
+            });
             let all_diags: Vec<_> = inner
                 .servers
                 .values()

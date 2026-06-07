@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::tui::layout::{LayoutState, LayoutTree, build_default_layout};
+use crate::tui::layout::{build_default_layout, LayoutState, LayoutTree};
 use ratatui::widgets::{Block, Borders};
 use runtime::CowdEvent;
 use std::collections::VecDeque;
@@ -1259,18 +1259,16 @@ mod tests {
         assert_eq!(app.timeline_pages.len(), 2);
 
         assert!(app.timeline_get(0).unwrap().full_text().contains("msg 0"));
-        assert!(
-            app.timeline_get(PAGE_SIZE - 1)
-                .unwrap()
-                .full_text()
-                .contains(&format!("msg {}", PAGE_SIZE - 1))
-        );
-        assert!(
-            app.timeline_get(PAGE_SIZE)
-                .unwrap()
-                .full_text()
-                .contains("overflow")
-        );
+        assert!(app
+            .timeline_get(PAGE_SIZE - 1)
+            .unwrap()
+            .full_text()
+            .contains(&format!("msg {}", PAGE_SIZE - 1)));
+        assert!(app
+            .timeline_get(PAGE_SIZE)
+            .unwrap()
+            .full_text()
+            .contains("overflow"));
 
         let count = app.timeline_iter().count();
         assert_eq!(count, PAGE_SIZE + 1);
@@ -1316,18 +1314,16 @@ mod tests {
         }
         assert_eq!(app.timeline_len(), PAGE_SIZE * 3 + 200);
         assert!(app.timeline_get(0).unwrap().full_text().contains("entry 0"));
-        assert!(
-            app.timeline_get(PAGE_SIZE)
-                .unwrap()
-                .full_text()
-                .contains(&format!("entry {}", PAGE_SIZE))
-        );
-        assert!(
-            app.timeline_get(PAGE_SIZE * 2 + 50)
-                .unwrap()
-                .full_text()
-                .contains(&format!("entry {}", PAGE_SIZE * 2 + 50))
-        );
+        assert!(app
+            .timeline_get(PAGE_SIZE)
+            .unwrap()
+            .full_text()
+            .contains(&format!("entry {}", PAGE_SIZE)));
+        assert!(app
+            .timeline_get(PAGE_SIZE * 2 + 50)
+            .unwrap()
+            .full_text()
+            .contains(&format!("entry {}", PAGE_SIZE * 2 + 50)));
     }
 
     #[test]

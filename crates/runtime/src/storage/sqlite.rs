@@ -34,7 +34,10 @@ impl SqliteStorage {
 
 impl StorageBackend for SqliteStorage {
     fn write(&self, key: &str, value: &[u8]) -> Result<(), CowdError> {
-        let conn = self.conn.lock().map_err(|e| CowdError::other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CowdError::other(e.to_string()))?;
         conn.execute(
             "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
             rusqlite::params![key, value],
@@ -44,26 +47,38 @@ impl StorageBackend for SqliteStorage {
     }
 
     fn read(&self, key: &str) -> Result<Option<Vec<u8>>, CowdError> {
-        let conn = self.conn.lock().map_err(|e| CowdError::other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CowdError::other(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT value FROM kv WHERE key = ?1")
             .map_err(|e| CowdError::other(e.to_string()))?;
         let mut rows = stmt
             .query_map(rusqlite::params![key], |row| row.get::<_, Vec<u8>>(0))
             .map_err(|e| CowdError::other(e.to_string()))?;
-        let result = rows.next().transpose().map_err(|e| CowdError::other(e.to_string()))?;
+        let result = rows
+            .next()
+            .transpose()
+            .map_err(|e| CowdError::other(e.to_string()))?;
         Ok(result)
     }
 
     fn delete(&self, key: &str) -> Result<(), CowdError> {
-        let conn = self.conn.lock().map_err(|e| CowdError::other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CowdError::other(e.to_string()))?;
         conn.execute("DELETE FROM kv WHERE key = ?1", rusqlite::params![key])
             .map_err(|e| CowdError::other(e.to_string()))?;
         Ok(())
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>, CowdError> {
-        let conn = self.conn.lock().map_err(|e| CowdError::other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| CowdError::other(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT key FROM kv WHERE key LIKE ?1")
             .map_err(|e| CowdError::other(e.to_string()))?;

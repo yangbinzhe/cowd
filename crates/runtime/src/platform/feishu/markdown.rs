@@ -199,16 +199,10 @@ pub fn parse_post_payload(payload: &str) -> PostParseResult {
         for row in content {
             if let Some(elements) = row.as_array() {
                 for element in elements {
-                    let tag = element
-                        .get("tag")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let tag = element.get("tag").and_then(|v| v.as_str()).unwrap_or("");
                     match tag {
                         "text" => {
-                            let text = element
-                                .get("text")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                            let text = element.get("text").and_then(|v| v.as_str()).unwrap_or("");
                             let styles: Vec<&str> = element
                                 .get("style")
                                 .and_then(|v| v.as_array())
@@ -227,9 +221,7 @@ pub fn parse_post_payload(payload: &str) -> PostParseResult {
                             }
                         }
                         "img" | "image" => {
-                            if let Some(key) =
-                                element.get("image_key").and_then(|v| v.as_str())
-                            {
+                            if let Some(key) = element.get("image_key").and_then(|v| v.as_str()) {
                                 image_keys.push(key.to_string());
                             }
                         }
@@ -260,24 +252,14 @@ pub fn parse_post_payload(payload: &str) -> PostParseResult {
                                 .and_then(|v| v.as_str())
                                 .filter(|s| !s.is_empty())
                                 .map(|s| s.to_string())
-                                .or_else(|| {
-                                    mentions_map
-                                        .get(user_id)
-                                        .cloned()
-                                })
+                                .or_else(|| mentions_map.get(user_id).cloned())
                                 .unwrap_or_else(|| user_id.to_string());
                             text_parts.push(format!("@{}", name));
                         }
                         "a" => {
                             // Link element
-                            let text = element
-                                .get("text")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let href = element
-                                .get("href")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                            let text = element.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            let href = element.get("href").and_then(|v| v.as_str()).unwrap_or("");
                             if href.is_empty() {
                                 text_parts.push(text.to_string());
                             } else {
@@ -502,7 +484,13 @@ mod tests {
         let rows = v["zh_cn"]["content"].as_array().unwrap();
 
         // Should produce 3 rows: md, code_block, md
-        assert_eq!(rows.len(), 3, "expected 3 rows, got {}: {}", rows.len(), payload);
+        assert_eq!(
+            rows.len(),
+            3,
+            "expected 3 rows, got {}: {}",
+            rows.len(),
+            payload
+        );
         assert_eq!(rows[0][0]["tag"], "md");
         assert_eq!(rows[1][0]["tag"], "code_block");
         assert_eq!(rows[2][0]["tag"], "md");
@@ -585,8 +573,7 @@ mod tests {
 
     #[test]
     fn test_parse_post_payload_bold_style() {
-        let payload =
-            r#"{"zh_cn":{"content":[[{"tag":"text","text":"bold","style":["bold"]}]]}}"#;
+        let payload = r#"{"zh_cn":{"content":[[{"tag":"text","text":"bold","style":["bold"]}]]}}"#;
         let result = parse_post_payload(payload);
         assert_eq!(result.text_content, "**bold**");
     }
@@ -609,8 +596,7 @@ mod tests {
 
     #[test]
     fn test_parse_post_payload_code_style() {
-        let payload =
-            r#"{"zh_cn":{"content":[[{"tag":"text","text":"code","style":["code"]}]]}}"#;
+        let payload = r#"{"zh_cn":{"content":[[{"tag":"text","text":"code","style":["code"]}]]}}"#;
         let result = parse_post_payload(payload);
         assert_eq!(result.text_content, "`code`");
     }
@@ -626,8 +612,7 @@ mod tests {
 
     #[test]
     fn test_parse_post_payload_image_key() {
-        let payload =
-            r#"{"zh_cn":{"content":[[{"tag":"img","image_key":"img_abc123"}]]}}"#;
+        let payload = r#"{"zh_cn":{"content":[[{"tag":"img","image_key":"img_abc123"}]]}}"#;
         let result = parse_post_payload(payload);
         assert_eq!(result.image_keys, vec!["img_abc123"]);
     }
@@ -659,8 +644,7 @@ mod tests {
 
     #[test]
     fn test_parse_post_payload_en_us_locale() {
-        let payload =
-            r#"{"en_us":{"content":[[{"tag":"text","text":"English"}]]}}"#;
+        let payload = r#"{"en_us":{"content":[[{"tag":"text","text":"English"}]]}}"#;
         let result = parse_post_payload(payload);
         assert_eq!(result.text_content, "English");
     }
@@ -675,8 +659,7 @@ mod tests {
 
     #[test]
     fn test_parse_post_payload_code_block() {
-        let payload =
-            r#"{"zh_cn":{"content":[[{"tag":"code_block","text":"fn main() {}"}]]}}"#;
+        let payload = r#"{"zh_cn":{"content":[[{"tag":"code_block","text":"fn main() {}"}]]}}"#;
         let result = parse_post_payload(payload);
         assert!(result.text_content.contains("```"));
         assert!(result.text_content.contains("fn main() {}"));

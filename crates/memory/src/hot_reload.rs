@@ -174,7 +174,11 @@ impl ConfigHotReloader {
                         let path = entry.path();
                         if is_config_file(&path) {
                             if let Err(e) = self.watch_file_sync(&path) {
-                                tracing::warn!("Failed to watch config file {}: {}", path.display(), e);
+                                tracing::warn!(
+                                    "Failed to watch config file {}: {}",
+                                    path.display(),
+                                    e
+                                );
                             }
                         }
                     }
@@ -212,10 +216,14 @@ impl ConfigHotReloader {
         if changes.is_empty() {
             0
         } else if changes.len() == 1 {
-            let _ = self.event_sender.try_send(ConfigChangeEvent::Modified(changes[0].clone()));
+            let _ = self
+                .event_sender
+                .try_send(ConfigChangeEvent::Modified(changes[0].clone()));
             1
         } else {
-            let _ = self.event_sender.try_send(ConfigChangeEvent::Batch(changes.clone()));
+            let _ = self
+                .event_sender
+                .try_send(ConfigChangeEvent::Batch(changes.clone()));
             changes.len()
         }
     }
@@ -251,7 +259,11 @@ impl ConfigHotReloader {
                         let path = entry.path();
                         if is_config_file(path) {
                             if let Err(e) = reloader_clone.watch_file(path).await {
-                                tracing::warn!("Failed to watch config file {}: {}", path.display(), e);
+                                tracing::warn!(
+                                    "Failed to watch config file {}: {}",
+                                    path.display(),
+                                    e
+                                );
                             }
                         }
                     }
@@ -261,7 +273,11 @@ impl ConfigHotReloader {
                             let path = entry.path();
                             if is_config_file(&path) {
                                 if let Err(e) = reloader_clone.watch_file(&path).await {
-                                    tracing::warn!("Failed to watch config file {}: {}", path.display(), e);
+                                    tracing::warn!(
+                                        "Failed to watch config file {}: {}",
+                                        path.display(),
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -271,7 +287,10 @@ impl ConfigHotReloader {
 
             let mut interval = tokio::time::interval(debounce);
 
-            while handle_clone.running.load(std::sync::atomic::Ordering::Relaxed) {
+            while handle_clone
+                .running
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 interval.tick().await;
 
                 // Check all watched files
@@ -296,7 +315,9 @@ impl ConfigHotReloader {
 
                 if !changes.is_empty() {
                     if changes.len() == 1 {
-                        let _ = sender.send(ConfigChangeEvent::Modified(changes[0].clone())).await;
+                        let _ = sender
+                            .send(ConfigChangeEvent::Modified(changes[0].clone()))
+                            .await;
                     } else {
                         let _ = sender.send(ConfigChangeEvent::Batch(changes)).await;
                     }
@@ -309,8 +330,8 @@ impl ConfigHotReloader {
     }
 
     fn compute_hash(path: &Path) -> std::io::Result<u64> {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let content = fs::read(path)?;
         let mut hasher = DefaultHasher::new();
@@ -329,7 +350,8 @@ pub struct HotReloadHandle {
 impl HotReloadHandle {
     /// Stop the background watcher.
     pub fn stop(&self) {
-        self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get the list of currently watched files.
@@ -385,13 +407,7 @@ impl SharedConfigReloader {
             }
         });
 
-        (
-            Self {
-                handle,
-                reload_tx,
-            },
-            rx,
-        )
+        (Self { handle, reload_tx }, rx)
     }
 
     /// Trigger a manual reload.

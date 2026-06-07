@@ -12,9 +12,8 @@ use tempfile::TempDir;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{
-    Decision, HandoffData, MemoryEntry, MemoryLayer, WorkItem, WorkItemStatus,
-};
+use crate::legacy_jsonl::legacy_jsonl_session_import_enabled;
+use crate::types::{Decision, HandoffData, MemoryEntry, MemoryLayer, WorkItem, WorkItemStatus};
 
 /// Source of state for reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +115,11 @@ impl RebuiltSessionState {
         self.memories_by_layer
             .entry(layer)
             .or_default()
-            .push(StateItem::new(entry, StateSource::MemoryLayer(layer), confidence));
+            .push(StateItem::new(
+                entry,
+                StateSource::MemoryLayer(layer),
+                confidence,
+            ));
     }
 
     /// Compute overall confidence from all items.
@@ -124,7 +127,11 @@ impl RebuiltSessionState {
         let all_confidences: Vec<f32> = std::iter::empty()
             .chain(self.work_items.iter().map(|i| i.confidence))
             .chain(self.decisions.iter().map(|i| i.confidence))
-            .chain(self.memories_by_layer.values().flat_map(|v| v.iter().map(|i| i.confidence)))
+            .chain(
+                self.memories_by_layer
+                    .values()
+                    .flat_map(|v| v.iter().map(|i| i.confidence)),
+            )
             .chain(self.pending_tasks.iter().map(|i| i.confidence))
             .collect();
 
@@ -179,12 +186,8 @@ impl Default for RebuildOptions {
         Self {
             max_age_seconds: Some(7 * 24 * 60 * 60), // 7 days
             min_confidence: 0.5,
-            include_history: true,
-            include_memory: vec![
-                MemoryLayer::L0,
-                MemoryLayer::L1,
-                MemoryLayer::L2,
-            ],
+            include_history: false,
+            include_memory: vec![MemoryLayer::L0, MemoryLayer::L1, MemoryLayer::L2],
             include_handoff: true,
             include_snapshots: true,
         }
@@ -211,7 +214,7 @@ impl StateRebuilder {
         let mut state = RebuiltSessionState::new();
 
         // Rebuild from session history
-        if options.include_history {
+        if options.include_history && legacy_jsonl_session_import_enabled() {
             if let Some(history_state) = self.rebuild_from_history().await {
                 state.session_id = history_state.session_id;
                 for (item, _ts) in history_state.work_items {
@@ -288,9 +291,8 @@ impl StateRebuilder {
                         if let Ok(modified) = metadata.modified() {
                             if modified > latest_mtime {
                                 latest_mtime = modified;
-                                latest_session_id = path.file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .map(String::from);
+                                latest_session_id =
+                                    path.file_stem().and_then(|s| s.to_str()).map(String::from);
                             }
                         }
                     }
@@ -430,8 +432,14 @@ impl StateRebuilder {
 
         // Sort by modification time (newest first)
         paths.sort_by(|a, b| {
-            let a_time = a.1.as_ref().map(|t| *t).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let b_time = b.1.as_ref().map(|t| *t).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let a_time =
+                a.1.as_ref()
+                    .map(|t| *t)
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let b_time =
+                b.1.as_ref()
+                    .map(|t| *t)
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             b_time.cmp(&a_time)
         });
 
@@ -479,7 +487,7 @@ impl StateRebuilder {
         self.rebuild(&RebuildOptions {
             max_age_seconds: Some(24 * 60 * 60), // 24 hours
             min_confidence: 0.7,
-            include_history: true,
+            include_history: false,
             include_memory: vec![MemoryLayer::L0, MemoryLayer::L1],
             include_handoff: true,
             include_snapshots: false,
@@ -523,8 +531,27 @@ struct SessionStoreEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Priority, DecisionStatus, WorkItemStatus};
+    use crate::types::{DecisionStatus, Priority, WorkItemStatus};
+    use std::io::Write;
     use tempfile::TempDir;
+
+    struct LegacyJsonlEnvGuard(Option<String>);
+
+    impl LegacyJsonlEnvGuard {
+        fn disabled() -> Self {
+            let previous = std::env::var("COWD_ENABLE_LEGACY_JSONL_SESSION_IMPORT").ok();
+            std::env::remove_var("COWD_ENABLE_LEGACY_JSONL_SESSION_IMPORT");
+            Self(previous)
+        }
+    }
+
+    impl Drop for LegacyJsonlEnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                std::env::set_var("COWD_ENABLE_LEGACY_JSONL_SESSION_IMPORT", previous);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_state_rebuilder_creation() {
@@ -565,6 +592,43 @@ mod tests {
 
         // Average of 0.8 and 0.9
         assert!((state.overall_confidence - 0.85).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_rebuild_options_do_not_include_legacy_history_by_default() {
+        let options = RebuildOptions::default();
+        assert!(!options.include_history);
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_skips_legacy_history_without_import_gate() {
+        let _env = LegacyJsonlEnvGuard::disabled();
+        let tmp = TempDir::new().unwrap();
+        let history_dir = tmp.path().join(".cowd/history");
+        fs::create_dir_all(&history_dir).unwrap();
+
+        let mut file = fs::File::create(history_dir.join("legacy-session.jsonl")).unwrap();
+        writeln!(
+            file,
+            r#"{{"content":"- [ ] imported legacy task","timestamp":1}}"#
+        )
+        .unwrap();
+
+        let rebuilder = StateRebuilder::new(tmp.path());
+        let state = rebuilder
+            .rebuild(&RebuildOptions {
+                include_history: true,
+                include_handoff: false,
+                include_snapshots: false,
+                include_memory: Vec::new(),
+                ..RebuildOptions::default()
+            })
+            .await;
+
+        assert!(state
+            .work_items
+            .iter()
+            .all(|item| item.source != StateSource::SessionHistory));
     }
 
     #[tokio::test]
@@ -625,7 +689,7 @@ mod tests {
 // 2. Direct extraction of essential state
 // 3. Prioritized reconstruction for quick recovery
 
-use crate::aaak_compression::{AaakCompressor, AaakCompressed, GsdContext, GsdState};
+use crate::aaak_compression::{AaakCompressed, AaakCompressor, GsdContext, GsdState};
 
 /// GSD-style state rebuild options - minimal compression dependency.
 #[derive(Debug, Clone)]
@@ -648,7 +712,7 @@ impl Default for GsdRebuildOptions {
     fn default() -> Self {
         Self {
             max_age_seconds: Some(24 * 60 * 60), // 24 hours
-            include_history: true,
+            include_history: false,
             include_handoff: true,
             include_aaak: true,
             extract_priority: true,
@@ -748,13 +812,15 @@ impl GsdStateRebuilder {
             if let Some(handoff) = self.extract_from_handoff().await {
                 state.context.task = handoff.summary.clone();
                 state.key_decisions = handoff.decisions;
-                state.blockers = handoff.blockers.into_iter().map(|b| {
-                    BlockerInfo {
+                state.blockers = handoff
+                    .blockers
+                    .into_iter()
+                    .map(|b| BlockerInfo {
                         description: b.description,
                         severity: BlockerSeverity::Medium,
                         hint: b.resolution_hint,
-                    }
-                }).collect();
+                    })
+                    .collect();
                 state.prioritized_work = self.prioritize_work_items(handoff.work_items);
                 state.confidence += 0.4;
                 state.sources_used.push(StateSource::Handoff);
@@ -773,7 +839,7 @@ impl GsdStateRebuilder {
         }
 
         // Extract from session history
-        if options.include_history {
+        if options.include_history && legacy_jsonl_session_import_enabled() {
             if let Some(history) = self.extract_from_history(options.max_age_seconds).await {
                 if state.context.task.is_empty() {
                     state.context.task = history.task_summary;
@@ -827,7 +893,8 @@ impl GsdStateRebuilder {
                 let path = entry.path();
                 if path.extension().map(|e| e == "json").unwrap_or(false)
                     && !path.to_string_lossy().contains(".resumed.")
-                    && !path.to_string_lossy().contains(".decisions.") {
+                    && !path.to_string_lossy().contains(".decisions.")
+                {
                     if let Ok(metadata) = entry.metadata() {
                         if let Ok(modified) = metadata.modified() {
                             if modified > latest_mtime {
@@ -871,8 +938,14 @@ impl GsdStateRebuilder {
 
         // Sort by mtime (newest first)
         paths.sort_by(|a, b| {
-            let a_time = a.1.as_ref().map(|t| *t).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let b_time = b.1.as_ref().map(|t| *t).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let a_time =
+                a.1.as_ref()
+                    .map(|t| *t)
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let b_time =
+                b.1.as_ref()
+                    .map(|t| *t)
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             b_time.cmp(&a_time)
         });
 
@@ -922,11 +995,13 @@ impl GsdStateRebuilder {
                         if let Some(content) = json.get("content").and_then(|c| c.as_str()) {
                             // Find file paths
                             for word in content.split_whitespace() {
-                                if word.contains('/') && (word.ends_with(".rs")
-                                    || word.ends_with(".json")
-                                    || word.ends_with(".yaml")
-                                    || word.ends_with(".md")
-                                    || word.ends_with(".toml")) {
+                                if word.contains('/')
+                                    && (word.ends_with(".rs")
+                                        || word.ends_with(".json")
+                                        || word.ends_with(".yaml")
+                                        || word.ends_with(".md")
+                                        || word.ends_with(".toml"))
+                                {
                                     if !files.contains(&word.to_string()) {
                                         files.push(word.to_string());
                                     }
@@ -968,14 +1043,18 @@ impl GsdStateRebuilder {
                 crate::types::Priority::Low => 3,
             };
 
-            status_order(a).cmp(&status_order(b))
+            status_order(a)
+                .cmp(&status_order(b))
                 .then(priority_order(a).cmp(&priority_order(b)))
         });
         sorted
     }
 
     fn extract_abbreviations(&self, compressed: &AaakCompressed) -> Vec<AbbreviationEntry> {
-        compressed.dictionary.abbreviations.values()
+        compressed
+            .dictionary
+            .abbreviations
+            .values()
             .map(|abbrev| AbbreviationEntry {
                 short: abbrev.short.clone(),
                 full: abbrev.full.clone(),
@@ -989,17 +1068,29 @@ impl GsdStateRebuilder {
         if !state.blockers.is_empty() {
             return format!(
                 "Resolve blocker: {}",
-                state.blockers.first().map(|b| b.description.as_str()).unwrap_or("Unknown")
+                state
+                    .blockers
+                    .first()
+                    .map(|b| b.description.as_str())
+                    .unwrap_or("Unknown")
             );
         }
 
         // Priority 2: In-progress items
-        if let Some(work) = state.prioritized_work.iter().find(|w| w.status == WorkItemStatus::InProgress) {
+        if let Some(work) = state
+            .prioritized_work
+            .iter()
+            .find(|w| w.status == WorkItemStatus::InProgress)
+        {
             return format!("Continue: {}", work.title);
         }
 
         // Priority 3: Next pending item
-        if let Some(work) = state.prioritized_work.iter().find(|w| w.status == WorkItemStatus::Pending) {
+        if let Some(work) = state
+            .prioritized_work
+            .iter()
+            .find(|w| w.status == WorkItemStatus::Pending)
+        {
             return format!("Start: {}", work.title);
         }
 
@@ -1028,6 +1119,24 @@ impl GsdStateRebuilder {
 mod gsd_tests {
     use super::*;
 
+    struct LegacyJsonlEnvGuard(Option<String>);
+
+    impl LegacyJsonlEnvGuard {
+        fn disabled() -> Self {
+            let previous = std::env::var("COWD_ENABLE_LEGACY_JSONL_SESSION_IMPORT").ok();
+            std::env::remove_var("COWD_ENABLE_LEGACY_JSONL_SESSION_IMPORT");
+            Self(previous)
+        }
+    }
+
+    impl Drop for LegacyJsonlEnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                std::env::set_var("COWD_ENABLE_LEGACY_JSONL_SESSION_IMPORT", previous);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_gsd_rebuilder_creation() {
         let tmp = TempDir::new().unwrap();
@@ -1042,6 +1151,38 @@ mod gsd_tests {
         let options = GsdRebuildOptions::default();
         let state = rebuilder.quick_rebuild(&options).await;
         assert!(state.confidence >= 0.0 && state.confidence <= 1.0);
+    }
+
+    #[test]
+    fn test_gsd_rebuild_options_do_not_include_legacy_history_by_default() {
+        let options = GsdRebuildOptions::default();
+        assert!(!options.include_history);
+    }
+
+    #[tokio::test]
+    async fn test_gsd_rebuild_skips_legacy_history_without_import_gate() {
+        let _env = LegacyJsonlEnvGuard::disabled();
+        let tmp = TempDir::new().unwrap();
+        let history_dir = tmp.path().join(".cowd/history");
+        fs::create_dir_all(&history_dir).unwrap();
+        fs::write(
+            history_dir.join("legacy-session.jsonl"),
+            r#"{"role":"user","content":"Please inspect crates/memory/src/state_rebuilder.rs"}"#,
+        )
+        .unwrap();
+
+        let rebuilder = GsdStateRebuilder::new(tmp.path());
+        let state = rebuilder
+            .quick_rebuild(&GsdRebuildOptions {
+                include_history: true,
+                include_handoff: false,
+                include_aaak: false,
+                ..GsdRebuildOptions::default()
+            })
+            .await;
+
+        assert!(!state.sources_used.contains(&StateSource::SessionHistory));
+        assert!(state.referenced_files.is_empty());
     }
 
     #[tokio::test]

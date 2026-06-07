@@ -8,7 +8,11 @@ pub struct ContextSync {
 }
 
 impl ContextSync {
-    pub fn new() -> Self { Self { shared: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            shared: HashMap::new(),
+        }
+    }
 
     pub fn store(&mut self, session_id: &str, key_points: Vec<String>) {
         self.shared.insert(session_id.to_string(), key_points);
@@ -21,23 +25,36 @@ impl ContextSync {
     pub fn inject_from_others(&self, target_session: &str, context: &mut String) -> usize {
         let mut injected = 0;
         for (sid, points) in &self.shared {
-            if sid == target_session { continue; }
-            if injected == 0 { context.push_str("\n<cross_session_context>\n"); }
+            if sid == target_session {
+                continue;
+            }
+            if injected == 0 {
+                context.push_str("\n<cross_session_context>\n");
+            }
             for point in points.iter().take(3) {
-                context.push_str(&format!("  <synced from=\"{}\">{}</synced>\n",
-                    &sid[..sid.len().min(8)], point));
+                context.push_str(&format!(
+                    "  <synced from=\"{}\">{}</synced>\n",
+                    &sid[..sid.len().min(8)],
+                    point
+                ));
                 injected += 1;
             }
         }
-        if injected > 0 { context.push_str("</cross_session_context>\n"); }
+        if injected > 0 {
+            context.push_str("</cross_session_context>\n");
+        }
         injected
     }
 
-    pub fn session_count(&self) -> usize { self.shared.len() }
+    pub fn session_count(&self) -> usize {
+        self.shared.len()
+    }
 }
 
 impl Default for ContextSync {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

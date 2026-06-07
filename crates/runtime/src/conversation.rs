@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{RwLock, Semaphore};
@@ -38,7 +38,7 @@ use crate::agent::{SubAgentConfig, SubAgentRuntime};
 use crate::agent_collaboration::{CollaborationContextResult, CollaborationOps};
 use crate::agent_discussion::DiscussionEngine;
 use crate::compact::{
-    CompactionConfig, CompactionResult, compact_session, estimate_session_tokens,
+    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::context_runtime::{
@@ -291,7 +291,7 @@ pub struct ConversationRuntime<C, T> {
     memory_status: Option<String>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
-    /// Optional session store for message dual-write (JSONL + SQLite).
+    /// Optional managed SQLite session store for messages and runtime events.
     session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
     /// Optional event log for time-travel debugging and session rebuild.
     event_log: Option<std::sync::Mutex<SessionEventLog>>,
@@ -698,9 +698,67 @@ where
         if let Ok(mut guard) = self.last_context_envelope.lock() {
             *guard = Some(envelope.clone());
         }
+        self.persist_context_envelope(envelope.clone());
         if let Some(cowd) = self.cowd_bus() {
             cowd.emit(crate::cowd_event::CowdEvent::ContextEnvelope { envelope });
         }
+    }
+
+    fn persist_context_envelope(&self, envelope: ContextEnvelope) {
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        let session_id = envelope.identity.session_id.clone();
+        let envelope_id = envelope.id.clone();
+        let payload = serde_json::json!({
+            "type": "ContextEnvelope",
+            "envelope_id": envelope_id,
+            "session_id": session_id,
+            "agent_id": envelope.identity.agent_id.clone(),
+            "profile": envelope.profile,
+            "diagnostics": envelope.diagnostics.clone(),
+            "budget": envelope.budget.clone(),
+            "hashes": {
+                "stable_head": envelope.diagnostics.stable_head_hash,
+                "runtime_header": envelope.diagnostics.runtime_header_hash,
+                "dynamic_tail": envelope.diagnostics.dynamic_tail_hash,
+            },
+            "envelope": envelope,
+        });
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            let sequence = match store.next_event_sequence(&session_id).await {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    tracing::warn!(%error, session_id, "context envelope sequence allocation failed");
+                    return;
+                }
+            };
+            let created_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            let event = memory::SessionEvent {
+                session_id: session_id.clone(),
+                event_type: "ContextEnvelope".to_string(),
+                event_json: payload.to_string(),
+                sequence,
+                created_at_ms,
+            };
+            match store.append_context_envelope_event_if_absent(&event).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        session_id,
+                        sequence,
+                        "context envelope event already persisted"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, session_id, sequence, "context envelope event append failed");
+                }
+            }
+        });
     }
 
     fn context_budget_tokens(&self) -> u64 {
@@ -1713,7 +1771,7 @@ where
             // Phase 2: Parallel+serial tool dispatch based on safety categories
             let mut callback_inject = None;
             {
-                use crate::tool_dispatch::{ToolRequest, categorize};
+                use crate::tool_dispatch::{categorize, ToolRequest};
                 use futures::stream::{FuturesUnordered, StreamExt};
 
                 let requests: Vec<ToolRequest> = pending_tool_uses
@@ -2302,7 +2360,11 @@ where
                         tool_name.to_string(),
                         effective_input.clone(),
                     ));
-                    if r.success { Some(r.data) } else { None }
+                    if r.success {
+                        Some(r.data)
+                    } else {
+                        None
+                    }
                 });
 
                 let start = Instant::now();
@@ -3029,8 +3091,10 @@ where
         Ok(())
     }
 
-    /// Write a message to the SQLite session store via a spawned background task.
-    /// JSONL is the canonical source; SQLite failure is logged and retried once.
+    /// Write a message to the durable SQLite session store via a spawned
+    /// background task. The in-memory session remains the hot turn state;
+    /// SQLite is the managed session source of truth. JSONL is only used by
+    /// explicit import/export codecs.
     fn dual_write_message(&self, msg: &crate::session::ConversationMessage, sequence: usize) {
         // Record the message in the event log for time-travel debugging.
         if let Some(ref log) = self.event_log {
@@ -3393,8 +3457,6 @@ mod tests {
         ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
         PromptCacheEvent, RuntimeError, StaticToolExecutor,
     };
-    use crate::SubAgentConfig;
-    use crate::ToolError;
     use crate::agent_collaboration::{
         AgentTeam, CollaborationContextResult, CollaborationOps, CollaborationReviewPacket,
         CollaborationScorecard, CollaborationTask, SubTask,
@@ -3413,6 +3475,8 @@ mod tests {
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
+    use crate::SubAgentConfig;
+    use crate::ToolError;
     use futures::stream::Stream;
     use std::fs;
     use std::future::Future;
@@ -3448,12 +3512,10 @@ mod tests {
             self.call_count += 1;
             let events = match self.call_count {
                 1 => {
-                    assert!(
-                        request
-                            .messages
-                            .iter()
-                            .any(|message| message.role == MessageRole::User)
-                    );
+                    assert!(request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == MessageRole::User));
                     vec![
                         AssistantEvent::TextDelta("Let me calculate that.".to_string()),
                         AssistantEvent::ToolUse {
@@ -3885,12 +3947,10 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(
-                            request
-                                .messages
-                                .iter()
-                                .any(|message| message.role == MessageRole::Tool)
-                        );
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
                         to_stream(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -3968,12 +4028,10 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(
-                            request
-                                .messages
-                                .iter()
-                                .any(|message| message.role == MessageRole::Tool)
-                        );
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
                         to_stream(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -4132,7 +4190,7 @@ mod tests {
     }
 
     #[test]
-    fn persists_conversation_turn_messages_to_jsonl_session() {
+    fn legacy_jsonl_persistence_remains_explicit_codec_only() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -4166,7 +4224,7 @@ mod tests {
 
         drop(runtime);
 
-        // Read back and verify through Session::load_from_path
+        // Read back and verify through the explicit local import/export codec.
         let restored = Session::load_from_path(&path).expect("persisted session should reload");
         assert_eq!(restored.messages.len(), 2); // user + assistant
         assert_eq!(restored.messages[0].role, MessageRole::User);
@@ -4176,7 +4234,7 @@ mod tests {
     }
 
     #[test]
-    fn dual_write_persists_messages_and_session_events() {
+    fn sqlite_session_store_is_runtime_turn_source_of_truth() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -4238,16 +4296,45 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
 
+            let envelope = runtime
+                .last_context_envelope()
+                .expect("context envelope should be remembered");
+            for _ in 0..20 {
+                if store
+                    .get_context_event_by_envelope_id(&envelope.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+
             let messages = store.get_messages(&session_id, 0, 10).await.unwrap();
             let events = store.get_events(&session_id, 0).await.unwrap();
+            let stored_count = store.get_message_count(&session_id).await.unwrap();
+            let record = store
+                .get_session(&session_id)
+                .await
+                .unwrap()
+                .expect("session record should remain queryable");
+            let context_event = store
+                .get_context_event_by_envelope_id(&envelope.id)
+                .await
+                .unwrap()
+                .expect("context envelope should be persisted");
+            let context_json: serde_json::Value =
+                serde_json::from_str(&context_event.event_json).expect("context event json");
 
             assert_eq!(messages.len(), 2);
+            assert_eq!(stored_count, 2);
+            assert_eq!(record.session_id, session_id);
+            assert_eq!(record.chat_id, session_id);
             assert!(events.len() >= 3);
-            assert!(
-                events
-                    .iter()
-                    .any(|event| event.event_type == memory::RUNTIME_EVENT_TYPE)
-            );
+            assert!(events
+                .iter()
+                .any(|event| event.event_type == memory::RUNTIME_EVENT_TYPE));
 
             let user_event = events
                 .iter()
@@ -4258,6 +4345,11 @@ mod tests {
             assert_eq!(event_json["role"], "user");
             assert_eq!(event_json["message"]["role"], "user");
             assert_eq!(event_json["message"]["blocks"][0]["text"], "persist events");
+            assert_eq!(context_event.event_type, "ContextEnvelope");
+            assert_eq!(context_json["type"], "ContextEnvelope");
+            assert_eq!(context_json["envelope_id"], envelope.id);
+            assert_eq!(context_json["envelope"]["id"], envelope.id);
+            assert_eq!(context_json["session_id"], session_id);
 
             let policy = events
                 .iter()
@@ -4527,11 +4619,9 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert!(
-            prompt
-                .iter()
-                .any(|segment| segment.contains("continue v0.8.13 context work"))
-        );
+        assert!(prompt
+            .iter()
+            .any(|segment| segment.contains("continue v0.8.13 context work")));
         assert_eq!(envelope.selected.len(), 1);
         assert_eq!(envelope.selected[0].source, ContextSourceKind::Handoff);
         assert_eq!(envelope.selected[0].authority, ContextAuthority::Session);
@@ -4563,17 +4653,13 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert!(
-            prompt
-                .iter()
-                .any(|segment| segment.contains("cargo test passed"))
-        );
-        assert!(
-            envelope
-                .selected
-                .iter()
-                .any(|item| item.source == ContextSourceKind::ToolTrace)
-        );
+        assert!(prompt
+            .iter()
+            .any(|segment| segment.contains("cargo test passed")));
+        assert!(envelope
+            .selected
+            .iter()
+            .any(|item| item.source == ContextSourceKind::ToolTrace));
     }
 
     #[tokio::test(flavor = "multi_thread")]

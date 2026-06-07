@@ -4,15 +4,18 @@
 //! supporting both sending and receiving messages through the WeCom API,
 //! with full AES-256-CBC message encryption/decryption and callback verification.
 
-use crate::platform::adapter::{ChatInfo, InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter, PlatformError, PlatformEvent, PlatformResult};
+use crate::platform::adapter::{
+    ChatInfo, InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter,
+    PlatformError, PlatformEvent, PlatformResult,
+};
 use crate::platform::types::SessionKey;
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::RwLock;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 /// WeCom adapter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,7 +36,11 @@ pub struct WeComConfig {
 
 impl WeComConfig {
     /// Create a new WeCom config.
-    pub fn new(corp_id: impl Into<String>, corp_secret: impl Into<String>, agent_id: impl Into<String>) -> Self {
+    pub fn new(
+        corp_id: impl Into<String>,
+        corp_secret: impl Into<String>,
+        agent_id: impl Into<String>,
+    ) -> Self {
         Self {
             corp_id: corp_id.into(),
             corp_secret: corp_secret.into(),
@@ -92,7 +99,8 @@ impl WeComCrypto {
 
         if key_bytes.len() != 32 {
             return Err(PlatformError::ConfigError(format!(
-                "AES key must be 32 bytes, got {}", key_bytes.len()
+                "AES key must be 32 bytes, got {}",
+                key_bytes.len()
             )));
         }
 
@@ -109,7 +117,7 @@ impl WeComCrypto {
     /// Decrypt an encrypted message from WeCom callback.
     pub fn decrypt(&self, encrypted: &str) -> PlatformResult<String> {
         use aes::Aes256;
-        use cbc::{Decryptor, cipher::BlockDecryptMut, cipher::KeyIvInit};
+        use cbc::{cipher::BlockDecryptMut, cipher::KeyIvInit, Decryptor};
 
         type Aes256CbcDec = Decryptor<Aes256>;
 
@@ -117,7 +125,11 @@ impl WeComCrypto {
             .decode(encrypted)
             .map_err(|e| PlatformError::ConfigError(format!("base64 decode failed: {}", e)))?;
 
-        let iv: [u8; 16] = self.key.get(..16).and_then(|s| s.try_into().ok()).ok_or_else(|| PlatformError::ConfigError("encryption key too short".into()))?;
+        let iv: [u8; 16] = self
+            .key
+            .get(..16)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| PlatformError::ConfigError("encryption key too short".into()))?;
 
         let plaintext = Aes256CbcDec::new(&self.key.into(), &iv.into())
             .decrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(&ciphertext)
@@ -125,12 +137,21 @@ impl WeComCrypto {
 
         // Plaintext layout: 16-byte random + 4-byte big-endian msg len + msg + corp_id
         if plaintext.len() < 20 {
-            return Err(PlatformError::ConfigError("decrypted payload too short".to_string()));
+            return Err(PlatformError::ConfigError(
+                "decrypted payload too short".to_string(),
+            ));
         }
 
-        let content_len = u32::from_be_bytes(plaintext.get(16..20).and_then(|s| s.try_into().ok()).ok_or_else(|| PlatformError::ConfigError("message content too short".into()))?) as usize;
+        let content_len = u32::from_be_bytes(
+            plaintext
+                .get(16..20)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| PlatformError::ConfigError("message content too short".into()))?,
+        ) as usize;
         if plaintext.len() < 20 + content_len {
-            return Err(PlatformError::ConfigError("decrypted payload truncated".to_string()));
+            return Err(PlatformError::ConfigError(
+                "decrypted payload truncated".to_string(),
+            ));
         }
 
         let msg = std::str::from_utf8(&plaintext[20..20 + content_len])
@@ -139,10 +160,11 @@ impl WeComCrypto {
         // Verify corp_id suffix
         let corp_id_start = 20 + content_len;
         if plaintext.len() > corp_id_start {
-            let received_corp = std::str::from_utf8(&plaintext[corp_id_start..])
-                .unwrap_or("");
+            let received_corp = std::str::from_utf8(&plaintext[corp_id_start..]).unwrap_or("");
             if received_corp != self.corp_id {
-                return Err(PlatformError::ConfigError("corp_id mismatch in decrypted payload".to_string()));
+                return Err(PlatformError::ConfigError(
+                    "corp_id mismatch in decrypted payload".to_string(),
+                ));
             }
         }
 
@@ -152,7 +174,7 @@ impl WeComCrypto {
     /// Encrypt a message for WeCom callback response.
     pub fn encrypt(&self, plaintext: &str) -> PlatformResult<String> {
         use aes::Aes256;
-        use cbc::{Encryptor, cipher::BlockEncryptMut, cipher::KeyIvInit};
+        use cbc::{cipher::BlockEncryptMut, cipher::KeyIvInit, Encryptor};
 
         type Aes256CbcEnc = Encryptor<Aes256>;
 
@@ -169,7 +191,11 @@ impl WeComCrypto {
         let padding = block_size - (data.len() % block_size);
         data.extend(std::iter::repeat(padding as u8).take(padding));
 
-        let iv: [u8; 16] = self.key.get(..16).and_then(|s| s.try_into().ok()).ok_or_else(|| PlatformError::ConfigError("encryption key too short".into()))?;
+        let iv: [u8; 16] = self
+            .key
+            .get(..16)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| PlatformError::ConfigError("encryption key too short".into()))?;
 
         let ciphertext = Aes256CbcEnc::new(&self.key.into(), &iv.into())
             .encrypt_padded_vec_mut::<cbc::cipher::block_padding::Pkcs7>(&data);
@@ -180,8 +206,14 @@ impl WeComCrypto {
     /// Verify the signature of a callback request.
     ///
     /// Signature = SHA1(sort([token, timestamp, nonce, encrypted]))
-    pub fn verify_signature(&self, timestamp: &str, nonce: &str, encrypted: &str, signature: &str) -> bool {
-        use sha1::{Sha1, Digest};
+    pub fn verify_signature(
+        &self,
+        timestamp: &str,
+        nonce: &str,
+        encrypted: &str,
+        signature: &str,
+    ) -> bool {
+        use sha1::{Digest, Sha1};
 
         let mut parts = vec![self.token.as_str(), timestamp, nonce, encrypted];
         parts.sort();
@@ -258,12 +290,13 @@ impl WeComAdapter {
             )));
         }
 
-        let token = token_resp
-            .access_token
-            .ok_or_else(|| PlatformError::AuthenticationFailed("no token in response".to_string()))?;
+        let token = token_resp.access_token.ok_or_else(|| {
+            PlatformError::AuthenticationFailed("no token in response".to_string())
+        })?;
 
         if let Some(expires_in) = token_resp.expires_in {
-            *self.token_expires_at.write().await = Some(Utc::now() + chrono::Duration::seconds(expires_in as i64));
+            *self.token_expires_at.write().await =
+                Some(Utc::now() + chrono::Duration::seconds(expires_in as i64));
         }
 
         Ok(token)
@@ -376,13 +409,20 @@ impl WeComAdapter {
             if let Some(sig) = &callback.msg_signature {
                 if self.config.is_crypto_configured() {
                     let crypto = WeComCrypto::new(
-                        self.config.encoding_aes_key.as_deref().ok_or_else(|| PlatformError::ConfigError("missing encoding_aes_key".into()))?,
-                        self.config.token.as_deref().ok_or_else(|| PlatformError::ConfigError("missing token".into()))?,
+                        self.config.encoding_aes_key.as_deref().ok_or_else(|| {
+                            PlatformError::ConfigError("missing encoding_aes_key".into())
+                        })?,
+                        self.config
+                            .token
+                            .as_deref()
+                            .ok_or_else(|| PlatformError::ConfigError("missing token".into()))?,
                         &self.config.corp_id,
                     )?;
 
                     if !crypto.verify_signature(timestamp, nonce, encrypted, sig) {
-                        return Err(PlatformError::Unknown("invalid wecom callback signature".to_string()));
+                        return Err(PlatformError::Unknown(
+                            "invalid wecom callback signature".to_string(),
+                        ));
                     }
 
                     let decrypted = crypto.decrypt(encrypted)?;
@@ -413,17 +453,34 @@ impl WeComAdapter {
         let event: WeComEvent = serde_json::from_slice(payload)
             .map_err(|e| PlatformError::Unknown(format!("failed to parse webhook event: {}", e)))?;
 
-        self.extract_inbound_message(&event.msg_type, &event.content, &event.from_user_name, &event.msg_id)
+        self.extract_inbound_message(
+            &event.msg_type,
+            &event.content,
+            &event.from_user_name,
+            &event.msg_id,
+        )
     }
 
     /// Parse a decrypted event XML/JSON payload.
     fn parse_decrypted_event(&self, decrypted: &str) -> PlatformResult<Option<InboundMessage>> {
         // WeCom decrypted content is typically XML, try JSON first then XML extraction
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(decrypted) {
-            let msg_type = val.get("MsgType").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let content = val.get("Content").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let from_user = val.get("FromUserName").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let msg_id = val.get("MsgId").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let msg_type = val
+                .get("MsgType")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let content = val
+                .get("Content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let from_user = val
+                .get("FromUserName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let msg_id = val
+                .get("MsgId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             return self.extract_inbound_message(&msg_type, &content, &from_user, &msg_id);
         }
@@ -496,14 +553,22 @@ impl WeComAdapter {
         }
 
         let crypto = WeComCrypto::new(
-            self.config.encoding_aes_key.as_deref().ok_or_else(|| PlatformError::ConfigError("missing encoding_aes_key".into()))?,
-            self.config.token.as_deref().ok_or_else(|| PlatformError::ConfigError("missing token".into()))?,
+            self.config
+                .encoding_aes_key
+                .as_deref()
+                .ok_or_else(|| PlatformError::ConfigError("missing encoding_aes_key".into()))?,
+            self.config
+                .token
+                .as_deref()
+                .ok_or_else(|| PlatformError::ConfigError("missing token".into()))?,
             &self.config.corp_id,
         )?;
 
         // Verify signature
         if !crypto.verify_signature(timestamp, nonce, echostr, msg_signature) {
-            return Err(PlatformError::Unknown("invalid callback signature".to_string()));
+            return Err(PlatformError::Unknown(
+                "invalid callback signature".to_string(),
+            ));
         }
 
         // Decrypt echostr to get the plain reply
@@ -512,21 +577,40 @@ impl WeComAdapter {
     }
 
     /// Build the encrypted response for a callback event reply.
-    pub fn encrypt_reply(&self, reply: &str, timestamp: &str, nonce: &str) -> PlatformResult<serde_json::Value> {
+    pub fn encrypt_reply(
+        &self,
+        reply: &str,
+        timestamp: &str,
+        nonce: &str,
+    ) -> PlatformResult<serde_json::Value> {
         if !self.config.is_crypto_configured() {
             return Ok(serde_json::json!({ "msg": reply }));
         }
 
         let crypto = WeComCrypto::new(
-            self.config.encoding_aes_key.as_deref().ok_or_else(|| PlatformError::ConfigError("missing encoding_aes_key".into()))?,
-            self.config.token.as_deref().ok_or_else(|| PlatformError::ConfigError("missing token".into()))?,
+            self.config
+                .encoding_aes_key
+                .as_deref()
+                .ok_or_else(|| PlatformError::ConfigError("missing encoding_aes_key".into()))?,
+            self.config
+                .token
+                .as_deref()
+                .ok_or_else(|| PlatformError::ConfigError("missing token".into()))?,
             &self.config.corp_id,
         )?;
 
         let encrypted = crypto.encrypt(reply)?;
         let signature = {
-            use sha1::{Sha1, Digest};
-            let mut parts = vec![self.config.token.as_deref().ok_or_else(|| PlatformError::ConfigError("missing token".into()))?, timestamp, nonce, &encrypted];
+            use sha1::{Digest, Sha1};
+            let mut parts = vec![
+                self.config
+                    .token
+                    .as_deref()
+                    .ok_or_else(|| PlatformError::ConfigError("missing token".into()))?,
+                timestamp,
+                nonce,
+                &encrypted,
+            ];
             parts.sort();
             let mut hasher = Sha1::new();
             for part in &parts {
@@ -596,31 +680,67 @@ impl PlatformAdapter for WeComAdapter {
         Err(PlatformError::NotImplemented("send_typing".into()))
     }
 
-    async fn send_image(&self, _chat_id: &str, _image_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_image(
+        &self,
+        _chat_id: &str,
+        _image_url: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_image".into()))
     }
 
-    async fn send_image_file(&self, _chat_id: &str, _image_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_image_file(
+        &self,
+        _chat_id: &str,
+        _image_path: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_image_file".into()))
     }
 
-    async fn send_voice(&self, _chat_id: &str, _audio_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_voice(
+        &self,
+        _chat_id: &str,
+        _audio_path: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_voice".into()))
     }
 
-    async fn send_document(&self, _chat_id: &str, _file_path: &str, _file_name: Option<&str>, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_document(
+        &self,
+        _chat_id: &str,
+        _file_path: &str,
+        _file_name: Option<&str>,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_document".into()))
     }
 
-    async fn send_video(&self, _chat_id: &str, _video_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_video(
+        &self,
+        _chat_id: &str,
+        _video_path: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_video".into()))
     }
 
-    async fn send_animation(&self, _chat_id: &str, _animation_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_animation(
+        &self,
+        _chat_id: &str,
+        _animation_url: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_animation".into()))
     }
 
-    async fn edit_message(&self, _chat_id: &str, _message_id: &str, _content: &str) -> PlatformResult<()> {
+    async fn edit_message(
+        &self,
+        _chat_id: &str,
+        _message_id: &str,
+        _content: &str,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("edit_message".into()))
     }
 
@@ -705,12 +825,18 @@ mod tests {
 
         let crypto = match WeComCrypto::new(encoding_aes_key, token, corp_id) {
             Ok(c) => c,
-            Err(_) => { tracing::debug!("skipping: crypto init failed (env-dependent)"); return; }
+            Err(_) => {
+                tracing::debug!("skipping: crypto init failed (env-dependent)");
+                return;
+            }
         };
         let plaintext = "Hello, WeCom!";
         let encrypted = match crypto.encrypt(plaintext) {
             Ok(e) => e,
-            Err(_) => { tracing::debug!("skipping: encrypt failed (env-dependent)"); return; }
+            Err(_) => {
+                tracing::debug!("skipping: encrypt failed (env-dependent)");
+                return;
+            }
         };
         match crypto.decrypt(&encrypted) {
             Ok(decrypted) => assert_eq!(decrypted, plaintext),
@@ -723,7 +849,10 @@ mod tests {
         let encoding_aes_key = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFA";
         let crypto = match WeComCrypto::new(encoding_aes_key, "test_token", "test_corp") {
             Ok(c) => c,
-            Err(_) => { tracing::debug!("skipping: crypto init failed"); return; }
+            Err(_) => {
+                tracing::debug!("skipping: crypto init failed");
+                return;
+            }
         };
 
         let encrypted = crypto.encrypt("test").unwrap();
@@ -732,7 +861,7 @@ mod tests {
 
         // Generate signature
         let sig = {
-            use sha1::{Sha1, Digest};
+            use sha1::{Digest, Sha1};
             let mut parts = vec!["test_token", timestamp, nonce, encrypted.as_str()];
             parts.sort();
             let mut hasher = Sha1::new();
@@ -751,7 +880,10 @@ mod tests {
         let xml = r#"<xml><MsgType>text</MsgType><Content>Hello</Content><FromUserName>user1</FromUserName></xml>"#;
         assert_eq!(extract_xml_value(xml, "MsgType"), Some("text".to_string()));
         assert_eq!(extract_xml_value(xml, "Content"), Some("Hello".to_string()));
-        assert_eq!(extract_xml_value(xml, "FromUserName"), Some("user1".to_string()));
+        assert_eq!(
+            extract_xml_value(xml, "FromUserName"),
+            Some("user1".to_string())
+        );
         assert_eq!(extract_xml_value(xml, "NonExistent"), None);
     }
 

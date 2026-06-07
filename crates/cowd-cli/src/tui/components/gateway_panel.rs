@@ -152,6 +152,10 @@ impl Component for GatewayPanel {
             Span::styled("Server: ", Style::default()),
             status,
         ]));
+        lines.push(Line::from(Span::styled(
+            "Keys: r refresh  h health  s start/stop",
+            Style::default().fg(Color::DarkGray),
+        )));
 
         // ── Health check ───────────────────────────────────────
         if let Some(ref health) = self.health_status {
@@ -195,7 +199,7 @@ impl Component for GatewayPanel {
         )));
         lines.push(Line::from(""));
 
-        let endpoints: [(&str, &str); 10] = [
+        let endpoints: [(&str, &str); 14] = [
             ("GET  /health", "Server health check"),
             ("GET  /api/sessions", "List sessions"),
             ("POST /api/sessions", "Create session"),
@@ -206,6 +210,13 @@ impl Component for GatewayPanel {
             ("GET  /api/config", "View config"),
             ("PUT  /api/config", "Update config"),
             ("GET  /api/platforms", "List platforms"),
+            ("GET  /api/cross-plane/summary", "Interop policy summary"),
+            ("GET  /api/cross-plane/grants", "List interop grants"),
+            (
+                "POST /api/cross-plane/policy/simulate",
+                "Test policy decision",
+            ),
+            ("GET  /api/cross-plane/audit", "Interop audit records"),
         ];
 
         for (endpoint, desc) in &endpoints {

@@ -18,11 +18,15 @@ pub fn semantic_split(text: &str, max_chars: usize) -> Vec<String> {
                 current.push_str(sentence);
             }
         } else {
-            if !current.is_empty() { current.push_str("\n\n"); }
+            if !current.is_empty() {
+                current.push_str("\n\n");
+            }
             current.push_str(para);
         }
     }
-    if !current.is_empty() { chunks.push(current); }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
     chunks
 }
 
@@ -31,16 +35,21 @@ pub fn split_on_functions(code: &str, max_chars: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
     for line in code.lines() {
-        let is_boundary = line.starts_with("pub fn ") || line.starts_with("fn ")
-            || line.starts_with("pub struct ") || line.starts_with("impl ")
-            || line.starts_with("#[cfg(test)]") || line.starts_with("mod ");
+        let is_boundary = line.starts_with("pub fn ")
+            || line.starts_with("fn ")
+            || line.starts_with("pub struct ")
+            || line.starts_with("impl ")
+            || line.starts_with("#[cfg(test)]")
+            || line.starts_with("mod ");
         if is_boundary && current.len() > max_chars {
             chunks.push(std::mem::take(&mut current));
         }
         current.push_str(line);
         current.push('\n');
     }
-    if !current.is_empty() { chunks.push(current); }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
     chunks
 }
 
@@ -53,7 +62,9 @@ mod tests {
         let text = "a".repeat(200) + "\n\n" + &"b".repeat(200);
         let chunks = semantic_split(&text, 150);
         assert!(chunks.len() >= 2);
-        for c in &chunks { assert!(c.len() <= 350, "chunk len: {}", c.len()); }
+        for c in &chunks {
+            assert!(c.len() <= 350, "chunk len: {}", c.len());
+        }
     }
 
     #[test]

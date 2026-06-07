@@ -130,7 +130,9 @@ impl ProfileManager {
             return Err(format!("Profile '{}' already exists", id));
         }
 
-        profile.ensure_dirs().map_err(|e| format!("Failed to create profile dirs: {}", e))?;
+        profile
+            .ensure_dirs()
+            .map_err(|e| format!("Failed to create profile dirs: {}", e))?;
 
         // Write a default config.yaml
         let config_content = format!(
@@ -142,7 +144,8 @@ impl ProfileManager {
             .map_err(|e| format!("Failed to write config: {}", e))?;
 
         // Write a default permissions.yaml
-        let perms_content = "# Default permissions for this profile\npermission_mode: workspace_write\n";
+        let perms_content =
+            "# Default permissions for this profile\npermission_mode: workspace_write\n";
         std::fs::write(profile.permissions_path(), perms_content)
             .map_err(|e| format!("Failed to write permissions: {}", e))?;
 
@@ -159,17 +162,22 @@ impl ProfileManager {
 
     /// List all available profiles.
     pub fn list_profiles(&self) -> Vec<ProfileMeta> {
-        let active = self.active_profile.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("profile manager RwLock poisoned; recovering");
-            poisoned.into_inner()
-        }).clone();
+        let active = self
+            .active_profile
+            .read()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("profile manager RwLock poisoned; recovering");
+                poisoned.into_inner()
+            })
+            .clone();
         let mut result = Vec::new();
 
         if let Ok(entries) = std::fs::read_dir(&self.profiles_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    let id = path.file_name()
+                    let id = path
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("")
                         .to_string();
@@ -236,19 +244,25 @@ impl ProfileManager {
 
     /// Get the currently active profile.
     pub fn active_profile(&self) -> Profile {
-        let active = self.active_profile.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("profile manager RwLock poisoned; recovering");
-            poisoned.into_inner()
-        }).clone();
+        let active = self
+            .active_profile
+            .read()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("profile manager RwLock poisoned; recovering");
+                poisoned.into_inner()
+            })
+            .clone();
         self.get_profile(&active).unwrap_or_else(|| {
             // Fallback to default if active is somehow invalid
-            self.get_profile("default").expect("default profile must exist")
+            self.get_profile("default")
+                .expect("default profile must exist")
         })
     }
 
     /// Switch the active profile.
     pub fn switch_profile(&self, name: &str) -> Result<(), String> {
-        let profile = self.get_profile(name)
+        let profile = self
+            .get_profile(name)
             .ok_or_else(|| format!("Profile '{}' not found", name))?;
 
         let mut active = self.active_profile.write().unwrap_or_else(|poisoned| {
@@ -268,12 +282,18 @@ impl ProfileManager {
             return Err("Cannot delete the default profile".to_string());
         }
 
-        let active = self.active_profile.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("profile manager RwLock poisoned; recovering");
-            poisoned.into_inner()
-        }).clone();
+        let active = self
+            .active_profile
+            .read()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("profile manager RwLock poisoned; recovering");
+                poisoned.into_inner()
+            })
+            .clone();
         if id == active {
-            return Err("Cannot delete the active profile. Switch to another profile first.".to_string());
+            return Err(
+                "Cannot delete the active profile. Switch to another profile first.".to_string(),
+            );
         }
 
         let base_dir = self.profiles_dir.join(&id);
@@ -296,10 +316,13 @@ impl ProfileManager {
 
     /// Return the currently active profile ID.
     pub fn active_id(&self) -> String {
-        self.active_profile.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("profile manager RwLock poisoned; recovering");
-            poisoned.into_inner()
-        }).clone()
+        self.active_profile
+            .read()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("profile manager RwLock poisoned; recovering");
+                poisoned.into_inner()
+            })
+            .clone()
     }
 
     /// Return the underlying profiles directory.
@@ -404,7 +427,9 @@ mod tests {
 
         assert_eq!(reopened.active_id(), "enterprise_ops");
         let profiles = reopened.list_profiles();
-        assert!(profiles.iter().any(|p| p.id == "enterprise_ops" && p.name == "Enterprise Ops" && p.is_active));
+        assert!(profiles
+            .iter()
+            .any(|p| p.id == "enterprise_ops" && p.name == "Enterprise Ops" && p.is_active));
     }
 
     #[test]

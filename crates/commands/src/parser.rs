@@ -4,14 +4,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
-use runtime::{ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig, ScopedMcpServerConfig, Session};
+use runtime::{
+    ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig, ScopedMcpServerConfig, Session,
+};
 use serde_json::{json, Value};
 
-use crate::specs::{SlashCommand, SlashCommandParseError, SlashCommandSpec, SkillSlashDispatch, SLASH_COMMAND_SPECS};
 use crate::skill_tools::{
-    SkillCreateInput, SkillCreateOutput, SkillDeleteInput, SkillDeleteOutput,
-    SkillEditInput, SkillEditOutput, SkillGenerateInput, SkillGenerateOutput,
-    SkillManager, SkillViewInput, SkillViewOutput,
+    SkillCreateInput, SkillCreateOutput, SkillDeleteInput, SkillDeleteOutput, SkillEditInput,
+    SkillEditOutput, SkillGenerateInput, SkillGenerateOutput, SkillManager, SkillViewInput,
+    SkillViewOutput,
+};
+use crate::specs::{
+    SkillSlashDispatch, SlashCommand, SlashCommandParseError, SlashCommandSpec, SLASH_COMMAND_SPECS,
 };
 impl SlashCommand {
     pub fn parse(input: &str) -> Result<Option<Self>, SlashCommandParseError> {
@@ -176,7 +180,11 @@ pub fn validate_slash_command_input(
             SlashCommand::Cost
         }
         "resume" => SlashCommand::Resume {
-            session_path: Some(require_remainder(command, remainder, "<session-id|latest>")?),
+            session_path: Some(require_remainder(
+                command,
+                remainder,
+                "<session-id|latest>",
+            )?),
         },
         "config" => SlashCommand::Config {
             section: parse_config_section(&args)?,
@@ -326,24 +334,26 @@ pub fn validate_slash_command_input(
             let task = args.get(1..).map(|s| s.join(" ")).filter(|t| !t.is_empty());
             SlashCommand::SubAgent { role, task }
         }
-        "closet" | "rooms" | "memory-rooms" => {
-            SlashCommand::Closet { topic: args.first().map(|s| s.to_string()) }
-        }
-        "sandbox-search" => {
-            SlashCommand::SandboxSearch { query: args.first().map(|s| s.to_string()) }
-        }
+        "closet" | "rooms" | "memory-rooms" => SlashCommand::Closet {
+            topic: args.first().map(|s| s.to_string()),
+        },
+        "sandbox-search" => SlashCommand::SandboxSearch {
+            query: args.first().map(|s| s.to_string()),
+        },
         "retry" => SlashCommand::Retry,
         "undo" => SlashCommand::Undo,
         "new" | "reset" => SlashCommand::NewSession,
-        "title" => SlashCommand::Title { name: args.first().map(|s| s.to_string()) },
+        "title" => SlashCommand::Title {
+            name: args.first().map(|s| s.to_string()),
+        },
         "compress" => SlashCommand::Compress,
         "state" => SlashCommand::State,
-        "pipeline" => {
-            SlashCommand::Pipeline { task: args.first().map(|s| s.to_string()) }
-        }
-        "solve" => {
-            SlashCommand::Solve { problem: args.first().map(|s| s.to_string()) }
-        }
+        "pipeline" => SlashCommand::Pipeline {
+            task: args.first().map(|s| s.to_string()),
+        },
+        "solve" => SlashCommand::Solve {
+            problem: args.first().map(|s| s.to_string()),
+        },
         other => SlashCommand::Unknown(other.to_string()),
     }))
 }
@@ -615,13 +625,11 @@ fn parse_list_or_help_args(
     }
 }
 
-fn parse_agent_command(
-    args: Option<&str>,
-) -> Result<SlashCommand, SlashCommandParseError> {
+fn parse_agent_command(args: Option<&str>) -> Result<SlashCommand, SlashCommandParseError> {
     match normalize_optional_args(args) {
-        None | Some("list" | "help" | "-h" | "--help") => {
-            Ok(SlashCommand::Agents { args: args.map(String::from) })
-        }
+        None | Some("list" | "help" | "-h" | "--help") => Ok(SlashCommand::Agents {
+            args: args.map(String::from),
+        }),
         Some(profile_args) if profile_args.starts_with("profile") => {
             let agent_id = profile_args
                 .strip_prefix("profile")
@@ -1234,7 +1242,9 @@ pub fn handle_agents_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
                     for w in &team.workers {
                         report.push_str(&format!(
                             "    - {} ({}) [{}]\n",
-                            w.agent_id, w.role, w.capabilities.join(", ")
+                            w.agent_id,
+                            w.role,
+                            w.capabilities.join(", ")
                         ));
                     }
                 } else {
@@ -1385,7 +1395,10 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> std::io::R
         Some(args) if args.starts_with("delete ") => {
             let name = args["delete ".len()..].trim();
             let force = name.contains("--force") || name.contains("-f");
-            let name = name.trim_end_matches("--force").trim_end_matches("-f").trim();
+            let name = name
+                .trim_end_matches("--force")
+                .trim_end_matches("-f")
+                .trim();
             if name.is_empty() {
                 return Ok(render_skills_usage(Some("delete")));
             }
@@ -1541,7 +1554,10 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
         Some(args) if args.starts_with("delete ") => {
             let name = args["delete ".len()..].trim();
             let force = name.contains("--force") || name.contains("-f");
-            let name = name.trim_end_matches("--force").trim_end_matches("-f").trim();
+            let name = name
+                .trim_end_matches("--force")
+                .trim_end_matches("-f")
+                .trim();
             if name.is_empty() {
                 return Ok(render_skills_usage_json(Some("delete")));
             }
@@ -1600,9 +1616,15 @@ pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
         }
         // New CRUD commands - all handled locally
         Some("create" | "view" | "edit" | "delete" | "generate") => SkillSlashDispatch::Local,
-        Some(args) if args.starts_with("create ") || args.starts_with("view ")
-            || args.starts_with("edit ") || args.starts_with("delete ")
-            || args.starts_with("generate ") => SkillSlashDispatch::Local,
+        Some(args)
+            if args.starts_with("create ")
+                || args.starts_with("view ")
+                || args.starts_with("edit ")
+                || args.starts_with("delete ")
+                || args.starts_with("generate ") =>
+        {
+            SkillSlashDispatch::Local
+        }
         Some(args) => SkillSlashDispatch::Invoke(format!("${}", args.trim_start_matches('/'))),
     }
 }
@@ -2889,8 +2911,11 @@ fn render_skill_view_report(result: &SkillViewOutput) -> String {
         lines.push(String::new());
         // Show content preview
         let preview = if result.content.len() > 500 {
-            format!("{}...\n\n[Truncated - use /skill view {} --file <path> for full content]",
-                    &result.content[..500], result.name)
+            format!(
+                "{}...\n\n[Truncated - use /skill view {} --file <path> for full content]",
+                &result.content[..500],
+                result.name
+            )
         } else {
             result.content.clone()
         };
@@ -2983,7 +3008,8 @@ Options:
   -t, --tags <tags>      Comma-separated tags
 
 Example:
-  /skill create my-skill --name my-skill --description "My custom skill""#.to_string(),
+  /skill create my-skill --name my-skill --description "My custom skill""#
+            .to_string(),
         Some("view") => r#"Skills - View
 
 Usage: /skill view <name>
@@ -2992,7 +3018,8 @@ View skill metadata and content.
 
 Example:
   /skill view git-essentials
-  /skill view my-skill --file references/api.md"#.to_string(),
+  /skill view my-skill --file references/api.md"#
+            .to_string(),
         Some("edit") => r#"Skills - Edit
 
 Usage: /skill edit <name> [options]
@@ -3006,7 +3033,8 @@ Options:
   -f, --file <path>       File to edit
 
 Example:
-  /skill edit my-skill --search old --replace new"#.to_string(),
+  /skill edit my-skill --search old --replace new"#
+            .to_string(),
         Some("delete") => r#"Skills - Delete
 
 Usage: /skill delete <name> [--force]
@@ -3016,7 +3044,8 @@ Options:
 
 Example:
   /skill delete my-skill
-  /skill delete my-skill --force"#.to_string(),
+  /skill delete my-skill --force"#
+            .to_string(),
         Some("generate") => r#"Skills - Generate
 
 Usage: /skill generate <task-description>
@@ -3024,7 +3053,8 @@ Usage: /skill generate <task-description>
 Auto-generate a skill based on task context.
 
 Example:
-  /skill generate "AWS Lambda deployment workflow""#.to_string(),
+  /skill generate "AWS Lambda deployment workflow""#
+            .to_string(),
         Some("install") => r#"Skills - Install
 
 Usage: /skill install <source>
@@ -3033,7 +3063,8 @@ Install a skill from a remote source.
 
 Example:
   /skill install github:user/repo
-  /skill install /path/to/skill"#.to_string(),
+  /skill install /path/to/skill"#
+            .to_string(),
         _ => {
             let mut lines = vec![
                 "Skills".to_string(),

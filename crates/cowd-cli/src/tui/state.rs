@@ -611,7 +611,8 @@ impl TuiState {
                     let _ = error_recovery::catch_render_panic(
                         "runtime_activity_panel",
                         AssertUnwindSafe(|| {
-                            self.runtime_activity_panel.render(&mut main_ctx, panel_area);
+                            self.runtime_activity_panel
+                                .render(&mut main_ctx, panel_area);
                         }),
                     );
                 }
@@ -1608,6 +1609,11 @@ impl TuiState {
                         .show_notification(&format!("Switched to model: {model}"));
                 }
             }
+            Action::ReloadProviders => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let loader = runtime::ConfigLoader::default_for(cwd);
+                self.reload_runtime_providers_from_loader(&loader);
+            }
             Action::HistoryBrowse(older) => {
                 let text = if older {
                     self.app.history_prev()
@@ -1685,6 +1691,65 @@ impl TuiState {
                 );
             }
             Action::Noop => {}
+        }
+    }
+
+    fn reload_runtime_providers_from_loader(&mut self, loader: &runtime::ConfigLoader) -> bool {
+        match loader.load() {
+            Ok(runtime_config) => {
+                let providers = runtime_config.providers().clone();
+                let provider_count = providers.providers.len();
+                let provider_model_count: usize =
+                    providers.providers.values().map(|p| p.models.len()).sum();
+                let configured_model = runtime_config.model().map(str::to_string);
+                let configured_model_provider = configured_model
+                    .as_deref()
+                    .and_then(|model| providers.resolve_full(model))
+                    .map(|provider| provider.name.clone());
+                let configured_model_resolved =
+                    configured_model.is_none() || configured_model_provider.is_some();
+                let status = if provider_count == 0 {
+                    "unconfigured"
+                } else if configured_model_resolved {
+                    "applied"
+                } else {
+                    "attention"
+                };
+
+                runtime::init_global_providers(providers);
+                self.runtime_activity_panel.sync_from_app(&self.app);
+
+                let route =
+                    configured_model_provider
+                        .as_deref()
+                        .unwrap_or(if configured_model_resolved {
+                            "override"
+                        } else {
+                            "missing"
+                        });
+                let message =
+                    format!("Providers {status}: {provider_count} providers, {provider_model_count} models, route {route}");
+                let variant = if status == "applied" {
+                    ToastVariant::Success
+                } else {
+                    ToastVariant::Warning
+                };
+                self.toast_manager
+                    .push(variant, Some("Providers".into()), message.clone(), 3000);
+                self.app.show_notification(&message);
+                true
+            }
+            Err(error) => {
+                let message = format!("Provider reload failed: {error}");
+                self.toast_manager.push(
+                    ToastVariant::Error,
+                    Some("Providers".into()),
+                    message.clone(),
+                    4000,
+                );
+                self.app.show_notification(&message);
+                false
+            }
         }
     }
 
@@ -2111,6 +2176,84 @@ mod tests {
 
         // Theme engine dark by default
         assert_eq!(state.theme_engine.theme.name, "dark");
+    }
+
+    #[test]
+    fn reload_runtime_providers_from_loader_updates_registry_without_leaking_secret() {
+        runtime::init_global_providers(runtime::ProvidersConfig::default());
+        let root = unique_temp_dir("cowd-tui-provider-reload");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            config_home.join("config.yaml"),
+            r#"
+model: "tui-reload-model"
+providers:
+  tui-provider:
+    base_url: "https://tui-provider.example/v1"
+    api_key: "tui-secret-key"
+    models: ["tui-reload-model", "tui-fast"]
+    protocol: "openai-compat"
+"#,
+        )
+        .unwrap();
+
+        let mut state = TuiState::new("tui-reload-model", "session-tui-provider");
+        let loader = runtime::ConfigLoader::new(&workspace, &config_home);
+        assert!(state.reload_runtime_providers_from_loader(&loader));
+
+        let provider = runtime::resolve_global_provider("tui-reload-model")
+            .expect("provider reload should resolve active model");
+        assert_eq!(provider.name, "tui-provider");
+        assert_eq!(runtime::list_all_models().len(), 2);
+        assert!(state
+            .app
+            .notification
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Providers applied"));
+        assert!(!state
+            .app
+            .notification
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tui-secret-key"));
+
+        let invalid_home = root.join("invalid-home");
+        std::fs::create_dir_all(&invalid_home).unwrap();
+        std::fs::write(
+            invalid_home.join("config.yaml"),
+            r#"
+model: "broken-model"
+providers:
+  broken:
+    base_url: "https://broken.example/v1"
+    api_key: "broken-secret-key"
+    models: ["broken-model"]
+    protocol: "unsupported-protocol"
+"#,
+        )
+        .unwrap();
+        let invalid_loader = runtime::ConfigLoader::new(&workspace, &invalid_home);
+        assert!(!state.reload_runtime_providers_from_loader(&invalid_loader));
+        assert!(runtime::resolve_global_provider("broken-model").is_none());
+        assert_eq!(
+            runtime::resolve_global_provider("tui-reload-model")
+                .expect("failed reload should preserve previous registry")
+                .name,
+            "tui-provider"
+        );
+        assert!(!state
+            .app
+            .notification
+            .as_deref()
+            .unwrap_or_default()
+            .contains("broken-secret-key"));
+
+        runtime::init_global_providers(runtime::ProvidersConfig::default());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -70,7 +70,10 @@ impl CardActionHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("button");
 
-        let value = action.get("value").cloned().unwrap_or(serde_json::Value::Null);
+        let value = action
+            .get("value")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
         // Build the synthetic command text: `/card {tag} {value_json}`
         let value_json = serde_json::to_string(&value).unwrap_or_else(|_| String::from("{}"));
@@ -125,8 +128,7 @@ impl CardActionHandler {
     }
 
     pub fn is_approval_card_action(event: &serde_json::Value) -> bool {
-        Self::extract_hermes_action(event).is_some()
-            && Self::extract_approval_id(event).is_some()
+        Self::extract_hermes_action(event).is_some() && Self::extract_approval_id(event).is_some()
     }
 
     /// Check whether a card action token is a duplicate.
@@ -182,13 +184,9 @@ mod tests {
             "open_chat_id": "oc_chat001"
         });
 
-        let msg = CardActionHandler::handle_card_action(
-            &event,
-            "om_msg001",
-            "oc_chat001",
-            "ou_abc123",
-        )
-        .expect("should produce an InboundMessage");
+        let msg =
+            CardActionHandler::handle_card_action(&event, "om_msg001", "oc_chat001", "ou_abc123")
+                .expect("should produce an InboundMessage");
 
         assert_eq!(msg.message_type, MessageType::Command);
         assert_eq!(msg.platform, Platform::Feishu);
@@ -215,13 +213,9 @@ mod tests {
             }
         });
 
-        let msg = CardActionHandler::handle_card_action(
-            &event,
-            "om_002",
-            "oc_chat002",
-            "ou_user002",
-        )
-        .expect("should produce an InboundMessage");
+        let msg =
+            CardActionHandler::handle_card_action(&event, "om_002", "oc_chat002", "ou_user002")
+                .expect("should produce an InboundMessage");
 
         assert!(msg.text.starts_with("/card select_static "));
         assert_eq!(msg.message_type, MessageType::Command);
@@ -246,13 +240,9 @@ mod tests {
             }
         });
 
-        let msg = CardActionHandler::handle_card_action(
-            &event,
-            "om_003",
-            "oc_chat003",
-            "ou_user003",
-        )
-        .expect("should produce an InboundMessage");
+        let msg =
+            CardActionHandler::handle_card_action(&event, "om_003", "oc_chat003", "ou_user003")
+                .expect("should produce an InboundMessage");
 
         assert!(msg.text.starts_with("/card button "));
     }
@@ -265,13 +255,9 @@ mod tests {
             }
         });
 
-        let msg = CardActionHandler::handle_card_action(
-            &event,
-            "om_004",
-            "oc_chat004",
-            "ou_user004",
-        )
-        .expect("should produce an InboundMessage");
+        let msg =
+            CardActionHandler::handle_card_action(&event, "om_004", "oc_chat004", "ou_user004")
+                .expect("should produce an InboundMessage");
 
         // When value is missing, it's null
         assert!(msg.text.contains("null"));
@@ -430,10 +416,8 @@ mod tests {
             "open_chat_id": "oc_chat"
         });
 
-        let msg = CardActionHandler::handle_card_action(
-            &event, "om_msg", "oc_chat", "ou_user",
-        )
-        .unwrap();
+        let msg =
+            CardActionHandler::handle_card_action(&event, "om_msg", "oc_chat", "ou_user").unwrap();
 
         assert_eq!(msg.metadata["hermes_action"], "approve_always");
         assert_eq!(msg.metadata["approval_id"], 7);

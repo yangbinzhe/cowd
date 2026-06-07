@@ -14,6 +14,7 @@ mod doctor;
 mod event_bus;
 mod gateway;
 mod init;
+mod logging;
 mod mcp_serve;
 mod render;
 mod server;
@@ -37,32 +38,32 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, UNIX_EPOCH};
 
 use api::{
-    AuthSource, CachedProviderClient, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
-    ProviderClient as ApiProviderClient, ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock, detect_provider_kind, resolve_startup_auth_source,
+    detect_provider_kind, resolve_startup_auth_source, AuthSource, CachedProviderClient,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
-    SkillSlashDispatch, SlashCommand, classify_skills_slash_command, handle_agents_slash_command,
-    handle_agents_slash_command_json, handle_mcp_slash_command, handle_mcp_slash_command_json,
-    handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
+    classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
+    handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
+    handle_skills_slash_command, handle_skills_slash_command_json,
     render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs,
+    slash_command_specs, SkillSlashDispatch, SlashCommand,
 };
-use compat_harness::{UpstreamPaths, extract_manifest};
+use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
-use runtime::{
-    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, JsonValue, McpServerManager, McpTool,
-    MessageRole, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, ResumeContextPacket, ResumeContextSource, RuntimeError, Session,
-    TokenUsage, ToolError, ToolExecutor, UsageTracker, check_base_commit,
-    format_stale_base_warning, load_system_prompt, resolve_expected_base, resolve_sandbox_status,
-};
 use runtime::ContextProfile;
+use runtime::{
+    check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
+    resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, JsonValue,
+    McpServerManager, McpTool, MessageRole, PermissionMode, PermissionPolicy, ProjectContext,
+    PromptCacheEvent, ResolvedPermissionMode, ResumeContextPacket, ResumeContextSource,
+    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tools::{GlobalToolRegistry, RuntimeToolDefinition};
@@ -153,8 +154,6 @@ pub(crate) const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 pub(crate) const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
-const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
-const LEGACY_SESSION_EXTENSION: &str = "json";
 const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/cowd";
 const OFFICIAL_REPO_SLUG: &str = "ultraworkers/cowd";
 const DEPRECATED_INSTALL_COMMAND: &str = "cargo install cowd";
@@ -217,7 +216,8 @@ fn build_platform_configs(gw: &runtime::GatewayConfig) -> Vec<runtime::platform:
     if !gw.enabled {
         return Vec::new();
     }
-    gw.platforms
+    let mut configs: Vec<_> = gw
+        .platforms
         .iter()
         .filter(|p| p.enabled && p.platform_type != "api_server")
         .map(|p| {
@@ -228,7 +228,24 @@ fn build_platform_configs(gw: &runtime::GatewayConfig) -> Vec<runtime::platform:
             }
             pc
         })
-        .collect()
+        .collect();
+
+    let has_wechat = configs
+        .iter()
+        .any(|p| matches!(p.platform_type.as_str(), "wechat_ilink" | "wechat"));
+    if !has_wechat {
+        if let Ok(accounts) = runtime::platform::wechat_ilink::list_wechat_qr_accounts(None) {
+            if let Some(account) = accounts.first() {
+                let mut pc = runtime::platform::PlatformConfig::new("wechat_ilink");
+                pc = pc
+                    .with_setting("credential_source", "qr_account")
+                    .with_setting("account_id", account.account_id.clone());
+                configs.push(pc);
+            }
+        }
+    }
+
+    configs
 }
 
 /// Convert `runtime::JsonValue` → `serde_json::Value` for use with
@@ -301,50 +318,8 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
-fn init_logging() {
-    use tracing_appender::rolling;
-    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
-
-    let log_dir = runtime::cowd_dirs::config_home_dir().join("logs");
-    let _ = std::fs::create_dir_all(&log_dir);
-
-    let file_appender = rolling::daily(&log_dir, "cowd");
-
-    // Level: debug builds = DEBUG, release = WARN
-    let default_level = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "warn"
-    };
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
-
-    // File layer: always on
-    let file_layer = fmt::layer()
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_writer(file_appender);
-
-    // Stderr layer: debug builds only
-    if cfg!(debug_assertions) && std::env::var("COWD_LOG_STDERR").is_ok() {
-        let stderr_layer = fmt::layer().with_target(false).with_writer(std::io::stderr);
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(file_layer)
-            .with(stderr_layer)
-            .init();
-    } else {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(file_layer)
-            .init();
-    }
-
-    tracing::info!("COWD v{} logging initialized", VERSION);
-}
-
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    init_logging();
+    logging::init_logging(VERSION);
 
     // Set up SIGCHLD handler to auto-reap daemon child processes
     setup_sigchld_handler();
@@ -651,7 +626,98 @@ fn run_gateway_action(
             tracing::info!(pid, "gateway restarted");
             Ok(())
         }
+        GatewayAction::WechatQr => run_wechat_qr_login(),
     }
+}
+
+fn run_wechat_qr_login() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to build runtime: {e}"))?;
+
+    println!("WeChat QR login");
+    println!("Use personal WeChat to scan and confirm in the mobile app.");
+
+    let qr = rt
+        .block_on(runtime::platform::wechat_ilink::request_wechat_qr_login(
+            "3",
+        ))
+        .map_err(|e| format!("failed to create WeChat QR code: {e}"))?;
+
+    println!();
+    println!("Scan data:");
+    println!("{}", qr.scan_data);
+    println!();
+
+    match qrcode::QrCode::new(qr.scan_data.as_bytes()) {
+        Ok(code) => {
+            let rendered = code
+                .render::<qrcode::render::unicode::Dense1x2>()
+                .quiet_zone(true)
+                .build();
+            println!("{rendered}");
+        }
+        Err(e) => {
+            println!("Failed to render terminal QR code: {e}");
+        }
+    }
+
+    println!("Waiting for scan confirmation...");
+    let mut base_url = qr.base_url.clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(480);
+    while std::time::Instant::now() < deadline {
+        let status = rt
+            .block_on(runtime::platform::wechat_ilink::poll_wechat_qr_login(
+                &qr.qrcode,
+                Some(&base_url),
+            ))
+            .map_err(|e| format!("failed to poll WeChat QR status: {e}"))?;
+
+        match status.status.as_str() {
+            "wait" => {
+                print!(".");
+                let _ = io::stdout().flush();
+            }
+            "scaned" => {
+                println!("\nScanned. Confirm login in WeChat.");
+            }
+            "scaned_but_redirect" => {
+                if let Some(host) = status.redirect_host {
+                    base_url = format!("https://{host}");
+                    println!("\nRedirected to regional iLink host.");
+                }
+            }
+            "confirmed" => {
+                let credentials = status
+                    .credentials
+                    .ok_or("WeChat confirmed without credentials")?;
+                let path =
+                    runtime::platform::wechat_ilink::save_wechat_qr_account(&credentials, None)
+                        .map_err(|e| format!("failed to save WeChat account: {e}"))?;
+                println!();
+                println!("WeChat connected.");
+                println!("Account          {}", credentials.account_id);
+                if let Some(user_id) = credentials.user_id.as_deref() {
+                    println!("User             {user_id}");
+                }
+                println!("Stored           {}", path.display());
+                println!(
+                    "Gateway          restart with `cowd gateway restart` to activate the channel"
+                );
+                return Ok(());
+            }
+            "expired" => {
+                return Err("WeChat QR code expired; rerun `cowd gateway wechat-qr`".into());
+            }
+            other => {
+                println!("\nStatus           {other}");
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    Err("WeChat QR login timed out".into())
 }
 
 fn should_bootstrap_for_action(action: &CliAction) -> bool {
@@ -665,6 +731,7 @@ pub(crate) enum GatewayAction {
     Status,
     Run,
     Restart,
+    WechatQr,
 }
 
 impl GatewayAction {
@@ -675,6 +742,7 @@ impl GatewayAction {
             "status" => Some(Self::Status),
             "run" => Some(Self::Run),
             "restart" => Some(Self::Restart),
+            "wechat-qr" => Some(Self::WechatQr),
             _ => None,
         }
     }
@@ -1066,11 +1134,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "import-session" => {
-            let path = rest
-                .get(1)
-                .ok_or_else(|| {
-                    "missing session file. Usage: cowd import-session <path>".to_string()
-                })?;
+            let path = rest.get(1).ok_or_else(|| {
+                "missing session file. Usage: cowd import-session <path>".to_string()
+            })?;
             if rest.len() > 2 {
                 return Err(
                     "unexpected arguments for import-session. Usage: cowd import-session <path>"
@@ -1527,11 +1593,11 @@ fn parse_gateway_args(
     output_format: CliOutputFormat,
 ) -> Result<CliAction, String> {
     let action_str = args.first().ok_or_else(|| {
-        "gateway requires a subcommand: start, stop, status, run, or restart".to_string()
+        "gateway requires a subcommand: start, stop, status, run, restart, or wechat-qr".to_string()
     })?;
     let action = GatewayAction::from_str(action_str).ok_or_else(|| {
         format!(
-            "unknown gateway subcommand: {action_str}. Expected start, stop, status, run, or restart"
+            "unknown gateway subcommand: {action_str}. Expected start, stop, status, run, restart, or wechat-qr"
         )
     })?;
     Ok(CliAction::Gateway {
@@ -1979,6 +2045,8 @@ impl ResumeCommandOutcome {
 pub(crate) struct StatusContext {
     cwd: PathBuf,
     session_path: Option<PathBuf>,
+    session_id: Option<String>,
+    session_store: String,
     loaded_config_files: usize,
     discovered_config_files: usize,
     memory_file_count: usize,
@@ -2377,7 +2445,8 @@ fn run_resume_command(
         SlashCommand::Status => {
             let tracker = UsageTracker::from_session(session);
             let usage = tracker.cumulative_usage();
-            let context = status_context(Some(session_path))?;
+            let context =
+                status_context_for_session(Some(session_path), Some(session.session_id.as_str()))?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 session_path: None,
@@ -2704,7 +2773,11 @@ fn detect_broad_cwd() -> Option<PathBuf> {
         .or_else(|| env::var_os("USERPROFILE"))
         .is_some_and(|h| Path::new(&h) == cwd);
     let is_root = cwd.parent().is_none();
-    if is_home || is_root { Some(cwd) } else { None }
+    if is_home || is_root {
+        Some(cwd)
+    } else {
+        None
+    }
 }
 
 /// Enforce the broad-CWD policy: when running from home or root, either
@@ -3024,10 +3097,10 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     use crossterm::{
         event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
         execute,
-        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
-    use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
+    use ratatui::Terminal;
     use std::io;
     use std::time::Duration;
     use tui::error_recovery;
@@ -4255,11 +4328,18 @@ fn current_task_phase_for_display(
 ) -> Option<&task_kernel::TaskPhaseRecord> {
     task.current_phase
         .as_deref()
-        .and_then(|phase| task.phases.iter().rev().find(|candidate| candidate.name == phase))
+        .and_then(|phase| {
+            task.phases
+                .iter()
+                .rev()
+                .find(|candidate| candidate.name == phase)
+        })
         .or_else(|| task.phases.last())
 }
 
-fn current_task_summary_from_record(task: &task_kernel::TaskRecord) -> tui::app::CurrentTaskSummary {
+fn current_task_summary_from_record(
+    task: &task_kernel::TaskRecord,
+) -> tui::app::CurrentTaskSummary {
     let phase = current_task_phase_for_display(task);
     tui::app::CurrentTaskSummary {
         id: task.id.clone(),
@@ -4745,7 +4825,11 @@ impl LiveCli {
                 },
                 self.permission_mode.as_str(),
                 if self.yolo_mode { "yolo" } else { "standard" },
-                &status_context(Some(&self.session.path)).expect("status context should load"),
+                &status_context_for_session(
+                    Some(&self.session.path),
+                    Some(self.session.id.as_str())
+                )
+                .expect("status context should load"),
             )
         );
     }
@@ -5315,13 +5399,7 @@ impl LiveCli {
             None,
             None,
         )?;
-        apply_cli_turn_context_profile(
-            &runtime,
-            self.yolo_mode,
-            self.permission_mode,
-            false,
-            true,
-        );
+        apply_cli_turn_context_profile(&runtime, self.yolo_mode, self.permission_mode, false, true);
         let prompter = runtime::permissions::SharedPrompter::new(Box::new(
             CliPermissionPrompter::new(self.permission_mode),
         ));
@@ -5392,7 +5470,7 @@ impl LiveCli {
     }
 }
 
-// ── Unified Session Store (replaces runtime::SessionStore) ────────────────────
+// ── Unified Session Store (DB-backed session source of truth) ─────────────────
 //
 // TUI sessions use the same SQLite-backed `UnifiedSessionStore` as the HTTP
 // server. SQLite is the canonical session store; JSONL is only an explicit
@@ -5456,7 +5534,10 @@ fn discover_local_session_import_candidates() -> Vec<LocalSessionImportCandidate
                 roots.push(path);
                 continue;
             }
-            let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+            let ext = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
             if ext != "jsonl" && ext != "json" {
                 continue;
             }
@@ -5472,35 +5553,6 @@ fn discover_local_session_import_candidates() -> Vec<LocalSessionImportCandidate
     }
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
     candidates
-}
-
-/// Explicitly import legacy `.jsonl`/`.json` files into the SQLite store.
-///
-/// This must never run automatically during startup.
-fn migrate_jsonl_sessions(
-    store: &memory::UnifiedSessionStore,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut count: u64 = 0;
-
-    for candidate in discover_local_session_import_candidates() {
-        let path = candidate.path;
-        let session = match Session::load_from_path(&path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let record = session_to_record(&session, &path);
-        if SHARED_RT.block_on(store.create_session(&record)).is_ok() {
-            count += 1;
-        }
-        if let Err(e) = migrate_session_messages(store, &record.session_id, &path) {
-            tracing::warn!(%e, path=%path.display(), "failed to import local session messages, continuing");
-        }
-    }
-
-    if count > 0 {
-        tracing::info!("migrated {count} sessions from JSONL");
-    }
-    Ok(())
 }
 
 /// Stream JSONL session file line-by-line, converting each message to
@@ -5569,7 +5621,10 @@ fn import_local_session_file(
     if !path.exists() {
         return Err(format!("session file not found: {}", path.display()).into());
     }
-    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
     if ext != "jsonl" && ext != "json" {
         return Err(format!(
             "unsupported session import format: {} (expected .jsonl or .json)",
@@ -5678,13 +5733,13 @@ fn sync_cli_session_to_unified_store(
         "workspace_root": session.workspace_root().map(|p| p.display().to_string()),
         "parent_session_id": session.fork.as_ref().map(|f| f.parent_session_id.clone()),
         "branch_name": session.fork.as_ref().and_then(|f| f.branch_name.clone()),
-        "legacy_path": handle.path.display().to_string(),
+        "session_path": handle.path.display().to_string(),
     });
 
     let record = memory::store::session::SessionRecord {
         session_id: session.session_id.clone(),
         platform: "cli".to_string(),
-        chat_id: handle.id.clone(),
+        chat_id: session.session_id.clone(),
         user_id: None,
         model: session
             .model
@@ -5836,10 +5891,14 @@ fn create_managed_session_handle(
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
     let path = session_db_path();
+    let workspace_root = env::current_dir()?;
 
     // Register metadata in SQLite (idempotent via INSERT OR IGNORE).
     if let Ok(store) = get_unified_store() {
         let now = chrono::Utc::now().to_rfc3339();
+        let metadata = serde_json::json!({
+            "workspace_root": workspace_root.display().to_string(),
+        });
         let record = memory::store::session::SessionRecord {
             session_id: session_id.to_string(),
             platform: "cli".to_string(),
@@ -5850,7 +5909,7 @@ fn create_managed_session_handle(
             last_activity: now,
             message_count: 0,
             reset_policy: "none".to_string(),
-            metadata_json: None,
+            metadata_json: Some(metadata.to_string()),
             input_tokens: 0,
             output_tokens: 0,
             estimated_cost_usd: 0.0,
@@ -5874,9 +5933,7 @@ fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn s
         || reference.eq_ignore_ascii_case("recent")
     {
         let store = get_unified_store()?;
-        let records = SHARED_RT.block_on(store.list_sessions()).map_err(
-            |e| -> Box<dyn std::error::Error> { format!("failed to list sessions: {e}").into() },
-        )?;
+        let records = list_workspace_session_records(store)?;
         let record = records
             .into_iter()
             .next()
@@ -5938,13 +5995,21 @@ fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std
 
 fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
     let store = get_unified_store()?;
-    let records =
-        SHARED_RT
-            .block_on(store.list_sessions())
-            .map_err(|e| -> Box<dyn std::error::Error> {
-                format!("failed to list sessions: {e}").into()
-            })?;
+    let records = list_workspace_session_records(store)?;
     Ok(records.into_iter().map(record_to_summary).collect())
+}
+
+fn list_workspace_session_records(
+    store: &memory::UnifiedSessionStore,
+) -> Result<Vec<memory::store::session::SessionRecord>, Box<dyn std::error::Error>> {
+    let workspace_root = env::current_dir()?;
+    SHARED_RT
+        .block_on(
+            store.list_sessions_by_workspace_root(workspace_root.display().to_string().as_str()),
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("failed to list workspace sessions: {e}").into()
+        })
 }
 
 /// Convert a SQLite [`memory::SessionRecord`] into the TUI's summary struct.
@@ -6122,7 +6187,10 @@ fn write_session_clear_backup(
     session_path: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let backup_path = session_clear_backup_path(session_path);
-    session.save_to_path(&backup_path)?;
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&backup_path, session.export_jsonl()?)?;
     Ok(backup_path)
 }
 
@@ -6134,8 +6202,8 @@ fn session_clear_backup_path(session_path: &Path) -> PathBuf {
     let file_name = session_path
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("session.jsonl");
-    session_path.with_file_name(format!("{file_name}.before-clear-{timestamp}.bak"))
+        .unwrap_or("session");
+    session_path.with_file_name(format!("{file_name}.before-clear-{timestamp}.jsonl"))
 }
 
 fn render_repl_help() -> String {
@@ -6221,13 +6289,8 @@ fn status_json_value(
             "unstaged_files": context.git_summary.unstaged_files,
             "untracked_files": context.git_summary.untracked_files,
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
-            "session_id": context.session_path.as_ref().and_then(|path| {
-                if path.file_name().and_then(|n| n.to_str()) == Some("sessions.db") {
-                    None
-                } else {
-                    path.file_stem().map(|n| n.to_string_lossy().into_owned())
-                }
-            }),
+            "session_id": context.session_id.as_deref(),
+            "session_store": context.session_store.as_str(),
             "loaded_config_files": context.loaded_config_files,
             "discovered_config_files": context.discovered_config_files,
             "memory_file_count": context.memory_file_count,
@@ -6253,6 +6316,13 @@ fn status_json_value(
 fn status_context(
     session_path: Option<&Path>,
 ) -> Result<StatusContext, Box<dyn std::error::Error>> {
+    status_context_for_session(session_path, None)
+}
+
+fn status_context_for_session(
+    session_path: Option<&Path>,
+    session_id: Option<&str>,
+) -> Result<StatusContext, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
@@ -6265,6 +6335,25 @@ fn status_context(
     Ok(StatusContext {
         cwd,
         session_path: session_path.map(Path::to_path_buf),
+        session_id: session_id.map(ToOwned::to_owned).or_else(|| {
+            session_path.and_then(|path| {
+                if path.file_name().and_then(|n| n.to_str()) == Some("sessions.db") {
+                    None
+                } else {
+                    path.file_stem().map(|n| n.to_string_lossy().into_owned())
+                }
+            })
+        }),
+        session_store: session_path.map_or_else(
+            || "live-repl".to_string(),
+            |path| {
+                if path.file_name().and_then(|n| n.to_str()) == Some("sessions.db") {
+                    "SQLite session store".to_string()
+                } else {
+                    "local import/export file".to_string()
+                }
+            },
+        ),
         loaded_config_files: runtime_config.loaded_entries().len(),
         discovered_config_files,
         memory_file_count: project_context.instruction_files.len(),
@@ -6315,6 +6404,8 @@ fn format_status_report(
   Unstaged         {}
   Untracked        {}
   Session          {}
+  Session id       {}
+  Session store    {}
   Config files     loaded {}/{}
   Memory files     {}
   Suggested flow   /status → /diff → /commit",
@@ -6333,6 +6424,8 @@ fn format_status_report(
                 || "live-repl".to_string(),
                 |path| path.display().to_string()
             ),
+            context.session_id.as_deref().unwrap_or("live-repl"),
+            context.session_store.as_str(),
             context.loaded_config_files,
             context.discovered_config_files,
             context.memory_file_count,
@@ -7398,13 +7491,7 @@ fn run_prompt(
         None,
         None,
     )?;
-    apply_cli_turn_context_profile(
-        &runtime,
-        yolo_mode,
-        permission_mode,
-        false,
-        false,
-    );
+    apply_cli_turn_context_profile(&runtime, yolo_mode, permission_mode, false, false);
     if let Some(effort) = reasoning_effort {
         if let Some(rt) = runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(Some(effort));
@@ -7873,7 +7960,11 @@ fn session_db_resume_context_packet(session: &Session) -> Option<ResumeContextPa
     if let Some(last_prompt) = session.prompt_history.last() {
         recent_decisions.push(format!(
             "last prompt: {}",
-            last_prompt.text.split_whitespace().collect::<Vec<_>>().join(" ")
+            last_prompt
+                .text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
         ));
     }
 
@@ -8059,7 +8150,11 @@ fn parse_git_status_path(line: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
-fn workspace_hot_symbols(root: &Path, touched_files: &[String], symbol_limit: usize) -> Vec<String> {
+fn workspace_hot_symbols(
+    root: &Path,
+    touched_files: &[String],
+    symbol_limit: usize,
+) -> Vec<String> {
     const FILE_LIMIT: usize = 4;
     const MAX_BYTES: u64 = 256 * 1024;
 
@@ -8250,7 +8345,8 @@ fn build_runtime_with_plugin_state(
     let cowd_bus = runtime::CowdEventBus::new();
     runtime = runtime.with_cowd_event_bus(cowd_bus);
     runtime.push_external_context_item(workspace_item);
-    let resume_context_loaded = inject_auto_resume_context(&runtime, session_resume_packet, session_id);
+    let resume_context_loaded =
+        inject_auto_resume_context(&runtime, session_resume_packet, session_id);
     // Wire the production sub-agent executor so the collaboration pipeline
     // can delegate real work to sub-agents.
     {
@@ -8428,7 +8524,7 @@ impl AnthropicRuntimeClient {
             }
         })?;
 
-        let mut client = ApiProviderClient::from_config(provider)?;
+        let mut client = ApiProviderClient::from_config(&provider)?;
 
         if provider.protocol.as_deref() == Some("anthropic") {
             client = client.with_prompt_cache(PromptCache::new(session_id));
@@ -8461,7 +8557,7 @@ impl AnthropicRuntimeClient {
             }
         })?;
 
-        let mut client = ApiProviderClient::from_config(provider)?;
+        let mut client = ApiProviderClient::from_config(&provider)?;
 
         if provider.protocol.as_deref() == Some("anthropic") {
             client = client.with_prompt_cache(PromptCache::new(&self.session_id));
@@ -10153,10 +10249,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Resume-safe commands: {resume_commands}")?;
     writeln!(out)?;
     writeln!(out, "Session shortcuts:")?;
-    writeln!(
-        out,
-        "  REPL turns auto-save to the SQLite session store"
-    )?;
+    writeln!(out, "  REPL turns auto-save to the SQLite session store")?;
     writeln!(
         out,
         "  Use `{LATEST_SESSION_REFERENCE}` with --resume, /resume, or /session switch to target the newest saved session"
@@ -10221,35 +10314,35 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     #![allow(unused_imports)]
     use super::{
-        CliAction, CliOutputFormat, CliToolExecutor, DEFAULT_MODEL, GitWorkspaceSummary,
-        LATEST_SESSION_REFERENCE, LiveCli, LocalHelpTopic, PromptHistoryEntry, SHARED_RT,
-        STUB_COMMANDS, SessionHandle, SlashCommand, StatusUsage, activate_live_cli_session,
-        build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        build_system_prompt_for_mode, collect_session_prompt_history,
-        create_managed_session_handle, current_task_summary_from_record,
-        discover_local_session_import_candidates, ensure_yolo_task, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_startup_banner, format_startup_banner_with_task,
-        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        activate_live_cli_session, build_runtime_plugin_state_with_loader,
+        build_runtime_with_plugin_state, build_system_prompt_for_mode, cli_turn_context_profile,
+        collect_session_prompt_history, create_managed_session_handle,
+        current_task_summary_from_record, discover_local_session_import_candidates,
+        ensure_yolo_task, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp, format_issue_report,
+        format_model_report, format_model_switch_report, format_permissions_report,
+        format_permissions_switch_report, format_pr_report, format_resume_report,
+        format_startup_banner, format_startup_banner_with_task, format_status_report,
+        format_tool_call_start, format_tool_result, format_ultraplan_report,
         format_unknown_slash_command_message, format_user_visible_api_error,
         gateway_auth_token_from_platform, get_unified_store, handoff_resume_context_packet,
         hydrate_session_from_unified_store, import_local_session_file, jsonl_sessions_dir,
-        merge_prompt_with_stdin,
-        normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
+        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
+        parse_gateway_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias_with_config, resolve_repl_model,
         resolve_session_reference, response_to_events, resume_supported_slash_commands,
         run_resume_command, session_db_path, session_db_resume_context_packet, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
         sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
-        workspace_context_item, write_mcp_server_fixture, cli_turn_context_profile,
+        workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
+        CliToolExecutor, GatewayAction, GitWorkspaceSummary, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, SessionHandle, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        LATEST_SESSION_REFERENCE, SHARED_RT, STUB_COMMANDS,
     };
     use crate::task_kernel::{
         TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
@@ -10259,9 +10352,9 @@ mod tests {
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
     use runtime::{
-        AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, GatewayPlatformConfig,
-        ContextProfile, JsonValue, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
-        load_oauth_credentials, save_oauth_credentials,
+        load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
+        ContextProfile, ConversationMessage, GatewayPlatformConfig, JsonValue, MessageRole,
+        OAuthConfig, PermissionMode, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -10374,6 +10467,16 @@ mod tests {
         assert!(rendered.contains("provider_retry_exhausted"), "{rendered}");
         assert!(rendered.contains("session session-issue-22"));
         assert!(rendered.contains("trace req_jobdori_790"));
+    }
+
+    #[test]
+    fn parse_gateway_wechat_qr_subcommand() {
+        let parsed = parse_gateway_args(&["wechat-qr".to_string()], CliOutputFormat::Text)
+            .expect("wechat qr gateway subcommand should parse");
+        match parsed {
+            CliAction::Gateway { action, .. } => assert_eq!(action, GatewayAction::WechatQr),
+            other => panic!("unexpected action: {other:?}"),
+        }
     }
 
     #[test]
@@ -10985,11 +11088,9 @@ mod tests {
             build_system_prompt_for_mode(true).expect("system prompt should build")
         });
 
-        assert!(
-            prompt
-                .iter()
-                .any(|section| section.contains("YOLO continuous execution mode is active"))
-        );
+        assert!(prompt
+            .iter()
+            .any(|section| section.contains("YOLO continuous execution mode is active")));
     }
 
     #[test]
@@ -12167,18 +12268,14 @@ mod tests {
 
         assert_eq!(packet.session_id, "session-resume-packet");
         assert_eq!(packet.source, runtime::ResumeContextSource::SessionDb);
-        assert!(
-            packet
-                .active_task
-                .as_deref()
-                .is_some_and(|task| task.contains("context timeline is persisted"))
-        );
-        assert!(
-            packet
-                .recent_decisions
-                .iter()
-                .any(|decision| decision.contains("compaction#2"))
-        );
+        assert!(packet
+            .active_task
+            .as_deref()
+            .is_some_and(|task| task.contains("context timeline is persisted")));
+        assert!(packet
+            .recent_decisions
+            .iter()
+            .any(|decision| decision.contains("compaction#2")));
     }
 
     #[test]
@@ -12218,32 +12315,24 @@ mod tests {
 
         assert_eq!(packet.session_id, "handoff-session");
         assert_eq!(packet.source, runtime::ResumeContextSource::Handoff);
-        assert!(
-            packet
-                .active_task
-                .as_deref()
-                .is_some_and(|task| task.contains("timeline complete"))
-        );
-        assert!(
-            packet
-                .recent_decisions
-                .iter()
-                .any(|decision| decision.contains("Use typed packets"))
-        );
-        assert!(
-            packet
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("fallback to latest"))
-        );
+        assert!(packet
+            .active_task
+            .as_deref()
+            .is_some_and(|task| task.contains("timeline complete")));
+        assert!(packet
+            .recent_decisions
+            .iter()
+            .any(|decision| decision.contains("Use typed packets")));
+        assert!(packet
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("fallback to latest")));
     }
 
     #[test]
     fn workspace_context_item_summarizes_runtime_workspace() {
-        let root = std::env::temp_dir().join(format!(
-            "cowd-workspace-context-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("cowd-workspace-context-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("temp workspace");
         let git_init = Command::new("git")
             .args(["-C"])
@@ -12390,6 +12479,8 @@ mod tests {
             &super::StatusContext {
                 cwd: PathBuf::from("/tmp/project"),
                 session_path: Some(PathBuf::from("session.jsonl")),
+                session_id: Some("session".to_string()),
+                session_store: "local import/export file".to_string(),
                 loaded_config_files: 2,
                 discovered_config_files: 3,
                 memory_file_count: 4,
@@ -12423,6 +12514,8 @@ mod tests {
         assert!(status.contains("Unstaged         1"));
         assert!(status.contains("Untracked        1"));
         assert!(status.contains("Session          session.jsonl"));
+        assert!(status.contains("Session id       session"));
+        assert!(status.contains("Session store    local import/export file"));
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
         assert!(status.contains("Suggested flow   /status → /diff → /commit"));
@@ -12442,22 +12535,16 @@ mod tests {
         assert!(preflight.contains("Result           ready"));
         assert!(preflight.contains("Branch           feature/ux"));
         assert!(preflight.contains("Workspace        dirty · 2 files · 1 staged, 1 unstaged"));
-        assert!(
-            preflight.contains(
-                "Action           create a git commit from the current workspace changes"
-            )
-        );
+        assert!(preflight
+            .contains("Action           create a git commit from the current workspace changes"));
     }
 
     #[test]
     fn commit_skipped_report_points_to_next_steps() {
         let report = format_commit_skipped_report();
         assert!(report.contains("Reason           no workspace changes"));
-        assert!(
-            report.contains(
-                "Action           create a git commit from the current workspace changes"
-            )
-        );
+        assert!(report
+            .contains("Action           create a git commit from the current workspace changes"));
         assert!(report.contains("/status to inspect context"));
         assert!(report.contains("/diff to inspect repo changes"));
     }
@@ -12694,7 +12781,7 @@ UU conflicted.rs",
             None,
             &target,
         )
-            .expect("target session should sync");
+        .expect("target session should sync");
 
         let command = SlashCommand::parse(&format!("/session switch {}", target_handle.id))
             .expect("parse should succeed")
@@ -12714,13 +12801,11 @@ UU conflicted.rs",
                 .canonicalize()
                 .expect("target path should exist")
         );
-        assert!(
-            outcome
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Session switched")
-        );
+        assert!(outcome
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Session switched"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         fs::remove_dir_all(config_home).expect("cleanup config home");
@@ -12768,7 +12853,7 @@ UU conflicted.rs",
 
         let handle = SessionHandle {
             id: session_id.to_string(),
-            path: root.join("sessions").join(format!("{session_id}.jsonl")),
+            path: root.join("sessions.db"),
         };
         let hydrated = hydrate_session_from_unified_store(&store, &handle)
             .expect("hydrate should work")
@@ -12789,7 +12874,7 @@ UU conflicted.rs",
         let store = memory::UnifiedSessionStore::open_in_memory().expect("store should open");
         let handle = SessionHandle {
             id: "cli-sync".to_string(),
-            path: root.join("cli-sync.jsonl"),
+            path: root.join("sessions.db"),
         };
         let mut session = Session::new().with_workspace_root(root.clone());
         session.session_id = "cli-sync".to_string();
@@ -12826,6 +12911,23 @@ UU conflicted.rs",
             .expect("record should exist");
 
         assert_eq!(record.message_count, 1);
+        let metadata = record
+            .metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .expect("record metadata should be valid json");
+        let expected_session_path = handle.path.display().to_string();
+        assert_eq!(
+            metadata
+                .get("session_path")
+                .and_then(|value| value.as_str()),
+            Some(expected_session_path.as_str())
+        );
+        assert!(
+            metadata.get("legacy_path").is_none(),
+            "runtime sync metadata should not describe DB-backed sessions as legacy paths"
+        );
+        assert_eq!(record.chat_id, "cli-sync");
         assert_eq!(messages.len(), 1);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].sequence, 0);
@@ -13014,11 +13116,8 @@ UU conflicted.rs",
         )
         .expect("target session should sync");
 
-        let report = crate::switch_live_cli_session(
-            &mut cli,
-            &target_session_id,
-        )
-        .expect("switch should succeed");
+        let report = crate::switch_live_cli_session(&mut cli, &target_session_id)
+            .expect("switch should succeed");
 
         assert_ne!(original_id, report.session_id);
         assert_eq!(report.session_id, target_session_id);
@@ -13093,7 +13192,9 @@ UU conflicted.rs",
         let error = crate::load_session_reference(&session_path.display().to_string())
             .expect_err("unimported local session file should fail");
         assert!(
-            error.to_string().contains("local session file is not imported"),
+            error
+                .to_string()
+                .contains("local session file is not imported"),
             "unexpected error: {error}"
         );
         assert!(
@@ -14048,7 +14149,7 @@ fn write_mcp_server_fixture(script_path: &Path) {
 #[cfg(test)]
 mod sandbox_report_tests {
     #![allow(unused_imports)]
-    use super::{HookAbortMonitor, format_sandbox_report};
+    use super::{format_sandbox_report, HookAbortMonitor};
     use runtime::HookAbortSignal;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -14105,7 +14206,7 @@ mod sandbox_report_tests {
 #[cfg(test)]
 mod dump_manifests_tests {
     #![allow(unused_imports)]
-    use super::{CliOutputFormat, dump_manifests_at_path};
+    use super::{dump_manifests_at_path, CliOutputFormat};
     use std::fs;
 
     #[test]

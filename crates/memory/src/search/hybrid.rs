@@ -104,7 +104,11 @@ impl HybridSearcher {
                 let scorer = BM25Scorer::default_params(all_documents);
                 *cache = Some((scorer, doc_hash));
             }
-            cache.as_ref().expect("BM25 index must be present after build/hit").0.rank(query)
+            cache
+                .as_ref()
+                .expect("BM25 index must be present after build/hit")
+                .0
+                .rank(query)
         };
         let bm25_candidates: Vec<_> = bm25_rankings.into_iter().take(over_fetch).collect();
 
@@ -113,18 +117,12 @@ impl HybridSearcher {
         let mut candidates: HashMap<MemoryId, (Option<f64>, Option<f64>, String)> = HashMap::new();
 
         for (id, content, score) in &vector_candidates {
-            candidates.insert(
-                id.clone(),
-                (Some(*score), None, content.clone()),
-            );
+            candidates.insert(id.clone(), (Some(*score), None, content.clone()));
         }
 
         for (doc_idx, bm25_score) in &bm25_candidates {
             if let Some(id) = doc_id_map.get(*doc_idx) {
-                let content = all_documents
-                    .get(*doc_idx)
-                    .cloned()
-                    .unwrap_or_default();
+                let content = all_documents.get(*doc_idx).cloned().unwrap_or_default();
                 candidates
                     .entry(id.clone())
                     .and_modify(|(_v, b, c)| {
@@ -148,7 +146,10 @@ impl HybridSearcher {
         let vec_min = vec_scores.iter().cloned().fold(f64::INFINITY, f64::min);
         let vec_max = vec_scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let bm25_min = bm25_scores.iter().cloned().fold(f64::INFINITY, f64::min);
-        let bm25_max = bm25_scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let bm25_max = bm25_scores
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
 
         // Step 5: Convex combination
         let mut results: Vec<SearchResult> = candidates
@@ -295,16 +296,21 @@ mod tests {
             "Python data science".to_string(),
             "Rust web development Axum".to_string(),
         ];
-        let doc_ids: Vec<MemoryId> = vec![
-            "id_0".to_string(),
-            "id_1".to_string(),
-            "id_2".to_string(),
-        ];
+        let doc_ids: Vec<MemoryId> =
+            vec!["id_0".to_string(), "id_1".to_string(), "id_2".to_string()];
 
         // Simulate vector results (Rust docs rank high)
         let vector_results = vec![
-            ("id_0".to_string(), "Rust programming language".to_string(), 0.95),
-            ("id_2".to_string(), "Rust web development Axum".to_string(), 0.85),
+            (
+                "id_0".to_string(),
+                "Rust programming language".to_string(),
+                0.95,
+            ),
+            (
+                "id_2".to_string(),
+                "Rust web development Axum".to_string(),
+                0.85,
+            ),
             ("id_1".to_string(), "Python data science".to_string(), 0.3),
         ];
 
@@ -314,7 +320,10 @@ mod tests {
         assert!(!results.is_empty());
         // Results that have at least one positive contribution should score > 0
         let positive_count = results.iter().filter(|r| r.hybrid_score > 0.0).count();
-        assert!(positive_count > 0, "at least one result should have a positive hybrid score");
+        assert!(
+            positive_count > 0,
+            "at least one result should have a positive hybrid score"
+        );
         for r in &results {
             assert!(r.hybrid_score >= 0.0);
         }
@@ -363,8 +372,14 @@ mod tests {
 
         // doc_b: 1/(60+2) + 1/(60+1) = 1/62 + 1/61 ≈ 0.03252
         // doc_a: 1/(60+1) + 1/(60+3) = 1/61 + 1/63 ≈ 0.03226
-        assert_eq!(results[0].id, "doc_b", "doc_b appears near top of both lists");
-        assert_eq!(results[1].id, "doc_a", "doc_a appears in both lists, rank 0 + rank 2");
+        assert_eq!(
+            results[0].id, "doc_b",
+            "doc_b appears near top of both lists"
+        );
+        assert_eq!(
+            results[1].id, "doc_a",
+            "doc_a appears in both lists, rank 0 + rank 2"
+        );
 
         assert!(results[0].hybrid_score > results[1].hybrid_score);
         assert!(results[1].hybrid_score > results[2].hybrid_score);
@@ -379,10 +394,7 @@ mod tests {
 
     #[test]
     fn test_rrf_single_list_fallback_porter() {
-        let porter = vec![
-            ("doc_a".to_string(), 0.95),
-            ("doc_b".to_string(), 0.80),
-        ];
+        let porter = vec![("doc_a".to_string(), 0.95), ("doc_b".to_string(), 0.80)];
 
         let searcher = HybridSearcher::new(0.6, 0.4);
         let results = searcher.search_rrf("test", &porter, &[]);
@@ -446,6 +458,9 @@ mod tests {
         // Second search with same docs should use cache (no rebuild)
         searcher.search("bar", vec![], &docs, &doc_ids, 5);
         // Verify cache exists
-        assert!(searcher.cache.lock().is_some(), "BM25 index should be cached after first search");
+        assert!(
+            searcher.cache.lock().is_some(),
+            "BM25 index should be cached after first search"
+        );
     }
 }

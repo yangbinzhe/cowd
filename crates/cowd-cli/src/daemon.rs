@@ -7,8 +7,13 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
-use axum::http::{HeaderValue, header};
+use axum::http::{header, HeaderValue};
+use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tower_http::cors::CorsLayer;
@@ -18,9 +23,9 @@ use crate::api_routes;
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use crate::session_kernel::SessionKernel;
+use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use memory::UnifiedSessionStore;
-use memory::cognitive::CognitiveContextManager;
 use runtime::mirror::MessageMirror;
 use runtime::platform::config::PlatformRuntimeConfig;
 use runtime::platform::{PlatformConfig, PlatformRuntime};
@@ -103,6 +108,97 @@ pub struct DaemonConfig {
     pub message_mirror: Option<Arc<MessageMirror>>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct PlatformStartupDiagnostic {
+    platform_type: String,
+    enabled: bool,
+    setting_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct StartupDiagnostics {
+    http_addr: String,
+    unix_sock_path: String,
+    workspace_root: String,
+    config_home: String,
+    webui_dir: String,
+    webui_available: bool,
+    memory_enabled: bool,
+    memory_available: bool,
+    unified_store_available: bool,
+    runtime_config_loaded: bool,
+    auth_required: bool,
+    cors_origin_count: usize,
+    platform_count: usize,
+    enabled_platform_count: usize,
+    platforms: Vec<PlatformStartupDiagnostic>,
+    message_mirror_configured: bool,
+}
+
+fn build_startup_diagnostics(
+    config: &DaemonConfig,
+    workspace_root: &Path,
+    config_home: &Path,
+    webui_dir: &Path,
+    memory_available: bool,
+    unified_store_available: bool,
+) -> StartupDiagnostics {
+    let platforms: Vec<PlatformStartupDiagnostic> = config
+        .platform_configs
+        .iter()
+        .map(|platform| {
+            let mut setting_keys = platform.settings.keys().cloned().collect::<Vec<_>>();
+            setting_keys.sort();
+            PlatformStartupDiagnostic {
+                platform_type: platform.platform_type.clone(),
+                enabled: platform.enabled,
+                setting_keys,
+            }
+        })
+        .collect();
+    let enabled_platform_count = platforms.iter().filter(|platform| platform.enabled).count();
+
+    StartupDiagnostics {
+        http_addr: config.http_addr.clone(),
+        unix_sock_path: config.unix_sock_path.clone(),
+        workspace_root: workspace_root.display().to_string(),
+        config_home: config_home.display().to_string(),
+        webui_dir: webui_dir.display().to_string(),
+        webui_available: has_webui_index(webui_dir),
+        memory_enabled: config.memory_config.is_some(),
+        memory_available,
+        unified_store_available,
+        runtime_config_loaded: config.runtime_config.is_some(),
+        auth_required: config.auth_token.is_some(),
+        cors_origin_count: config.cors_origins.len(),
+        platform_count: platforms.len(),
+        enabled_platform_count,
+        platforms,
+        message_mirror_configured: config.message_mirror.is_some(),
+    }
+}
+
+fn emit_startup_diagnostics(diagnostics: &StartupDiagnostics) {
+    tracing::info!(
+        http_addr = %diagnostics.http_addr,
+        unix_sock_path = %diagnostics.unix_sock_path,
+        workspace_root = %diagnostics.workspace_root,
+        config_home = %diagnostics.config_home,
+        webui_dir = %diagnostics.webui_dir,
+        webui_available = diagnostics.webui_available,
+        memory_enabled = diagnostics.memory_enabled,
+        memory_available = diagnostics.memory_available,
+        unified_store_available = diagnostics.unified_store_available,
+        runtime_config_loaded = diagnostics.runtime_config_loaded,
+        auth_required = diagnostics.auth_required,
+        cors_origin_count = diagnostics.cors_origin_count,
+        platform_count = diagnostics.platform_count,
+        enabled_platform_count = diagnostics.enabled_platform_count,
+        message_mirror_configured = diagnostics.message_mirror_configured,
+        "daemon startup diagnostics"
+    );
+}
+
 // ── PID file guard ──────────────────────────────────────────────
 
 struct PidFileGuard;
@@ -116,6 +212,47 @@ impl PidFileGuard {
         tracing::info!(pid, path = %pid_path.display(), "PID file written");
         Ok(Self)
     }
+}
+
+fn has_webui_index(path: &Path) -> bool {
+    path.join("index.html").is_file()
+}
+
+fn resolve_webui_dir() -> PathBuf {
+    if let Some(path) = env::var_os("COWD_WEBUI_DIR").map(PathBuf::from) {
+        if has_webui_index(&path) {
+            return path;
+        }
+        tracing::warn!(
+            path = %path.display(),
+            "COWD_WEBUI_DIR does not contain index.html; trying fallback paths"
+        );
+    }
+
+    if let Ok(cwd) = env::current_dir() {
+        let source_tree_path = cwd.join("webui");
+        if has_webui_index(&source_tree_path) {
+            return source_tree_path;
+        }
+    }
+
+    if let Ok(exe) = env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let installed_path = exe_dir.join("webui");
+            if has_webui_index(&installed_path) {
+                return installed_path;
+            }
+        }
+    }
+
+    let fallback = env::current_dir()
+        .map(|cwd| cwd.join("webui"))
+        .unwrap_or_else(|_| PathBuf::from("webui"));
+    tracing::warn!(
+        path = %fallback.display(),
+        "WebUI index.html was not found; static file serving may return 404"
+    );
+    fallback
 }
 
 impl Drop for PidFileGuard {
@@ -139,10 +276,10 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     let sessions = Arc::new(ActiveSessions::default());
     let tools = Arc::new(GlobalToolRegistry::builtin());
 
-    let cognitive: Option<Arc<CognitiveContextManager>> = match config.memory_config {
+    let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
         Some(mem_cfg) => {
             tracing::info!("initialising memory manager...");
-            CognitiveContextManager::new(mem_cfg)
+            CognitiveContextManager::new(mem_cfg.clone())
                 .await
                 .ok()
                 .map(Arc::new)
@@ -209,6 +346,18 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         Duration::from_secs(300),
     );
 
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let webui_dir = resolve_webui_dir();
+    let startup_diagnostics = build_startup_diagnostics(
+        &config,
+        &workspace_root,
+        &approval_dir,
+        &webui_dir,
+        cognitive.is_some(),
+        unified_store.is_some(),
+    );
+    emit_startup_diagnostics(&startup_diagnostics);
+
     let app_state = Arc::new(api_routes::AppState {
         session_kernel: session_kernel.clone(),
         sessions: sessions.clone(),
@@ -219,7 +368,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         event_bus: event_bus.clone(),
         approval_gate: Some(approval_gate),
         auth_token: config.auth_token.clone(),
-        workspace_root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        workspace_root,
         config_home: approval_dir.clone(),
         profile_id,
         profile_manager,
@@ -254,7 +403,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
             ])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
-        let webui_dir = std::env::current_dir().unwrap().join("webui");
+        tracing::info!(path = %webui_dir.display(), "serving WebUI assets");
         api_routes::api_router(app_state.clone())
             .fallback_service(ServeDir::new(webui_dir))
             .layer(cors)
@@ -668,6 +817,24 @@ async fn handle_unix_client(
 mod tests {
     use super::*;
     use memory::MemoryConfig;
+    use std::fs;
+    use std::sync::Mutex;
+
+    static WEBUI_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn temp_webui_dir(label: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "cowd-webui-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&dir).expect("create temp webui dir");
+        dir
+    }
 
     #[test]
     fn daemon_config_defaults() {
@@ -719,5 +886,82 @@ mod tests {
             message_mirror: None,
         };
         assert!(config.memory_config.is_some());
+    }
+
+    #[test]
+    fn startup_diagnostics_expose_capability_state_without_secret_values() {
+        let webui_dir = temp_webui_dir("diagnostics");
+        fs::write(webui_dir.join("index.html"), "<!doctype html>").expect("write index");
+        let workspace = std::env::temp_dir().join("cowd-diagnostics-workspace");
+        let config_home = std::env::temp_dir().join("cowd-diagnostics-config");
+        let platform = PlatformConfig::new("feishu")
+            .with_setting("app_id", "cli_test_app")
+            .with_setting("app_secret", "do-not-log-this-secret");
+        let config = DaemonConfig {
+            http_addr: "127.0.0.1:9864".into(),
+            unix_sock_path: "/tmp/cowd-diagnostics.sock".into(),
+            memory_config: Some(MemoryConfig::default()),
+            platform_configs: vec![platform],
+            runtime_config: Some(serde_json::json!({"model": "test-model"})),
+            cors_origins: vec!["http://localhost:3000".into()],
+            auth_token: Some("do-not-log-this-token".into()),
+            message_mirror: None,
+        };
+
+        let diagnostics =
+            build_startup_diagnostics(&config, &workspace, &config_home, &webui_dir, true, true);
+        let serialized = serde_json::to_string(&diagnostics).expect("diagnostics should serialize");
+
+        assert_eq!(diagnostics.http_addr, "127.0.0.1:9864");
+        assert!(diagnostics.webui_available);
+        assert!(diagnostics.memory_enabled);
+        assert!(diagnostics.memory_available);
+        assert!(diagnostics.unified_store_available);
+        assert!(diagnostics.runtime_config_loaded);
+        assert!(diagnostics.auth_required);
+        assert_eq!(diagnostics.platform_count, 1);
+        assert_eq!(diagnostics.enabled_platform_count, 1);
+        assert_eq!(diagnostics.platforms[0].platform_type, "feishu");
+        assert_eq!(
+            diagnostics.platforms[0].setting_keys,
+            vec!["app_id".to_string(), "app_secret".to_string()]
+        );
+        assert!(!serialized.contains("do-not-log-this-secret"));
+        assert!(!serialized.contains("do-not-log-this-token"));
+
+        let _ = fs::remove_dir_all(&webui_dir);
+    }
+
+    #[test]
+    fn resolve_webui_dir_prefers_valid_env_path() {
+        let _guard = WEBUI_ENV_LOCK.lock().expect("webui env lock");
+        let previous = std::env::var_os("COWD_WEBUI_DIR");
+        let dir = temp_webui_dir("env");
+        fs::write(dir.join("index.html"), "<!doctype html>").expect("write index");
+        std::env::set_var("COWD_WEBUI_DIR", &dir);
+
+        assert_eq!(resolve_webui_dir(), dir);
+
+        if let Some(value) = previous {
+            std::env::set_var("COWD_WEBUI_DIR", value);
+        } else {
+            std::env::remove_var("COWD_WEBUI_DIR");
+        }
+    }
+
+    #[test]
+    fn resolve_webui_dir_ignores_env_path_without_index() {
+        let _guard = WEBUI_ENV_LOCK.lock().expect("webui env lock");
+        let previous = std::env::var_os("COWD_WEBUI_DIR");
+        let dir = temp_webui_dir("missing-index");
+        std::env::set_var("COWD_WEBUI_DIR", &dir);
+
+        assert_ne!(resolve_webui_dir(), dir);
+
+        if let Some(value) = previous {
+            std::env::set_var("COWD_WEBUI_DIR", value);
+        } else {
+            std::env::remove_var("COWD_WEBUI_DIR");
+        }
     }
 }

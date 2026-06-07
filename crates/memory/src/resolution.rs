@@ -94,12 +94,7 @@ impl ConflictResolver {
         self.agent_weights
             .get(agent)
             .copied()
-            .unwrap_or_else(|| {
-                self.agent_weights
-                    .get("unknown")
-                    .copied()
-                    .unwrap_or(0.4)
-            })
+            .unwrap_or_else(|| self.agent_weights.get("unknown").copied().unwrap_or(0.4))
     }
 
     /// Compute a weighted confidence score for a triple.
@@ -258,7 +253,9 @@ mod tests {
     fn test_resolve_by_agent_weight() {
         // New agent weight 0.9 × confidence 0.85 = 0.765 > existing 0.6 → ReplaceWithNew
         let mut resolver = ConflictResolver::new();
-        resolver.agent_weights.insert("TrustedAgent".to_string(), 0.9);
+        resolver
+            .agent_weights
+            .insert("TrustedAgent".to_string(), 0.9);
 
         let conflict = conflict_info(0.6, 0.85, "TrustedAgent", /* consensus_count */ 0);
 

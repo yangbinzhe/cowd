@@ -49,24 +49,31 @@ struct PredicateRule {
 
 /// Predicates that only make sense for persons.
 const PERSON_PREDICATES: &[&str] = &[
-    "child_of", "parent_of", "partner_of", "sibling_of",
-    "born_on", "birthday", "works_for", "manages",
+    "child_of",
+    "parent_of",
+    "partner_of",
+    "sibling_of",
+    "born_on",
+    "birthday",
+    "works_for",
+    "manages",
 ];
 
 /// Predicates valid for organizations.
-const ORG_PREDICATES: &[&str] = &[
-    "located_in", "subsidiary_of", "owns", "employs",
-];
+const ORG_PREDICATES: &[&str] = &["located_in", "subsidiary_of", "owns", "employs"];
 
 /// Predicates valid for projects.
-const PROJECT_PREDICATES: &[&str] = &[
-    "uses", "depends_on", "belongs_to", "has_member",
-];
+const PROJECT_PREDICATES: &[&str] = &["uses", "depends_on", "belongs_to", "has_member"];
 
 /// Predicates valid for any entity type.
 const UNIVERSAL_PREDICATES: &[&str] = &[
-    "related_to", "has_property", "contains", "part_of",
-    "located_in", "known_as", "also_called",
+    "related_to",
+    "has_property",
+    "contains",
+    "part_of",
+    "located_in",
+    "known_as",
+    "also_called",
 ];
 
 // ─── FactChecker ───────────────────────────────────────────────────────────────
@@ -124,11 +131,7 @@ impl FactChecker {
     /// Score = 0.4*confidence + 0.3*recency + 0.3*agent_weight.
     pub fn detect_conflict(&self, triple: &Triple) -> Option<(&Triple, f32)> {
         let agent = triple.source_agent.as_deref().unwrap_or("unknown");
-        let weight = self
-            .agent_weights
-            .get(agent)
-            .copied()
-            .unwrap_or(0.4);
+        let weight = self.agent_weights.get(agent).copied().unwrap_or(0.4);
         let now = chrono::Utc::now();
 
         for existing in self.triples.iter().rev() {
@@ -323,10 +326,7 @@ impl FactChecker {
             if triple.predicate == "child_of" || triple.predicate == "parent_of" {
                 if let Some(ref parent) = facts.parent {
                     let obj_lc = triple.object.to_lowercase();
-                    if obj_lc != parent.to_lowercase()
-                        && !obj_lc.is_empty()
-                        && !parent.is_empty()
-                    {
+                    if obj_lc != parent.to_lowercase() && !obj_lc.is_empty() && !parent.is_empty() {
                         contradictions.push(format!(
                             "Triple says {} is child_of {}, but registered facts say parent is {}",
                             triple.subject, triple.object, parent
@@ -338,9 +338,7 @@ impl FactChecker {
             if triple.predicate == "partner_of" {
                 if let Some(ref partner) = facts.partner {
                     let obj_lc = triple.object.to_lowercase();
-                    if obj_lc != partner.to_lowercase()
-                        && !obj_lc.is_empty()
-                        && !partner.is_empty()
+                    if obj_lc != partner.to_lowercase() && !obj_lc.is_empty() && !partner.is_empty()
                     {
                         contradictions.push(format!(
                             "Triple says {} is partner_of {}, but registered facts say partner is {}",
@@ -377,7 +375,10 @@ impl FactChecker {
         };
 
         let suggested_correction = if !is_consistent {
-            Some(format!("Review and reconcile the conflicting facts for {}", triple.subject))
+            Some(format!(
+                "Review and reconcile the conflicting facts for {}",
+                triple.subject
+            ))
         } else {
             None
         };
@@ -393,7 +394,11 @@ impl FactChecker {
 
     /// Batch-check all triples in a knowledge graph.
     pub fn check_graph(&self, graph: &KnowledgeGraph) -> Vec<FactCheckResult> {
-        graph.all_triples().iter().map(|t| self.check_triple(t)).collect()
+        graph
+            .all_triples()
+            .iter()
+            .map(|t| self.check_triple(t))
+            .collect()
     }
 
     // ── helpers ────────────────────────────────────────────────────────────
@@ -532,7 +537,10 @@ mod tests {
 
         let result = checker.check_triple(&triple);
         assert!(!result.is_consistent);
-        assert!(result.contradiction.unwrap().contains("not valid for entity type"));
+        assert!(result
+            .contradiction
+            .unwrap()
+            .contains("not valid for entity type"));
     }
 
     // ── auto_correct tests ──────────────────────────────────────────
@@ -562,9 +570,21 @@ mod tests {
     #[test]
     fn test_auto_correct_replace() {
         let mut checker = FactChecker::new();
-        checker.register_triple(make_triple("t1", "Alice", "partner_of", "Bob", 0.3, "unknown"));
         checker.register_triple(make_triple(
-            "t2", "Alice", "partner_of", "Charlie", 0.9, "Orchestrator",
+            "t1",
+            "Alice",
+            "partner_of",
+            "Bob",
+            0.3,
+            "unknown",
+        ));
+        checker.register_triple(make_triple(
+            "t2",
+            "Alice",
+            "partner_of",
+            "Charlie",
+            0.9,
+            "Orchestrator",
         ));
 
         let report = checker.auto_correct();
@@ -582,16 +602,36 @@ mod tests {
     fn test_auto_correct_consensus() {
         let mut checker = FactChecker::new();
         checker.register_triple(make_triple(
-            "t1", "Bob", "works_for", "Acme", 0.7, "Orchestrator",
+            "t1",
+            "Bob",
+            "works_for",
+            "Acme",
+            0.7,
+            "Orchestrator",
         ));
         checker.register_triple(make_triple(
-            "t2", "Bob", "works_for", "Acme", 0.7, "Reviewer",
+            "t2",
+            "Bob",
+            "works_for",
+            "Acme",
+            0.7,
+            "Reviewer",
         ));
         checker.register_triple(make_triple(
-            "t3", "Bob", "works_for", "Acme", 0.7, "Executor",
+            "t3",
+            "Bob",
+            "works_for",
+            "Acme",
+            0.7,
+            "Executor",
         ));
         checker.register_triple(make_triple(
-            "t4", "Bob", "works_for", "Globex", 0.7, "unknown",
+            "t4",
+            "Bob",
+            "works_for",
+            "Globex",
+            0.7,
+            "unknown",
         ));
 
         let report = checker.auto_correct();
@@ -611,10 +651,20 @@ mod tests {
     fn test_auto_correct_noop() {
         let mut checker = FactChecker::new();
         checker.register_triple(make_triple(
-            "t1", "Carol", "child_of", "Dave", 0.8, "Orchestrator",
+            "t1",
+            "Carol",
+            "child_of",
+            "Dave",
+            0.8,
+            "Orchestrator",
         ));
         checker.register_triple(make_triple(
-            "t2", "Eve", "works_for", "Inc", 0.7, "Reviewer",
+            "t2",
+            "Eve",
+            "works_for",
+            "Inc",
+            0.7,
+            "Reviewer",
         ));
 
         let report = checker.auto_correct();

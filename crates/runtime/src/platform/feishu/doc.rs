@@ -64,21 +64,13 @@ pub enum DocumentElement {
         elements: Vec<TextElement>,
     },
     /// Quote.
-    Quote {
-        elements: Vec<TextElement>,
-    },
+    Quote { elements: Vec<TextElement> },
     /// Bullet list.
-    BulletList {
-        items: Vec<ListItem>,
-    },
+    BulletList { items: Vec<ListItem> },
     /// Numbered list.
-    NumberedList {
-        items: Vec<ListItem>,
-    },
+    NumberedList { items: Vec<ListItem> },
     /// Table.
-    Table {
-        rows: Vec<TableRow>,
-    },
+    Table { rows: Vec<TableRow> },
     /// Image.
     Image {
         token: String,
@@ -231,13 +223,12 @@ impl DocumentClient {
             .map_err(|e| PlatformError::Unknown(format!("failed to parse response: {}", e)))?;
 
         if resp.code != 0 {
-            return Err(PlatformError::Unknown(format!(
-                "API error: {}",
-                resp.msg
-            )));
+            return Err(PlatformError::Unknown(format!("API error: {}", resp.msg)));
         }
 
-        let doc = resp.data.and_then(|d| d.document)
+        let doc = resp
+            .data
+            .and_then(|d| d.document)
             .ok_or_else(|| PlatformError::Unknown("no document in response".to_string()))?;
 
         Ok(DocumentMetadata {
@@ -245,11 +236,13 @@ impl DocumentClient {
             doc_type: DocumentType::Doc,
             title: doc.title.unwrap_or_else(|| "Untitled".to_string()),
             owner_open_id: doc.owner_id.and_then(|o| o.open_id).unwrap_or_default(),
-            created_at: doc.create_time
+            created_at: doc
+                .create_time
                 .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(Utc::now),
-            updated_at: doc.update_time
+            updated_at: doc
+                .update_time
                 .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(Utc::now),
@@ -264,7 +257,11 @@ impl DocumentClient {
         let client = reqwest::Client::new();
 
         let response = client
-            .get(&format!("{}/{}/document_blocks", Self::doc_api_base(), doc_token))
+            .get(&format!(
+                "{}/{}/document_blocks",
+                Self::doc_api_base(),
+                doc_token
+            ))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
@@ -298,10 +295,7 @@ impl DocumentClient {
             .map_err(|e| PlatformError::Unknown(format!("failed to parse response: {}", e)))?;
 
         if resp.code != 0 {
-            return Err(PlatformError::Unknown(format!(
-                "API error: {}",
-                resp.msg
-            )));
+            return Err(PlatformError::Unknown(format!("API error: {}", resp.msg)));
         }
 
         Ok(resp.data.and_then(|d| d.items).unwrap_or_default())
@@ -378,7 +372,10 @@ impl DocumentClient {
                 let children = block.get("children").and_then(|c| c.as_array());
                 let text = self.extract_text_from_children(children);
 
-                Some(DocumentElement::CodeBlock { language, elements: text })
+                Some(DocumentElement::CodeBlock {
+                    language,
+                    elements: text,
+                })
             }
             // Quote
             15 => {
@@ -421,7 +418,11 @@ impl DocumentClient {
                     .and_then(|h| h.as_u64())
                     .unwrap_or(0) as u32;
 
-                Some(DocumentElement::Image { token, width, height })
+                Some(DocumentElement::Image {
+                    token,
+                    width,
+                    height,
+                })
             }
             // Divider
             37 => Some(DocumentElement::Divider),
@@ -430,7 +431,10 @@ impl DocumentClient {
     }
 
     /// Extract text from children blocks.
-    fn extract_text_from_children(&self, children: Option<&Vec<serde_json::Value>>) -> Vec<TextElement> {
+    fn extract_text_from_children(
+        &self,
+        children: Option<&Vec<serde_json::Value>>,
+    ) -> Vec<TextElement> {
         let mut elements = Vec::new();
 
         if let Some(children_arr) = children {
@@ -458,9 +462,19 @@ impl DocumentClient {
                 italic: t.get("italic").and_then(|i| i.as_bool()),
                 strikethrough: t.get("strike_through").and_then(|s| s.as_bool()),
                 underline: t.get("underline").and_then(|u| u.as_bool()),
-                text_color: t.get("text_color").and_then(|c| c.as_str()).map(|s| s.to_string()),
-                background_color: t.get("highlight_color").and_then(|c| c.as_str()).map(|s| s.to_string()),
-                link: t.get("link").and_then(|l| l.get("url")).and_then(|u| u.as_str()).map(|s| s.to_string()),
+                text_color: t
+                    .get("text_color")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string()),
+                background_color: t
+                    .get("highlight_color")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string()),
+                link: t
+                    .get("link")
+                    .and_then(|l| l.get("url"))
+                    .and_then(|u| u.as_str())
+                    .map(|s| s.to_string()),
             })
         });
 
@@ -489,9 +503,8 @@ impl DocumentClient {
 
         if let Some(children) = block.get("children").and_then(|c| c.as_array()) {
             for child in children {
-                let elements = self.extract_text_from_children(
-                    child.get("children").and_then(|c| c.as_array())
-                );
+                let elements = self
+                    .extract_text_from_children(child.get("children").and_then(|c| c.as_array()));
                 let children_items = self.parse_list_items(child, numbered);
 
                 items.push(ListItem {
@@ -512,7 +525,7 @@ impl DocumentClient {
             if let Some(cells_arr) = cells_data.as_array() {
                 for (idx, cell_data) in cells_arr.iter().enumerate() {
                     let text_elements = self.extract_text_from_children(
-                        cell_data.get("children").and_then(|c| c.as_array())
+                        cell_data.get("children").and_then(|c| c.as_array()),
                     );
 
                     // Wrap text in a Paragraph element
@@ -537,7 +550,10 @@ impl DocumentClient {
         let mut md = String::new();
 
         md.push_str(&format!("# {}\n\n", content.metadata.title));
-        md.push_str(&format!("> Last updated: {}\n\n", content.metadata.updated_at));
+        md.push_str(&format!(
+            "> Last updated: {}\n\n",
+            content.metadata.updated_at
+        ));
 
         for element in &content.elements {
             self.element_to_markdown(element, &mut md, 0);
@@ -556,14 +572,21 @@ impl DocumentClient {
                 let text = self.elements_to_text(elements);
                 output.push_str(&format!("{}{}\n", indent_str, text));
             }
-            DocumentElement::Heading { level, elements, .. } => {
+            DocumentElement::Heading {
+                level, elements, ..
+            } => {
                 let text = self.elements_to_text(elements);
                 let prefix = "#".repeat(*level as usize);
                 output.push_str(&format!("{} {} {}\n", indent_str, prefix, text));
             }
-            DocumentElement::CodeBlock { language, elements, .. } => {
+            DocumentElement::CodeBlock {
+                language, elements, ..
+            } => {
                 let text = self.elements_to_text(elements);
-                output.push_str(&format!("{}```{}\n{}{}\n```\n", indent_str, language, indent_str, text));
+                output.push_str(&format!(
+                    "{}```{}\n{}{}\n```\n",
+                    indent_str, language, indent_str, text
+                ));
             }
             DocumentElement::Quote { elements, .. } => {
                 let text = self.elements_to_text(elements);
@@ -581,13 +604,19 @@ impl DocumentClient {
             }
             DocumentElement::Table { rows } => {
                 for row in rows {
-                    let cells: Vec<String> = row.cells.iter()
+                    let cells: Vec<String> = row
+                        .cells
+                        .iter()
                         .map(|c| self.elements_to_text_from_doc_elements(&c.content))
                         .collect();
                     let cell_str = cells.join(" | ");
                     if row.is_header {
                         output.push_str(&format!("{}| {} |\n", indent_str, cell_str));
-                        output.push_str(&format!("{}|{}|\n", indent_str, "-".repeat(cells.iter().map(|s| s.len()).max().unwrap_or(1) + 2)));
+                        output.push_str(&format!(
+                            "{}|{}|\n",
+                            indent_str,
+                            "-".repeat(cells.iter().map(|s| s.len()).max().unwrap_or(1) + 2)
+                        ));
                     } else {
                         output.push_str(&format!("{}| {} |\n", indent_str, cell_str));
                     }
@@ -603,7 +632,13 @@ impl DocumentClient {
     }
 
     /// Convert list item to markdown.
-    fn list_item_to_markdown(&self, item: &ListItem, output: &mut String, indent: usize, prefix: &str) {
+    fn list_item_to_markdown(
+        &self,
+        item: &ListItem,
+        output: &mut String,
+        indent: usize,
+        prefix: &str,
+    ) {
         let indent_str = "  ".repeat(indent);
         let text = self.elements_to_text(&item.elements);
         output.push_str(&format!("{}{}{}\n", indent_str, prefix, text));
@@ -617,7 +652,8 @@ impl DocumentClient {
 
     /// Convert text elements to plain text.
     fn elements_to_text(&self, elements: &[TextElement]) -> String {
-        elements.iter()
+        elements
+            .iter()
             .map(|e| e.text.clone())
             .collect::<Vec<_>>()
             .join("")
@@ -625,11 +661,16 @@ impl DocumentClient {
 
     /// Convert document elements to plain text (for table cells).
     fn elements_to_text_from_doc_elements(&self, elements: &[DocumentElement]) -> String {
-        elements.iter()
+        elements
+            .iter()
             .filter_map(|e| match e {
-                DocumentElement::Paragraph { elements, .. } => Some(self.elements_to_text(elements)),
+                DocumentElement::Paragraph { elements, .. } => {
+                    Some(self.elements_to_text(elements))
+                }
                 DocumentElement::Heading { elements, .. } => Some(self.elements_to_text(elements)),
-                DocumentElement::CodeBlock { elements, .. } => Some(self.elements_to_text(elements)),
+                DocumentElement::CodeBlock { elements, .. } => {
+                    Some(self.elements_to_text(elements))
+                }
                 DocumentElement::Quote { elements, .. } => Some(self.elements_to_text(elements)),
                 _ => None,
             })
@@ -683,15 +724,16 @@ pub struct SearchDocumentsResponse {
 
 impl DocumentClient {
     /// Search for documents.
-    pub async fn search(&self, request: SearchDocumentsRequest) -> PlatformResult<SearchDocumentsResponse> {
+    pub async fn search(
+        &self,
+        request: SearchDocumentsRequest,
+    ) -> PlatformResult<SearchDocumentsResponse> {
         let token = self.adapter.ensure_token().await?;
         let client = reqwest::Client::new();
 
         let count = request.page_size.unwrap_or(20).to_string();
-        let mut query_params: Vec<(&str, &str)> = vec![
-            ("search_key", &request.query),
-            ("count", &count),
-        ];
+        let mut query_params: Vec<(&str, &str)> =
+            vec![("search_key", &request.query), ("count", &count)];
 
         if let Some(page_token) = &request.page_token {
             query_params.push(("page_token", page_token));
@@ -756,13 +798,11 @@ impl DocumentClient {
             .map_err(|e| PlatformError::Unknown(format!("failed to parse response: {}", e)))?;
 
         if resp.code != 0 {
-            return Err(PlatformError::Unknown(format!(
-                "API error: {}",
-                resp.msg
-            )));
+            return Err(PlatformError::Unknown(format!("API error: {}", resp.msg)));
         }
 
-        let results: Vec<SearchResult> = resp.data
+        let results: Vec<SearchResult> = resp
+            .data
             .as_ref()
             .and_then(|d| d.docs.clone())
             .unwrap_or_default()

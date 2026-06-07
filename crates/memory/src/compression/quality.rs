@@ -77,8 +77,16 @@ pub fn verify_compaction(original_texts: &[&str], summary: &str) -> QualityMetri
 /// Extract decision-like phrases from text.
 fn extract_decisions(texts: &[&str]) -> Vec<String> {
     let keywords = [
-        "decided", "chosen", "agreed", "will use", "we should", "let's use",
-        "decided to", "opted for", "going with", "settled on",
+        "decided",
+        "chosen",
+        "agreed",
+        "will use",
+        "we should",
+        "let's use",
+        "decided to",
+        "opted for",
+        "going with",
+        "settled on",
     ];
     let mut decisions = Vec::new();
     for text in texts {
@@ -134,7 +142,10 @@ fn retention_rate(items: &[String], summary_lower: &str) -> f64 {
     if items.is_empty() {
         return 1.0; // No items to lose = perfect retention
     }
-    let found = items.iter().filter(|item| summary_lower.contains(&item.to_ascii_lowercase())).count();
+    let found = items
+        .iter()
+        .filter(|item| summary_lower.contains(&item.to_ascii_lowercase()))
+        .count();
     found as f64 / items.len() as f64
 }
 
@@ -169,8 +180,12 @@ mod tests {
 
     #[test]
     fn verify_compaction_with_full_retention() {
-        let originals = ["We decided to use Rust for the backend", "The file src/main.rs depends on lib.rs"];
-        let summary = "We decided to use Rust for the backend. The file src/main.rs depends on lib.rs.";
+        let originals = [
+            "We decided to use Rust for the backend",
+            "The file src/main.rs depends on lib.rs",
+        ];
+        let summary =
+            "We decided to use Rust for the backend. The file src/main.rs depends on lib.rs.";
         let metrics = verify_compaction(&originals, summary);
         assert!(metrics.decision_retention >= 0.9);
         assert!(metrics.entity_retention >= 0.9);
@@ -179,7 +194,10 @@ mod tests {
 
     #[test]
     fn verify_compaction_with_poor_retention() {
-        let originals = ["We decided to use Rust", "The file src/main.rs is important"];
+        let originals = [
+            "We decided to use Rust",
+            "The file src/main.rs is important",
+        ];
         let summary = "General discussion about programming.";
         let metrics = verify_compaction(&originals, summary);
         assert!(metrics.overall_score < 0.5);

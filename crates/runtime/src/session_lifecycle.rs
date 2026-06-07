@@ -274,10 +274,7 @@ impl SessionLifecycleManager {
         let dead_ids: Vec<String> = sessions
             .iter()
             .filter(|(_, entry)| {
-                matches!(
-                    entry.status,
-                    SessionStatus::Expired | SessionStatus::Closed
-                )
+                matches!(entry.status, SessionStatus::Expired | SessionStatus::Closed)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -293,8 +290,10 @@ impl SessionLifecycleManager {
 
         // Apply the configured eviction policy to the remaining sessions.
         let candidate_ids: Vec<String> = {
-            let mut candidates: Vec<(String, &SessionEntry)> =
-                sessions.iter().map(|(id, entry)| (id.clone(), entry)).collect();
+            let mut candidates: Vec<(String, &SessionEntry)> = sessions
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry))
+                .collect();
 
             match self.config.eviction_policy {
                 EvictionPolicy::Lru => {

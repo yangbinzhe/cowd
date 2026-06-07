@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
+use cowd_memory::config::MemoryConfig;
+use cowd_memory::store::{sqlite::SqliteStore, MemoryStore};
 use cowd_memory::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryLayer, MemoryOrchestrator, MemoryScope,
     MemorySource, Priority,
 };
-use cowd_memory::config::MemoryConfig;
-use cowd_memory::store::{sqlite::SqliteStore, MemoryStore};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -60,9 +60,8 @@ async fn test_swarm_5_agents_concurrent_writes_no_data_loss() {
     let db_path = tmp.path().join("swarm_nodataloss.db");
     let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_path(&db_path).unwrap());
 
-    let orch = Arc::new(
-        MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap(),
-    );
+    let orch =
+        Arc::new(MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap());
 
     // Set a common project scope for all agents.
     orch.set_active_scope(MemoryScope::Project("concurrent-project".into()));
@@ -126,9 +125,8 @@ async fn test_swarm_source_agent_tracking() {
     let db_path = tmp.path().join("swarm_agent_tracking.db");
     let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open_path(&db_path).unwrap());
 
-    let orch = Arc::new(
-        MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap(),
-    );
+    let orch =
+        Arc::new(MemoryOrchestrator::from_store(test_config(), Arc::clone(&store), None).unwrap());
 
     // Set common scope
     orch.set_active_scope(MemoryScope::Project("tracking-project".into()));
@@ -371,5 +369,8 @@ async fn test_swarm_scope_isolation() {
             }
         }
     }
-    assert_eq!(alpha_agent_count, 5, "All alpha entries should have agent-alpha source");
+    assert_eq!(
+        alpha_agent_count, 5,
+        "All alpha entries should have agent-alpha source"
+    );
 }

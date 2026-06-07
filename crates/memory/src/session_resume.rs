@@ -88,7 +88,7 @@ impl SessionResume {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{MemoryCategory, MemoryLayer, Priority, MemorySource};
+    use crate::types::{MemoryCategory, MemoryLayer, MemorySource, Priority};
     use crate::MemoryScope;
     use uuid::Uuid;
 
@@ -142,7 +142,9 @@ mod tests {
 
         let resume = SessionResume::new(entries.clone());
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let results = rt.block_on(resume.resume_recent("session-1", None, 5)).unwrap();
+        let results = rt
+            .block_on(resume.resume_recent("session-1", None, 5))
+            .unwrap();
 
         assert!(!results.is_empty());
         // Session-1 entries should rank highest
@@ -162,7 +164,9 @@ mod tests {
 
         let resume = SessionResume::new(entries);
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let results = rt.block_on(resume.resume_recent("nonexistent", None, 5)).unwrap();
+        let results = rt
+            .block_on(resume.resume_recent("nonexistent", None, 5))
+            .unwrap();
 
         assert!(results.is_empty());
     }
@@ -171,7 +175,9 @@ mod tests {
     fn test_resume_empty_index_returns_empty() {
         let resume = SessionResume::new(vec![]);
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let results = rt.block_on(resume.resume_recent("session-1", None, 5)).unwrap();
+        let results = rt
+            .block_on(resume.resume_recent("session-1", None, 5))
+            .unwrap();
 
         assert!(results.is_empty());
     }
@@ -191,7 +197,9 @@ mod tests {
 
         let resume = SessionResume::new(entries);
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let results = rt.block_on(resume.resume_recent("session-1", None, 3)).unwrap();
+        let results = rt
+            .block_on(resume.resume_recent("session-1", None, 3))
+            .unwrap();
 
         assert_eq!(results.len(), 3);
     }

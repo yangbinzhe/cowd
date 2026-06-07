@@ -433,7 +433,10 @@ mod tests {
         let text = "Line one.\n\nLine two.\n\nLine three.";
         let result = split_long_text(text, 15);
         // Split at \n\n; boundary chars stay with the first part.
-        assert_eq!(result, vec!["Line one.\n\n", "Line two.\n\n", "Line three."]);
+        assert_eq!(
+            result,
+            vec!["Line one.\n\n", "Line two.\n\n", "Line three."]
+        );
     }
 
     #[test]
@@ -441,10 +444,7 @@ mod tests {
         let text = "First\nSecond\nThird\nFourth";
         let result = split_long_text(text, 10);
         // Each line fits within 10 chars, splits on \n boundaries.
-        assert_eq!(
-            result,
-            vec!["First\n", "Second\n", "Third\n", "Fourth"]
-        );
+        assert_eq!(result, vec!["First\n", "Second\n", "Third\n", "Fourth"]);
     }
 
     #[test]
@@ -530,12 +530,7 @@ mod tests {
     async fn test_timer_fires_after_delay() {
         let mock = Arc::new(MockSender::new());
         // Use a short delay so the test runs quickly.
-        let mgr = TextBatchManager::new(
-            30,
-            8,
-            4000,
-            mock.clone() as Arc<dyn BatchSender>,
-        );
+        let mgr = TextBatchManager::new(30, 8, 4000, mock.clone() as Arc<dyn BatchSender>);
 
         mgr.queue("chat-1", "msg1").await;
 
@@ -590,12 +585,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_chat_ids_independent_buffers() {
         let mock = Arc::new(MockSender::new());
-        let mgr = TextBatchManager::new(
-            40,
-            8,
-            4000,
-            mock.clone() as Arc<dyn BatchSender>,
-        );
+        let mgr = TextBatchManager::new(40, 8, 4000, mock.clone() as Arc<dyn BatchSender>);
 
         // Queue messages for two different chats.
         mgr.queue("chat-A", "A1").await;
@@ -620,12 +610,7 @@ mod tests {
     #[tokio::test]
     async fn test_flush_all_clears_everything() {
         let mock = Arc::new(MockSender::new());
-        let mgr = TextBatchManager::new(
-            100,
-            8,
-            4000,
-            mock.clone() as Arc<dyn BatchSender>,
-        );
+        let mgr = TextBatchManager::new(100, 8, 4000, mock.clone() as Arc<dyn BatchSender>);
 
         mgr.queue("chat-1", "msg1").await;
         mgr.queue("chat-2", "msg2").await;
@@ -653,12 +638,7 @@ mod tests {
     #[tokio::test]
     async fn test_flush_all_cancels_pending_timer() {
         let mock = Arc::new(MockSender::new());
-        let mgr = TextBatchManager::new(
-            200,
-            8,
-            4000,
-            mock.clone() as Arc<dyn BatchSender>,
-        );
+        let mgr = TextBatchManager::new(200, 8, 4000, mock.clone() as Arc<dyn BatchSender>);
 
         mgr.queue("chat-1", "hello").await;
 
@@ -684,10 +664,7 @@ mod tests {
     #[tokio::test]
     async fn test_media_batch_accumulates() {
         let mock = Arc::new(MockSender::new());
-        let mgr = MediaBatchManager::new(
-            30,
-            mock.clone() as Arc<dyn BatchSender>,
-        );
+        let mgr = MediaBatchManager::new(30, mock.clone() as Arc<dyn BatchSender>);
 
         mgr.queue("chat-1", "file_key_001").await;
         mgr.queue("chat-1", "file_key_002").await;
@@ -703,10 +680,7 @@ mod tests {
     #[tokio::test]
     async fn test_media_flush_all() {
         let mock = Arc::new(MockSender::new());
-        let mgr = MediaBatchManager::new(
-            800,
-            mock.clone() as Arc<dyn BatchSender>,
-        );
+        let mgr = MediaBatchManager::new(800, mock.clone() as Arc<dyn BatchSender>);
 
         mgr.queue("chat-A", "img_key_1").await;
         mgr.queue("chat-A", "img_key_2").await;

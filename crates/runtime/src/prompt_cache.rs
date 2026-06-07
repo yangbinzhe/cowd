@@ -212,8 +212,7 @@ impl PromptCache {
                     persist_state(&inner);
                     return None;
                 }
-                let expired =
-                    now_unix_secs().saturating_sub(cached_at_unix_secs) >= ttl.as_secs();
+                let expired = now_unix_secs().saturating_sub(cached_at_unix_secs) >= ttl.as_secs();
                 if expired {
                     inner.memory_cache.pop(request_hash);
                     inner.stats.completion_cache_misses += 1;
@@ -257,8 +256,7 @@ impl PromptCache {
             return None;
         }
 
-        let expired =
-            now_unix_secs().saturating_sub(entry.cached_at_unix_secs) >= ttl.as_secs();
+        let expired = now_unix_secs().saturating_sub(entry.cached_at_unix_secs) >= ttl.as_secs();
         let mut inner = self.lock();
         inner.stats.last_completion_cache_key = Some(request_hash.to_string());
         if expired {

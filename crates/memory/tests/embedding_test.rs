@@ -20,7 +20,10 @@ async fn embedding_retries_on_transient_http_failure() {
     let start = std::time::Instant::now();
     let result = client.embed(&["hello"]).await;
     // Should fail after exhausting retries
-    assert!(result.is_err(), "embedding should fail against non-existent server");
+    assert!(
+        result.is_err(),
+        "embedding should fail against non-existent server"
+    );
     let elapsed_ms = start.elapsed().as_millis();
     // With 3 retries and backoff (500ms, 1000ms), total delay is ~1500ms
     assert!(

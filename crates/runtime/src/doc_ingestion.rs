@@ -177,7 +177,8 @@ impl DocumentClassifier {
 
         // Score based on keyword matches
         for (category, keywords) in &self.keyword_map {
-            let matches = keywords.iter()
+            let matches = keywords
+                .iter()
                 .filter(|kw| text_lower.contains(&kw.to_lowercase()))
                 .count();
             if matches > 0 {
@@ -192,11 +193,21 @@ impl DocumentClassifier {
 
         // Check custom rules
         for rule in &self.custom_rules {
-            let keyword_matches = rule.keywords.iter()
+            let keyword_matches = rule
+                .keywords
+                .iter()
                 .filter(|kw| text_lower.contains(&kw.to_lowercase()))
                 .count();
-            let pattern_matches = rule.patterns.iter()
-                .filter(|p| content.metadata.title.to_lowercase().contains(&p.to_lowercase()))
+            let pattern_matches = rule
+                .patterns
+                .iter()
+                .filter(|p| {
+                    content
+                        .metadata
+                        .title
+                        .to_lowercase()
+                        .contains(&p.to_lowercase())
+                })
                 .count();
 
             if keyword_matches > 0 || pattern_matches > 0 {
@@ -216,7 +227,10 @@ impl DocumentClassifier {
             *scores.entry(DocumentCategory::ApiReference).or_insert(0.0) += 0.4;
             reasoning.push("Title suggests API Reference".to_string());
         }
-        if title_lower.contains("config") || title_lower.contains(".yaml") || title_lower.contains(".json") {
+        if title_lower.contains("config")
+            || title_lower.contains(".yaml")
+            || title_lower.contains(".json")
+        {
             *scores.entry(DocumentCategory::Configuration).or_insert(0.0) += 0.5;
             reasoning.push("Title suggests Configuration".to_string());
         }
@@ -285,10 +299,10 @@ impl DocumentClassifier {
         let mut text = String::new();
         for element in &content.elements {
             match element {
-                DocumentElement::Paragraph { elements, .. } |
-                DocumentElement::Heading { elements, .. } |
-                DocumentElement::CodeBlock { elements, .. } |
-                DocumentElement::Quote { elements, .. } => {
+                DocumentElement::Paragraph { elements, .. }
+                | DocumentElement::Heading { elements, .. }
+                | DocumentElement::CodeBlock { elements, .. }
+                | DocumentElement::Quote { elements, .. } => {
                     for e in elements {
                         text.push_str(&e.text);
                         text.push(' ');
@@ -304,16 +318,19 @@ impl DocumentClassifier {
     /// Extract keywords from text.
     fn extract_keywords(&self, text: &str) -> Vec<String> {
         let stop_words = vec![
-            "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
-            "of", "with", "by", "from", "as", "is", "was", "are", "were",
-            "been", "be", "have", "has", "had", "do", "does", "did", "will",
-            "would", "could", "should", "may", "might", "must", "shall",
-            "这", "的", "是", "在", "了", "和", "与", "或", "但", "为", "与",
-            "被", "由", "对", "于", "上", "下", "中", "内", "外", "前", "后",
+            "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
+            "by", "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had",
+            "do", "does", "did", "will", "would", "could", "should", "may", "might", "must",
+            "shall", "这", "的", "是", "在", "了", "和", "与", "或", "但", "为", "与", "被", "由",
+            "对", "于", "上", "下", "中", "内", "外", "前", "后",
         ];
 
-        let words: Vec<String> = text.split_whitespace()
-            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        let words: Vec<String> = text
+            .split_whitespace()
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase()
+            })
             .filter(|w| w.len() > 3 && !stop_words.contains(&w.as_str()))
             .collect();
 
@@ -324,11 +341,14 @@ impl DocumentClassifier {
         }
 
         // Get top keywords
-        let mut keywords_vec: Vec<(usize, String)> = freq.into_iter()
-            .map(|(k, v)| (v, k))
-            .collect();
+        let mut keywords_vec: Vec<(usize, String)> =
+            freq.into_iter().map(|(k, v)| (v, k)).collect();
         keywords_vec.sort_by(|a, b| b.0.cmp(&a.0));
-        keywords_vec.iter().take(10).map(|(_, k)| k.clone()).collect()
+        keywords_vec
+            .iter()
+            .take(10)
+            .map(|(_, k)| k.clone())
+            .collect()
     }
 
     /// Generate tags based on content and category.
@@ -341,12 +361,21 @@ impl DocumentClassifier {
             ("javascript", vec!["javascript", "js", "node", "npm"]),
             ("python", vec!["python", "pip", "py"]),
             ("api", vec!["api", "rest", "grpc", "endpoint"]),
-            ("database", vec!["database", "sql", "db", "postgres", "mysql"]),
+            (
+                "database",
+                vec!["database", "sql", "db", "postgres", "mysql"],
+            ),
             ("docker", vec!["docker", "container", "kubernetes", "k8s"]),
             ("git", vec!["git", "github", "commit", "branch"]),
             ("test", vec!["test", "testing", "unit", "integration"]),
-            ("security", vec!["security", "auth", "oauth", "jwt", "token"]),
-            ("performance", vec!["performance", "optimization", "speed", "latency"]),
+            (
+                "security",
+                vec!["security", "auth", "oauth", "jwt", "token"],
+            ),
+            (
+                "performance",
+                vec!["performance", "optimization", "speed", "latency"],
+            ),
         ];
 
         let text_lower = text.to_lowercase();
@@ -370,90 +399,117 @@ impl Default for DocumentClassifier {
 fn default_keyword_map() -> HashMap<DocumentCategory, Vec<String>> {
     let mut map = HashMap::new();
 
-    map.insert(DocumentCategory::Technical, vec![
-        "implementation".to_string(),
-        "algorithm".to_string(),
-        "performance".to_string(),
-        "optimization".to_string(),
-        "benchmark".to_string(),
-    ]);
+    map.insert(
+        DocumentCategory::Technical,
+        vec![
+            "implementation".to_string(),
+            "algorithm".to_string(),
+            "performance".to_string(),
+            "optimization".to_string(),
+            "benchmark".to_string(),
+        ],
+    );
 
-    map.insert(DocumentCategory::UserGuide, vec![
-        "how to".to_string(),
-        "tutorial".to_string(),
-        "getting started".to_string(),
-        "step by step".to_string(),
-        "入门".to_string(),
-        "教程".to_string(),
-        "使用指南".to_string(),
-    ]);
+    map.insert(
+        DocumentCategory::UserGuide,
+        vec![
+            "how to".to_string(),
+            "tutorial".to_string(),
+            "getting started".to_string(),
+            "step by step".to_string(),
+            "入门".to_string(),
+            "教程".to_string(),
+            "使用指南".to_string(),
+        ],
+    );
 
-    map.insert(DocumentCategory::ApiReference, vec![
-        "endpoint".to_string(),
-        "method".to_string(),
-        "parameter".to_string(),
-        "response".to_string(),
-        "error code".to_string(),
-        "API".to_string(),
-        "接口".to_string(),
-    ]);
+    map.insert(
+        DocumentCategory::ApiReference,
+        vec![
+            "endpoint".to_string(),
+            "method".to_string(),
+            "parameter".to_string(),
+            "response".to_string(),
+            "error code".to_string(),
+            "API".to_string(),
+            "接口".to_string(),
+        ],
+    );
 
-    map.insert(DocumentCategory::Architecture, vec![
-        "architecture".to_string(),
-        "design pattern".to_string(),
-        "system design".to_string(),
-        "component".to_string(),
-        "module".to_string(),
-        "架构".to_string(),
-        "设计".to_string(),
-    ]);
+    map.insert(
+        DocumentCategory::Architecture,
+        vec![
+            "architecture".to_string(),
+            "design pattern".to_string(),
+            "system design".to_string(),
+            "component".to_string(),
+            "module".to_string(),
+            "架构".to_string(),
+            "设计".to_string(),
+        ],
+    );
 
-    map.insert(DocumentCategory::MeetingNotes, vec![
-        "meeting".to_string(),
-        "agenda".to_string(),
-        "minutes".to_string(),
-        "action item".to_string(),
-        "decision".to_string(),
-        "会议".to_string(),
-        "纪要".to_string(),
-    ]);
+    map.insert(
+        DocumentCategory::MeetingNotes,
+        vec![
+            "meeting".to_string(),
+            "agenda".to_string(),
+            "minutes".to_string(),
+            "action item".to_string(),
+            "decision".to_string(),
+            "会议".to_string(),
+            "纪要".to_string(),
+        ],
+    );
 
-    map.insert(DocumentCategory::Task, vec![
-        "task".to_string(),
-        "issue".to_string(),
-        "bug".to_string(),
-        "feature".to_string(),
-        "todo".to_string(),
-        "任务".to_string(),
-        "工单".to_string(),
-    ]);
+    map.insert(
+        DocumentCategory::Task,
+        vec![
+            "task".to_string(),
+            "issue".to_string(),
+            "bug".to_string(),
+            "feature".to_string(),
+            "todo".to_string(),
+            "任务".to_string(),
+            "工单".to_string(),
+        ],
+    );
 
-    map.insert(DocumentCategory::Configuration, vec![
-        "config".to_string(),
-        "setting".to_string(),
-        "environment".to_string(),
-        "variable".to_string(),
-        "配置".to_string(),
-        "环境变量".to_string(),
-    ]);
+    map.insert(
+        DocumentCategory::Configuration,
+        vec![
+            "config".to_string(),
+            "setting".to_string(),
+            "environment".to_string(),
+            "variable".to_string(),
+            "配置".to_string(),
+            "环境变量".to_string(),
+        ],
+    );
 
-    map.insert(DocumentCategory::CodeReview, vec![
-        "review".to_string(),
-        "pull request".to_string(),
-        "pr".to_string(),
-        "code review".to_string(),
-        "审核".to_string(),
-        "审查".to_string(),
-    ]);
+    map.insert(
+        DocumentCategory::CodeReview,
+        vec![
+            "review".to_string(),
+            "pull request".to_string(),
+            "pr".to_string(),
+            "code review".to_string(),
+            "审核".to_string(),
+            "审查".to_string(),
+        ],
+    );
 
-    map.insert(DocumentCategory::KnowledgeBase, vec![
-        "knowledge".to_string(),
-        "faq".to_string(),
-        "troubleshooting".to_string(),
-        "best practice".to_string(),
-        "知识库".to_string(),
-        "常见问题".to_string(),
-    ]);
+    map.insert(
+        DocumentCategory::KnowledgeBase,
+        vec![
+            "knowledge".to_string(),
+            "faq".to_string(),
+            "troubleshooting".to_string(),
+            "best practice".to_string(),
+            "知识库".to_string(),
+            "常见问题".to_string(),
+        ],
+    );
 
     map
 }
@@ -551,8 +607,10 @@ impl Default for DocumentIngestor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::feishu::doc::{
+        DocumentElement, DocumentMetadata as FeishuDocMeta, TextElement,
+    };
     use chrono::Utc;
-    use crate::platform::feishu::doc::{DocumentElement, DocumentMetadata as FeishuDocMeta, TextElement};
 
     fn create_test_doc(title: &str, text: &str) -> DocumentContent {
         DocumentContent {
@@ -566,15 +624,13 @@ mod tests {
                 is_folder: false,
                 parent_token: None,
             },
-            elements: vec![
-                DocumentElement::Paragraph {
-                    elements: vec![TextElement {
-                        text: text.to_string(),
-                        style: None,
-                    }],
+            elements: vec![DocumentElement::Paragraph {
+                elements: vec![TextElement {
+                    text: text.to_string(),
                     style: None,
-                },
-            ],
+                }],
+                style: None,
+            }],
             raw_blocks: vec![],
         }
     }
@@ -591,7 +647,7 @@ mod tests {
 
         let doc = create_test_doc(
             "API Reference Guide",
-            "This document describes the REST API endpoints and parameters."
+            "This document describes the REST API endpoints and parameters.",
         );
 
         let result = classifier.classify(&doc);

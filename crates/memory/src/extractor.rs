@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
-use crate::{ MemoryScope,
+use crate::{
     compression::llm_summarizer::LlmSummarizer,
     config::ExtractorConfig,
     error::MemoryError,
@@ -51,6 +51,7 @@ use crate::{ MemoryScope,
         AgentVisibility, MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Message,
         MessageRole, Priority,
     },
+    MemoryScope,
 };
 
 /// Result alias used throughout this module.
@@ -195,12 +196,8 @@ impl MemoryExtractor {
         }
 
         // At least one user message and one assistant message.
-        let has_user = messages
-            .iter()
-            .any(|m| m.role == MessageRole::User);
-        let has_assistant = messages
-            .iter()
-            .any(|m| m.role == MessageRole::Assistant);
+        let has_user = messages.iter().any(|m| m.role == MessageRole::User);
+        let has_assistant = messages.iter().any(|m| m.role == MessageRole::Assistant);
 
         if !has_user || !has_assistant {
             return false;
@@ -367,7 +364,7 @@ impl MemoryExtractor {
     /// configured `poll_interval_secs` and calls [`Self::poll`] each cycle.
     ///
     /// Returns a `JoinHandle` that the caller can await or abort.
-    #[must_use] 
+    #[must_use]
     pub fn spawn(self) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(self.config.poll_interval_secs));
@@ -508,10 +505,7 @@ impl MemoryExtractor {
             }
 
             // Extract the tool name and a brief error description.
-            let tool_name = prev
-                .tool_name
-                .as_deref()
-                .unwrap_or("unknown_tool");
+            let tool_name = prev.tool_name.as_deref().unwrap_or("unknown_tool");
 
             // Summarise: first 120 chars of the error content.
             let error_summary = Self::truncate(&prev.content, 120);
@@ -559,15 +553,9 @@ impl MemoryExtractor {
             if msg.role == MessageRole::Assistant {
                 // Simple heuristic: count occurrences of known tool patterns.
                 for keyword in &["read_file", "write_file", "run_bash", "search_code"] {
-                    let count = msg
-                        .content
-                        .to_lowercase()
-                        .matches(keyword)
-                        .count();
+                    let count = msg.content.to_lowercase().matches(keyword).count();
                     if count > 0 {
-                        *tool_counts
-                            .entry((*keyword).to_string())
-                            .or_insert(0) += count;
+                        *tool_counts.entry((*keyword).to_string()).or_insert(0) += count;
                     }
                 }
             }
@@ -646,7 +634,8 @@ impl MemoryExtractor {
         // Guard against non-char-boundary start (can happen with multi-byte).
         let safe_start = text
             .char_indices()
-            .map(|(i, _)| i).rfind(|&i| i <= start)
+            .map(|(i, _)| i)
+            .rfind(|&i| i <= start)
             .unwrap_or(0);
 
         let slice = &text[safe_start..];
@@ -964,15 +953,11 @@ mod tests {
     fn should_extract_returns_false_when_only_tool_activity() {
         // Tool-only messages should NOT trigger extraction — the content
         // is machine-optimised and can be re-derived.
-        let msgs = vec![
-            Message::user(""),
-            Message::assistant(""),
-            {
-                let mut m = Message::tool_result("t1", "bash", "ok");
-                m.role = MessageRole::Tool;
-                m
-            },
-        ];
+        let msgs = vec![Message::user(""), Message::assistant(""), {
+            let mut m = Message::tool_result("t1", "bash", "ok");
+            m.role = MessageRole::Tool;
+            m
+        }];
         assert!(
             !MemoryExtractor::should_extract(&msgs),
             "tool-only messages should not trigger extraction"
@@ -1015,10 +1000,7 @@ mod tests {
     #[tokio::test]
     async fn extract_empty_for_trivial_conversation() {
         let ex = default_extractor();
-        let msgs = vec![
-            Message::user("hi"),
-            Message::assistant("hello"),
-        ];
+        let msgs = vec![Message::user("hi"), Message::assistant("hello")];
         let entries = ex.extract(&msgs).await.unwrap();
         // Should_extract returns false → empty result.
         assert!(entries.is_empty());

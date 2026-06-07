@@ -15,9 +15,9 @@
 //! and retry up to 3 times on 429 (rate limit) or 5xx (server error) responses
 //! with exponential backoff (1.5ˢ seconds).
 
+use super::types::{CreateFileResponse, CreateImageResponse};
 use crate::cowd_dirs::config_home_dir;
 use crate::platform::adapter::{PlatformError, PlatformResult};
-use super::types::{CreateFileResponse, CreateImageResponse};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -131,9 +131,7 @@ fn is_feishu_domain(url_str: &str) -> bool {
     }
 
     // Block raw IP addresses (IPv4 and IPv6)
-    if host.parse::<std::net::Ipv4Addr>().is_ok()
-        || host.parse::<std::net::Ipv6Addr>().is_ok()
-    {
+    if host.parse::<std::net::Ipv4Addr>().is_ok() || host.parse::<std::net::Ipv6Addr>().is_ok() {
         return false;
     }
 
@@ -174,15 +172,13 @@ pub async fn upload_image(
             let t = token.clone();
             let u = url.clone();
             async move {
-                let form = reqwest::multipart::Form::new()
-                    .text("image_type", it)
-                    .part(
-                        "image",
-                        reqwest::multipart::Part::bytes(bytes)
-                            .file_name("image.png")
-                            .mime_str("application/octet-stream")
-                            .expect("valid mime type"),
-                    );
+                let form = reqwest::multipart::Form::new().text("image_type", it).part(
+                    "image",
+                    reqwest::multipart::Part::bytes(bytes)
+                        .file_name("image.png")
+                        .mime_str("application/octet-stream")
+                        .expect("valid mime type"),
+                );
 
                 reqwest::Client::new()
                     .post(&u)
@@ -337,13 +333,9 @@ pub async fn download_message_resource(
     )
     .await?;
 
-    response
-        .bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| {
-            PlatformError::SendFailed(format!("download_message_resource: read body: {}", e))
-        })
+    response.bytes().await.map(|b| b.to_vec()).map_err(|e| {
+        PlatformError::SendFailed(format!("download_message_resource: read body: {}", e))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -378,9 +370,8 @@ pub fn cache_image(data: &[u8], ext: &str) -> PlatformResult<String> {
     let id = uuid::Uuid::new_v4();
     let path = dir.join(format!("img_{}.{}", id, ext));
 
-    std::fs::write(&path, data).map_err(|e| {
-        PlatformError::Unknown(format!("cache_image: write failed: {}", e))
-    })?;
+    std::fs::write(&path, data)
+        .map_err(|e| PlatformError::Unknown(format!("cache_image: write failed: {}", e)))?;
 
     Ok(path.to_string_lossy().to_string())
 }
@@ -499,10 +490,7 @@ pub fn validate_image_magic(data: &[u8]) -> bool {
     }
 
     // WEBP: starts with "RIFF", followed by 4 bytes (file size), then "WEBP"
-    if data.len() >= 12
-        && &data[..4] == b"RIFF"
-        && &data[8..12] == b"WEBP"
-    {
+    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
         return true;
     }
 
@@ -624,51 +612,135 @@ mod tests {
 
     #[test]
     fn test_resolve_media_type_images() {
-        assert_eq!(resolve_media_type(Path::new("photo.jpg")), ("message", "jpg".to_string()));
-        assert_eq!(resolve_media_type(Path::new("photo.JPEG")), ("message", "jpeg".to_string()));
-        assert_eq!(resolve_media_type(Path::new("icon.png")), ("message", "png".to_string()));
-        assert_eq!(resolve_media_type(Path::new("anim.gif")), ("message", "gif".to_string()));
-        assert_eq!(resolve_media_type(Path::new("img.webp")), ("message", "webp".to_string()));
-        assert_eq!(resolve_media_type(Path::new("img.bmp")), ("message", "bmp".to_string()));
+        assert_eq!(
+            resolve_media_type(Path::new("photo.jpg")),
+            ("message", "jpg".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("photo.JPEG")),
+            ("message", "jpeg".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("icon.png")),
+            ("message", "png".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("anim.gif")),
+            ("message", "gif".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("img.webp")),
+            ("message", "webp".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("img.bmp")),
+            ("message", "bmp".to_string())
+        );
     }
 
     #[test]
     fn test_resolve_media_type_audio() {
-        assert_eq!(resolve_media_type(Path::new("voice.opus")), ("opus", "opus".to_string()));
-        assert_eq!(resolve_media_type(Path::new("sound.ogg")), ("opus", "ogg".to_string()));
-        assert_eq!(resolve_media_type(Path::new("song.mp3")), ("stream", "mp3".to_string()));
-        assert_eq!(resolve_media_type(Path::new("song.wav")), ("stream", "wav".to_string()));
-        assert_eq!(resolve_media_type(Path::new("song.m4a")), ("stream", "m4a".to_string()));
-        assert_eq!(resolve_media_type(Path::new("song.aac")), ("stream", "aac".to_string()));
-        assert_eq!(resolve_media_type(Path::new("song.flac")), ("stream", "flac".to_string()));
+        assert_eq!(
+            resolve_media_type(Path::new("voice.opus")),
+            ("opus", "opus".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("sound.ogg")),
+            ("opus", "ogg".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("song.mp3")),
+            ("stream", "mp3".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("song.wav")),
+            ("stream", "wav".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("song.m4a")),
+            ("stream", "m4a".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("song.aac")),
+            ("stream", "aac".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("song.flac")),
+            ("stream", "flac".to_string())
+        );
     }
 
     #[test]
     fn test_resolve_media_type_video() {
-        assert_eq!(resolve_media_type(Path::new("clip.mp4")), ("mp4", "mp4".to_string()));
-        assert_eq!(resolve_media_type(Path::new("clip.mov")), ("mp4", "mov".to_string()));
-        assert_eq!(resolve_media_type(Path::new("clip.avi")), ("mp4", "avi".to_string()));
-        assert_eq!(resolve_media_type(Path::new("clip.mkv")), ("mp4", "mkv".to_string()));
+        assert_eq!(
+            resolve_media_type(Path::new("clip.mp4")),
+            ("mp4", "mp4".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("clip.mov")),
+            ("mp4", "mov".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("clip.avi")),
+            ("mp4", "avi".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("clip.mkv")),
+            ("mp4", "mkv".to_string())
+        );
     }
 
     #[test]
     fn test_resolve_media_type_documents() {
-        assert_eq!(resolve_media_type(Path::new("report.pdf")), ("pdf", "pdf".to_string()));
-        assert_eq!(resolve_media_type(Path::new("letter.doc")), ("doc", "doc".to_string()));
-        assert_eq!(resolve_media_type(Path::new("letter.docx")), ("doc", "docx".to_string()));
-        assert_eq!(resolve_media_type(Path::new("sheet.xls")), ("xls", "xls".to_string()));
-        assert_eq!(resolve_media_type(Path::new("sheet.xlsx")), ("xls", "xlsx".to_string()));
-        assert_eq!(resolve_media_type(Path::new("slides.ppt")), ("ppt", "ppt".to_string()));
-        assert_eq!(resolve_media_type(Path::new("slides.pptx")), ("ppt", "pptx".to_string()));
+        assert_eq!(
+            resolve_media_type(Path::new("report.pdf")),
+            ("pdf", "pdf".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("letter.doc")),
+            ("doc", "doc".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("letter.docx")),
+            ("doc", "docx".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("sheet.xls")),
+            ("xls", "xls".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("sheet.xlsx")),
+            ("xls", "xlsx".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("slides.ppt")),
+            ("ppt", "ppt".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("slides.pptx")),
+            ("ppt", "pptx".to_string())
+        );
     }
 
     #[test]
     fn test_resolve_media_type_unknown() {
-        assert_eq!(resolve_media_type(Path::new("data.bin")), ("stream", "bin".to_string()));
-        assert_eq!(resolve_media_type(Path::new("data.csv")), ("stream", "csv".to_string()));
-        assert_eq!(resolve_media_type(Path::new("script.py")), ("stream", "py".to_string()));
+        assert_eq!(
+            resolve_media_type(Path::new("data.bin")),
+            ("stream", "bin".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("data.csv")),
+            ("stream", "csv".to_string())
+        );
+        assert_eq!(
+            resolve_media_type(Path::new("script.py")),
+            ("stream", "py".to_string())
+        );
         // No extension
-        assert_eq!(resolve_media_type(Path::new("Makefile")), ("stream", "".to_string()));
+        assert_eq!(
+            resolve_media_type(Path::new("Makefile")),
+            ("stream", "".to_string())
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -679,7 +751,10 @@ mod tests {
     fn test_sanitize_filename_strips_directory() {
         assert_eq!(sanitize_filename("/etc/passwd"), "passwd");
         assert_eq!(sanitize_filename("../../../root/key"), "key");
-        assert_eq!(sanitize_filename("C:\\Windows\\system32\\cmd.exe"), "cmd.exe");
+        assert_eq!(
+            sanitize_filename("C:\\Windows\\system32\\cmd.exe"),
+            "cmd.exe"
+        );
     }
 
     #[test]
@@ -706,7 +781,9 @@ mod tests {
 
     #[test]
     fn test_is_feishu_domain_valid() {
-        assert!(is_feishu_domain("https://open.feishu.cn/open-apis/im/v1/images"));
+        assert!(is_feishu_domain(
+            "https://open.feishu.cn/open-apis/im/v1/images"
+        ));
         assert!(is_feishu_domain("https://open.feishu.cn/anything"));
         assert!(is_feishu_domain("https://feishu.cn/some/path"));
         assert!(is_feishu_domain("https://sub.feishu.cn/path"));
@@ -759,7 +836,10 @@ mod tests {
         let result = cache_image(b"not an image", "png");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("magic bytes"), "error should mention magic bytes");
+        assert!(
+            err.contains("magic bytes"),
+            "error should mention magic bytes"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -813,8 +893,8 @@ mod tests {
     #[test]
     fn test_cache_document_sanitizes_path() {
         let data = b"hello";
-        let path = cache_document(data, "../../../etc/passwd")
-            .expect("cache_document should succeed");
+        let path =
+            cache_document(data, "../../../etc/passwd").expect("cache_document should succeed");
         // Should NOT contain directory traversal
         assert!(!path.contains("../"));
         assert!(!path.contains("etc"));

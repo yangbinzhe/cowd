@@ -108,7 +108,8 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         let result = rt.block_on(execute_bash_async(input, sandbox_status, cwd));
         let _ = tx.send(result);
     });
-    rx.recv().map_err(|_| io::Error::new(io::ErrorKind::Other, "bash thread panicked"))?
+    rx.recv()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "bash thread panicked"))?
 }
 
 async fn execute_bash_async(

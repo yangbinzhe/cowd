@@ -25,8 +25,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Override with `COWD_DIR_NAME` env var. Always includes the leading dot.
 pub fn dot_dir() -> String {
-    std::env::var("COWD_DIR_NAME")
-        .unwrap_or_else(|_| ".cowd".to_string())
+    std::env::var("COWD_DIR_NAME").unwrap_or_else(|_| ".cowd".to_string())
 }
 
 /// Project-level dot-directory path under `cwd`.
@@ -68,7 +67,6 @@ pub const SKILLS_DIR: &str = "skills";
 pub const PLUGINS_DIR: &str = "plugins";
 pub const CREDENTIALS_DIR: &str = "credentials";
 pub const WORKER_STATE_FILE: &str = "worker-state.json";
-pub const SESSION_EXT: &str = ".jsonl";
 
 // ── Session paths ──
 
@@ -78,7 +76,9 @@ const PROJECT_SESSIONS_DIR: &str = "projects";
 
 /// User-level global sessions: `~/.cowd/sessions/global/`
 pub fn user_sessions_dir() -> PathBuf {
-    config_home_dir().join(SESSIONS_DIR).join(GLOBAL_SESSIONS_DIR)
+    config_home_dir()
+        .join(SESSIONS_DIR)
+        .join(GLOBAL_SESSIONS_DIR)
 }
 
 /// User-level project-scoped sessions: `~/.cowd/sessions/projects/<hash>/`
@@ -102,7 +102,9 @@ const SANDBOX_TMP_SUBDIR: &str = "tmp";
 
 /// User-level sandbox home: `~/.cowd/sandbox/home/`
 pub fn sandbox_home_dir() -> PathBuf {
-    config_home_dir().join(SANDBOX_DIR).join(SANDBOX_HOME_SUBDIR)
+    config_home_dir()
+        .join(SANDBOX_DIR)
+        .join(SANDBOX_HOME_SUBDIR)
 }
 
 /// User-level sandbox tmp: `~/.cowd/sandbox/tmp/`

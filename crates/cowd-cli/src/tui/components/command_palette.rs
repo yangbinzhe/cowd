@@ -255,6 +255,11 @@ fn default_entries() -> Vec<CommandEntry> {
         Action::SubmitInput,
     ));
     entries.push(CommandEntry::new(
+        "Reload Providers",
+        "Reload provider and model routing from runtime config",
+        Action::ReloadProviders,
+    ));
+    entries.push(CommandEntry::new(
         "Cancel",
         "Cancel the current operation",
         Action::Cancel,
@@ -901,6 +906,14 @@ mod tests {
         let before = p.command_count();
         p.register("my-cmd", "A custom command", Action::Noop);
         assert_eq!(p.command_count(), before + 1);
+    }
+
+    #[test]
+    fn default_entries_include_reload_providers_action() {
+        let p = setup_palette();
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.name == "Reload Providers" && entry.action == Action::ReloadProviders
+        }));
     }
 
     // ── Search scoring ────────────────────────────────────────────

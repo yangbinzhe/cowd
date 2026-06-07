@@ -118,9 +118,7 @@ impl CompressionGuard {
         self.is_compressing
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| {
-                MemoryError::Compression(
-                    "another compression is already in progress".into(),
-                )
+                MemoryError::Compression("another compression is already in progress".into())
             })?;
 
         Ok(CompressionPermit { guard: self })
@@ -213,19 +211,19 @@ impl Default for GuardBuilder {
 }
 
 impl GuardBuilder {
-    #[must_use] 
+    #[must_use]
     pub fn max_depth(mut self, v: u32) -> Self {
         self.max_depth = v;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn max_retries(mut self, v: u32) -> Self {
         self.max_retries = v;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn cooldown_secs(mut self, v: u32) -> Self {
         self.cooldown_secs = v;
         self
@@ -311,7 +309,10 @@ mod tests {
 
     #[test]
     fn circuit_opens_after_max_retries() {
-        let g = CompressionGuard::builder().max_retries(2).cooldown_secs(60).build();
+        let g = CompressionGuard::builder()
+            .max_retries(2)
+            .cooldown_secs(60)
+            .build();
         assert!(!g.is_circuit_open());
         g.report_failure();
         assert!(!g.is_circuit_open());
@@ -321,7 +322,10 @@ mod tests {
 
     #[test]
     fn reset_clears_circuit() {
-        let g = CompressionGuard::builder().max_retries(1).cooldown_secs(60).build();
+        let g = CompressionGuard::builder()
+            .max_retries(1)
+            .cooldown_secs(60)
+            .build();
         g.report_failure();
         assert!(g.is_circuit_open());
         g.reset();
@@ -331,7 +335,10 @@ mod tests {
 
     #[test]
     fn report_success_resets_failure_count() {
-        let g = CompressionGuard::builder().max_retries(3).cooldown_secs(60).build();
+        let g = CompressionGuard::builder()
+            .max_retries(3)
+            .cooldown_secs(60)
+            .build();
         g.report_failure();
         g.report_failure();
         g.report_success();

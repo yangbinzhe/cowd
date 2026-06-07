@@ -48,8 +48,8 @@ use crate::{
     fresh_context::FreshContextManager,
     handoff::HandoffManager,
     maintenance::{
-        MaintenanceCandidate, MaintenanceCandidateFilter, MaintenanceCandidateStatus,
-        MaintenanceQueue, MaintenanceScanConfig, scan_maintenance_candidates,
+        scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateFilter,
+        MaintenanceCandidateStatus, MaintenanceQueue, MaintenanceScanConfig,
     },
     memory_pulse::{MemoryPulseBatch, MemoryPulseConsumer, MemoryPulseReport},
     orchestrator::MemoryOrchestrator,
@@ -1978,10 +1978,10 @@ impl CognitiveContextManager {
         }
 
         // ── Extract ∥ Drift+Seeds ── Maintenance ──────────────────────
-        let (extract_result, drift_result) = tokio::join!(
-            async { self.extract_and_remember(messages).await },
-            async { self.run_drift_and_seeds(messages).await },
-        );
+        let (extract_result, drift_result) =
+            tokio::join!(async { self.extract_and_remember(messages).await }, async {
+                self.run_drift_and_seeds(messages).await
+            },);
         if let Err(error) = extract_result {
             tracing::warn!(%error, "on_turn_end: extraction failed");
         }

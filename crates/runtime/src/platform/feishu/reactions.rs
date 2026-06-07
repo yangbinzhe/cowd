@@ -9,7 +9,9 @@
 //! and prevent memory leaks from abandoned message IDs.
 
 use crate::platform::adapter::{InboundMessage, PlatformError, PlatformResult};
-use crate::platform::feishu::types::{CreateReactionRequest, CreateReactionResponse, DeleteReactionResponse, ReactionType};
+use crate::platform::feishu::types::{
+    CreateReactionRequest, CreateReactionResponse, DeleteReactionResponse, ReactionType,
+};
 use crate::platform::types::{MessageType, Platform, SessionKey};
 use chrono::Utc;
 use std::collections::{HashMap, VecDeque};
@@ -81,7 +83,9 @@ impl ProcessingReactions {
     /// If the pending cache exceeds `max_cache`, the oldest entry is evicted
     /// (its reaction is NOT deleted — it simply ages out of tracking).
     pub async fn start_processing(&self, token: &str, message_id: &str) -> PlatformResult<()> {
-        let reaction_id = self.create_reaction(token, message_id, REACTION_TYPING).await?;
+        let reaction_id = self
+            .create_reaction(token, message_id, REACTION_TYPING)
+            .await?;
 
         // Store in pending map and track insertion order
         {
@@ -147,7 +151,8 @@ impl ProcessingReactions {
         }
 
         // Set the CrossMark reaction
-        self.create_reaction(token, message_id, REACTION_CROSS_MARK).await?;
+        self.create_reaction(token, message_id, REACTION_CROSS_MARK)
+            .await?;
 
         Ok(())
     }
@@ -242,7 +247,12 @@ impl ProcessingReactions {
     // -----------------------------------------------------------------------
 
     /// POST to create a reaction on a message.
-    async fn create_reaction(&self, token: &str, message_id: &str, emoji_type: &str) -> PlatformResult<String> {
+    async fn create_reaction(
+        &self,
+        token: &str,
+        message_id: &str,
+        emoji_type: &str,
+    ) -> PlatformResult<String> {
         let client = reqwest::Client::new();
         let url = format!("{FEISHU_API_BASE}/im/v1/messages/{message_id}/reactions");
         let body = CreateReactionRequest {
@@ -285,7 +295,12 @@ impl ProcessingReactions {
     }
 
     /// DELETE a reaction from a message.
-    async fn delete_reaction(&self, token: &str, message_id: &str, reaction_id: &str) -> PlatformResult<()> {
+    async fn delete_reaction(
+        &self,
+        token: &str,
+        message_id: &str,
+        reaction_id: &str,
+    ) -> PlatformResult<()> {
         let client = reqwest::Client::new();
         let url = format!("{FEISHU_API_BASE}/im/v1/messages/{message_id}/reactions/{reaction_id}");
 
@@ -303,10 +318,9 @@ impl ProcessingReactions {
             )));
         }
 
-        let result: DeleteReactionResponse = response
-            .json()
-            .await
-            .map_err(|e| PlatformError::SendFailed(format!("parse delete reaction response: {e}")))?;
+        let result: DeleteReactionResponse = response.json().await.map_err(|e| {
+            PlatformError::SendFailed(format!("parse delete reaction response: {e}"))
+        })?;
 
         if result.code != 0 {
             return Err(PlatformError::SendFailed(format!(

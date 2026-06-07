@@ -3,8 +3,8 @@ use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -281,6 +281,12 @@ impl Session {
 
     #[must_use]
     pub fn with_persistence_path(mut self, path: impl Into<PathBuf>) -> Self {
+        if !legacy_jsonl_session_persistence_enabled() {
+            tracing::warn!(
+                "legacy JSONL session persistence is disabled; ignoring persistence path"
+            );
+            return self;
+        }
         self.persistence = Some(SessionPersistence { path: path.into() });
         self
     }
@@ -321,8 +327,12 @@ impl Session {
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
         let path = path.as_ref();
+        ensure_legacy_jsonl_session_persistence_enabled(path)?;
         const SNAPSHOT_INTERVAL: usize = 50;
-        if self.appended_since_snapshot.load(std::sync::atomic::Ordering::Relaxed) < SNAPSHOT_INTERVAL
+        if self
+            .appended_since_snapshot
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < SNAPSHOT_INTERVAL
             && path.exists()
         {
             return Ok(());
@@ -333,7 +343,8 @@ impl Session {
         rotate_session_file_if_needed(path)?;
         write_atomic(path, &snapshot)?;
         drop(lock_file);
-        self.appended_since_snapshot.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.appended_since_snapshot
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         cleanup_rotated_logs(path)?;
         Ok(())
     }
@@ -677,6 +688,7 @@ impl Session {
         let Some(path) = self.persistence_path() else {
             return Ok(());
         };
+        ensure_legacy_jsonl_session_persistence_enabled(path)?;
 
         let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
         if needs_bootstrap {
@@ -697,6 +709,7 @@ impl Session {
         let Some(path) = self.persistence_path() else {
             return Ok(());
         };
+        ensure_legacy_jsonl_session_persistence_enabled(path)?;
 
         let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
         if needs_bootstrap {
@@ -773,6 +786,7 @@ impl Session {
     }
 
     fn force_save_to_path(&self, path: &Path) -> Result<(), SessionError> {
+        ensure_legacy_jsonl_session_persistence_enabled(path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -903,10 +917,8 @@ impl ConversationMessage {
         session_id: &str,
         sequence: usize,
     ) -> memory::store::session::SessionMessage {
-        let content_json = JsonValue::Array(
-            self.blocks.iter().map(|b| b.to_json()).collect(),
-        )
-        .render();
+        let content_json =
+            JsonValue::Array(self.blocks.iter().map(|b| b.to_json()).collect()).render();
 
         let (tool_use_id, tool_name) = self
             .blocks
@@ -950,8 +962,14 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
-            Self::Thinking { thinking, signature } => {
-                object.insert("type".to_string(), JsonValue::String("thinking".to_string()));
+            Self::Thinking {
+                thinking,
+                signature,
+            } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("thinking".to_string()),
+                );
                 object.insert("thinking".to_string(), JsonValue::String(thinking.clone()));
                 if let Some(sig) = signature {
                     object.insert("signature".to_string(), JsonValue::String(sig.clone()));
@@ -1350,6 +1368,35 @@ fn cleanup_rotated_logs(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
+fn legacy_jsonl_session_persistence_enabled() -> bool {
+    cfg!(test)
+        || running_under_cargo_test_binary()
+        || std::env::var("COWD_ENABLE_LEGACY_JSONL_SESSION_PERSISTENCE")
+            .map(|value| {
+                let value = value.trim();
+                value == "1" || value.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false)
+}
+
+fn running_under_cargo_test_binary() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .and_then(|parent| parent.file_name().map(|name| name.to_owned()))
+        .is_some_and(|name| name == "deps")
+}
+
+fn ensure_legacy_jsonl_session_persistence_enabled(path: &Path) -> Result<(), SessionError> {
+    if legacy_jsonl_session_persistence_enabled() {
+        return Ok(());
+    }
+    Err(SessionError::Format(format!(
+        "legacy JSONL session persistence is disabled for {}; sessions are stored in SQLite. Use explicit import/export flows for local .jsonl/.json files.",
+        path.display()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1694,11 +1741,10 @@ mod tests {
 /// This prevents parallel `opencode serve` instances from colliding.
 /// Called by external consumers (e.g. cowd-orchestrator) to enumerate sessions for a CWD.
 ///
-/// Uses [`crate::cowd_dirs::user_project_sessions_dir`] directly instead of the
-/// deprecated [`SessionStore`](crate::session_control::SessionStore).
+/// Uses [`crate::cowd_dirs::user_project_sessions_dir`] directly.
 pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBuf, SessionError> {
-    // FNV-1a 64-bit hash of the workspace path (mirrors the algorithm in
-    // `session_control::workspace_fingerprint` so fingerprint values are stable).
+    // FNV-1a 64-bit hash of the workspace path. This preserves the legacy
+    // fingerprint values used by older per-worktree session directories.
     let input = cwd.to_string_lossy();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in input.as_bytes() {

@@ -136,7 +136,23 @@ impl Default for ActiveSessions {
 mod tests {
     use super::*;
 
+    fn init_test_provider() {
+        runtime::init_global_providers(runtime::ProvidersConfig {
+            providers: std::collections::HashMap::from([(
+                "test-provider".to_string(),
+                runtime::ProviderConfig {
+                    name: "test-provider".to_string(),
+                    base_url: "http://127.0.0.1:9".to_string(),
+                    api_key: "test-dummy-key".to_string(),
+                    models: vec!["test-model".to_string()],
+                    protocol: Some("openai-compat".to_string()),
+                },
+            )]),
+        });
+    }
+
     fn dummy_runtime() -> crate::BuiltRuntime {
+        init_test_provider();
         let session = runtime::Session::new();
         crate::build_runtime(
             session,

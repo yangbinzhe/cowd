@@ -3,11 +3,11 @@
 //! Tests retrieval recall using verbatim-stored entries.
 //! Run: cargo test --release -p cowd-memory --test longmem_eval_harness -- --nocapture
 
-use cowd_memory::{ MemoryScope,
-    CognitiveContextManager, MemoryConfig, MemoryEntry, MemoryLayer, MemoryCategory,
+use cowd_memory::config::{BudgetConfig, StoreConfig};
+use cowd_memory::{
+    CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
     MemorySource, Priority,
 };
-use cowd_memory::config::{BudgetConfig, StoreConfig};
 
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
@@ -34,7 +34,9 @@ fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
 #[tokio::test]
 async fn test_longmem_eval_recall_at_5() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mgr = CognitiveContextManager::new(test_config(&tmp.path().join("lme.db"))).await.unwrap();
+    let mgr = CognitiveContextManager::new(test_config(&tmp.path().join("lme.db")))
+        .await
+        .unwrap();
 
     // Store 100 fact entries with unique identifiers
     let n_entries = 100;
@@ -43,7 +45,10 @@ async fn test_longmem_eval_recall_at_5() {
 
     for i in 0..n_entries {
         let fact = format!("unique_fact_{}", uuid::Uuid::new_v4().as_simple());
-        let content = format!("Memory entry containing fact: {}. The verification code is VERIFY-{}", fact, i);
+        let content = format!(
+            "Memory entry containing fact: {}. The verification code is VERIFY-{}",
+            fact, i
+        );
         let entry = MemoryEntry {
             id: uuid::Uuid::new_v4(),
             layer: MemoryLayer::L3,
@@ -81,9 +86,17 @@ async fn test_longmem_eval_recall_at_5() {
     }
 
     let r1 = recall_hits as f32 / n_entries as f32;
-    eprintln!("LongMemEval R@1 (direct lookup): {:.2}% ({}/{})", r1 * 100.0, recall_hits, n_entries);
+    eprintln!(
+        "LongMemEval R@1 (direct lookup): {:.2}% ({}/{})",
+        r1 * 100.0,
+        recall_hits,
+        n_entries
+    );
 
-    assert!(r1 > 0.9, "R@1 must be >90% for direct lookup — entries should be retrievable");
+    assert!(
+        r1 > 0.9,
+        "R@1 must be >90% for direct lookup — entries should be retrievable"
+    );
 }
 
 /// Stress: verifies that entries survive restart and remain retrievable.
@@ -96,7 +109,9 @@ async fn test_longmem_persistence_recall() {
     let mut ids = Vec::new();
 
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path)).await.unwrap();
+        let mgr = CognitiveContextManager::new(test_config(&db_path))
+            .await
+            .unwrap();
         for i in 0..n {
             let fact = format!("persist_fact_{}", i);
             let entry = MemoryEntry {
@@ -118,8 +133,8 @@ async fn test_longmem_persistence_recall() {
                 last_accessed_at: None,
                 scope: MemoryScope::default(),
                 session_id: None,
-            source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+                source_agent: None,
+                visibility: cowd_memory::AgentVisibility::default(),
             };
             ids.push(entry.id);
             mgr.remember(entry).await.unwrap();
@@ -127,7 +142,9 @@ async fn test_longmem_persistence_recall() {
     }
 
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path)).await.unwrap();
+        let mgr = CognitiveContextManager::new(test_config(&db_path))
+            .await
+            .unwrap();
         let mut found = 0u32;
         for target_id in &ids {
             if let Ok(Some(_)) = mgr.get_entry(&target_id.to_string()).await {
@@ -135,7 +152,15 @@ async fn test_longmem_persistence_recall() {
             }
         }
         let recall = found as f32 / n as f32;
-        eprintln!("Persistence recall: {:.2}% ({}/{})", recall * 100.0, found, n);
-        assert!(recall > 0.5, "More than 50% of entries should be retrievable after restart");
+        eprintln!(
+            "Persistence recall: {:.2}% ({}/{})",
+            recall * 100.0,
+            found,
+            n
+        );
+        assert!(
+            recall > 0.5,
+            "More than 50% of entries should be retrievable after restart"
+        );
     }
 }

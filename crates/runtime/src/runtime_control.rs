@@ -482,12 +482,10 @@ mod tests {
         assert_eq!(profile.recommended_agent_mode, AgentMode::CriticalSwarm);
         assert_eq!(profile.recommended_profile, ContextProfile::Review);
         assert!(profile.requires_review);
-        assert!(
-            profile
-                .signals
-                .iter()
-                .any(|signal| signal.name == "risk_sensitive")
-        );
+        assert!(profile
+            .signals
+            .iter()
+            .any(|signal| signal.name == "risk_sensitive"));
     }
 
     #[test]

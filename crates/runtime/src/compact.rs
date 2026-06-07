@@ -607,7 +607,9 @@ mod tests {
             &session,
             CompactionConfig {
                 preserve_recent_messages: 2,
-                max_estimated_tokens: 1, priority_threshold: 3, keep_high_priority: true,
+                max_estimated_tokens: 1,
+                priority_threshold: 3,
+                keep_high_priority: true,
             },
         );
 
@@ -633,7 +635,9 @@ mod tests {
             &session,
             CompactionConfig {
                 preserve_recent_messages: 2,
-                max_estimated_tokens: 1, priority_threshold: 3, keep_high_priority: true,
+                max_estimated_tokens: 1,
+                priority_threshold: 3,
+                keep_high_priority: true,
             }
         ));
         // Note: with the tool-use/tool-result boundary guard the compacted session
@@ -661,7 +665,9 @@ mod tests {
         ];
         let config = CompactionConfig {
             preserve_recent_messages: 2,
-            max_estimated_tokens: 1, priority_threshold: 3, keep_high_priority: true,
+            max_estimated_tokens: 1,
+            priority_threshold: 3,
+            keep_high_priority: true,
         };
 
         let first = compact_session(&initial_session, config);
@@ -723,7 +729,9 @@ mod tests {
             &session,
             CompactionConfig {
                 preserve_recent_messages: 2,
-                max_estimated_tokens: 1, priority_threshold: 3, keep_high_priority: true,
+                max_estimated_tokens: 1,
+                priority_threshold: 3,
+                keep_high_priority: true,
             }
         ));
     }

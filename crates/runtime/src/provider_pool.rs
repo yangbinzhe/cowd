@@ -1,12 +1,12 @@
 // M5: ProviderPool — multi-API-key rotation with history preservation.
 // Derived from GenericAgent's next_llm() + hermes-agent's adapter pattern.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::RwLock;
-use std::pin::Pin;
+use crate::conversation::{ApiClient, ApiRequest, AssistantEvent, RuntimeError};
 use futures::stream;
 use futures::stream::Stream;
-use crate::conversation::{ApiClient, ApiRequest, AssistantEvent, RuntimeError};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
 
 pub struct ProviderPool {
     clients: Vec<Box<dyn ApiClient + Send>>,
@@ -16,9 +16,17 @@ pub struct ProviderPool {
 }
 
 impl ProviderPool {
-    pub fn new() -> Self { Self { clients: Vec::new(), current: AtomicUsize::new(0), history: RwLock::new(Vec::new()) } }
+    pub fn new() -> Self {
+        Self {
+            clients: Vec::new(),
+            current: AtomicUsize::new(0),
+            history: RwLock::new(Vec::new()),
+        }
+    }
 
-    pub fn add(&mut self, client: Box<dyn ApiClient + Send>) { self.clients.push(client); }
+    pub fn add(&mut self, client: Box<dyn ApiClient + Send>) {
+        self.clients.push(client);
+    }
 
     pub fn rotate(&self) -> usize {
         let next = (self.current.load(Ordering::Relaxed) + 1) % self.clients.len().max(1);
@@ -26,26 +34,39 @@ impl ProviderPool {
         next
     }
 
-    pub fn current_idx(&self) -> usize { self.current.load(Ordering::Relaxed) }
+    pub fn current_idx(&self) -> usize {
+        self.current.load(Ordering::Relaxed)
+    }
 
     /// M5-L1-2: Save history before switching providers
     pub fn save_history(&self, messages: Vec<String>) {
-        if let Ok(mut h) = self.history.write() { *h = messages; }
+        if let Ok(mut h) = self.history.write() {
+            *h = messages;
+        }
     }
 
     /// M5-L1-2: Retrieve preserved history after rotation
     pub fn history_len(&self) -> usize {
         self.history.read().map(|h| h.len()).unwrap_or(0)
     }
-    pub fn len(&self) -> usize { self.clients.len() }
-    pub fn is_empty(&self) -> bool { self.clients.is_empty() }
+    pub fn len(&self) -> usize {
+        self.clients.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+    }
 }
 
 impl ApiClient for ProviderPool {
-    fn stream(&mut self, request: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+    fn stream(
+        &mut self,
+        request: ApiRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
         let idx = self.current.load(Ordering::Relaxed) % self.clients.len().max(1);
         if self.clients.is_empty() {
-            return Box::pin(stream::once(async { Err(RuntimeError::new("ProviderPool: no clients configured")) }));
+            return Box::pin(stream::once(async {
+                Err(RuntimeError::new("ProviderPool: no clients configured"))
+            }));
         }
         self.clients[idx].stream(request)
     }
@@ -54,13 +75,19 @@ impl ApiClient for ProviderPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::pin::Pin;
     use futures::stream;
+    use std::pin::Pin;
 
     struct DummyClient(usize);
     impl ApiClient for DummyClient {
-        fn stream(&mut self, _: ApiRequest) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
-            Box::pin(stream::iter(vec![Ok(AssistantEvent::TextDelta(self.0.to_string())), Ok(AssistantEvent::MessageStop)]))
+        fn stream(
+            &mut self,
+            _: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta(self.0.to_string())),
+                Ok(AssistantEvent::MessageStop),
+            ]))
         }
     }
 

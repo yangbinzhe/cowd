@@ -86,9 +86,7 @@ const PERSON_PATTERNS: &[&str] = &[
     "(?i)@([\\w]+)",
 ];
 
-const PROJECT_PATTERNS: &[&str] = &[
-    "(?i)(project|repo|repository|项目|仓库)\\s+([A-Za-z0-9_-]+)",
-];
+const PROJECT_PATTERNS: &[&str] = &["(?i)(project|repo|repository|项目|仓库)\\s+([A-Za-z0-9_-]+)"];
 
 const TOOL_PATTERNS: &[&str] = &[
     "(?i)(using|with|用|使用|基于)\\s+([A-Za-z0-9_.-]+)",
@@ -248,7 +246,9 @@ impl KnowledgeGraph {
     /// Get entity by name (case-insensitive).
     pub fn get_entity_by_name(&self, name: &str) -> Option<&Entity> {
         let lower = name.to_lowercase();
-        self.entities.values().find(|e| e.name.to_lowercase() == lower)
+        self.entities
+            .values()
+            .find(|e| e.name.to_lowercase() == lower)
     }
 
     /// Get entity by ID.
@@ -322,7 +322,10 @@ impl KnowledgeGraph {
 
     /// List all valid triples.
     pub fn list_triples(&self) -> Vec<&Triple> {
-        self.triples.iter().filter(|t| t.valid_to.is_none()).collect()
+        self.triples
+            .iter()
+            .filter(|t| t.valid_to.is_none())
+            .collect()
     }
 
     /// Get entities related to a given entity.
@@ -416,18 +419,21 @@ impl KnowledgeGraph {
             }
             let mut sorted = indices.clone();
             sorted.sort_by(|a, b| {
-                self.triples[*b].created_at.cmp(&self.triples[*a].created_at)
+                self.triples[*b]
+                    .created_at
+                    .cmp(&self.triples[*a].created_at)
             });
             let newest_obj = self.triples[sorted[0]].object_id.clone();
             for &idx in &sorted[1..] {
-                if self.triples[idx].object_id != newest_obj
-                    && self.triples[idx].valid_to.is_none()
+                if self.triples[idx].object_id != newest_obj && self.triples[idx].valid_to.is_none()
                 {
                     let before = self.triples[idx].confidence;
                     self.triples[idx].confidence *= 0.5;
                     fixes.push(format!(
                         "conflict: triple {} confidence {}→{} (newer triple {} conflicts)",
-                        self.triples[idx].id, before, self.triples[idx].confidence,
+                        self.triples[idx].id,
+                        before,
+                        self.triples[idx].confidence,
                         self.triples[sorted[0]].id,
                     ));
                 }
@@ -460,9 +466,18 @@ mod tests {
         assert!(!candidates.is_empty(), "Should detect entities");
 
         let types: Vec<_> = candidates.iter().map(|(_, t, _)| t).collect();
-        assert!(types.iter().any(|t| **t == EntityType::Person), "Should detect person");
-        assert!(types.iter().any(|t| **t == EntityType::Tool), "Should detect tool");
-        assert!(types.iter().any(|t| **t == EntityType::Project), "Should detect project");
+        assert!(
+            types.iter().any(|t| **t == EntityType::Person),
+            "Should detect person"
+        );
+        assert!(
+            types.iter().any(|t| **t == EntityType::Tool),
+            "Should detect tool"
+        );
+        assert!(
+            types.iter().any(|t| **t == EntityType::Project),
+            "Should detect project"
+        );
     }
 
     #[test]
@@ -475,7 +490,10 @@ mod tests {
         let mut freq = HashMap::new();
         freq.insert("React".to_string(), 3);
         let entities = detector.classify(&candidates, &freq);
-        assert!(!entities.is_empty(), "React should pass frequency threshold");
+        assert!(
+            !entities.is_empty(),
+            "React should pass frequency threshold"
+        );
     }
 
     #[test]

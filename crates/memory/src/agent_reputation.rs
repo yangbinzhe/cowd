@@ -168,7 +168,10 @@ impl ReputationManager {
     /// Get a connection from the pool.
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, MemoryError> {
         use rusqlite::Error as RusqliteError;
-        let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemoryError::Store(e.to_string()))?;
         // Handle PRAGMAs that may return results in rusqlite 0.31+
         let _ = conn
             .execute("PRAGMA journal_mode=WAL", [])
@@ -277,16 +280,18 @@ impl ReputationManager {
         };
 
         // Compute idle time and apply decay to the old composite score.
-        let idle_days = (now - current.updated_at).num_milliseconds() as f64
-            / (1000.0 * 60.0 * 60.0 * 24.0);
+        let idle_days =
+            (now - current.updated_at).num_milliseconds() as f64 / (1000.0 * 60.0 * 60.0 * 24.0);
         let decayed_old = apply_decay(current.reputation_score, idle_days, &self.decay_config);
 
         // Update rolling metrics.
         let n = current.tasks_completed;
-        current.avg_quality_score =
-            update_rolling_avg(current.avg_quality_score, quality_score, n);
-        current.on_time_rate =
-            update_rolling_rate(current.on_time_rate, if completed_on_time { 1.0 } else { 0.0 }, n);
+        current.avg_quality_score = update_rolling_avg(current.avg_quality_score, quality_score, n);
+        current.on_time_rate = update_rolling_rate(
+            current.on_time_rate,
+            if completed_on_time { 1.0 } else { 0.0 },
+            n,
+        );
         current.tasks_completed = n + 1;
 
         // Domain expertise: bump each domain by a small increment, bounded.
@@ -306,8 +311,7 @@ impl ReputationManager {
             &self.decay_config,
         );
         // Blend with decayed historical score for stability.
-        current.reputation_score =
-            decayed_old * 0.3 + current.reputation_score * 0.7;
+        current.reputation_score = decayed_old * 0.3 + current.reputation_score * 0.7;
 
         current.updated_at = now;
 
@@ -418,25 +422,15 @@ impl ReputationManager {
             })
             .map_err(|e| MemoryError::Store(e.to_string()))?;
 
-        let mut agents: Vec<AgentMetrics> = rows
-            .filter_map(|r| r.ok())
-            .collect();
+        let mut agents: Vec<AgentMetrics> = rows.filter_map(|r| r.ok()).collect();
 
         // If a domain filter is requested, re-rank by domain_expertise * reputation.
         if let Some(d) = domain {
             agents.sort_by(|a, b| {
-                let score_a = a
-                    .domain_expertise
-                    .get(d)
-                    .copied()
-                    .unwrap_or(0.0)
-                    * a.reputation_score;
-                let score_b = b
-                    .domain_expertise
-                    .get(d)
-                    .copied()
-                    .unwrap_or(0.0)
-                    * b.reputation_score;
+                let score_a =
+                    a.domain_expertise.get(d).copied().unwrap_or(0.0) * a.reputation_score;
+                let score_b =
+                    b.domain_expertise.get(d).copied().unwrap_or(0.0) * b.reputation_score;
                 score_b
                     .partial_cmp(&score_a)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -486,7 +480,9 @@ mod tests {
         assert!((metrics.avg_quality_score - 0.9).abs() < 0.001);
         assert!((metrics.on_time_rate - 1.0).abs() < 0.001);
         assert!(metrics.reputation_score > 0.4); // volume weight causes low initial score
-        assert!((metrics.domain_expertise.get("rust").copied().unwrap_or(0.0) - 0.05).abs() < 0.001);
+        assert!(
+            (metrics.domain_expertise.get("rust").copied().unwrap_or(0.0) - 0.05).abs() < 0.001
+        );
 
         // Second task — scores should be rolling averages.
         let m2 = mgr
@@ -594,7 +590,8 @@ mod tests {
     fn delete_removes_record() {
         let pool = test_pool();
         let mgr = ReputationManager::with_default_config(pool);
-        mgr.record_completion("del-me", 0.5, true, &[]).expect("record");
+        mgr.record_completion("del-me", 0.5, true, &[])
+            .expect("record");
         assert!(mgr.get("del-me").expect("get").is_some());
         mgr.delete("del-me").expect("delete");
         assert!(mgr.get("del-me").expect("get").is_none());

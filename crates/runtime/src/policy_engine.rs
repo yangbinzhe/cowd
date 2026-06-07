@@ -253,7 +253,9 @@ mod tests {
         let engine = PolicyEngine::new(vec![PolicyRule::new(
             "merge-to-dev",
             PolicyCondition::And(vec![
-                PolicyCondition::GreenAt { level: GreenLevel::Workspace },
+                PolicyCondition::GreenAt {
+                    level: GreenLevel::Workspace,
+                },
                 PolicyCondition::ScopedDiff,
                 PolicyCondition::ReviewPassed,
             ]),
@@ -453,7 +455,9 @@ mod tests {
                 PolicyCondition::Or(vec![
                     PolicyCondition::StartupBlocked,
                     PolicyCondition::And(vec![
-                        PolicyCondition::GreenAt { level: GreenLevel::Workspace },
+                        PolicyCondition::GreenAt {
+                            level: GreenLevel::Workspace,
+                        },
                         PolicyCondition::TimedOut {
                             duration: Duration::from_secs(5),
                         },

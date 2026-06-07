@@ -11,35 +11,34 @@ use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[ignore]
 #[test]
 fn resumed_binary_accepts_slash_commands_with_arguments() {
     // given
     let temp_dir = unique_temp_dir("resume-slash-commands");
+    let config_home = temp_dir.join("home").join(".cowd");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
 
-    let session_path = temp_dir.join("session.jsonl");
     let export_path = temp_dir.join("notes.txt");
 
     let mut session = workspace_session(&temp_dir);
+    session.session_id = "resume-slash-commands-session".to_string();
     session
         .push_user_text("ship the slash command harness")
         .expect("session write should succeed");
-    session
-        .save_to_path(&session_path)
-        .expect("session should persist");
+    persist_unified_session_fixture(&config_home, &session, "2026-06-05T00:00:00Z");
 
     // when
-    let output = run_cowd(
+    let output = run_cowd_with_env(
         &temp_dir,
         &[
             "--resume",
-            session_path.to_str().expect("utf8 path"),
+            session.session_id.as_str(),
             "/export",
             export_path.to_str().expect("utf8 path"),
             "/clear",
             "--confirm",
         ],
+        &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
     );
 
     // then
@@ -56,29 +55,60 @@ fn resumed_binary_accepts_slash_commands_with_arguments() {
     assert!(stdout.contains(export_path.to_str().expect("utf8 path")));
     assert!(stdout.contains("Session cleared"));
     assert!(stdout.contains("Mode             resumed session reset"));
-    assert!(stdout.contains("Previous session"));
-    assert!(stdout.contains("Resume previous  cowd --resume"));
-    assert!(stdout.contains("Backup           "));
-    assert!(stdout.contains("Session file     "));
+    assert!(stdout.contains("Previous session resume-slash-commands-session"));
+    assert!(stdout.contains("Backup export    "));
+    assert!(stdout.contains("Resume previous  cowd import-session"));
+    assert!(stdout.contains("New session      "));
+    assert!(stdout.contains("Store            SQLite session store"));
 
     let export = fs::read_to_string(&export_path).expect("export file should exist");
     assert!(export.contains("# Conversation Export"));
     assert!(export.contains("ship the slash command harness"));
 
-    let restored = Session::load_from_path(&session_path).expect("cleared session should load");
-    assert!(restored.messages.is_empty());
-
     let backup_path = stdout
         .lines()
-        .find_map(|line| line.strip_prefix("  Backup           "))
+        .find_map(|line| line.strip_prefix("  Backup export    "))
         .map(PathBuf::from)
         .expect("clear output should include backup path");
+    assert_eq!(
+        backup_path.extension().and_then(|value| value.to_str()),
+        Some("jsonl")
+    );
     let backup = Session::load_from_path(&backup_path).expect("backup session should load");
     assert_eq!(backup.messages.len(), 1);
     assert!(matches!(
         backup.messages[0].blocks.first(),
         Some(ContentBlock::Text { text }) if text == "ship the slash command harness"
     ));
+
+    let import_output = run_cowd_with_env(
+        &temp_dir,
+        &["import-session", backup_path.to_str().expect("utf8 path")],
+        &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
+    );
+    assert!(
+        import_output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&import_output.stdout),
+        String::from_utf8_lossy(&import_output.stderr)
+    );
+    let import_stdout = String::from_utf8(import_output.stdout).expect("stdout should be utf8");
+    assert!(import_stdout.contains("Session imported"));
+    assert!(import_stdout.contains("resume-slash-commands-session"));
+
+    let new_session_id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("  New session      "))
+        .expect("clear output should include new session id");
+    let store = memory::UnifiedSessionStore::open(&config_home.join("sessions.db"))
+        .expect("unified session store should open");
+    let new_record = tokio::runtime::Runtime::new()
+        .expect("tokio runtime should create")
+        .block_on(store.get_session(new_session_id))
+        .expect("new session record should read")
+        .expect("new session record should exist");
+    assert_eq!(new_record.chat_id, new_session_id);
+    assert_eq!(new_record.message_count, 0);
 }
 
 #[test]
@@ -109,7 +139,7 @@ fn status_command_applies_cli_flags_end_to_end() {
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Status"));
-    assert!(stdout.contains("Model            claude-sonnet-4-6"));
+    assert!(stdout.contains("Model            sonnet"));
     assert!(stdout.contains("Permission mode  read-only"));
 }
 
@@ -122,11 +152,9 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
     fs::create_dir_all(project_dir.join(".cowd")).expect("project config dir should exist");
     fs::create_dir_all(&config_home).expect("config home should exist");
 
-    let session_path = project_dir.join("session.jsonl");
-    workspace_session(&project_dir)
-        .with_persistence_path(&session_path)
-        .save_to_path(&session_path)
-        .expect("session should persist");
+    let mut session = workspace_session(&project_dir);
+    session.session_id = "resume-config-session".to_string();
+    persist_unified_session_fixture(&config_home, &session, "2026-06-05T00:00:00Z");
 
     fs::write(config_home.join("config.yaml"), r#"{"model":"haiku"}"#)
         .expect("user config should write");
@@ -139,12 +167,7 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
     // when
     let output = run_cowd_with_env(
         &project_dir,
-        &[
-            "--resume",
-            session_path.to_str().expect("utf8 path"),
-            "/config",
-            "model",
-        ],
+        &["--resume", session.session_id.as_str(), "/config", "model"],
         &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
     );
 
@@ -159,12 +182,7 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Config"));
     assert!(stdout.contains("Loaded files      2"));
-    assert!(stdout.contains(
-        config_home
-            .join("config.yaml")
-            .to_str()
-            .expect("utf8 path")
-    ));
+    assert!(stdout.contains(config_home.join("config.yaml").to_str().expect("utf8 path")));
     assert!(stdout.contains(
         project_dir
             .join(".cowd")
@@ -183,21 +201,13 @@ fn resume_latest_restores_the_most_recent_managed_session() {
     let project_dir = temp_dir.join("project");
     let config_home = temp_dir.join("home").join(".cowd");
     fs::create_dir_all(&project_dir).expect("project dir should exist");
-    fs::create_dir_all(config_home.join("sessions")).expect("session dir should exist");
-
-    let older_path = config_home.join("sessions").join("session-older.jsonl");
-    let newer_path = config_home.join("sessions").join("session-newer.jsonl");
-
-    let mut older = workspace_session(&project_dir).with_persistence_path(&older_path);
+    let mut older = workspace_session(&project_dir);
     older.session_id = "session-older".to_string();
     older
         .push_user_text("older session")
         .expect("older session write should succeed");
-    older
-        .save_to_path(&older_path)
-        .expect("older session should persist");
 
-    let mut newer = workspace_session(&project_dir).with_persistence_path(&newer_path);
+    let mut newer = workspace_session(&project_dir);
     newer.session_id = "session-newer".to_string();
     newer
         .push_user_text("newer session")
@@ -205,22 +215,9 @@ fn resume_latest_restores_the_most_recent_managed_session() {
     newer
         .push_user_text("resume me")
         .expect("newer session write should succeed");
-    newer
-        .save_to_path(&newer_path)
-        .expect("newer session should persist");
 
-    persist_unified_session_fixture(
-        &config_home,
-        &older,
-        &older_path,
-        "2026-06-05T00:00:00Z",
-    );
-    persist_unified_session_fixture(
-        &config_home,
-        &newer,
-        &newer_path,
-        "2026-06-05T00:00:01Z",
-    );
+    persist_unified_session_fixture(&config_home, &older, "2026-06-05T00:00:00Z");
+    persist_unified_session_fixture(&config_home, &newer, "2026-06-05T00:00:01Z");
 
     // when
     let output = run_cowd_with_env(
@@ -240,7 +237,11 @@ fn resume_latest_restores_the_most_recent_managed_session() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("Status"));
     assert!(stdout.contains("Messages         2"));
-    assert!(stdout.contains(newer_path.to_str().expect("utf8 path")));
+    assert!(stdout.contains("Session          "));
+    assert!(stdout.contains("sessions.db"));
+    assert!(stdout.contains("Session id       session-newer"));
+    assert!(stdout.contains("Session store    SQLite session store"));
+    assert!(!stdout.contains("session-newer.jsonl"));
 }
 
 #[test]
@@ -248,26 +249,23 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     // given
     let temp_dir = unique_temp_dir("resume-status-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
-    let session_path = temp_dir.join("session.jsonl");
+    let config_home = temp_dir.join("home").join(".cowd");
 
     let mut session = workspace_session(&temp_dir);
+    session.session_id = "resume-status-json-session".to_string();
     session
         .push_user_text("resume status json fixture")
         .expect("session write should succeed");
-    session
-        .save_to_path(&session_path)
-        .expect("session should persist");
+    persist_unified_session_fixture(&config_home, &session, "2026-06-05T00:00:00Z");
 
     // when
-    let config_home = temp_dir.join("home").join(".cowd");
-    fs::create_dir_all(&config_home).expect("config home should exist");
     let output = run_cowd_with_env(
         &temp_dir,
         &[
             "--output-format",
             "json",
             "--resume",
-            session_path.to_str().expect("utf8 path"),
+            session.session_id.as_str(),
             "/status",
         ],
         &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
@@ -287,14 +285,16 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     assert_eq!(parsed["kind"], "status");
     // model is null in resume mode (not known without --model flag)
     assert!(parsed["model"].is_null());
-    assert_eq!(parsed["permission_mode"], "danger-full-access");
+    assert_eq!(parsed["permission_mode"], "workspace-write");
     assert_eq!(parsed["usage"]["messages"], 1);
     assert!(parsed["usage"]["turns"].is_number());
     assert!(parsed["workspace"]["cwd"].as_str().is_some());
     assert_eq!(
         parsed["workspace"]["session"],
-        session_path.to_str().expect("utf8 path")
+        config_home.join("sessions.db").to_str().expect("utf8 path")
     );
+    assert_eq!(parsed["workspace"]["session_id"], session.session_id);
+    assert_eq!(parsed["workspace"]["session_store"], "SQLite session store");
     assert!(parsed["workspace"]["changed_files"].is_number());
     assert_eq!(parsed["workspace"]["loaded_config_files"].as_u64(), Some(0));
     assert!(parsed["sandbox"]["filesystem_mode"].as_str().is_some());
@@ -305,25 +305,27 @@ fn resumed_status_surfaces_persisted_model() {
     // given — create a session with model already set
     let temp_dir = unique_temp_dir("resume-status-model");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
-    let session_path = temp_dir.join("session.jsonl");
+    let config_home = temp_dir.join("home").join(".cowd");
 
     let mut session = workspace_session(&temp_dir);
+    session.session_id = "resume-status-model-session".to_string();
     session.model = Some("claude-sonnet-4-6".to_string());
     session
         .push_user_text("model persistence fixture")
         .expect("write ok");
-    session.save_to_path(&session_path).expect("persist ok");
+    persist_unified_session_fixture(&config_home, &session, "2026-06-05T00:00:00Z");
 
     // when
-    let output = run_cowd(
+    let output = run_cowd_with_env(
         &temp_dir,
         &[
             "--output-format",
             "json",
             "--resume",
-            session_path.to_str().expect("utf8 path"),
+            session.session_id.as_str(),
             "/status",
         ],
+        &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
     );
 
     // then
@@ -346,22 +348,23 @@ fn resumed_sandbox_command_emits_structured_json_when_requested() {
     // given
     let temp_dir = unique_temp_dir("resume-sandbox-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
-    let session_path = temp_dir.join("session.jsonl");
+    let config_home = temp_dir.join("home").join(".cowd");
 
-    workspace_session(&temp_dir)
-        .save_to_path(&session_path)
-        .expect("session should persist");
+    let mut session = workspace_session(&temp_dir);
+    session.session_id = "resume-sandbox-json-session".to_string();
+    persist_unified_session_fixture(&config_home, &session, "2026-06-05T00:00:00Z");
 
     // when
-    let output = run_cowd(
+    let output = run_cowd_with_env(
         &temp_dir,
         &[
             "--output-format",
             "json",
             "--resume",
-            session_path.to_str().expect("utf8 path"),
+            session.session_id.as_str(),
             "/sandbox",
         ],
+        &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
     );
 
     // then
@@ -388,20 +391,21 @@ fn resumed_sandbox_command_emits_structured_json_when_requested() {
 fn resumed_version_command_emits_structured_json() {
     let temp_dir = unique_temp_dir("resume-version-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
-    let session_path = temp_dir.join("session.jsonl");
-    workspace_session(&temp_dir)
-        .save_to_path(&session_path)
-        .expect("session should persist");
+    let config_home = temp_dir.join("home").join(".cowd");
+    let mut session = workspace_session(&temp_dir);
+    session.session_id = "resume-version-json-session".to_string();
+    persist_unified_session_fixture(&config_home, &session, "2026-06-05T00:00:00Z");
 
-    let output = run_cowd(
+    let output = run_cowd_with_env(
         &temp_dir,
         &[
             "--output-format",
             "json",
             "--resume",
-            session_path.to_str().expect("utf8 path"),
+            session.session_id.as_str(),
             "/version",
         ],
+        &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
     );
 
     assert!(
@@ -421,22 +425,24 @@ fn resumed_version_command_emits_structured_json() {
 fn resumed_export_command_emits_structured_json() {
     let temp_dir = unique_temp_dir("resume-export-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
-    let session_path = temp_dir.join("session.jsonl");
+    let config_home = temp_dir.join("home").join(".cowd");
     let mut session = workspace_session(&temp_dir);
+    session.session_id = "resume-export-json-session".to_string();
     session
         .push_user_text("export json fixture")
         .expect("write ok");
-    session.save_to_path(&session_path).expect("persist ok");
+    persist_unified_session_fixture(&config_home, &session, "2026-06-05T00:00:00Z");
 
-    let output = run_cowd(
+    let output = run_cowd_with_env(
         &temp_dir,
         &[
             "--output-format",
             "json",
             "--resume",
-            session_path.to_str().expect("utf8 path"),
+            session.session_id.as_str(),
             "/export",
         ],
+        &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
     );
 
     assert!(
@@ -455,20 +461,21 @@ fn resumed_export_command_emits_structured_json() {
 fn resumed_help_command_emits_structured_json() {
     let temp_dir = unique_temp_dir("resume-help-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
-    let session_path = temp_dir.join("session.jsonl");
-    workspace_session(&temp_dir)
-        .save_to_path(&session_path)
-        .expect("persist ok");
+    let config_home = temp_dir.join("home").join(".cowd");
+    let mut session = workspace_session(&temp_dir);
+    session.session_id = "resume-help-json-session".to_string();
+    persist_unified_session_fixture(&config_home, &session, "2026-06-05T00:00:00Z");
 
-    let output = run_cowd(
+    let output = run_cowd_with_env(
         &temp_dir,
         &[
             "--output-format",
             "json",
             "--resume",
-            session_path.to_str().expect("utf8 path"),
+            session.session_id.as_str(),
             "/help",
         ],
+        &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
     );
 
     assert!(
@@ -488,21 +495,23 @@ fn resumed_help_command_emits_structured_json() {
 fn resumed_no_command_emits_restored_json() {
     let temp_dir = unique_temp_dir("resume-no-cmd-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
-    let session_path = temp_dir.join("session.jsonl");
+    let config_home = temp_dir.join("home").join(".cowd");
     let mut session = workspace_session(&temp_dir);
+    session.session_id = "resume-no-cmd-json-session".to_string();
     session
         .push_user_text("restored json fixture")
         .expect("write ok");
-    session.save_to_path(&session_path).expect("persist ok");
+    persist_unified_session_fixture(&config_home, &session, "2026-06-05T00:00:00Z");
 
-    let output = run_cowd(
+    let output = run_cowd_with_env(
         &temp_dir,
         &[
             "--output-format",
             "json",
             "--resume",
-            session_path.to_str().expect("utf8 path"),
+            session.session_id.as_str(),
         ],
+        &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
     );
 
     assert!(
@@ -513,8 +522,11 @@ fn resumed_no_command_emits_restored_json() {
     let stdout = String::from_utf8(output.stdout).expect("utf8");
     let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
     assert_eq!(parsed["kind"], "restored");
-    assert!(parsed["session_id"].as_str().is_some());
-    assert!(parsed["path"].as_str().is_some());
+    assert_eq!(parsed["session_id"], session.session_id);
+    assert_eq!(
+        parsed["path"],
+        config_home.join("sessions.db").to_str().expect("utf8 path")
+    );
     assert_eq!(parsed["message_count"], 1);
 }
 
@@ -522,20 +534,21 @@ fn resumed_no_command_emits_restored_json() {
 fn resumed_stub_command_emits_not_implemented_json() {
     let temp_dir = unique_temp_dir("resume-stub-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
-    let session_path = temp_dir.join("session.jsonl");
-    workspace_session(&temp_dir)
-        .save_to_path(&session_path)
-        .expect("persist ok");
+    let config_home = temp_dir.join("home").join(".cowd");
+    let mut session = workspace_session(&temp_dir);
+    session.session_id = "resume-stub-json-session".to_string();
+    persist_unified_session_fixture(&config_home, &session, "2026-06-05T00:00:00Z");
 
-    let output = run_cowd(
+    let output = run_cowd_with_env(
         &temp_dir,
         &[
             "--output-format",
             "json",
             "--resume",
-            session_path.to_str().expect("utf8 path"),
+            session.session_id.as_str(),
             "/allowed-tools",
         ],
+        &[("COWD_CONFIG_HOME", config_home.to_str().expect("utf8 path"))],
     );
 
     // Stub commands exit with code 2
@@ -561,12 +574,8 @@ fn workspace_session(root: &Path) -> Session {
     Session::new().with_workspace_root(root.to_path_buf())
 }
 
-fn persist_unified_session_fixture(
-    config_home: &Path,
-    session: &Session,
-    path: &Path,
-    last_activity: &str,
-) {
+fn persist_unified_session_fixture(config_home: &Path, session: &Session, last_activity: &str) {
+    fs::create_dir_all(config_home).expect("config home should exist");
     let store = memory::UnifiedSessionStore::open(&config_home.join("sessions.db"))
         .expect("unified session store should open");
     let record = memory::SessionRecord {
@@ -582,7 +591,7 @@ fn persist_unified_session_fixture(
         metadata_json: Some(
             serde_json::json!({
                 "workspace_root": session.workspace_root().map(|path| path.display().to_string()),
-                "legacy_path": path.display().to_string(),
+                "session_path": config_home.join("sessions.db").display().to_string(),
             })
             .to_string(),
         ),

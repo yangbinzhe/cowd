@@ -37,17 +37,16 @@ impl ToolSafetyCategory {
     /// Classify a tool by name using a built-in mapping.
     pub fn from_tool_name(name: &str) -> Self {
         match name {
-            "read" | "read_file" | "cat" | "head" | "tail"
-            | "grep" | "grep_search" | "rg"
-            | "glob" | "glob_search" | "find" | "ls" | "list_directory"
-            | "file_search"
-            | "git_status" | "git_log" | "git_diff" | "git_show"
-            | "memory_search" | "memory_list" | "memory_get" | "session_list"
-            | "session_get" | "skill_list" | "skill_view" => Self::ReadOnly,
+            "read" | "read_file" | "cat" | "head" | "tail" | "grep" | "grep_search" | "rg"
+            | "glob" | "glob_search" | "find" | "ls" | "list_directory" | "file_search"
+            | "git_status" | "git_log" | "git_diff" | "git_show" | "memory_search"
+            | "memory_list" | "memory_get" | "session_list" | "session_get" | "skill_list"
+            | "skill_view" => Self::ReadOnly,
 
-            "write" | "write_file" | "edit" | "edit_file"
-            | "bash" | "create_file" | "delete_file"
-            | "memory_create" | "memory_delete" | "session_create" => Self::WriteLocal,
+            "write" | "write_file" | "edit" | "edit_file" | "bash" | "create_file"
+            | "delete_file" | "memory_create" | "memory_delete" | "session_create" => {
+                Self::WriteLocal
+            }
 
             // Network tools
             "web_search" | "web_fetch" | "http_request" | "mcp_call" => Self::Network,
@@ -166,7 +165,8 @@ impl ToolSafetyRegistry {
 
     /// Set a per-tool timeout override (seconds).
     pub fn set_tool_timeout(&mut self, tool_name: &str, timeout_secs: u64) {
-        self.tool_timeout_secs.insert(tool_name.to_string(), timeout_secs);
+        self.tool_timeout_secs
+            .insert(tool_name.to_string(), timeout_secs);
     }
 }
 
@@ -238,11 +238,19 @@ impl ToolResultBudget {
 
         match self.truncation_strategy {
             TruncationStrategy::HeadOnly => {
-                format!("{}...\n[truncated: {} chars omitted]", &output[..max_chars.min(output.len())], output.len().saturating_sub(max_chars))
+                format!(
+                    "{}...\n[truncated: {} chars omitted]",
+                    &output[..max_chars.min(output.len())],
+                    output.len().saturating_sub(max_chars)
+                )
             }
             TruncationStrategy::TailOnly => {
                 let start = output.len().saturating_sub(max_chars);
-                format!("[truncated: {} chars omitted]\n{}", output.len().saturating_sub(max_chars), &output[start..])
+                format!(
+                    "[truncated: {} chars omitted]\n{}",
+                    output.len().saturating_sub(max_chars),
+                    &output[start..]
+                )
             }
             TruncationStrategy::HeadAndTail | TruncationStrategy::Summary => {
                 let head_end = self.head_chars.min(output.len());
@@ -365,36 +373,78 @@ mod tests {
 
     #[test]
     fn classifies_read_tools() {
-        assert_eq!(ToolSafetyCategory::from_tool_name("read"), ToolSafetyCategory::ReadOnly);
-        assert_eq!(ToolSafetyCategory::from_tool_name("read_file"), ToolSafetyCategory::ReadOnly);
-        assert_eq!(ToolSafetyCategory::from_tool_name("grep"), ToolSafetyCategory::ReadOnly);
-        assert_eq!(ToolSafetyCategory::from_tool_name("grep_search"), ToolSafetyCategory::ReadOnly);
-        assert_eq!(ToolSafetyCategory::from_tool_name("glob"), ToolSafetyCategory::ReadOnly);
-        assert_eq!(ToolSafetyCategory::from_tool_name("glob_search"), ToolSafetyCategory::ReadOnly);
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("read"),
+            ToolSafetyCategory::ReadOnly
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("read_file"),
+            ToolSafetyCategory::ReadOnly
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("grep"),
+            ToolSafetyCategory::ReadOnly
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("grep_search"),
+            ToolSafetyCategory::ReadOnly
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("glob"),
+            ToolSafetyCategory::ReadOnly
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("glob_search"),
+            ToolSafetyCategory::ReadOnly
+        );
     }
 
     #[test]
     fn classifies_write_tools() {
-        assert_eq!(ToolSafetyCategory::from_tool_name("write"), ToolSafetyCategory::WriteLocal);
-        assert_eq!(ToolSafetyCategory::from_tool_name("write_file"), ToolSafetyCategory::WriteLocal);
-        assert_eq!(ToolSafetyCategory::from_tool_name("edit"), ToolSafetyCategory::WriteLocal);
-        assert_eq!(ToolSafetyCategory::from_tool_name("edit_file"), ToolSafetyCategory::WriteLocal);
-        assert_eq!(ToolSafetyCategory::from_tool_name("bash"), ToolSafetyCategory::WriteLocal);
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("write"),
+            ToolSafetyCategory::WriteLocal
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("write_file"),
+            ToolSafetyCategory::WriteLocal
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("edit"),
+            ToolSafetyCategory::WriteLocal
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("edit_file"),
+            ToolSafetyCategory::WriteLocal
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("bash"),
+            ToolSafetyCategory::WriteLocal
+        );
     }
 
     #[test]
     fn classifies_network_tools() {
-        assert_eq!(ToolSafetyCategory::from_tool_name("web_search"), ToolSafetyCategory::Network);
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("web_search"),
+            ToolSafetyCategory::Network
+        );
     }
 
     #[test]
     fn classifies_destructive_tools() {
-        assert_eq!(ToolSafetyCategory::from_tool_name("rm"), ToolSafetyCategory::Destructive);
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("rm"),
+            ToolSafetyCategory::Destructive
+        );
     }
 
     #[test]
     fn unknown_defaults_to_write_local() {
-        assert_eq!(ToolSafetyCategory::from_tool_name("custom_tool"), ToolSafetyCategory::WriteLocal);
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("custom_tool"),
+            ToolSafetyCategory::WriteLocal
+        );
     }
 
     #[test]
@@ -417,7 +467,10 @@ mod tests {
     fn override_changes_category() {
         let mut orch = ToolOrchestrator::new();
         orch.set_override("custom_read".to_string(), ToolSafetyCategory::ReadOnly);
-        assert_eq!(orch.category_for("custom_read"), ToolSafetyCategory::ReadOnly);
+        assert_eq!(
+            orch.category_for("custom_read"),
+            ToolSafetyCategory::ReadOnly
+        );
     }
 
     #[test]

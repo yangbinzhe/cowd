@@ -188,6 +188,7 @@ window.Api = (()=>{
       const params=new URLSearchParams();
       if(o.from_seq!==undefined)params.set('from_seq',o.from_seq);
       if(o.limit!==undefined)params.set('limit',o.limit);
+      params.set('include_envelopes',o.include_envelopes===true?'true':'false');
       const query=params.toString();
       return req('GET','/api/sessions/'+encodeURIComponent(sid)+'/context'+(query?'?'+query:''));
     },
@@ -211,6 +212,12 @@ window.Api = (()=>{
     },
     async runtimeEffectiveConfig(){
       return req('GET','/api/runtime/config/effective');
+    },
+    async runtimeControlPlane(){
+      return req('GET','/api/runtime/control-plane');
+    },
+    async runtimeReloadProviders(){
+      return req('POST','/api/runtime/providers/reload');
     },
     async contextEnvelope(envelopeId){
       return req('GET','/api/context/'+encodeURIComponent(envelopeId));
@@ -333,6 +340,20 @@ window.Api = (()=>{
     // ── Platforms ──
     async listPlatforms(){return req('GET','/api/platforms')},
     async getPlatform(name){return req('GET','/api/platforms/'+name)},
+
+    // ── Cross-plane policy ──
+    async crossPlaneSummary(){return req('GET','/api/cross-plane/summary')},
+    async crossPlaneIdentities(){return req('GET','/api/cross-plane/identities')},
+    async createCrossPlaneIdentity(identity){return req('POST','/api/cross-plane/identities',identity)},
+    async revokeCrossPlaneIdentity(id){return req('DELETE','/api/cross-plane/identities/'+encodeURIComponent(id))},
+    async crossPlaneGrants(){return req('GET','/api/cross-plane/grants')},
+    async createCrossPlaneGrant(grant){return req('POST','/api/cross-plane/grants',grant)},
+    async revokeCrossPlaneGrant(id){return req('DELETE','/api/cross-plane/grants/'+encodeURIComponent(id))},
+    async crossPlaneAudit(){return req('GET','/api/cross-plane/audit')},
+    async simulateCrossPlanePolicy(action){return req('POST','/api/cross-plane/policy/simulate',action)},
+    async wechatIlinkAccounts(){return req('GET','/api/channels/wechat-ilink/accounts')},
+    async startWechatIlinkQr(body){return req('POST','/api/channels/wechat-ilink/qr',body||{})},
+    async pollWechatIlinkQr(body){return req('POST','/api/channels/wechat-ilink/qr/poll',body)},
 
     // ── Usage ──
     async getUsage(){return req('GET','/api/usage')},

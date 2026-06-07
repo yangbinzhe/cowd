@@ -13,8 +13,8 @@
 
 use crate::skill_manifest::{
     check_prerequisites, get_config_vars, get_related_skills, get_skill_description,
-    get_skill_name, get_tags, matches_platform, parse_skill_file,
-    PrerequisitesCheck, SkillConfigVar,
+    get_skill_name, get_tags, matches_platform, parse_skill_file, PrerequisitesCheck,
+    SkillConfigVar,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -280,15 +280,13 @@ impl SkillManager {
             .map(|p| {
                 p.split(':')
                     .filter_map(|dir| {
-                        fs::read_dir(dir)
-                            .ok()
-                            .map(|entries| {
-                                entries
-                                    .filter_map(|e| e.ok())
-                                    .filter(|e| e.path().is_file())
-                                    .filter_map(|e| e.file_name().into_string().ok())
-                                    .collect::<Vec<String>>()
-                            })
+                        fs::read_dir(dir).ok().map(|entries| {
+                            entries
+                                .filter_map(|e| e.ok())
+                                .filter(|e| e.path().is_file())
+                                .filter_map(|e| e.file_name().into_string().ok())
+                                .collect::<Vec<String>>()
+                        })
                     })
                     .flatten()
                     .collect::<Vec<String>>()
@@ -313,7 +311,12 @@ impl SkillManager {
                             if let Ok(parsed) = parse_skill_file(&skill_md) {
                                 let name = get_skill_name(&parsed)
                                     .map(|s| s.to_string())
-                                    .unwrap_or_else(|| path.file_name().unwrap_or_default().to_string_lossy().to_string());
+                                    .unwrap_or_else(|| {
+                                        path.file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .to_string()
+                                    });
                                 let description = get_skill_description(&parsed)
                                     .unwrap_or_default()
                                     .to_string();
@@ -332,10 +335,15 @@ impl SkillManager {
                                 }
 
                                 // Check prerequisites
-                                let prereqs_met = matches_prerequisites(&parsed, &self.env_vars, &self.available_commands);
+                                let prereqs_met = matches_prerequisites(
+                                    &parsed,
+                                    &self.env_vars,
+                                    &self.available_commands,
+                                );
 
                                 let tags = get_tags(&parsed);
-                                let category = path.file_name().map(|n| n.to_string_lossy().to_string());
+                                let category =
+                                    path.file_name().map(|n| n.to_string_lossy().to_string());
 
                                 // Update category counts
                                 if let Some(ref cat) = category {
@@ -397,7 +405,12 @@ impl SkillManager {
                             if let Ok(parsed) = parse_skill_file(&skill_md) {
                                 let skill_name = get_skill_name(&parsed)
                                     .map(|s| s.to_string())
-                                    .unwrap_or_else(|| path.file_name().unwrap_or_default().to_string_lossy().to_string());
+                                    .unwrap_or_else(|| {
+                                        path.file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .to_string()
+                                    });
 
                                 if skill_name.eq_ignore_ascii_case(&name) {
                                     // Check if viewing a specific file
@@ -413,13 +426,28 @@ impl SkillManager {
                                                 tags: get_tags(&parsed),
                                                 related_skills: get_related_skills(&parsed),
                                                 content,
-                                                body_summary: truncate_content(&parsed.body, MAX_BODY_SUMMARY_LENGTH),
+                                                body_summary: truncate_content(
+                                                    &parsed.body,
+                                                    MAX_BODY_SUMMARY_LENGTH,
+                                                ),
                                                 path: full_path.display().to_string(),
                                                 linked_files: discover_linked_files(&path),
                                                 config_vars: get_config_vars(&parsed),
-                                                prerequisites: get_prerequisites_status(&parsed, &self.env_vars, &self.available_commands),
-                                                setup_needed: !matches_prerequisites(&parsed, &self.env_vars, &self.available_commands),
-                                                readiness_status: if matches_prerequisites(&parsed, &self.env_vars, &self.available_commands) {
+                                                prerequisites: get_prerequisites_status(
+                                                    &parsed,
+                                                    &self.env_vars,
+                                                    &self.available_commands,
+                                                ),
+                                                setup_needed: !matches_prerequisites(
+                                                    &parsed,
+                                                    &self.env_vars,
+                                                    &self.available_commands,
+                                                ),
+                                                readiness_status: if matches_prerequisites(
+                                                    &parsed,
+                                                    &self.env_vars,
+                                                    &self.available_commands,
+                                                ) {
                                                     "ready".to_string()
                                                 } else {
                                                     "setup_needed".to_string()
@@ -438,14 +466,32 @@ impl SkillManager {
                                             .to_string(),
                                         tags: get_tags(&parsed),
                                         related_skills: get_related_skills(&parsed),
-                                        content: truncate_content(&parsed.body, MAX_CONTENT_DISPLAY_LENGTH),
-                                        body_summary: truncate_content(&parsed.body, MAX_BODY_SUMMARY_LENGTH),
+                                        content: truncate_content(
+                                            &parsed.body,
+                                            MAX_CONTENT_DISPLAY_LENGTH,
+                                        ),
+                                        body_summary: truncate_content(
+                                            &parsed.body,
+                                            MAX_BODY_SUMMARY_LENGTH,
+                                        ),
                                         path: skill_md.display().to_string(),
                                         linked_files: discover_linked_files(&path),
                                         config_vars: get_config_vars(&parsed),
-                                        prerequisites: get_prerequisites_status(&parsed, &self.env_vars, &self.available_commands),
-                                        setup_needed: !matches_prerequisites(&parsed, &self.env_vars, &self.available_commands),
-                                        readiness_status: if matches_prerequisites(&parsed, &self.env_vars, &self.available_commands) {
+                                        prerequisites: get_prerequisites_status(
+                                            &parsed,
+                                            &self.env_vars,
+                                            &self.available_commands,
+                                        ),
+                                        setup_needed: !matches_prerequisites(
+                                            &parsed,
+                                            &self.env_vars,
+                                            &self.available_commands,
+                                        ),
+                                        readiness_status: if matches_prerequisites(
+                                            &parsed,
+                                            &self.env_vars,
+                                            &self.available_commands,
+                                        ) {
                                             "ready".to_string()
                                         } else {
                                             "setup_needed".to_string()
@@ -500,9 +546,9 @@ impl SkillManager {
         }
 
         // Build skill content
-        let content = input.content.unwrap_or_else(|| {
-            format!("# {}\n\n{}", input.name, input.description)
-        });
+        let content = input
+            .content
+            .unwrap_or_else(|| format!("# {}\n\n{}", input.name, input.description));
 
         // Build SKILL.md
         let mut frontmatter = format!(
@@ -535,7 +581,11 @@ impl SkillManager {
                 success: false,
                 name: input.name.clone(),
                 path: skill_dir.display().to_string(),
-                message: format!("Skill '{}' already exists at {}", input.name, skill_dir.display()),
+                message: format!(
+                    "Skill '{}' already exists at {}",
+                    input.name,
+                    skill_dir.display()
+                ),
             };
         }
 
@@ -578,9 +628,8 @@ impl SkillManager {
                         let skill_md = path.join("SKILL.md");
                         if skill_md.exists() {
                             if let Ok(parsed) = parse_skill_file(&skill_md) {
-                                let skill_name = get_skill_name(&parsed)
-                                    .unwrap_or_default()
-                                    .to_string();
+                                let skill_name =
+                                    get_skill_name(&parsed).unwrap_or_default().to_string();
 
                                 if skill_name.eq_ignore_ascii_case(&input.name) {
                                     // Perform the edit
@@ -590,28 +639,40 @@ impl SkillManager {
                                         new_content = new_body.clone();
                                     }
 
-                                    if let (Some(ref search), Some(ref replace)) = (&input.search, &input.replace) {
+                                    if let (Some(ref search), Some(ref replace)) =
+                                        (&input.search, &input.replace)
+                                    {
                                         if !new_content.contains(search) {
                                             return SkillEditOutput {
                                                 success: false,
                                                 name: input.name.clone(),
                                                 path: skill_md.display().to_string(),
-                                                message: format!("Search string '{}' not found in skill content", search),
+                                                message: format!(
+                                                    "Search string '{}' not found in skill content",
+                                                    search
+                                                ),
                                             };
                                         }
                                         new_content = new_content.replace(search, replace);
                                     }
 
                                     // Rebuild the file
-                                    let new_frontmatter = if let Some(ref desc) = input.description {
-                                        format!("---\nname: {}\ndescription: {}\n---\n\n", skill_name, desc)
+                                    let new_frontmatter = if let Some(ref desc) = input.description
+                                    {
+                                        format!(
+                                            "---\nname: {}\ndescription: {}\n---\n\n",
+                                            skill_name, desc
+                                        )
                                     } else {
-                                        format!("---\nname: {}\ndescription: {}\n---\n\n",
+                                        format!(
+                                            "---\nname: {}\ndescription: {}\n---\n\n",
                                             skill_name,
-                                            get_skill_description(&parsed).unwrap_or_default())
+                                            get_skill_description(&parsed).unwrap_or_default()
+                                        )
                                     };
 
-                                    let full_content = format!("{}{}", new_frontmatter, new_content);
+                                    let full_content =
+                                        format!("{}{}", new_frontmatter, new_content);
 
                                     if let Err(e) = fs::write(&skill_md, &full_content) {
                                         return SkillEditOutput {
@@ -656,17 +717,19 @@ impl SkillManager {
                         let skill_md = path.join("SKILL.md");
                         if skill_md.exists() {
                             if let Ok(parsed) = parse_skill_file(&skill_md) {
-                                let skill_name = get_skill_name(&parsed)
-                                    .unwrap_or_default()
-                                    .to_string();
+                                let skill_name =
+                                    get_skill_name(&parsed).unwrap_or_default().to_string();
 
                                 if skill_name.eq_ignore_ascii_case(&name) {
                                     if !input.force {
                                         return SkillDeleteOutput {
                                             success: false,
                                             name: name.clone(),
-                                            message: format!("Skill '{}' found at {}. Use force=true to delete.",
-                                                name, path.display()),
+                                            message: format!(
+                                                "Skill '{}' found at {}. Use force=true to delete.",
+                                                name,
+                                                path.display()
+                                            ),
                                         };
                                     }
 
@@ -731,9 +794,10 @@ impl SkillManager {
         let trigger_reason = triggers.primary_reason();
 
         // Generate skill content based on context
-        let name = input.name.clone().unwrap_or_else(|| {
-            generate_skill_name(&task_description)
-        });
+        let name = input
+            .name
+            .clone()
+            .unwrap_or_else(|| generate_skill_name(&task_description));
 
         let content = generate_skill_content(&name, &task_description, &triggers);
 
@@ -871,7 +935,8 @@ fn generate_skill_content(
     let prerequisites = extract_prerequisites(task_description);
 
     // Build skill content
-    let mut content = format!(r#"# {}
+    let mut content = format!(
+        r#"# {}
 
 {}
 
@@ -891,9 +956,21 @@ fn generate_skill_content(
             task_description
         },
         triggers.complexity_score,
-        if triggers.tool_call_trigger { "high" } else { "normal" },
-        if triggers.error_trigger { "repeated" } else { "none" },
-        if triggers.correction_trigger { "detected" } else { "none" },
+        if triggers.tool_call_trigger {
+            "high"
+        } else {
+            "normal"
+        },
+        if triggers.error_trigger {
+            "repeated"
+        } else {
+            "none"
+        },
+        if triggers.correction_trigger {
+            "detected"
+        } else {
+            "none"
+        },
         use_cases,
     );
 
@@ -941,9 +1018,22 @@ fn extract_use_cases(description: &str) -> String {
     }
 
     let keywords = vec![
-        "deploy", "build", "test", "create", "manage", "monitor",
-        "backup", "restore", "analyze", "generate", "process",
-        "convert", "migrate", "configure", "install", "setup",
+        "deploy",
+        "build",
+        "test",
+        "create",
+        "manage",
+        "monitor",
+        "backup",
+        "restore",
+        "analyze",
+        "generate",
+        "process",
+        "convert",
+        "migrate",
+        "configure",
+        "install",
+        "setup",
     ];
 
     let desc_lower = description.to_lowercase();
@@ -957,9 +1047,19 @@ fn extract_use_cases(description: &str) -> String {
     }
 
     if matched.is_empty() {
-        format!("When working with: {}", description.split_whitespace().take(5).collect::<Vec<_>>().join(" "))
+        format!(
+            "When working with: {}",
+            description
+                .split_whitespace()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
     } else {
-        format!("When you need to {} (detected from context)", matched.join(", "))
+        format!(
+            "When you need to {} (detected from context)",
+            matched.join(", ")
+        )
     }
 }
 
@@ -972,7 +1072,12 @@ fn extract_procedures(description: &str) -> Vec<String> {
     for line in description.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with(|c: char| c.is_numeric() && trimmed.contains('.')) {
-            procedures.push(trimmed.chars().skip_while(|c| c.is_numeric() || *c == '.' || c.is_whitespace()).collect());
+            procedures.push(
+                trimmed
+                    .chars()
+                    .skip_while(|c| c.is_numeric() || *c == '.' || c.is_whitespace())
+                    .collect(),
+            );
         }
     }
 
@@ -1020,7 +1125,10 @@ fn matches_prerequisites(
     env_vars: &HashMap<String, String>,
     commands: &[String],
 ) -> bool {
-    matches!(check_prerequisites(parsed, env_vars, commands), PrerequisitesCheck::Met)
+    matches!(
+        check_prerequisites(parsed, env_vars, commands),
+        PrerequisitesCheck::Met
+    )
 }
 
 fn get_prerequisites_status(
@@ -1034,7 +1142,10 @@ fn get_prerequisites_status(
             missing_env_vars: Vec::new(),
             missing_commands: Vec::new(),
         },
-        PrerequisitesCheck::Missing { env_vars: missing_env, commands: missing_cmds } => SkillPrerequisitesStatus {
+        PrerequisitesCheck::Missing {
+            env_vars: missing_env,
+            commands: missing_cmds,
+        } => SkillPrerequisitesStatus {
             met: false,
             missing_env_vars: missing_env,
             missing_commands: missing_cmds,
@@ -1052,11 +1163,18 @@ fn discover_linked_files(skill_dir: &Path) -> SkillLinkedFiles {
             let path = entry.path();
             if path.is_file() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("references/") || path.to_string_lossy().contains("/references/") {
+                    if name.starts_with("references/")
+                        || path.to_string_lossy().contains("/references/")
+                    {
                         references.push(name.to_string());
-                    } else if name.starts_with("templates/") || path.to_string_lossy().contains("/templates/") {
+                    } else if name.starts_with("templates/")
+                        || path.to_string_lossy().contains("/templates/")
+                    {
                         templates.push(name.to_string());
-                    } else if name.ends_with(".sh") || name.ends_with(".py") || name.ends_with(".js") {
+                    } else if name.ends_with(".sh")
+                        || name.ends_with(".py")
+                        || name.ends_with(".js")
+                    {
                         scripts.push(name.to_string());
                     }
                 }
@@ -1074,7 +1192,10 @@ fn discover_linked_files(skill_dir: &Path) -> SkillLinkedFiles {
 fn get_platforms(parsed: &crate::skill_manifest::ParsedSkill) -> Vec<String> {
     if let Some(manifest) = &parsed.manifest {
         if let Some(platforms) = &manifest.platforms {
-            return platforms.iter().map(|p| format!("{:?}", p).to_lowercase()).collect();
+            return platforms
+                .iter()
+                .map(|p| format!("{:?}", p).to_lowercase())
+                .collect();
         }
     }
     Vec::new()
@@ -1099,8 +1220,8 @@ pub(crate) fn generate_skill_name(description: &str) -> String {
 
 // ─── Handoff Command Handler ───────────────────────────────────────────────────
 
+use memory::types::{Blocker, Decision, HandoffData, WorkItem, WorkItemStatus};
 use memory::HandoffManager;
-use memory::types::{HandoffData, WorkItem, WorkItemStatus, Decision, Blocker};
 
 /// Handle /handoff slash command
 pub fn handle_handoff_command(
@@ -1125,7 +1246,10 @@ pub fn handle_handoff_command(
         }
         "load" | "resume" => {
             let sid = session_id.as_ref().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Session ID required for load")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Session ID required for load",
+                )
             })?;
 
             match manager.load(sid) {
@@ -1134,31 +1258,29 @@ pub fn handle_handoff_command(
                 Err(e) => Ok(format!("Error loading handoff: {}", e)),
             }
         }
-        "list" => {
-            match manager.load_latest() {
-                Ok(Some(data)) => {
-                    let output = format!(
-                        "Latest handoff:\n\
+        "list" => match manager.load_latest() {
+            Ok(Some(data)) => {
+                let output = format!(
+                    "Latest handoff:\n\
                          Session: {}\n\
                          Time: {}\n\
                          Summary: {}",
-                        data.session_id,
-                        data.timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
-                        data.summary
-                    );
-                    Ok(output)
-                }
-                Ok(None) => Ok("No handoffs found. Use /handoff save <session-id> to create one.".to_string()),
-                Err(e) => Ok(format!("Error listing handoffs: {}", e)),
+                    data.session_id,
+                    data.timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
+                    data.summary
+                );
+                Ok(output)
             }
-        }
-        "latest" => {
-            match manager.load_latest() {
-                Ok(Some(data)) => Ok(render_handoff_data(&data)),
-                Ok(None) => Ok("No handoffs found.".to_string()),
-                Err(e) => Ok(format!("Error loading latest: {}", e)),
+            Ok(None) => {
+                Ok("No handoffs found. Use /handoff save <session-id> to create one.".to_string())
             }
-        }
+            Err(e) => Ok(format!("Error listing handoffs: {}", e)),
+        },
+        "latest" => match manager.load_latest() {
+            Ok(Some(data)) => Ok(render_handoff_data(&data)),
+            Ok(None) => Ok("No handoffs found.".to_string()),
+            Err(e) => Ok(format!("Error loading latest: {}", e)),
+        },
         "help" => Ok(render_handoff_help()),
         _ => Ok(format!(
             "Unknown handoff action: {}\n\n{}",
@@ -1179,31 +1301,29 @@ pub fn handle_handoff_command_json(
     let manager = HandoffManager::with_dir(handoff_dir);
 
     match action {
-        "list" | "latest" => {
-            match manager.load_latest() {
-                Ok(Some(data)) => Ok(serde_json::json!({
-                    "success": true,
-                    "action": action,
-                    "handoff": {
-                        "session_id": data.session_id,
-                        "timestamp": data.timestamp.to_rfc3339(),
-                        "summary": data.summary,
-                        "work_items_count": data.work_items.len(),
-                        "decisions_count": data.decisions.len(),
-                        "blockers_count": data.blockers.len(),
-                    }
-                })),
-                Ok(None) => Ok(serde_json::json!({
-                    "success": false,
-                    "action": action,
-                    "message": "No handoffs found"
-                })),
-                Err(e) => Ok(serde_json::json!({
-                    "success": false,
-                    "error": e.to_string()
-                })),
-            }
-        }
+        "list" | "latest" => match manager.load_latest() {
+            Ok(Some(data)) => Ok(serde_json::json!({
+                "success": true,
+                "action": action,
+                "handoff": {
+                    "session_id": data.session_id,
+                    "timestamp": data.timestamp.to_rfc3339(),
+                    "summary": data.summary,
+                    "work_items_count": data.work_items.len(),
+                    "decisions_count": data.decisions.len(),
+                    "blockers_count": data.blockers.len(),
+                }
+            })),
+            Ok(None) => Ok(serde_json::json!({
+                "success": false,
+                "action": action,
+                "message": "No handoffs found"
+            })),
+            Err(e) => Ok(serde_json::json!({
+                "success": false,
+                "error": e.to_string()
+            })),
+        },
         "load" | "resume" => {
             let sid = session_id.as_ref().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "Session ID required")
@@ -1254,18 +1374,22 @@ pub fn create_session_handoff(
     let handoff_dir = cwd.join(".cowd/handoffs");
     let manager = HandoffManager::with_dir(handoff_dir.clone());
 
-    let handoff = manager.create_handoff(
-        session_id,
-        None, // current task
-        vec![], // completed
-        work_items,
-        decisions,
-        blockers,
-        next_action,
-        context_notes,
-    ).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let handoff = manager
+        .create_handoff(
+            session_id,
+            None,   // current task
+            vec![], // completed
+            work_items,
+            decisions,
+            blockers,
+            next_action,
+            context_notes,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-    manager.save(&handoff).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    manager
+        .save(&handoff)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
     Ok(format!(
         "Handoff created for session '{}'\nSaved to: {}",
@@ -1276,21 +1400,23 @@ pub fn create_session_handoff(
 
 /// Resume from a handoff
 #[allow(dead_code)]
-pub async fn resume_from_handoff(
-    session_id: &str,
-    cwd: &Path,
-) -> std::io::Result<HandoffData> {
+pub async fn resume_from_handoff(session_id: &str, cwd: &Path) -> std::io::Result<HandoffData> {
     let handoff_dir = cwd.join(".cowd/handoffs");
     let manager = HandoffManager::with_dir(handoff_dir);
 
-    let data = manager.load(session_id)
+    let data = manager
+        .load(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-        .ok_or_else(|| std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("No handoff found for session '{}'", session_id)
-        ))?;
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("No handoff found for session '{}'", session_id),
+            )
+        })?;
 
-    manager.resume(data.clone()).await
+    manager
+        .resume(data.clone())
+        .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
     Ok(data)
@@ -1339,9 +1465,7 @@ fn render_handoff_data(data: &HandoffData) -> String {
         for decision in &data.decisions {
             output.push_str(&format!(
                 "### {} ({:?})\n> {}\n\n",
-                decision.summary,
-                decision.status,
-                decision.rationale
+                decision.summary, decision.status, decision.rationale
             ));
         }
     }
@@ -1352,8 +1476,7 @@ fn render_handoff_data(data: &HandoffData) -> String {
             let hint = blocker.resolution_hint.as_deref().unwrap_or("No hint");
             output.push_str(&format!(
                 "- **{}** _(hint: {})_\n",
-                blocker.description,
-                hint
+                blocker.description, hint
             ));
         }
         output.push('\n');
@@ -1382,7 +1505,8 @@ Examples:
   /handoff latest             Show the most recent handoff
 
 Handoffs are saved to .cowd/handoffs/ as JSON and Markdown files.
-"#.to_string()
+"#
+    .to_string()
 }
 
 #[cfg(test)]

@@ -13,17 +13,15 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use crate::{ MemoryScope,
-    compression::{
-        llm_summarizer::LlmSummarizer,
-        Result,
-    },
+use crate::{
+    compression::{llm_summarizer::LlmSummarizer, Result},
     config::CompressionConfig,
     orchestrator::MemoryOrchestrator,
     types::{
         CompactionResult, MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Message,
         MessageRole, Priority,
     },
+    MemoryScope,
 };
 
 /// Preamble for LLM summarization prompts (hermes-agent inspired).
@@ -227,7 +225,7 @@ impl SessionCompactor {
     // -----------------------------------------------------------------------
 
     /// Approximate token count using the improved estimator.
-    #[must_use] 
+    #[must_use]
     pub fn estimate_tokens(&self, messages: &[Message]) -> u32 {
         super::token_estimation::estimate_tokens_messages(messages)
     }
@@ -252,7 +250,11 @@ impl SessionCompactor {
     ///
     /// When `previous_summary` is `Some`, the prompt instructs the LLM to
     /// update the existing summary iteratively rather than creating a new one.
-    async fn generate_summary(&self, messages: &[Message], previous_summary: Option<&str>) -> String {
+    async fn generate_summary(
+        &self,
+        messages: &[Message],
+        previous_summary: Option<&str>,
+    ) -> String {
         // Try LLM summariser first
         if let Some(ref summarizer) = self.llm_summarizer {
             let content: String = messages
@@ -277,11 +279,7 @@ impl SessionCompactor {
                     STRUCTURED_SUMMARY_TEMPLATE,
                 )
             } else {
-                format!(
-                    "{} {}",
-                    SUMMARIZER_PREAMBLE,
-                    STRUCTURED_SUMMARY_TEMPLATE,
-                )
+                format!("{} {}", SUMMARIZER_PREAMBLE, STRUCTURED_SUMMARY_TEMPLATE,)
             };
 
             let effective_content = if previous_summary.is_some() {
@@ -322,7 +320,11 @@ impl SessionCompactor {
     }
 
     /// Template-based heuristic summary generation (fallback).
-    fn generate_summary_template(&self, messages: &[Message], previous_summary: Option<&str>) -> String {
+    fn generate_summary_template(
+        &self,
+        messages: &[Message],
+        previous_summary: Option<&str>,
+    ) -> String {
         let context = self.extract_context(messages);
         let decisions_text = self.extract_decisions(messages).join("\n- ");
         let code_changes = self.extract_code_changes(messages);
@@ -346,9 +348,7 @@ impl SessionCompactor {
         };
 
         let previous_block = previous_summary.map_or_else(String::new, |prev| {
-            format!(
-                "\n## Previous Summary (preserved)\n{prev}\n\n## New Content\n"
-            )
+            format!("\n## Previous Summary (preserved)\n{prev}\n\n## New Content\n")
         });
 
         format!(
@@ -410,10 +410,9 @@ None
         use std::collections::HashMap;
 
         const FILE_EXTENSIONS: &[&str] = &[
-            ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java",
-            ".c", ".cpp", ".h", ".hpp", ".toml", ".yaml", ".yml", ".json",
-            ".md", ".txt", ".sql", ".html", ".css", ".scss", ".vue", ".svelte",
-            ".rb", ".php", ".swift", ".kt", ".scala",
+            ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".c", ".cpp", ".h", ".hpp",
+            ".toml", ".yaml", ".yml", ".json", ".md", ".txt", ".sql", ".html", ".css", ".scss",
+            ".vue", ".svelte", ".rb", ".php", ".swift", ".kt", ".scala",
         ];
 
         let mut file_actions: HashMap<String, usize> = HashMap::new();
@@ -422,14 +421,23 @@ None
             let action = msg.tool_name.as_deref().unwrap_or("reference");
             for word in msg.content.split_whitespace() {
                 let clean = word.trim_matches(|c: char| {
-                    c == '"' || c == '\'' || c == ',' || c == ';'
-                        || c == ':' || c == '(' || c == ')' || c == '[' || c == ']'
+                    c == '"'
+                        || c == '\''
+                        || c == ','
+                        || c == ';'
+                        || c == ':'
+                        || c == '('
+                        || c == ')'
+                        || c == '['
+                        || c == ']'
                 });
                 if FILE_EXTENSIONS
                     .iter()
                     .any(|ext| clean.ends_with(ext) && clean.len() > ext.len())
                 {
-                    *file_actions.entry(format!("{clean} ({action})")).or_default() += 1;
+                    *file_actions
+                        .entry(format!("{clean} ({action})"))
+                        .or_default() += 1;
                 }
             }
         }
@@ -446,8 +454,11 @@ None
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
 
         for (i, (file, n)) in sorted.iter().enumerate() {
-            let entry = if i > 0 { format!(" {file} (action×{n})") }
-                        else { format!("{file} (action×{n})") };
+            let entry = if i > 0 {
+                format!(" {file} (action×{n})")
+            } else {
+                format!("{file} (action×{n})")
+            };
             if xml.len() + entry.len() + "</files></snapshot>".len() > max_bytes {
                 break;
             }
@@ -479,7 +490,14 @@ None
 
     fn extract_decisions(&self, messages: &[Message]) -> Vec<String> {
         // Heuristic: lines containing "decided", "chosen", "agreed", "will use"
-        let keywords = ["decided", "chosen", "agreed", "will use", "we should", "let's use"];
+        let keywords = [
+            "decided",
+            "chosen",
+            "agreed",
+            "will use",
+            "we should",
+            "let's use",
+        ];
         let mut decisions = Vec::new();
         for msg in messages {
             for line in msg.content.lines() {
@@ -502,14 +520,12 @@ None
             .iter()
             .filter(|m| {
                 m.is_tool_result()
-                    && m.tool_name
-                        .as_deref()
-                        .is_some_and(|n| {
-                            n.contains("write")
-                                || n.contains("edit")
-                                || n.contains("create")
-                                || n.contains("replace")
-                        })
+                    && m.tool_name.as_deref().is_some_and(|n| {
+                        n.contains("write")
+                            || n.contains("edit")
+                            || n.contains("create")
+                            || n.contains("replace")
+                    })
             })
             .count();
         if write_ops == 0 {
@@ -537,7 +553,8 @@ None
 
     fn extract_patterns(&self, messages: &[Message]) -> String {
         // Heuristic: look for repeated keywords/phrases across messages
-        let mut keyword_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut keyword_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         for msg in messages {
             for word in msg.content.split_whitespace() {
                 let w = word.to_lowercase();
@@ -559,7 +576,16 @@ None
     }
 
     fn extract_preferences(&self, messages: &[Message]) -> String {
-        let keywords = ["prefer", "like", "always", "never", "use", "don't use", "avoid", "recommend"];
+        let keywords = [
+            "prefer",
+            "like",
+            "always",
+            "never",
+            "use",
+            "don't use",
+            "avoid",
+            "recommend",
+        ];
         let mut prefs = Vec::new();
         for msg in messages {
             for line in msg.content.lines() {
@@ -603,10 +629,14 @@ None
         messages
             .iter()
             .rev()
-            .find(|m| matches!(m.role, MessageRole::Assistant) && !m.content.trim().is_empty()).map_or_else(|| "State unknown.".into(), |m| {
-                let s: String = m.content.chars().take(500).collect();
-                s
-            })
+            .find(|m| matches!(m.role, MessageRole::Assistant) && !m.content.trim().is_empty())
+            .map_or_else(
+                || "State unknown.".into(),
+                |m| {
+                    let s: String = m.content.chars().take(500).collect();
+                    s
+                },
+            )
     }
 
     fn infer_next_steps(&self, messages: &[Message]) -> String {
@@ -723,13 +753,23 @@ mod tests {
     use crate::types::{Message, MessageRole};
 
     fn msg(role: MessageRole, content: &str) -> Message {
-        Message { turn_index: 0, role, content: content.into(), tool_use_id: None, tool_name: None, pinned: false }
+        Message {
+            turn_index: 0,
+            role,
+            content: content.into(),
+            tool_use_id: None,
+            tool_name: None,
+            pinned: false,
+        }
     }
 
     #[test]
     fn should_compact_false_below_threshold() {
         let compactor = SessionCompactor::new();
-        let messages = vec![msg(MessageRole::User, "hi"), msg(MessageRole::Assistant, "hello")];
+        let messages = vec![
+            msg(MessageRole::User, "hi"),
+            msg(MessageRole::Assistant, "hello"),
+        ];
         assert!(!compactor.should_compact(&messages));
     }
 
@@ -749,7 +789,9 @@ mod tests {
     #[test]
     fn split_messages_preserves_recent() {
         let compactor = SessionCompactor::new();
-        let messages: Vec<_> = (0..15).map(|i| msg(MessageRole::User, &format!("msg{i}"))).collect();
+        let messages: Vec<_> = (0..15)
+            .map(|i| msg(MessageRole::User, &format!("msg{i}")))
+            .collect();
         let (old, recent) = compactor.split_messages(messages);
         assert_eq!(recent.len(), 10);
         assert_eq!(old.len(), 5);
@@ -758,7 +800,10 @@ mod tests {
     #[test]
     fn extract_decisions_finds_keywords() {
         let compactor = SessionCompactor::new();
-        let messages = vec![msg(MessageRole::User, "I decided to use Axum for the web framework")];
+        let messages = vec![msg(
+            MessageRole::User,
+            "I decided to use Axum for the web framework",
+        )];
         let decisions = compactor.extract_decisions(&messages);
         assert!(!decisions.is_empty());
     }

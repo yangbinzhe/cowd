@@ -8,11 +8,11 @@
 //! Currently KG is in-memory only. After GREEN implementation, entity
 //! data will be persisted alongside MemoryEntries.
 
-use cowd_memory::{ MemoryScope,
-    CognitiveContextManager, MemoryConfig,
-    MemoryEntry, MemoryLayer, MemoryCategory, MemorySource, Priority,
-};
 use cowd_memory::config::{BudgetConfig, StoreConfig};
+use cowd_memory::{
+    CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
+    MemorySource, Priority,
+};
 
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
@@ -50,7 +50,8 @@ async fn test_kg_survives_restart() {
     // ===== Phase 1: 创建第一个实例，插入记忆 =====
     {
         let config = test_config(&db_path);
-        let mgr = CognitiveContextManager::new(config).await
+        let mgr = CognitiveContextManager::new(config)
+            .await
             .expect("Should create first instance");
 
         // 插入带有实体信息的记忆
@@ -76,7 +77,9 @@ async fn test_kg_survives_restart() {
             source_agent: None,
             visibility: cowd_memory::AgentVisibility::default(),
         };
-        mgr.remember(entry_rust).await.expect("Should remember entry");
+        mgr.remember(entry_rust)
+            .await
+            .expect("Should remember entry");
 
         let entry_cowd = MemoryEntry {
             id: uuid::Uuid::new_v4(),
@@ -100,15 +103,22 @@ async fn test_kg_survives_restart() {
             source_agent: None,
             visibility: cowd_memory::AgentVisibility::default(),
         };
-        mgr.remember(entry_cowd).await.expect("Should remember entry");
+        mgr.remember(entry_cowd)
+            .await
+            .expect("Should remember entry");
 
         let layers = mgr.list_layers().await;
         eprintln!("Phase 1: L3 entry count: {:?}", layers);
-        let l3_count: u32 = layers.iter()
+        let l3_count: u32 = layers
+            .iter()
             .filter_map(|v| {
                 let layer = v.get("layer").and_then(|l| l.as_str()).unwrap_or("");
                 let count = v.get("entry_count").and_then(|c| c.as_u64()).unwrap_or(0);
-                if layer == "L3" { Some(count as u32) } else { None }
+                if layer == "L3" {
+                    Some(count as u32)
+                } else {
+                    None
+                }
             })
             .next()
             .unwrap_or(0);
@@ -119,16 +129,22 @@ async fn test_kg_survives_restart() {
     // ===== Phase 2: "重启" - 用同个 DB 路径创建新实例 =====
     {
         let config = test_config(&db_path);
-        let mgr = CognitiveContextManager::new(config).await
+        let mgr = CognitiveContextManager::new(config)
+            .await
             .expect("Should create second instance (after simulated restart)");
 
         let layers = mgr.list_layers().await;
         eprintln!("Phase 2 (after restart): L3 entry count: {:?}", layers);
-        let l3_count: u32 = layers.iter()
+        let l3_count: u32 = layers
+            .iter()
             .filter_map(|v| {
                 let layer = v.get("layer").and_then(|l| l.as_str()).unwrap_or("");
                 let count = v.get("entry_count").and_then(|c| c.as_u64()).unwrap_or(0);
-                if layer == "L3" { Some(count as u32) } else { None }
+                if layer == "L3" {
+                    Some(count as u32)
+                } else {
+                    None
+                }
             })
             .next()
             .unwrap_or(0);
@@ -168,7 +184,10 @@ async fn test_kg_entities_restored_after_reboot() {
                 priority: Priority::Normal,
                 source: MemorySource::AutoExtracted,
                 title: format!("Entity test entry {}", i),
-                content: format!("This entry tests knowledge graph entity persistence for entity_{}", i),
+                content: format!(
+                    "This entry tests knowledge graph entity persistence for entity_{}",
+                    i
+                ),
                 embedding: None,
                 tags: vec![entity_tag.clone(), format!("entity_{}", i)],
                 relations: vec![],
@@ -180,18 +199,23 @@ async fn test_kg_entities_restored_after_reboot() {
                 last_accessed_at: None,
                 scope: MemoryScope::default(),
                 session_id: None,
-            source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+                source_agent: None,
+                visibility: cowd_memory::AgentVisibility::default(),
             };
             mgr.remember(entry).await.expect("Should remember entry");
         }
 
         let layers = mgr.list_layers().await;
-        let l3_count: u32 = layers.iter()
+        let l3_count: u32 = layers
+            .iter()
             .filter_map(|v| {
                 let layer = v.get("layer").and_then(|l| l.as_str()).unwrap_or("");
                 let count = v.get("entry_count").and_then(|c| c.as_u64()).unwrap_or(0);
-                if layer == "L3" { Some(count as u32) } else { None }
+                if layer == "L3" {
+                    Some(count as u32)
+                } else {
+                    None
+                }
             })
             .next()
             .unwrap_or(0);
@@ -205,19 +229,23 @@ async fn test_kg_entities_restored_after_reboot() {
         let mgr = CognitiveContextManager::new(config).await.unwrap();
 
         let layers = mgr.list_layers().await;
-        let l3_count: u32 = layers.iter()
+        let l3_count: u32 = layers
+            .iter()
             .filter_map(|v| {
                 let layer = v.get("layer").and_then(|l| l.as_str()).unwrap_or("");
                 let count = v.get("entry_count").and_then(|c| c.as_u64()).unwrap_or(0);
-                if layer == "L3" { Some(count as u32) } else { None }
+                if layer == "L3" {
+                    Some(count as u32)
+                } else {
+                    None
+                }
             })
             .next()
             .unwrap_or(0);
         eprintln!("Phase 2: found {} entries in L3", l3_count);
 
         assert_eq!(
-            l3_count as usize,
-            entity_count_phase1,
+            l3_count as usize, entity_count_phase1,
             "Entity-tagged entries should survive restart"
         );
     }
@@ -266,18 +294,23 @@ async fn test_kg_triples_restored_with_correct_confidence() {
                 last_accessed_at: None,
                 scope: MemoryScope::default(),
                 session_id: None,
-            source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+                source_agent: None,
+                visibility: cowd_memory::AgentVisibility::default(),
             };
             mgr.remember(entry).await.expect("Should remember entry");
         }
 
         let layers = mgr.list_layers().await;
-        let l3_count: u32 = layers.iter()
+        let l3_count: u32 = layers
+            .iter()
             .filter_map(|v| {
                 let layer = v.get("layer").and_then(|l| l.as_str()).unwrap_or("");
                 let count = v.get("entry_count").and_then(|c| c.as_u64()).unwrap_or(0);
-                if layer == "L3" { Some(count as u32) } else { None }
+                if layer == "L3" {
+                    Some(count as u32)
+                } else {
+                    None
+                }
             })
             .next()
             .unwrap_or(0);
@@ -291,11 +324,16 @@ async fn test_kg_triples_restored_with_correct_confidence() {
         let mgr = CognitiveContextManager::new(config).await.unwrap();
 
         let layers = mgr.list_layers().await;
-        let l3_count: u32 = layers.iter()
+        let l3_count: u32 = layers
+            .iter()
             .filter_map(|v| {
                 let layer = v.get("layer").and_then(|l| l.as_str()).unwrap_or("");
                 let count = v.get("entry_count").and_then(|c| c.as_u64()).unwrap_or(0);
-                if layer == "L3" { Some(count as u32) } else { None }
+                if layer == "L3" {
+                    Some(count as u32)
+                } else {
+                    None
+                }
             })
             .next()
             .unwrap_or(0);
@@ -303,7 +341,8 @@ async fn test_kg_triples_restored_with_correct_confidence() {
 
         assert_eq!(
             l3_count, 3,
-            "RED: All 3 entries should survive restart (expected 3, got {})", l3_count
+            "RED: All 3 entries should survive restart (expected 3, got {})",
+            l3_count
         );
     }
 }

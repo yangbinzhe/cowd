@@ -150,10 +150,7 @@ impl FeishuWsClient {
         // Register pin — get WebSocket URL and client config
         let result = register_pin(&self.app_id, &self.app_secret).await?;
         let ws_url = result.ws_url;
-        let ping_interval_secs = result
-            .ping_interval
-            .map(|v| v.max(1) as u64)
-            .unwrap_or(90);
+        let ping_interval_secs = result.ping_interval.map(|v| v.max(1) as u64).unwrap_or(90);
 
         // Create event channel
         let (tx, rx) = mpsc::unbounded_channel();
@@ -201,7 +198,9 @@ pub async fn register_pin(app_id: &str, app_secret: &str) -> PlatformResult<Regi
         }))
         .send()
         .await
-        .map_err(|e| PlatformError::ConnectionFailed(format!("pin register request failed: {e}")))?;
+        .map_err(|e| {
+            PlatformError::ConnectionFailed(format!("pin register request failed: {e}"))
+        })?;
 
     let body: EndpointResponse = resp
         .json()
@@ -227,7 +226,10 @@ pub async fn register_pin(app_id: &str, app_secret: &str) -> PlatformResult<Regi
         ws_url,
         ping_interval: data.client_config.as_ref().and_then(|c| c.ping_interval),
         reconnect_count: data.client_config.as_ref().and_then(|c| c.reconnect_count),
-        reconnect_interval: data.client_config.as_ref().and_then(|c| c.reconnect_interval),
+        reconnect_interval: data
+            .client_config
+            .as_ref()
+            .and_then(|c| c.reconnect_interval),
         reconnect_nonce: data.client_config.as_ref().and_then(|c| c.reconnect_nonce),
     })
 }
@@ -389,8 +391,7 @@ async fn ws_read_loop(
                         continue;
                     }
                     FRAME_DATA => {
-                        let msg_type =
-                            frame.get_header(HEADER_TYPE).unwrap_or("").to_string();
+                        let msg_type = frame.get_header(HEADER_TYPE).unwrap_or("").to_string();
 
                         // Handle multi-part messages
                         let msg_id = frame
@@ -488,8 +489,7 @@ fn send_response_frame(
         payload_encoding: None,
         payload_type: None,
         payload: Some(
-            serde_json::to_vec(&serde_json::json!({"code": status_code}))
-                .unwrap_or_default(),
+            serde_json::to_vec(&serde_json::json!({"code": status_code})).unwrap_or_default(),
         ),
         log_id_new: None,
     };
@@ -553,13 +553,7 @@ impl FragmentBuffer {
 
     /// Add a fragment. Returns `Some(combined_bytes)` when all fragments
     /// have been received, `None` while waiting for more.
-    fn add(
-        &mut self,
-        msg_id: &str,
-        sum: i32,
-        seq: usize,
-        data: Vec<u8>,
-    ) -> Option<Vec<u8>> {
+    fn add(&mut self, msg_id: &str, sum: i32, seq: usize, data: Vec<u8>) -> Option<Vec<u8>> {
         if sum <= 1 {
             return Some(data);
         }
@@ -604,16 +598,14 @@ mod tests {
 
     #[test]
     fn test_reconnect_settings_are_stored() {
-        let client = FeishuWsClient::new("app", "sec")
-            .with_reconnect(5, 30);
+        let client = FeishuWsClient::new("app", "sec").with_reconnect(5, 30);
         assert_eq!(client.reconnect_max_attempts, 5);
         assert_eq!(client.reconnect_interval_secs, 30);
     }
 
     #[test]
     fn test_with_reconnect_zero_attempts() {
-        let client = FeishuWsClient::new("app", "sec")
-            .with_reconnect(0, 60);
+        let client = FeishuWsClient::new("app", "sec").with_reconnect(0, 60);
         assert_eq!(client.reconnect_max_attempts, 0);
         assert_eq!(client.reconnect_interval_secs, 60);
     }
@@ -639,7 +631,10 @@ mod tests {
         assert_eq!(parsed.code, 0);
         assert_eq!(parsed.msg, "");
         let data = parsed.data.expect("data present");
-        assert_eq!(data.url.as_deref(), Some("wss://msg-frontier.feishu.cn/ws/v2?token=abc"));
+        assert_eq!(
+            data.url.as_deref(),
+            Some("wss://msg-frontier.feishu.cn/ws/v2?token=abc")
+        );
         let cfg = data.client_config.expect("client config present");
         assert_eq!(cfg.ping_interval, Some(90));
         assert_eq!(cfg.reconnect_count, Some(-1));
@@ -693,7 +688,10 @@ mod tests {
         }"#;
         let parsed: EndpointResponse = serde_json::from_str(raw).expect("deserialize");
         let data = parsed.data.expect("data present");
-        assert_eq!(data.url.as_deref(), Some("wss://open.feishu.cn/ws/event/minimal"));
+        assert_eq!(
+            data.url.as_deref(),
+            Some("wss://open.feishu.cn/ws/event/minimal")
+        );
         assert!(data.client_config.is_none());
     }
 
@@ -905,22 +903,16 @@ mod tests {
         };
 
         let encoded = data_frame.encode_to_vec();
-        let messages: Vec<Result<Message, tokio_tungstenite::tungstenite::Error>> = vec![
-            Ok(Message::Binary(encoded.into())),
-        ];
+        let messages: Vec<Result<Message, tokio_tungstenite::tungstenite::Error>> =
+            vec![Ok(Message::Binary(encoded.into()))];
 
         let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        let handle = tokio::spawn(async move {
-            ws_read_loop(
-                stream::iter(messages),
-                &tx,
-                write_tx,
-                5,
-            )
-            .await
-        });
+        let handle =
+            tokio::spawn(
+                async move { ws_read_loop(stream::iter(messages), &tx, write_tx, 5).await },
+            );
 
         // Should receive the JSON event
         let event = rx.recv().await.expect("should receive event");
@@ -968,13 +960,7 @@ mod tests {
 
         drop(rx); // No events expected
 
-        let result = ws_read_loop(
-            stream::iter(messages),
-            &tx,
-            write_tx,
-            5,
-        )
-        .await;
+        let result = ws_read_loop(stream::iter(messages), &tx, write_tx, 5).await;
 
         // Should get Ok(false) because of the Close frame
         assert_eq!(result, Ok(false));
@@ -984,20 +970,13 @@ mod tests {
     async fn test_ws_read_loop_close_frame_returns_false() {
         use futures::stream;
 
-        let messages: Vec<Result<Message, tokio_tungstenite::tungstenite::Error>> = vec![
-            Ok(Message::Close(None)),
-        ];
+        let messages: Vec<Result<Message, tokio_tungstenite::tungstenite::Error>> =
+            vec![Ok(Message::Close(None))];
 
         let (tx, _rx) = mpsc::unbounded_channel::<serde_json::Value>();
         let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        let result = ws_read_loop(
-            stream::iter(messages),
-            &tx,
-            write_tx,
-            5,
-        )
-        .await;
+        let result = ws_read_loop(stream::iter(messages), &tx, write_tx, 5).await;
 
         assert_eq!(result, Ok(false));
     }
@@ -1023,22 +1002,15 @@ mod tests {
         };
 
         let encoded = data_frame.encode_to_vec();
-        let messages: Vec<Result<Message, tokio_tungstenite::tungstenite::Error>> = vec![
-            Ok(Message::Binary(encoded.into())),
-        ];
+        let messages: Vec<Result<Message, tokio_tungstenite::tungstenite::Error>> =
+            vec![Ok(Message::Binary(encoded.into()))];
 
         let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
         let (write_tx, mut _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         drop(rx); // Receiver already dropped
 
-        let result = ws_read_loop(
-            stream::iter(messages),
-            &tx,
-            write_tx,
-            5,
-        )
-        .await;
+        let result = ws_read_loop(stream::iter(messages), &tx, write_tx, 5).await;
 
         // Should detect receiver is gone and return Ok(true) after trying to send
         assert_eq!(result, Ok(true));
@@ -1059,13 +1031,7 @@ mod tests {
 
         drop(rx);
 
-        let result = ws_read_loop(
-            stream::iter(messages),
-            &tx,
-            write_tx,
-            5,
-        )
-        .await;
+        let result = ws_read_loop(stream::iter(messages), &tx, write_tx, 5).await;
 
         // Should skip garbage, hit Close, return false
         assert_eq!(result, Ok(false));
@@ -1075,20 +1041,13 @@ mod tests {
     async fn test_ws_read_loop_read_error_returns_err() {
         use futures::stream;
 
-        let messages: Vec<Result<Message, tokio_tungstenite::tungstenite::Error>> = vec![
-            Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed),
-        ];
+        let messages: Vec<Result<Message, tokio_tungstenite::tungstenite::Error>> =
+            vec![Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed)];
 
         let (tx, _rx) = mpsc::unbounded_channel::<serde_json::Value>();
         let (write_tx, _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        let result = ws_read_loop(
-            stream::iter(messages),
-            &tx,
-            write_tx,
-            5,
-        )
-        .await;
+        let result = ws_read_loop(stream::iter(messages), &tx, write_tx, 5).await;
 
         assert_eq!(result, Err(()));
     }
@@ -1168,9 +1127,10 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
         let (write_tx, mut _write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        let handle = tokio::spawn(async move {
-            ws_read_loop(stream::iter(messages), &tx, write_tx, 5).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { ws_read_loop(stream::iter(messages), &tx, write_tx, 5).await },
+            );
 
         let event = rx.recv().await.expect("should receive combined event");
         assert_eq!(event["multi"], "part");

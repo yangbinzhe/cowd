@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-
 use api::ToolDefinition;
 use plugins::PluginTool;
 use runtime::{
@@ -9,13 +8,16 @@ use runtime::{
     permission_enforcer::PermissionEnforcer,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
-    worker_boot::WorkerRegistry, McpDegradedReport, PermissionMode,
+    worker_boot::WorkerRegistry,
+    McpDegradedReport, PermissionMode,
 };
 use serde_json::Value;
 
 // Re-exports from split modules
+pub(crate) use tool_specs::{
+    deferred_tool_specs, normalize_tool_name, permission_mode_from_plugin,
+};
 pub use tool_specs::{mvp_tool_specs, ToolSpec};
-pub(crate) use tool_specs::{deferred_tool_specs, normalize_tool_name, permission_mode_from_plugin};
 
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
@@ -99,7 +101,15 @@ pub struct RuntimeToolDefinition {
 }
 
 /// M4: Global registry for self-registered tools (populated via register_tool! macro)
-pub static REGISTERED_TOOLS: std::sync::LazyLock<std::sync::Mutex<Vec<(String, String, std::sync::Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>)>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+pub static REGISTERED_TOOLS: std::sync::LazyLock<
+    std::sync::Mutex<
+        Vec<(
+            String,
+            String,
+            std::sync::Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>,
+        )>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 /// M4: Self-registering tool macro. Usage: `register_tool!("my_tool", "Does X", my_handler);`
 #[macro_export]
@@ -110,7 +120,11 @@ macro_rules! register_tool {
             $crate::REGISTERED_TOOLS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(($name.to_string(), $description.to_string(), std::sync::Arc::new($handler)));
+                .push((
+                    $name.to_string(),
+                    $description.to_string(),
+                    std::sync::Arc::new($handler),
+                ));
         }
     };
 }
@@ -368,6 +382,5 @@ pub use executor::{execute_tool, ToolSearchOutput};
 pub mod lane_completion;
 pub mod pdf_extract;
 pub mod sandbox_exec;
-pub mod web_tools;
 pub mod tool_specs;
-
+pub mod web_tools;

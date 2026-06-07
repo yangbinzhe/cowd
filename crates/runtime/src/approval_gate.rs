@@ -121,12 +121,8 @@ impl ApprovalHistoryStore {
     ) -> (Vec<ApprovalHistoryEntry>, usize) {
         let entries = self.entries.read().await;
         let total = entries.len();
-        let page: Vec<ApprovalHistoryEntry> = entries
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .cloned()
-            .collect();
+        let page: Vec<ApprovalHistoryEntry> =
+            entries.iter().skip(offset).take(limit).cloned().collect();
         (page, total)
     }
 }
@@ -227,7 +223,9 @@ impl SmartApprovalGate {
     }
 
     /// Get a reference to the pending approvals map (for API endpoints).
-    pub fn pending(&self) -> &Arc<RwLock<HashMap<String, (ApprovalRequest, oneshot::Sender<ApprovalVerdict>)>>> {
+    pub fn pending(
+        &self,
+    ) -> &Arc<RwLock<HashMap<String, (ApprovalRequest, oneshot::Sender<ApprovalVerdict>)>>> {
         &self.pending
     }
 
@@ -268,7 +266,9 @@ impl SmartApprovalGate {
         // Step 0: Same-session auto-approve
         let key = format!("{tool_name}:{}", &input[..input.len().min(80)]);
         if self.session_approved.lock().await.contains(&key) {
-            return ApprovalGateResult::AutoPass { reason: AutoPassReason::ReadOnlyCommand };
+            return ApprovalGateResult::AutoPass {
+                reason: AutoPassReason::ReadOnlyCommand,
+            };
         }
         // Step 1: Read-only tools always auto-pass
         if READ_ONLY_TOOLS.contains(&tool_name) {
@@ -304,9 +304,7 @@ impl SmartApprovalGate {
                 }
                 ApprovalGateResult::AutoPass { reason }
             }
-            SmartApprovalVerdict::NeedsApproval(request) => {
-                self.request_approval(request).await
-            }
+            SmartApprovalVerdict::NeedsApproval(request) => self.request_approval(request).await,
         }
     }
 
@@ -333,8 +331,6 @@ impl SmartApprovalGate {
         if let Some(sender) = &self.sse_sender {
             sender.send_approval_request(&request);
         }
-
-
 
         // Wait for response with timeout
         match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
@@ -509,7 +505,10 @@ impl SmartApprovalGate {
             }
         }
 
-        self.card_approval_map.write().await.remove(&card_approval_id);
+        self.card_approval_map
+            .write()
+            .await
+            .remove(&card_approval_id);
 
         Some(verdict)
     }
@@ -575,10 +574,7 @@ impl SmartApprovalGate {
     /// Get all pending approval requests (for GET /api/approval/pending).
     pub async fn get_pending_requests(&self) -> Vec<ApprovalRequest> {
         let pending = self.pending.read().await;
-        pending
-            .values()
-            .map(|(req, _)| req.clone())
-            .collect()
+        pending.values().map(|(req, _)| req.clone()).collect()
     }
 }
 
@@ -595,7 +591,9 @@ mod tests {
     #[tokio::test]
     async fn read_only_tools_auto_pass() {
         let gate = make_gate(ApprovalConfig::default());
-        let result = gate.evaluate("read_file", r#"{"path": "/etc/passwd"}"#).await;
+        let result = gate
+            .evaluate("read_file", r#"{"path": "/etc/passwd"}"#)
+            .await;
         assert!(matches!(
             result,
             ApprovalGateResult::AutoPass {
@@ -619,9 +617,7 @@ mod tests {
     #[tokio::test]
     async fn bash_read_only_command_auto_passes() {
         let gate = make_gate(ApprovalConfig::default());
-        let result = gate
-            .evaluate("bash", r#"{"command": "ls -la"}"#)
-            .await;
+        let result = gate.evaluate("bash", r#"{"command": "ls -la"}"#).await;
         assert!(matches!(
             result,
             ApprovalGateResult::AutoPass {
@@ -633,9 +629,7 @@ mod tests {
     #[tokio::test]
     async fn bash_safe_command_auto_passes() {
         let gate = make_gate(ApprovalConfig::default());
-        let result = gate
-            .evaluate("bash", r#"{"command": "echo hello"}"#)
-            .await;
+        let result = gate.evaluate("bash", r#"{"command": "echo hello"}"#).await;
         // echo is in read-only list
         assert!(matches!(result, ApprovalGateResult::AutoPass { .. }));
     }
@@ -731,8 +725,7 @@ mod tests {
 
     #[test]
     fn extract_command_from_json() {
-        let cmd =
-            SmartApprovalGate::extract_command(r#"{"command": "rm -rf /tmp"}"#);
+        let cmd = SmartApprovalGate::extract_command(r#"{"command": "rm -rf /tmp"}"#);
         assert_eq!(cmd, "rm -rf /tmp");
     }
 

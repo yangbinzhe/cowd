@@ -1,5 +1,23 @@
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const WEBUI_RUNTIME_FILES: &[&str] = &[
+    "index.html",
+    "style.css",
+    "api.js",
+    "boot.js",
+    "commands.js",
+    "messages.js",
+    "panels.js",
+    "sessions.js",
+    "state.js",
+    "sw.js",
+    "ui.js",
+    "workspace.js",
+    "manifest.json",
+];
 
 fn main() {
     // Get git SHA (short hash)
@@ -55,14 +73,14 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
 
-    // Copy webui/ → static/ so the embedded frontend stays in sync
+    // Copy only runtime WebUI assets. Test/build dependencies such as
+    // node_modules must never enter the generated CLI artifacts.
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let webui_dir = std::path::Path::new(&manifest_dir).join("../../webui");
-    let static_dir = std::path::Path::new(&manifest_dir).join("static");
+    let webui_dir = Path::new(&manifest_dir).join("../../webui");
+    let static_dir = Path::new(&manifest_dir).join("static");
 
     if webui_dir.exists() {
-        copy_dir_recursive(&webui_dir, &static_dir);
-        println!("cargo:rerun-if-changed=../../webui");
+        copy_webui_runtime_assets(&webui_dir, &static_dir);
 
         // Also copy webui/ → target/{profile}/webui/ so the binary can find it
         // relative to its own location at runtime.
@@ -71,26 +89,96 @@ fn main() {
             .map(|p| p.to_string())
             .unwrap_or_else(|_| {
                 let manifest = std::path::Path::new(&manifest_dir);
-                let workspace_root = manifest.parent().and_then(|p| p.parent()).unwrap_or(manifest);
+                let workspace_root = manifest
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .unwrap_or(manifest);
                 workspace_root.join("target").to_string_lossy().to_string()
             });
-        let target_webui = std::path::Path::new(&target_dir).join(&profile).join("webui");
-        copy_dir_recursive(&webui_dir, &target_webui);
+        let target_webui = Path::new(&target_dir).join(&profile).join("webui");
+        copy_webui_runtime_assets(&webui_dir, &target_webui);
     }
 }
 
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
-    if src.is_dir() {
-        std::fs::create_dir_all(dst).ok();
-        for entry in std::fs::read_dir(src).unwrap() {
-            let entry = entry.unwrap();
-            let src_path = entry.path();
-            let dst_path = dst.join(entry.file_name());
-            if src_path.is_dir() {
-                copy_dir_recursive(&src_path, &dst_path);
-            } else {
-                std::fs::copy(&src_path, &dst_path).ok();
-            }
+fn copy_webui_runtime_assets(src: &Path, dst: &Path) {
+    if let Err(error) = fs::remove_dir_all(dst) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            println!(
+                "cargo:warning=failed to clear generated WebUI dir {}: {error}",
+                dst.display()
+            );
+        }
+    }
+    if let Err(error) = fs::create_dir_all(dst) {
+        println!(
+            "cargo:warning=failed to create generated WebUI dir {}: {error}",
+            dst.display()
+        );
+        return;
+    }
+
+    for file in WEBUI_RUNTIME_FILES {
+        let source = src.join(file);
+        let destination = dst.join(file);
+        println!("cargo:rerun-if-changed={}", source.display());
+        copy_file_if_exists(&source, &destination);
+    }
+
+    let assets = src.join("assets");
+    println!("cargo:rerun-if-changed={}", assets.display());
+    copy_dir_recursive(&assets, &dst.join("assets"));
+}
+
+fn copy_file_if_exists(src: &Path, dst: &Path) {
+    if !src.is_file() {
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            println!(
+                "cargo:warning=failed to create generated WebUI parent {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    if let Err(error) = fs::copy(src, dst) {
+        println!(
+            "cargo:warning=failed to copy WebUI asset {} -> {}: {error}",
+            src.display(),
+            dst.display()
+        );
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    if !src.is_dir() {
+        return;
+    }
+    if let Err(error) = fs::create_dir_all(dst) {
+        println!(
+            "cargo:warning=failed to create generated WebUI asset dir {}: {error}",
+            dst.display()
+        );
+        return;
+    }
+    let entries = match fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(error) => {
+            println!(
+                "cargo:warning=failed to read WebUI asset dir {}: {error}",
+                src.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let src_path = entry.path();
+        let dst_path: PathBuf = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path);
+        } else {
+            copy_file_if_exists(&src_path, &dst_path);
         }
     }
 }

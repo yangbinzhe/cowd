@@ -1,6 +1,5 @@
 use std::fmt;
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
     pub name: String,

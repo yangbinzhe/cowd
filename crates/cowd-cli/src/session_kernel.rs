@@ -573,9 +573,7 @@ mod tests {
     use super::{RuntimeCommand, SessionKernel};
     use crate::event_bus::SessionEventBus;
     use crate::gateway::ActiveSessions;
-    use memory::{
-        MaintenanceCandidate, MaintenanceCandidateKind, MaintenanceCandidateStatus,
-    };
+    use memory::{MaintenanceCandidate, MaintenanceCandidateKind, MaintenanceCandidateStatus};
     use runtime::{
         AgentTaskTrace, AgentWorkGraph, CollaborationReviewPacket, CollaborationScorecard,
         CollaborationTask,
