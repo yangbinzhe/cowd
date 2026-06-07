@@ -1758,10 +1758,28 @@ window.Panels = (()=>{
       }
       platforms.forEach(async function(p){
         const sec=UI.el('div','panel-section');
-        sec.innerHTML='<h3>'+UI.esc(p.name||p)+'</h3>';
+        const platformName=p.name||p;
+        sec.innerHTML='<h3>'+UI.esc(platformName)+'</h3>';
+        if(typeof p==='object'){
+          const metrics=UI.el('div','memory-metrics');
+          metrics.appendChild(renderMemoryMetric('status',p.status||'unknown','channel'));
+          metrics.appendChild(renderMemoryMetric('enabled',p.enabled?'yes':'no','config'));
+          metrics.appendChild(renderMemoryMetric('credential',p.credential_present?'present':'missing','secret'));
+          sec.appendChild(metrics);
+          if((p.missing_required||[]).length){
+            sec.appendChild(UI.el('div','panel-empty','Missing '+p.missing_required.join(', ')));
+          }
+          if((p.capabilities||[]).length){
+            sec.appendChild(UI.el('div','panel-empty','Capabilities '+p.capabilities.join(' · ')));
+          }
+        }
         c.appendChild(sec);
         try{
-          const sessions=await Api.getPlatform(p.name||p);
+          const sessions=await Api.getPlatform(platformName);
+          const readiness=sessions&&sessions.readiness;
+          if(readiness&&(!p||typeof p!=='object')){
+            sec.appendChild(UI.el('div','panel-empty','Status '+(readiness.status||'unknown')));
+          }
           if(sessions&&sessions.sessions){
             sessions.sessions.forEach(function(s){
               const item=UI.el('div','panel-item');

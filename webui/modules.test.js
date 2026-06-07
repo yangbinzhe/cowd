@@ -776,6 +776,47 @@ describe('API module', () => {
     expect(typeof window.Panels.renderCCUsage).toBe('function');
   });
 
+  it('renders gateway platform readiness without secrets', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    vi.stubGlobal('fetch', vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/cross-plane/summary')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: [], grants: [], decisions: [] }) });
+      }
+      if (path.includes('/api/channels/wechat-ilink/accounts')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ accounts: [] }) });
+      }
+      if (path === '/api/platforms') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve([
+          {
+            name: 'feishu',
+            status: 'degraded',
+            enabled: true,
+            credential_present: false,
+            missing_required: ['app_secret'],
+            capabilities: ['send_text', 'doc_ops'],
+          }
+        ]) });
+      }
+      if (path === '/api/platforms/feishu') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ readiness: { status: 'degraded' }, sessions: [] }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    }));
+
+    await window.Panels.renderGateway();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const text = document.getElementById('panel-content').textContent;
+    expect(text).toContain('Gateway Platforms');
+    expect(text).toContain('feishu');
+    expect(text).toContain('degraded');
+    expect(text).toContain('Missing app_secret');
+    expect(text).toContain('Capabilities send_text · doc_ops');
+    expect(text).not.toContain('cli_app_secret');
+  });
+
   it('index exposes the context panel tab and slash command', () => {
     const html = fs.readFileSync('index.html', 'utf8');
     expect(html).toContain('data-panel="context"');

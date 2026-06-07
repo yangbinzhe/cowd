@@ -456,6 +456,28 @@ mod tests {
         })
     }
 
+    fn test_state_with_config(config: serde_json::Value) -> Arc<AppState> {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
+            sessions,
+            memory_manager: None,
+            unified_store: None,
+            tool_registry: tools,
+            config: Some(config),
+            event_bus,
+            approval_gate: None,
+            auth_token: None,
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            config_home: default_config_home(),
+            profile_id: "default".to_string(),
+            profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
+        })
+    }
+
     fn test_state_with_store(store: Arc<UnifiedSessionStore>) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
@@ -2909,6 +2931,69 @@ providers:
             .await
             .unwrap();
         assert_eq!(solo_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn platform_readiness_defaults_to_disabled_without_config() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/platforms")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let platforms = json.as_array().unwrap();
+        assert!(platforms.iter().any(|item| item["name"] == "feishu"
+            && item["status"] == "disabled"
+            && item["credential_present"] == false));
+        assert!(platforms.iter().any(|item| item["name"] == "wechat-ilink"
+            && item["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("qr_login"))));
+    }
+
+    #[tokio::test]
+    async fn platform_readiness_reports_missing_fields_without_leaking_secrets() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [
+                    {
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "cli_app_id",
+                        "app_secret": ""
+                    }
+                ]
+            }
+        })));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/platforms/feishu")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["readiness"]["status"], "degraded");
+        assert_eq!(json["readiness"]["credential_present"], false);
+        assert!(json["readiness"]["missing_required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("app_secret")));
+        assert!(!json.to_string().contains("cli_app_id"));
     }
 
     #[tokio::test]

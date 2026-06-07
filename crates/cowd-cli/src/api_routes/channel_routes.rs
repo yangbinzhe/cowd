@@ -1,17 +1,21 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::{Path, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
+use serde::Serialize;
 
 use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/api/platforms", get(list_platforms_handler))
+        .route("/api/platforms/:name", get(get_platform_handler))
         .route(
             "/api/channels/wechat-ilink/accounts",
             get(wechat_ilink_accounts_handler),
@@ -38,8 +42,183 @@ struct WechatQrPollRequest {
     base_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct PlatformReadiness {
+    name: String,
+    platform_type: String,
+    enabled: bool,
+    status: &'static str,
+    configured: bool,
+    credential_present: bool,
+    missing_required: Vec<String>,
+    capabilities: Vec<&'static str>,
+    diagnostics: Vec<String>,
+}
+
 fn default_wechat_bot_type() -> String {
     "3".to_string()
+}
+
+async fn list_platforms_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    let platforms = configured_platforms(state.config.as_ref());
+    Json(serde_json::json!(platforms))
+}
+
+async fn get_platform_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let platforms = configured_platforms(state.config.as_ref());
+    let matched = platforms
+        .into_iter()
+        .find(|platform| platform.name == name || platform.platform_type == name);
+    Json(serde_json::json!({
+        "name": name,
+        "readiness": matched,
+        "sessions": []
+    }))
+}
+
+fn configured_platforms(config: Option<&serde_json::Value>) -> Vec<PlatformReadiness> {
+    let Some(config) = config else {
+        return vec![
+            disabled_platform("feishu"),
+            disabled_platform("wechat-ilink"),
+            disabled_platform("wecom"),
+        ];
+    };
+    let platform_values = config
+        .get("gateway")
+        .and_then(|value| value.get("platforms"))
+        .or_else(|| {
+            config
+                .get("platform")
+                .and_then(|value| value.get("platforms"))
+        })
+        .or_else(|| config.get("platforms"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if platform_values.is_empty() {
+        return vec![
+            disabled_platform("feishu"),
+            disabled_platform("wechat-ilink"),
+            disabled_platform("wecom"),
+        ];
+    }
+
+    platform_values
+        .iter()
+        .filter_map(platform_readiness_from_value)
+        .collect()
+}
+
+fn platform_readiness_from_value(value: &serde_json::Value) -> Option<PlatformReadiness> {
+    let platform_type = value
+        .get("platformType")
+        .or_else(|| value.get("platform_type"))
+        .and_then(|value| value.as_str())?
+        .to_ascii_lowercase();
+    if platform_type == "api_server" {
+        return None;
+    }
+    let name = value
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or(&platform_type)
+        .to_string();
+    let enabled = value
+        .get("enabled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let required = required_fields(&platform_type);
+    let missing_required = required
+        .iter()
+        .filter(|field| !has_non_empty(value, field))
+        .map(|field| (*field).to_string())
+        .collect::<Vec<_>>();
+    let credential_present = required
+        .iter()
+        .any(|field| credential_field(field) && has_non_empty(value, field));
+    let configured = missing_required.is_empty();
+    let status = if !enabled {
+        "disabled"
+    } else if configured {
+        "ready"
+    } else {
+        "degraded"
+    };
+    let diagnostics = if configured {
+        vec!["required configuration present; secrets are redacted".to_string()]
+    } else {
+        vec![format!(
+            "missing required fields: {}",
+            missing_required.join(", ")
+        )]
+    };
+
+    Some(PlatformReadiness {
+        name,
+        platform_type: platform_type.clone(),
+        enabled,
+        status,
+        configured,
+        credential_present,
+        missing_required,
+        capabilities: platform_capabilities(&platform_type),
+        diagnostics,
+    })
+}
+
+fn disabled_platform(platform_type: &str) -> PlatformReadiness {
+    PlatformReadiness {
+        name: platform_type.to_string(),
+        platform_type: platform_type.to_string(),
+        enabled: false,
+        status: "disabled",
+        configured: false,
+        credential_present: false,
+        missing_required: required_fields(platform_type)
+            .iter()
+            .map(|field| (*field).to_string())
+            .collect(),
+        capabilities: platform_capabilities(platform_type),
+        diagnostics: vec!["platform is not configured".to_string()],
+    }
+}
+
+fn required_fields(platform_type: &str) -> Vec<&'static str> {
+    match platform_type {
+        "feishu" => vec!["app_id", "app_secret"],
+        "wecom" => vec!["corp_id", "corp_secret", "agent_id"],
+        "wechat-ilink" | "wechat_ilink" | "wechat" => Vec::new(),
+        "email" => vec!["smtp_server", "username", "password"],
+        _ => Vec::new(),
+    }
+}
+
+fn platform_capabilities(platform_type: &str) -> Vec<&'static str> {
+    match platform_type {
+        "feishu" => vec!["send_text", "send_image", "send_file", "doc_ops"],
+        "wecom" => vec!["send_text", "callback"],
+        "wechat-ilink" | "wechat_ilink" | "wechat" => vec!["qr_login", "send_text"],
+        "email" => vec!["send_email"],
+        _ => Vec::new(),
+    }
+}
+
+fn credential_field(field: &str) -> bool {
+    field.contains("secret") || field.contains("password") || field.contains("token")
+}
+
+fn has_non_empty(value: &serde_json::Value, field: &str) -> bool {
+    value
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .map(|value| !value.is_empty())
+        .unwrap_or_else(|| value.get(field).is_some_and(|value| !value.is_null()))
 }
 
 fn qr_svg(scan_data: &str) -> Option<String> {
