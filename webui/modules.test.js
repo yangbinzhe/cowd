@@ -1030,6 +1030,87 @@ describe('API module', () => {
     expect(document.getElementById('panel-content').textContent).toContain('Execution Result');
   });
 
+  it('gateway composer picks workspace files for typed file actions', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    const mockF = vi.fn((url, options = {}) => {
+      const path = String(url);
+      if (path.includes('/api/workspace/files')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          workspace_root: '/repo',
+          dir: '',
+          files: [
+            { name: 'reports', path: 'reports', is_dir: true, type: 'dir' },
+            { name: 'panel.txt', path: 'reports/panel.txt', is_dir: false, type: 'file' },
+          ],
+        }) });
+      }
+      if (path.includes('/api/cross-plane/summary')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: {}, grants: {}, interop: {} }) });
+      if (path.includes('/api/channels/wechat-ilink/accounts')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ accounts: [] }) });
+      if (path.includes('/api/cross-plane/identities')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: [] }) });
+      if (path.includes('/api/cross-plane/grants')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ grants: [] }) });
+      if (path.includes('/api/cross-plane/audit')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ records: [] }) });
+      if (path.includes('/api/cross-plane/action/adapters')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ capabilities: [{ platform: 'feishu', operation: 'send_file', live_supported: true, adapter_bound: true }] }) });
+      if (path.includes('/api/cross-plane/action/executions')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ executions: [] }) });
+      if (path.includes('/api/cross-plane/action/preflight')) {
+        const body = JSON.parse(options.body);
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          dispatch_target: {
+            ready: true,
+            platform: 'feishu',
+            operation: 'send_file',
+            session_key: 'feishu:demo',
+            blockers: [],
+            outbound_message: { payload_kind: 'file', payload_ref: body.resource_ref, text: body.resource_ref },
+          },
+        }) });
+      }
+      if (path.includes('/api/cross-plane/action/execute')) {
+        const body = JSON.parse(options.body);
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          status: 'planned',
+          dispatch_status: 'dry_run',
+          dispatched: false,
+          dispatch_target: {
+            ready: true,
+            platform: 'feishu',
+            operation: 'send_file',
+            session_key: 'feishu:demo',
+            blockers: [],
+            outbound_message: { payload_kind: 'file', payload_ref: body.action.resource_ref, text: body.action.resource_ref },
+          },
+        }) });
+      }
+      if (path === '/api/platforms') return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderGateway();
+    const operation = document.querySelector('.cross-plane-composer select[aria-label="Operation"]');
+    operation.value = 'send_file';
+    operation.dispatchEvent(new Event('change'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const fileSelect = document.querySelector('.cross-plane-file-picker select');
+    expect(document.querySelector('.cross-plane-file-picker').classList.contains('hidden')).toBe(false);
+    expect([...fileSelect.options].map(opt => opt.value)).toContain('reports/panel.txt');
+    fileSelect.value = 'reports/panel.txt';
+    fileSelect.dispatchEvent(new Event('change'));
+    expect(document.querySelector('.cross-plane-composer textarea').value).toBe('workspace://file/reports/panel.txt');
+
+    document.querySelector('.cross-plane-actions button').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const preflightBody = JSON.parse(mockF.mock.calls.find(call => String(call[0]).includes('/api/cross-plane/action/preflight'))[1].body);
+    expect(preflightBody.requested_capability).toBe('channel.feishu.send_file');
+    expect(preflightBody.resource_ref).toBe('workspace://file/reports/panel.txt');
+
+    document.querySelectorAll('.cross-plane-actions button')[1].click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const executeBody = JSON.parse(mockF.mock.calls.find(call => String(call[0]).includes('/api/cross-plane/action/execute'))[1].body);
+    expect(executeBody.action.resource_ref).toBe('workspace://file/reports/panel.txt');
+    expect(document.getElementById('panel-content').textContent).toContain('Execution Result');
+  });
+
   it('index exposes the context panel tab and slash command', () => {
     const html = fs.readFileSync('index.html', 'utf8');
     expect(html).toContain('data-panel="context"');

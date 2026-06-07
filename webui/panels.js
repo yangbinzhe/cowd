@@ -312,6 +312,7 @@ window.Panels = (()=>{
     const box=UI.el('div','cross-plane-composer');
     box.innerHTML='<h3>Action Composer</h3>';
     const form=UI.el('div','panel-form cross-plane-form');
+    let workspaceFilesLoaded=false;
 
     const operation=UI.el('select');
     operation.setAttribute('aria-label','Operation');
@@ -341,6 +342,14 @@ window.Panels = (()=>{
     payload.value='hello from cowd';
     payload.setAttribute('aria-label','Payload');
 
+    const filePicker=UI.el('div','cross-plane-file-picker hidden');
+    const fileSelect=UI.el('select');
+    fileSelect.setAttribute('aria-label','Workspace file');
+    const fileHint=UI.el('span','audit-meta');
+    fileHint.textContent='Workspace files are loaded on demand.';
+    filePicker.appendChild(fileSelect);
+    filePicker.appendChild(fileHint);
+
     const mode=UI.el('select');
     mode.setAttribute('aria-label','Execution mode');
     [['dry_run','Dry run'],['commit','Commit']].forEach(function(pair){
@@ -357,6 +366,7 @@ window.Panels = (()=>{
     form.appendChild(principal);
     form.appendChild(target);
     form.appendChild(payload);
+    form.appendChild(filePicker);
 
     const actions=UI.el('div','cross-plane-actions');
     const preflightBtn=UI.el('button','btn-secondary');
@@ -401,10 +411,52 @@ window.Panels = (()=>{
       }
     }
 
-    operation.onchange=function(){
+    function setFileOptions(files){
+      fileSelect.innerHTML='';
+      const placeholder=UI.el('option');
+      placeholder.value='';
+      placeholder.textContent='Select workspace file';
+      fileSelect.appendChild(placeholder);
+      (files||[]).filter(function(file){
+        return file&&!file.is_dir&&file.type!=='dir';
+      }).slice(0,100).forEach(function(file){
+        const opt=UI.el('option');
+        opt.value=file.path||file.name||'';
+        opt.textContent=file.path||file.name||'';
+        fileSelect.appendChild(opt);
+      });
+    }
+
+    async function loadWorkspaceFiles(){
+      if(workspaceFilesLoaded)return;
+      workspaceFilesLoaded=true;
+      fileHint.textContent='Loading workspace files...';
+      setFileOptions([]);
+      try{
+        const data=await Api.listFiles('');
+        const files=(data&&data.files)||[];
+        setFileOptions(files);
+        const count=[...fileSelect.options].filter(function(opt){return opt.value;}).length;
+        fileHint.textContent=count?('Loaded '+count+' files from workspace root.'):'No root files available. Enter a workspace path manually.';
+      }catch(e){
+        fileHint.textContent='Workspace picker unavailable. Enter a path manually.';
+      }
+    }
+
+    function updateOperation(){
       if(operation.value==='send_text')payload.value='hello from cowd';
       else if(operation.value==='send_image')payload.value='https://example.test/panel.png';
       else payload.value='workspace://file/reports/panel.txt';
+      filePicker.classList.toggle('hidden',operation.value!=='send_file');
+      if(operation.value==='send_file')loadWorkspaceFiles();
+    }
+
+    operation.onchange=function(){
+      updateOperation();
+    };
+
+    fileSelect.onchange=function(){
+      if(fileSelect.value)payload.value='workspace://file/'+fileSelect.value.replace(/^\/+/,'');
     };
 
     preflightBtn.onclick=async function(){

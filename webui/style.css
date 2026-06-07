@@ -284,6 +284,8 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .cross-plane-composer h3{font-size:12px;margin-bottom:8px}
 .cross-plane-form{margin:0}
 .cross-plane-form-grid{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:8px}
+.cross-plane-file-picker{display:grid;grid-template-columns:minmax(0,1fr);gap:4px;padding:7px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface2)}
+.cross-plane-file-picker.hidden{display:none}
 .cross-plane-actions{display:flex;gap:8px;align-items:center;justify-content:flex-end}
 .cross-plane-actions button:disabled{opacity:.6;cursor:progress}
 .profile-create-row{display:flex;gap:8px;margin-bottom:10px}
