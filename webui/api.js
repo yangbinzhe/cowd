@@ -351,6 +351,7 @@ window.Api = (()=>{
     async createCrossPlaneGrant(grant){return req('POST','/api/cross-plane/grants',grant)},
     async revokeCrossPlaneGrant(id){return req('DELETE','/api/cross-plane/grants/'+encodeURIComponent(id))},
     async crossPlaneAudit(){return req('GET','/api/cross-plane/audit')},
+    async crossPlaneActionAdapters(){return req('GET','/api/cross-plane/action/adapters')},
     async simulateCrossPlanePolicy(action){return req('POST','/api/cross-plane/policy/simulate',action)},
     async preflightCrossPlaneAction(action){return req('POST','/api/cross-plane/action/preflight',action)},
     async executeCrossPlaneAction(request){return req('POST','/api/cross-plane/action/execute',request)},

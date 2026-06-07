@@ -464,6 +464,12 @@ describe('API module', () => {
           json: () => Promise.resolve({ kind: 'cross_plane_action_execution', status: 'planned', dispatch_status: 'dry_run' })
         });
       }
+      if (path.includes('/api/cross-plane/action/adapters')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ kind: 'cross_plane_action_adapters', capabilities: [{ platform: 'feishu', operation: 'send_text' }] })
+        });
+      }
       if (path.includes('/api/cross-plane/identity/resolve')) {
         return Promise.resolve({
           ok: true,
@@ -503,6 +509,7 @@ describe('API module', () => {
     await window.Api.createCrossPlaneGrant({ id: 'grant-1', principal_id: 'user:demo', capability: 'channel.feishu.send_text' });
     await window.Api.revokeCrossPlaneGrant('grant-1');
     await window.Api.crossPlaneAudit();
+    const adapters = await window.Api.crossPlaneActionAdapters();
     const resolved = await window.Api.resolveCrossPlaneIdentity('channel://wechat/user/demo?email=demo@example.com');
     const preflight = await window.Api.preflightCrossPlaneAction({
       actor_principal: 'user:demo',
@@ -541,14 +548,16 @@ describe('API module', () => {
     expect(String(mockF.mock.calls[6][0])).toBe('/api/cross-plane/grants/grant-1');
     expect(mockF.mock.calls[6][1].method).toBe('DELETE');
     expect(String(mockF.mock.calls[7][0])).toBe('/api/cross-plane/audit');
-    expect(String(mockF.mock.calls[8][0])).toBe('/api/cross-plane/identity/resolve');
-    expect(JSON.parse(mockF.mock.calls[8][1].body).identity_ref).toContain('demo@example.com');
-    expect(String(mockF.mock.calls[9][0])).toBe('/api/cross-plane/action/preflight');
-    expect(JSON.parse(mockF.mock.calls[9][1].body).requested_capability).toBe('channel.feishu.send_text');
-    expect(String(mockF.mock.calls[10][0])).toBe('/api/cross-plane/action/execute');
-    expect(JSON.parse(mockF.mock.calls[10][1].body).action.requested_capability).toBe('channel.feishu.send_text');
-    expect(String(mockF.mock.calls[11][0])).toBe('/api/cross-plane/policy/simulate');
-    expect(JSON.parse(mockF.mock.calls[11][1].body).requested_capability).toBe('channel.feishu.send_text');
+    expect(String(mockF.mock.calls[8][0])).toBe('/api/cross-plane/action/adapters');
+    expect(String(mockF.mock.calls[9][0])).toBe('/api/cross-plane/identity/resolve');
+    expect(JSON.parse(mockF.mock.calls[9][1].body).identity_ref).toContain('demo@example.com');
+    expect(String(mockF.mock.calls[10][0])).toBe('/api/cross-plane/action/preflight');
+    expect(JSON.parse(mockF.mock.calls[10][1].body).requested_capability).toBe('channel.feishu.send_text');
+    expect(String(mockF.mock.calls[11][0])).toBe('/api/cross-plane/action/execute');
+    expect(JSON.parse(mockF.mock.calls[11][1].body).action.requested_capability).toBe('channel.feishu.send_text');
+    expect(String(mockF.mock.calls[12][0])).toBe('/api/cross-plane/policy/simulate');
+    expect(JSON.parse(mockF.mock.calls[12][1].body).requested_capability).toBe('channel.feishu.send_text');
+    expect(adapters.capabilities[0].operation).toBe('send_text');
     expect(resolved.resolved.principal_id).toBe('user:demo');
     expect(preflight.executable).toBe(true);
     expect(execution.status).toBe('planned');

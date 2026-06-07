@@ -38,6 +38,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/cross-plane/audit", get(cross_plane_audit_handler))
         .route(
+            "/api/cross-plane/action/adapters",
+            get(cross_plane_action_adapters_handler),
+        )
+        .route(
             "/api/cross-plane/policy/simulate",
             post(cross_plane_policy_simulate_handler),
         )
@@ -75,8 +79,18 @@ struct CrossPlaneActionReadiness {
     decision: CrossPlanePolicyDecision,
     target_platform: Option<String>,
     platform_readiness: Option<channel_routes::PlatformReadiness>,
+    adapter_capability: Option<CrossPlaneAdapterCapability>,
     executable: bool,
     blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CrossPlaneAdapterCapability {
+    platform: String,
+    capability: String,
+    operation: String,
+    live_supported: bool,
+    adapter_bound: bool,
 }
 
 fn default_execute_mode() -> String {
@@ -229,6 +243,20 @@ async fn cross_plane_audit_handler(
     }))
 }
 
+async fn cross_plane_action_adapters_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    let platforms = channel_routes::configured_platforms(state.config.as_ref());
+    let capabilities = platforms
+        .iter()
+        .flat_map(adapter_capabilities_for_platform)
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "kind": "cross_plane_action_adapters",
+        "capabilities": capabilities,
+    }))
+}
+
 async fn cross_plane_policy_simulate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(action): Json<CrossPlaneAction>,
@@ -256,6 +284,7 @@ async fn cross_plane_action_preflight_handler(
         "decision": readiness.decision,
         "target_platform": readiness.target_platform,
         "platform_readiness": readiness.platform_readiness,
+        "adapter_capability": readiness.adapter_capability,
         "executable": readiness.executable,
         "blockers": readiness.blockers,
     }))
@@ -284,7 +313,11 @@ async fn cross_plane_action_execute_handler(
             dispatch_status = "dry_run";
             audit_result = "dry_run";
             audit_summary = "dry_run_execution_plan".to_string();
-        } else {
+        } else if readiness
+            .adapter_capability
+            .as_ref()
+            .is_some_and(|capability| capability.live_supported)
+        {
             readiness
                 .blockers
                 .push("dispatch:adapter_not_bound".to_string());
@@ -292,6 +325,14 @@ async fn cross_plane_action_execute_handler(
             dispatch_status = "adapter_not_bound";
             audit_result = "blocked_dispatch";
             audit_summary = "live_dispatch_adapter_not_bound".to_string();
+        } else {
+            readiness
+                .blockers
+                .push("dispatch:capability_not_supported".to_string());
+            readiness.executable = false;
+            dispatch_status = "capability_not_supported";
+            audit_result = "blocked_dispatch";
+            audit_summary = "live_dispatch_capability_not_supported".to_string();
         }
     }
 
@@ -315,6 +356,7 @@ async fn cross_plane_action_execute_handler(
         "decision": readiness.decision,
         "target_platform": readiness.target_platform,
         "platform_readiness": readiness.platform_readiness,
+        "adapter_capability": readiness.adapter_capability,
         "executable": readiness.executable,
         "blockers": readiness.blockers,
         "dispatched": false,
@@ -363,6 +405,9 @@ fn evaluate_action_readiness(
             .into_iter()
             .find(|platform| platform.name == *target || platform.platform_type == *target)
     });
+    let adapter_capability = platform_readiness
+        .as_ref()
+        .and_then(|platform| adapter_capability_for_action(platform, &action));
     let mut blockers = Vec::new();
     if decision.decision != PolicyDecisionKind::Allow {
         blockers.push(format!("policy:{}", decision.reason));
@@ -380,6 +425,7 @@ fn evaluate_action_readiness(
         decision,
         target_platform,
         platform_readiness,
+        adapter_capability,
         executable,
         blockers,
     }
@@ -409,4 +455,84 @@ fn target_platform_from_ref(value: &str) -> Option<String> {
         return rest.split('/').next().map(str::to_string);
     }
     None
+}
+
+fn adapter_capability_for_action(
+    platform: &channel_routes::PlatformReadiness,
+    action: &CrossPlaneAction,
+) -> Option<CrossPlaneAdapterCapability> {
+    let operation = operation_from_capability(&action.requested_capability)?;
+    adapter_capabilities_for_platform(platform)
+        .into_iter()
+        .find(|capability| capability.operation == operation)
+}
+
+fn adapter_capabilities_for_platform(
+    platform: &channel_routes::PlatformReadiness,
+) -> Vec<CrossPlaneAdapterCapability> {
+    let adapter_bound = false;
+    platform
+        .capabilities
+        .iter()
+        .map(|capability| {
+            let operation = normalize_operation(capability);
+            CrossPlaneAdapterCapability {
+                platform: platform.platform_type.clone(),
+                capability: format!("channel.{}.{}", platform.platform_type, operation),
+                operation: operation.to_string(),
+                live_supported: platform_supports_live_operation(
+                    &platform.platform_type,
+                    operation,
+                ),
+                adapter_bound,
+            }
+        })
+        .collect()
+}
+
+fn operation_from_capability(capability: &str) -> Option<String> {
+    let lower = capability.trim().to_ascii_lowercase();
+    for part in lower.split('.') {
+        let operation = normalize_operation(part);
+        if is_known_cross_plane_operation(operation) {
+            return Some(operation.to_string());
+        }
+    }
+    lower
+        .rsplit('.')
+        .next()
+        .map(normalize_operation)
+        .filter(|operation| !operation.is_empty())
+        .map(str::to_string)
+}
+
+fn normalize_operation(operation: &str) -> &str {
+    match operation.trim() {
+        "send_file" | "send_document" => "send_file",
+        "doc_ops" | "docx" | "docs" => "doc_ops",
+        other => other,
+    }
+}
+
+fn platform_supports_live_operation(platform: &str, operation: &str) -> bool {
+    matches!(
+        (platform, operation),
+        ("feishu", "send_text")
+            | ("feishu", "send_image")
+            | ("feishu", "send_file")
+            | ("wechat-ilink", "send_text")
+            | ("wechat_ilink", "send_text")
+            | ("wechat", "send_text")
+            | ("wechat-ilink", "send_image")
+            | ("wechat_ilink", "send_image")
+            | ("wechat", "send_image")
+            | ("wecom", "send_text")
+    )
+}
+
+fn is_known_cross_plane_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "send_text" | "send_image" | "send_file" | "doc_ops" | "callback" | "qr_login"
+    )
 }

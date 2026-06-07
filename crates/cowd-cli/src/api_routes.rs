@@ -3579,6 +3579,8 @@ providers:
         assert_eq!(json["status"], "blocked");
         assert_eq!(json["dispatch_status"], "adapter_not_bound");
         assert_eq!(json["executable"], false);
+        assert_eq!(json["adapter_capability"]["live_supported"], true);
+        assert_eq!(json["adapter_capability"]["adapter_bound"], false);
         assert!(json["blockers"]
             .as_array()
             .unwrap()
@@ -3599,6 +3601,54 @@ providers:
         let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
         let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
         assert_eq!(first_json["decision"]["decision"], "allow");
+    }
+
+    #[tokio::test]
+    async fn cross_plane_adapter_registry_reports_supported_and_unsupported_live_operations() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [
+                    {
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    },
+                    {
+                        "platformType": "wecom",
+                        "enabled": true,
+                        "corp_id": "corp",
+                        "corp_secret": "secret",
+                        "agent_id": "agent"
+                    }
+                ]
+            }
+        })));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/action/adapters")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "cross_plane_action_adapters");
+        let capabilities = json["capabilities"].as_array().unwrap();
+        assert!(capabilities.iter().any(|item| {
+            item["platform"] == "feishu"
+                && item["operation"] == "send_text"
+                && item["live_supported"] == true
+                && item["adapter_bound"] == false
+        }));
+        assert!(capabilities.iter().any(|item| {
+            item["platform"] == "wecom"
+                && item["operation"] == "callback"
+                && item["live_supported"] == false
+        }));
     }
 
     #[tokio::test]
