@@ -70,6 +70,26 @@ pub struct SendResult {
     pub error: Option<String>,
 }
 
+impl SendResult {
+    #[must_use]
+    pub fn success(message_id: Option<String>) -> Self {
+        Self {
+            success: true,
+            message_id,
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn failure(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            message_id: None,
+            error: Some(error.into()),
+        }
+    }
+}
+
 /// Basic chat/group information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatInfo {

@@ -105,7 +105,7 @@ pub trait PlatformAdapter: Send + Sync {
     async fn receive(&mut self) -> Result<Option<InboundMessage>, PlatformError>;
 
     /// Send an outbound message.
-    async fn send(&self, msg: &OutboundMessage) -> Result<(), PlatformError>;
+    async fn send(&self, msg: &OutboundMessage) -> Result<SendResult, PlatformError>;
 
     /// Send a typing indicator to the chat.
     #[allow(unused_variables)]
@@ -248,8 +248,8 @@ impl PlatformAdapter for NullAdapter {
         Ok(None)
     }
 
-    async fn send(&self, _msg: &OutboundMessage) -> PlatformResult<()> {
-        Ok(())
+    async fn send(&self, _msg: &OutboundMessage) -> PlatformResult<SendResult> {
+        Ok(SendResult::success(None))
     }
 
     async fn send_typing(&self, _chat_id: &str) -> Result<(), PlatformError> {

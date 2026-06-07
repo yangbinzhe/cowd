@@ -3,7 +3,7 @@
 use crate::mirror::MessageMirror;
 use crate::platform::adapter::{InboundMessage, OutboundMessage, PlatformAdapter, PlatformError};
 use crate::platform::config::{PlatformRuntimeConfig, RetryConfig, SessionResetPolicy};
-use crate::platform::types::{PlatformSession, SessionKey};
+use crate::platform::types::{PlatformSession, SendResult, SessionKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -19,7 +19,7 @@ enum RuntimeOutboundCommand {
     Enqueue(OutboundMessage),
     Dispatch {
         msg: OutboundMessage,
-        ack: tokio::sync::oneshot::Sender<Result<(), PlatformError>>,
+        ack: tokio::sync::oneshot::Sender<Result<SendResult, PlatformError>>,
     },
 }
 
@@ -262,7 +262,7 @@ impl PlatformRuntime {
         &self,
         platform_name: &str,
         msg: OutboundMessage,
-    ) -> Result<(), PlatformError> {
+    ) -> Result<SendResult, PlatformError> {
         let handles = self.adapter_handles.read().await;
         let handle = handles.get(platform_name).ok_or_else(|| {
             PlatformError::Unknown(format!("no adapter handle for platform: {platform_name}"))
@@ -495,9 +495,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn send(&self, msg: &OutboundMessage) -> Result<(), PlatformError> {
+        async fn send(&self, msg: &OutboundMessage) -> Result<SendResult, PlatformError> {
             self.sent.lock().unwrap().push(msg.clone());
-            Ok(())
+            Ok(SendResult::success(Some(format!(
+                "mock-{}",
+                msg.session_key.user_id
+            ))))
         }
     }
 
@@ -531,7 +534,7 @@ mod tests {
             .unwrap();
         runtime.start().await.unwrap();
 
-        runtime
+        let result = runtime
             .dispatch_outbound(
                 "feishu",
                 OutboundMessage {
@@ -543,6 +546,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(result.message_id.as_deref(), Some("mock-open-id"));
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);

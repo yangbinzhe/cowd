@@ -33,7 +33,7 @@ use crate::platform::adapter::{
     ChatInfo, InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter,
     PlatformError, PlatformEvent, PlatformResult,
 };
-use crate::platform::types::SessionKey;
+use crate::platform::types::{SendResult, SessionKey};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use regex::Regex;
@@ -206,7 +206,11 @@ impl FeishuAdapter {
     }
 
     /// Send a message via Feishu API.
-    pub async fn send_message(&self, session_key: &SessionKey, text: &str) -> PlatformResult<()> {
+    pub async fn send_message(
+        &self,
+        session_key: &SessionKey,
+        text: &str,
+    ) -> PlatformResult<SendResult> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
 
@@ -237,6 +241,12 @@ impl FeishuAdapter {
         struct SendResponse {
             code: i32,
             msg: String,
+            data: Option<SendData>,
+        }
+
+        #[derive(Deserialize)]
+        struct SendData {
+            message_id: Option<String>,
         }
 
         let resp: SendResponse = response
@@ -249,7 +259,9 @@ impl FeishuAdapter {
         }
 
         tracing::debug!(to = %open_id, "feishu message sent successfully");
-        Ok(())
+        Ok(SendResult::success(
+            resp.data.and_then(|data| data.message_id),
+        ))
     }
 
     /// Process a webhook event payload.
@@ -473,10 +485,10 @@ impl FeishuAdapter {
     ///
     /// Only retries on `SendFailed` and `RateLimited` errors. Other errors
     /// (including `NotImplemented`, `AuthenticationFailed`) are returned immediately.
-    async fn feishu_send_with_retry<F, Fut>(&self, mut f: F) -> PlatformResult<()>
+    async fn feishu_send_with_retry<F, Fut, T>(&self, mut f: F) -> PlatformResult<T>
     where
         F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = PlatformResult<()>>,
+        Fut: std::future::Future<Output = PlatformResult<T>>,
     {
         let mut last_err = None;
         for attempt in 0..3 {
@@ -486,7 +498,7 @@ impl FeishuAdapter {
                 tokio::time::sleep(backoff).await;
             }
             match f().await {
-                Ok(()) => return Ok(()),
+                Ok(result) => return Ok(result),
                 Err(e) => {
                     if matches!(
                         e,
@@ -512,7 +524,7 @@ impl FeishuAdapter {
         receive_id: &str,
         text: &str,
         reply_to: Option<&str>,
-    ) -> PlatformResult<()> {
+    ) -> PlatformResult<SendResult> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
 
@@ -549,7 +561,9 @@ impl FeishuAdapter {
                 .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
 
             if post_resp.code == 0 {
-                return Ok(());
+                return Ok(SendResult::success(
+                    post_resp.data.and_then(|data| data.message_id),
+                ));
             }
 
             // Reply-specific error codes → fall back to new message
@@ -578,7 +592,9 @@ impl FeishuAdapter {
 
                 if text_resp.code == 0 {
                     tracing::debug!("feishu text fallback reply succeeded");
-                    return Ok(());
+                    return Ok(SendResult::success(
+                        text_resp.data.and_then(|data| data.message_id),
+                    ));
                 }
 
                 if text_resp.code == 230011 || text_resp.code == 231003 {
@@ -618,7 +634,9 @@ impl FeishuAdapter {
 
         if post_resp.code == 0 {
             tracing::debug!(to = %receive_id, "feishu post message sent");
-            return Ok(());
+            return Ok(SendResult::success(
+                post_resp.data.and_then(|data| data.message_id),
+            ));
         }
 
         if post_reject_re.is_match(&post_resp.msg) {
@@ -647,11 +665,12 @@ impl FeishuAdapter {
                 return Err(PlatformError::SendFailed(text_resp.msg));
             }
             tracing::debug!(to = %receive_id, "feishu text fallback message sent");
+            return Ok(SendResult::success(
+                text_resp.data.and_then(|data| data.message_id),
+            ));
         } else {
             return Err(PlatformError::SendFailed(post_resp.msg));
         }
-
-        Ok(())
     }
 
     /// Return the Feishu Open API base URL.
@@ -805,6 +824,7 @@ impl BatchSender for FeishuAdapter {
             async move { self.send_internal(&chat_id, &text, None).await }
         })
         .await
+        .map(|_result| ())
     }
 }
 
@@ -937,7 +957,7 @@ impl PlatformAdapter for FeishuAdapter {
         }
     }
 
-    async fn send(&self, msg: &OutboundMessage) -> PlatformResult<()> {
+    async fn send(&self, msg: &OutboundMessage) -> PlatformResult<SendResult> {
         if let Some(ref batch_mgr) = self.batch_manager {
             let chat_id = msg
                 .session_key
@@ -945,7 +965,7 @@ impl PlatformAdapter for FeishuAdapter {
                 .as_deref()
                 .unwrap_or(&msg.session_key.user_id);
             batch_mgr.queue(chat_id, &msg.text).await;
-            return Ok(());
+            return Ok(SendResult::success(None));
         }
 
         let receive_id = msg

@@ -19,7 +19,7 @@ use crate::platform::adapter::{
     PlatformError, PlatformEvent, PlatformResult,
 };
 use crate::platform::dedup::DedupStore;
-use crate::platform::types::SessionKey;
+use crate::platform::types::{SendResult, SessionKey};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -1015,10 +1015,10 @@ impl PlatformAdapter for WeChatLinkAdapter {
         Ok(None)
     }
 
-    async fn send(&self, msg: &OutboundMessage) -> PlatformResult<()> {
+    async fn send(&self, msg: &OutboundMessage) -> PlatformResult<SendResult> {
         let to_user = &msg.session_key.user_id;
         self.send_text(to_user, &msg.text).await?;
-        Ok(())
+        Ok(SendResult::success(None))
     }
 
     async fn send_typing(&self, chat_id: &str) -> Result<(), PlatformError> {

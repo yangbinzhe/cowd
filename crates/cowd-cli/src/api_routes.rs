@@ -348,7 +348,7 @@ mod tests {
     use memory::config::{BudgetConfig, StoreConfig};
     use runtime::permission_enforcer::DestructivePatternDetector;
     use runtime::platform::adapter::{
-        InboundMessage, OutboundMessage, PlatformAdapter, PlatformError,
+        InboundMessage, OutboundMessage, PlatformAdapter, PlatformError, SendResult,
     };
     use runtime::platform::config::PlatformRuntimeConfig;
     use runtime::platform::types::Platform;
@@ -493,9 +493,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn send(&self, msg: &OutboundMessage) -> Result<(), PlatformError> {
+        async fn send(&self, msg: &OutboundMessage) -> Result<SendResult, PlatformError> {
             self.sent.lock().unwrap().push(msg.clone());
-            Ok(())
+            Ok(SendResult::success(Some(format!(
+                "mock-{}",
+                msg.session_key.user_id
+            ))))
         }
     }
 
@@ -4308,6 +4311,10 @@ providers:
             "feishu:live-chat"
         );
         assert_eq!(executed_json["dispatch_outcome"]["status"], "sent");
+        assert_eq!(
+            executed_json["dispatch_outcome"]["provider_message_id"],
+            "mock-live-chat"
+        );
         assert_eq!(
             executed_json["execution_receipt"]["dispatch_outcome"]["session_key"],
             "feishu:live-chat"

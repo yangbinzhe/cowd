@@ -68,7 +68,10 @@ async fn test_gateway_loop() {
                 };
 
                 match adapter.send(&reply).await {
-                    Ok(()) => println!("✅ Reply sent successfully\n"),
+                    Ok(result) => println!(
+                        "✅ Reply sent successfully ({})\n",
+                        result.message_id.as_deref().unwrap_or("no message id")
+                    ),
                     Err(e) => println!("❌ Reply failed: {:?}\n", e),
                 }
             }

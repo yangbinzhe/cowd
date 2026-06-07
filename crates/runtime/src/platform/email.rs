@@ -6,7 +6,7 @@ use crate::platform::adapter::{
     InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter, PlatformError,
     PlatformResult,
 };
-use crate::platform::types::SessionKey;
+use crate::platform::types::{SendResult, SessionKey};
 use async_trait::async_trait;
 use chrono::Utc;
 use lettre::Transport;
@@ -362,8 +362,9 @@ impl PlatformAdapter for EmailAdapter {
         Ok(messages.into_iter().next())
     }
 
-    async fn send(&self, msg: &OutboundMessage) -> PlatformResult<()> {
-        self.send_email(msg).await
+    async fn send(&self, msg: &OutboundMessage) -> PlatformResult<SendResult> {
+        self.send_email(msg).await?;
+        Ok(SendResult::success(None))
     }
 }
 

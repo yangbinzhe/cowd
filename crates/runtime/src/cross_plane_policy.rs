@@ -273,6 +273,7 @@ impl CrossPlaneDispatchOutcome {
         platform: impl Into<String>,
         operation: impl Into<String>,
         session_key: impl Into<String>,
+        provider_message_id: Option<String>,
     ) -> Self {
         Self {
             attempted_at: Utc::now(),
@@ -281,7 +282,7 @@ impl CrossPlaneDispatchOutcome {
             session_key: session_key.into(),
             status: "sent".to_string(),
             error: None,
-            provider_message_id: None,
+            provider_message_id,
         }
     }
 
@@ -1539,6 +1540,7 @@ mod tests {
             "feishu",
             "send_text",
             "feishu:open-id",
+            Some("om-test".to_string()),
         )));
 
         let text = serde_json::to_string(&receipt).unwrap();
@@ -1557,6 +1559,13 @@ mod tests {
                 .as_ref()
                 .map(|outcome| outcome.status.as_str()),
             Some("sent")
+        );
+        assert_eq!(
+            decoded
+                .dispatch_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.provider_message_id.as_deref()),
+            Some("om-test")
         );
     }
 

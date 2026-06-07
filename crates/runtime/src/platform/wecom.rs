@@ -8,7 +8,7 @@ use crate::platform::adapter::{
     ChatInfo, InboundMessage, MessageType, OutboundMessage, Platform, PlatformAdapter,
     PlatformError, PlatformEvent, PlatformResult,
 };
-use crate::platform::types::SessionKey;
+use crate::platform::types::{SendResult, SessionKey};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Utc};
@@ -672,8 +672,9 @@ impl PlatformAdapter for WeComAdapter {
         Ok(None)
     }
 
-    async fn send(&self, msg: &OutboundMessage) -> PlatformResult<()> {
-        self.send_message(&msg.session_key, &msg.text).await
+    async fn send(&self, msg: &OutboundMessage) -> PlatformResult<SendResult> {
+        self.send_message(&msg.session_key, &msg.text).await?;
+        Ok(SendResult::success(None))
     }
 
     async fn send_typing(&self, _chat_id: &str) -> Result<(), PlatformError> {

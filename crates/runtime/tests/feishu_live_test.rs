@@ -223,7 +223,13 @@ async fn test_feishu_e2e_full_flow() {
         .send_message(&session_key, "🧪 Cowd adapter.send_message() live test!")
         .await
     {
-        Ok(()) => ok("adapter.send_message()", "message sent"),
+        Ok(result) => ok(
+            "adapter.send_message()",
+            &format!(
+                "message sent ({})",
+                result.message_id.as_deref().unwrap_or("no message id")
+            ),
+        ),
         Err(e) => {
             let err_str = format!("{:?}", e);
             if err_str.contains("230013") || err_str.contains("NO availability") {
@@ -250,7 +256,13 @@ async fn test_feishu_e2e_full_flow() {
     };
 
     match adapter.send(&outbound).await {
-        Ok(()) => ok("adapter.send()", "message sent"),
+        Ok(result) => ok(
+            "adapter.send()",
+            &format!(
+                "message sent ({})",
+                result.message_id.as_deref().unwrap_or("no message id")
+            ),
+        ),
         Err(e) => {
             let err_str = format!("{:?}", e);
             if err_str.contains("230013") || err_str.contains("NO availability") {
@@ -335,7 +347,13 @@ async fn test_feishu_ws_receive_and_reply() {
                 };
 
                 match adapter.send(&outbound).await {
-                    Ok(()) => ok("reply", "message sent successfully"),
+                    Ok(result) => ok(
+                        "reply",
+                        &format!(
+                            "message sent successfully ({})",
+                            result.message_id.as_deref().unwrap_or("no message id")
+                        ),
+                    ),
                     Err(e) => fail("reply", &format!("{:?}", e)),
                 }
                 break;

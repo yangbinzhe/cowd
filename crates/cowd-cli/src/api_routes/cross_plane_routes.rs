@@ -683,11 +683,26 @@ async fn dispatch_ready_target(
         )
         .await
     {
-        Ok(()) => Ok(CrossPlaneDispatchOutcome::sent(
+        Ok(result) if result.success => Ok(CrossPlaneDispatchOutcome::sent(
             platform,
             "send_text",
             outbound.session_key.clone(),
+            result.message_id,
         )),
+        Ok(result) => {
+            let error = result
+                .error
+                .unwrap_or_else(|| "adapter reported unsuccessful send".to_string());
+            Err((
+                format!("dispatch:send_failed:{error}"),
+                Some(CrossPlaneDispatchOutcome::failed(
+                    platform,
+                    "send_text",
+                    outbound.session_key.clone(),
+                    error,
+                )),
+            ))
+        }
         Err(err) => {
             let error = err.to_string();
             Err((
