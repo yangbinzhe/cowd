@@ -270,6 +270,28 @@ window.Panels = (()=>{
     return row;
   }
 
+  function renderDispatchOutcome(outcome){
+    const status=(outcome&&outcome.status)||'unknown';
+    const row=UI.el('div','panel-item audit-record dispatch-outcome '+status);
+    const source=UI.el('span','audit-source');
+    source.textContent=status;
+    const body=UI.el('span','pi-name audit-body');
+    const title=UI.el('span','audit-title');
+    const targetName=[outcome&&outcome.platform,outcome&&outcome.operation].filter(Boolean).join(' · ');
+    title.textContent='Dispatch Outcome'+(targetName?' · '+targetName:'');
+    const meta=UI.el('span','audit-meta');
+    const parts=[];
+    if(outcome&&outcome.session_key)parts.push('session '+outcome.session_key);
+    if(outcome&&outcome.provider_message_id)parts.push('provider '+outcome.provider_message_id);
+    if(outcome&&outcome.error)parts.push(String(outcome.error).slice(0,72));
+    meta.textContent=parts.join(' · ')||'no delivery detail';
+    body.appendChild(title);
+    body.appendChild(meta);
+    row.appendChild(source);
+    row.appendChild(body);
+    return row;
+  }
+
   function latestPolicyDecision(events){
     const policyEvents=(events||[]).filter(function(item){return item&&item.kind==='runtime.policy.decided'});
     const latest=policyEvents[policyEvents.length-1]||null;
@@ -1767,6 +1789,7 @@ window.Panels = (()=>{
           row.appendChild(body);
           executionList.appendChild(row);
           if(receipt.dispatch_target)executionList.appendChild(renderDispatchTarget(receipt.dispatch_target));
+          if(receipt.dispatch_outcome)executionList.appendChild(renderDispatchOutcome(receipt.dispatch_outcome));
         });
         sec.appendChild(executionList);
       }

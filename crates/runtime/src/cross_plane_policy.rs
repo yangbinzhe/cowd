@@ -193,6 +193,8 @@ pub struct CrossPlaneExecutionReceipt {
     pub audit_record_id: Option<String>,
     #[serde(default)]
     pub dispatch_target: Option<CrossPlaneDispatchTarget>,
+    #[serde(default)]
+    pub dispatch_outcome: Option<CrossPlaneDispatchOutcome>,
 }
 
 impl CrossPlaneExecutionReceipt {
@@ -219,6 +221,7 @@ impl CrossPlaneExecutionReceipt {
             blockers,
             audit_record_id,
             dispatch_target: None,
+            dispatch_outcome: None,
         }
     }
 
@@ -228,6 +231,15 @@ impl CrossPlaneExecutionReceipt {
         dispatch_target: Option<CrossPlaneDispatchTarget>,
     ) -> Self {
         self.dispatch_target = dispatch_target;
+        self
+    }
+
+    #[must_use]
+    pub fn with_dispatch_outcome(
+        mut self,
+        dispatch_outcome: Option<CrossPlaneDispatchOutcome>,
+    ) -> Self {
+        self.dispatch_outcome = dispatch_outcome;
         self
     }
 }
@@ -242,6 +254,54 @@ pub struct CrossPlaneDispatchTarget {
     pub outbound_message: Option<CrossPlaneOutboundMessagePlan>,
     pub ready: bool,
     pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossPlaneDispatchOutcome {
+    pub attempted_at: DateTime<Utc>,
+    pub platform: String,
+    pub operation: String,
+    pub session_key: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub provider_message_id: Option<String>,
+}
+
+impl CrossPlaneDispatchOutcome {
+    #[must_use]
+    pub fn sent(
+        platform: impl Into<String>,
+        operation: impl Into<String>,
+        session_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            attempted_at: Utc::now(),
+            platform: platform.into(),
+            operation: operation.into(),
+            session_key: session_key.into(),
+            status: "sent".to_string(),
+            error: None,
+            provider_message_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn failed(
+        platform: impl Into<String>,
+        operation: impl Into<String>,
+        session_key: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            attempted_at: Utc::now(),
+            platform: platform.into(),
+            operation: operation.into(),
+            session_key: session_key.into(),
+            status: "failed".to_string(),
+            error: Some(error.into()),
+            provider_message_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1474,7 +1534,12 @@ mod tests {
             Vec::new(),
             Some("audit-1".to_string()),
         )
-        .with_dispatch_target(target);
+        .with_dispatch_target(target)
+        .with_dispatch_outcome(Some(CrossPlaneDispatchOutcome::sent(
+            "feishu",
+            "send_text",
+            "feishu:open-id",
+        )));
 
         let text = serde_json::to_string(&receipt).unwrap();
         let decoded: CrossPlaneExecutionReceipt = serde_json::from_str(&text).unwrap();
@@ -1485,6 +1550,13 @@ mod tests {
                 .as_ref()
                 .and_then(|target| target.session_key.as_deref()),
             Some("feishu:open-id")
+        );
+        assert_eq!(
+            decoded
+                .dispatch_outcome
+                .as_ref()
+                .map(|outcome| outcome.status.as_str()),
+            Some("sent")
         );
     }
 

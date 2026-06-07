@@ -902,6 +902,12 @@ describe('API module', () => {
               blockers: [],
               outbound_message: { text: 'hello from test' },
             },
+            dispatch_outcome: {
+              status: 'sent',
+              platform: 'feishu',
+              operation: 'send_text',
+              session_key: 'feishu:open-id:chat-id',
+            },
           }],
         }) });
       }
@@ -949,6 +955,8 @@ describe('API module', () => {
     expect(text).toContain('Dispatch Target');
     expect(text).toContain('session feishu:open-id:chat-id');
     expect(text).toContain('payload hello from test');
+    expect(text).toContain('Dispatch Outcome');
+    expect(text).toContain('sent');
     expect(text).not.toContain('cli_app_secret');
   });
 

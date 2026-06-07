@@ -4307,6 +4307,11 @@ providers:
             executed_json["execution_receipt"]["dispatch_target"]["session_key"],
             "feishu:live-chat"
         );
+        assert_eq!(executed_json["dispatch_outcome"]["status"], "sent");
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_outcome"]["session_key"],
+            "feishu:live-chat"
+        );
 
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);

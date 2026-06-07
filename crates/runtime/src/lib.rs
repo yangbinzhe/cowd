@@ -131,10 +131,11 @@ pub use cowd_event::{
 };
 pub use cross_plane_policy::{
     CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneDecisionEvidence,
-    CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt, CrossPlaneGrant,
-    CrossPlaneIdentityBinding, CrossPlaneOutboundMessagePlan, CrossPlanePolicyConfig,
-    CrossPlanePolicyDecision, CrossPlanePolicyEngine, CrossPlaneResolvedIdentity, CrossPlaneRisk,
-    CrossPlaneSummary, DataClassification, GrantType, IdentityTrust, PolicyDecisionKind,
+    CrossPlaneDispatchOutcome, CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt,
+    CrossPlaneGrant, CrossPlaneIdentityBinding, CrossPlaneOutboundMessagePlan,
+    CrossPlanePolicyConfig, CrossPlanePolicyDecision, CrossPlanePolicyEngine,
+    CrossPlaneResolvedIdentity, CrossPlaneRisk, CrossPlaneSummary, DataClassification, GrantType,
+    IdentityTrust, PolicyDecisionKind,
 };
 pub use doc_ingestion::{
     ClassificationResult, ConflictStrategy, DocumentCategory, DocumentClassifier, DocumentIngestor,

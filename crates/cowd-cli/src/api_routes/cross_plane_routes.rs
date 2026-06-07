@@ -12,9 +12,9 @@ use axum::{
 };
 use runtime::platform::{OutboundMessage, SessionKey};
 use runtime::{
-    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneDispatchTarget,
-    CrossPlaneExecutionReceipt, CrossPlaneGrant, CrossPlaneIdentityBinding,
-    CrossPlanePolicyDecision, PolicyDecisionKind,
+    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneDispatchOutcome,
+    CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt, CrossPlaneGrant,
+    CrossPlaneIdentityBinding, CrossPlanePolicyDecision, PolicyDecisionKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -360,6 +360,7 @@ async fn cross_plane_action_execute_handler(
         .cloned()
         .unwrap_or_else(|| readiness.decision.reason.clone());
     let mut dispatched = false;
+    let mut dispatch_outcome = None;
 
     if readiness.executable {
         if mode == "dry_run" {
@@ -392,15 +393,17 @@ async fn cross_plane_action_execute_handler(
                 match dispatch_ready_target(&state, readiness.dispatch_target.as_ref().unwrap())
                     .await
                 {
-                    Ok(()) => {
+                    Ok(outcome) => {
                         status = "dispatched";
                         dispatch_status = "sent";
                         audit_result = "dispatched";
                         audit_summary = "live_dispatch_sent".to_string();
                         dispatched = true;
+                        dispatch_outcome = Some(outcome);
                     }
-                    Err(blocker) => {
+                    Err((blocker, outcome)) => {
                         readiness.blockers.push(blocker);
+                        dispatch_outcome = outcome;
                         readiness.executable = false;
                         dispatch_status = "dispatch_failed";
                         audit_result = "blocked_dispatch";
@@ -452,7 +455,8 @@ async fn cross_plane_action_execute_handler(
         readiness.blockers.clone(),
         Some(audit_record_id.clone()),
     )
-    .with_dispatch_target(readiness.dispatch_target.clone());
+    .with_dispatch_target(readiness.dispatch_target.clone())
+    .with_dispatch_outcome(dispatch_outcome.clone());
     cross_plane_control().record_execution(receipt.clone());
     save_cross_plane_state(&state);
 
@@ -468,6 +472,7 @@ async fn cross_plane_action_execute_handler(
         "platform_readiness": readiness.platform_readiness,
         "adapter_capability": readiness.adapter_capability,
         "dispatch_target": readiness.dispatch_target,
+        "dispatch_outcome": dispatch_outcome,
         "executable": readiness.executable,
         "blockers": readiness.blockers,
         "dispatched": dispatched,
@@ -646,27 +651,27 @@ fn build_dispatch_target(
 async fn dispatch_ready_target(
     state: &AppState,
     target: &CrossPlaneDispatchTarget,
-) -> Result<(), String> {
+) -> Result<CrossPlaneDispatchOutcome, (String, Option<CrossPlaneDispatchOutcome>)> {
     if !target.ready {
-        return Err("dispatch:target_not_ready".to_string());
+        return Err(("dispatch:target_not_ready".to_string(), None));
     }
     if target.operation.as_deref() != Some("send_text") {
-        return Err("dispatch:not_implemented".to_string());
+        return Err(("dispatch:not_implemented".to_string(), None));
     }
     let platform = target
         .platform
         .as_deref()
-        .ok_or_else(|| "dispatch:target_platform_missing".to_string())?;
+        .ok_or_else(|| ("dispatch:target_platform_missing".to_string(), None))?;
     let outbound = target
         .outbound_message
         .as_ref()
-        .ok_or_else(|| "dispatch:outbound_message_missing".to_string())?;
+        .ok_or_else(|| ("dispatch:outbound_message_missing".to_string(), None))?;
     let runtime = state
         .platform_runtime
         .as_ref()
-        .ok_or_else(|| "dispatch:runtime_unavailable".to_string())?;
+        .ok_or_else(|| ("dispatch:runtime_unavailable".to_string(), None))?;
 
-    runtime
+    match runtime
         .dispatch_outbound(
             platform,
             OutboundMessage {
@@ -677,7 +682,25 @@ async fn dispatch_ready_target(
             },
         )
         .await
-        .map_err(|err| format!("dispatch:send_failed:{err}"))
+    {
+        Ok(()) => Ok(CrossPlaneDispatchOutcome::sent(
+            platform,
+            "send_text",
+            outbound.session_key.clone(),
+        )),
+        Err(err) => {
+            let error = err.to_string();
+            Err((
+                format!("dispatch:send_failed:{error}"),
+                Some(CrossPlaneDispatchOutcome::failed(
+                    platform,
+                    "send_text",
+                    outbound.session_key.clone(),
+                    error,
+                )),
+            ))
+        }
+    }
 }
 
 fn operation_from_capability(capability: &str) -> Option<String> {
