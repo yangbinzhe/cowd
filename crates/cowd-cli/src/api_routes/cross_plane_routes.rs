@@ -11,8 +11,9 @@ use axum::{
     Json, Router,
 };
 use runtime::{
-    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneExecutionReceipt,
-    CrossPlaneGrant, CrossPlaneIdentityBinding, CrossPlanePolicyDecision, PolicyDecisionKind,
+    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneDispatchTarget,
+    CrossPlaneExecutionReceipt, CrossPlaneGrant, CrossPlaneIdentityBinding,
+    CrossPlanePolicyDecision, PolicyDecisionKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -97,26 +98,6 @@ struct CrossPlaneAdapterCapability {
     operation: String,
     live_supported: bool,
     adapter_bound: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct CrossPlaneDispatchTarget {
-    platform: Option<String>,
-    operation: Option<String>,
-    target_ref: Option<String>,
-    resource_ref: Option<String>,
-    session_key: Option<String>,
-    outbound_message: Option<CrossPlaneOutboundMessagePlan>,
-    ready: bool,
-    blockers: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct CrossPlaneOutboundMessagePlan {
-    session_key: String,
-    text: String,
-    reply_to: Option<String>,
-    metadata: serde_json::Value,
 }
 
 fn default_execute_mode() -> String {
@@ -442,10 +423,6 @@ async fn cross_plane_action_execute_handler(
     );
     let audit_record_id = audit_record.id.clone();
     cross_plane_control().record_audit(audit_record);
-    let dispatch_target_snapshot = readiness
-        .dispatch_target
-        .as_ref()
-        .and_then(|target| serde_json::to_value(target).ok());
     let receipt = CrossPlaneExecutionReceipt::new(
         idempotency_key.clone(),
         mode.clone(),
@@ -456,7 +433,7 @@ async fn cross_plane_action_execute_handler(
         readiness.blockers.clone(),
         Some(audit_record_id.clone()),
     )
-    .with_dispatch_target(dispatch_target_snapshot);
+    .with_dispatch_target(readiness.dispatch_target.clone());
     cross_plane_control().record_execution(receipt.clone());
     save_cross_plane_state(&state);
 
@@ -644,174 +621,7 @@ fn build_dispatch_target(
     let operation = adapter_capability
         .map(|capability| capability.operation.clone())
         .or_else(|| operation_from_capability(&action.requested_capability));
-    if target_platform.is_none() && operation.is_none() {
-        return None;
-    }
-
-    let platform = target_platform.map(str::to_string);
-    let mut blockers = Vec::new();
-    if platform.is_none() {
-        blockers.push("dispatch:target_platform_missing".to_string());
-    }
-    let session_key = match (platform.as_deref(), action.target_ref.as_deref()) {
-        (_, None) => {
-            blockers.push("dispatch:target_ref_missing".to_string());
-            None
-        }
-        (None, Some(_)) => None,
-        (Some(platform), Some(target_ref)) => {
-            match session_key_from_target_ref(platform, target_ref) {
-                Some(session_key) => Some(session_key),
-                None => {
-                    blockers.push("dispatch:target_ref_invalid".to_string());
-                    None
-                }
-            }
-        }
-    };
-
-    let text = operation
-        .as_deref()
-        .and_then(|operation| outbound_text_for_operation(operation, action, &mut blockers));
-    let outbound_message =
-        session_key
-            .as_ref()
-            .zip(text)
-            .map(|(session_key, text)| CrossPlaneOutboundMessagePlan {
-                session_key: session_key.clone(),
-                text,
-                reply_to: None,
-                metadata: serde_json::json!({
-                    "cross_plane": true,
-                    "operation": operation,
-                    "requested_capability": action.requested_capability,
-                    "resource_ref": action.resource_ref,
-                    "source_channel": action.source_channel,
-                    "session_id": action.session_id,
-                }),
-            });
-    let ready = blockers.is_empty() && outbound_message.is_some();
-
-    Some(CrossPlaneDispatchTarget {
-        platform,
-        operation,
-        target_ref: action.target_ref.clone(),
-        resource_ref: action.resource_ref.clone(),
-        session_key,
-        outbound_message,
-        ready,
-        blockers,
-    })
-}
-
-fn session_key_from_target_ref(platform: &str, target_ref: &str) -> Option<String> {
-    let value = target_ref.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if let Some(rest) = value
-        .strip_prefix("channel://")
-        .or_else(|| value.strip_prefix("service://"))
-    {
-        let mut parts = rest.split('/').filter(|part| !part.is_empty());
-        let target_platform = parts.next()?.to_ascii_lowercase();
-        if target_platform != platform.to_ascii_lowercase() {
-            return None;
-        }
-        let remaining = parts.collect::<Vec<_>>();
-        return session_key_from_path_parts(platform, &remaining);
-    }
-
-    let parts = value.split(':').collect::<Vec<_>>();
-    if parts.len() >= 2 && parts[0].eq_ignore_ascii_case(platform) {
-        let user_id = parts[1].trim();
-        if user_id.is_empty() {
-            return None;
-        }
-        return if parts.get(2).is_some_and(|thread| !thread.trim().is_empty()) {
-            Some(format!("{platform}:{user_id}:{}", parts[2].trim()))
-        } else {
-            Some(format!("{platform}:{user_id}"))
-        };
-    }
-
-    None
-}
-
-fn session_key_from_path_parts(platform: &str, parts: &[&str]) -> Option<String> {
-    if parts.is_empty() {
-        return None;
-    }
-    let user_id = if matches!(parts[0], "user" | "chat" | "session") {
-        parts.get(1).copied()
-    } else {
-        parts.first().copied()
-    }?
-    .trim();
-    if user_id.is_empty() {
-        return None;
-    }
-    let thread_id = parts
-        .windows(2)
-        .find(|window| matches!(window[0], "thread" | "topic"))
-        .map(|window| window[1].trim())
-        .filter(|thread| !thread.is_empty());
-    Some(match thread_id {
-        Some(thread_id) => format!("{platform}:{user_id}:{thread_id}"),
-        None => format!("{platform}:{user_id}"),
-    })
-}
-
-fn outbound_text_for_operation(
-    operation: &str,
-    action: &CrossPlaneAction,
-    blockers: &mut Vec<String>,
-) -> Option<String> {
-    match operation {
-        "send_text" => {
-            let text = action
-                .resource_ref
-                .as_deref()
-                .and_then(text_payload_from_resource_ref);
-            if text.as_deref().is_none_or(str::is_empty) {
-                blockers.push("dispatch:payload_text_missing".to_string());
-            }
-            text
-        }
-        "send_image" | "send_file" => {
-            let Some(resource_ref) = action.resource_ref.as_deref().map(str::trim) else {
-                blockers.push("dispatch:resource_ref_missing".to_string());
-                return None;
-            };
-            if resource_ref.is_empty() {
-                blockers.push("dispatch:resource_ref_missing".to_string());
-                None
-            } else {
-                Some(resource_ref.to_string())
-            }
-        }
-        _ => {
-            blockers.push("dispatch:operation_not_dispatchable".to_string());
-            None
-        }
-    }
-}
-
-fn text_payload_from_resource_ref(resource_ref: &str) -> Option<String> {
-    let value = resource_ref.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if let Some(text) = value
-        .strip_prefix("text://")
-        .or_else(|| value.strip_prefix("text:"))
-    {
-        return Some(text.to_string());
-    }
-    if value.contains("://") {
-        return None;
-    }
-    Some(value.to_string())
+    CrossPlaneDispatchTarget::from_action(action, target_platform, operation.as_deref())
 }
 
 fn operation_from_capability(capability: &str) -> Option<String> {
