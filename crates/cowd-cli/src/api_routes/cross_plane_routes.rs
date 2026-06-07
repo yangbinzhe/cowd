@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, OnceLock},
 };
 
@@ -684,6 +684,20 @@ async fn dispatch_ready_target(
             ));
         }
     };
+    let payload_ref =
+        resolve_dispatch_payload_ref(&state.workspace_root, kind, &outbound.payload_ref).map_err(
+            |error| {
+                (
+                    format!("dispatch:payload_blocked:{error}"),
+                    Some(CrossPlaneDispatchOutcome::failed(
+                        platform,
+                        operation,
+                        outbound.session_key.clone(),
+                        error,
+                    )),
+                )
+            },
+        )?;
 
     match runtime
         .dispatch_payload(
@@ -691,7 +705,7 @@ async fn dispatch_ready_target(
             OutboundDispatch {
                 session_key: SessionKey::from(outbound.session_key.as_str()),
                 kind,
-                payload_ref: outbound.payload_ref.clone(),
+                payload_ref,
                 caption: outbound.caption.clone(),
                 file_name: outbound.file_name.clone(),
                 reply_to: outbound.reply_to.clone(),
@@ -733,6 +747,77 @@ async fn dispatch_ready_target(
             ))
         }
     }
+}
+
+fn resolve_dispatch_payload_ref(
+    workspace_root: &FsPath,
+    kind: OutboundPayloadKind,
+    payload_ref: &str,
+) -> Result<String, String> {
+    let payload_ref = payload_ref.trim();
+    if payload_ref.is_empty() {
+        return Err("payload_ref_missing".to_string());
+    }
+    if matches!(kind, OutboundPayloadKind::Text) {
+        return Ok(payload_ref.to_string());
+    }
+    if payload_ref.starts_with("http://") || payload_ref.starts_with("https://") {
+        return match kind {
+            OutboundPayloadKind::Image => Ok(payload_ref.to_string()),
+            OutboundPayloadKind::File => Err("file_remote_payload_unsupported".to_string()),
+            OutboundPayloadKind::Text => Ok(payload_ref.to_string()),
+        };
+    }
+
+    let relative = payload_ref
+        .strip_prefix("workspace://file/")
+        .or_else(|| payload_ref.strip_prefix("workspace://changed-file/"));
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|_| "workspace_root_unavailable".to_string())?;
+    let candidate = match relative {
+        Some(path) => {
+            let rel = FsPath::new(path);
+            if !path_has_safe_dispatch_components(rel) {
+                return Err("workspace_payload_outside_root".to_string());
+            }
+            root.join(rel)
+        }
+        None => {
+            let path = FsPath::new(payload_ref);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                if !path_has_safe_dispatch_components(path) {
+                    return Err("workspace_payload_outside_root".to_string());
+                }
+                root.join(path)
+            }
+        }
+    };
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|_| "workspace_payload_not_found".to_string())?;
+    if !resolved.starts_with(&root) {
+        return Err("workspace_payload_outside_root".to_string());
+    }
+    if !resolved.is_file() {
+        return Err("workspace_payload_not_file".to_string());
+    }
+    resolved
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "workspace_payload_path_not_utf8".to_string())
+}
+
+fn path_has_safe_dispatch_components(path: &FsPath) -> bool {
+    !path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
 }
 
 fn operation_from_capability(capability: &str) -> Option<String> {

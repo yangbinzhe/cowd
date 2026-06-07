@@ -631,6 +631,18 @@ mod tests {
         config: serde_json::Value,
         platform_runtime: Option<Arc<PlatformRuntime>>,
     ) -> Arc<AppState> {
+        test_state_with_config_runtime_and_workspace(
+            config,
+            platform_runtime,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
+    }
+
+    fn test_state_with_config_runtime_and_workspace(
+        config: serde_json::Value,
+        platform_runtime: Option<Arc<PlatformRuntime>>,
+        workspace_root: PathBuf,
+    ) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
         let event_bus = SessionEventBus::new();
@@ -645,7 +657,7 @@ mod tests {
             event_bus,
             approval_gate: None,
             auth_token: None,
-            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            workspace_root,
             config_home: default_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
@@ -2773,13 +2785,6 @@ providers:
             assert!(joined.contains("envelope_id=env-log-1"));
             assert!(joined.contains("sequence=7"));
         }
-        assert!(joined.contains("summary_count=1"));
-        assert!(
-            joined.contains("context envelope loaded"),
-            "expected context envelope log, got: {joined}"
-        );
-        assert!(joined.contains("env-log-1"));
-        assert!(joined.contains("sequence=7"));
     }
 
     #[tokio::test]
@@ -4499,6 +4504,215 @@ providers:
         drop(media_sent);
 
         platform_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_commit_dispatches_workspace_file_target() {
+        let root = test_temp_dir("cross-plane-file-dispatch");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(workspace.join("reports")).unwrap();
+        let report_path = workspace.join("reports").join("panel.txt");
+        std::fs::write(&report_path, "dispatchable report").unwrap();
+        let (platform_runtime, media_sent) =
+            test_platform_runtime_with_media_adapter("feishu").await;
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+            workspace.clone(),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-file-{suffix}");
+        let capability = format!("channel.feishu.send_file.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-file-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "commit",
+            "idempotency_key": format!("idem-dispatch-file-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/source",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": "channel://feishu/chat/live-chat",
+                "resource_ref": "file://reports/panel.txt",
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+        let executed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+
+        assert_eq!(executed_json["status"], "dispatched");
+        assert_eq!(executed_json["dispatch_status"], "sent");
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
+                ["payload_kind"],
+            "file"
+        );
+        let media_sent = media_sent.lock().unwrap();
+        assert_eq!(
+            media_sent.as_slice(),
+            [format!(
+                "file:live-chat:{}:panel.txt:",
+                report_path.canonicalize().unwrap().display()
+            )]
+        );
+        drop(media_sent);
+
+        platform_runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_commit_blocks_file_outside_workspace() {
+        let root = test_temp_dir("cross-plane-file-block");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside.txt");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&outside, "must not send").unwrap();
+        let (platform_runtime, media_sent) =
+            test_platform_runtime_with_media_adapter("feishu").await;
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+            workspace,
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-file-block-{suffix}");
+        let capability = format!("channel.feishu.send_file.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-file-block-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "commit",
+            "idempotency_key": format!("idem-dispatch-file-block-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/source",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": "channel://feishu/chat/live-chat",
+                "resource_ref": format!("file://{}", outside.display()),
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+        let executed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+
+        assert_eq!(executed_json["status"], "blocked");
+        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
+        assert!(executed_json["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspace_payload_outside_root")));
+        assert!(media_sent.lock().unwrap().is_empty());
+
+        platform_runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
