@@ -952,12 +952,82 @@ describe('API module', () => {
     expect(text).toContain('Execution Receipts');
     expect(text).toContain('channel.feishu.send_text');
     expect(text).toContain('idem idem-demo');
+    expect(text).toContain('Action Composer');
+    expect(text).toContain('Preflight action');
+    expect(text).toContain('Execute action');
     expect(text).toContain('Dispatch Target');
     expect(text).toContain('session feishu:open-id:chat-id');
     expect(text).toContain('payload hello from test');
     expect(text).toContain('Dispatch Outcome');
     expect(text).toContain('sent');
     expect(text).not.toContain('cli_app_secret');
+  });
+
+  it('gateway composer preflights and executes typed media actions', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    const mockF = vi.fn((url, options = {}) => {
+      const path = String(url);
+      if (path.includes('/api/cross-plane/summary')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: {}, grants: {}, interop: {} }) });
+      if (path.includes('/api/channels/wechat-ilink/accounts')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ accounts: [] }) });
+      if (path.includes('/api/cross-plane/identities')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: [] }) });
+      if (path.includes('/api/cross-plane/grants')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ grants: [] }) });
+      if (path.includes('/api/cross-plane/audit')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ records: [] }) });
+      if (path.includes('/api/cross-plane/action/adapters')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ capabilities: [{ platform: 'feishu', operation: 'send_image', live_supported: true, adapter_bound: true }] }) });
+      if (path.includes('/api/cross-plane/action/executions')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ executions: [] }) });
+      if (path.includes('/api/cross-plane/action/preflight')) {
+        const body = JSON.parse(options.body);
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          dispatch_target: {
+            ready: true,
+            platform: 'feishu',
+            operation: body.requested_capability.split('.').pop(),
+            session_key: 'feishu:demo',
+            blockers: [],
+            outbound_message: { payload_kind: 'image', payload_ref: body.resource_ref, text: body.resource_ref },
+          },
+        }) });
+      }
+      if (path.includes('/api/cross-plane/action/execute')) {
+        const body = JSON.parse(options.body);
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          status: 'planned',
+          dispatch_status: 'dry_run',
+          dispatched: false,
+          dispatch_target: {
+            ready: true,
+            platform: 'feishu',
+            operation: body.action.requested_capability.split('.').pop(),
+            session_key: 'feishu:demo',
+            blockers: [],
+            outbound_message: { payload_kind: 'image', payload_ref: body.action.resource_ref, text: body.action.resource_ref },
+          },
+        }) });
+      }
+      if (path === '/api/platforms') return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderGateway();
+    const selects = [...document.querySelectorAll('.cross-plane-composer select')];
+    selects[0].value = 'send_image';
+    selects[0].dispatchEvent(new Event('change'));
+    document.querySelector('.cross-plane-composer textarea').value = 'https://example.test/panel.png';
+
+    document.querySelector('.cross-plane-actions button').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    let preflightBody = JSON.parse(mockF.mock.calls.find(call => String(call[0]).includes('/api/cross-plane/action/preflight'))[1].body);
+    expect(preflightBody.requested_capability).toBe('channel.feishu.send_image');
+    expect(preflightBody.resource_ref).toBe('image://https://example.test/panel.png');
+    expect(document.getElementById('panel-content').textContent).toContain('Preflight Result');
+
+    document.querySelectorAll('.cross-plane-actions button')[1].click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const executeBody = JSON.parse(mockF.mock.calls.find(call => String(call[0]).includes('/api/cross-plane/action/execute'))[1].body);
+    expect(executeBody.mode).toBe('dry_run');
+    expect(executeBody.action.requested_capability).toBe('channel.feishu.send_image');
+    expect(executeBody.action.resource_ref).toBe('image://https://example.test/panel.png');
+    expect(document.getElementById('panel-content').textContent).toContain('Execution Result');
   });
 
   it('index exposes the context panel tab and slash command', () => {

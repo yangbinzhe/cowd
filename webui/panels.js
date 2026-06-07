@@ -292,6 +292,156 @@ window.Panels = (()=>{
     return row;
   }
 
+  function crossPlanePayloadRef(operation,value){
+    const raw=String(value||'').trim();
+    if(operation==='send_text'){
+      return raw.startsWith('text://')||raw.startsWith('text:')?raw:'text://'+raw;
+    }
+    if(operation==='send_image'){
+      if(raw.startsWith('image://')||raw.startsWith('http://')||raw.startsWith('https://')||raw.startsWith('workspace://'))return raw.startsWith('image://')?raw:'image://'+raw;
+      return 'image://'+raw;
+    }
+    if(operation==='send_file'){
+      if(raw.startsWith('file://')||raw.startsWith('workspace://'))return raw;
+      return 'file://'+raw;
+    }
+    return raw;
+  }
+
+  function renderCrossPlaneComposer(){
+    const box=UI.el('div','cross-plane-composer');
+    box.innerHTML='<h3>Action Composer</h3>';
+    const form=UI.el('div','panel-form cross-plane-form');
+
+    const operation=UI.el('select');
+    operation.setAttribute('aria-label','Operation');
+    [
+      ['send_text','Send text'],
+      ['send_image','Send image'],
+      ['send_file','Send file'],
+    ].forEach(function(pair){
+      const opt=UI.el('option');
+      opt.value=pair[0];
+      opt.textContent=pair[1];
+      operation.appendChild(opt);
+    });
+
+    const principal=UI.el('input');
+    principal.placeholder='user:demo';
+    principal.value='user:demo';
+    principal.setAttribute('aria-label','Principal');
+
+    const target=UI.el('input');
+    target.placeholder='channel://feishu/chat/demo';
+    target.value='channel://feishu/chat/demo';
+    target.setAttribute('aria-label','Target channel ref');
+
+    const payload=UI.el('textarea');
+    payload.placeholder='Message text, image URL, or workspace file path';
+    payload.value='hello from cowd';
+    payload.setAttribute('aria-label','Payload');
+
+    const mode=UI.el('select');
+    mode.setAttribute('aria-label','Execution mode');
+    [['dry_run','Dry run'],['commit','Commit']].forEach(function(pair){
+      const opt=UI.el('option');
+      opt.value=pair[0];
+      opt.textContent=pair[1];
+      mode.appendChild(opt);
+    });
+
+    const row=UI.el('div','cross-plane-form-grid');
+    row.appendChild(operation);
+    row.appendChild(mode);
+    form.appendChild(row);
+    form.appendChild(principal);
+    form.appendChild(target);
+    form.appendChild(payload);
+
+    const actions=UI.el('div','cross-plane-actions');
+    const preflightBtn=UI.el('button','btn-secondary');
+    preflightBtn.textContent='Preflight action';
+    const executeBtn=UI.el('button','btn-secondary');
+    executeBtn.textContent='Execute action';
+    actions.appendChild(preflightBtn);
+    actions.appendChild(executeBtn);
+    form.appendChild(actions);
+
+    const resultBox=UI.el('div','dispatch-target-preview');
+
+    function actionBody(){
+      const op=operation.value;
+      return {
+        actor_principal:principal.value.trim()||'user:demo',
+        source_channel:'local:webui',
+        session_id:'webui-composer',
+        requested_capability:'channel.feishu.'+op,
+        provider_account:'feishu-main',
+        target_ref:target.value.trim(),
+        resource_ref:crossPlanePayloadRef(op,payload.value),
+        risk:op==='send_text'?'low':'high',
+        data_classification:'internal',
+        identity_trust:'verified'
+      };
+    }
+
+    function setBusy(busy){
+      preflightBtn.disabled=busy;
+      executeBtn.disabled=busy;
+    }
+
+    function renderResult(title,result){
+      resultBox.innerHTML='<h3>'+UI.esc(title)+'</h3>';
+      if(result.dispatch_target)resultBox.appendChild(renderDispatchTarget(result.dispatch_target));
+      if(result.dispatch_outcome)resultBox.appendChild(renderDispatchOutcome(result.dispatch_outcome));
+      if((result.blockers||[]).length){
+        const blockers=UI.el('div','panel-empty');
+        blockers.textContent='Blocked '+result.blockers.slice(0,3).join(' · ');
+        resultBox.appendChild(blockers);
+      }
+    }
+
+    operation.onchange=function(){
+      if(operation.value==='send_text')payload.value='hello from cowd';
+      else if(operation.value==='send_image')payload.value='https://example.test/panel.png';
+      else payload.value='workspace://file/reports/panel.txt';
+    };
+
+    preflightBtn.onclick=async function(){
+      setBusy(true);
+      try{
+        const result=await Api.preflightCrossPlaneAction(actionBody());
+        renderResult('Preflight Result',result);
+        UI.showToast((result.dispatch_target&&result.dispatch_target.ready)?'Dispatch target ready':'Dispatch target blocked');
+      }catch(e){
+        UI.showToast('Preflight failed: '+e.message,'error');
+      }finally{
+        setBusy(false);
+      }
+    };
+
+    executeBtn.onclick=async function(){
+      setBusy(true);
+      try{
+        const result=await Api.executeCrossPlaneAction({
+          mode:mode.value,
+          idempotency_key:'webui-'+Date.now(),
+          action:actionBody()
+        });
+        renderResult('Execution Result',result);
+        UI.showToast(result.dispatched?'Dispatch sent':'Dispatch '+(result.dispatch_status||result.status));
+      }catch(e){
+        UI.showToast('Execute failed: '+e.message,'error');
+      }finally{
+        setBusy(false);
+      }
+    };
+
+    box.appendChild(form);
+    box.appendChild(resultBox);
+    return box;
+  }
+
   function latestPolicyDecision(events){
     const policyEvents=(events||[]).filter(function(item){return item&&item.kind==='runtime.policy.decided'});
     const latest=policyEvents[policyEvents.length-1]||null;
@@ -1793,30 +1943,7 @@ window.Panels = (()=>{
         });
         sec.appendChild(executionList);
       }
-      const sim=UI.el('button','btn-secondary');
-      sim.textContent='Preflight verified Feishu send';
-      const preflightBox=UI.el('div','dispatch-target-preview');
-      sim.onclick=async function(){
-        try{
-          const result=await Api.preflightCrossPlaneAction({
-            actor_principal:'user:demo',
-            source_channel:'local:tui',
-            session_id:'demo',
-            requested_capability:'channel.feishu.send_text',
-            provider_account:'feishu-main',
-            target_ref:'channel://feishu/chat/demo',
-            resource_ref:'text://hello from cowd',
-            risk:'low',
-            data_classification:'internal',
-            identity_trust:'verified'
-          });
-          preflightBox.innerHTML='<h3>Dispatch Target</h3>';
-          preflightBox.appendChild(renderDispatchTarget(result.dispatch_target||{}));
-          UI.showToast((result.dispatch_target&&result.dispatch_target.ready)?'Dispatch target ready':'Dispatch target blocked');
-        }catch(e){UI.showToast('Preflight failed: '+e.message,'error')}
-      };
-      sec.appendChild(sim);
-      sec.appendChild(preflightBox);
+      sec.appendChild(renderCrossPlaneComposer());
       c.appendChild(sec);
     }catch(e){
       c.appendChild(UI.el('div','panel-empty','Cross-plane policy unavailable'));

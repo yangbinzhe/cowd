@@ -280,6 +280,12 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .dispatch-target .audit-source:first-child{font-variant-numeric:tabular-nums}
 .dispatch-target-preview{margin-top:8px}
 .dispatch-target-preview:empty{display:none}
+.cross-plane-composer{border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);padding:9px;margin-top:10px}
+.cross-plane-composer h3{font-size:12px;margin-bottom:8px}
+.cross-plane-form{margin:0}
+.cross-plane-form-grid{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:8px}
+.cross-plane-actions{display:flex;gap:8px;align-items:center;justify-content:flex-end}
+.cross-plane-actions button:disabled{opacity:.6;cursor:progress}
 .profile-create-row{display:flex;gap:8px;margin-bottom:10px}
 .profile-create-row input{flex:1;min-width:0;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:13px}
 .profile-active{font-size:11px;color:var(--success);padding:2px 6px;border:1px solid var(--border);border-radius:999px}
