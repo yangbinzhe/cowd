@@ -11,6 +11,8 @@ if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
 test('runtime console opens timeline context refs in browser', async ({ page }) => {
   const errors = [];
   let providerReloads = 0;
+  let approved = 0;
+  let completed = 0;
 
   page.on('pageerror', err => errors.push('pageerror: ' + err.message));
   page.on('console', msg => {
@@ -255,6 +257,46 @@ test('runtime console opens timeline context refs in browser', async ({ page }) 
     if (path === '/api/memory/maintenance') {
       return json({ enabled: true, candidates: [] });
     }
+    if (path === '/api/tasks') {
+      return json({
+        current: {
+          id: 'task-runtime-1',
+          objective: 'Finish daemon runtime parity',
+          status: completed ? 'completed' : 'running',
+          current_phase: 'webui-control',
+          review_result: 'accepted',
+          artifact_count: 2,
+        },
+        tasks: [{
+          id: 'task-runtime-1',
+          objective: 'Finish daemon runtime parity',
+          status: completed ? 'completed' : 'running',
+          current_phase: 'webui-control',
+          review_result: 'accepted',
+          artifact_count: 2,
+        }],
+      });
+    }
+    if (path === '/api/tasks/task-runtime-1/complete') {
+      completed += 1;
+      return json({ ok: true });
+    }
+    if (path === '/api/tasks/task-runtime-1/cancel') {
+      return json({ ok: true });
+    }
+    if (path === '/api/approval/pending') {
+      return json(approved ? [] : [{
+        id: 'approval-runtime-1',
+        tool_name: 'shell.exec',
+        risk: 'medium',
+        requester: 'session-runtime-1',
+        input_preview: 'cargo test -p cowd-cli',
+      }]);
+    }
+    if (path === '/api/approval/respond') {
+      approved += 1;
+      return json({ ok: true });
+    }
 
     return json({});
   });
@@ -283,9 +325,19 @@ test('runtime console opens timeline context refs in browser', async ({ page }) 
   await expect(page.locator('#panel-content')).toContainText('components');
   await expect(page.locator('#panel-content')).toContainText('caps');
   await expect(page.locator('#panel-content')).toContainText('Runtime Timeline');
+  await expect(page.locator('#panel-content')).toContainText('Daemon Tasks');
+  await expect(page.locator('#panel-content')).toContainText('Finish daemon runtime parity');
+  await expect(page.locator('#panel-content')).toContainText('webui-control');
+  await expect(page.locator('#panel-content')).toContainText('Pending Approvals');
+  await expect(page.locator('#panel-content')).toContainText('shell.exec');
+  await expect(page.locator('#panel-content')).toContainText('cargo test -p cowd-cli');
   await expect(page.locator('#panel-content')).toContainText('context_envelope:ctx-browser-1');
   await expect(page.locator('.runtime-timeline .runtime-context-link')).toContainText('ctx-browser-1');
 
+  await page.getByRole('button', { name: 'Complete' }).click();
+  await expect.poll(() => completed).toBe(1);
+  await page.getByRole('button', { name: 'Approve' }).click();
+  await expect.poll(() => approved).toBe(1);
   await page.getByRole('button', { name: 'Reload providers' }).click();
   await expect.poll(() => providerReloads).toBe(1);
 

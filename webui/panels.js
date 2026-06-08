@@ -740,6 +740,105 @@ window.Panels = (()=>{
     return sec;
   }
 
+  function normalizeApprovalRows(data){
+    if(Array.isArray(data))return data;
+    return (data && (data.approvals || data.pending || data.requests || data.items)) || [];
+  }
+
+  function renderRuntimeTaskItem(task,refresh){
+    const row=UI.el('div','runtime-control-item runtime-task-item');
+    const main=UI.el('div','runtime-control-body');
+    const id=task.id||task.task_id||'task';
+    const title=task.objective||task.title||id;
+    const status=task.status||'unknown';
+    const phase=task.current_phase||task.phase||((task.phases&&task.phases.length)?(task.phases[task.phases.length-1].name||task.phases[task.phases.length-1].id):'');
+    const review=task.review_result||((task.phases&&task.phases.length)?task.phases[task.phases.length-1].review_result:'');
+    const artifacts=task.artifact_count??((task.phases||[]).reduce(function(count,phase){return count+((phase.artifacts||[]).length)},0));
+    main.innerHTML='<b>'+UI.esc(status+' · '+title)+'</b><small>'+UI.esc([id,phase,review?'review '+review:'',artifacts?'artifacts '+artifacts:''].filter(Boolean).join(' · '))+'</small>';
+    if(task.blocker_reason){
+      const blocker=UI.el('em');
+      blocker.textContent=task.blocker_reason;
+      main.appendChild(blocker);
+    }
+    const actions=UI.el('div','runtime-control-actions');
+    const canCancel=!['completed','cancelled','canceled'].includes(String(status).toLowerCase());
+    if(canCancel){
+      const cancel=UI.el('button','btn-secondary btn-xs');
+      cancel.type='button';
+      cancel.textContent='Cancel';
+      cancel.onclick=async function(){
+        cancel.disabled=true;
+        try{
+          await Api.cancelTask(id);
+          UI.showToast('Task canceled','success');
+          if(refresh)await refresh();
+        }catch(e){
+          UI.showToast(e.message,'error');
+          cancel.disabled=false;
+        }
+      };
+      actions.appendChild(cancel);
+    }
+    const canComplete=!['completed','cancelled','canceled'].includes(String(status).toLowerCase());
+    if(canComplete){
+      const complete=UI.el('button','btn-secondary btn-xs');
+      complete.type='button';
+      complete.textContent='Complete';
+      complete.onclick=async function(){
+        complete.disabled=true;
+        try{
+          await Api.completeTask(id);
+          UI.showToast('Task completed','success');
+          if(refresh)await refresh();
+        }catch(e){
+          UI.showToast(e.message,'error');
+          complete.disabled=false;
+        }
+      };
+      actions.appendChild(complete);
+    }
+    row.appendChild(main);
+    row.appendChild(actions);
+    return row;
+  }
+
+  function renderRuntimeApprovalItem(approval,refresh){
+    const row=UI.el('div','runtime-control-item runtime-approval-item');
+    const main=UI.el('div','runtime-control-body');
+    const id=approval.id||approval.approval_id||approval.request_id||'approval';
+    const tool=approval.tool||approval.tool_name||approval.action||approval.capability||id;
+    const risk=approval.risk||approval.risk_level||approval.riskLevel||'risk n/a';
+    const requester=approval.requester||approval.session_id||approval.source||'unknown requester';
+    const preview=approval.input_preview||approval.inputPreview||approval.preview||approval.command||approval.reason||'';
+    main.innerHTML='<b>'+UI.esc(tool)+'</b><small>'+UI.esc([id,risk,requester].filter(Boolean).join(' · '))+'</small>';
+    if(preview){
+      const pre=UI.el('em');
+      pre.textContent=String(preview).slice(0,140);
+      main.appendChild(pre);
+    }
+    const actions=UI.el('div','runtime-control-actions');
+    [['Approve',true,'success'],['Reject',false,'error']].forEach(function(pair){
+      const btn=UI.el('button','btn-secondary btn-xs');
+      btn.type='button';
+      btn.textContent=pair[0];
+      btn.onclick=async function(){
+        btn.disabled=true;
+        try{
+          await Api.respondApproval(id,pair[1]);
+          UI.showToast(pair[1]?'Approval accepted':'Approval rejected',pair[2]);
+          if(refresh)await refresh();
+        }catch(e){
+          UI.showToast(e.message,'error');
+          btn.disabled=false;
+        }
+      };
+      actions.appendChild(btn);
+    });
+    row.appendChild(main);
+    row.appendChild(actions);
+    return row;
+  }
+
   async function renderContext(){
     const c=cont();c.innerHTML='';
     const hdr=UI.el('div','panel-section context-header');
@@ -1334,9 +1433,13 @@ window.Panels = (()=>{
     const runsSec=UI.el('div','panel-section runtime-runs');
     const timelineSec=UI.el('div','panel-section runtime-timeline');
     const contextSec=UI.el('div','panel-section context-list');
+    const taskSec=UI.el('div','panel-section runtime-tasks');
+    const approvalSec=UI.el('div','panel-section runtime-approvals');
     const maintSec=UI.el('div','panel-section memory-maintenance');
     const runtimeDetailMount=UI.el('div','context-history-detail-mount runtime-context-detail-mount');
     grid.appendChild(summary);
+    grid.appendChild(taskSec);
+    grid.appendChild(approvalSec);
     grid.appendChild(runsSec);
     grid.appendChild(timelineSec);
     grid.appendChild(contextSec);
@@ -1348,6 +1451,8 @@ window.Panels = (()=>{
       runsSec.innerHTML='<h3>Runtime Runs</h3>';
       timelineSec.innerHTML='<h3>Runtime Timeline</h3>';
       contextSec.innerHTML='<h3>Active Context</h3>';
+      taskSec.innerHTML='<h3>Daemon Tasks</h3>';
+      approvalSec.innerHTML='<h3>Pending Approvals</h3>';
       maintSec.innerHTML='<h3>Memory Maintenance</h3>';
       runtimeDetailMount.innerHTML='';
       const opts={q:input.value||'',profile:profile.value};
@@ -1412,6 +1517,38 @@ window.Panels = (()=>{
       const selected=envelope.selected||[];
       if(!selected.length)contextSec.appendChild(UI.el('div','panel-empty','No selected context'));
       selected.slice(0,6).forEach(function(item){contextSec.appendChild(renderContextItem(item))});
+
+      try{
+        const taskData=await Api.taskStatus();
+        const rows=(taskData.tasks||[]);
+        const current=taskData.current;
+        const taskMetrics=UI.el('div','memory-metrics');
+        taskMetrics.appendChild(renderMemoryMetric('open',rows.filter(function(task){return !['completed','cancelled','canceled'].includes(String(task.status||'').toLowerCase())}).length,'tasks'));
+        taskMetrics.appendChild(renderMemoryMetric('current',current?(current.status||'active'):'none','daemon'));
+        taskMetrics.appendChild(renderMemoryMetric('total',rows.length,'registry'));
+        taskSec.appendChild(taskMetrics);
+        if(current)taskSec.appendChild(renderRuntimeTaskItem(current,load));
+        rows.slice(-6).reverse().forEach(function(task){
+          if(current&&task.id===current.id)return;
+          taskSec.appendChild(renderRuntimeTaskItem(task,load));
+        });
+        if(!current&&!rows.length)taskSec.appendChild(UI.el('div','panel-empty','No daemon tasks'));
+      }catch(e){
+        taskSec.appendChild(UI.el('div','panel-empty','Task control unavailable'));
+      }
+
+      try{
+        const approvals=normalizeApprovalRows(await Api.pendingApprovals());
+        const metrics=UI.el('div','memory-metrics');
+        metrics.appendChild(renderMemoryMetric('pending',approvals.length,'requests'));
+        metrics.appendChild(renderMemoryMetric('gate',controlPlane&&controlPlane.components&&controlPlane.components.permissions&&controlPlane.components.permissions.approval_gate?'on':'n/a','approval'));
+        metrics.appendChild(renderMemoryMetric('auth',controlPlane&&controlPlane.components&&controlPlane.components.permissions&&controlPlane.components.permissions.auth_required?'on':'off','runtime'));
+        approvalSec.appendChild(metrics);
+        if(!approvals.length)approvalSec.appendChild(UI.el('div','panel-empty','No pending approvals'));
+        approvals.slice(0,6).forEach(function(approval){approvalSec.appendChild(renderRuntimeApprovalItem(approval,load))});
+      }catch(e){
+        approvalSec.appendChild(UI.el('div','panel-empty','Approval queue unavailable'));
+      }
 
       if(!Api.sid){
         runsSec.appendChild(UI.el('div','panel-empty','No active session'));

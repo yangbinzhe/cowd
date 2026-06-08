@@ -259,6 +259,15 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .runtime-value-loop-stage-missing{border-color:rgba(245,158,11,.45);color:var(--warn)}
 .runtime-value-loop-stage-failed,.runtime-value-loop-stage-degraded{border-color:rgba(239,68,68,.45);color:var(--error)}
 .runtime-value-loop-stage-optional{opacity:.7}
+.runtime-control-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:start;border-top:1px solid var(--border);padding:8px 0}
+.runtime-control-item:first-of-type{border-top:0}
+.runtime-control-body{min-width:0}
+.runtime-control-body b,.runtime-control-body small,.runtime-control-body em{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.runtime-control-body b{font-size:12px;color:var(--text)}
+.runtime-control-body small{margin-top:2px;font-size:10px;color:var(--text3)}
+.runtime-control-body em{margin-top:2px;font-size:11px;color:var(--text2);font-style:normal}
+.runtime-control-actions{display:flex;gap:4px;align-items:center;justify-content:flex-end}
+.runtime-control-actions button:disabled{opacity:.6;cursor:progress}
 @media(min-width:1100px){
   .runtime-console-grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
   .runtime-console-summary{grid-column:1 / -1}
