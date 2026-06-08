@@ -3732,6 +3732,78 @@ providers:
     }
 
     #[tokio::test]
+    async fn connector_resource_revalidation_route_updates_index_state() {
+        let workspace = unique_test_workspace("connector-resource-revalidate");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
+        let request = serde_json::json!({
+            "actor_principal": "user:connector-resource-revalidate",
+            "tool_id": "service.mock.docs.read",
+            "resource_id": "revalidate-doc",
+            "title": "Revalidate Doc",
+            "mode": "commit",
+            "idempotency_key": format!("revalidate-{}", uuid::Uuid::new_v4())
+        });
+        let execute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execute.status(), StatusCode::OK);
+
+        let revalidate = serde_json::json!({
+            "reference": "service://mock.docs/document/revalidate-doc",
+            "state": "stale"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/resources/revalidate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(revalidate.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_resource_revalidation");
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["resource"]["indexed_state"], "stale");
+
+        let resources = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/resources?q=Revalidate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resources.status(), StatusCode::OK);
+        let body = to_bytes(resources.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resource| resource["indexed_state"] == "stale"));
+    }
+
+    #[tokio::test]
     async fn feishu_readonly_service_blocks_without_ready_account() {
         let workspace = unique_test_workspace("feishu-readonly-blocked");
         let app = api_router(test_state_with_config_runtime_and_workspace(

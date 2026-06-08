@@ -1060,6 +1060,9 @@ describe('API module', () => {
     const mockF = vi.fn((url, options = {}) => {
       const path = String(url);
       if (path.includes('/api/connectors/resources')) {
+        if (path.includes('/api/connectors/resources/revalidate')) {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_resource_revalidation', ok: true }) });
+        }
         const query = path.includes('q=Ready') ? 'Ready Feishu Doc' : 'Mock Runtime Doc';
         return Promise.resolve({ ok: true, json: () => Promise.resolve({
           kind: 'connector_resources',
@@ -1163,6 +1166,10 @@ describe('API module', () => {
     await new Promise(resolve => setTimeout(resolve, 240));
     expect(panel.textContent).toContain('Ready Feishu Doc');
     expect(String(mockF.mock.calls.find(call => String(call[0]).includes('/api/connectors/resources?q=Ready'))[0])).toContain('offset=0');
+    document.querySelector('.connector-resource-list .runtime-ref-actions button').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const revalidateCall = mockF.mock.calls.find(call => String(call[0]).includes('/api/connectors/resources/revalidate'));
+    expect(JSON.parse(revalidateCall[1].body).state).toBe('indexed');
 
     document.querySelector('.connector-service-executor button').click();
     await new Promise(resolve => setTimeout(resolve, 0));

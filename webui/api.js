@@ -390,6 +390,9 @@ window.Api = (()=>{
       const query=params.toString();
       return req('GET','/api/connectors/resources'+(query?'?'+query:''));
     },
+    async revalidateConnectorResource(reference,state){
+      return req('POST','/api/connectors/resources/revalidate',{reference,state:state||'indexed'});
+    },
     async connectorServiceTools(service){return req('GET','/api/connectors/services/'+encodeURIComponent(service)+'/tools')},
     async executeConnectorService(service,body){return req('POST','/api/connectors/services/'+encodeURIComponent(service)+'/execute',body||{})},
 

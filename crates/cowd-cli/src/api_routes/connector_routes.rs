@@ -32,6 +32,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(connector_resources_handler),
         )
         .route(
+            "/api/connectors/resources/revalidate",
+            axum::routing::post(connector_resource_revalidate_handler),
+        )
+        .route(
             "/api/connectors/services/mock.docs/tools",
             get(mock_docs_tools_handler),
         )
@@ -84,6 +88,13 @@ struct ConnectorResourceQuery {
     limit: Option<usize>,
     #[serde(default)]
     offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnectorResourceRevalidateRequest {
+    reference: String,
+    #[serde(default)]
+    state: Option<String>,
 }
 
 pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot {
@@ -406,6 +417,50 @@ async fn connector_resources_handler(
         "resources": resources,
         "total": total,
     }))
+}
+
+async fn connector_resource_revalidate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<ConnectorResourceRevalidateRequest>,
+) -> impl IntoResponse {
+    let reference = request.reference.trim();
+    if reference.is_empty() {
+        return Json(serde_json::json!({
+            "kind": "connector_resource_revalidation",
+            "ok": false,
+            "reason": "reference is required",
+        }));
+    }
+    let desired_state = request.state.as_deref().unwrap_or("indexed");
+    let result = durable_resource_directory(&state).and_then(|directory| {
+        let changed = match desired_state {
+            "indexed" => directory.mark_indexed(reference)?,
+            "stale" => directory.mark_stale(reference)?,
+            other => {
+                return Ok((false, None, Some(format!("unsupported state: {other}"))));
+            }
+        };
+        let resource = directory.get(reference)?;
+        Ok((changed, resource, None))
+    });
+    match result {
+        Ok((changed, resource, reason)) => Json(serde_json::json!({
+            "kind": "connector_resource_revalidation",
+            "ok": changed && reason.is_none(),
+            "state": desired_state,
+            "changed": changed,
+            "resource": resource,
+            "reason": reason,
+        })),
+        Err(error) => Json(serde_json::json!({
+            "kind": "connector_resource_revalidation",
+            "ok": false,
+            "state": desired_state,
+            "changed": false,
+            "resource": null,
+            "reason": error.to_string(),
+        })),
+    }
 }
 
 async fn mock_docs_tools_handler() -> impl IntoResponse {

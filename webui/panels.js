@@ -2275,7 +2275,27 @@ window.Panels = (()=>{
           if(!rows.length)list.appendChild(UI.el('div','panel-empty','No connector resources'));
           rows.forEach(function(resource){
             const meta=[resource.resource_type,resource.indexed_state,resource.source].filter(Boolean).join(' · ');
-            list.appendChild(connectorRow(resource.provider||'resource',resource.title||resource.reference,meta||resource.reference,resource.indexed_state));
+            const row=connectorRow(resource.provider||'resource',resource.title||resource.reference,meta||resource.reference,resource.indexed_state);
+            const actions=UI.el('span','runtime-ref-actions');
+            [['indexed','Mark indexed'],['stale','Mark stale']].forEach(function(pair){
+              const btn=UI.el('button','runtime-context-link');
+              btn.textContent=pair[1];
+              btn.onclick=async function(){
+                btn.disabled=true;
+                try{
+                  const result=await Api.revalidateConnectorResource(resource.reference,pair[0]);
+                  UI.showToast(result.ok?'Resource updated':'Resource unchanged');
+                  await loadResources();
+                }catch(e){
+                  UI.showToast('Resource update failed: '+e.message);
+                }finally{
+                  btn.disabled=false;
+                }
+              };
+              actions.appendChild(btn);
+            });
+            row.appendChild(actions);
+            list.appendChild(row);
           });
           if(data.degraded_reason)list.appendChild(UI.el('div','panel-empty','Resource directory degraded: '+data.degraded_reason));
         }catch(e){
