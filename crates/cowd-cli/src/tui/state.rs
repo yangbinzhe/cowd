@@ -1748,6 +1748,7 @@ impl TuiState {
                     .show_notification("Command prepared. Press Enter to run.");
             }
             Action::RespondDaemonApproval { id, approved } => {
+                let approval_id = id.clone();
                 let result = run_daemon_projection_blocking(move |client| async move {
                     client
                         .respond_approval(&id, approved, Some("once"), None)
@@ -1755,6 +1756,7 @@ impl TuiState {
                 });
                 match result {
                     Ok(_) => {
+                        self.apply_local_daemon_approval_response(&approval_id);
                         let verdict = if approved { "approved" } else { "rejected" };
                         self.toast_manager.push(
                             ToastVariant::Success,
@@ -1772,16 +1774,20 @@ impl TuiState {
                 }
             }
             Action::CancelDaemonTask(id) => {
+                let task_id = id.clone();
                 let result = run_daemon_projection_blocking(move |client| async move {
                     client.cancel_task(&id).await
                 });
                 match result {
-                    Ok(_) => self.toast_manager.push(
-                        ToastVariant::Success,
-                        Some("Task".into()),
-                        "Daemon task canceled".into(),
-                        2000,
-                    ),
+                    Ok(_) => {
+                        self.apply_local_daemon_task_status(&task_id, "cancelled");
+                        self.toast_manager.push(
+                            ToastVariant::Success,
+                            Some("Task".into()),
+                            "Daemon task canceled".into(),
+                            2000,
+                        );
+                    }
                     Err(err) => self.toast_manager.push(
                         ToastVariant::Warning,
                         Some("Task".into()),
@@ -1791,16 +1797,20 @@ impl TuiState {
                 }
             }
             Action::CompleteDaemonTask(id) => {
+                let task_id = id.clone();
                 let result = run_daemon_projection_blocking(move |client| async move {
                     client.complete_task(&id).await
                 });
                 match result {
-                    Ok(_) => self.toast_manager.push(
-                        ToastVariant::Success,
-                        Some("Task".into()),
-                        "Daemon task completed".into(),
-                        2000,
-                    ),
+                    Ok(_) => {
+                        self.apply_local_daemon_task_status(&task_id, "completed");
+                        self.toast_manager.push(
+                            ToastVariant::Success,
+                            Some("Task".into()),
+                            "Daemon task completed".into(),
+                            2000,
+                        );
+                    }
                     Err(err) => self.toast_manager.push(
                         ToastVariant::Warning,
                         Some("Task".into()),
@@ -1826,6 +1836,33 @@ impl TuiState {
             }
             Action::Noop => {}
         }
+    }
+
+    fn apply_local_daemon_approval_response(&mut self, approval_id: &str) {
+        self.app
+            .daemon_approval_items
+            .retain(|approval| approval.id != approval_id);
+        self.app.daemon_pending_approvals = Some(self.app.daemon_approval_items.len() as u64);
+        self.approval_cockpit_panel.sync_from_app(&self.app);
+        let snapshot =
+            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
+        self.command_palette.sync_runtime_actions(&snapshot);
+    }
+
+    fn apply_local_daemon_task_status(&mut self, task_id: &str, status: &str) {
+        for task in &mut self.app.daemon_tasks {
+            if task.id == task_id {
+                task.status = status.to_string();
+                if matches!(status, "completed" | "cancelled" | "canceled") {
+                    task.blocker_reason = None;
+                }
+            }
+        }
+        self.app.daemon_task_count = Some(self.app.daemon_tasks.len() as u64);
+        self.goal_workbench_panel.sync_from_app(&self.app);
+        let snapshot =
+            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
+        self.command_palette.sync_runtime_actions(&snapshot);
     }
 
     fn reload_runtime_providers_from_loader(&mut self, loader: &runtime::ConfigLoader) -> bool {
@@ -2352,6 +2389,71 @@ mod tests {
 
         // Theme engine dark by default
         assert_eq!(state.theme_engine.theme.name, "dark");
+    }
+
+    #[test]
+    fn local_daemon_approval_response_updates_projection_state() {
+        let mut state = TuiState::new("test-model", "test-session");
+        state.app.daemon_approval_items = vec![
+            crate::tui::runtime_control_store::DaemonApprovalSummary {
+                id: "approval-1".to_string(),
+                tool_name: "bash".to_string(),
+                risk: Some("high".to_string()),
+                requester: Some("session".to_string()),
+                input_preview: "rm -rf /tmp/example".to_string(),
+            },
+            crate::tui::runtime_control_store::DaemonApprovalSummary {
+                id: "approval-2".to_string(),
+                tool_name: "edit".to_string(),
+                risk: Some("medium".to_string()),
+                requester: Some("session".to_string()),
+                input_preview: "write file".to_string(),
+            },
+        ];
+        state.app.daemon_pending_approvals = Some(2);
+
+        state.apply_local_daemon_approval_response("approval-1");
+
+        assert_eq!(state.app.daemon_pending_approvals, Some(1));
+        assert_eq!(state.app.daemon_approval_items.len(), 1);
+        assert_eq!(state.app.daemon_approval_items[0].id, "approval-2");
+    }
+
+    #[test]
+    fn local_daemon_task_status_updates_projection_state() {
+        let mut state = TuiState::new("test-model", "test-session");
+        state.app.daemon_tasks = vec![
+            crate::tui::runtime_control_store::DaemonTaskSummary {
+                id: "task-1".to_string(),
+                objective: "blocked task".to_string(),
+                status: "blocked".to_string(),
+                current_phase: Some("verify".to_string()),
+                yolo_mode: true,
+                failure_count: 1,
+                review_result: None,
+                artifact_count: 0,
+                blocker_reason: Some("waiting for approval".to_string()),
+            },
+            crate::tui::runtime_control_store::DaemonTaskSummary {
+                id: "task-2".to_string(),
+                objective: "running task".to_string(),
+                status: "running".to_string(),
+                current_phase: None,
+                yolo_mode: false,
+                failure_count: 0,
+                review_result: None,
+                artifact_count: 0,
+                blocker_reason: None,
+            },
+        ];
+        state.app.daemon_task_count = Some(2);
+
+        state.apply_local_daemon_task_status("task-1", "completed");
+
+        assert_eq!(state.app.daemon_task_count, Some(2));
+        assert_eq!(state.app.daemon_tasks[0].status, "completed");
+        assert_eq!(state.app.daemon_tasks[0].blocker_reason, None);
+        assert_eq!(state.app.daemon_tasks[1].status, "running");
     }
 
     #[test]
