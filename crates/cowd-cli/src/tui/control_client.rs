@@ -253,6 +253,90 @@ impl DaemonControlClient {
         Ok(value)
     }
 
+    pub async fn task_status(&self) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "task_list",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+            }))
+            .await?,
+            "daemon rejected task_list request",
+        )
+    }
+
+    pub async fn start_task(
+        &self,
+        objective: &str,
+        yolo_mode: bool,
+    ) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "task_start",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "objective": objective,
+                "yolo_mode": yolo_mode,
+            }))
+            .await?,
+            "daemon rejected task_start request",
+        )
+    }
+
+    pub async fn cancel_task(&self, id: &str) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "task_cancel",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "id": id,
+            }))
+            .await?,
+            "daemon rejected task_cancel request",
+        )
+    }
+
+    pub async fn complete_task(&self, id: &str) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "task_complete",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "id": id,
+            }))
+            .await?,
+            "daemon rejected task_complete request",
+        )
+    }
+
+    pub async fn pending_approvals(&self) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "approval_pending",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+            }))
+            .await?,
+            "daemon rejected approval_pending request",
+        )
+    }
+
+    pub async fn respond_approval(
+        &self,
+        id: &str,
+        approved: bool,
+        persistence: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "approval_respond",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "id": id,
+                "approved": approved,
+                "persistence": persistence.unwrap_or("once"),
+                "reason": reason,
+            }))
+            .await?,
+            "daemon rejected approval_respond request",
+        )
+    }
+
     pub async fn chat_session(
         &self,
         session_id: &str,
@@ -366,6 +450,23 @@ impl DaemonControlClient {
             Ok(result) => result,
             Err(_) => Err(DaemonControlError::Timeout),
         }
+    }
+
+    fn expect_ok(
+        &self,
+        value: serde_json::Value,
+        fallback: &'static str,
+    ) -> Result<serde_json::Value, DaemonControlError> {
+        if !value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(DaemonControlError::Rejected(
+                value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(fallback)
+                    .to_string(),
+            ));
+        }
+        Ok(value)
     }
 }
 
@@ -583,6 +684,83 @@ mod tests {
         assert_eq!(snapshot.sessions, vec!["s1"]);
         assert_eq!(snapshot.leases.total, 1);
         assert_eq!(snapshot.leases.items[0].owner, "tui:test");
+
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn task_control_client_sends_socket_commands() {
+        let socket = temp_socket("task-control");
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read command");
+            let command: serde_json::Value =
+                serde_json::from_str(line.trim()).expect("command json");
+            assert_eq!(
+                command.get("cmd").and_then(|v| v.as_str()),
+                Some("task_cancel")
+            );
+            assert_eq!(command.get("id").and_then(|v| v.as_str()), Some("task-1"));
+            writer
+                .write_all(br#"{"ok":true,"task":{"id":"task-1","status":"cancelled"}}"#)
+                .await
+                .expect("write response");
+            writer.write_all(b"\n").await.expect("write newline");
+        });
+
+        let value = DaemonControlClient::new(&socket)
+            .with_timeout(Duration::from_secs(1))
+            .cancel_task("task-1")
+            .await
+            .expect("cancel task");
+        assert_eq!(value["task"]["status"], "cancelled");
+
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn approval_control_client_sends_socket_commands() {
+        let socket = temp_socket("approval-control");
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read command");
+            let command: serde_json::Value =
+                serde_json::from_str(line.trim()).expect("command json");
+            assert_eq!(
+                command.get("cmd").and_then(|v| v.as_str()),
+                Some("approval_respond")
+            );
+            assert_eq!(
+                command.get("id").and_then(|v| v.as_str()),
+                Some("approval-1")
+            );
+            assert_eq!(
+                command.get("approved").and_then(|v| v.as_bool()),
+                Some(true)
+            );
+            writer
+                .write_all(br#"{"ok":true,"id":"approval-1","resolved":true,"approved":true}"#)
+                .await
+                .expect("write response");
+            writer.write_all(b"\n").await.expect("write newline");
+        });
+
+        let value = DaemonControlClient::new(&socket)
+            .with_timeout(Duration::from_secs(1))
+            .respond_approval("approval-1", true, Some("once"), None)
+            .await
+            .expect("respond approval");
+        assert_eq!(value["resolved"], true);
 
         server.await.expect("server task");
         let _ = std::fs::remove_file(socket);

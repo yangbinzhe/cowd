@@ -29,6 +29,7 @@ use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use memory::UnifiedSessionStore;
 use runtime::mirror::MessageMirror;
+use runtime::permission_enforcer::{ApprovalPersistence, ApprovalVerdict};
 use runtime::platform::config::PlatformRuntimeConfig;
 use runtime::platform::{PlatformConfig, PlatformRuntime};
 use tools::GlobalToolRegistry;
@@ -636,6 +637,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         let event_bus = event_bus.clone();
         let unified_store = unified_store.clone();
         let lease_registry = lease_registry.clone();
+        let task_kernel = app_state.task_kernel.clone();
+        let approval_gate = app_state.approval_gate.clone();
         let started_at = started_at;
         tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
@@ -647,12 +650,16 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
                             let event_bus = event_bus.clone();
                             let unified_store = unified_store.clone();
                             let lease_registry = lease_registry.clone();
+                            let task_kernel = task_kernel.clone();
+                            let approval_gate = approval_gate.clone();
                             handle_unix_client(
                                 stream,
                                 sessions,
                                 event_bus,
                                 unified_store,
                                 lease_registry,
+                                task_kernel,
+                                approval_gate,
                                 started_at,
                             )
                             .await;
@@ -718,6 +725,12 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
 /// Supported commands:
 ///   {"cmd":"status"}
 ///   {"cmd":"runtime_snapshot"}
+///   {"cmd":"task_list"}
+///   {"cmd":"task_start","objective":"...","yolo_mode":true}
+///   {"cmd":"task_cancel","id":"..."}
+///   {"cmd":"task_complete","id":"..."}
+///   {"cmd":"approval_pending"}
+///   {"cmd":"approval_respond","id":"...","approved":true,"persistence":"once|session|always","reason":"..."}
 ///   {"cmd":"ensure_session","session_id":"...","model":"..."}
 ///   {"cmd":"subscribe_session","session_id":"..."}
 ///   {"cmd":"acquire_session_lease","session_id":"...","owner":"...","mode":"collaborative|exclusive|takeover"}
@@ -731,6 +744,8 @@ async fn handle_unix_client(
     event_bus: Arc<SessionEventBus>,
     unified_store: Option<Arc<UnifiedSessionStore>>,
     lease_registry: Arc<SessionLeaseRegistry>,
+    task_kernel: Arc<crate::task_kernel::TaskKernel>,
+    approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
     started_at: Instant,
 ) {
     let (reader, mut writer) = stream.into_split();
@@ -772,6 +787,126 @@ async fn handle_unix_client(
                                 daemon_runtime_snapshot(&sessions, &lease_registry, started_at)
                                     .await
                             }
+                            Some("task_list") => serde_json::json!({
+                                "ok": true,
+                                "tasks": task_kernel.list(),
+                                "current": task_kernel.current(),
+                            }),
+                            Some("task_start") => {
+                                let objective = cmd
+                                    .get("objective")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or_default();
+                                let yolo_mode = cmd
+                                    .get("yolo_mode")
+                                    .and_then(|value| value.as_bool())
+                                    .unwrap_or(false);
+                                match task_kernel.start_goal(objective, yolo_mode) {
+                                    Ok(task) => serde_json::json!({
+                                        "ok": true,
+                                        "task": task,
+                                    }),
+                                    Err(error) => serde_json::json!({
+                                        "ok": false,
+                                        "error": error,
+                                    }),
+                                }
+                            }
+                            Some("task_cancel") => {
+                                let id = cmd
+                                    .get("id")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or_default();
+                                match task_kernel.transition(
+                                    id,
+                                    crate::task_kernel::TaskStatus::Cancelled,
+                                    None,
+                                    "cancelled by TUI socket",
+                                ) {
+                                    Ok(task) => serde_json::json!({
+                                        "ok": true,
+                                        "task": task,
+                                    }),
+                                    Err(error) => serde_json::json!({
+                                        "ok": false,
+                                        "error": error,
+                                    }),
+                                }
+                            }
+                            Some("task_complete") => {
+                                let id = cmd
+                                    .get("id")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or_default();
+                                match task_kernel.transition(
+                                    id,
+                                    crate::task_kernel::TaskStatus::Completed,
+                                    None,
+                                    "accepted by TUI socket",
+                                ) {
+                                    Ok(task) => serde_json::json!({
+                                        "ok": true,
+                                        "task": task,
+                                    }),
+                                    Err(error) => serde_json::json!({
+                                        "ok": false,
+                                        "error": error,
+                                    }),
+                                }
+                            }
+                            Some("approval_pending") => {
+                                let pending = match approval_gate.as_ref() {
+                                    Some(gate) => gate.get_pending_requests().await,
+                                    None => Vec::new(),
+                                };
+                                serde_json::json!({
+                                    "ok": true,
+                                    "approvals": pending,
+                                })
+                            }
+                            Some("approval_respond") => match approval_gate.as_ref() {
+                                Some(gate) => {
+                                    let id = cmd
+                                        .get("id")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default();
+                                    let approved = cmd
+                                        .get("approved")
+                                        .and_then(|value| value.as_bool())
+                                        .unwrap_or(false);
+                                    let persistence = parse_socket_approval_persistence(
+                                        cmd.get("persistence")
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or("once"),
+                                    );
+                                    let verdict = if approved {
+                                        ApprovalVerdict::Approved
+                                    } else {
+                                        ApprovalVerdict::Denied {
+                                            reason: cmd
+                                                .get("reason")
+                                                .and_then(|value| value.as_str())
+                                                .unwrap_or("denied by TUI socket")
+                                                .to_string(),
+                                        }
+                                    };
+                                    match gate.resolve_approval(id, verdict, persistence).await {
+                                        Some(request) => serde_json::json!({
+                                            "ok": true,
+                                            "id": id,
+                                            "resolved": true,
+                                            "approved": approved,
+                                            "tool": "bash",
+                                            "action": request.command,
+                                        }),
+                                        None => serde_json::json!({
+                                            "ok": false,
+                                            "error": "approval request not found",
+                                        }),
+                                    }
+                                }
+                                None => return_json_error("approval gate not configured"),
+                            },
                             Some("acquire_session_lease") => {
                                 let session_id = cmd
                                     .get("session_id")
@@ -989,6 +1124,21 @@ async fn handle_unix_client(
                 break;
             }
         }
+    }
+}
+
+fn return_json_error(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "error": message,
+    })
+}
+
+fn parse_socket_approval_persistence(value: &str) -> ApprovalPersistence {
+    match value {
+        "session" => ApprovalPersistence::Session,
+        "always" | "forever" => ApprovalPersistence::Always,
+        _ => ApprovalPersistence::Once,
     }
 }
 

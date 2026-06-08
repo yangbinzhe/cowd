@@ -1793,10 +1793,18 @@ impl TuiState {
             }
             Action::RespondDaemonApproval { id, approved } => {
                 let approval_id = id.clone();
-                let result = run_daemon_projection_blocking(move |client| async move {
+                let projection_id = id.clone();
+                let result = run_daemon_control_blocking(move |client| async move {
                     client
                         .respond_approval(&id, approved, Some("once"), None)
                         .await
+                })
+                .or_else(move |_| {
+                    run_daemon_projection_blocking(move |client| async move {
+                        client
+                            .respond_approval(&projection_id, approved, Some("once"), None)
+                            .await
+                    })
                 });
                 match result {
                     Ok(_) => {
@@ -1819,8 +1827,14 @@ impl TuiState {
             }
             Action::CancelDaemonTask(id) => {
                 let task_id = id.clone();
-                let result = run_daemon_projection_blocking(move |client| async move {
+                let projection_id = id.clone();
+                let result = run_daemon_control_blocking(move |client| async move {
                     client.cancel_task(&id).await
+                })
+                .or_else(move |_| {
+                    run_daemon_projection_blocking(move |client| async move {
+                        client.cancel_task(&projection_id).await
+                    })
                 });
                 match result {
                     Ok(_) => {
@@ -1842,8 +1856,14 @@ impl TuiState {
             }
             Action::CompleteDaemonTask(id) => {
                 let task_id = id.clone();
-                let result = run_daemon_projection_blocking(move |client| async move {
+                let projection_id = id.clone();
+                let result = run_daemon_control_blocking(move |client| async move {
                     client.complete_task(&id).await
+                })
+                .or_else(move |_| {
+                    run_daemon_projection_blocking(move |client| async move {
+                        client.complete_task(&projection_id).await
+                    })
                 });
                 match result {
                     Ok(_) => {
@@ -2403,6 +2423,34 @@ impl L4KnowledgeView {
 
         let paragraph = Paragraph::new(lines).block(block);
         ctx.frame_mut().render_widget(paragraph, rect);
+    }
+}
+
+fn run_daemon_control_blocking<F, Fut>(operation: F) -> Result<serde_json::Value, String>
+where
+    F: FnOnce(crate::tui::control_client::DaemonControlClient) -> Fut + Send + 'static,
+    Fut: std::future::Future<
+            Output = Result<serde_json::Value, crate::tui::control_client::DaemonControlError>,
+        > + Send
+        + 'static,
+{
+    let run = move || {
+        let client = crate::tui::control_client::DaemonControlClient::default_local();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())?;
+        runtime
+            .block_on(operation(client))
+            .map_err(|err| err.to_string())
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(run)
+            .join()
+            .map_err(|_| "daemon control worker panicked".to_string())?
+    } else {
+        run()
     }
 }
 

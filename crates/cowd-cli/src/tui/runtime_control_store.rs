@@ -512,13 +512,25 @@ pub async fn refresh_runtime_control_snapshot(
         Ok(value) => snapshot.ingest_runtime_control_plane(&value),
         Err(err) => snapshot.degrade(format!("runtime projection unavailable: {err}")),
     }
-    match projection.task_status().await {
+    match control_client.task_status().await {
         Ok(value) => snapshot.ingest_task_status(&value),
-        Err(err) => snapshot.degrade(format!("task projection unavailable: {err}")),
+        Err(socket_err) => match projection.task_status().await {
+            Ok(value) => {
+                snapshot.degrade(format!("task socket unavailable: {socket_err}"));
+                snapshot.ingest_task_status(&value);
+            }
+            Err(err) => snapshot.degrade(format!("task projection unavailable: {err}")),
+        },
     }
-    match projection.pending_approvals().await {
+    match control_client.pending_approvals().await {
         Ok(value) => snapshot.ingest_pending_approvals(&value),
-        Err(err) => snapshot.degrade(format!("approval projection unavailable: {err}")),
+        Err(socket_err) => match projection.pending_approvals().await {
+            Ok(value) => {
+                snapshot.degrade(format!("approval socket unavailable: {socket_err}"));
+                snapshot.ingest_pending_approvals(&value);
+            }
+            Err(err) => snapshot.degrade(format!("approval projection unavailable: {err}")),
+        },
     }
     match projection.memory_status().await {
         Ok(value) => snapshot.ingest_memory_status(&value),
