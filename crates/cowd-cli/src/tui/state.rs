@@ -1810,6 +1810,13 @@ impl TuiState {
                     Ok(_) => {
                         self.apply_local_daemon_approval_response(&approval_id);
                         let verdict = if approved { "approved" } else { "rejected" };
+                        self.push_runtime_action_receipt(
+                            "ok",
+                            verdict,
+                            "daemon-control",
+                            "daemon.approval.respond",
+                            Some(approval_id.clone()),
+                        );
                         self.toast_manager.push(
                             ToastVariant::Success,
                             Some("Approval".into()),
@@ -1817,12 +1824,21 @@ impl TuiState {
                             2000,
                         );
                     }
-                    Err(err) => self.toast_manager.push(
-                        ToastVariant::Warning,
-                        Some("Approval".into()),
-                        err,
-                        3000,
-                    ),
+                    Err(err) => {
+                        self.push_runtime_action_receipt(
+                            "failed",
+                            &err,
+                            "daemon-control",
+                            "daemon.approval.respond",
+                            Some(approval_id),
+                        );
+                        self.toast_manager.push(
+                            ToastVariant::Warning,
+                            Some("Approval".into()),
+                            err,
+                            3000,
+                        );
+                    }
                 }
             }
             Action::CancelDaemonTask(id) => {
@@ -1839,6 +1855,13 @@ impl TuiState {
                 match result {
                     Ok(_) => {
                         self.apply_local_daemon_task_status(&task_id, "cancelled");
+                        self.push_runtime_action_receipt(
+                            "ok",
+                            "cancelled",
+                            "daemon-control",
+                            "daemon.task.cancel",
+                            Some(task_id.clone()),
+                        );
                         self.toast_manager.push(
                             ToastVariant::Success,
                             Some("Task".into()),
@@ -1846,12 +1869,21 @@ impl TuiState {
                             2000,
                         );
                     }
-                    Err(err) => self.toast_manager.push(
-                        ToastVariant::Warning,
-                        Some("Task".into()),
-                        err,
-                        3000,
-                    ),
+                    Err(err) => {
+                        self.push_runtime_action_receipt(
+                            "failed",
+                            &err,
+                            "daemon-control",
+                            "daemon.task.cancel",
+                            Some(task_id),
+                        );
+                        self.toast_manager.push(
+                            ToastVariant::Warning,
+                            Some("Task".into()),
+                            err,
+                            3000,
+                        );
+                    }
                 }
             }
             Action::CompleteDaemonTask(id) => {
@@ -1868,6 +1900,13 @@ impl TuiState {
                 match result {
                     Ok(_) => {
                         self.apply_local_daemon_task_status(&task_id, "completed");
+                        self.push_runtime_action_receipt(
+                            "ok",
+                            "completed",
+                            "daemon-control",
+                            "daemon.task.complete",
+                            Some(task_id.clone()),
+                        );
                         self.toast_manager.push(
                             ToastVariant::Success,
                             Some("Task".into()),
@@ -1875,12 +1914,21 @@ impl TuiState {
                             2000,
                         );
                     }
-                    Err(err) => self.toast_manager.push(
-                        ToastVariant::Warning,
-                        Some("Task".into()),
-                        err,
-                        3000,
-                    ),
+                    Err(err) => {
+                        self.push_runtime_action_receipt(
+                            "failed",
+                            &err,
+                            "daemon-control",
+                            "daemon.task.complete",
+                            Some(task_id),
+                        );
+                        self.toast_manager.push(
+                            ToastVariant::Warning,
+                            Some("Task".into()),
+                            err,
+                            3000,
+                        );
+                    }
                 }
             }
             Action::RevalidateConnectorResource { reference, state } => {
@@ -1905,6 +1953,13 @@ impl TuiState {
                         if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) =>
                     {
                         self.apply_local_connector_resource_state(&resource_ref, &desired_state);
+                        self.push_runtime_action_receipt(
+                            "ok",
+                            &desired_state,
+                            "daemon-control",
+                            "connector.resource.revalidate",
+                            Some(resource_ref.clone()),
+                        );
                         self.toast_manager.push(
                             ToastVariant::Success,
                             Some("Connector".into()),
@@ -1912,22 +1967,41 @@ impl TuiState {
                             2000,
                         );
                     }
-                    Ok(value) => self.toast_manager.push(
-                        ToastVariant::Warning,
-                        Some("Connector".into()),
-                        value
+                    Ok(value) => {
+                        let reason = value
                             .get("reason")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("resource state unchanged")
-                            .to_string(),
-                        3000,
-                    ),
-                    Err(err) => self.toast_manager.push(
-                        ToastVariant::Warning,
-                        Some("Connector".into()),
-                        err,
-                        3000,
-                    ),
+                            .to_string();
+                        self.push_runtime_action_receipt(
+                            "skipped",
+                            &reason,
+                            "daemon-control",
+                            "connector.resource.revalidate",
+                            Some(resource_ref),
+                        );
+                        self.toast_manager.push(
+                            ToastVariant::Warning,
+                            Some("Connector".into()),
+                            reason,
+                            3000,
+                        );
+                    }
+                    Err(err) => {
+                        self.push_runtime_action_receipt(
+                            "failed",
+                            &err,
+                            "daemon-control",
+                            "connector.resource.revalidate",
+                            Some(resource_ref),
+                        );
+                        self.toast_manager.push(
+                            ToastVariant::Warning,
+                            Some("Connector".into()),
+                            err,
+                            3000,
+                        );
+                    }
                 }
             }
             Action::PromoteConnectorResourceToMemory {
@@ -1938,6 +2012,7 @@ impl TuiState {
                     .clone()
                     .or_else(|| Some(self.app.session_id.clone()));
                 let projection_ref = reference.clone();
+                let receipt_ref = reference.clone();
                 let projection_session_id = session_id.clone();
                 let result = run_daemon_control_blocking(move |client| async move {
                     client
@@ -1958,6 +2033,17 @@ impl TuiState {
                     Ok(value)
                         if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) =>
                     {
+                        let memory_id = value
+                            .get("memory_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("remembered");
+                        self.push_runtime_action_receipt(
+                            "ok",
+                            memory_id,
+                            "daemon-control",
+                            "connector.resource.promote_memory",
+                            Some(receipt_ref.clone()),
+                        );
                         self.toast_manager.push(
                             ToastVariant::Success,
                             Some("Memory".into()),
@@ -1965,22 +2051,41 @@ impl TuiState {
                             2000,
                         );
                     }
-                    Ok(value) => self.toast_manager.push(
-                        ToastVariant::Warning,
-                        Some("Memory".into()),
-                        value
+                    Ok(value) => {
+                        let reason = value
                             .get("reason")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("memory promotion skipped")
-                            .to_string(),
-                        3000,
-                    ),
-                    Err(err) => self.toast_manager.push(
-                        ToastVariant::Warning,
-                        Some("Memory".into()),
-                        err,
-                        3000,
-                    ),
+                            .to_string();
+                        self.push_runtime_action_receipt(
+                            "skipped",
+                            &reason,
+                            "daemon-control",
+                            "connector.resource.promote_memory",
+                            Some(receipt_ref.clone()),
+                        );
+                        self.toast_manager.push(
+                            ToastVariant::Warning,
+                            Some("Memory".into()),
+                            reason,
+                            3000,
+                        );
+                    }
+                    Err(err) => {
+                        self.push_runtime_action_receipt(
+                            "failed",
+                            &err,
+                            "daemon-control",
+                            "connector.resource.promote_memory",
+                            Some(receipt_ref),
+                        );
+                        self.toast_manager.push(
+                            ToastVariant::Warning,
+                            Some("Memory".into()),
+                            err,
+                            3000,
+                        );
+                    }
                 }
             }
             Action::TogglePanel(ref _name) => {}
@@ -2035,6 +2140,31 @@ impl TuiState {
                 resource.indexed_state = state.to_string();
             }
         }
+        self.gateway_panel.sync_from_app(&self.app);
+        let snapshot =
+            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
+        self.command_palette.sync_runtime_actions(&snapshot);
+    }
+
+    fn push_runtime_action_receipt(
+        &mut self,
+        status: &str,
+        dispatch_status: &str,
+        mode: &str,
+        capability: &str,
+        idempotency_key: Option<String>,
+    ) {
+        self.app.daemon_action_receipts.insert(
+            0,
+            crate::tui::runtime_control_store::RuntimeActionReceiptSummary {
+                status: status.to_string(),
+                dispatch_status: truncate_receipt_field(dispatch_status, 80),
+                mode: mode.to_string(),
+                capability: capability.to_string(),
+                idempotency_key,
+            },
+        );
+        self.app.daemon_action_receipts.truncate(8);
         self.gateway_panel.sync_from_app(&self.app);
         let snapshot =
             crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
@@ -2516,6 +2646,16 @@ where
     }
 }
 
+fn truncate_receipt_field(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 fn search_l4_entries_blocking(
     orchestrator: std::sync::Arc<memory::MemoryOrchestrator>,
 ) -> Result<Vec<memory::MemoryEntry>, String> {
@@ -2765,7 +2905,26 @@ mod tests {
             state.app.daemon_connector_resources[0].indexed_state,
             "stale"
         );
+        assert_eq!(state.app.daemon_action_receipts.len(), 2);
+        assert_eq!(
+            state.app.daemon_action_receipts[0].capability,
+            "connector.resource.promote_memory"
+        );
+        assert_eq!(
+            state.app.daemon_action_receipts[1].capability,
+            "connector.resource.revalidate"
+        );
+        assert_eq!(state.gateway_panel.execution_receipts.len(), 2);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn runtime_action_receipt_truncates_long_status() {
+        let long = "x".repeat(100);
+        let truncated = truncate_receipt_field(&long, 16);
+
+        assert_eq!(truncated.chars().count(), 19);
+        assert!(truncated.ends_with("..."));
     }
 
     #[test]

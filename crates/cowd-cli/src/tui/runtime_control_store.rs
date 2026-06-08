@@ -56,6 +56,15 @@ pub struct ConnectorResourceSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeActionReceiptSummary {
+    pub status: String,
+    pub dispatch_status: String,
+    pub mode: String,
+    pub capability: String,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeControlSnapshot {
     pub daemon_running: bool,
     pub active_sessions: usize,
@@ -75,6 +84,7 @@ pub struct RuntimeControlSnapshot {
     pub connector_accounts: Vec<ConnectorAccountSummary>,
     pub connector_capabilities: Vec<ConnectorCapabilitySummary>,
     pub connector_resources: Vec<ConnectorResourceSummary>,
+    pub action_receipts: Vec<RuntimeActionReceiptSummary>,
     pub connector_degraded_reasons: Vec<String>,
     pub degraded_reasons: Vec<String>,
 }
@@ -122,6 +132,7 @@ impl RuntimeControlSnapshot {
             connector_accounts: app.daemon_connector_accounts.clone(),
             connector_capabilities: app.daemon_connector_capabilities.clone(),
             connector_resources: app.daemon_connector_resources.clone(),
+            action_receipts: app.daemon_action_receipts.clone(),
             connector_degraded_reasons: app.daemon_connector_degraded_reasons.clone(),
             degraded_reasons: app.daemon_degraded_reasons.clone(),
             ..Self::default()
@@ -149,6 +160,7 @@ impl RuntimeControlSnapshot {
         app.daemon_connector_accounts = self.connector_accounts.clone();
         app.daemon_connector_capabilities = self.connector_capabilities.clone();
         app.daemon_connector_resources = self.connector_resources.clone();
+        app.daemon_action_receipts = self.action_receipts.clone();
         app.daemon_connector_degraded_reasons = self.connector_degraded_reasons.clone();
         app.daemon_degraded_reasons = self.degraded_reasons.clone();
         app.daemon_lease_owner = self.lease_owner.clone();
@@ -754,5 +766,30 @@ mod tests {
 
         let restored = RuntimeControlSnapshot::from_app(&app);
         assert_eq!(restored.memory_status.as_deref(), Some("available"));
+    }
+
+    #[test]
+    fn snapshot_round_trips_action_receipts_through_app() {
+        let mut app = App::new("claude-sonnet-4-6", "session-action-receipt");
+        let snapshot = RuntimeControlSnapshot {
+            action_receipts: vec![RuntimeActionReceiptSummary {
+                status: "ok".to_string(),
+                dispatch_status: "completed".to_string(),
+                mode: "daemon-control".to_string(),
+                capability: "daemon.task.complete".to_string(),
+                idempotency_key: Some("task-1".to_string()),
+            }],
+            ..RuntimeControlSnapshot::from_status(&status())
+        };
+
+        snapshot.apply_to_app(&mut app);
+        assert_eq!(app.daemon_action_receipts.len(), 1);
+
+        let restored = RuntimeControlSnapshot::from_app(&app);
+        assert_eq!(restored.action_receipts.len(), 1);
+        assert_eq!(
+            restored.action_receipts[0].capability,
+            "daemon.task.complete"
+        );
     }
 }

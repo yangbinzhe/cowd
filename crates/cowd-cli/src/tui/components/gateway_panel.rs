@@ -22,6 +22,7 @@ use crate::tui::{
     app::App,
     runtime_control_store::{
         ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
+        RuntimeActionReceiptSummary,
     },
 };
 
@@ -80,14 +81,7 @@ pub struct GatewayAdapterCapability {
     pub adapter_bound: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GatewayExecutionReceipt {
-    pub status: String,
-    pub dispatch_status: String,
-    pub mode: String,
-    pub capability: String,
-    pub idempotency_key: Option<String>,
-}
+pub type GatewayExecutionReceipt = RuntimeActionReceiptSummary;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayDispatchTarget {
@@ -174,6 +168,7 @@ impl GatewayPanel {
         self.connector_accounts = app.daemon_connector_accounts.clone();
         self.connector_capabilities = app.daemon_connector_capabilities.clone();
         self.connector_resources = app.daemon_connector_resources.clone();
+        self.execution_receipts = app.daemon_action_receipts.clone();
         self.connector_degraded_reasons = app.daemon_connector_degraded_reasons.clone();
         self.degraded_reasons = app.daemon_degraded_reasons.clone();
         if app.server_running {
