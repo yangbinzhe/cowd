@@ -27,6 +27,7 @@ use crate::tui::animation::{AnimationEngine, AnimationKind};
 use crate::tui::app::App;
 use crate::tui::components::agent_team_panel::AgentTeamPanel;
 use crate::tui::components::agents_overlay::AgentsOverlay;
+use crate::tui::components::approval_cockpit_panel::ApprovalCockpitPanel;
 use crate::tui::components::chat_view::ChatView;
 use crate::tui::components::command_palette::CommandPalette;
 use crate::tui::components::context_panel::ContextPanel;
@@ -37,6 +38,7 @@ use crate::tui::components::export_dialog::ExportDialog;
 use crate::tui::components::file_changes_panel::FileChangesPanel;
 use crate::tui::components::file_tree::FileTree;
 use crate::tui::components::gateway_panel::GatewayPanel;
+use crate::tui::components::goal_workbench_panel::GoalWorkbenchPanel;
 use crate::tui::components::memory_panel::MemoryPanel;
 use crate::tui::components::performance_dashboard::PerformanceDashboard;
 use crate::tui::components::prompt::Prompt;
@@ -68,6 +70,32 @@ pub enum ProcessedKey {
     Cancel,
     Exit,
     Nothing,
+}
+
+const SIDEBAR_TAB_COUNT: usize = 12;
+
+fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
+    if width < 96 {
+        vec![
+            "Run", "Ctx", "Chg", "Goal", "Appr", "Todo", "Diff", "File", "Sess", "Mem", "Skill",
+            "Gate",
+        ]
+    } else {
+        vec![
+            "Runtime",
+            "Context",
+            "Changes",
+            "Goals",
+            "Approvals",
+            "Todo",
+            "Diff",
+            "Files",
+            "Sessions",
+            "Memory",
+            "Skills",
+            "Gateway",
+        ]
+    }
 }
 
 // ── TuiState ────────────────────────────────────────────────────
@@ -157,6 +185,12 @@ pub struct TuiState {
     /// Todo panel displaying task list from TodoWrite tool calls.
     pub todo_panel: TodoPanel,
 
+    /// Goal workbench showing daemon task and YOLO/solo goal progress.
+    pub goal_workbench_panel: GoalWorkbenchPanel,
+
+    /// Approval and cross-plane permission cockpit.
+    pub approval_cockpit_panel: ApprovalCockpitPanel,
+
     /// Diff viewer component for unified/split diff display.
     pub diff_viewer: DiffViewer,
 
@@ -184,7 +218,7 @@ pub struct TuiState {
     /// Runtime activity panel summarizing run/context/tool state.
     pub runtime_activity_panel: RuntimeActivityPanel,
 
-    /// Active tab index in the sidebar (0=Runtime, 1=Context, 2=Changes, 3=Todo, 4=Diff, 5=Files, 6=Sessions, 7=Memory, 8=Skills, 9=Gateway).
+    /// Active tab index in the sidebar (0=Runtime, 1=Context, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Diff, 7=Files, 8=Sessions, 9=Memory, 10=Skills, 11=Gateway).
     pub sidebar_active_tab: usize,
 
     /// Status bar at the bottom showing model, tokens, and system info.
@@ -265,6 +299,8 @@ impl TuiState {
         let context_suggestions = ContextSuggestions::new();
         let file_changes_panel = FileChangesPanel::new();
         let todo_panel = TodoPanel::new();
+        let goal_workbench_panel = GoalWorkbenchPanel::new();
+        let approval_cockpit_panel = ApprovalCockpitPanel::new();
         let status_bar = StatusBar::with_default_sections();
         let animation_engine = AnimationEngine::new();
         let frame_timer = FrameTimer::new();
@@ -308,6 +344,8 @@ impl TuiState {
             context_suggestions,
             file_changes_panel,
             todo_panel,
+            goal_workbench_panel,
+            approval_cockpit_panel,
             status_bar,
             animation_engine,
             frame_timer,
@@ -458,6 +496,12 @@ impl TuiState {
         // Sync todo panel from timeline (TodoWrite ToolCall outputs)
         self.todo_panel.sync_from_timeline(&timeline);
 
+        // Sync goal workbench from daemon runtime state.
+        self.goal_workbench_panel.sync_from_app(&self.app);
+
+        // Sync approval/permission cockpit from daemon runtime state.
+        self.approval_cockpit_panel.sync_from_app(&self.app);
+
         // Sync diff viewer from App (extract diff text from timeline ToolCall outputs)
         self.diff_viewer.sync_from_app(&self.app);
 
@@ -475,7 +519,7 @@ impl TuiState {
 
         // Sync memory panel from the real cognitive store only when the tab is
         // visible. Keep App fallback for memory-disabled sessions.
-        if self.sidebar_active_tab == 7 && self.memory_panel.memory_manager.is_some() {
+        if self.sidebar_active_tab == 9 && self.memory_panel.memory_manager.is_some() {
             let should_sync = self
                 .memory_panel_last_sync
                 .map(|last| last.elapsed() >= Duration::from_millis(750))
@@ -581,10 +625,7 @@ impl TuiState {
 
             // Render sidebar: tab bar + active panel
             let tab_height = 1u16;
-            let tab_labels = [
-                "Runtime", "Context", "Changes", "Todo", "Diff", "Files", "Sessions", "Memory",
-                "Skills", "Gateway",
-            ];
+            let tab_labels = sidebar_tab_labels(sidebar_area.width);
             let tab_area = ratatui::layout::Rect::new(
                 sidebar_area.x,
                 sidebar_area.y,
@@ -635,7 +676,8 @@ impl TuiState {
                     let _ = error_recovery::catch_render_panic(
                         "runtime_activity_panel",
                         AssertUnwindSafe(|| {
-                            self.runtime_activity_panel.render(&mut main_ctx, panel_area);
+                            self.runtime_activity_panel
+                                .render(&mut main_ctx, panel_area);
                         }),
                     );
                 }
@@ -657,13 +699,30 @@ impl TuiState {
                 }
                 3 => {
                     let _ = error_recovery::catch_render_panic(
+                        "goal_workbench_panel",
+                        AssertUnwindSafe(|| {
+                            self.goal_workbench_panel.render(&mut main_ctx, panel_area);
+                        }),
+                    );
+                }
+                4 => {
+                    let _ = error_recovery::catch_render_panic(
+                        "approval_cockpit_panel",
+                        AssertUnwindSafe(|| {
+                            self.approval_cockpit_panel
+                                .render(&mut main_ctx, panel_area);
+                        }),
+                    );
+                }
+                5 => {
+                    let _ = error_recovery::catch_render_panic(
                         "todo_panel",
                         AssertUnwindSafe(|| {
                             self.todo_panel.render(&mut main_ctx, panel_area);
                         }),
                     );
                 }
-                4 => {
+                6 => {
                     let _guard = self.render_profiler.guard("diff_viewer");
                     let _ = error_recovery::catch_render_panic(
                         "diff_viewer",
@@ -672,7 +731,7 @@ impl TuiState {
                         }),
                     );
                 }
-                5 => {
+                7 => {
                     let _guard = self.render_profiler.guard("file_tree");
                     let _ = error_recovery::catch_render_panic(
                         "file_tree",
@@ -681,7 +740,7 @@ impl TuiState {
                         }),
                     );
                 }
-                6 => {
+                8 => {
                     let _guard = self.render_profiler.guard("session_sidebar");
                     let _ = error_recovery::catch_render_panic(
                         "session_sidebar",
@@ -690,7 +749,7 @@ impl TuiState {
                         }),
                     );
                 }
-                7 => {
+                9 => {
                     let _guard = self.render_profiler.guard("memory_panel");
                     let _ = error_recovery::catch_render_panic(
                         "memory_panel",
@@ -699,7 +758,7 @@ impl TuiState {
                         }),
                     );
                 }
-                8 => {
+                10 => {
                     let _ = error_recovery::catch_render_panic(
                         "skills_panel",
                         AssertUnwindSafe(|| {
@@ -707,7 +766,7 @@ impl TuiState {
                         }),
                     );
                 }
-                9 => {
+                11 => {
                     let _ = error_recovery::catch_render_panic(
                         "gateway_panel",
                         AssertUnwindSafe(|| {
@@ -1052,12 +1111,10 @@ impl TuiState {
         // 1.75. Tab/BackTab sidebar cycling (before keybind engine which maps Tab to no-op NextPanel)
         match event.code {
             KeyCode::Tab => {
-                const SIDEBAR_TAB_COUNT: usize = 10;
                 self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
                 return true;
             }
             KeyCode::BackTab => {
-                const SIDEBAR_TAB_COUNT: usize = 10;
                 self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
                     SIDEBAR_TAB_COUNT - 1
                 } else {
@@ -1254,8 +1311,7 @@ impl TuiState {
         }
 
         // ── Sidebar tab switching ──
-        // Tab / Shift+Tab: cycle through sidebar tabs (Context / Changes / Todo / Diff / Files / Sessions / Memory / Skills / Gateway)
-        const SIDEBAR_TAB_COUNT: usize = 10;
+        // Tab / Shift+Tab: cycle through sidebar tabs.
         if key.code == KeyCode::Tab {
             self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
             return ProcessedKey::Nothing;
@@ -1585,6 +1641,11 @@ impl TuiState {
                 if self.command_palette.is_open() {
                     self.command_palette.close();
                 } else {
+                    let snapshot =
+                        crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(
+                            &self.app,
+                        );
+                    self.command_palette.sync_runtime_actions(&snapshot);
                     self.command_palette.open();
                 }
             }
@@ -1654,6 +1715,11 @@ impl TuiState {
                         .show_notification(&format!("Switched to model: {model}"));
                 }
             }
+            Action::ReloadProviders => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let loader = runtime::ConfigLoader::default_for(cwd);
+                self.reload_runtime_providers_from_loader(&loader);
+            }
             Action::HistoryBrowse(older) => {
                 let text = if older {
                     self.app.history_prev()
@@ -1706,15 +1772,99 @@ impl TuiState {
                 }
             }
             Action::FocusDiff => {
-                self.sidebar_active_tab = 4;
-            }
-            Action::FocusFileTree => {
-                self.sidebar_active_tab = 5;
-            }
-            Action::FocusSessions => {
                 self.sidebar_active_tab = 6;
             }
-            Action::Execute(ref _cmd) => {}
+            Action::FocusFileTree => {
+                self.sidebar_active_tab = 7;
+            }
+            Action::FocusSessions => {
+                self.sidebar_active_tab = 8;
+            }
+            Action::Execute(ref cmd) => {
+                let mut input = tui_textarea::TextArea::default();
+                input.set_block(
+                    ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+                );
+                input.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
+                input.insert_str(cmd);
+                self.app.input = input;
+                self.app
+                    .show_notification("Command prepared. Press Enter to run.");
+            }
+            Action::RespondDaemonApproval { id, approved } => {
+                let approval_id = id.clone();
+                let result = run_daemon_projection_blocking(move |client| async move {
+                    client
+                        .respond_approval(&id, approved, Some("once"), None)
+                        .await
+                });
+                match result {
+                    Ok(_) => {
+                        self.apply_local_daemon_approval_response(&approval_id);
+                        let verdict = if approved { "approved" } else { "rejected" };
+                        self.toast_manager.push(
+                            ToastVariant::Success,
+                            Some("Approval".into()),
+                            format!("Daemon approval {verdict}"),
+                            2000,
+                        );
+                    }
+                    Err(err) => self.toast_manager.push(
+                        ToastVariant::Warning,
+                        Some("Approval".into()),
+                        err,
+                        3000,
+                    ),
+                }
+            }
+            Action::CancelDaemonTask(id) => {
+                let task_id = id.clone();
+                let result = run_daemon_projection_blocking(move |client| async move {
+                    client.cancel_task(&id).await
+                });
+                match result {
+                    Ok(_) => {
+                        self.apply_local_daemon_task_status(&task_id, "cancelled");
+                        self.toast_manager.push(
+                            ToastVariant::Success,
+                            Some("Task".into()),
+                            "Daemon task canceled".into(),
+                            2000,
+                        );
+                    }
+                    Err(err) => self.toast_manager.push(
+                        ToastVariant::Warning,
+                        Some("Task".into()),
+                        err,
+                        3000,
+                    ),
+                }
+            }
+            Action::CompleteDaemonTask(id) => {
+                let task_id = id.clone();
+                let result = run_daemon_projection_blocking(move |client| async move {
+                    client.complete_task(&id).await
+                });
+                match result {
+                    Ok(_) => {
+                        self.apply_local_daemon_task_status(&task_id, "completed");
+                        self.toast_manager.push(
+                            ToastVariant::Success,
+                            Some("Task".into()),
+                            "Daemon task completed".into(),
+                            2000,
+                        );
+                    }
+                    Err(err) => self.toast_manager.push(
+                        ToastVariant::Warning,
+                        Some("Task".into()),
+                        err,
+                        3000,
+                    ),
+                }
+            }
             Action::TogglePanel(ref _name) => {}
             Action::ApplyPreset(preset) => {
                 self.layout_tree.apply_preset(preset);
@@ -1731,6 +1881,92 @@ impl TuiState {
                 );
             }
             Action::Noop => {}
+        }
+    }
+
+    fn apply_local_daemon_approval_response(&mut self, approval_id: &str) {
+        self.app
+            .daemon_approval_items
+            .retain(|approval| approval.id != approval_id);
+        self.app.daemon_pending_approvals = Some(self.app.daemon_approval_items.len() as u64);
+        self.approval_cockpit_panel.sync_from_app(&self.app);
+        let snapshot =
+            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
+        self.command_palette.sync_runtime_actions(&snapshot);
+    }
+
+    fn apply_local_daemon_task_status(&mut self, task_id: &str, status: &str) {
+        for task in &mut self.app.daemon_tasks {
+            if task.id == task_id {
+                task.status = status.to_string();
+                if matches!(status, "completed" | "cancelled" | "canceled") {
+                    task.blocker_reason = None;
+                }
+            }
+        }
+        self.app.daemon_task_count = Some(self.app.daemon_tasks.len() as u64);
+        self.goal_workbench_panel.sync_from_app(&self.app);
+        let snapshot =
+            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
+        self.command_palette.sync_runtime_actions(&snapshot);
+    }
+
+    fn reload_runtime_providers_from_loader(&mut self, loader: &runtime::ConfigLoader) -> bool {
+        match loader.load() {
+            Ok(runtime_config) => {
+                let providers = runtime_config.providers().clone();
+                let provider_count = providers.providers.len();
+                let provider_model_count: usize =
+                    providers.providers.values().map(|p| p.models.len()).sum();
+                let configured_model = runtime_config.model().map(str::to_string);
+                let configured_model_provider = configured_model
+                    .as_deref()
+                    .and_then(|model| providers.resolve_full(model))
+                    .map(|provider| provider.name.clone());
+                let configured_model_resolved =
+                    configured_model.is_none() || configured_model_provider.is_some();
+                let status = if provider_count == 0 {
+                    "unconfigured"
+                } else if configured_model_resolved {
+                    "applied"
+                } else {
+                    "attention"
+                };
+
+                runtime::init_global_providers(providers);
+                self.runtime_activity_panel.sync_from_app(&self.app);
+
+                let route =
+                    configured_model_provider
+                        .as_deref()
+                        .unwrap_or(if configured_model_resolved {
+                            "override"
+                        } else {
+                            "missing"
+                        });
+                let message =
+                    format!("Providers {status}: {provider_count} providers, {provider_model_count} models, route {route}");
+                let variant = if status == "applied" {
+                    ToastVariant::Success
+                } else {
+                    ToastVariant::Warning
+                };
+                self.toast_manager
+                    .push(variant, Some("Providers".into()), message.clone(), 3000);
+                self.app.show_notification(&message);
+                true
+            }
+            Err(error) => {
+                let message = format!("Provider reload failed: {error}");
+                self.toast_manager.push(
+                    ToastVariant::Error,
+                    Some("Providers".into()),
+                    message.clone(),
+                    4000,
+                );
+                self.app.show_notification(&message);
+                false
+            }
         }
     }
 
@@ -2081,6 +2317,47 @@ impl L4KnowledgeView {
     }
 }
 
+fn daemon_projection_auth_token() -> Option<String> {
+    std::env::var("COWD_API_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("COWD_AUTH_TOKEN").ok())
+}
+
+fn run_daemon_projection_blocking<F, Fut>(operation: F) -> Result<serde_json::Value, String>
+where
+    F: FnOnce(crate::tui::projection_client::DaemonProjectionClient) -> Fut + Send + 'static,
+    Fut: std::future::Future<
+            Output = Result<serde_json::Value, crate::tui::projection_client::ProjectionError>,
+        > + Send
+        + 'static,
+{
+    let run = move || {
+        let Some(client) =
+            crate::tui::projection_client::DaemonProjectionClient::from_running_gateway(
+                daemon_projection_auth_token(),
+            )
+            .map_err(|err| err.to_string())?
+        else {
+            return Err("daemon gateway is not running".to_string());
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())?;
+        runtime
+            .block_on(operation(client))
+            .map_err(|err| err.to_string())
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(run)
+            .join()
+            .map_err(|_| "daemon projection worker panicked".to_string())?
+    } else {
+        run()
+    }
+}
+
 fn search_l4_entries_blocking(
     orchestrator: std::sync::Arc<memory::MemoryOrchestrator>,
 ) -> Result<Vec<memory::MemoryEntry>, String> {
@@ -2119,6 +2396,7 @@ impl Default for L4KnowledgeView {
 mod tests {
     use super::*;
     use crate::tui::layout::LayoutNode;
+    use crate::tui::test_utils::MockTerminal;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
 
@@ -2157,6 +2435,149 @@ mod tests {
 
         // Theme engine dark by default
         assert_eq!(state.theme_engine.theme.name, "dark");
+    }
+
+    #[test]
+    fn local_daemon_approval_response_updates_projection_state() {
+        let mut state = TuiState::new("test-model", "test-session");
+        state.app.daemon_approval_items = vec![
+            crate::tui::runtime_control_store::DaemonApprovalSummary {
+                id: "approval-1".to_string(),
+                tool_name: "bash".to_string(),
+                risk: Some("high".to_string()),
+                requester: Some("session".to_string()),
+                input_preview: "rm -rf /tmp/example".to_string(),
+            },
+            crate::tui::runtime_control_store::DaemonApprovalSummary {
+                id: "approval-2".to_string(),
+                tool_name: "edit".to_string(),
+                risk: Some("medium".to_string()),
+                requester: Some("session".to_string()),
+                input_preview: "write file".to_string(),
+            },
+        ];
+        state.app.daemon_pending_approvals = Some(2);
+
+        state.apply_local_daemon_approval_response("approval-1");
+
+        assert_eq!(state.app.daemon_pending_approvals, Some(1));
+        assert_eq!(state.app.daemon_approval_items.len(), 1);
+        assert_eq!(state.app.daemon_approval_items[0].id, "approval-2");
+    }
+
+    #[test]
+    fn local_daemon_task_status_updates_projection_state() {
+        let mut state = TuiState::new("test-model", "test-session");
+        state.app.daemon_tasks = vec![
+            crate::tui::runtime_control_store::DaemonTaskSummary {
+                id: "task-1".to_string(),
+                objective: "blocked task".to_string(),
+                status: "blocked".to_string(),
+                current_phase: Some("verify".to_string()),
+                yolo_mode: true,
+                failure_count: 1,
+                review_result: None,
+                artifact_count: 0,
+                blocker_reason: Some("waiting for approval".to_string()),
+            },
+            crate::tui::runtime_control_store::DaemonTaskSummary {
+                id: "task-2".to_string(),
+                objective: "running task".to_string(),
+                status: "running".to_string(),
+                current_phase: None,
+                yolo_mode: false,
+                failure_count: 0,
+                review_result: None,
+                artifact_count: 0,
+                blocker_reason: None,
+            },
+        ];
+        state.app.daemon_task_count = Some(2);
+
+        state.apply_local_daemon_task_status("task-1", "completed");
+
+        assert_eq!(state.app.daemon_task_count, Some(2));
+        assert_eq!(state.app.daemon_tasks[0].status, "completed");
+        assert_eq!(state.app.daemon_tasks[0].blocker_reason, None);
+        assert_eq!(state.app.daemon_tasks[1].status, "running");
+    }
+
+    #[test]
+    fn reload_runtime_providers_from_loader_updates_registry_without_leaking_secret() {
+        runtime::init_global_providers(runtime::ProvidersConfig::default());
+        let root = unique_temp_dir("cowd-tui-provider-reload");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            config_home.join("config.yaml"),
+            r#"
+model: "tui-reload-model"
+providers:
+  tui-provider:
+    base_url: "https://tui-provider.example/v1"
+    api_key: "tui-secret-key"
+    models: ["tui-reload-model", "tui-fast"]
+    protocol: "openai-compat"
+"#,
+        )
+        .unwrap();
+
+        let mut state = TuiState::new("tui-reload-model", "session-tui-provider");
+        let loader = runtime::ConfigLoader::new(&workspace, &config_home);
+        assert!(state.reload_runtime_providers_from_loader(&loader));
+
+        let provider = runtime::resolve_global_provider("tui-reload-model")
+            .expect("provider reload should resolve active model");
+        assert_eq!(provider.name, "tui-provider");
+        assert_eq!(runtime::list_all_models().len(), 2);
+        assert!(state
+            .app
+            .notification
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Providers applied"));
+        assert!(!state
+            .app
+            .notification
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tui-secret-key"));
+
+        let invalid_home = root.join("invalid-home");
+        std::fs::create_dir_all(&invalid_home).unwrap();
+        std::fs::write(
+            invalid_home.join("config.yaml"),
+            r#"
+model: "broken-model"
+providers:
+  broken:
+    base_url: "https://broken.example/v1"
+    api_key: "broken-secret-key"
+    models: ["broken-model"]
+    protocol: "unsupported-protocol"
+"#,
+        )
+        .unwrap();
+        let invalid_loader = runtime::ConfigLoader::new(&workspace, &invalid_home);
+        assert!(!state.reload_runtime_providers_from_loader(&invalid_loader));
+        assert!(runtime::resolve_global_provider("broken-model").is_none());
+        assert_eq!(
+            runtime::resolve_global_provider("tui-reload-model")
+                .expect("failed reload should preserve previous registry")
+                .name,
+            "tui-provider"
+        );
+        assert!(!state
+            .app
+            .notification
+            .as_deref()
+            .unwrap_or_default()
+            .contains("broken-secret-key"));
+
+        runtime::init_global_providers(runtime::ProvidersConfig::default());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -2502,6 +2923,45 @@ mod tests {
 
         // ThemeEngine starts with dark builtin (no file), so hot_reload is a no-op
         assert!(!state.hot_reload_theme());
+    }
+
+    #[test]
+    fn sidebar_tab_labels_use_compact_mode_for_narrow_sidebars() {
+        let compact = sidebar_tab_labels(72);
+        let full = sidebar_tab_labels(120);
+
+        assert_eq!(compact.len(), SIDEBAR_TAB_COUNT);
+        assert_eq!(full.len(), SIDEBAR_TAB_COUNT);
+        assert_eq!(compact[0], "Run");
+        assert_eq!(compact[4], "Appr");
+        assert_eq!(full[0], "Runtime");
+        assert_eq!(full[4], "Approvals");
+    }
+
+    #[test]
+    fn renders_every_sidebar_tab_in_wide_and_compact_layouts() {
+        for (width, height) in [(140, 38), (88, 32)] {
+            for tab in 0..SIDEBAR_TAB_COUNT {
+                let mut state = TuiState::new("m", "scenario-session");
+                state.app.server_running = true;
+                state.app.active_api_sessions = 1;
+                state.app.daemon_runtime_readiness = Some("92%".to_string());
+                state.app.daemon_task_count = Some(1);
+                state.app.daemon_pending_approvals = Some(1);
+                state.app.daemon_cross_plane_grants_active = Some(1);
+                state.app.memory_status = Some("available".to_string());
+                state.sidebar_active_tab = tab;
+
+                let mut terminal = MockTerminal::new(width, height);
+                terminal.draw(|frame| state.render(frame));
+                let joined = terminal.buffer_lines().join("\n");
+
+                assert!(
+                    !joined.trim().is_empty(),
+                    "tab {tab} at {width}x{height} rendered an empty buffer"
+                );
+            }
+        }
     }
 
     // ── startup_loading ─────────────────────────────────────────

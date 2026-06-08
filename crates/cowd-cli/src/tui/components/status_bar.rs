@@ -103,6 +103,7 @@ impl StatusBar {
         sb.add_section(Self::cache_section());
         sb.add_section(Self::search_section());
         sb.add_section(Self::history_section());
+        sb.add_section(Self::lease_section());
         sb.add_section(Self::task_section());
         sb.add_section(Self::wave_section());
         // Task 12: Footer status sections (right-aligned)
@@ -201,6 +202,15 @@ impl StatusBar {
             content: None,
             style: Style::default().fg(Color::Magenta),
             width: SectionWidth::Fixed(28),
+        }
+    }
+
+    fn lease_section() -> StatusSection {
+        StatusSection {
+            id: "lease".into(),
+            content: None,
+            style: Style::default().fg(Color::Cyan),
+            width: SectionWidth::Fixed(30),
         }
     }
 
@@ -394,6 +404,13 @@ impl StatusBar {
                     }
                 }
                 "history" => app.history_idx.map(|hidx| format!("hist:{}", hidx + 1)),
+                "lease" => app.daemon_lease_owner.as_ref().map(|owner| {
+                    format!(
+                        "Lease {}:{}",
+                        app.daemon_lease_mode.as_deref().unwrap_or("unknown"),
+                        owner
+                    )
+                }),
                 "task" => app.current_task.as_ref().map(|task| {
                     let short_id: String = task.id.chars().take(8).collect();
                     let phase = task
@@ -624,6 +641,7 @@ mod tests {
         assert!(ids.contains(&"cache"));
         assert!(ids.contains(&"search"));
         assert!(ids.contains(&"history"));
+        assert!(ids.contains(&"lease"));
         assert!(ids.contains(&"task"));
     }
 
@@ -722,6 +740,21 @@ mod tests {
         let content = section.content.as_ref().unwrap();
         assert!(content.contains("Task running"));
         assert!(content.contains("task-123"));
+    }
+
+    #[test]
+    fn sync_from_app_shows_daemon_session_lease() {
+        let mut app = App::new("claude-sonnet-4", "test-session");
+        app.daemon_lease_owner = Some("tui:4242".to_string());
+        app.daemon_lease_mode = Some("collaborative".to_string());
+        let mut bar = StatusBar::with_default_sections();
+
+        bar.sync_from_app(&app);
+
+        let section = bar.section_mut("lease").unwrap();
+        let content = section.content.as_ref().unwrap();
+        assert!(content.contains("collaborative"));
+        assert!(content.contains("tui:4242"));
     }
 
     #[test]

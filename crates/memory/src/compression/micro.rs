@@ -172,8 +172,7 @@ impl MicroCompactor {
                     if last_idx > i {
                         // This is an older duplicate – replace content with a
                         // minimal placeholder.
-                        msg.content =
-                            format!("[duplicate – see turn {last_idx}]");
+                        msg.content = format!("[duplicate – see turn {last_idx}]");
                     }
                 }
             }
@@ -393,8 +392,7 @@ fn summarize_tool_output(tool_name: &str, content: &str) -> String {
 
         // ── delegate_task (improved — subagent type) ─────────────────────
         n if n.contains("delegate") => {
-            let subagent_re =
-                regex::Regex::new(r#""subagent_type"\s*:\s*"([^"]+)""#).ok();
+            let subagent_re = regex::Regex::new(r#""subagent_type"\s*:\s*"([^"]+)""#).ok();
             let subagent = subagent_re
                 .and_then(|re| re.captures(content))
                 .and_then(|c| c.get(1))
@@ -432,7 +430,11 @@ mod tests {
     fn test_summarize_terminal_with_exit_code() {
         let content = r#"{"exit_code": 1, "output": "test failed"}"#;
         let result = summarize_tool_output("terminal", content);
-        assert!(result.contains("exit 1"), "Should contain exit code, got: {}", result);
+        assert!(
+            result.contains("exit 1"),
+            "Should contain exit code, got: {}",
+            result
+        );
         assert!(result.contains("lines"), "Should contain line count");
         assert!(result.len() < content.len(), "Should be compressed");
     }

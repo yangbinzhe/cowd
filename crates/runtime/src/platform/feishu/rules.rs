@@ -2,9 +2,9 @@
 //!
 //! Provides rule-based message processing and routing for Feishu platform.
 
-use crate::platform::adapter::{InboundMessage, PlatformError, PlatformResult};
 #[cfg(test)]
 use crate::platform::adapter::MessageType;
+use crate::platform::adapter::{InboundMessage, PlatformError, PlatformResult};
 use crate::platform::feishu::FeishuAdapter;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -33,7 +33,10 @@ pub enum RuleAction {
     /// Execute a command.
     ExecuteCommand { command: String },
     /// Forward to another platform.
-    ForwardToPlatform { platform: String, session_id: Option<String> },
+    ForwardToPlatform {
+        platform: String,
+        session_id: Option<String>,
+    },
     /// No action (silently ignore).
     Ignore,
 }
@@ -60,11 +63,17 @@ pub struct RoutingRule {
 #[serde(tag = "type")]
 pub enum RuleCondition {
     /// Match by keyword in message text.
-    Keyword { keyword: String, case_sensitive: bool },
+    Keyword {
+        keyword: String,
+        case_sensitive: bool,
+    },
     /// Match by regex pattern.
     Pattern { pattern: String },
     /// Match by message sender.
-    Sender { open_id: Option<String>, user_id: Option<String> },
+    Sender {
+        open_id: Option<String>,
+        user_id: Option<String>,
+    },
     /// Match by chat type (p2p or group).
     ChatType { chat_type: String },
     /// Match by presence of mention.
@@ -105,11 +114,17 @@ impl RuleCondition {
     /// Check if this condition matches the given message.
     pub fn matches(&self, message: &InboundMessage) -> bool {
         match self {
-            RuleCondition::Keyword { keyword, case_sensitive } => {
+            RuleCondition::Keyword {
+                keyword,
+                case_sensitive,
+            } => {
                 if *case_sensitive {
                     message.text.contains(keyword)
                 } else {
-                    message.text.to_lowercase().contains(&keyword.to_lowercase())
+                    message
+                        .text
+                        .to_lowercase()
+                        .contains(&keyword.to_lowercase())
                 }
             }
             RuleCondition::Pattern { pattern } => {
@@ -132,26 +147,21 @@ impl RuleCondition {
                 }
                 false
             }
-            RuleCondition::ChatType { chat_type } => {
-                message.session_key.thread_id.as_ref()
-                    .map(|t| t == chat_type)
-                    .unwrap_or(false)
-            }
+            RuleCondition::ChatType { chat_type } => message
+                .session_key
+                .thread_id
+                .as_ref()
+                .map(|t| t == chat_type)
+                .unwrap_or(false),
             RuleCondition::Mentioned { mention_all: _ } => {
                 // Check if @all or @someone is present
-                message.text.contains("@all") ||
-                message.text.contains("@someone") ||
-                message.text.contains("<at")
+                message.text.contains("@all")
+                    || message.text.contains("@someone")
+                    || message.text.contains("<at")
             }
-            RuleCondition::All { conditions } => {
-                conditions.iter().all(|c| c.matches(message))
-            }
-            RuleCondition::Any { conditions } => {
-                conditions.iter().any(|c| c.matches(message))
-            }
-            RuleCondition::Not { condition } => {
-                !condition.matches(message)
-            }
+            RuleCondition::All { conditions } => conditions.iter().all(|c| c.matches(message)),
+            RuleCondition::Any { conditions } => conditions.iter().any(|c| c.matches(message)),
+            RuleCondition::Not { condition } => !condition.matches(message),
         }
     }
 }
@@ -323,13 +333,15 @@ impl RulesEngine {
                     RuleAction::ExecuteCommand { command } => {
                         // Command execution would be handled separately
                         tracing::info!(command = %command, "executing command");
-                        adapter.send_message(
-                            &message.session_key,
-                            &format!("Executing: {}", command),
-                        ).await?;
+                        adapter
+                            .send_message(&message.session_key, &format!("Executing: {}", command))
+                            .await?;
                         Ok(Some(format!("Executing: {}", command)))
                     }
-                    RuleAction::ForwardToPlatform { platform, session_id } => {
+                    RuleAction::ForwardToPlatform {
+                        platform,
+                        session_id,
+                    } => {
                         tracing::info!(
                             platform = %platform,
                             session_id = ?session_id,

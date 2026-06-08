@@ -307,7 +307,10 @@ type Handler interface {
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
     let names: Vec<_> = entities.iter().map(|e| e.name.as_str()).collect();
 
-    assert!(names.contains(&"main"), "should find func main, got: {names:?}");
+    assert!(
+        names.contains(&"main"),
+        "should find func main, got: {names:?}"
+    );
     assert!(
         names.contains(&"processData"),
         "should find func processData, got: {names:?}"
@@ -520,7 +523,10 @@ serde = "1.0"
         names.contains(&"dependencies"),
         "should find [dependencies] section, got: {names:?}"
     );
-    assert!(names.contains(&"name"), "should find name key, got: {names:?}");
+    assert!(
+        names.contains(&"name"),
+        "should find name key, got: {names:?}"
+    );
     assert!(
         names.contains(&"version"),
         "should find version key, got: {names:?}"
@@ -563,8 +569,14 @@ fn extracts_html_tags_as_data_fields() {
         .filter(|e| e.entity_type == EntityType::DataField)
         .map(|e| e.name.as_str())
         .collect();
-    assert!(data_fields.contains(&"div"), "should find div tag as DataField, got: {data_fields:?}");
-    assert!(data_fields.contains(&"h1"), "should find h1 tag as DataField, got: {data_fields:?}");
+    assert!(
+        data_fields.contains(&"div"),
+        "should find div tag as DataField, got: {data_fields:?}"
+    );
+    assert!(
+        data_fields.contains(&"h1"),
+        "should find h1 tag as DataField, got: {data_fields:?}"
+    );
 
     // Custom elements (dash-case) → Concept
     let concepts: Vec<_> = entities
@@ -583,8 +595,14 @@ fn extracts_html_tags_as_data_fields() {
         .filter(|e| e.entity_type == EntityType::DocHeading)
         .map(|e| e.name.as_str())
         .collect();
-    assert!(headings.contains(&"main"), "main should be DocHeading, got: {headings:?}");
-    assert!(headings.contains(&"nav"), "nav should be DocHeading, got: {headings:?}");
+    assert!(
+        headings.contains(&"main"),
+        "main should be DocHeading, got: {headings:?}"
+    );
+    assert!(
+        headings.contains(&"nav"),
+        "nav should be DocHeading, got: {headings:?}"
+    );
 
     // Aria roles → ConfigKey
     let config_keys: Vec<_> = entities
@@ -690,9 +708,7 @@ fn extracts_css_selectors_and_keyframes() {
     );
 
     // @media queries counted
-    let media_entity = entities
-        .iter()
-        .find(|e| e.name.contains("media-queries"));
+    let media_entity = entities.iter().find(|e| e.name.contains("media-queries"));
     assert!(
         media_entity.is_some(),
         "should have a media-queries count entity, got {count} entities",
@@ -833,10 +849,7 @@ export default {
     );
 
     // source_type should be "frontend"
-    let app_entity = entities
-        .iter()
-        .find(|e| e.name == "AppLayout")
-        .unwrap();
+    let app_entity = entities.iter().find(|e| e.name == "AppLayout").unwrap();
     assert_eq!(app_entity.source_type, "frontend");
 }
 
@@ -908,11 +921,7 @@ fn source_type_is_set_correctly() {
 
     write_file(tmp.path(), "src/lib.rs", "fn my_fn() {}");
     write_file(tmp.path(), "README.md", "# My Project");
-    write_file(
-        tmp.path(),
-        "config.yaml",
-        "app:\n  name: test\n",
-    );
+    write_file(tmp.path(), "config.yaml", "app:\n  name: test\n");
 
     let (kg, _mtimes) = build_project_kg(tmp.path());
     let entities: Vec<_> = kg.list_entities().into_iter().cloned().collect();
@@ -920,10 +929,7 @@ fn source_type_is_set_correctly() {
     let code_entity = entities.iter().find(|e| e.name == "my_fn").unwrap();
     assert_eq!(code_entity.source_type, "code");
 
-    let doc_entity = entities
-        .iter()
-        .find(|e| e.name == "My Project")
-        .unwrap();
+    let doc_entity = entities.iter().find(|e| e.name == "My Project").unwrap();
     assert_eq!(doc_entity.source_type, "doc");
 
     let config_entity = entities.iter().find(|e| e.name == "app").unwrap();
@@ -993,14 +999,12 @@ fn second_project_kg_does_not_contaminate_first() {
 fn functions_get_tool_entity_type() {
     let tmp = tempfile::TempDir::new().unwrap();
 
-    write_file(
-        tmp.path(),
-        "src/lib.rs",
-        "fn compute() {}",
-    );
+    write_file(tmp.path(), "src/lib.rs", "fn compute() {}");
 
     let (kg, _mtimes) = build_project_kg(tmp.path());
-    let entity = kg.get_entity_by_name("compute").expect("compute should exist");
+    let entity = kg
+        .get_entity_by_name("compute")
+        .expect("compute should exist");
     assert_eq!(
         entity.entity_type,
         EntityType::Tool,
@@ -1106,7 +1110,9 @@ fn entity_source_ids_track_origin_file() {
     write_file(tmp.path(), "src/foo.rs", "fn foo_fn() {}");
 
     let (kg, _mtimes) = build_project_kg(tmp.path());
-    let entity = kg.get_entity_by_name("foo_fn").expect("foo_fn should exist");
+    let entity = kg
+        .get_entity_by_name("foo_fn")
+        .expect("foo_fn should exist");
 
     assert_eq!(entity.source_ids.len(), 1);
     assert!(
@@ -1240,9 +1246,10 @@ pub enum AuthError {
     assert!(!result.mtimes.is_empty(), "should track file mtimes");
 
     // Edge edges should be found (authenticate_user calls validate_credentials)
-    let has_calls = result.edges.iter().any(|e| {
-        e.edge_type == cowd_memory::code_indexer::SymbolEdgeType::Calls
-    });
+    let has_calls = result
+        .edges
+        .iter()
+        .any(|e| e.edge_type == cowd_memory::code_indexer::SymbolEdgeType::Calls);
     assert!(has_calls, "should find call edges between functions");
 }
 
@@ -1254,10 +1261,22 @@ fn test_regex_cached_on_second_call() {
     let tmp = tempfile::TempDir::new().unwrap();
 
     // Create several files for a non-trivial scan
-    write_file(tmp.path(), "src/lib.rs", "fn foo() {}\nfn bar() {}\nstruct S {}\n");
+    write_file(
+        tmp.path(),
+        "src/lib.rs",
+        "fn foo() {}\nfn bar() {}\nstruct S {}\n",
+    );
     write_file(tmp.path(), "src/main.rs", "fn main() {}\nfn helper() {}\n");
-    write_file(tmp.path(), "README.md", "# Project\n\nSome **important** text.\n");
-    write_file(tmp.path(), "config.yaml", "app:\n  name: test\n  version: 1\n");
+    write_file(
+        tmp.path(),
+        "README.md",
+        "# Project\n\nSome **important** text.\n",
+    );
+    write_file(
+        tmp.path(),
+        "config.yaml",
+        "app:\n  name: test\n  version: 1\n",
+    );
 
     // First call: cold (regexes compiled and cached)
     let start1 = Instant::now();

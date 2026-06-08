@@ -227,12 +227,7 @@ impl BackgroundWatcher {
     fn is_source_file(path: &std::path::Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|ext| {
-                matches!(
-                    ext,
-                    "rs" | "py" | "ts" | "tsx" | "go" | "java" | "js"
-                )
-            })
+            .map(|ext| matches!(ext, "rs" | "py" | "ts" | "tsx" | "go" | "java" | "js"))
             .unwrap_or(false)
     }
 }
@@ -248,42 +243,42 @@ mod tests {
 
     #[test]
     fn is_source_file_rust() {
-        assert!(BackgroundWatcher::is_source_file(
-            &PathBuf::from("src/main.rs")
-        ));
+        assert!(BackgroundWatcher::is_source_file(&PathBuf::from(
+            "src/main.rs"
+        )));
     }
 
     #[test]
     fn is_source_file_typescript() {
-        assert!(BackgroundWatcher::is_source_file(
-            &PathBuf::from("components/App.tsx")
-        ));
+        assert!(BackgroundWatcher::is_source_file(&PathBuf::from(
+            "components/App.tsx"
+        )));
     }
 
     #[test]
     fn is_source_file_python() {
-        assert!(BackgroundWatcher::is_source_file(
-            &PathBuf::from("app/models.py")
-        ));
+        assert!(BackgroundWatcher::is_source_file(&PathBuf::from(
+            "app/models.py"
+        )));
     }
 
     #[test]
     fn is_source_file_rejects_non_source() {
-        assert!(!BackgroundWatcher::is_source_file(
-            &PathBuf::from("README.md")
-        ));
-        assert!(!BackgroundWatcher::is_source_file(
-            &PathBuf::from("Cargo.toml")
-        ));
-        assert!(!BackgroundWatcher::is_source_file(
-            &PathBuf::from("image.png")
-        ));
+        assert!(!BackgroundWatcher::is_source_file(&PathBuf::from(
+            "README.md"
+        )));
+        assert!(!BackgroundWatcher::is_source_file(&PathBuf::from(
+            "Cargo.toml"
+        )));
+        assert!(!BackgroundWatcher::is_source_file(&PathBuf::from(
+            "image.png"
+        )));
     }
 
     #[test]
     fn is_source_file_no_extension() {
-        assert!(!BackgroundWatcher::is_source_file(
-            &PathBuf::from("Makefile")
-        ));
+        assert!(!BackgroundWatcher::is_source_file(&PathBuf::from(
+            "Makefile"
+        )));
     }
 }

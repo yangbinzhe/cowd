@@ -34,12 +34,7 @@ use crate::{
 const DEFAULT_MAX_TOKENS: u64 = 3000;
 
 /// Files that are recognised as project-context sources (in priority order).
-const PROJECT_CONTEXT_FILES: &[&str] = &[
-    "CLAUDE.md",
-    "AGENTS.md",
-    "CONTRIBUTING.md",
-    "README.md",
-];
+const PROJECT_CONTEXT_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md", "README.md"];
 
 /// Manager for the L2 project-specific layer.
 pub struct ProjectLayer {
@@ -294,9 +289,7 @@ impl LayerManager for ProjectLayer {
             entry.staleness = (entry.staleness + decay).min(1.0);
 
             // Only prune if above the hard prune threshold and low priority.
-            if entry.priority == Priority::Low
-                && entry.staleness >= self.drift.prune_threshold
-            {
+            if entry.priority == Priority::Low && entry.staleness >= self.drift.prune_threshold {
                 self.store.delete(&entry.id).await?;
                 continue;
             }
@@ -402,16 +395,35 @@ mod tests {
     async fn insert_overrides_layer_to_l2() {
         let layer = ProjectLayer::new(in_memory());
         let entry = MemoryEntry {
-            id: uuid::Uuid::new_v4(), layer: MemoryLayer::L1, category: MemoryCategory::Decision,
-            priority: Priority::Normal, source: MemorySource::AutoExtracted,
-            title: "t".into(), content: "c".into(), embedding: None,
-            tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
-            staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            last_accessed_at: None, scope: MemoryScope::default(), session_id: None,
-            source_agent: None, visibility: crate::types::AgentVisibility::default(),
+            id: uuid::Uuid::new_v4(),
+            layer: MemoryLayer::L1,
+            category: MemoryCategory::Decision,
+            priority: Priority::Normal,
+            source: MemorySource::AutoExtracted,
+            title: "t".into(),
+            content: "c".into(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed_at: None,
+            scope: MemoryScope::default(),
+            session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
         let id = layer.insert(entry).await.unwrap();
-        let loaded = layer.load().await.unwrap().into_iter().find(|e| e.id == id).unwrap();
+        let loaded = layer
+            .load()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == id)
+            .unwrap();
         assert_eq!(loaded.layer, MemoryLayer::L2);
     }
 
@@ -422,7 +434,10 @@ mod tests {
         std::fs::write(&claude_md, "# Project\n\nA test project.").unwrap();
 
         let layer = ProjectLayer::with_workspace(
-            in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
+            in_memory(),
+            tmp.path().to_path_buf(),
+            3000,
+            DriftConfig::default(),
         );
         let files = layer.discover_project_context().await.unwrap();
         assert_eq!(files.len(), 1);
@@ -436,7 +451,10 @@ mod tests {
         std::fs::write(tmp.path().join("CLAUDE.md"), "").unwrap();
 
         let layer = ProjectLayer::with_workspace(
-            in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
+            in_memory(),
+            tmp.path().to_path_buf(),
+            3000,
+            DriftConfig::default(),
         );
         let files = layer.discover_project_context().await.unwrap();
         assert!(files.is_empty());
@@ -455,9 +473,15 @@ mod tests {
         std::fs::write(tmp.path().join("CLAUDE.md"), "Test project.").unwrap();
 
         let layer = ProjectLayer::with_workspace(
-            in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
+            in_memory(),
+            tmp.path().to_path_buf(),
+            3000,
+            DriftConfig::default(),
         );
-        let ids = layer.ingest_project_context(MemoryScope::Project("p1".into())).await.unwrap();
+        let ids = layer
+            .ingest_project_context(MemoryScope::Project("p1".into()))
+            .await
+            .unwrap();
         assert_eq!(ids.len(), 1);
 
         let entries = layer.load().await.unwrap();
@@ -471,11 +495,20 @@ mod tests {
         std::fs::write(tmp.path().join("CLAUDE.md"), "Test.").unwrap();
 
         let layer = ProjectLayer::with_workspace(
-            in_memory(), tmp.path().to_path_buf(), 3000, DriftConfig::default(),
+            in_memory(),
+            tmp.path().to_path_buf(),
+            3000,
+            DriftConfig::default(),
         );
-        let ids1 = layer.ingest_project_context(MemoryScope::default()).await.unwrap();
+        let ids1 = layer
+            .ingest_project_context(MemoryScope::default())
+            .await
+            .unwrap();
         assert_eq!(ids1.len(), 1);
-        let ids2 = layer.ingest_project_context(MemoryScope::default()).await.unwrap();
+        let ids2 = layer
+            .ingest_project_context(MemoryScope::default())
+            .await
+            .unwrap();
         assert!(ids2.is_empty());
     }
 
@@ -486,9 +519,22 @@ mod tests {
             prune_threshold: 0.5,
             ..Default::default()
         };
-        let layer = ProjectLayer::with_workspace(in_memory(), std::path::PathBuf::from("/tmp/test"), 3000, drift);
+        let layer = ProjectLayer::with_workspace(
+            in_memory(),
+            std::path::PathBuf::from("/tmp/test"),
+            3000,
+            drift,
+        );
         layer
-            .add(MemoryCategory::ProjectConvention, "T", "C", Priority::Low, MemorySource::Import, vec![], MemoryScope::default())
+            .add(
+                MemoryCategory::ProjectConvention,
+                "T",
+                "C",
+                Priority::Low,
+                MemorySource::Import,
+                vec![],
+                MemoryScope::default(),
+            )
             .await
             .unwrap();
         layer.tick().await.unwrap();

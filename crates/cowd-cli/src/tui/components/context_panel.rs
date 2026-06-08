@@ -29,6 +29,10 @@ pub struct ContextPanel {
     pub turn_output_tokens: u64,
     /// Latest runtime context envelope, if one has been assembled for a turn.
     pub latest_envelope: Option<ContextEnvelope>,
+    /// Memory subsystem status surfaced into the context plane.
+    pub memory_status: Option<String>,
+    /// Number of memory entries visible in App fallback state.
+    pub memory_entry_count: usize,
     evidence_detail_open: bool,
     evidence_cursor: usize,
 }
@@ -41,6 +45,8 @@ impl ContextPanel {
             turn_input_tokens: 0,
             turn_output_tokens: 0,
             latest_envelope: None,
+            memory_status: None,
+            memory_entry_count: 0,
             evidence_detail_open: false,
             evidence_cursor: 0,
         }
@@ -52,6 +58,8 @@ impl ContextPanel {
         self.turn_input_tokens = app.turn_input_tokens;
         self.turn_output_tokens = app.turn_output_tokens;
         self.latest_envelope = app.latest_context_envelope.clone();
+        self.memory_status = app.memory_status.clone();
+        self.memory_entry_count = app.memory_entries.len();
     }
 
     pub fn from_app(app: &App) -> Self {
@@ -129,6 +137,24 @@ impl ContextPanel {
         refs
     }
 
+    fn selected_memory_count(envelope: &ContextEnvelope) -> usize {
+        envelope
+            .selected
+            .iter()
+            .filter(|item| item.source == runtime::ContextSourceKind::Memory)
+            .count()
+    }
+
+    fn stable_head_reuse_hint(envelope: &ContextEnvelope) -> &'static str {
+        if envelope.diagnostics.stable_head_hash.is_empty() {
+            "unavailable"
+        } else if envelope.assembled.stable_head.is_empty() {
+            "empty"
+        } else {
+            "cache-friendly"
+        }
+    }
+
     fn selected_evidence_ref(&self) -> Option<String> {
         let refs = self.evidence_refs();
         refs.get(self.evidence_cursor.min(refs.len().saturating_sub(1)))
@@ -144,7 +170,11 @@ impl ContextPanel {
         envelope
             .selected
             .iter()
-            .find(|item| item.evidence.iter().any(|candidate| candidate == evidence_ref))
+            .find(|item| {
+                item.evidence
+                    .iter()
+                    .any(|candidate| candidate == evidence_ref)
+            })
             .map(|item| Self::preview(&item.content, 96))
     }
 
@@ -245,6 +275,7 @@ impl Component for ContextPanel {
 
         if let Some(envelope) = &self.latest_envelope {
             let evidence_refs = self.evidence_refs();
+            let memory_selected = Self::selected_memory_count(envelope);
             lines.push(Line::from(vec![
                 Span::styled("Profile:  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -283,6 +314,35 @@ impl Component for ContextPanel {
                         Self::short_hash(&envelope.diagnostics.dynamic_tail_hash)
                     ),
                     Style::default().fg(Color::White),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Stable:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    Self::stable_head_reuse_hint(envelope),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!("  segments {}", envelope.assembled.stable_head.len()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Memory:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    self.memory_status.as_deref().unwrap_or("unknown"),
+                    Style::default().fg(if memory_selected > 0 {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::styled(
+                    format!(
+                        "  selected {} fallback {}",
+                        memory_selected, self.memory_entry_count
+                    ),
+                    Style::default().fg(Color::DarkGray),
                 ),
             ]));
             if !envelope.diagnostics.degraded_sources.is_empty() {
@@ -434,6 +494,17 @@ impl Component for ContextPanel {
                 "No runtime envelope yet.",
                 Style::default().fg(Color::DarkGray),
             )));
+            lines.push(Line::from(vec![
+                Span::styled("Memory:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    self.memory_status.as_deref().unwrap_or("unknown"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("  fallback {}", self.memory_entry_count),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
         }
 
         lines.push(Line::raw(""));
@@ -595,12 +666,21 @@ mod tests {
         app.context_window = 100_000;
         app.turn_input_tokens = 500;
         app.turn_output_tokens = 200;
+        app.memory_status = Some("available".to_string());
+        app.memory_entries = vec![crate::tui::app::MemoryEntry {
+            id: Some("m1".to_string()),
+            layer: "L4".to_string(),
+            content: "durable note".to_string(),
+            priority: "high".to_string(),
+        }];
 
         let mut panel = ContextPanel::from_app(&app);
         assert_eq!(panel.token_count, 10_000);
         assert_eq!(panel.context_window, 100_000);
         assert_eq!(panel.turn_input_tokens, 500);
         assert_eq!(panel.turn_output_tokens, 200);
+        assert_eq!(panel.memory_status.as_deref(), Some("available"));
+        assert_eq!(panel.memory_entry_count, 1);
 
         // Re-sync with updated values
         app.token_count = 20_000;
@@ -630,16 +710,35 @@ mod tests {
         let stable_hash = ContextPanel::short_hash(&envelope.diagnostics.stable_head_hash);
         let mut panel = ContextPanel::new();
         panel.latest_envelope = Some(envelope);
+        panel.memory_status = Some("available".to_string());
+        panel.memory_entry_count = 4;
 
-        let lines = render_panel(&mut panel, 88, 32);
+        let lines = render_panel(&mut panel, 88, 40);
         let joined = lines.join("\n");
         assert!(joined.contains("Runtime Envelope"));
         assert!(joined.contains("SessionKernel owns durable sessions"));
         assert!(joined.contains("session://session-1/memory/mem-1"));
         assert!(joined.contains("context lease exhausted"));
         assert!(joined.contains(&stable_hash));
+        assert!(joined.contains("cache-friendly"));
+        assert!(joined.contains("Memory:"));
+        assert!(joined.contains("selected 1 fallback 4"));
         assert!(joined.contains("stable 1"));
         assert!(joined.contains("Recommendations"));
+    }
+
+    #[test]
+    fn renders_memory_status_without_runtime_envelope() {
+        let mut panel = ContextPanel::new();
+        panel.memory_status = Some("warming".to_string());
+        panel.memory_entry_count = 2;
+
+        let lines = render_panel(&mut panel, 72, 18);
+        let joined = lines.join("\n");
+        assert!(joined.contains("No runtime envelope yet."));
+        assert!(joined.contains("Memory:"));
+        assert!(joined.contains("warming"));
+        assert!(joined.contains("fallback 2"));
     }
 
     #[test]
@@ -677,7 +776,10 @@ mod tests {
         ));
 
         assert!(panel.handle_event(&next).is_consumed());
-        assert_eq!(panel.selected_evidence_ref().as_deref(), Some("tool://tool-1"));
+        assert_eq!(
+            panel.selected_evidence_ref().as_deref(),
+            Some("tool://tool-1")
+        );
         assert!(panel.handle_event(&close).is_consumed());
         assert!(!panel.evidence_detail_open);
     }

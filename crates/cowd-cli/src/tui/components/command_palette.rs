@@ -21,6 +21,7 @@ use ratatui::Frame;
 
 use crate::tui::components::base::{Component, EventResult, RenderContext};
 use crate::tui::keybind::Action;
+use crate::tui::runtime_control_store::RuntimeControlSnapshot;
 
 // ═══════════════════════════════════════════════════════════════════
 // Types
@@ -35,6 +36,8 @@ pub struct CommandEntry {
     pub description: String,
     /// The action to dispatch when this command is selected.
     pub action: Action,
+    /// Whether this entry was generated from live runtime state.
+    pub dynamic: bool,
 }
 
 impl CommandEntry {
@@ -43,6 +46,20 @@ impl CommandEntry {
             name: name.into(),
             description: description.into(),
             action,
+            dynamic: false,
+        }
+    }
+
+    pub fn dynamic(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        action: Action,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            action,
+            dynamic: true,
         }
     }
 }
@@ -124,6 +141,7 @@ fn default_entries() -> Vec<CommandEntry> {
         "allowed-tools",
         "api-key",
         "approve",
+        "approvals",
         "branch",
         "brief",
         "bughunter",
@@ -135,6 +153,7 @@ fn default_entries() -> Vec<CommandEntry> {
         "context",
         "copy",
         "cost",
+        "cross-plane",
         "debug-tool-call",
         "deny",
         "desktop",
@@ -215,6 +234,7 @@ fn default_entries() -> Vec<CommandEntry> {
             name: format!("/{cmd}"),
             description: desc,
             action: Action::Execute(format!("/{cmd}")),
+            dynamic: false,
         });
     }
 
@@ -253,6 +273,11 @@ fn default_entries() -> Vec<CommandEntry> {
         "Submit Input",
         "Send the current input buffer as a message",
         Action::SubmitInput,
+    ));
+    entries.push(CommandEntry::new(
+        "Reload Providers",
+        "Reload provider and model routing from runtime config",
+        Action::ReloadProviders,
     ));
     entries.push(CommandEntry::new(
         "Cancel",
@@ -341,6 +366,136 @@ impl CommandPalette {
     ) {
         self.all_commands
             .push(CommandEntry::new(name, description, action));
+    }
+
+    /// Replace live runtime-derived actions while preserving static commands.
+    pub fn sync_runtime_actions(&mut self, snapshot: &RuntimeControlSnapshot) {
+        self.all_commands.retain(|entry| !entry.dynamic);
+
+        if !snapshot.daemon_running {
+            self.all_commands.push(CommandEntry::dynamic(
+                "Start Gateway",
+                "Daemon is offline; inspect gateway status or start it from CLI",
+                Action::Execute("/status".into()),
+            ));
+            self.run_search();
+            return;
+        }
+
+        self.all_commands.push(CommandEntry::dynamic(
+            "Inspect Runtime",
+            format!(
+                "Daemon readiness {} across {} components",
+                snapshot.runtime_readiness.as_deref().unwrap_or("unknown"),
+                snapshot.runtime_components.unwrap_or_default()
+            ),
+            Action::Execute("/context runtime".into()),
+        ));
+        self.all_commands.push(CommandEntry::dynamic(
+            "Inspect Context",
+            "Show current context envelope, stable head, dynamic tail, and pressure",
+            Action::Execute("/context".into()),
+        ));
+
+        if snapshot.task_count.unwrap_or_default() > 0 {
+            self.all_commands.push(CommandEntry::dynamic(
+                "Manage Running Tasks",
+                format!(
+                    "{} daemon tasks visible",
+                    snapshot.task_count.unwrap_or_default()
+                ),
+                Action::Execute("/tasks".into()),
+            ));
+            if let Some(task) = snapshot
+                .tasks
+                .iter()
+                .find(|task| task.status == "blocked" || task.failure_count > 0)
+            {
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Cancel Problem Task",
+                    format!("Cancel {} directly: {}", task.id, task.objective),
+                    Action::CancelDaemonTask(task.id.clone()),
+                ));
+            }
+            if let Some(task) = snapshot.tasks.iter().find(|task| {
+                task.review_result.as_deref() == Some("accepted")
+                    || task.status == "reviewed"
+                    || task.status == "completed"
+            }) {
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Complete Reviewed Task",
+                    format!(
+                        "Complete {} directly with {} artifacts",
+                        task.id, task.artifact_count
+                    ),
+                    Action::CompleteDaemonTask(task.id.clone()),
+                ));
+            }
+        } else {
+            self.all_commands.push(CommandEntry::dynamic(
+                "Start YOLO Goal",
+                "Prepare a continuous daemon task command",
+                Action::Execute("/tasks start --yolo ".into()),
+            ));
+        }
+
+        if snapshot.pending_approvals.unwrap_or_default() > 0 {
+            self.all_commands.push(CommandEntry::dynamic(
+                "Review Pending Approvals",
+                format!(
+                    "{} approval requests need attention",
+                    snapshot.pending_approvals.unwrap_or_default()
+                ),
+                Action::Execute("/approvals".into()),
+            ));
+            if let Some(approval) = snapshot.approval_items.first() {
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Approve First Pending Request",
+                    format!(
+                        "{} [{}] {}",
+                        approval.tool_name,
+                        approval.risk.as_deref().unwrap_or("unknown"),
+                        approval.input_preview
+                    ),
+                    Action::RespondDaemonApproval {
+                        id: approval.id.clone(),
+                        approved: true,
+                    },
+                ));
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Reject First Pending Request",
+                    format!("Reject {}", approval.id),
+                    Action::RespondDaemonApproval {
+                        id: approval.id.clone(),
+                        approved: false,
+                    },
+                ));
+            }
+        }
+
+        if snapshot.cross_plane_grants_active.unwrap_or_default() > 0
+            || snapshot.cross_plane_actions_24h.unwrap_or_default() > 0
+        {
+            self.all_commands.push(CommandEntry::dynamic(
+                "Inspect Cross-Plane",
+                format!(
+                    "{} active grants, {} actions in 24h",
+                    snapshot.cross_plane_grants_active.unwrap_or_default(),
+                    snapshot.cross_plane_actions_24h.unwrap_or_default()
+                ),
+                Action::Execute("/cross-plane".into()),
+            ));
+        }
+
+        if !snapshot.degraded_reasons.is_empty() {
+            self.all_commands.push(CommandEntry::dynamic(
+                "Inspect Daemon Degradation",
+                snapshot.degraded_reasons.join("; "),
+                Action::Execute("/context runtime".into()),
+            ));
+        }
+
+        self.run_search();
     }
 
     /// Return the number of registered commands.
@@ -901,6 +1056,124 @@ mod tests {
         let before = p.command_count();
         p.register("my-cmd", "A custom command", Action::Noop);
         assert_eq!(p.command_count(), before + 1);
+    }
+
+    #[test]
+    fn default_entries_include_reload_providers_action() {
+        let p = setup_palette();
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.name == "Reload Providers" && entry.action == Action::ReloadProviders
+        }));
+    }
+
+    #[test]
+    fn sync_runtime_actions_adds_contextual_daemon_entries() {
+        let mut p = setup_palette();
+        let before = p.command_count();
+        let snapshot = RuntimeControlSnapshot {
+            daemon_running: true,
+            runtime_readiness: Some("92%".to_string()),
+            runtime_components: Some(9),
+            task_count: Some(2),
+            tasks: vec![
+                crate::tui::runtime_control_store::DaemonTaskSummary {
+                    id: "task-blocked".to_string(),
+                    objective: "blocked task".to_string(),
+                    status: "blocked".to_string(),
+                    current_phase: Some("verify".to_string()),
+                    yolo_mode: false,
+                    failure_count: 1,
+                    review_result: None,
+                    artifact_count: 0,
+                    blocker_reason: Some("approval".to_string()),
+                },
+                crate::tui::runtime_control_store::DaemonTaskSummary {
+                    id: "task-reviewed".to_string(),
+                    objective: "reviewed task".to_string(),
+                    status: "reviewed".to_string(),
+                    current_phase: Some("review".to_string()),
+                    yolo_mode: true,
+                    failure_count: 0,
+                    review_result: Some("accepted".to_string()),
+                    artifact_count: 2,
+                    blocker_reason: None,
+                },
+            ],
+            pending_approvals: Some(1),
+            approval_items: vec![crate::tui::runtime_control_store::DaemonApprovalSummary {
+                id: "approval-1".to_string(),
+                tool_name: "bash".to_string(),
+                risk: Some("high".to_string()),
+                requester: Some("session".to_string()),
+                input_preview: "rm -rf /tmp/example".to_string(),
+            }],
+            cross_plane_grants_active: Some(3),
+            cross_plane_actions_24h: Some(5),
+            ..RuntimeControlSnapshot::default()
+        };
+
+        p.sync_runtime_actions(&snapshot);
+
+        assert!(p.command_count() > before);
+        assert!(p
+            .all_commands
+            .iter()
+            .any(|entry| { entry.dynamic && entry.name == "Inspect Runtime" }));
+        assert!(p
+            .all_commands
+            .iter()
+            .any(|entry| { entry.dynamic && entry.action == Action::Execute("/tasks".into()) }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic && entry.action == Action::Execute("/approvals".into())
+        }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic
+                && entry.action
+                    == Action::RespondDaemonApproval {
+                        id: "approval-1".to_string(),
+                        approved: true,
+                    }
+        }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic
+                && entry.action
+                    == Action::RespondDaemonApproval {
+                        id: "approval-1".to_string(),
+                        approved: false,
+                    }
+        }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic && entry.action == Action::CancelDaemonTask("task-blocked".into())
+        }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic && entry.action == Action::CompleteDaemonTask("task-reviewed".into())
+        }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic && entry.action == Action::Execute("/cross-plane".into())
+        }));
+    }
+
+    #[test]
+    fn sync_runtime_actions_replaces_old_dynamic_entries() {
+        let mut p = setup_palette();
+        let offline = RuntimeControlSnapshot::default();
+        p.sync_runtime_actions(&offline);
+        let first_dynamic = p.all_commands.iter().filter(|entry| entry.dynamic).count();
+
+        let online = RuntimeControlSnapshot {
+            daemon_running: true,
+            task_count: Some(0),
+            ..RuntimeControlSnapshot::default()
+        };
+        p.sync_runtime_actions(&online);
+        let second_dynamic = p.all_commands.iter().filter(|entry| entry.dynamic).count();
+
+        assert_eq!(first_dynamic, 1);
+        assert!(second_dynamic >= 3);
+        assert!(!p
+            .all_commands
+            .iter()
+            .any(|entry| entry.dynamic && entry.name == "Start Gateway"));
     }
 
     // ── Search scoring ────────────────────────────────────────────

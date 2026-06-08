@@ -26,7 +26,11 @@ impl PlatformConfig {
     }
 
     /// Set a setting value.
-    pub fn with_setting(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+    pub fn with_setting(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
         self.settings.insert(key.into(), value.into());
         self
     }
@@ -38,7 +42,9 @@ impl PlatformConfig {
 
     /// Get a setting as a specific type.
     pub fn get_setting_as<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
-        self.settings.get(key).and_then(|v| serde_json::from_value(v.clone()).ok())
+        self.settings
+            .get(key)
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
 }
 

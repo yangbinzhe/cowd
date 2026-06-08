@@ -45,6 +45,12 @@ impl Hash for KeyChord {
 pub enum Action {
     /// Execute a command string (e.g., `":help"`, `":session list"`).
     Execute(String),
+    /// Respond to a pending daemon approval through the projection API.
+    RespondDaemonApproval { id: String, approved: bool },
+    /// Cancel a daemon task through the projection API.
+    CancelDaemonTask(String),
+    /// Complete a daemon task through the projection API.
+    CompleteDaemonTask(String),
     /// Toggle visibility of a named panel.
     TogglePanel(String),
     /// Open a dialog by name (picker, approval, file chooser, etc.).
@@ -83,6 +89,8 @@ pub enum Action {
     SubmitInput,
     /// Cycle to the next available model.
     NextModel,
+    /// Reload provider/model registry from the active runtime configuration.
+    ReloadProviders,
     /// Browse input history (true = older, false = newer).
     HistoryBrowse(bool),
     /// Toggle the command palette overlay.

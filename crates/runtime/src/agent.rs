@@ -4,8 +4,8 @@
 //! a write guard that prevents writing to protected memory layers (L0/L1),
 //! and a token budget that caps its execution.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -1060,8 +1060,8 @@ mod tests {
         }
     }
 
-    fn make_dummy_runtime()
-    -> crate::conversation::ConversationRuntime<MockApiClient, MockToolExecutor> {
+    fn make_dummy_runtime(
+    ) -> crate::conversation::ConversationRuntime<MockApiClient, MockToolExecutor> {
         use crate::permissions::{PermissionMode, PermissionPolicy};
         use crate::session::Session;
 
@@ -1099,11 +1099,9 @@ mod tests {
         assert_eq!(lease.task_contract, "review context runtime");
         assert_eq!(lease.max_tokens, 4_096);
         assert!(lease.allowed_sources.contains(&ContextSourceKind::Memory));
-        assert!(
-            lease
-                .required_return
-                .contains(&AgentReturnRequirement::ResultSummary)
-        );
+        assert!(lease
+            .required_return
+            .contains(&AgentReturnRequirement::ResultSummary));
         assert_eq!(
             config
                 .context_lease()

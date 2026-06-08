@@ -2,9 +2,9 @@
 //! Run: cargo run --example feishu_gateway
 //! Or: cargo test --test feishu_gateway test_gateway_loop -- --ignored --nocapture
 
+use runtime::platform::adapter::PlatformAdapter;
 use runtime::platform::feishu::FeishuAdapter;
 use runtime::platform::feishu::FeishuConfig;
-use runtime::platform::adapter::PlatformAdapter;
 use tokio::time::{timeout, Duration};
 
 fn app_id() -> String {
@@ -45,10 +45,13 @@ async fn test_gateway_loop() {
             Ok(Ok(Some(msg))) => {
                 msg_count += 1;
                 let elapsed = start.elapsed().as_secs();
-                
+
                 println!("┌─────────────────────────────────────┐");
                 println!("│ 📩 Message #{msg_count} @ {elapsed}s");
-                println!("│ From:  {}", msg.sender_name.as_deref().unwrap_or("unknown"));
+                println!(
+                    "│ From:  {}",
+                    msg.sender_name.as_deref().unwrap_or("unknown")
+                );
                 println!("│ Chat:  {}", msg.session_key);
                 println!("│ Text:  {}", msg.text);
                 println!("│ Type:  {:?}", msg.message_type);
@@ -56,7 +59,7 @@ async fn test_gateway_loop() {
 
                 // Build reply
                 let reply_text = format!("🤖 Cowd(Rust) 收到！你说：{}", msg.text);
-                
+
                 let reply = runtime::platform::adapter::OutboundMessage {
                     session_key: msg.session_key.clone(),
                     text: reply_text,
@@ -65,7 +68,10 @@ async fn test_gateway_loop() {
                 };
 
                 match adapter.send(&reply).await {
-                    Ok(()) => println!("✅ Reply sent successfully\n"),
+                    Ok(result) => println!(
+                        "✅ Reply sent successfully ({})\n",
+                        result.message_id.as_deref().unwrap_or("no message id")
+                    ),
                     Err(e) => println!("❌ Reply failed: {:?}\n", e),
                 }
             }
@@ -73,7 +79,9 @@ async fn test_gateway_loop() {
                 // No message — just waiting
                 let elapsed = start.elapsed().as_secs();
                 if elapsed % 30 == 0 && elapsed > 0 {
-                    println!("⏳ Waiting for messages... ({elapsed}s elapsed, {msg_count} received)");
+                    println!(
+                        "⏳ Waiting for messages... ({elapsed}s elapsed, {msg_count} received)"
+                    );
                 }
             }
             Ok(Err(e)) => {

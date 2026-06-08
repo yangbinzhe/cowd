@@ -26,6 +26,7 @@ pub enum RuntimeEventScope {
     Workgraph,
     Memory,
     Policy,
+    Task,
     Approval,
     Scheduler,
 }
@@ -131,6 +132,16 @@ impl RuntimeEvent {
             payload
         };
 
+        let refs = refs_from_payload(&payload);
+        let status = if event.event_type == RUNTIME_EVENT_TYPE {
+            Some("degraded".to_string())
+        } else {
+            payload
+                .get("status")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        };
+
         Self {
             event_id: format!("legacy:{}:{}", event.session_id, event.sequence),
             session_id: event.session_id.clone(),
@@ -140,12 +151,39 @@ impl RuntimeEvent {
             span_id: None,
             parent_span_id: None,
             correlation_id: None,
-            status: (event.event_type == RUNTIME_EVENT_TYPE).then(|| "degraded".to_string()),
-            refs: Vec::new(),
+            status,
+            refs,
             payload,
             created_at_ms: event.created_at_ms,
         }
     }
+}
+
+fn refs_from_payload(payload: &Value) -> Vec<RuntimeRef> {
+    payload
+        .get("refs")
+        .and_then(Value::as_array)
+        .map(|refs| {
+            refs.iter()
+                .filter_map(|reference| {
+                    let ref_type = reference
+                        .get("type")
+                        .or_else(|| reference.get("ref_type"))
+                        .and_then(Value::as_str)?;
+                    let id = reference.get("id").and_then(Value::as_str)?;
+                    let label = reference
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    Some(RuntimeRef {
+                        ref_type: ref_type.to_string(),
+                        id: id.to_string(),
+                        label,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn scope_for_legacy_event_type(event_type: &str) -> RuntimeEventScope {
@@ -198,6 +236,36 @@ mod tests {
         assert_eq!(event.kind, "ToolStart");
         assert_eq!(event.payload["tool"], "shell");
         assert_eq!(event.status, None);
+    }
+
+    #[test]
+    fn legacy_runtime_run_projects_status_and_refs() {
+        let stored = SessionEvent {
+            session_id: "s-run".to_string(),
+            event_type: "RuntimeRun".to_string(),
+            event_json: serde_json::json!({
+                "run_id": "run-1",
+                "status": "completed",
+                "refs": [
+                    {"type": "context_envelope", "id": "ctx-1", "label": "main context"},
+                    {"ref_type": "task", "id": "task-1"}
+                ]
+            })
+            .to_string(),
+            sequence: 11,
+            created_at_ms: 66,
+        };
+
+        let event = RuntimeEvent::from_session_event_lossy(&stored);
+        assert_eq!(event.scope, RuntimeEventScope::Turn);
+        assert_eq!(event.kind, "RuntimeRun");
+        assert_eq!(event.status.as_deref(), Some("completed"));
+        assert_eq!(event.refs.len(), 2);
+        assert_eq!(event.refs[0].ref_type, "context_envelope");
+        assert_eq!(event.refs[0].id, "ctx-1");
+        assert_eq!(event.refs[0].label.as_deref(), Some("main context"));
+        assert_eq!(event.refs[1].ref_type, "task");
+        assert_eq!(event.refs[1].id, "task-1");
     }
 
     #[test]

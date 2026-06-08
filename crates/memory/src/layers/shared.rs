@@ -38,7 +38,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::{ MemoryScope,
+use crate::{
     config::DriftConfig,
     layers::{LayerManager, Result},
     store::MemoryStore,
@@ -46,6 +46,7 @@ use crate::{ MemoryScope,
         MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, PreparedContext,
         Priority, TokenBudget,
     },
+    MemoryScope,
 };
 
 /// Default maximum token budget for the shared layer.
@@ -139,7 +140,7 @@ pub struct SharedLayer {
 
 impl SharedLayer {
     /// Create a disabled shared layer (all operations are no-ops).
-    #[must_use] 
+    #[must_use]
     pub fn disabled() -> Self {
         Self {
             store: Arc::new(NoopStore),
@@ -182,7 +183,7 @@ impl SharedLayer {
     }
 
     /// Whether this layer is active.
-    #[must_use] 
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -266,7 +267,10 @@ impl SharedLayer {
             return Ok(Vec::new());
         }
         let scope = self.shared_scope.clone().unwrap_or_default();
-        let results = self.store.search_fts_scoped(query, &scope, limit * 2).await?;
+        let results = self
+            .store
+            .search_fts_scoped(query, &scope, limit * 2)
+            .await?;
         let filtered: Vec<MemoryEntry> = results
             .into_iter()
             .filter(|e| e.layer == MemoryLayer::L4)
@@ -280,7 +284,10 @@ impl SharedLayer {
         if !self.enabled {
             return Ok(Vec::new());
         }
-        let results = self.store.search_fts_scoped(query, &MemoryScope::Global, limit * 2).await?;
+        let results = self
+            .store
+            .search_fts_scoped(query, &MemoryScope::Global, limit * 2)
+            .await?;
         let filtered: Vec<MemoryEntry> = results
             .into_iter()
             .filter(|e| e.layer == MemoryLayer::L4)
@@ -305,7 +312,10 @@ impl SharedLayer {
             return Ok(Vec::new());
         }
         let cutoff = Utc::now() - chrono::Duration::minutes(5);
-        let results = self.store.search_fts(query, max_peers * max_per_peer * 2).await?;
+        let results = self
+            .store
+            .search_fts(query, max_peers * max_per_peer * 2)
+            .await?;
         let peer_entries: Vec<MemoryEntry> = results
             .into_iter()
             .filter(|e| {
@@ -317,7 +327,8 @@ impl SharedLayer {
             .collect();
 
         // Group by source_agent, cap per peer, then cap total peers.
-        let mut seen_peers: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut seen_peers: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut capped = Vec::new();
         for entry in peer_entries {
             let agent_key = entry.source_agent.clone().unwrap_or_default();
@@ -351,7 +362,10 @@ impl SharedLayer {
         if !self.enabled {
             return Ok(Vec::new());
         }
-        let results = self.store.search_fts(query, max_peers * max_per_peer * 2).await?;
+        let results = self
+            .store
+            .search_fts(query, max_peers * max_per_peer * 2)
+            .await?;
         let peer_entries: Vec<MemoryEntry> = results
             .into_iter()
             .filter(|e| {
@@ -364,7 +378,8 @@ impl SharedLayer {
             .collect();
 
         // Group by source_agent, cap per peer, then cap total peers.
-        let mut seen_peers: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut seen_peers: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut capped = Vec::new();
         for entry in peer_entries {
             let agent_key = entry.source_agent.clone().unwrap_or_default();
@@ -407,9 +422,14 @@ impl SharedLayer {
             return Vec::new();
         }
         let cutoff = Utc::now() - chrono::Duration::seconds(window_secs);
-        let entries = self.store.search_by_layer(MemoryLayer::L4).await.unwrap_or_default();
+        let entries = self
+            .store
+            .search_by_layer(MemoryLayer::L4)
+            .await
+            .unwrap_or_default();
 
-        let mut tag_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut tag_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         for entry in &entries {
             if entry.created_at >= cutoff {
                 for tag in &entry.tags {
@@ -542,8 +562,8 @@ fn estimate_tokens(content: &str) -> u64 {
 // NoopStore – used when SharedLayer is disabled
 // ---------------------------------------------------------------------------
 
-use crate::types::MemoryMeta;
 use crate::entity::{Entity, Triple};
+use crate::types::MemoryMeta;
 
 /// A no-op store used when the `SharedLayer` is disabled.
 struct NoopStore;
@@ -562,7 +582,11 @@ impl crate::store::MemoryStore for NoopStore {
     async fn delete(&self, _id: &MemoryId) -> crate::store::Result<()> {
         Ok(())
     }
-    async fn search_fts(&self, _query: &str, _limit: usize) -> crate::store::Result<Vec<MemoryEntry>> {
+    async fn search_fts(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> crate::store::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }
     async fn search_fts_advanced(
@@ -578,19 +602,29 @@ impl crate::store::MemoryStore for NoopStore {
             keywords: Vec::new(),
         })
     }
-    async fn search_vector(&self, _embedding: &[f32], _limit: usize) -> crate::store::Result<Vec<MemoryEntry>> {
+    async fn search_vector(
+        &self,
+        _embedding: &[f32],
+        _limit: usize,
+    ) -> crate::store::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }
     async fn search_by_layer(&self, _layer: MemoryLayer) -> crate::store::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }
-    async fn search_by_category(&self, _category: MemoryCategory) -> crate::store::Result<Vec<MemoryEntry>> {
+    async fn search_by_category(
+        &self,
+        _category: MemoryCategory,
+    ) -> crate::store::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
     }
     async fn get_meta(&self, _id: &MemoryId) -> crate::store::Result<Option<MemoryMeta>> {
         Ok(None)
     }
-    async fn list_metas(&self, _layer: Option<MemoryLayer>) -> crate::store::Result<Vec<MemoryMeta>> {
+    async fn list_metas(
+        &self,
+        _layer: Option<MemoryLayer>,
+    ) -> crate::store::Result<Vec<MemoryMeta>> {
         Ok(Vec::new())
     }
     async fn list_all(&self) -> crate::store::Result<Vec<MemoryEntry>> {
@@ -624,7 +658,10 @@ impl crate::store::MemoryStore for NoopStore {
         Ok(())
     }
 
-    async fn load_verbatim_by_id(&self, _id: &str) -> crate::store::Result<Option<crate::store::VerbatimEntry>> {
+    async fn load_verbatim_by_id(
+        &self,
+        _id: &str,
+    ) -> crate::store::Result<Option<crate::store::VerbatimEntry>> {
         Ok(None)
     }
 
@@ -663,7 +700,14 @@ mod tests {
     async fn add_returns_nil_when_disabled() {
         let layer = SharedLayer::disabled();
         let id = layer
-            .add(MemoryCategory::Shared, "T", "C", Priority::Normal, MemorySource::AutoExtracted, vec![])
+            .add(
+                MemoryCategory::Shared,
+                "T",
+                "C",
+                Priority::Normal,
+                MemorySource::AutoExtracted,
+                vec![],
+            )
             .await
             .unwrap();
         assert_eq!(id, uuid::Uuid::nil());
@@ -673,7 +717,14 @@ mod tests {
     async fn add_creates_entry_when_enabled() {
         let layer = SharedLayer::new(in_memory());
         let id = layer
-            .add(MemoryCategory::Shared, "Team decision", "Use Rust", Priority::High, MemorySource::Import, vec!["lang".into()])
+            .add(
+                MemoryCategory::Shared,
+                "Team decision",
+                "Use Rust",
+                Priority::High,
+                MemorySource::Import,
+                vec!["lang".into()],
+            )
             .await
             .unwrap();
         assert_ne!(id, uuid::Uuid::nil());
@@ -701,13 +752,26 @@ mod tests {
     async fn insert_noops_when_disabled() {
         let layer = SharedLayer::disabled();
         let entry = MemoryEntry {
-            id: uuid::Uuid::new_v4(), layer: MemoryLayer::L0, category: MemoryCategory::Shared,
-            priority: Priority::Normal, source: MemorySource::AutoExtracted,
-            title: "t".into(), content: "c".into(), embedding: None,
-            tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
-            staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            last_accessed_at: None, scope: MemoryScope::default(), session_id: None,
-            source_agent: None, visibility: crate::types::AgentVisibility::default(),
+            id: uuid::Uuid::new_v4(),
+            layer: MemoryLayer::L0,
+            category: MemoryCategory::Shared,
+            priority: Priority::Normal,
+            source: MemorySource::AutoExtracted,
+            title: "t".into(),
+            content: "c".into(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed_at: None,
+            scope: MemoryScope::default(),
+            session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
         let id = layer.insert(entry).await.unwrap();
         assert_eq!(id, uuid::Uuid::nil());
@@ -717,13 +781,26 @@ mod tests {
     async fn insert_overrides_layer_to_l4_when_enabled() {
         let layer = SharedLayer::new(in_memory());
         let entry = MemoryEntry {
-            id: uuid::Uuid::new_v4(), layer: MemoryLayer::L0, category: MemoryCategory::Shared,
-            priority: Priority::Normal, source: MemorySource::AutoExtracted,
-            title: "t".into(), content: "c".into(), embedding: None,
-            tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
-            staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            last_accessed_at: None, scope: MemoryScope::default(), session_id: None,
-            source_agent: None, visibility: crate::types::AgentVisibility::default(),
+            id: uuid::Uuid::new_v4(),
+            layer: MemoryLayer::L0,
+            category: MemoryCategory::Shared,
+            priority: Priority::Normal,
+            source: MemorySource::AutoExtracted,
+            title: "t".into(),
+            content: "c".into(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed_at: None,
+            scope: MemoryScope::default(),
+            session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
         let id = layer.insert(entry).await.unwrap();
         assert_ne!(id, uuid::Uuid::nil());
@@ -741,7 +818,14 @@ mod tests {
     #[tokio::test]
     async fn prepare_context_returns_empty_when_disabled() {
         let layer = SharedLayer::disabled();
-        let budget = TokenBudget { total: 1000, reserved_system: 0, reserved_response: 0, allocated_memory: 0, allocated_conversation: 0, available: 1000 };
+        let budget = TokenBudget {
+            total: 1000,
+            reserved_system: 0,
+            reserved_response: 0,
+            allocated_memory: 0,
+            allocated_conversation: 0,
+            available: 1000,
+        };
         let ctx = layer.prepare_context(&budget).await.unwrap();
         assert!(ctx.entries.is_empty());
     }
@@ -762,7 +846,14 @@ mod tests {
     async fn sync_reduces_staleness() {
         let layer = SharedLayer::new(in_memory());
         let id = layer
-            .add(MemoryCategory::Shared, "T", "C", Priority::Normal, MemorySource::AutoExtracted, vec![])
+            .add(
+                MemoryCategory::Shared,
+                "T",
+                "C",
+                Priority::Normal,
+                MemorySource::AutoExtracted,
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -781,7 +872,14 @@ mod tests {
         };
         let layer = SharedLayer::with_config(in_memory(), true, None, 2000, drift);
         layer
-            .add(MemoryCategory::Shared, "T", "C", Priority::Normal, MemorySource::AutoExtracted, vec![])
+            .add(
+                MemoryCategory::Shared,
+                "T",
+                "C",
+                Priority::Normal,
+                MemorySource::AutoExtracted,
+                vec![],
+            )
             .await
             .unwrap();
         layer.tick().await.unwrap();

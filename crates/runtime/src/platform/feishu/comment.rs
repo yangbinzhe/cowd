@@ -205,10 +205,7 @@ impl CommentHandler {
             .map_err(|e| PlatformError::Unknown(format!("failed to parse response: {}", e)))?;
 
         if resp.code != 0 {
-            return Err(PlatformError::Unknown(format!(
-                "API error: {}",
-                resp.msg
-            )));
+            return Err(PlatformError::Unknown(format!("API error: {}", resp.msg)));
         }
 
         let items = resp.data.and_then(|d| d.items).unwrap_or_default();
@@ -282,13 +279,20 @@ impl CommentHandler {
     }
 
     /// Get a single comment by ID.
-    pub async fn get_comment(&self, doc_token: &str, comment_id: &str) -> PlatformResult<Option<FeishuComment>> {
+    pub async fn get_comment(
+        &self,
+        doc_token: &str,
+        comment_id: &str,
+    ) -> PlatformResult<Option<FeishuComment>> {
         let comments = self.list_comments(doc_token).await?;
         Ok(comments.into_iter().find(|c| c.id == comment_id))
     }
 
     /// Create a new comment.
-    pub async fn create_comment(&self, request: CreateCommentRequest) -> PlatformResult<FeishuComment> {
+    pub async fn create_comment(
+        &self,
+        request: CreateCommentRequest,
+    ) -> PlatformResult<FeishuComment> {
         let token = self.adapter.ensure_token().await?;
         let client = reqwest::Client::new();
 
@@ -429,13 +433,12 @@ impl CommentHandler {
             .map_err(|e| PlatformError::Unknown(format!("failed to parse response: {}", e)))?;
 
         if resp.code != 0 {
-            return Err(PlatformError::Unknown(format!(
-                "API error: {}",
-                resp.msg
-            )));
+            return Err(PlatformError::Unknown(format!("API error: {}", resp.msg)));
         }
 
-        let item = resp.data.and_then(|d| d.comment)
+        let item = resp
+            .data
+            .and_then(|d| d.comment)
             .ok_or_else(|| PlatformError::Unknown("no comment in response".to_string()))?;
 
         // Parse the comment
@@ -500,33 +503,42 @@ impl CommentHandler {
     }
 
     /// Reply to a comment.
-    pub async fn reply_comment(&self, request: ReplyCommentRequest) -> PlatformResult<FeishuComment> {
+    pub async fn reply_comment(
+        &self,
+        request: ReplyCommentRequest,
+    ) -> PlatformResult<FeishuComment> {
         // Get the parent comment to find the doc_token
         let cache = self.cache.read().await;
 
         // Find the doc_token for this comment
-        let doc_token = cache.iter()
+        let doc_token = cache
+            .iter()
             .find(|(_, comments)| comments.iter().any(|c| c.id == request.comment_id))
             .map(|(dt, _)| dt.clone());
 
         if let Some(dt) = doc_token {
             drop(cache);
-            return self.create_comment(CreateCommentRequest {
-                doc_token: dt,
-                content: request.content,
-                parent_id: Some(request.comment_id),
-                position: None,
-            }).await;
+            return self
+                .create_comment(CreateCommentRequest {
+                    doc_token: dt,
+                    content: request.content,
+                    parent_id: Some(request.comment_id),
+                    position: None,
+                })
+                .await;
         }
 
         drop(cache);
         Err(PlatformError::Unknown(
-            "parent comment not found".to_string()
+            "parent comment not found".to_string(),
         ))
     }
 
     /// Update a comment.
-    pub async fn update_comment(&self, request: UpdateCommentRequest) -> PlatformResult<FeishuComment> {
+    pub async fn update_comment(
+        &self,
+        request: UpdateCommentRequest,
+    ) -> PlatformResult<FeishuComment> {
         let token = self.adapter.ensure_token().await?;
         let client = reqwest::Client::new();
 
@@ -562,7 +574,8 @@ impl CommentHandler {
 
         // Need to find the document token first
         let cache = self.cache.read().await;
-        let doc_token = cache.iter()
+        let doc_token = cache
+            .iter()
             .find(|(_, comments)| comments.iter().any(|c| c.id == request.comment_id))
             .map(|(dt, _)| dt.clone())
             .ok_or_else(|| PlatformError::Unknown("comment not found".to_string()))?;
@@ -602,10 +615,7 @@ impl CommentHandler {
             .map_err(|e| PlatformError::Unknown(format!("failed to parse response: {}", e)))?;
 
         if resp.code != 0 {
-            return Err(PlatformError::Unknown(format!(
-                "API error: {}",
-                resp.msg
-            )));
+            return Err(PlatformError::Unknown(format!("API error: {}", resp.msg)));
         }
 
         // Invalidate cache
@@ -669,10 +679,7 @@ impl CommentHandler {
             .map_err(|e| PlatformError::Unknown(format!("failed to parse response: {}", e)))?;
 
         if resp.code != 0 {
-            return Err(PlatformError::Unknown(format!(
-                "API error: {}",
-                resp.msg
-            )));
+            return Err(PlatformError::Unknown(format!("API error: {}", resp.msg)));
         }
 
         // Invalidate cache
@@ -720,10 +727,7 @@ impl CommentHandler {
             .map_err(|e| PlatformError::Unknown(format!("failed to parse response: {}", e)))?;
 
         if resp.code != 0 {
-            return Err(PlatformError::Unknown(format!(
-                "API error: {}",
-                resp.msg
-            )));
+            return Err(PlatformError::Unknown(format!("API error: {}", resp.msg)));
         }
 
         // Invalidate cache

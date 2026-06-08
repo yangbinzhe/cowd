@@ -3,10 +3,8 @@
 //! Goal: verify code_injection adds <500 tokens and is only triggered
 //! on code-related queries.
 
-use cowd_memory::{
-    CognitiveContextManager, MemoryConfig,
-};
 use cowd_memory::config::{BudgetConfig, StoreConfig};
+use cowd_memory::{CognitiveContextManager, MemoryConfig};
 
 fn test_config(db_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
@@ -48,7 +46,11 @@ async fn test_benchmark_no_injection_on_non_code_query() {
 
     for query in &queries {
         let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
-        assert!(ctx.code_context.is_none(), "query '{}' should not inject code", query);
+        assert!(
+            ctx.code_context.is_none(),
+            "query '{}' should not inject code",
+            query
+        );
     }
 }
 
@@ -94,8 +96,12 @@ async fn test_benchmark_token_budget_not_exceeded() {
     for query in &queries {
         let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
         // Total tokens should never exceed budget total
-        assert!(ctx.total_tokens <= ctx.budget.total,
-            "token count {} exceeds budget {}", ctx.total_tokens, ctx.budget.total);
+        assert!(
+            ctx.total_tokens <= ctx.budget.total,
+            "token count {} exceeds budget {}",
+            ctx.total_tokens,
+            ctx.budget.total
+        );
     }
 }
 
@@ -114,7 +120,11 @@ async fn test_benchmark_code_context_size_within_limits() {
   Kind: Function";
     let char_count = simulated_context.chars().count() as u64;
     let token_estimate = char_count / 4;
-    assert!(token_estimate < 500, "code injection should add <500 tokens, got {}", token_estimate);
+    assert!(
+        token_estimate < 500,
+        "code injection should add <500 tokens, got {}",
+        token_estimate
+    );
     assert!(simulated_context.contains("## Relevant Code Symbols"));
     assert!(simulated_context.contains("authenticate_user"));
 }

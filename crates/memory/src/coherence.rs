@@ -61,17 +61,32 @@ mod tests {
 
     #[test]
     fn p11_high_relevance_passes_threshold() {
-        assert!(is_relevant("fixing tokio async bug", "tokio runtime panic", 0.1, false));
+        assert!(is_relevant(
+            "fixing tokio async bug",
+            "tokio runtime panic",
+            0.1,
+            false
+        ));
     }
 
     #[test]
     fn p11_low_relevance_fails_threshold() {
-        assert!(!is_relevant("python flask web app", "rust tokio runtime", 0.2, false));
+        assert!(!is_relevant(
+            "python flask web app",
+            "rust tokio runtime",
+            0.2,
+            false
+        ));
     }
 
     #[test]
     fn p11_identity_always_relevant() {
-        assert!(is_relevant("anything", "completely different query", 0.5, true));
+        assert!(is_relevant(
+            "anything",
+            "completely different query",
+            0.5,
+            true
+        ));
     }
 
     #[test]

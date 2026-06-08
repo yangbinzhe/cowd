@@ -22,12 +22,12 @@ use crate::cowd_event::{CowdEvent, CowdEventBus};
 use memory::agent_directory::AgentInfo;
 use memory::cognitive::CognitiveContextManager;
 use memory::fact_checker::FactChecker;
-use memory::{MemoryKernel, MemoryTurnContext};
 use memory::project_scope::MemoryScope;
 use memory::temporal_graph::Triple;
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
+use memory::{MemoryKernel, MemoryTurnContext};
 
 // ── ConsensusMethod ───────────────────────────────────────────────────────────
 
@@ -278,10 +278,7 @@ impl DiscussionEngine {
         let mut by_topic: HashMap<String, Vec<&MemoryEntry>> = HashMap::new();
         for entry in &entries {
             let topic = &entry.title;
-            by_topic
-                .entry(topic.clone())
-                .or_default()
-                .push(entry);
+            by_topic.entry(topic.clone()).or_default().push(entry);
         }
 
         for entries in by_topic.values() {
@@ -293,9 +290,7 @@ impl DiscussionEngine {
                 for j in (i + 1)..entries.len() {
                     let a = entries[i];
                     let b = entries[j];
-                    if a.source_agent != b.source_agent
-                        && a.content != b.content
-                    {
+                    if a.source_agent != b.source_agent && a.content != b.content {
                         conflicts.push((a.clone(), b.clone()));
                     }
                 }
@@ -373,10 +368,7 @@ impl DiscussionEngine {
     pub async fn run_round(&mut self, round_num: u32) -> Result<String, String> {
         // Extract data from discussion first to avoid borrow conflicts.
         let (max_rounds, topic, participants) = {
-            let discussion = self
-                .discussion
-                .as_ref()
-                .ok_or("No active discussion")?;
+            let discussion = self.discussion.as_ref().ok_or("No active discussion")?;
             (
                 discussion.max_rounds,
                 discussion.topic.clone(),
@@ -385,9 +377,7 @@ impl DiscussionEngine {
         };
 
         if round_num > max_rounds {
-            return Err(format!(
-                "Round {round_num} exceeds max rounds {max_rounds}",
-            ));
+            return Err(format!("Round {round_num} exceeds max rounds {max_rounds}",));
         }
 
         // Collect contributions by writing to L4 for each participant.
@@ -411,15 +401,10 @@ impl DiscussionEngine {
 
         // Update discussion state.
         {
-            let discussion = self
-                .discussion
-                .as_mut()
-                .ok_or("No active discussion")?;
+            let discussion = self.discussion.as_mut().ok_or("No active discussion")?;
             discussion.current_round = round_num;
             discussion.phase = DiscussionPhase::Contributing;
-            discussion
-                .contributions
-                .insert(round_num, contributions);
+            discussion.contributions.insert(round_num, contributions);
             discussion.phase = DiscussionPhase::Synthesizing;
         }
 
@@ -479,10 +464,7 @@ impl DiscussionEngine {
     /// Uses `FactChecker` to evaluate conflicting claims and computes a
     /// consensus score.
     pub async fn check_consensus(&mut self) -> Result<ConsensusResult, String> {
-        let discussion = self
-            .discussion
-            .as_mut()
-            .ok_or("No active discussion")?;
+        let discussion = self.discussion.as_mut().ok_or("No active discussion")?;
 
         discussion.phase = DiscussionPhase::CheckingConsensus;
 
@@ -521,10 +503,7 @@ impl DiscussionEngine {
         let mut unresolved_conflicts: Vec<String> = Vec::new();
 
         if report.flagged > 0 {
-            unresolved_conflicts.push(format!(
-                "{} claims flagged for review",
-                report.flagged
-            ));
+            unresolved_conflicts.push(format!("{} claims flagged for review", report.flagged));
         }
 
         // Compute consensus score based on method.
@@ -555,10 +534,7 @@ impl DiscussionEngine {
                 } else {
                     0.0
                 };
-                (
-                    (score * total as f32).round() as usize,
-                    score,
-                )
+                ((score * total as f32).round() as usize, score)
             }
             ConsensusMethod::LeaderDecides => {
                 // Leader's contribution has ultimate authority.
@@ -601,10 +577,7 @@ impl DiscussionEngine {
 
     /// Finalize the discussion — write the final decision to L4.
     pub async fn finalize(&mut self) -> Result<String, String> {
-        let discussion = self
-            .discussion
-            .take()
-            .ok_or("No active discussion")?;
+        let discussion = self.discussion.take().ok_or("No active discussion")?;
 
         let leader_id = discussion
             .leader()
@@ -619,7 +592,10 @@ impl DiscussionEngine {
         // Build the final decision text.
         let mut decision = String::from("## Discussion Final Decision\n\n");
         decision.push_str(&format!("**Topic**: {}\n", discussion.topic));
-        decision.push_str(&format!("**Participants**: {}\n", discussion.participants.len()));
+        decision.push_str(&format!(
+            "**Participants**: {}\n",
+            discussion.participants.len()
+        ));
         decision.push_str(&format!("**Rounds**: {}\n", discussion.current_round));
         decision.push_str(&format!("**Method**: {:?}\n", discussion.consensus_method));
         decision.push_str(&format!(
@@ -655,8 +631,10 @@ impl DiscussionEngine {
         }
 
         // Write final decision to L4.
-        let memory_ctx =
-            MemoryTurnContext::new(format!("discussion:{}", discussion.topic), leader_id.clone());
+        let memory_ctx = MemoryTurnContext::new(
+            format!("discussion:{}", discussion.topic),
+            leader_id.clone(),
+        );
         let kernel = MemoryKernel::new(Arc::clone(&self.memory));
         let entry = MemoryEntry {
             id: MemoryId::new_v4(),
@@ -664,7 +642,10 @@ impl DiscussionEngine {
             category: MemoryCategory::Shared,
             priority: Priority::High,
             source: MemorySource::Import,
-            title: format!("discussion-decision: {}", truncate_str(&discussion.topic, 100)),
+            title: format!(
+                "discussion-decision: {}",
+                truncate_str(&discussion.topic, 100)
+            ),
             content: decision.clone(),
             embedding: None,
             tags: vec![
@@ -926,12 +907,7 @@ mod tests {
     fn empty_participants_not_recommended_but_handled() {
         // While the engine rejects empty participants, the struct itself
         // should not panic.
-        let disc = Discussion::new(
-            "void".into(),
-            vec![],
-            ConsensusMethod::MajorityVote,
-            1,
-        );
+        let disc = Discussion::new("void".into(), vec![], ConsensusMethod::MajorityVote, 1);
         assert!(disc.leader().is_none());
         assert_eq!(disc.participant_count(), 0);
     }

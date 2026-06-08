@@ -16,9 +16,7 @@ use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
 use runtime::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
-use super::{
-    anthropic_missing_credentials, model_token_limit, Provider, ProviderFuture,
-};
+use super::{anthropic_missing_credentials, model_token_limit, Provider, ProviderFuture};
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
 
@@ -874,12 +872,17 @@ impl MessageStream {
                     if let (Some(prompt_cache), Some(usage)) =
                         (&self.prompt_cache, self.latest_usage.as_ref())
                     {
-                        let cache_key = crate::cached_client::CachedProviderClient::compute_cache_key(&self.request);
+                        let cache_key =
+                            crate::cached_client::CachedProviderClient::compute_cache_key(
+                                &self.request,
+                            );
                         let fingerprints = runtime::prompt_cache::RequestFingerprintHashes {
                             model: runtime::prompt_cache::hash_serializable(&self.request.model),
                             system: runtime::prompt_cache::hash_serializable(&self.request.system),
                             tools: runtime::prompt_cache::hash_serializable(&self.request.tools),
-                            messages: runtime::prompt_cache::hash_serializable(&self.request.messages),
+                            messages: runtime::prompt_cache::hash_serializable(
+                                &self.request.messages,
+                            ),
                         };
                         let cache_usage = runtime::prompt_cache::CacheUsage {
                             input_tokens: usage.input_tokens,
@@ -887,7 +890,8 @@ impl MessageStream {
                             cache_read_input_tokens: usage.cache_read_input_tokens,
                             output_tokens: usage.output_tokens,
                         };
-                        let record = prompt_cache.record_usage(&cache_key, &cache_usage, &fingerprints);
+                        let record =
+                            prompt_cache.record_usage(&cache_key, &cache_usage, &fingerprints);
                         *self
                             .last_prompt_cache_record
                             .lock()
@@ -1061,8 +1065,8 @@ mod tests {
         now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
         resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet,
     };
-    use crate::types::{ContentBlockDelta, MessageRequest};
     use crate::test_utils::{env_lock, temp_config_home};
+    use crate::types::{ContentBlockDelta, MessageRequest};
 
     fn cleanup_temp_config_home(config_home: &std::path::Path) {
         match std::fs::remove_dir_all(config_home) {

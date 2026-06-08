@@ -82,7 +82,10 @@ async fn test_feishu_e2e_full_flow() {
         }
     }
 
-    assert!(adapter.is_connected(), "adapter should report connected after connect()");
+    assert!(
+        adapter.is_connected(),
+        "adapter should report connected after connect()"
+    );
 
     // ────────────────────────────────────────────────────────────
     // STEP 2: Acquire tenant access token
@@ -129,8 +132,7 @@ async fn test_feishu_e2e_full_flow() {
                 return;
             }
 
-            let v: serde_json::Value =
-                serde_json::from_str(&body).expect("bot info JSON parse");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("bot info JSON parse");
             // /bot/v3/info returns {"bot":{...}} — no "data" wrapper
             let bot = &v["bot"];
             let app_name = bot["app_name"].as_str().unwrap_or("N/A");
@@ -217,8 +219,17 @@ async fn test_feishu_e2e_full_flow() {
     section("STEP 5: Send via adapter.send_message()");
 
     let session_key = SessionKey::new("feishu", &bot_open_id);
-    match adapter.send_message(&session_key, "🧪 Cowd adapter.send_message() live test!").await {
-        Ok(()) => ok("adapter.send_message()", "message sent"),
+    match adapter
+        .send_message(&session_key, "🧪 Cowd adapter.send_message() live test!")
+        .await
+    {
+        Ok(result) => ok(
+            "adapter.send_message()",
+            &format!(
+                "message sent ({})",
+                result.message_id.as_deref().unwrap_or("no message id")
+            ),
+        ),
         Err(e) => {
             let err_str = format!("{:?}", e);
             if err_str.contains("230013") || err_str.contains("NO availability") {
@@ -245,7 +256,13 @@ async fn test_feishu_e2e_full_flow() {
     };
 
     match adapter.send(&outbound).await {
-        Ok(()) => ok("adapter.send()", "message sent"),
+        Ok(result) => ok(
+            "adapter.send()",
+            &format!(
+                "message sent ({})",
+                result.message_id.as_deref().unwrap_or("no message id")
+            ),
+        ),
         Err(e) => {
             let err_str = format!("{:?}", e);
             if err_str.contains("230013") || err_str.contains("NO availability") {
@@ -315,19 +332,13 @@ async fn test_feishu_ws_receive_and_reply() {
                 received = true;
                 ok(
                     "received",
-                    &format!(
-                        "sender={}, text=\"{}\"",
-                        msg.session_key.user_id, msg.text
-                    ),
+                    &format!("sender={}, text=\"{}\"", msg.session_key.user_id, msg.text),
                 );
                 println!("   platform: {:?}", msg.platform);
                 println!("   message_id: {:?}", msg.message_id);
                 println!("   chat_id: {:?}", msg.metadata.get("chat_id"));
 
-                let reply_text = format!(
-                    "🤖 收到！Cowd 飞书适配器测试回复：{}",
-                    msg.text
-                );
+                let reply_text = format!("🤖 收到！Cowd 飞书适配器测试回复：{}", msg.text);
                 let outbound = OutboundMessage {
                     session_key: msg.session_key.clone(),
                     text: reply_text,
@@ -336,7 +347,13 @@ async fn test_feishu_ws_receive_and_reply() {
                 };
 
                 match adapter.send(&outbound).await {
-                    Ok(()) => ok("reply", "message sent successfully"),
+                    Ok(result) => ok(
+                        "reply",
+                        &format!(
+                            "message sent successfully ({})",
+                            result.message_id.as_deref().unwrap_or("no message id")
+                        ),
+                    ),
                     Err(e) => fail("reply", &format!("{:?}", e)),
                 }
                 break;
@@ -389,7 +406,10 @@ async fn test_feishu_ws_receive_and_reply() {
             Ok(Some(msg)) => {
                 ok(
                     "process_webhook_event",
-                    &format!("parsed message: \"{}\" from {}", msg.text, msg.session_key.user_id),
+                    &format!(
+                        "parsed message: \"{}\" from {}",
+                        msg.text, msg.session_key.user_id
+                    ),
                 );
                 println!("   message_id: {:?}", msg.message_id);
                 println!("   chat_id: {:?}", msg.metadata.get("chat_id"));
@@ -435,17 +455,22 @@ async fn test_feishu_ws_connect_real() {
     section("Cowd Feishu — Full WebSocket Connect Live Test");
     println!("   APP_ID: {}", app_id());
 
-    let client = FeishuWsClient::new(&app_id(), &app_secret())
-        .with_reconnect(0, 0); // No reconnect for test
+    let client = FeishuWsClient::new(&app_id(), &app_secret()).with_reconnect(0, 0); // No reconnect for test
 
     match client.connect().await {
         Ok(mut rx) => {
-            ok("connect()", "WebSocket connected, waiting for event (30s timeout)...");
+            ok(
+                "connect()",
+                "WebSocket connected, waiting for event (30s timeout)...",
+            );
 
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
                 if tokio::time::Instant::now() > deadline {
-                    warn("timeout", "No event received in 30s — but connection worked");
+                    warn(
+                        "timeout",
+                        "No event received in 30s — but connection worked",
+                    );
                     break;
                 }
                 match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {

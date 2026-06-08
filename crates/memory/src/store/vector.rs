@@ -27,8 +27,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{error::MemoryError, types::MemoryId};
 use crate::store::sqlite::SqliteStore;
+use crate::{error::MemoryError, types::MemoryId};
 
 // ─── Serialisation envelope ───────────────────────────────────────────────────
 
@@ -167,9 +167,8 @@ impl VectorIndex {
 
     fn persist_json(&self) -> Result<(), MemoryError> {
         if let Some(parent) = self.persist_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                MemoryError::Store(format!("create vector index dir: {e}"))
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|e| MemoryError::Store(format!("create vector index dir: {e}")))?;
         }
 
         let snap = IndexSnapshot {
@@ -271,11 +270,7 @@ impl VectorIndex {
     /// # Errors
     /// Returns [`MemoryError::InvalidArgument`] if `query` is empty or has the
     /// wrong length.
-    pub fn search(
-        &self,
-        query: &[f32],
-        limit: usize,
-    ) -> Result<Vec<(MemoryId, f32)>, MemoryError> {
+    pub fn search(&self, query: &[f32], limit: usize) -> Result<Vec<(MemoryId, f32)>, MemoryError> {
         self.search_with_filter(query, limit, &|_| true)
     }
 
@@ -460,9 +455,7 @@ mod tests {
         idx.upsert(id, vec![1.0, 0.01, 0.0]).unwrap();
 
         // Very similar vector — should be found at threshold 0.15.
-        let dups = idx
-            .find_duplicates(&[1.0, 0.0, 0.0], 0.15)
-            .unwrap();
+        let dups = idx.find_duplicates(&[1.0, 0.0, 0.0], 0.15).unwrap();
         assert!(!dups.is_empty());
         assert_eq!(dups[0].0, id);
     }

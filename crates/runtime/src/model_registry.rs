@@ -154,11 +154,12 @@ impl ModelRegistry {
         if !path.exists() {
             return Err(ModelRegistryError::NotFound(path));
         }
-        let content =
-            std::fs::read_to_string(&path).map_err(ModelRegistryError::Io)?;
+        let content = std::fs::read_to_string(&path).map_err(ModelRegistryError::Io)?;
         let file: ModelsFile =
             serde_yaml::from_str(&content).map_err(|e| ModelRegistryError::Parse(e.to_string()))?;
-        Ok(Self { models: file.models })
+        Ok(Self {
+            models: file.models,
+        })
     }
 
     /// Create an empty registry (used as fallback when the file is missing).
@@ -217,9 +218,8 @@ impl ModelRegistry {
 #[must_use]
 pub fn global_registry() -> &'static ModelRegistry {
     use std::sync::LazyLock;
-    static REGISTRY: LazyLock<ModelRegistry> = LazyLock::new(|| {
-        ModelRegistry::load().unwrap_or_else(|_| ModelRegistry::empty())
-    });
+    static REGISTRY: LazyLock<ModelRegistry> =
+        LazyLock::new(|| ModelRegistry::load().unwrap_or_else(|_| ModelRegistry::empty()));
     &REGISTRY
 }
 
@@ -437,7 +437,9 @@ mod tests {
         assert_eq!(info.max_output_tokens, 16_000);
         assert_eq!(info.provider, "test");
 
-        let pricing = registry.pricing_for("test-model").expect("pricing should exist");
+        let pricing = registry
+            .pricing_for("test-model")
+            .expect("pricing should exist");
         assert_eq!(pricing.input_per_1m, 1.0);
     }
 

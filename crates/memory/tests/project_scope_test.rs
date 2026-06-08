@@ -3,7 +3,7 @@
 //! Tests project registration, idempotent re-registration, active-project
 //! switching, and the always-available global store.
 
-use cowd_memory::{ProjectScopeManager, store::MemoryStore};
+use cowd_memory::{store::MemoryStore, ProjectScopeManager};
 
 /// Helper: create a temporary directory and a `ProjectScopeManager` using
 /// `memory.db` inside it.

@@ -185,7 +185,10 @@ impl ProjectScopeManager {
     where
         F: Fn(&PathBuf) + Send + Sync + 'static,
     {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).on_project_registered = Some(Box::new(callback));
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .on_project_registered = Some(Box::new(callback));
         self
     }
 
@@ -195,12 +198,18 @@ impl ProjectScopeManager {
     /// Calling this with the same path multiple times is **idempotent**:
     /// it returns the same ID and does not create duplicate stores.
     pub fn register_project(&self, path: &Path) -> Result<String, MemoryError> {
-        let canonical = path.canonicalize().map_err(|e| {
-            MemoryError::Store(format!("failed to canonicalize path: {e}"))
-        })?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| MemoryError::Store(format!("failed to canonicalize path: {e}")))?;
         let project_id = hash_path(&canonical);
         let db_filename = format!("memory_{}.db", &project_id[..12.min(project_id.len())]);
-        let db_path = if let Some(parent) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).global_path.parent() {
+        let db_path = if let Some(parent) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .global_path
+            .parent()
+        {
             parent.join(&db_filename)
         } else {
             PathBuf::from(&db_filename)
@@ -232,7 +241,9 @@ impl ProjectScopeManager {
         };
 
         inner.projects.insert(project_id.clone(), manifest);
-        inner.project_stores.insert(project_id.clone(), store.clone());
+        inner
+            .project_stores
+            .insert(project_id.clone(), store.clone());
         let project_registered_cb = inner.on_project_registered.as_ref().map(|_| ());
         drop(inner);
 
@@ -266,7 +277,9 @@ impl ProjectScopeManager {
             .project_stores
             .get(project_id)
             .cloned()
-            .ok_or_else(|| MemoryError::NotFound(format!("project not registered: {project_id}")))?;
+            .ok_or_else(|| {
+                MemoryError::NotFound(format!("project not registered: {project_id}"))
+            })?;
 
         // Update last_activity.
         if let Some(manifest) = inner.projects.get_mut(project_id) {
@@ -292,7 +305,11 @@ impl ProjectScopeManager {
     ///
     /// The global store is always available and never destroyed.
     pub fn global_store(&self) -> SqliteStore {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).global_store.clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .global_store
+            .clone()
     }
 
     /// Check whether the indexed files for a registered project have changed
@@ -304,10 +321,9 @@ impl ProjectScopeManager {
     /// stale and should be rebuilt.
     pub fn is_kg_stale(&self, project_id: &str) -> Result<bool, MemoryError> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let manifest = inner
-            .projects
-            .get(project_id)
-            .ok_or_else(|| MemoryError::NotFound(format!("project not registered: {project_id}")))?;
+        let manifest = inner.projects.get(project_id).ok_or_else(|| {
+            MemoryError::NotFound(format!("project not registered: {project_id}"))
+        })?;
 
         for (file_path, stored_mtime) in &manifest.indexed_file_mtimes {
             match std::fs::metadata(file_path) {
@@ -453,7 +469,14 @@ pub fn unified_scan(
             .iter()
             .find(|l| l.extensions.iter().any(|e| e == &ext))
         {
-            process_code(&content, &source_file, &lang.compiled, "code", &now, &mut kg);
+            process_code(
+                &content,
+                &source_file,
+                &lang.compiled,
+                "code",
+                &now,
+                &mut kg,
+            );
         } else {
             match ext.as_str() {
                 "md" | "mdx" | "rst" | "adoc" | "txt" | "text" => process_doc(
@@ -525,7 +548,13 @@ pub fn unified_scan(
                     );
                 }
                 "xml" | "svg" => {
-                    process_web(&content, &source_file, patterns.tag_re.as_ref(), &now, &mut kg);
+                    process_web(
+                        &content,
+                        &source_file,
+                        patterns.tag_re.as_ref(),
+                        &now,
+                        &mut kg,
+                    );
                 }
                 "css" | "scss" | "less" => {
                     process_css(
@@ -838,7 +867,15 @@ fn process_doc(
             if let Some(m) = cap.get(1) {
                 let heading = m.as_str().trim();
                 if !heading.is_empty() && heading.len() <= 120 {
-                    add_entity(heading, EntityType::DocHeading, 0.7, source_file, "doc", now, kg);
+                    add_entity(
+                        heading,
+                        EntityType::DocHeading,
+                        0.7,
+                        source_file,
+                        "doc",
+                        now,
+                        kg,
+                    );
                 }
             }
         }
@@ -893,7 +930,15 @@ fn process_config(
             if let Some(m) = cap.get(1) {
                 let key = m.as_str();
                 if !key.is_empty() && key.len() <= 80 {
-                    add_entity(key, EntityType::ConfigKey, 0.7, source_file, source_type, now, kg);
+                    add_entity(
+                        key,
+                        EntityType::ConfigKey,
+                        0.7,
+                        source_file,
+                        source_type,
+                        now,
+                        kg,
+                    );
                 }
             }
         }
@@ -916,13 +961,30 @@ fn process_web(
                 // Skip structural boilerplate
                 if matches!(
                     tag.as_str(),
-                    "html" | "head" | "body" | "meta" | "link" | "script" | "style"
-                        | "br" | "hr" | "!doctype" | "!DOCTYPE"
+                    "html"
+                        | "head"
+                        | "body"
+                        | "meta"
+                        | "link"
+                        | "script"
+                        | "style"
+                        | "br"
+                        | "hr"
+                        | "!doctype"
+                        | "!DOCTYPE"
                 ) {
                     continue;
                 }
                 if tag.len() <= 60 && seen.insert(tag.clone()) {
-                    add_entity(&tag, EntityType::DataField, 0.6, source_file, "data", now, kg);
+                    add_entity(
+                        &tag,
+                        EntityType::DataField,
+                        0.6,
+                        source_file,
+                        "data",
+                        now,
+                        kg,
+                    );
                 }
             }
         }
@@ -949,7 +1011,15 @@ fn process_html(
             if let Some(m) = cap.get(1) {
                 let name = m.as_str().to_lowercase();
                 if name.len() <= 60 && seen.insert(name.clone()) {
-                    add_entity(&name, EntityType::Concept, 0.8, source_file, "frontend", now, kg);
+                    add_entity(
+                        &name,
+                        EntityType::Concept,
+                        0.8,
+                        source_file,
+                        "frontend",
+                        now,
+                        kg,
+                    );
                 }
             }
         }
@@ -961,7 +1031,15 @@ fn process_html(
             if let Some(m) = cap.get(1) {
                 let role = m.as_str().trim().to_lowercase();
                 if !role.is_empty() && role.len() <= 60 && seen.insert(role.clone()) {
-                    add_entity(&role, EntityType::ConfigKey, 0.7, source_file, "frontend", now, kg);
+                    add_entity(
+                        &role,
+                        EntityType::ConfigKey,
+                        0.7,
+                        source_file,
+                        "frontend",
+                        now,
+                        kg,
+                    );
                 }
             }
         }
@@ -975,8 +1053,16 @@ fn process_html(
                 // Skip structural boilerplate
                 if matches!(
                     tag.as_str(),
-                    "html" | "head" | "body" | "meta" | "link" | "script" | "style"
-                        | "br" | "hr" | "!doctype"
+                    "html"
+                        | "head"
+                        | "body"
+                        | "meta"
+                        | "link"
+                        | "script"
+                        | "style"
+                        | "br"
+                        | "hr"
+                        | "!doctype"
                 ) {
                     continue;
                 }
@@ -988,11 +1074,27 @@ fn process_html(
                 }
 
                 if semantic_tags.contains(&tag.as_str()) {
-                    add_entity(&tag, EntityType::DocHeading, 0.7, source_file, "frontend", now, kg);
+                    add_entity(
+                        &tag,
+                        EntityType::DocHeading,
+                        0.7,
+                        source_file,
+                        "frontend",
+                        now,
+                        kg,
+                    );
                 } else if tag.contains('-') {
                     // Already handled by custom_elem_re above; skip duplicates
                 } else {
-                    add_entity(&tag, EntityType::DataField, 0.6, source_file, "frontend", now, kg);
+                    add_entity(
+                        &tag,
+                        EntityType::DataField,
+                        0.6,
+                        source_file,
+                        "frontend",
+                        now,
+                        kg,
+                    );
                 }
             }
         }
@@ -1017,7 +1119,15 @@ fn process_css(
             if let Some(m) = cap.get(1) {
                 let name = m.as_str();
                 if !name.is_empty() && name.len() <= 60 && seen.insert(name.to_string()) {
-                    add_entity(name, EntityType::DataField, 0.7, source_file, "style", now, kg);
+                    add_entity(
+                        name,
+                        EntityType::DataField,
+                        0.7,
+                        source_file,
+                        "style",
+                        now,
+                        kg,
+                    );
                 }
             }
         }
@@ -1030,7 +1140,15 @@ fn process_css(
             if let Some(m) = cap.get(1) {
                 let name = m.as_str();
                 if !name.is_empty() && name.len() <= 60 && seen.insert(name.to_string()) {
-                    add_entity(name, EntityType::DataField, 0.7, source_file, "style", now, kg);
+                    add_entity(
+                        name,
+                        EntityType::DataField,
+                        0.7,
+                        source_file,
+                        "style",
+                        now,
+                        kg,
+                    );
                 }
             }
         }
@@ -1042,7 +1160,15 @@ fn process_css(
             if let Some(m) = cap.get(1) {
                 let name = m.as_str();
                 if !name.is_empty() && name.len() <= 60 {
-                    add_entity(name, EntityType::Concept, 0.8, source_file, "style", now, kg);
+                    add_entity(
+                        name,
+                        EntityType::Concept,
+                        0.8,
+                        source_file,
+                        "style",
+                        now,
+                        kg,
+                    );
                 }
             }
         }
@@ -1172,19 +1298,8 @@ fn process_vue(
                     for m in pattern_re.captures_iter(script) {
                         if let Some(n) = m.get(1) {
                             let name = n.as_str().to_string();
-                            if !name.is_empty()
-                                && name.len() <= 80
-                                && !name.starts_with("__")
-                            {
-                                add_entity(
-                                    &name,
-                                    *etype,
-                                    0.7,
-                                    source_file,
-                                    "frontend",
-                                    now,
-                                    kg,
-                                );
+                            if !name.is_empty() && name.len() <= 80 && !name.starts_with("__") {
+                                add_entity(&name, *etype, 0.7, source_file, "frontend", now, kg);
                             }
                         }
                     }
@@ -1219,8 +1334,15 @@ fn process_vue(
                             let tag = m.as_str().to_lowercase();
                             if matches!(
                                 tag.as_str(),
-                                "html" | "head" | "body" | "meta" | "link"
-                                    | "script" | "style" | "br" | "hr"
+                                "html"
+                                    | "head"
+                                    | "body"
+                                    | "meta"
+                                    | "link"
+                                    | "script"
+                                    | "style"
+                                    | "br"
+                                    | "hr"
                                     | "!doctype"
                             ) {
                                 continue;
@@ -1290,17 +1412,20 @@ fn is_js_keyword(name: &str) -> bool {
 }
 
 /// Fallback for unrecognised text: use the first non-empty line as a Concept.
-fn process_unknown(
-    content: &str,
-    source_file: &str,
-    now: &DateTime<Utc>,
-    kg: &mut KnowledgeGraph,
-) {
+fn process_unknown(content: &str, source_file: &str, now: &DateTime<Utc>, kg: &mut KnowledgeGraph) {
     for line in content.lines() {
         let trimmed = line.trim();
         if !trimmed.is_empty() {
             let name = &trimmed[..trimmed.len().min(100)];
-            add_entity(name, EntityType::Concept, 0.3, source_file, "unknown", now, kg);
+            add_entity(
+                name,
+                EntityType::Concept,
+                0.3,
+                source_file,
+                "unknown",
+                now,
+                kg,
+            );
             break;
         }
     }

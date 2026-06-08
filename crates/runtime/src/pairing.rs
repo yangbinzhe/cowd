@@ -117,8 +117,9 @@ impl PairingManager {
             let lockouts = self.lockouts.read().await;
             if let Some(lockout) = lockouts.get(&key_str) {
                 if lockout.locked_at + ChronoDuration::seconds(LOCKOUT_SECS) > Utc::now() {
-                    let remaining = (lockout.locked_at + ChronoDuration::seconds(LOCKOUT_SECS) - Utc::now())
-                        .num_seconds();
+                    let remaining = (lockout.locked_at + ChronoDuration::seconds(LOCKOUT_SECS)
+                        - Utc::now())
+                    .num_seconds();
                     return Err(PairingError::LockedOut {
                         remaining_secs: remaining.max(0),
                     });
@@ -131,8 +132,10 @@ impl PairingManager {
             let rate_limits = self.rate_limits.read().await;
             if let Some(entry) = rate_limits.get(&key_str) {
                 if entry.last_generated + ChronoDuration::seconds(RATE_LIMIT_SECS) > Utc::now() {
-                    let remaining = (entry.last_generated + ChronoDuration::seconds(RATE_LIMIT_SECS) - Utc::now())
-                        .num_seconds();
+                    let remaining = (entry.last_generated
+                        + ChronoDuration::seconds(RATE_LIMIT_SECS)
+                        - Utc::now())
+                    .num_seconds();
                     return Err(PairingError::RateLimited {
                         remaining_secs: remaining.max(0),
                     });
@@ -152,7 +155,10 @@ impl PairingManager {
         };
 
         // Store in memory
-        self.pending_codes.write().await.insert(code.clone(), pending.clone());
+        self.pending_codes
+            .write()
+            .await
+            .insert(code.clone(), pending.clone());
 
         // Update rate limit
         self.rate_limits.write().await.insert(
@@ -179,14 +185,10 @@ impl PairingManager {
     ///
     /// Returns the platform and session key on success.
     /// On failure, increments the attempt counter and may lock out after 5 failures.
-    pub async fn verify_code(
-        &self,
-        code: &str,
-    ) -> Result<(Platform, SessionKey), PairingError> {
+    pub async fn verify_code(&self, code: &str) -> Result<(Platform, SessionKey), PairingError> {
         // Take ownership of the entry to avoid borrow conflicts
         let mut codes = self.pending_codes.write().await;
-        let mut pending = codes.remove(code)
-            .ok_or(PairingError::InvalidCode)?;
+        let mut pending = codes.remove(code).ok_or(PairingError::InvalidCode)?;
 
         // Check expiry
         if pending.created_at + ChronoDuration::seconds(EXPIRY_SECS) <= Utc::now() {
@@ -251,7 +253,10 @@ impl PairingManager {
         }
 
         if !expired_keys.is_empty() {
-            tracing::info!(count = expired_keys.len(), "cleaned up expired pairing codes");
+            tracing::info!(
+                count = expired_keys.len(),
+                "cleaned up expired pairing codes"
+            );
         }
 
         // Also clean up expired lockouts
@@ -260,7 +265,8 @@ impl PairingManager {
 
         // Clean up old rate limits
         let mut rate_limits = self.rate_limits.write().await;
-        rate_limits.retain(|_, v| v.last_generated + ChronoDuration::seconds(RATE_LIMIT_SECS) > now);
+        rate_limits
+            .retain(|_, v| v.last_generated + ChronoDuration::seconds(RATE_LIMIT_SECS) > now);
     }
 
     /// Generate a random 8-character code from the unambiguous alphabet.
@@ -335,7 +341,11 @@ mod tests {
         assert_eq!(code.len(), CODE_LENGTH);
         // All chars should be from the unambiguous alphabet
         for c in code.chars() {
-            assert!(ALPHABET.contains(&(c as u8)), "char '{}' not in alphabet", c);
+            assert!(
+                ALPHABET.contains(&(c as u8)),
+                "char '{}' not in alphabet",
+                c
+            );
         }
     }
 
@@ -355,7 +365,10 @@ mod tests {
         let manager = PairingManager::new(dir.path().to_path_buf());
 
         let session_key = SessionKey::new("feishu", "user123");
-        let code = manager.generate_code(&Platform::Feishu, &session_key).await.unwrap();
+        let code = manager
+            .generate_code(&Platform::Feishu, &session_key)
+            .await
+            .unwrap();
 
         let (platform, verified_key) = manager.verify_code(&code).await.unwrap();
         assert_eq!(platform, Platform::Feishu);
@@ -377,7 +390,10 @@ mod tests {
         let manager = PairingManager::new(dir.path().to_path_buf());
 
         let session_key = SessionKey::new("feishu", "user456");
-        let code = manager.generate_code(&Platform::Feishu, &session_key).await.unwrap();
+        let code = manager
+            .generate_code(&Platform::Feishu, &session_key)
+            .await
+            .unwrap();
 
         // First verification succeeds
         let _ = manager.verify_code(&code).await.unwrap();
@@ -393,7 +409,10 @@ mod tests {
         let manager = PairingManager::new(dir.path().to_path_buf());
 
         let session_key = SessionKey::new("feishu", "user789");
-        let _ = manager.generate_code(&Platform::Feishu, &session_key).await.unwrap();
+        let _ = manager
+            .generate_code(&Platform::Feishu, &session_key)
+            .await
+            .unwrap();
 
         // Second generation should be rate limited
         let result = manager.generate_code(&Platform::Feishu, &session_key).await;

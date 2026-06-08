@@ -228,9 +228,7 @@ impl LayerManager for EssentialLayer {
             }
 
             // Prune Normal entries above prune_threshold.
-            if entry.priority == Priority::Normal
-                && entry.staleness >= self.drift.prune_threshold
-            {
+            if entry.priority == Priority::Normal && entry.staleness >= self.drift.prune_threshold {
                 self.store.delete(&entry.id).await?;
                 continue;
             }
@@ -341,7 +339,15 @@ mod tests {
     async fn update_modifies_content_and_resets_staleness() {
         let layer = EssentialLayer::new(in_memory());
         let id = layer
-            .add(MemoryCategory::Decision, "T", "old", Priority::Normal, MemorySource::AutoExtracted, vec![], MemoryScope::default())
+            .add(
+                MemoryCategory::Decision,
+                "T",
+                "old",
+                Priority::Normal,
+                MemorySource::AutoExtracted,
+                vec![],
+                MemoryScope::default(),
+            )
             .await
             .unwrap();
         layer.update(&id, "new content here").await.unwrap();
@@ -354,16 +360,35 @@ mod tests {
     async fn insert_overrides_layer_to_l1() {
         let layer = EssentialLayer::new(in_memory());
         let entry = MemoryEntry {
-            id: uuid::Uuid::new_v4(), layer: MemoryLayer::L3, category: MemoryCategory::Decision,
-            priority: Priority::Normal, source: MemorySource::AutoExtracted,
-            title: "t".into(), content: "c".into(), embedding: None,
-            tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
-            staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            last_accessed_at: None, scope: MemoryScope::default(), session_id: None,
-            source_agent: None, visibility: crate::types::AgentVisibility::default(),
+            id: uuid::Uuid::new_v4(),
+            layer: MemoryLayer::L3,
+            category: MemoryCategory::Decision,
+            priority: Priority::Normal,
+            source: MemorySource::AutoExtracted,
+            title: "t".into(),
+            content: "c".into(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed_at: None,
+            scope: MemoryScope::default(),
+            session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
         let id = layer.insert(entry).await.unwrap();
-        let loaded = layer.load().await.unwrap().into_iter().find(|e| e.id == id).unwrap();
+        let loaded = layer
+            .load()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == id)
+            .unwrap();
         assert_eq!(loaded.layer, MemoryLayer::L1);
     }
 
@@ -371,7 +396,15 @@ mod tests {
     async fn remove_deletes_entry() {
         let layer = EssentialLayer::new(in_memory());
         let id = layer
-            .add(MemoryCategory::Decision, "T", "C", Priority::Normal, MemorySource::AutoExtracted, vec![], MemoryScope::default())
+            .add(
+                MemoryCategory::Decision,
+                "T",
+                "C",
+                Priority::Normal,
+                MemorySource::AutoExtracted,
+                vec![],
+                MemoryScope::default(),
+            )
             .await
             .unwrap();
         assert_eq!(layer.load().await.unwrap().len(), 1);
@@ -388,7 +421,15 @@ mod tests {
         };
         let layer = EssentialLayer::with_config(in_memory(), 2000, drift);
         layer
-            .add(MemoryCategory::Decision, "T", "C", Priority::High, MemorySource::AutoExtracted, vec![], MemoryScope::default())
+            .add(
+                MemoryCategory::Decision,
+                "T",
+                "C",
+                Priority::High,
+                MemorySource::AutoExtracted,
+                vec![],
+                MemoryScope::default(),
+            )
             .await
             .unwrap();
         layer.tick().await.unwrap();
@@ -405,7 +446,15 @@ mod tests {
         };
         let layer = EssentialLayer::with_config(in_memory(), 2000, drift);
         layer
-            .add(MemoryCategory::Decision, "T", "C", Priority::Low, MemorySource::AutoExtracted, vec![], MemoryScope::default())
+            .add(
+                MemoryCategory::Decision,
+                "T",
+                "C",
+                Priority::Low,
+                MemorySource::AutoExtracted,
+                vec![],
+                MemoryScope::default(),
+            )
             .await
             .unwrap();
         layer.tick().await.unwrap(); // staleness now 0.9 >= 0.8 threshold
@@ -421,7 +470,15 @@ mod tests {
         };
         let layer = EssentialLayer::with_config(in_memory(), 2000, drift);
         layer
-            .add(MemoryCategory::Decision, "T", "C", Priority::High, MemorySource::AutoExtracted, vec![], MemoryScope::default())
+            .add(
+                MemoryCategory::Decision,
+                "T",
+                "C",
+                Priority::High,
+                MemorySource::AutoExtracted,
+                vec![],
+                MemoryScope::default(),
+            )
             .await
             .unwrap();
         layer.tick().await.unwrap();
@@ -432,7 +489,15 @@ mod tests {
     async fn load_truncates_to_budget() {
         let layer = EssentialLayer::with_config(in_memory(), 10, DriftConfig::default());
         layer
-            .add(MemoryCategory::Decision, "T", &"x".repeat(1000), Priority::Normal, MemorySource::AutoExtracted, vec![], MemoryScope::default())
+            .add(
+                MemoryCategory::Decision,
+                "T",
+                &"x".repeat(1000),
+                Priority::Normal,
+                MemorySource::AutoExtracted,
+                vec![],
+                MemoryScope::default(),
+            )
             .await
             .unwrap();
         // 1000 chars → ~250 tokens, but max_tokens is 10 → entry excluded
@@ -444,11 +509,27 @@ mod tests {
     async fn load_sorts_by_priority() {
         let layer = EssentialLayer::new(in_memory());
         layer
-            .add(MemoryCategory::Decision, "low", "x", Priority::Low, MemorySource::AutoExtracted, vec![], MemoryScope::default())
+            .add(
+                MemoryCategory::Decision,
+                "low",
+                "x",
+                Priority::Low,
+                MemorySource::AutoExtracted,
+                vec![],
+                MemoryScope::default(),
+            )
             .await
             .unwrap();
         layer
-            .add(MemoryCategory::Decision, "critical", "x", Priority::Critical, MemorySource::AutoExtracted, vec![], MemoryScope::default())
+            .add(
+                MemoryCategory::Decision,
+                "critical",
+                "x",
+                Priority::Critical,
+                MemorySource::AutoExtracted,
+                vec![],
+                MemoryScope::default(),
+            )
             .await
             .unwrap();
 

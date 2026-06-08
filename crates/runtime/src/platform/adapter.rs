@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 // Re-export types for backward compatibility.
-pub use crate::platform::types::{ChatInfo, MessageType, Platform, PlatformEvent, SendResult};
+pub use crate::platform::types::{
+    ChatInfo, MessageType, OutboundPayloadKind, Platform, PlatformEvent, SendResult,
+};
 
 /// Errors that can occur during platform operations.
 #[derive(Error, Debug)]
@@ -78,6 +80,33 @@ pub struct OutboundMessage {
     pub metadata: serde_json::Value,
 }
 
+/// Typed outbound dispatch request.
+#[derive(Debug, Clone)]
+pub struct OutboundDispatch {
+    pub session_key: SessionKey,
+    pub kind: OutboundPayloadKind,
+    pub payload_ref: String,
+    pub caption: Option<String>,
+    pub file_name: Option<String>,
+    pub reply_to: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+impl OutboundDispatch {
+    #[must_use]
+    pub fn text(msg: OutboundMessage) -> Self {
+        Self {
+            session_key: msg.session_key,
+            kind: OutboundPayloadKind::Text,
+            payload_ref: msg.text,
+            caption: None,
+            file_name: None,
+            reply_to: msg.reply_to,
+            metadata: msg.metadata,
+        }
+    }
+}
+
 /// Trait for platform adapters.
 ///
 /// Implement this trait to add support for new platforms.
@@ -105,7 +134,7 @@ pub trait PlatformAdapter: Send + Sync {
     async fn receive(&mut self) -> Result<Option<InboundMessage>, PlatformError>;
 
     /// Send an outbound message.
-    async fn send(&self, msg: &OutboundMessage) -> Result<(), PlatformError>;
+    async fn send(&self, msg: &OutboundMessage) -> Result<SendResult, PlatformError>;
 
     /// Send a typing indicator to the chat.
     #[allow(unused_variables)]
@@ -115,43 +144,79 @@ pub trait PlatformAdapter: Send + Sync {
 
     /// Send an image from a URL.
     #[allow(unused_variables)]
-    async fn send_image(&self, chat_id: &str, image_url: &str, caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_image(
+        &self,
+        chat_id: &str,
+        image_url: &str,
+        caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_image".into()))
     }
 
     /// Send an image from a local file path.
     #[allow(unused_variables)]
-    async fn send_image_file(&self, chat_id: &str, image_path: &str, caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_image_file(
+        &self,
+        chat_id: &str,
+        image_path: &str,
+        caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_image_file".into()))
     }
 
     /// Send a voice message from an audio file.
     #[allow(unused_variables)]
-    async fn send_voice(&self, chat_id: &str, audio_path: &str, caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_voice(
+        &self,
+        chat_id: &str,
+        audio_path: &str,
+        caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_voice".into()))
     }
 
     /// Send a document/file.
     #[allow(unused_variables)]
-    async fn send_document(&self, chat_id: &str, file_path: &str, file_name: Option<&str>, caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_document(
+        &self,
+        chat_id: &str,
+        file_path: &str,
+        file_name: Option<&str>,
+        caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_document".into()))
     }
 
     /// Send a video message.
     #[allow(unused_variables)]
-    async fn send_video(&self, chat_id: &str, video_path: &str, caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_video(
+        &self,
+        chat_id: &str,
+        video_path: &str,
+        caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_video".into()))
     }
 
     /// Send an animation/GIF from a URL.
     #[allow(unused_variables)]
-    async fn send_animation(&self, chat_id: &str, animation_url: &str, caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_animation(
+        &self,
+        chat_id: &str,
+        animation_url: &str,
+        caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_animation".into()))
     }
 
     /// Edit an existing message.
     #[allow(unused_variables)]
-    async fn edit_message(&self, chat_id: &str, message_id: &str, content: &str) -> PlatformResult<()> {
+    async fn edit_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("edit_message".into()))
     }
 
@@ -212,39 +277,75 @@ impl PlatformAdapter for NullAdapter {
         Ok(None)
     }
 
-    async fn send(&self, _msg: &OutboundMessage) -> PlatformResult<()> {
-        Ok(())
+    async fn send(&self, _msg: &OutboundMessage) -> PlatformResult<SendResult> {
+        Ok(SendResult::success(None))
     }
 
     async fn send_typing(&self, _chat_id: &str) -> Result<(), PlatformError> {
         Ok(())
     }
 
-    async fn send_image(&self, _chat_id: &str, _image_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_image(
+        &self,
+        _chat_id: &str,
+        _image_url: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_image".into()))
     }
 
-    async fn send_image_file(&self, _chat_id: &str, _image_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_image_file(
+        &self,
+        _chat_id: &str,
+        _image_path: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_image_file".into()))
     }
 
-    async fn send_voice(&self, _chat_id: &str, _audio_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_voice(
+        &self,
+        _chat_id: &str,
+        _audio_path: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_voice".into()))
     }
 
-    async fn send_document(&self, _chat_id: &str, _file_path: &str, _file_name: Option<&str>, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_document(
+        &self,
+        _chat_id: &str,
+        _file_path: &str,
+        _file_name: Option<&str>,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_document".into()))
     }
 
-    async fn send_video(&self, _chat_id: &str, _video_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_video(
+        &self,
+        _chat_id: &str,
+        _video_path: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_video".into()))
     }
 
-    async fn send_animation(&self, _chat_id: &str, _animation_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_animation(
+        &self,
+        _chat_id: &str,
+        _animation_url: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_animation".into()))
     }
 
-    async fn edit_message(&self, _chat_id: &str, _message_id: &str, _content: &str) -> PlatformResult<()> {
+    async fn edit_message(
+        &self,
+        _chat_id: &str,
+        _message_id: &str,
+        _content: &str,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("edit_message".into()))
     }
 

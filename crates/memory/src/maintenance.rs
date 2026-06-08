@@ -280,8 +280,8 @@ impl MaintenanceQueue {
             if !existed {
                 inserted += 1;
             }
-            let entry_ids_json = serde_json::to_string(&candidate.entry_ids)
-                .map_err(MemoryError::Serialisation)?;
+            let entry_ids_json =
+                serde_json::to_string(&candidate.entry_ids).map_err(MemoryError::Serialisation)?;
             tx.execute(
                 r"INSERT INTO memory_maintenance_candidates
                   (id, kind, status, entry_ids_json, summary, reason, confidence,
@@ -514,7 +514,8 @@ fn add_conflict_candidates(
                 MaintenanceCandidateKind::Conflict,
                 group.iter().map(|entry| entry.id).collect(),
                 format!("Resolve conflicting memories: {}", group[0].title),
-                "same title has divergent content and at least one weak-confidence fact".to_string(),
+                "same title has divergent content and at least one weak-confidence fact"
+                    .to_string(),
                 0.82,
             ));
         }
@@ -582,9 +583,7 @@ mod tests {
 
     use super::*;
     use crate::project_scope::MemoryScope;
-    use crate::types::{
-        AgentVisibility, MemoryCategory, MemoryLayer, MemorySource, Priority,
-    };
+    use crate::types::{AgentVisibility, MemoryCategory, MemoryLayer, MemorySource, Priority};
 
     fn entry(title: &str, content: &str) -> MemoryEntry {
         MemoryEntry {
@@ -632,8 +631,10 @@ mod tests {
         let mut weak_conflict = entry("Session store", "JSONL is authoritative");
         weak_conflict.confidence = 0.2;
 
-        let candidates =
-            scan_maintenance_candidates(&[a, duplicate, weak_conflict], &MaintenanceScanConfig::default());
+        let candidates = scan_maintenance_candidates(
+            &[a, duplicate, weak_conflict],
+            &MaintenanceScanConfig::default(),
+        );
 
         assert!(candidates
             .iter()

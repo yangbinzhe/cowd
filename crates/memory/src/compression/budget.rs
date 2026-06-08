@@ -42,7 +42,9 @@ impl BudgetManager {
         let total = self.config.context_window;
         let reserved_system = self.config.reserved_system;
         let reserved_response = self.config.reserved_response;
-        let available = total.saturating_sub(reserved_system).saturating_sub(reserved_response);
+        let available = total
+            .saturating_sub(reserved_system)
+            .saturating_sub(reserved_response);
         TokenBudget {
             total,
             reserved_system,
@@ -145,8 +147,11 @@ mod tests {
             critical_threshold: 0.95,
         });
         let alloc = mgr.allocate(AllocationPhase::MemoryInjection, 85_000);
-        assert!((alloc.pressure_factor - 0.5).abs() < 0.01,
-            "memory phase should halve under high pressure, got {}", alloc.pressure_factor);
+        assert!(
+            (alloc.pressure_factor - 0.5).abs() < 0.01,
+            "memory phase should halve under high pressure, got {}",
+            alloc.pressure_factor
+        );
     }
 
     #[test]

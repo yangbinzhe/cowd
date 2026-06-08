@@ -131,7 +131,11 @@ impl Closet {
         }
 
         // Sort by relevance (descending)
-        pointers.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap_or(std::cmp::Ordering::Equal));
+        pointers.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Apply char limit
         let mut total_chars = 0usize;
@@ -354,10 +358,7 @@ impl ClosetManager {
         self.closet
             .pointers
             .iter()
-            .find(|p| {
-                p.kind == PointerKind::CodeSymbol
-                    && p.symbol_name.as_deref() == Some(name)
-            })
+            .find(|p| p.kind == PointerKind::CodeSymbol && p.symbol_name.as_deref() == Some(name))
             .and_then(|p| p.symbol_id.clone())
     }
 
@@ -409,22 +410,18 @@ impl ClosetManager {
 /// Extract keyword tokens from content for closet indexing.
 fn extract_keywords(content: &str) -> Vec<String> {
     let stop_words: &[&str] = &[
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "as", "into", "through", "during",
-        "before", "after", "above", "below", "between", "out", "off", "over",
-        "under", "again", "further", "then", "once", "and", "but", "or", "nor",
-        "not", "so", "yet", "both", "either", "neither", "each", "every",
-        "all", "any", "few", "more", "most", "other", "some", "such", "no",
-        "only", "own", "same", "than", "too", "very", "just", "because",
-        "this", "that", "these", "those", "it", "its", "i", "me", "my",
-        "we", "us", "our", "you", "your", "he", "him", "his", "she", "her",
-        "they", "them", "their", "what", "which", "who", "whom", "how",
-        "when", "where", "why", "if", "about", "up", "there", "also",
-        "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都",
-        "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你",
-        "会", "着", "没有", "看", "好", "自己", "这",
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through",
+        "during", "before", "after", "above", "below", "between", "out", "off", "over", "under",
+        "again", "further", "then", "once", "and", "but", "or", "nor", "not", "so", "yet", "both",
+        "either", "neither", "each", "every", "all", "any", "few", "more", "most", "other", "some",
+        "such", "no", "only", "own", "same", "than", "too", "very", "just", "because", "this",
+        "that", "these", "those", "it", "its", "i", "me", "my", "we", "us", "our", "you", "your",
+        "he", "him", "his", "she", "her", "they", "them", "their", "what", "which", "who", "whom",
+        "how", "when", "where", "why", "if", "about", "up", "there", "also", "的", "了", "在",
+        "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个", "上", "也", "很", "到", "说",
+        "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这",
     ];
 
     let lower = content.to_lowercase();

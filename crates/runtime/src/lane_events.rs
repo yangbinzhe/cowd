@@ -258,8 +258,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        dedupe_superseded_commit_events,
-        LaneCommitProvenance, LaneEvent, LaneEventBlocker,
+        dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
         LaneEventName, LaneEventStatus, LaneFailureClass,
     };
 
@@ -425,5 +424,4 @@ mod tests {
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].detail.as_deref(), Some("new"));
     }
-
 }

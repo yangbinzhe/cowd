@@ -1,12 +1,8 @@
-//! RED Tests: Task 1 - prepare_context hybrid search integration
+//! Tests for prepare_context and recall integration.
 //!
-//! These tests verify that CognitiveContextManager uses HybridSearcher
-//! to find semantically similar entries when keyword matching fails.
-//!
-//! Current state: HybridSearcher is designed but NOT wired into prepare_context.
-//! Test 3 should FAIL: entries with semantic similarity only (no keyword overlap)
-//! are NOT currently returned by prepare_context(). After GREEN implementation,
-//! hybrid search will match them via vector similarity.
+//! These tests verify that CognitiveContextManager can recall durable memories
+//! through direct lookup, FTS cache paths, and the lightweight semantic bridge
+//! used when local keyword matching has no direct overlap.
 
 use cowd_memory::config::TuningConfig;
 use cowd_memory::config::{BudgetConfig, StoreConfig};
@@ -101,15 +97,8 @@ async fn test_prepare_context_layer_isolation() {
     assert_eq!(retrieved.layer, MemoryLayer::L2);
 }
 
-// Test 3 (RED): Semantic similarity recall without keyword overlap
-//
-// Store entries with wording that has NO keyword overlap with the query,
-// then verify prepare_context CANNOT find them (because hybrid search
-// is not yet wired in). After GREEN, this test should find the entries
-// via hybrid search and the assertion should change from assert_zero
-// to assert_nonzero.
 #[tokio::test]
-async fn test_prepare_context_semantic_recall_fails_without_hybrid_search() {
+async fn test_recall_semantic_bridge_finds_related_memory_without_keyword_overlap() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = test_basic_config(&tmp.path().join("test.db"));
     let mgr = CognitiveContextManager::new(config).await.unwrap();
@@ -149,7 +138,8 @@ async fn test_prepare_context_semantic_recall_fails_without_hybrid_search() {
     let entry_id = entry.id;
     mgr.remember(entry).await.unwrap();
 
-    // Query with completely different keywords (semantically related but no word overlap)
+    // Query with different keywords. The local semantic bridge should expand
+    // the machine-vision concept family to neural-network/classification terms.
     let results = mgr
         .recall("machine vision inference", 10)
         .await
@@ -162,15 +152,11 @@ async fn test_prepare_context_semantic_recall_fails_without_hybrid_search() {
         results.iter().any(|e| e.id == entry_id)
     );
 
-    // RED assertion: currently, FTS5 keyword search fails to find this entry
-    // because there's NO keyword overlap between the query and the content.
-    // After hybrid search integration, the entry SHOULD be found.
     let found = results.iter().any(|e| e.id == entry_id);
     assert!(
-        !found,
-        "RED: Entry with semantic-only similarity should NOT be found ",
+        found,
+        "semantic bridge should recall related memory without direct keyword overlap",
     );
-    eprintln!("RED PASS: Semantic-only entry correctly not found by keyword search");
 }
 
 #[tokio::test]

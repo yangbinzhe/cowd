@@ -33,9 +33,82 @@ pub struct GatewayPanel {
     pub uptime_secs: Option<u64>,
     /// Number of active sessions.
     pub active_sessions: usize,
+    /// Runtime readiness score or status from daemon projection API.
+    pub runtime_readiness: Option<String>,
+    /// Number of runtime control-plane components.
+    pub runtime_components: Option<u64>,
+    /// Number of daemon tasks visible to the TUI.
+    pub task_count: Option<u64>,
+    /// Number of pending daemon approval requests.
+    pub pending_approvals: Option<u64>,
+    /// Current daemon session lease owner.
+    pub lease_owner: Option<String>,
+    /// Current daemon session lease mode.
+    pub lease_mode: Option<String>,
+    /// Cross-plane adapter capability summaries.
+    pub adapter_capabilities: Vec<GatewayAdapterCapability>,
+    /// Recent cross-plane execution receipts.
+    pub execution_receipts: Vec<GatewayExecutionReceipt>,
+    /// Recent dispatch target readiness summaries.
+    pub dispatch_targets: Vec<GatewayDispatchTarget>,
     /// Scroll offset for content overflow.
     pub scroll_offset: u16,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayAdapterCapability {
+    pub platform: String,
+    pub operation: String,
+    pub live_supported: bool,
+    pub adapter_bound: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayExecutionReceipt {
+    pub status: String,
+    pub dispatch_status: String,
+    pub mode: String,
+    pub capability: String,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayDispatchTarget {
+    pub platform: String,
+    pub operation: String,
+    pub session_key: Option<String>,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GatewayActionTemplate {
+    operation: &'static str,
+    capability: &'static str,
+    resource_ref: &'static str,
+    risk: &'static str,
+}
+
+const GATEWAY_ACTION_TEMPLATES: [GatewayActionTemplate; 3] = [
+    GatewayActionTemplate {
+        operation: "send_text",
+        capability: "channel.feishu.send_text",
+        resource_ref: "text://hello",
+        risk: "low",
+    },
+    GatewayActionTemplate {
+        operation: "send_image",
+        capability: "channel.feishu.send_image",
+        resource_ref: "image://https://example.test/panel.png",
+        risk: "high",
+    },
+    GatewayActionTemplate {
+        operation: "send_file",
+        capability: "channel.feishu.send_file",
+        resource_ref: "workspace://file/reports/panel.txt",
+        risk: "high",
+    },
+];
 
 impl GatewayPanel {
     /// Create a new GatewayPanel in default stopped state.
@@ -46,6 +119,15 @@ impl GatewayPanel {
             health_status: None,
             uptime_secs: None,
             active_sessions: 0,
+            runtime_readiness: None,
+            runtime_components: None,
+            task_count: None,
+            pending_approvals: None,
+            lease_owner: None,
+            lease_mode: None,
+            adapter_capabilities: Vec::new(),
+            execution_receipts: Vec::new(),
+            dispatch_targets: Vec::new(),
             scroll_offset: 0,
         }
     }
@@ -59,6 +141,12 @@ impl GatewayPanel {
         self.server_running = app.server_running;
         self.uptime_secs = app.server_uptime_secs;
         self.active_sessions = app.active_api_sessions;
+        self.runtime_readiness = app.daemon_runtime_readiness.clone();
+        self.runtime_components = app.daemon_runtime_components;
+        self.task_count = app.daemon_task_count;
+        self.pending_approvals = app.daemon_pending_approvals;
+        self.lease_owner = app.daemon_lease_owner.clone();
+        self.lease_mode = app.daemon_lease_mode.clone();
         if app.server_running {
             self.health_status = Some("Healthy".to_string());
         } else {
@@ -90,6 +178,18 @@ impl GatewayPanel {
     /// Set the active session count.
     pub fn set_active_sessions(&mut self, count: usize) {
         self.active_sessions = count;
+    }
+
+    pub fn set_adapter_capabilities(&mut self, capabilities: Vec<GatewayAdapterCapability>) {
+        self.adapter_capabilities = capabilities;
+    }
+
+    pub fn set_execution_receipts(&mut self, receipts: Vec<GatewayExecutionReceipt>) {
+        self.execution_receipts = receipts;
+    }
+
+    pub fn set_dispatch_targets(&mut self, targets: Vec<GatewayDispatchTarget>) {
+        self.dispatch_targets = targets;
     }
 
     // ── Rendering helpers ────────────────────────────────────────
@@ -152,6 +252,10 @@ impl Component for GatewayPanel {
             Span::styled("Server: ", Style::default()),
             status,
         ]));
+        lines.push(Line::from(Span::styled(
+            "Keys: r refresh  h health  s start/stop",
+            Style::default().fg(Color::DarkGray),
+        )));
 
         // ── Health check ───────────────────────────────────────
         if let Some(ref health) = self.health_status {
@@ -185,6 +289,144 @@ impl Component for GatewayPanel {
                     ),
                 ]));
             }
+
+            if let Some(readiness) = self.runtime_readiness.as_ref() {
+                lines.push(Line::from(vec![
+                    Span::styled("Runtime: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "ready {readiness}, components {}",
+                            self.runtime_components.unwrap_or_default()
+                        ),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]));
+            }
+
+            if self.task_count.is_some() || self.pending_approvals.is_some() {
+                lines.push(Line::from(vec![
+                    Span::styled("Control: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "tasks {}, approvals {}",
+                            self.task_count.unwrap_or_default(),
+                            self.pending_approvals.unwrap_or_default()
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+            }
+
+            if let Some(owner) = self.lease_owner.as_ref() {
+                lines.push(Line::from(vec![
+                    Span::styled("Lease: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "{} ({})",
+                            owner,
+                            self.lease_mode.as_deref().unwrap_or("unknown")
+                        ),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                ]));
+            }
+        }
+
+        if !self.adapter_capabilities.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "─ Cross-Plane Adapters ─",
+                Style::default().fg(Color::Cyan),
+            )));
+            for capability in self.adapter_capabilities.iter().take(4) {
+                let support = if capability.live_supported {
+                    "live"
+                } else {
+                    "plan"
+                };
+                let binding = if capability.adapter_bound {
+                    "bound"
+                } else {
+                    "not-bound"
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:12}", capability.platform),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(
+                        format!("{:12}", capability.operation),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("{support} · {binding}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+
+        if !self.execution_receipts.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "─ Execution Receipts ─",
+                Style::default().fg(Color::Cyan),
+            )));
+            for receipt in self.execution_receipts.iter().take(3) {
+                let idem = receipt
+                    .idempotency_key
+                    .as_deref()
+                    .map(|key| format!(" · idem {key}"))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:8}", receipt.status),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(
+                        format!("{:16}", receipt.dispatch_status),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("{} · {}{}", receipt.mode, receipt.capability, idem),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+
+        if !self.dispatch_targets.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "─ Dispatch Targets ─",
+                Style::default().fg(Color::Cyan),
+            )));
+            for target in self.dispatch_targets.iter().take(3) {
+                let state = if target.ready { "ready" } else { "blocked" };
+                let detail = target
+                    .session_key
+                    .as_deref()
+                    .map(|key| format!("session {key}"))
+                    .or_else(|| target.blockers.first().map(|blocker| blocker.to_string()))
+                    .unwrap_or_else(|| "no target".to_string());
+                let state_color = if target.ready {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:8}", state), Style::default().fg(state_color)),
+                    Span::styled(
+                        format!("{:10}", target.platform),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(
+                        format!("{:12}", target.operation),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(detail, Style::default().fg(Color::DarkGray)),
+                ]));
+            }
         }
 
         // ── API Endpoints ──────────────────────────────────────
@@ -195,7 +437,7 @@ impl Component for GatewayPanel {
         )));
         lines.push(Line::from(""));
 
-        let endpoints: [(&str, &str); 10] = [
+        let endpoints: [(&str, &str); 16] = [
             ("GET  /health", "Server health check"),
             ("GET  /api/sessions", "List sessions"),
             ("POST /api/sessions", "Create session"),
@@ -206,6 +448,21 @@ impl Component for GatewayPanel {
             ("GET  /api/config", "View config"),
             ("PUT  /api/config", "Update config"),
             ("GET  /api/platforms", "List platforms"),
+            ("GET  /api/cross-plane/summary", "Interop policy summary"),
+            ("GET  /api/cross-plane/grants", "List interop grants"),
+            (
+                "GET  /api/cross-plane/action/adapters",
+                "Interop dispatch capability",
+            ),
+            (
+                "GET  /api/cross-plane/action/executions",
+                "Interop execution receipts",
+            ),
+            (
+                "POST /api/cross-plane/policy/simulate",
+                "Test policy decision",
+            ),
+            ("GET  /api/cross-plane/audit", "Interop audit records"),
         ];
 
         for (endpoint, desc) in &endpoints {
@@ -231,6 +488,36 @@ impl Component for GatewayPanel {
                 Span::styled(format!(" — {desc}"), Style::default().fg(Color::DarkGray)),
             ]));
         }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "─ Action Composer Contract ─",
+            Style::default().fg(Color::Cyan),
+        )));
+        lines.push(Line::from(Span::styled(
+            "POST /api/cross-plane/action/preflight  POST /api/cross-plane/action/execute",
+            Style::default().fg(Color::DarkGray),
+        )));
+        for template in GATEWAY_ACTION_TEMPLATES {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:10}", template.operation),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    format!("{:26}", template.capability),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("{} · {}", template.risk, template.resource_ref),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            "source local:tui · principal user:demo · target channel://feishu/chat/demo",
+            Style::default().fg(Color::DarkGray),
+        )));
 
         // ── Keyboard hint bar ──────────────────────────────────
         lines.push(Line::from(""));
@@ -370,6 +657,12 @@ mod tests {
         panel.update_health("Healthy - all systems operational".into());
         panel.set_uptime(3600);
         panel.set_active_sessions(2);
+        panel.runtime_readiness = Some("87%".to_string());
+        panel.runtime_components = Some(12);
+        panel.task_count = Some(3);
+        panel.pending_approvals = Some(1);
+        panel.lease_owner = Some("tui:42".to_string());
+        panel.lease_mode = Some("collaborative".to_string());
 
         let mut terminal = MockTerminal::new(60, 20);
         let skin = SkinConfig::default();
@@ -394,6 +687,18 @@ mod tests {
         assert!(
             joined.contains("Sessions"),
             "Should show sessions, got: {joined}"
+        );
+        assert!(
+            joined.contains("Runtime") && joined.contains("87%"),
+            "Should show runtime projection summary, got: {joined}"
+        );
+        assert!(
+            joined.contains("Control") && joined.contains("approvals 1"),
+            "Should show daemon control summary, got: {joined}"
+        );
+        assert!(
+            joined.contains("Lease") && joined.contains("tui:42"),
+            "Should show daemon lease summary, got: {joined}"
         );
     }
 
@@ -430,6 +735,120 @@ mod tests {
         assert!(
             joined.contains("/api/platforms"),
             "Should show platforms endpoint, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/cross-plane/action/adapters"),
+            "Should show cross-plane adapter endpoint, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/cross-plane/action/executions"),
+            "Should show cross-plane execution endpoint, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn render_shows_cross_plane_adapter_and_execution_state() {
+        use crate::tui::skin::SkinConfig;
+        use crate::tui::test_utils::MockTerminal;
+
+        let mut panel = GatewayPanel::new();
+        panel.set_adapter_capabilities(vec![GatewayAdapterCapability {
+            platform: "feishu".to_string(),
+            operation: "send_text".to_string(),
+            live_supported: true,
+            adapter_bound: false,
+        }]);
+        panel.set_execution_receipts(vec![GatewayExecutionReceipt {
+            status: "planned".to_string(),
+            dispatch_status: "dry_run".to_string(),
+            mode: "dry_run".to_string(),
+            capability: "channel.feishu.send_text".to_string(),
+            idempotency_key: Some("idem-demo".to_string()),
+        }]);
+        panel.set_dispatch_targets(vec![GatewayDispatchTarget {
+            platform: "feishu".to_string(),
+            operation: "send_text".to_string(),
+            session_key: Some("feishu:open-id:chat-id".to_string()),
+            ready: true,
+            blockers: Vec::new(),
+        }]);
+
+        let mut terminal = MockTerminal::new(96, 30);
+        let skin = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &skin);
+            panel.render(&mut ctx, Rect::new(0, 0, 96, 30));
+        });
+        let lines = terminal.buffer_lines();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Cross-Plane Adapters"),
+            "Should show adapter section, got: {joined}"
+        );
+        assert!(
+            joined.contains("feishu"),
+            "Should show platform, got: {joined}"
+        );
+        assert!(
+            joined.contains("send_text"),
+            "Should show operation, got: {joined}"
+        );
+        assert!(
+            joined.contains("live") && joined.contains("not-bound"),
+            "Should show adapter support and binding state, got: {joined}"
+        );
+        assert!(
+            joined.contains("Execution Receipts"),
+            "Should show execution section, got: {joined}"
+        );
+        assert!(
+            joined.contains("planned") && joined.contains("dry_run"),
+            "Should show receipt state, got: {joined}"
+        );
+        assert!(
+            joined.contains("channel.feishu.send_text") && joined.contains("idem-demo"),
+            "Should show receipt capability and idempotency key, got: {joined}"
+        );
+        assert!(
+            joined.contains("Dispatch Targets"),
+            "Should show dispatch target section, got: {joined}"
+        );
+        assert!(
+            joined.contains("ready") && joined.contains("feishu:open-id:chat-id"),
+            "Should show target readiness and session key, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn render_shows_cross_plane_action_contracts() {
+        use crate::tui::skin::SkinConfig;
+        use crate::tui::test_utils::MockTerminal;
+
+        let mut panel = GatewayPanel::new();
+        let mut terminal = MockTerminal::new(118, 32);
+        let skin = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &skin);
+            panel.render(&mut ctx, Rect::new(0, 0, 118, 32));
+        });
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(
+            joined.contains("Action Composer Contract"),
+            "Should show action contract section, got: {joined}"
+        );
+        assert!(
+            joined.contains("channel.feishu.send_text")
+                && joined.contains("channel.feishu.send_image")
+                && joined.contains("channel.feishu.send_file"),
+            "Should show typed send capabilities, got: {joined}"
+        );
+        assert!(
+            joined.contains("workspace://file/reports/panel.txt"),
+            "Should show canonical workspace file reference, got: {joined}"
+        );
+        assert!(
+            joined.contains("/api/cross-plane/action/execute"),
+            "Should show execute endpoint, got: {joined}"
         );
     }
 

@@ -145,6 +145,21 @@ impl UnifiedSessionStore {
         self.inner.lock().await.list_sessions_by_platform(platform)
     }
 
+    /// List sessions bound to one workspace root, ordered by `last_activity DESC`.
+    ///
+    /// The workspace root is stored in `metadata_json.workspace_root`. This is
+    /// the canonical DB-backed replacement for the deprecated runtime
+    /// filesystem `SessionStore` namespace.
+    pub async fn list_sessions_by_workspace_root(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Vec<SessionRecord>> {
+        self.inner
+            .lock()
+            .await
+            .list_sessions_by_workspace_root(workspace_root)
+    }
+
     /// Search sessions using FTS5 full-text search.
     ///
     /// Searches across platform, chat_id, user_id, and metadata_json.
@@ -204,6 +219,17 @@ impl UnifiedSessionStore {
     /// Append a mutation event to the session's event log.
     pub async fn append_event(&self, event: &SessionEvent) -> Result<()> {
         self.inner.lock().await.append_event(event)
+    }
+
+    /// Append a context envelope event unless the same envelope id already exists.
+    pub async fn append_context_envelope_event_if_absent(
+        &self,
+        event: &SessionEvent,
+    ) -> Result<bool> {
+        self.inner
+            .lock()
+            .await
+            .append_context_envelope_event_if_absent(event)
     }
 
     /// Append a canonical runtime event to the session event log.
@@ -572,5 +598,39 @@ mod tests {
         assert_eq!(page.events[0].scope, RuntimeEventScope::Tool);
         assert_eq!(page.next_seq, Some(1));
         assert!(page.has_more);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_by_workspace_root_uses_db_metadata_namespace() {
+        let store = UnifiedSessionStore::open_in_memory().unwrap();
+        let workspace_a = "/tmp/cowd-unified-a";
+        let workspace_b = "/tmp/cowd-unified-b";
+
+        let mut older = make_record("unified-a-older");
+        older.last_activity = "2024-01-01T00:00:00Z".to_string();
+        older.metadata_json = Some(serde_json::json!({"workspace_root": workspace_a}).to_string());
+        store.create_session(&older).await.unwrap();
+
+        let mut newer = make_record("unified-a-newer");
+        newer.last_activity = "2024-01-02T00:00:00Z".to_string();
+        newer.metadata_json = Some(serde_json::json!({"workspace_root": workspace_a}).to_string());
+        store.create_session(&newer).await.unwrap();
+
+        let mut other = make_record("unified-b");
+        other.metadata_json = Some(serde_json::json!({"workspace_root": workspace_b}).to_string());
+        store.create_session(&other).await.unwrap();
+
+        let records = store
+            .list_sessions_by_workspace_root(workspace_a)
+            .await
+            .expect("workspace sessions should list");
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unified-a-newer", "unified-a-older"]
+        );
     }
 }

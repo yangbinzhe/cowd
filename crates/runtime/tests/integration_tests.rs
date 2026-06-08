@@ -99,7 +99,9 @@ fn green_contract_unsatisfied_blocks_merge() {
     // LaneContext now uses the GreenLevel enum from green_contract
     let engine = PolicyEngine::new(vec![PolicyRule::new(
         "workspace-green-required",
-        PolicyCondition::GreenAt { level: GreenLevel::Workspace },
+        PolicyCondition::GreenAt {
+            level: GreenLevel::Workspace,
+        },
         PolicyAction::MergeToDev,
         10,
     )]);
@@ -270,7 +272,9 @@ fn fresh_approved_lane_gets_merge_action() {
     let engine = PolicyEngine::new(vec![PolicyRule::new(
         "merge-if-green-approved-not-stale",
         PolicyCondition::And(vec![
-            PolicyCondition::GreenAt { level: GreenLevel::Workspace },
+            PolicyCondition::GreenAt {
+                level: GreenLevel::Workspace,
+            },
             PolicyCondition::ReviewPassed,
             // NOT PolicyCondition::StaleBranch — fresh lanes bypass this
         ]),
@@ -362,7 +366,9 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
         PolicyRule::new(
             "merge-after-successful-recovery",
             PolicyCondition::And(vec![
-                PolicyCondition::GreenAt { level: GreenLevel::Workspace },
+                PolicyCondition::GreenAt {
+                    level: GreenLevel::Workspace,
+                },
                 PolicyCondition::ReviewPassed,
             ]),
             PolicyAction::MergeToDev,
@@ -388,8 +394,8 @@ fn worker_provider_failure_flows_through_recovery_to_policy() {
 /// global AgentDirectory by skill overlap.
 #[test]
 fn team_discovery_ranks_by_skill_overlap_from_directory() {
-    use runtime::team_discovery::TeamDiscoveryProtocol;
     use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus};
+    use runtime::team_discovery::TeamDiscoveryProtocol;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -439,7 +445,7 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
 
     assert_eq!(ranked.len(), 2);
     assert_eq!(ranked[0].agent_id, "rust-expert"); // 2 matches (rust+testing)
-    assert_eq!(ranked[1].agent_id, "tester");       // 1 match (testing)
+    assert_eq!(ranked[1].agent_id, "tester"); // 1 match (testing)
 
     // python-dev doesn't match rust or testing
     assert!(ranked.iter().all(|a| a.agent_id != "python-dev"));
@@ -456,8 +462,8 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
 #[test]
 fn orchestrator_assemble_team_uses_discovery_protocol() {
     use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus, ReputationScore};
+    use runtime::agent::{SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentResult};
     use runtime::agent_collaboration::{CollaborationOrchestrator, CollaborationTask};
-    use runtime::agent::{SubAgentExecutor, SubAgentConfig, SubAgentResult, SubAgentError};
 
     struct NoopExecutor;
     impl SubAgentExecutor for NoopExecutor {
@@ -601,7 +607,10 @@ async fn test_reputation_flows_to_agent_directory() {
         .iter()
         .find(|a| a.agent_id == "test-rep-1")
         .expect("test-rep-1 should be in the directory");
-    assert!(agent.reputation.is_some(), "reputation should be set after update");
+    assert!(
+        agent.reputation.is_some(),
+        "reputation should be set after update"
+    );
     assert!(
         agent.reputation.unwrap().success_rate > 0.0,
         "success_rate should be > 0 after a recorded completion"
@@ -618,8 +627,8 @@ async fn test_reputation_flows_to_agent_directory() {
 async fn test_discussion_engine_detects_conflicts() {
     use memory::cognitive::CognitiveContextManager;
     use memory::config::MemoryConfig;
-    use runtime::cowd_event::CowdEventBus;
     use runtime::agent_discussion::DiscussionEngine;
+    use runtime::cowd_event::CowdEventBus;
     use std::sync::Arc;
 
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -658,9 +667,9 @@ async fn test_discussion_engine_detects_conflicts() {
 async fn test_collaboration_orchestrator_synthesis() {
     use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus};
     use runtime::agent::SubAgentConfig;
-    use runtime::agent_collaboration::{CollaborationOrchestrator, CollaborationOps};
+    use runtime::agent::{SubAgentError, SubAgentExecutor, SubAgentResult};
+    use runtime::agent_collaboration::{CollaborationOps, CollaborationOrchestrator};
     use std::sync::Arc;
-    use runtime::agent::{SubAgentExecutor, SubAgentResult, SubAgentError};
 
     struct DummyExec;
     impl SubAgentExecutor for DummyExec {
@@ -691,7 +700,10 @@ async fn test_collaboration_orchestrator_synthesis() {
 
     let orch = CollaborationOrchestrator::<DummyExec>::new(Arc::new(DummyExec));
     let result: Option<String> = orch.run_boxed("test task", &["rust".to_string()]).await;
-    assert!(result.is_some(), "run_boxed should return Some for valid task");
+    assert!(
+        result.is_some(),
+        "run_boxed should return Some for valid task"
+    );
     let synthesis = result.unwrap();
     assert!(!synthesis.is_empty(), "synthesis should be non-empty");
 
@@ -749,8 +761,8 @@ async fn test_memory_sync_import_from_l4() {
 /// with a no-op executor and produces a PipelineResult.
 #[tokio::test]
 async fn test_jps_pipeline_runs() {
+    use runtime::agent::{SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentResult};
     use runtime::joint_problem_solving::{ProblemSolvingPipeline, ProblemStatement};
-    use runtime::agent::{SubAgentConfig, SubAgentExecutor, SubAgentResult, SubAgentError};
     use std::sync::Arc;
 
     struct DummyExec;

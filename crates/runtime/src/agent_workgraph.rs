@@ -199,6 +199,7 @@ impl AgentWorkGraph {
                 "graph": self,
                 "board_id": packet.board_id,
                 "scorecard": packet.scorecard,
+                "value_verdict": packet.scorecard.value_verdict(),
                 "maintenance_candidates": packet.maintenance_candidates,
             }),
             current_time_ms(),
@@ -525,17 +526,17 @@ mod tests {
         assert!(event
             .refs
             .iter()
-            .any(|reference| reference.ref_type == "workgraph"
-                && reference.id == graph.graph_id));
-        assert_eq!(event.payload["graph"]["objective"], "parallel implementation");
+            .any(|reference| reference.ref_type == "workgraph" && reference.id == graph.graph_id));
+        assert_eq!(
+            event.payload["graph"]["objective"],
+            "parallel implementation"
+        );
     }
 
     #[test]
     fn agent_workgraph_review_event_carries_memory_candidates_and_refs() {
         use chrono::Utc;
-        use memory::{
-            MaintenanceCandidate, MaintenanceCandidateKind, MaintenanceCandidateStatus,
-        };
+        use memory::{MaintenanceCandidate, MaintenanceCandidateKind, MaintenanceCandidateStatus};
 
         let task = CollaborationTask {
             description: "review implementation".to_string(),
@@ -587,7 +588,10 @@ mod tests {
         assert_eq!(event.kind, "agent.workgraph.reviewed");
         assert_eq!(event.status.as_deref(), Some("completed"));
         assert_eq!(event.correlation_id.as_deref(), Some("turn-run"));
-        assert_eq!(event.payload["maintenance_candidates"][0]["id"], "candidate-1");
+        assert_eq!(
+            event.payload["maintenance_candidates"][0]["id"],
+            "candidate-1"
+        );
         assert!(event
             .refs
             .iter()
@@ -596,7 +600,6 @@ mod tests {
         assert!(event
             .refs
             .iter()
-            .any(|reference| reference.ref_type == "context_envelope"
-                && reference.id == "env-1"));
+            .any(|reference| reference.ref_type == "context_envelope" && reference.id == "env-1"));
     }
 }

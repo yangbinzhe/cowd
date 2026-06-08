@@ -2,9 +2,9 @@
 // Allows multiple concurrent sessions within the same profile to share
 // extracted memories, context, and knowledge graph updates.
 
-use std::sync::{Arc, RwLock};
 use crate::cognitive::CognitiveContextManager;
 use crate::config::MemoryConfig;
+use std::sync::{Arc, RwLock};
 
 /// Singleton wrapper that enables cross-session memory sharing.
 /// All sessions within the same process share one CognitiveContextManager.
@@ -15,7 +15,9 @@ pub struct SharedMemoryManager {
 impl SharedMemoryManager {
     /// Create a new (uninitialized) shared manager.
     pub fn new() -> Self {
-        Self { inner: RwLock::new(None) }
+        Self {
+            inner: RwLock::new(None),
+        }
     }
 
     /// Initialize the shared memory backend. Safe to call multiple times;
@@ -43,10 +45,13 @@ impl SharedMemoryManager {
 
     /// Get the current shared manager, if initialized.
     pub fn get(&self) -> Option<Arc<CognitiveContextManager>> {
-        self.inner.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("shared memory RwLock poisoned; recovering");
-            poisoned.into_inner()
-        }).clone()
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("shared memory RwLock poisoned; recovering");
+                poisoned.into_inner()
+            })
+            .clone()
     }
 }
 

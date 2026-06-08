@@ -428,8 +428,8 @@ impl Gate for PreFlightGate {
                         .iter()
                         .any(|v| v.file == *file && fixer.can_fix(&v.message));
 
-                    let should_try = has_relevant_violation
-                        || (file.ends_with(".rs") && fixer.can_fix("lint"));
+                    let should_try =
+                        has_relevant_violation || (file.ends_with(".rs") && fixer.can_fix("lint"));
 
                     if should_try {
                         match fixer.apply_fix(file_path, "auto-fix attempt") {
@@ -488,7 +488,8 @@ impl PreFlightGate {
                 }
                 PreFlightCheck::LargeFiles { max_size_kb } => {
                     for file in &context.changed_files {
-                        if file.ends_with(".exe") || file.ends_with(".dll") || file.ends_with(".so") {
+                        if file.ends_with(".exe") || file.ends_with(".dll") || file.ends_with(".so")
+                        {
                             warnings.push(format!("Binary file detected: {}", file));
                             suggestions.push(format!(
                                 "Consider using git-lfs for files larger than {} KB",
@@ -499,8 +500,15 @@ impl PreFlightGate {
                 }
                 PreFlightCheck::SensitiveData => {
                     let sensitive_patterns = [
-                        "password", "api_key", "secret", "token", "private_key",
-                        "密码", "密钥", "token", "api密钥",
+                        "password",
+                        "api_key",
+                        "secret",
+                        "token",
+                        "private_key",
+                        "密码",
+                        "密钥",
+                        "token",
+                        "api密钥",
                     ];
                     for file in &context.changed_files {
                         if file.contains("password") || file.contains("secret") {
@@ -532,7 +540,9 @@ impl PreFlightGate {
                 PreFlightCheck::CommitMessageFormat { pattern } => {
                     if let Ok(re) = regex::Regex::new(pattern) {
                         if !re.is_match(&context.commit_message) {
-                            warnings.push("Commit message doesn't follow conventional format".to_string());
+                            warnings.push(
+                                "Commit message doesn't follow conventional format".to_string(),
+                            );
                             suggestions.push(
                                 "Use format: type(scope): description (e.g., feat(auth): add login)"
                                     .to_string(),
@@ -544,7 +554,8 @@ impl PreFlightGate {
                     let todo_patterns = ["TODO", "FIXME", "XXX", "HACK"];
                     for line in context.diff.lines() {
                         for pattern in &todo_patterns {
-                            if line.contains(pattern) && !line.contains("//") && !line.contains("#") {
+                            if line.contains(pattern) && !line.contains("//") && !line.contains("#")
+                            {
                                 warnings.push(format!("Unowned TODO/FIXME found: {}", line.trim()));
                             }
                         }
@@ -562,9 +573,8 @@ impl PreFlightGate {
                             summary.indirect.len(),
                             summary.affected_files.len()
                         ));
-                        suggestions.push(
-                            "Review impact before proceeding with changes".to_string(),
-                        );
+                        suggestions
+                            .push("Review impact before proceeding with changes".to_string());
                     }
                 }
             }
@@ -610,7 +620,9 @@ impl RevisionGate {
         Self {
             enabled: true,
             checks: vec![
-                RevisionCheck::TestCoverage { min_percentage: 70.0 },
+                RevisionCheck::TestCoverage {
+                    min_percentage: 70.0,
+                },
                 RevisionCheck::TestResults,
                 RevisionCheck::LintResults,
                 RevisionCheck::Formatting,
@@ -662,11 +674,8 @@ impl Gate for RevisionGate {
                         v.violation_type == ViolationType::TestFailure
                             && v.severity == ViolationSeverity::Blocking
                     }) {
-                        return GateResult::fail(
-                            self.name(),
-                            "Test failures detected",
-                        )
-                        .with_suggestion("Fix failing tests before pushing".to_string());
+                        return GateResult::fail(self.name(), "Test failures detected")
+                            .with_suggestion("Fix failing tests before pushing".to_string());
                     }
                 }
                 RevisionCheck::LintResults => {
@@ -688,7 +697,10 @@ impl Gate for RevisionGate {
                         .collect();
 
                     if !format_violations.is_empty() {
-                        warnings.push(format!("{} formatting issues found", format_violations.len()));
+                        warnings.push(format!(
+                            "{} formatting issues found",
+                            format_violations.len()
+                        ));
                         suggestions.push("Run cargo fmt to fix formatting".to_string());
                     }
                 }
@@ -700,11 +712,8 @@ impl Gate for RevisionGate {
                         .collect();
 
                     if !security_violations.is_empty() {
-                        return GateResult::fail(
-                            self.name(),
-                            "Security vulnerabilities detected",
-                        )
-                        .with_suggestion("Address security issues before pushing".to_string());
+                        return GateResult::fail(self.name(), "Security vulnerabilities detected")
+                            .with_suggestion("Address security issues before pushing".to_string());
                     }
                 }
                 RevisionCheck::BuildSuccess => {
@@ -892,7 +901,9 @@ impl Gate for AbortGate {
                             self.name(),
                             "Merge conflict markers found - ABORT",
                         )
-                        .with_suggestion("Resolve all merge conflicts before committing".to_string());
+                        .with_suggestion(
+                            "Resolve all merge conflicts before committing".to_string(),
+                        );
                     }
                 }
                 HardStop::SensitiveData { patterns } => {
@@ -918,9 +929,7 @@ impl Gate for AbortGate {
                             self.name(),
                             format!("Diff too large ({} lines) - ABORT", diff_lines),
                         )
-                        .with_suggestion(
-                            "Split large changes into smaller commits".to_string(),
-                        );
+                        .with_suggestion("Split large changes into smaller commits".to_string());
                     }
                 }
                 HardStop::ForbiddenFiles { patterns } => {
@@ -958,9 +967,7 @@ pub struct GateEvaluator {
 impl GateEvaluator {
     /// Create a new evaluator.
     pub fn new() -> Self {
-        Self {
-            gates: Vec::new(),
-        }
+        Self { gates: Vec::new() }
     }
 
     /// Add a gate.
@@ -1223,10 +1230,22 @@ mod tests {
 
     #[test]
     fn test_impact_risk_level() {
-        assert_eq!(ImpactRiskLevel::from_caller_count(0, 0), ImpactRiskLevel::Low);
-        assert_eq!(ImpactRiskLevel::from_caller_count(2, 0), ImpactRiskLevel::Medium);
-        assert_eq!(ImpactRiskLevel::from_caller_count(5, 0), ImpactRiskLevel::High);
-        assert_eq!(ImpactRiskLevel::from_caller_count(1, 10), ImpactRiskLevel::Critical);
+        assert_eq!(
+            ImpactRiskLevel::from_caller_count(0, 0),
+            ImpactRiskLevel::Low
+        );
+        assert_eq!(
+            ImpactRiskLevel::from_caller_count(2, 0),
+            ImpactRiskLevel::Medium
+        );
+        assert_eq!(
+            ImpactRiskLevel::from_caller_count(5, 0),
+            ImpactRiskLevel::High
+        );
+        assert_eq!(
+            ImpactRiskLevel::from_caller_count(1, 10),
+            ImpactRiskLevel::Critical
+        );
     }
 
     #[test]
@@ -1254,7 +1273,10 @@ mod tests {
         let result = gate.evaluate(&context);
         assert!(result.passed); // ApprovalGate always passes, warns instead
         assert!(!result.warnings.is_empty(), "should have impact warnings");
-        assert!(!result.suggestions.is_empty(), "should have impact suggestions");
+        assert!(
+            !result.suggestions.is_empty(),
+            "should have impact suggestions"
+        );
     }
 
     #[test]

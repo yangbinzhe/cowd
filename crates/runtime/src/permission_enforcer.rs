@@ -655,7 +655,9 @@ mod tests {
 
     #[test]
     fn bash_heuristic_blocks_interpreter_code_execution() {
-        assert!(!is_read_only_command("python3 -c \"import os; os.system('id')\""));
+        assert!(!is_read_only_command(
+            "python3 -c \"import os; os.system('id')\""
+        ));
         assert!(!is_read_only_command("python -c \"print('x')\""));
         assert!(!is_read_only_command("node -e \"console.log('x')\""));
         assert!(!is_read_only_command("ruby -e \"system('id')\""));
@@ -673,9 +675,9 @@ use tokio::sync::RwLock;
 /// Risk level for dangerous commands
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RiskLevel {
-    Low,    // mv (overwrite), cp (overwrite)
-    Medium, // git reset, pip uninstall, apt remove
-    High,   // rm -rf (specified dir), git push --force, chmod 777
+    Low,      // mv (overwrite), cp (overwrite)
+    Medium,   // git reset, pip uninstall, apt remove
+    High,     // rm -rf (specified dir), git push --force, chmod 777
     Critical, // rm -rf /, dd, mkfs, format
 }
 
@@ -751,9 +753,21 @@ impl DestructivePatternDetector {
 
         // File deletion (15 patterns)
         let file_del = &[
-            (r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+/|.*--force\s+/)", RiskLevel::Critical, "rm recursive force on root"),
-            (r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|.*--force\s+)", RiskLevel::High, "rm recursive force"),
-            (r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)", RiskLevel::High, "rm recursive"),
+            (
+                r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+/|.*--force\s+/)",
+                RiskLevel::Critical,
+                "rm recursive force on root",
+            ),
+            (
+                r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|.*--force\s+)",
+                RiskLevel::High,
+                "rm recursive force",
+            ),
+            (
+                r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)",
+                RiskLevel::High,
+                "rm recursive",
+            ),
             (r"rmdir\s+", RiskLevel::Low, "remove directory"),
             (r"unlink\s+", RiskLevel::Medium, "unlink file"),
             (r"shred\s+", RiskLevel::High, "shred file contents"),
@@ -769,7 +783,12 @@ impl DestructivePatternDetector {
         ];
         for (re, risk, desc) in file_del {
             if let Ok(r) = regex::Regex::new(re) {
-                patterns.push(DangerPattern { name: format!("file_del_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+                patterns.push(DangerPattern {
+                    name: format!("file_del_{}", patterns.len()),
+                    regex: r,
+                    risk: risk.clone(),
+                    description: desc.to_string(),
+                });
             }
         }
 
@@ -781,18 +800,31 @@ impl DestructivePatternDetector {
             (r"parted\b", RiskLevel::Critical, "parted partition editor"),
             (r"format\s+[A-Z]:", RiskLevel::Critical, "format drive"),
             (r"hdparm\b", RiskLevel::Critical, "hard disk parameters"),
-            (r"badblocks\s+-w", RiskLevel::Critical, "badblocks write test"),
+            (
+                r"badblocks\s+-w",
+                RiskLevel::Critical,
+                "badblocks write test",
+            ),
             (r"shred\s+/dev/", RiskLevel::Critical, "shred device"),
         ];
         for (re, risk, desc) in disk {
             if let Ok(r) = regex::Regex::new(re) {
-                patterns.push(DangerPattern { name: format!("disk_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+                patterns.push(DangerPattern {
+                    name: format!("disk_{}", patterns.len()),
+                    regex: r,
+                    risk: risk.clone(),
+                    description: desc.to_string(),
+                });
             }
         }
 
         // Permission changes (10 patterns)
         let perms = &[
-            (r"chmod\s+(777|666|000|a\+[rwx])", RiskLevel::High, "dangerous chmod"),
+            (
+                r"chmod\s+(777|666|000|a\+[rwx])",
+                RiskLevel::High,
+                "dangerous chmod",
+            ),
             (r"chown\s+root", RiskLevel::High, "chown to root"),
             (r"chgrp\s+root", RiskLevel::High, "chgrp to root"),
             (r"chmod\s+-R\s+", RiskLevel::High, "recursive chmod"),
@@ -805,64 +837,124 @@ impl DestructivePatternDetector {
         ];
         for (re, risk, desc) in perms {
             if let Ok(r) = regex::Regex::new(re) {
-                patterns.push(DangerPattern { name: format!("perms_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+                patterns.push(DangerPattern {
+                    name: format!("perms_{}", patterns.len()),
+                    regex: r,
+                    risk: risk.clone(),
+                    description: desc.to_string(),
+                });
             }
         }
 
         // Git destructive (12 patterns)
         let git = &[
             (r"git\s+push\s+.*--force", RiskLevel::High, "git force push"),
-            (r"git\s+push\s+-f\b", RiskLevel::High, "git force push short"),
+            (
+                r"git\s+push\s+-f\b",
+                RiskLevel::High,
+                "git force push short",
+            ),
             (r"git\s+reset\s+--hard", RiskLevel::High, "git reset hard"),
-            (r"git\s+reflog\s+expire", RiskLevel::High, "git reflog expire"),
-            (r"git\s+branch\s+-D\s+", RiskLevel::Medium, "git delete branch force"),
+            (
+                r"git\s+reflog\s+expire",
+                RiskLevel::High,
+                "git reflog expire",
+            ),
+            (
+                r"git\s+branch\s+-D\s+",
+                RiskLevel::Medium,
+                "git delete branch force",
+            ),
             (r"git\s+tag\s+-d\s+", RiskLevel::Low, "git delete tag"),
             (r"git\s+stash\s+drop", RiskLevel::Low, "git stash drop"),
             (r"git\s+filter-branch", RiskLevel::High, "git filter-branch"),
-            (r"git\s+submodule\s+deinit", RiskLevel::Medium, "git submodule deinit"),
-            (r"git\s+worktree\s+remove", RiskLevel::Low, "git worktree remove"),
+            (
+                r"git\s+submodule\s+deinit",
+                RiskLevel::Medium,
+                "git submodule deinit",
+            ),
+            (
+                r"git\s+worktree\s+remove",
+                RiskLevel::Low,
+                "git worktree remove",
+            ),
             (r"git\s+annex\s+drop", RiskLevel::Medium, "git annex drop"),
             (r"git\s+rebase\b", RiskLevel::Medium, "git rebase"),
         ];
         for (re, risk, desc) in git {
             if let Ok(r) = regex::Regex::new(re) {
-                patterns.push(DangerPattern { name: format!("git_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+                patterns.push(DangerPattern {
+                    name: format!("git_{}", patterns.len()),
+                    regex: r,
+                    risk: risk.clone(),
+                    description: desc.to_string(),
+                });
             }
         }
 
         // Package management (8 patterns)
         let pkg = &[
-            (r"apt\s+(remove|purge)", RiskLevel::Medium, "apt remove/purge"),
-            (r"apt-get\s+(remove|purge)", RiskLevel::Medium, "apt-get remove/purge"),
+            (
+                r"apt\s+(remove|purge)",
+                RiskLevel::Medium,
+                "apt remove/purge",
+            ),
+            (
+                r"apt-get\s+(remove|purge)",
+                RiskLevel::Medium,
+                "apt-get remove/purge",
+            ),
             (r"yum\s+remove", RiskLevel::Medium, "yum remove"),
             (r"dnf\s+remove", RiskLevel::Medium, "dnf remove"),
             (r"pip\s+uninstall", RiskLevel::Medium, "pip uninstall"),
-            (r"npm\s+uninstall\s+-g", RiskLevel::Medium, "npm global uninstall"),
+            (
+                r"npm\s+uninstall\s+-g",
+                RiskLevel::Medium,
+                "npm global uninstall",
+            ),
             (r"cargo\s+uninstall", RiskLevel::Low, "cargo uninstall"),
             (r"brew\s+uninstall", RiskLevel::Low, "brew uninstall"),
         ];
         for (re, risk, desc) in pkg {
             if let Ok(r) = regex::Regex::new(re) {
-                patterns.push(DangerPattern { name: format!("pkg_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+                patterns.push(DangerPattern {
+                    name: format!("pkg_{}", patterns.len()),
+                    regex: r,
+                    risk: risk.clone(),
+                    description: desc.to_string(),
+                });
             }
         }
 
         // Network dangerous (10 patterns)
         let net = &[
             (r"iptables\s+-F", RiskLevel::Critical, "flush iptables"),
-            (r"curl.*\|.*(sh|bash)", RiskLevel::Critical, "pipe curl to shell"),
+            (
+                r"curl.*\|.*(sh|bash)",
+                RiskLevel::Critical,
+                "pipe curl to shell",
+            ),
             (r"wget.*\|.*sh", RiskLevel::Critical, "pipe wget to shell"),
             (r"nc\s+-l\s+", RiskLevel::High, "netcat listen"),
             (r"socat\s+", RiskLevel::High, "socat relay"),
             (r"ssh\s+.*-R\s+", RiskLevel::High, "SSH remote port forward"),
-            (r"ssh\s+.*-L\s+", RiskLevel::Medium, "SSH local port forward"),
+            (
+                r"ssh\s+.*-L\s+",
+                RiskLevel::Medium,
+                "SSH local port forward",
+            ),
             (r"tcpdump\s+-w", RiskLevel::Medium, "tcpdump write capture"),
             (r"nmap\s+.*--script", RiskLevel::High, "nmap script scan"),
             (r"airmon-ng\s+", RiskLevel::Critical, "WiFi monitor mode"),
         ];
         for (re, risk, desc) in net {
             if let Ok(r) = regex::Regex::new(re) {
-                patterns.push(DangerPattern { name: format!("net_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+                patterns.push(DangerPattern {
+                    name: format!("net_{}", patterns.len()),
+                    regex: r,
+                    risk: risk.clone(),
+                    description: desc.to_string(),
+                });
             }
         }
 
@@ -874,50 +966,117 @@ impl DestructivePatternDetector {
             (r"shutdown\b", RiskLevel::Critical, "system shutdown"),
             (r"reboot\b", RiskLevel::Critical, "system reboot"),
             (r"init\s+[06]", RiskLevel::Critical, "init shutdown/reboot"),
-            (r"systemctl\s+stop\s+ssh", RiskLevel::Critical, "stop SSH service"),
-            (r"systemctl\s+disable\s+ssh", RiskLevel::High, "disable SSH service"),
+            (
+                r"systemctl\s+stop\s+ssh",
+                RiskLevel::Critical,
+                "stop SSH service",
+            ),
+            (
+                r"systemctl\s+disable\s+ssh",
+                RiskLevel::High,
+                "disable SSH service",
+            ),
             (r"systemctl\s+mask\s+", RiskLevel::High, "mask service"),
-            (r"journalctl\s+--vacuum", RiskLevel::Medium, "journal vacuum"),
+            (
+                r"journalctl\s+--vacuum",
+                RiskLevel::Medium,
+                "journal vacuum",
+            ),
             (r"sysctl\s+-w\s+", RiskLevel::High, "write kernel parameter"),
             (r"modprobe\s+-r\s+", RiskLevel::High, "remove kernel module"),
         ];
         for (re, risk, desc) in sys {
             if let Ok(r) = regex::Regex::new(re) {
-                patterns.push(DangerPattern { name: format!("sys_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+                patterns.push(DangerPattern {
+                    name: format!("sys_{}", patterns.len()),
+                    regex: r,
+                    risk: risk.clone(),
+                    description: desc.to_string(),
+                });
             }
         }
 
         // Docker (6 patterns)
         let docker = &[
-            (r"docker\s+rm\s+-f", RiskLevel::High, "docker force remove container"),
-            (r"docker\s+system\s+prune", RiskLevel::High, "docker system prune"),
+            (
+                r"docker\s+rm\s+-f",
+                RiskLevel::High,
+                "docker force remove container",
+            ),
+            (
+                r"docker\s+system\s+prune",
+                RiskLevel::High,
+                "docker system prune",
+            ),
             (r"docker\s+rmi\s+", RiskLevel::Medium, "docker remove image"),
-            (r"docker\s+volume\s+rm", RiskLevel::Medium, "docker remove volume"),
-            (r"docker\s+network\s+rm", RiskLevel::Low, "docker remove network"),
-            (r"docker\s+compose\s+down\s+.*--rmi", RiskLevel::High, "docker compose down remove images"),
+            (
+                r"docker\s+volume\s+rm",
+                RiskLevel::Medium,
+                "docker remove volume",
+            ),
+            (
+                r"docker\s+network\s+rm",
+                RiskLevel::Low,
+                "docker remove network",
+            ),
+            (
+                r"docker\s+compose\s+down\s+.*--rmi",
+                RiskLevel::High,
+                "docker compose down remove images",
+            ),
         ];
         for (re, risk, desc) in docker {
             if let Ok(r) = regex::Regex::new(re) {
-                patterns.push(DangerPattern { name: format!("docker_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+                patterns.push(DangerPattern {
+                    name: format!("docker_{}", patterns.len()),
+                    regex: r,
+                    risk: risk.clone(),
+                    description: desc.to_string(),
+                });
             }
         }
 
         // Database (10 patterns)
         let db = &[
-            (r"DROP\s+(DATABASE|TABLE|SCHEMA)", RiskLevel::Critical, "DROP database/table"),
+            (
+                r"DROP\s+(DATABASE|TABLE|SCHEMA)",
+                RiskLevel::Critical,
+                "DROP database/table",
+            ),
             (r"TRUNCATE\s+", RiskLevel::Critical, "TRUNCATE table"),
-            (r"DELETE\s+FROM\s+\w+\s*;?\s*$", RiskLevel::High, "DELETE all rows"),
+            (
+                r"DELETE\s+FROM\s+\w+\s*;?\s*$",
+                RiskLevel::High,
+                "DELETE all rows",
+            ),
             (r"ALTER\s+DATABASE\s+", RiskLevel::High, "ALTER database"),
             (r"DROP\s+INDEX\s+", RiskLevel::High, "DROP index"),
             (r"DROP\s+USER\s+", RiskLevel::Critical, "DROP user"),
             (r"GRANT\s+ALL\s+", RiskLevel::High, "GRANT all privileges"),
-            (r"REVOKE\s+ALL\s+", RiskLevel::Medium, "REVOKE all privileges"),
-            (r"pg_dump\s+.*--clean", RiskLevel::High, "pg_dump with clean"),
-            (r"mysqldump\s+.*--add-drop-table", RiskLevel::Medium, "mysqldump drop table"),
+            (
+                r"REVOKE\s+ALL\s+",
+                RiskLevel::Medium,
+                "REVOKE all privileges",
+            ),
+            (
+                r"pg_dump\s+.*--clean",
+                RiskLevel::High,
+                "pg_dump with clean",
+            ),
+            (
+                r"mysqldump\s+.*--add-drop-table",
+                RiskLevel::Medium,
+                "mysqldump drop table",
+            ),
         ];
         for (re, risk, desc) in db {
             if let Ok(r) = regex::Regex::new(re) {
-                patterns.push(DangerPattern { name: format!("db_{}", patterns.len()), regex: r, risk: risk.clone(), description: desc.to_string() });
+                patterns.push(DangerPattern {
+                    name: format!("db_{}", patterns.len()),
+                    regex: r,
+                    risk: risk.clone(),
+                    description: desc.to_string(),
+                });
             }
         }
 

@@ -1,6 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
 
 #[derive(Debug, Clone)]
 pub struct SessionEvent {
@@ -28,7 +28,10 @@ pub struct ContextProfiler {
 
 impl ContextProfiler {
     pub fn new() -> Self {
-        Self { events: Vec::new(), seen_hashes: std::collections::HashSet::new() }
+        Self {
+            events: Vec::new(),
+            seen_hashes: std::collections::HashSet::new(),
+        }
     }
 
     pub fn record(&mut self, mut event: SessionEvent) {
@@ -39,7 +42,9 @@ impl ContextProfiler {
     /// Deduplicated record: skips if same hash already seen
     pub fn record_dedup(&mut self, mut event: SessionEvent) -> bool {
         event.data_hash = hash_str(&event.data_summary);
-        if self.seen_hashes.contains(&event.data_hash) { return false; }
+        if self.seen_hashes.contains(&event.data_hash) {
+            return false;
+        }
         self.seen_hashes.insert(event.data_hash);
         self.events.push(event);
         true
@@ -53,7 +58,6 @@ impl ContextProfiler {
         p.total_events = self.events.len();
         p
     }
-
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -72,7 +76,9 @@ pub fn detect_project_dir() -> Option<String> {
     // Walk up to find .git
     for ancestor in cwd.ancestors().skip(1) {
         if ancestor.join(".git").exists() {
-            return ancestor.file_name().map(|n| n.to_string_lossy().to_string());
+            return ancestor
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string());
         }
     }
     // Fallback: use current dir name
@@ -97,8 +103,14 @@ pub fn attribution_confidence(project_dir: &Option<String>) -> f32 {
 impl Default for SessionEvent {
     fn default() -> Self {
         Self {
-            event_type: String::new(), category: String::new(), data_summary: String::new(),
-            priority: 5, data_hash: 0, timestamp: 0, project_dir: None, attribution_confidence: 0.0,
+            event_type: String::new(),
+            category: String::new(),
+            data_summary: String::new(),
+            priority: 5,
+            data_hash: 0,
+            timestamp: 0,
+            project_dir: None,
+            attribution_confidence: 0.0,
         }
     }
 }
@@ -108,7 +120,12 @@ mod tests {
     use super::*;
 
     fn make_event(cat: &str, data: &str) -> SessionEvent {
-        SessionEvent { event_type: "test".into(), category: cat.into(), data_summary: data.into(), ..Default::default() }
+        SessionEvent {
+            event_type: "test".into(),
+            category: cat.into(),
+            data_summary: data.into(),
+            ..Default::default()
+        }
     }
 
     #[test]

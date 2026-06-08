@@ -4,11 +4,11 @@
 //! Verifies that memory entries, KG entities, and compression summaries all
 //! survive the full lifecycle.
 
-use cowd_memory::{ MemoryScope,
-    CognitiveContextManager, MemoryConfig, MemoryEntry, MemoryLayer, MemoryCategory,
+use cowd_memory::config::{BudgetConfig, StoreConfig};
+use cowd_memory::{
+    CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
     MemorySource, Priority,
 };
-use cowd_memory::config::{BudgetConfig, StoreConfig};
 
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
@@ -49,8 +49,8 @@ fn entry(content: &str, layer: MemoryLayer) -> MemoryEntry {
         last_accessed_at: None,
         scope: MemoryScope::default(),
         session_id: None,
-            source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+        source_agent: None,
+        visibility: cowd_memory::AgentVisibility::default(),
     }
 }
 
@@ -64,10 +64,17 @@ async fn test_e2e_memory_lifecycle() {
 
     // ===== Phase 1: Write entries across all layers =====
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path)).await.unwrap();
+        let mgr = CognitiveContextManager::new(test_config(&db_path))
+            .await
+            .unwrap();
 
         // Write entries to each layer
-        let layers = [MemoryLayer::L0, MemoryLayer::L1, MemoryLayer::L2, MemoryLayer::L3];
+        let layers = [
+            MemoryLayer::L0,
+            MemoryLayer::L1,
+            MemoryLayer::L2,
+            MemoryLayer::L3,
+        ];
         let mut ids = Vec::new();
         for (i, layer) in layers.iter().enumerate() {
             for j in 0..(n_entries / 4) {
@@ -89,24 +96,33 @@ async fn test_e2e_memory_lifecycle() {
         // Verify entry retrieval
         let first_id = entry_ids[0];
         let retrieved = mgr.get_entry(&first_id.to_string()).await.unwrap();
-        assert!(retrieved.is_some(), "Entry should be retrievable immediately");
+        assert!(
+            retrieved.is_some(),
+            "Entry should be retrievable immediately"
+        );
     }
     // mgr dropped - data should persist in SQLite
 
     // ===== Phase 2: Restart and verify persistence =====
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path)).await.unwrap();
+        let mgr = CognitiveContextManager::new(test_config(&db_path))
+            .await
+            .unwrap();
 
         // Verify entries survive restart via layer listing
         let layer_info = mgr.list_layers().await;
         eprintln!("Phase 2 layers after restart: {:?}", layer_info);
 
-        let total_entries: u64 = layer_info.iter()
+        let total_entries: u64 = layer_info
+            .iter()
             .filter_map(|v| v.get("entry_count").and_then(|c| c.as_u64()))
             .sum();
-        assert!(total_entries >= n_entries as u64,
+        assert!(
+            total_entries >= n_entries as u64,
             "Expected at least {} total entries after restart, got {}",
-            n_entries, total_entries);
+            n_entries,
+            total_entries
+        );
 
         // Verify individual entries
         let first_id = entry_ids[0];
@@ -115,14 +131,19 @@ async fn test_e2e_memory_lifecycle() {
 
         // Verify content preserved
         if let Some(e) = retrieved {
-            assert!(e.content.contains("Rust programming"),
-                "Entry content should be preserved: {}", e.content);
+            assert!(
+                e.content.contains("Rust programming"),
+                "Entry content should be preserved: {}",
+                e.content
+            );
         }
     }
 
     // ===== Phase 3: Verify fact checking (if FactChecker is integrated) =====
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path)).await.unwrap();
+        let mgr = CognitiveContextManager::new(test_config(&db_path))
+            .await
+            .unwrap();
 
         // Write identity fact
         let identity = MemoryEntry {
@@ -178,20 +199,28 @@ async fn test_e2e_memory_lifecycle() {
         // Verify confidence was downgraded
         let retrieved = mgr.get_entry(&contradictory_id.to_string()).await.unwrap();
         if let Some(e) = retrieved {
-            eprintln!("Fact check result: confidence={:.3} (was 0.9)", e.confidence);
-            assert!(e.confidence < 0.9,
+            eprintln!(
+                "Fact check result: confidence={:.3} (was 0.9)",
+                e.confidence
+            );
+            assert!(
+                e.confidence < 0.9,
                 "Contradictory entry confidence should be downgraded (was 0.9, got {:.3})",
-                e.confidence);
+                e.confidence
+            );
         }
     }
 
     // ===== Phase 4: Final restart - verify everything is intact =====
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path)).await.unwrap();
+        let mgr = CognitiveContextManager::new(test_config(&db_path))
+            .await
+            .unwrap();
         let layer_info = mgr.list_layers().await;
         eprintln!("Phase 4 final state: {:?}", layer_info);
 
-        let total_entries: u64 = layer_info.iter()
+        let total_entries: u64 = layer_info
+            .iter()
             .filter_map(|v| v.get("entry_count").and_then(|c| c.as_u64()))
             .sum();
         assert!(total_entries > 0, "Entries should survive final restart");

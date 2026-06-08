@@ -3,39 +3,29 @@
 // DO NOT delete old server/mod.rs yet (T16 will do that).
 
 use std::{
-    collections::HashMap,
-    convert::Infallible,
-    fs,
-    path::{Component, Path as FsPath, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    Router,
     body::Body,
-    extract::{Path, Query, State as AxumState},
-    http::{Request, StatusCode, header},
+    extract::State as AxumState,
+    http::{header, Request, StatusCode},
     middleware::{self, Next},
-    response::{
-        IntoResponse, Json,
-        sse::{Event, KeepAlive, Sse},
-    },
-    routing::{get, post},
+    response::{IntoResponse, Json},
+    Router,
 };
-use futures::StreamExt;
-use futures::stream::Stream;
 use runtime::approval_gate::SmartApprovalGate;
-use runtime::permission_enforcer::{ApprovalPersistence, ApprovalVerdict};
+use runtime::platform::PlatformRuntime;
+#[cfg(test)]
+use runtime::ApprovalConfig;
+#[cfg(test)]
 use runtime::{
-    ApprovalConfig, ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem,
-    ContextMode, ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
-    ContextVisibility, ResumeContextPacket, ResumeContextSource,
+    ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextRole, ContextRuntimeKernel,
+    ContextSourceKind,
 };
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use tokio::time::{Duration, timeout};
-use tokio_stream::wrappers::ReceiverStream;
+use serde::Serialize;
 
 use runtime::ProfileManager;
 use tools::GlobalToolRegistry;
@@ -43,21 +33,32 @@ use tools::GlobalToolRegistry;
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
 use crate::session_kernel::SessionKernel;
-use crate::task_kernel::{TaskKernel, TaskRecord, TaskStatus};
-use memory::RotAlert;
+use crate::task_kernel::TaskKernel;
 use memory::cognitive::CognitiveContextManager;
 use memory::session_store::UnifiedSessionStore;
-use memory::store::session::{SessionEvent, SessionListOptions, SessionRecord};
+use memory::store::session::SessionRecord;
+#[cfg(test)]
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
-use memory::{
-    MaintenanceCandidateFilter, MaintenanceCandidateKind, MaintenanceCandidateStatus,
-    MaintenanceScanConfig, MemoryKernel, MemoryScope, MemoryTurnContext, SearchMemoriesRequest,
-};
+#[cfg(test)]
+use memory::MemoryScope;
 
+mod approval_routes;
+mod audit_routes;
+mod channel_routes;
+mod connector_routes;
+mod context_routes;
+mod cross_plane_routes;
+mod memory_routes;
+mod message_routes;
+mod profile_routes;
+mod public_routes;
 mod runtime_routes;
-use runtime_routes::get_runtime_timeline;
+mod session_routes;
+mod system_routes;
+mod task_routes;
+mod workspace_routes;
 
 // ── Shared application state ───────────────────────────────────
 
@@ -70,6 +71,7 @@ pub struct AppState {
     pub unified_store: Option<Arc<UnifiedSessionStore>>,
     pub tool_registry: Arc<GlobalToolRegistry>,
     pub config: Option<serde_json::Value>,
+    pub platform_runtime: Option<Arc<PlatformRuntime>>,
     pub event_bus: Arc<SessionEventBus>,
     pub approval_gate: Option<Arc<SmartApprovalGate>>,
     pub auth_token: Option<String>,
@@ -78,6 +80,7 @@ pub struct AppState {
     pub profile_id: String,
     pub profile_manager: Arc<ProfileManager>,
     pub task_kernel: Arc<TaskKernel>,
+    pub session_lease_registry: Option<Arc<crate::daemon::SessionLeaseRegistry>>,
 }
 
 type RuntimeEntry = Arc<tokio::sync::Mutex<crate::BuiltRuntime>>;
@@ -148,123 +151,23 @@ async fn auth_middleware(
 // ── Router ─────────────────────────────────────────────────────
 
 pub fn api_router(state: Arc<AppState>) -> Router {
-    let public_routes = Router::new()
-        .route("/health", get(health_handler))
-        .route("/api/auth/login", post(login_handler))
-        .route("/api/auth/verify", get(verify_handler));
+    let public_routes = public_routes::router();
 
     let protected_routes = Router::new()
-        .route("/api/sessions", get(list_sessions).post(create_session))
-        .route("/api/sessions/search", get(search_messages_handler))
-        .route(
-            "/api/sessions/:id",
-            get(get_session)
-                .patch(update_session_handler)
-                .delete(delete_session),
-        )
-        .route(
-            "/api/sessions/:id/messages",
-            get(get_session_messages).post(send_message),
-        )
-        .route("/api/sessions/:id/events", get(get_session_events))
-        .route("/api/sessions/:id/runs", get(get_session_runs))
-        .route(
-            "/api/sessions/:id/context",
-            get(get_session_context_history),
-        )
-        .route(
-            "/api/sessions/:id/context/recommendations",
-            get(get_context_recommendation_stats).post(record_context_recommendation_action),
-        )
-        .route("/api/sessions/:id/stream", get(sse_stream_handler))
-        .route("/api/sessions/:id/compact", post(compact_session_handler))
-        .route("/api/sessions/:id/stats", get(get_session_stats_handler))
-        .route("/api/context/current", get(context_current_handler))
-        .route("/api/runtime/timeline", get(get_runtime_timeline))
-        .route(
-            "/api/context/:envelope_id",
-            get(get_context_envelope_handler),
-        )
-        .route("/api/evidence/resolve", get(resolve_evidence_ref_handler))
-        .route("/api/tasks", get(tasks_status_handler))
-        .route("/api/tasks/start", post(start_task_handler))
-        .route("/api/tasks/:id/phases", post(start_task_phase_handler))
-        .route(
-            "/api/tasks/:id/phases/:phase_id/artifacts",
-            post(record_task_phase_artifact_handler),
-        )
-        .route(
-            "/api/tasks/:id/phases/:phase_id/review",
-            post(review_task_phase_handler),
-        )
-        .route("/api/tasks/:id/cancel", post(cancel_task_handler))
-        .route("/api/tasks/:id/complete", post(complete_task_handler))
-        .route("/api/tasks/:id/failure", post(record_task_failure_handler))
-        .route("/api/memory", get(memory_handler))
-        .route("/api/memory/status", get(memory_status_handler))
-        .route("/api/memory/search", get(memory_search_handler))
-        .route(
-            "/api/memory/recall/explain",
-            get(memory_recall_explain_handler),
-        )
-        .route("/api/memory/packet", get(memory_packet_handler))
-        .route("/api/memory/links", get(memory_links_handler))
-        .route("/api/memory/stats", get(memory_stats_handler))
-        .route("/api/memory/layers", get(memory_layers_handler))
-        .route(
-            "/api/memory/maintenance",
-            get(memory_maintenance_handler).post(scan_memory_maintenance_handler),
-        )
-        .route(
-            "/api/memory/maintenance/:id",
-            axum::routing::patch(update_memory_maintenance_handler),
-        )
-        .route("/api/memory/entities", get(memory_entities_handler))
-        .route("/api/memory/triples", get(memory_triples_handler))
-        .route(
-            "/api/memory/symbol-links",
-            get(memory_symbol_links_handler).post(create_memory_symbol_link_handler),
-        )
-        .route("/api/memory/performance", get(performance_handler))
-        .route(
-            "/api/memory/:layer",
-            get(memory_layer_handler).post(create_memory_entry_handler),
-        )
-        .route(
-            "/api/memory/:layer/:id",
-            axum::routing::delete(delete_memory_entry_handler),
-        )
-        .route(
-            "/api/memory/entry/:id",
-            axum::routing::patch(update_memory_entry_handler),
-        )
-        .route("/api/tools", get(tools_handler))
-        .route("/api/config", get(config_handler))
-        .route(
-            "/api/profiles",
-            get(profiles_handler).post(create_profile_handler),
-        )
-        .route("/api/profiles/switch", post(switch_profile_handler))
-        .route(
-            "/api/profiles/:id",
-            axum::routing::delete(delete_profile_handler),
-        )
-        .route("/api/workspace", get(workspace_handler))
-        .route("/api/workspaces", get(workspaces_handler))
-        .route(
-            "/api/workspace/files",
-            get(workspace_files_handler).post(create_workspace_file_handler),
-        )
-        .route("/api/file/raw", get(raw_workspace_file_handler))
-        .route("/api/approval/pending", get(approval_pending_handler))
-        .route("/api/approval/respond", post(approval_respond_handler))
-        .route(
-            "/api/approval/config",
-            get(approval_config_handler).put(update_approval_config_handler),
-        )
-        .route("/api/approval/solo", post(toggle_solo_handler))
-        .route("/api/approval/history", get(approval_history_handler))
-        .route("/api/audit/export", get(audit_export_handler))
+        .merge(approval_routes::router())
+        .merge(audit_routes::router())
+        .merge(channel_routes::router())
+        .merge(connector_routes::router())
+        .merge(context_routes::router())
+        .merge(cross_plane_routes::router())
+        .merge(memory_routes::router())
+        .merge(message_routes::router())
+        .merge(profile_routes::router())
+        .merge(runtime_routes::router())
+        .merge(session_routes::router())
+        .merge(system_routes::router())
+        .merge(task_routes::router())
+        .merge(workspace_routes::router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -276,223 +179,8 @@ pub fn api_router(state: Arc<AppState>) -> Router {
 // ── Response types ─────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct SessionInfo {
-    id: String,
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    created_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    updated_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input_tokens: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output_tokens: Option<i64>,
-}
-
-#[derive(Serialize)]
 struct ErrorResponse {
     error: String,
-}
-
-#[derive(Deserialize)]
-struct CreateSessionRequest {
-    #[serde(default)]
-    model: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SendMessageRequest {
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ContextRecommendationActionRequest {
-    envelope_id: String,
-    recommendation: String,
-    #[serde(default = "default_context_recommendation_action")]
-    action: String,
-    #[serde(default)]
-    note: Option<String>,
-}
-
-fn default_context_recommendation_action() -> String {
-    "acknowledged".to_string()
-}
-
-#[derive(Deserialize)]
-struct LoginRequest {
-    token: String,
-}
-
-#[derive(Deserialize)]
-struct CreateMemoryEntryRequest {
-    content: String,
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    category: Option<String>,
-    #[serde(default)]
-    priority: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    scope: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct UpdateMemoryEntryRequest {
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    tags: Option<Vec<String>>,
-    #[serde(default)]
-    priority: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct MemoryMaintenanceQuery {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct MemoryMaintenanceScanRequest {
-    #[serde(default)]
-    stale_threshold: Option<f32>,
-    #[serde(default)]
-    low_confidence_threshold: Option<f32>,
-    #[serde(default)]
-    authority_confidence_threshold: Option<f32>,
-    #[serde(default)]
-    max_candidates: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct UpdateMemoryMaintenanceRequest {
-    status: String,
-}
-
-#[derive(Deserialize)]
-struct CreateSymbolLinkRequest {
-    symbol_id: String,
-    memory_id: String,
-    #[serde(default)]
-    turn_index: Option<i32>,
-    #[serde(default)]
-    reference_type: Option<String>,
-}
-
-// ── Query param types ────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct ListSessionsParams {
-    #[serde(default = "default_sort")]
-    sort: String,
-    #[serde(default = "default_order")]
-    order: String,
-    #[serde(default)]
-    q: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    offset: Option<usize>,
-}
-
-fn default_sort() -> String {
-    "updated_at".to_string()
-}
-fn default_order() -> String {
-    "desc".to_string()
-}
-
-#[derive(Deserialize)]
-struct GetMessagesParams {
-    #[serde(default)]
-    offset: Option<usize>,
-    #[serde(default)]
-    from_seq: Option<usize>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct GetEventsParams {
-    #[serde(default)]
-    from_seq: Option<usize>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct GetRecommendationStatsParams {
-    #[serde(default)]
-    from_seq: Option<usize>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct SearchMessagesParams {
-    q: String,
-    #[serde(default = "default_search_limit")]
-    limit: usize,
-}
-
-fn default_search_limit() -> usize {
-    20
-}
-
-#[derive(Deserialize)]
-struct WorkspaceFilesParams {
-    #[serde(default)]
-    dir: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RawFileParams {
-    path: String,
-}
-
-#[derive(Deserialize)]
-struct CreateWorkspaceFileRequest {
-    path: String,
-    #[serde(default)]
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct CreateProfileRequest {
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct SwitchProfileRequest {
-    profile: String,
-}
-
-#[derive(Serialize)]
-struct WorkspaceFileItem {
-    name: String,
-    path: String,
-    is_dir: bool,
-    #[serde(rename = "type")]
-    kind: String,
-    size: u64,
-    modified_ms: Option<u128>,
 }
 
 fn default_config_home() -> PathBuf {
@@ -504,133 +192,6 @@ fn default_config_home() -> PathBuf {
                 .map(|home| home.join(".cowd"))
         })
         .unwrap_or_else(|| PathBuf::from(".cowd"))
-}
-
-fn path_has_safe_relative_components(path: &FsPath) -> bool {
-    !path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
-}
-
-fn workspace_root_canonical(workspace_root: &FsPath) -> Result<PathBuf, String> {
-    workspace_root
-        .canonicalize()
-        .map_err(|e| format!("workspace root is unavailable: {e}"))
-}
-
-fn resolve_existing_workspace_path(
-    workspace_root: &FsPath,
-    relative: Option<&str>,
-) -> Result<PathBuf, String> {
-    let root = workspace_root_canonical(workspace_root)?;
-    let rel = relative.map(str::trim).unwrap_or("");
-    let rel_path = FsPath::new(rel);
-    if !rel.is_empty() && !path_has_safe_relative_components(rel_path) {
-        return Err("path must stay inside the workspace".to_string());
-    }
-    let candidate = if rel.is_empty() {
-        root.clone()
-    } else {
-        root.join(rel_path)
-    };
-    let resolved = candidate
-        .canonicalize()
-        .map_err(|e| format!("path not found: {e}"))?;
-    if !resolved.starts_with(&root) {
-        return Err("path must stay inside the workspace".to_string());
-    }
-    Ok(resolved)
-}
-
-fn resolve_new_workspace_file_path(
-    workspace_root: &FsPath,
-    relative: &str,
-) -> Result<PathBuf, String> {
-    let root = workspace_root_canonical(workspace_root)?;
-    let rel = relative.trim();
-    if rel.is_empty() {
-        return Err("path is required".to_string());
-    }
-    let rel_path = FsPath::new(rel);
-    if !path_has_safe_relative_components(rel_path) {
-        return Err("path must stay inside the workspace".to_string());
-    }
-    let target = root.join(rel_path);
-    let parent = target
-        .parent()
-        .ok_or_else(|| "file parent is unavailable".to_string())?;
-    fs::create_dir_all(parent).map_err(|e| format!("failed to create parent directory: {e}"))?;
-    let parent_resolved = parent
-        .canonicalize()
-        .map_err(|e| format!("file parent is unavailable: {e}"))?;
-    if !parent_resolved.starts_with(&root) {
-        return Err("path must stay inside the workspace".to_string());
-    }
-    Ok(target)
-}
-
-fn workspace_relative_path(root: &FsPath, path: &FsPath) -> String {
-    path.strip_prefix(root)
-        .ok()
-        .and_then(|p| p.to_str())
-        .unwrap_or("")
-        .replace('\\', "/")
-}
-
-fn workspace_file_item(root: &FsPath, path: PathBuf) -> Option<WorkspaceFileItem> {
-    let metadata = fs::metadata(&path).ok()?;
-    let name = path.file_name()?.to_string_lossy().to_string();
-    let is_dir = metadata.is_dir();
-    let modified_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis());
-    Some(WorkspaceFileItem {
-        name,
-        path: workspace_relative_path(root, &path),
-        is_dir,
-        kind: if is_dir { "dir" } else { "file" }.to_string(),
-        size: if is_dir { 0 } else { metadata.len() },
-        modified_ms,
-    })
-}
-
-fn session_title_from_metadata(metadata_json: Option<&str>) -> Option<String> {
-    metadata_json
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .and_then(|v| {
-            v.get("title")
-                .and_then(|t| t.as_str())
-                .map(ToString::to_string)
-        })
-}
-
-fn session_info_from_record(record: SessionRecord) -> SessionInfo {
-    SessionInfo {
-        id: record.session_id,
-        status: record.status,
-        title: session_title_from_metadata(record.metadata_json.as_deref()),
-        model: record.model,
-        created_at: Some(record.created_at),
-        updated_at: Some(record.last_activity),
-        input_tokens: Some(record.input_tokens),
-        output_tokens: Some(record.output_tokens),
-    }
-}
-
-fn active_session_info(id: String) -> SessionInfo {
-    SessionInfo {
-        id,
-        status: "active".to_string(),
-        title: None,
-        model: None,
-        created_at: None,
-        updated_at: None,
-        input_tokens: None,
-        output_tokens: None,
-    }
 }
 
 pub(crate) fn new_api_session_record(session_id: &str, model: Option<String>) -> SessionRecord {
@@ -735,560 +296,6 @@ pub(crate) async fn sync_runtime_session_metadata_to_store(
     Ok(())
 }
 
-// ── Search response types ────────────────────────────────────────
-
-#[derive(Serialize)]
-struct SearchMessagesItem {
-    session_id: String,
-    sequence: usize,
-    role: String,
-    blocks: Vec<serde_json::Value>,
-    content_preview: String,
-    tool_use_id: Option<String>,
-    tool_name: Option<String>,
-    created_at_ms: u64,
-}
-
-#[derive(Serialize)]
-struct SearchMessagesResponse {
-    query: String,
-    results: Vec<SearchMessagesItem>,
-    total: usize,
-}
-
-#[derive(Deserialize)]
-struct UpdateSessionRequest {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    metadata: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct ApprovalRespondRequest {
-    id: String,
-    approved: bool,
-    #[serde(default)]
-    persistence: Option<String>,
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct StartTaskRequest {
-    objective: String,
-    #[serde(default)]
-    yolo_mode: bool,
-}
-
-#[derive(Deserialize)]
-struct TaskFailureRequest {
-    reason: String,
-}
-
-#[derive(Deserialize)]
-struct StartTaskPhaseRequest {
-    name: String,
-    objective: String,
-    #[serde(default)]
-    plan: Vec<String>,
-    #[serde(default)]
-    acceptance: Vec<String>,
-    #[serde(default)]
-    test_commands: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct TaskPhaseArtifactRequest {
-    #[serde(default = "default_task_artifact_kind")]
-    kind: String,
-    label: String,
-    value: String,
-}
-
-#[derive(Deserialize)]
-struct TaskPhaseReviewRequest {
-    result: String,
-    #[serde(default)]
-    completed: bool,
-}
-
-fn default_task_artifact_kind() -> String {
-    "note".to_string()
-}
-
-// ── Handlers ───────────────────────────────────────────────────
-
-async fn health_handler() -> &'static str {
-    "OK"
-}
-
-async fn tasks_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "tasks": state.task_kernel.list(),
-        "current": state.task_kernel.current(),
-    }))
-}
-
-async fn context_current_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
-    let session_id = params
-        .get("session_id")
-        .cloned()
-        .or_else(|| state.list_active_session_ids().into_iter().next())
-        .unwrap_or_else(|| "api-context".to_string());
-    let query = params.get("q").cloned().unwrap_or_default();
-    let profile = params
-        .get("profile")
-        .and_then(|value| parse_context_profile(value))
-        .unwrap_or(ContextProfile::MainTurn);
-
-    if let Some(runtime_entry) = state.active_runtime(&session_id) {
-        let runtime = runtime_entry.lock().await;
-        if let Some(envelope) = runtime.last_context_envelope() {
-            let lean_probe = ContextRuntimeKernel::lean_probe(&envelope);
-            let policy_decision = ContextRuntimeKernel::policy_decision(&lean_probe);
-            return Json(serde_json::json!({
-                "enabled": true,
-                "source": "runtime",
-                "envelope": envelope,
-                "lean_probe": lean_probe,
-                "policy_decision": policy_decision,
-            }));
-        }
-    }
-
-    let mut identity = ContextIdentity::main(session_id.clone());
-    identity.mode = context_mode_for_profile(profile);
-    let mut dynamic_items = Vec::new();
-    let mut omitted_items = Vec::new();
-    let mut degraded = Vec::new();
-
-    if let Some(ref mgr) = state.memory_manager {
-        let mgr = Arc::clone(mgr);
-        let session_for_packet = session_id.clone();
-        let query_for_packet = query.clone();
-        let packet_result = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|err| err.to_string())?;
-            rt.block_on(async move {
-                let kernel = MemoryKernel::new(mgr);
-                let memory_ctx = MemoryTurnContext::new(session_for_packet, "api");
-                kernel
-                    .context_packet(&memory_ctx, &query_for_packet, &[], 12, 2_000)
-                    .await
-                    .map_err(|err| err.to_string())
-            })
-        })
-        .await
-        .map_err(|err| err.to_string())
-        .and_then(|result| result);
-
-        match packet_result {
-            Ok(packet) => {
-                for item in packet.selected {
-                    let mut context_item = ContextItem::new(
-                        item.atom.id.to_string(),
-                        ContextSourceKind::Memory,
-                        match item.role {
-                            memory::MemoryPacketRole::Orientation => ContextRole::Orientation,
-                            memory::MemoryPacketRole::Supporting => ContextRole::Evidence,
-                            memory::MemoryPacketRole::Warning
-                            | memory::MemoryPacketRole::Conflict => ContextRole::Warning,
-                        },
-                        format!(
-                            "{}\nreason: {}\nevidence: {}",
-                            item.atom.title,
-                            item.reason,
-                            item.atom.evidence_pointer.as_deref().unwrap_or("")
-                        ),
-                    );
-                    context_item.authority = ContextAuthority::Session;
-                    context_item.visibility = ContextVisibility::Private;
-                    context_item.score = item.atom.confidence;
-                    dynamic_items.push(context_item);
-                }
-                for omitted in packet.omitted {
-                    omitted_items.push(ContextOmission {
-                        source: ContextSourceKind::Memory,
-                        reason: format!("{}: {}", omitted.reason, omitted.title),
-                        token_estimate: 0,
-                    });
-                }
-            }
-            Err(_) => degraded.push(ContextSourceKind::Memory),
-        }
-    } else {
-        degraded.push(ContextSourceKind::Memory);
-    }
-
-    let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
-        profile,
-        identity,
-        intent: query,
-        stable_head: vec!["cowd-context-runtime:v0.8.13".to_string()],
-        runtime_header: vec![format!("session:{session_id} agent:api profile:{profile:?}")],
-        dynamic_items,
-        omitted: omitted_items,
-        total_budget_tokens: 8_000,
-    });
-    envelope.diagnostics.degraded_sources = degraded;
-    let lean_probe = ContextRuntimeKernel::lean_probe(&envelope);
-    let policy_decision = ContextRuntimeKernel::policy_decision(&lean_probe);
-
-    Json(serde_json::json!({
-        "enabled": true,
-        "source": "synthetic",
-        "lean_probe": lean_probe,
-        "policy_decision": policy_decision,
-        "envelope": envelope,
-    }))
-}
-
-fn parse_context_profile(value: &str) -> Option<ContextProfile> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "mainturn" | "main" => Some(ContextProfile::MainTurn),
-        "sologoal" | "solo" => Some(ContextProfile::SoloGoal),
-        "yologoal" | "yolo" => Some(ContextProfile::YoloGoal),
-        "subagent" | "sub_agent" => Some(ContextProfile::SubAgent),
-        "collaboration" => Some(ContextProfile::Collaboration),
-        "review" => Some(ContextProfile::Review),
-        "resume" => Some(ContextProfile::Resume),
-        "cron" => Some(ContextProfile::Cron),
-        _ => None,
-    }
-}
-
-fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
-    match profile {
-        ContextProfile::MainTurn => ContextMode::MainTurn,
-        ContextProfile::SoloGoal => ContextMode::SoloGoal,
-        ContextProfile::YoloGoal => ContextMode::YoloGoal,
-        ContextProfile::SubAgent => ContextMode::SubAgent,
-        ContextProfile::Collaboration => ContextMode::Collaboration,
-        ContextProfile::Review => ContextMode::Review,
-        ContextProfile::Resume => ContextMode::Resume,
-        ContextProfile::Cron => ContextMode::Cron,
-    }
-}
-
-async fn start_task_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<StartTaskRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let task = state
-        .task_kernel
-        .start_goal(body.objective, body.yolo_mode)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    Ok((StatusCode::CREATED, Json(task)))
-}
-
-async fn start_task_phase_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<StartTaskPhaseRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let task = state
-        .task_kernel
-        .start_phase(
-            &id,
-            body.name,
-            body.objective,
-            body.plan,
-            body.acceptance,
-            body.test_commands,
-        )
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    Ok((StatusCode::CREATED, Json(task)))
-}
-
-async fn record_task_phase_artifact_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path((id, phase_id)): Path<(String, String)>,
-    Json(body): Json<TaskPhaseArtifactRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let task = state
-        .task_kernel
-        .record_phase_artifact(&id, &phase_id, body.kind, body.label, body.value)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    Ok(Json(task))
-}
-
-async fn review_task_phase_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path((id, phase_id)): Path<(String, String)>,
-    Json(body): Json<TaskPhaseReviewRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let task = state
-        .task_kernel
-        .review_phase(&id, &phase_id, body.result, body.completed)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    Ok(Json(task))
-}
-
-async fn cancel_task_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let task = state
-        .task_kernel
-        .transition(&id, TaskStatus::Cancelled, None, "cancelled by user")
-        .map_err(|e| api_error(StatusCode::NOT_FOUND, e))?;
-    Ok(Json(task))
-}
-
-async fn complete_task_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let task = state
-        .task_kernel
-        .transition(&id, TaskStatus::Completed, None, "accepted")
-        .map_err(|e| api_error(StatusCode::NOT_FOUND, e))?;
-    Ok(Json(task))
-}
-
-async fn record_task_failure_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<TaskFailureRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let task = state
-        .task_kernel
-        .record_failure(&id, body.reason)
-        .map_err(|e| api_error(StatusCode::NOT_FOUND, e))?;
-    Ok(Json(task))
-}
-
-async fn list_sessions(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<ListSessionsParams>,
-) -> impl IntoResponse {
-    let limit = params.limit.unwrap_or(20).min(200);
-    let offset = params.offset.unwrap_or(0);
-
-    // Try unified store first for DB-backed listing
-    if let Ok(Some(page)) = state
-        .session_kernel
-        .list_stored_sessions_page(&SessionListOptions {
-            query: params.q.as_deref(),
-            model: params.model.as_deref(),
-            status: params.status.as_deref(),
-            sort: &params.sort,
-            order: &params.order,
-            limit,
-            offset,
-        })
-        .await
-    {
-        let total = page.total;
-        let sessions: Vec<SessionInfo> = page
-            .records
-            .into_iter()
-            .map(session_info_from_record)
-            .collect();
-        return Json(serde_json::json!({
-            "sessions": sessions,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "sort": params.sort,
-            "order": params.order,
-        }));
-    }
-
-    // Fallback: in-memory active sessions
-    let mut sessions: Vec<SessionInfo> = state
-        .list_active_session_ids()
-        .into_iter()
-        .map(active_session_info)
-        .collect();
-    if let Some(status) = params.status.as_ref().filter(|s| !s.is_empty()) {
-        sessions.retain(|s| s.status.eq_ignore_ascii_case(status));
-    }
-    if let Some(model) = params.model.as_ref().filter(|s| !s.is_empty()) {
-        sessions.retain(|s| {
-            s.model
-                .as_deref()
-                .is_some_and(|m| m.eq_ignore_ascii_case(model))
-        });
-    }
-    if let Some(q) = params
-        .q
-        .as_ref()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-    {
-        sessions.retain(|s| {
-            s.id.to_lowercase().contains(&q)
-                || s.title.as_deref().unwrap_or("").to_lowercase().contains(&q)
-        });
-    }
-    if params.sort == "created_at" {
-        sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    } else {
-        sessions.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
-    }
-    if !params.order.eq_ignore_ascii_case("asc") {
-        sessions.reverse();
-    }
-    let total = sessions.len();
-    let sessions: Vec<SessionInfo> = sessions.into_iter().skip(offset).take(limit).collect();
-    Json(serde_json::json!({
-        "sessions": sessions,
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "sort": params.sort,
-        "order": params.order,
-    }))
-}
-
-async fn create_session(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<CreateSessionRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let session_id = uuid::Uuid::new_v4().to_string();
-    tracing::info!(%session_id, "API session create requested");
-
-    let session = runtime::Session::new();
-    let model = body
-        .model
-        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-    let runtime = if let Some(store) = state.unified_store() {
-        crate::build_runtime_with_session_store(
-            store.clone(),
-            session,
-            &session_id,
-            model.clone(),
-            vec![],
-            true,
-            true,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    } else {
-        crate::build_runtime(
-            session,
-            &session_id,
-            model.clone(),
-            vec![],
-            true,
-            true,
-            None,
-            runtime::PermissionMode::WorkspaceWrite,
-            None,
-            None,
-        )
-    }
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("failed to build runtime: {e}"),
-            }),
-        )
-    })?;
-
-    if let Err(e) = state.register_runtime(session_id.clone(), runtime) {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: format!("failed to register session: {e}"),
-            }),
-        ));
-    }
-
-    let mut info = active_session_info(session_id.clone());
-    if state.has_unified_store() {
-        let record = new_api_session_record(&session_id, Some(model));
-        state
-            .session_kernel
-            .upsert_stored_session(&record)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to persist session: {e}"),
-                    }),
-                )
-            })?;
-        info = session_info_from_record(record);
-    }
-
-    Ok((StatusCode::CREATED, Json(info)))
-}
-
-async fn get_session(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if state.has_unified_store() {
-        match state.session_kernel.stored_session(&id).await {
-            Ok(Some(record)) => return Ok(Json(session_info_from_record(record))),
-            Ok(None) => {}
-            Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to load session: {e}"),
-                    }),
-                ));
-            }
-        }
-    }
-
-    if state.active_runtime(&id).is_some() {
-        Ok(Json(active_session_info(id)))
-    } else {
-        Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        ))
-    }
-}
-
-async fn delete_session(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let removed_active = state.remove_active_runtime(&id).is_some();
-    let removed_stored = state
-        .session_kernel
-        .delete_stored_session(&id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to delete session: {e}"),
-                }),
-            )
-        })?;
-
-    if removed_active || removed_stored {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        ))
-    }
-}
-
 async fn append_session_timeline_event(
     store: &UnifiedSessionStore,
     session_id: &str,
@@ -1322,1366 +329,6 @@ fn current_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
-async fn append_session_timeline_event_to_kernel(
-    kernel: &SessionKernel,
-    session_id: &str,
-    event_type: &str,
-    payload: serde_json::Value,
-) {
-    if let Err(error) = kernel
-        .append_timeline_event(session_id, event_type, payload)
-        .await
-    {
-        tracing::warn!(%session_id, %event_type, error = %error, "failed to append session event");
-    }
-}
-
-fn task_resume_context_packet(session_id: &str, task: &TaskRecord) -> ResumeContextPacket {
-    let current_phase = task.current_phase.as_ref().and_then(|phase_ref| {
-        task.phases
-            .iter()
-            .find(|phase| &phase.id == phase_ref || &phase.name == phase_ref)
-    });
-    let phase_summary = current_phase.map(|phase| {
-        format!(
-            "phase={} status={} objective={} acceptance=[{}]",
-            phase.name,
-            phase.status.as_str(),
-            phase.objective,
-            phase.acceptance.join("; ")
-        )
-    });
-    let active_task = Some(format!(
-        "id={} status={} yolo={} objective={}{}",
-        task.id,
-        task.status.as_str(),
-        task.yolo_mode,
-        task.objective,
-        phase_summary
-            .as_ref()
-            .map(|summary| format!(" current_{summary}"))
-            .unwrap_or_default()
-    ));
-    let recent_decisions = task
-        .audit
-        .iter()
-        .rev()
-        .take(5)
-        .map(|event| format!("{}: {}", event.event_type, event.message))
-        .collect::<Vec<_>>();
-    let mut blockers = Vec::new();
-    if let Some(reason) = task
-        .blocker_reason
-        .as_ref()
-        .filter(|reason| !reason.is_empty())
-    {
-        blockers.push(reason.clone());
-    }
-    if task.failure_count > 0 {
-        blockers.push(format!("failure_count={}", task.failure_count));
-    }
-
-    ResumeContextPacket {
-        session_id: session_id.to_string(),
-        handoff_summary: None,
-        active_task,
-        recent_decisions,
-        blockers,
-        source: ResumeContextSource::TaskRegistry,
-    }
-}
-
-fn runtime_run_started_payload(
-    session_id: &str,
-    run_id: &str,
-    profile: ContextProfile,
-    intent: &str,
-    started_at_ms: u64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type": "RuntimeRun",
-        "phase": "started",
-        "run_id": run_id,
-        "parent_run_id": null,
-        "kind": "main_turn",
-        "session_id": session_id,
-        "profile": profile,
-        "status": "running",
-        "summary": intent.chars().take(120).collect::<String>(),
-        "intent_preview": intent.chars().take(240).collect::<String>(),
-        "started_at_ms": started_at_ms,
-        "refs": [],
-    })
-}
-
-fn runtime_run_completed_payload(
-    session_id: &str,
-    run_id: &str,
-    profile: ContextProfile,
-    status: &str,
-    iterations: Option<usize>,
-    context_envelope_id: Option<String>,
-    error: Option<String>,
-    started_at_ms: u64,
-    completed_at_ms: u64,
-) -> serde_json::Value {
-    let refs = context_envelope_id
-        .as_ref()
-        .map(|id| vec![serde_json::json!({"type": "context_envelope", "id": id})])
-        .unwrap_or_default();
-    serde_json::json!({
-        "type": "RuntimeRun",
-        "phase": "completed",
-        "run_id": run_id,
-        "parent_run_id": null,
-        "kind": "main_turn",
-        "session_id": session_id,
-        "profile": profile,
-        "status": status,
-        "summary": error
-            .as_ref()
-            .map(|value| value.chars().take(160).collect::<String>())
-            .unwrap_or_else(|| format!("turn {status}")),
-        "iterations": iterations,
-        "context_envelope_id": context_envelope_id,
-        "error": error,
-        "started_at_ms": started_at_ms,
-        "completed_at_ms": completed_at_ms,
-        "duration_ms": completed_at_ms.saturating_sub(started_at_ms),
-        "refs": refs,
-    })
-}
-
-async fn send_message(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<SendMessageRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_entry = state.active_runtime(&id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        )
-    })?;
-
-    tracing::info!(%id, content_len = body.content.len(), "API message received");
-
-    let session_id = id.clone();
-    let event_bus = state.event_bus();
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let run_started_at_ms = current_time_ms();
-    let active_task = state.task_kernel.current();
-    let run_profile = if active_task
-        .as_ref()
-        .is_some_and(|task| task.yolo_mode)
-    {
-        ContextProfile::YoloGoal
-    } else {
-        ContextProfile::MainTurn
-    };
-    append_session_timeline_event_to_kernel(
-        &state.session_kernel,
-        &session_id,
-        "RuntimeRun",
-        runtime_run_started_payload(
-            &session_id,
-            &run_id,
-            run_profile,
-            &body.content,
-            run_started_at_ms,
-        ),
-    )
-    .await;
-
-    // Phase 1b: Subscribe CowdEventBus → forward text/thinking/tool events to SessionEventBus
-    {
-        let runtime_guard = runtime_entry.lock().await;
-        if let Some(cowd_bus) = runtime_guard.cowd_bus() {
-            let mut rx = cowd_bus.subscribe();
-            let eb = event_bus.clone();
-            let sid = session_id.clone();
-            let kernel = state.session_kernel.clone();
-            let active_run_id = run_id.clone();
-            tokio::spawn(async move {
-                while let Ok(event) = rx.recv().await {
-                    match event {
-                        runtime::CowdEvent::TextDelta { text } => {
-                            eb.text_delta(&sid, &text).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
-                                &sid,
-                                "TextDelta",
-                                serde_json::json!({"type":"TextDelta","content":text}),
-                            )
-                            .await;
-                        }
-                        runtime::CowdEvent::ThinkingDelta { thinking } => {
-                            eb.thinking_delta(&sid, &thinking).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
-                                &sid,
-                                "ThinkingDelta",
-                                serde_json::json!({"type":"ThinkingDelta","content":thinking}),
-                            )
-                            .await;
-                        }
-                        runtime::CowdEvent::ToolStart { id, name, preview } => {
-                            eb.tool_start(&sid, &id, &name).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
-                                &sid,
-                                "ToolStart",
-                                serde_json::json!({"type":"ToolStart","id":id,"name":name,"preview":preview}),
-                            )
-                            .await;
-                        }
-                        runtime::CowdEvent::ToolProgress { id, name, progress } => {
-                            eb.tool_progress(&sid, &id, &name, &progress).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
-                                &sid,
-                                "ToolProgress",
-                                serde_json::json!({"type":"ToolProgress","id":id,"name":name,"progress":progress}),
-                            )
-                            .await;
-                        }
-                        runtime::CowdEvent::ToolComplete {
-                            id,
-                            name,
-                            summary,
-                            exit_code,
-                        } => {
-                            eb.tool_complete(&sid, &id, &name, &summary, exit_code)
-                                .await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
-                                &sid,
-                                "ToolComplete",
-                                serde_json::json!({"type":"ToolComplete","id":id,"name":name,"summary":summary,"exit_code":exit_code}),
-                            )
-                            .await;
-                        }
-                        runtime::CowdEvent::TurnComplete {
-                            assistant_text,
-                            iterations,
-                        } => {
-                            let json = serde_json::json!({"type":"TurnComplete","text":assistant_text,"iterations":iterations});
-                            eb.broadcast(&sid, &json.to_string()).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
-                                &sid,
-                                "TurnComplete",
-                                json,
-                            )
-                            .await;
-                        }
-                        runtime::CowdEvent::TurnStarted => {
-                            let json = serde_json::json!({"type":"TurnStarted"});
-                            eb.broadcast(&sid, &json.to_string()).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
-                                &sid,
-                                "TurnStarted",
-                                json,
-                            )
-                            .await;
-                        }
-                        runtime::CowdEvent::TurnError { error } => {
-                            let json = serde_json::json!({"type":"TurnError","error":error});
-                            eb.broadcast(&sid, &json.to_string()).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
-                                &sid,
-                                "TurnError",
-                                json,
-                            )
-                            .await;
-                        }
-                        runtime::CowdEvent::ContextEnvelope { envelope } => {
-                            let json = serde_json::json!({
-                                "type": "ContextEnvelope",
-                                "envelope_id": envelope.id.clone(),
-                                "run_id": active_run_id.clone(),
-                                "session_id": envelope.identity.session_id.clone(),
-                                "agent_id": envelope.identity.agent_id.clone(),
-                                "profile": envelope.profile,
-                                "diagnostics": envelope.diagnostics.clone(),
-                                "budget": envelope.budget.clone(),
-                                "hashes": {
-                                    "stable_head": envelope.diagnostics.stable_head_hash,
-                                    "runtime_header": envelope.diagnostics.runtime_header_hash,
-                                    "dynamic_tail": envelope.diagnostics.dynamic_tail_hash,
-                                },
-                                "envelope": envelope,
-                            });
-                            eb.broadcast(&sid, &json.to_string()).await;
-                            append_session_timeline_event_to_kernel(
-                                &kernel,
-                                &sid,
-                                "ContextEnvelope",
-                                json,
-                            )
-                            .await;
-                        }
-                        runtime::CowdEvent::TokenUsage { .. }
-                        | runtime::CowdEvent::Warning { .. }
-                        | runtime::CowdEvent::CompactionNotice { .. }
-                        | _ => {}
-                    }
-                }
-            });
-        }
-    }
-
-    if let Some(task) = active_task {
-        let packet = task_resume_context_packet(&session_id, &task);
-        let runtime_guard = runtime_entry.lock().await;
-        runtime_guard.set_context_profile(run_profile);
-        runtime_guard.inject_resume_context(packet);
-    } else {
-        let runtime_guard = runtime_entry.lock().await;
-        runtime_guard.set_context_profile(run_profile);
-    }
-
-    const TURN_TIMEOUT: Duration = Duration::from_secs(300);
-
-    // Phase 2: Run turn in spawn_blocking — ConversationRuntime::run_turn_async
-    // internally holds std::sync::MutexGuard across .await, making its future !Send.
-    // spawn_blocking runs this on a dedicated thread so the axum handler future stays Send.
-    let content = body.content;
-    let rt_entry = runtime_entry.clone();
-    let turn_result = tokio::task::spawn_blocking(move || {
-        let handle = tokio::runtime::Handle::current();
-        handle.block_on(async move {
-            let mut runtime_guard = rt_entry.lock().await;
-            timeout(
-                TURN_TIMEOUT,
-                runtime_guard
-                    .run_turn_async(&content, &runtime::permissions::SharedPrompter::none()),
-            )
-            .await
-        })
-    })
-    .await;
-
-    // Phase 3: Process result — all work here is Send (tokio::sync channels, serde, Json)
-    match turn_result {
-        Ok(Ok(Ok(summary))) => {
-            let final_text = summary
-                .assistant_messages
-                .last()
-                .map(|msg| {
-                    msg.blocks
-                        .iter()
-                        .filter_map(|block| match block {
-                            runtime::ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-
-            let session_snapshot = {
-                let runtime_guard = runtime_entry.lock().await;
-                runtime_guard.session().clone()
-            };
-            let context_envelope_id = {
-                let runtime_guard = runtime_entry.lock().await;
-                runtime_guard
-                    .last_context_envelope()
-                    .map(|envelope| envelope.id)
-            };
-            let collaboration_result = {
-                let runtime_guard = runtime_entry.lock().await;
-                runtime_guard.take_collaboration_result()
-            };
-            if let Err(e) = state
-                .session_kernel
-                .sync_runtime_session_snapshot(&session_id, &session_snapshot)
-                .await
-            {
-                tracing::warn!(%session_id, error = %e, "failed to sync API session to SQLite");
-            }
-            if let Some(collaboration_result) = collaboration_result {
-                if let Err(e) = state
-                    .session_kernel
-                    .persist_workgraph_review(
-                        &collaboration_result.work_graph,
-                        &collaboration_result.review_packet,
-                        state.memory_manager.as_ref(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        %session_id,
-                        error = %e,
-                        "failed to persist collaboration closed-loop runtime event"
-                    );
-                }
-            }
-
-            let response = serde_json::json!({
-                "session_id": &session_id,
-                "status": "complete",
-                "response": final_text,
-                "iterations": summary.iterations,
-            });
-
-            let sse_data = serde_json::json!({
-                "type": "TurnComplete",
-                "session_id": &session_id,
-                "response": final_text,
-                "iterations": summary.iterations,
-            });
-            event_bus
-                .broadcast(&session_id, &sse_data.to_string())
-                .await;
-            append_session_timeline_event_to_kernel(
-                &state.session_kernel,
-                &session_id,
-                "RuntimeRun",
-                runtime_run_completed_payload(
-                    &session_id,
-                    &run_id,
-                    run_profile,
-                    "completed",
-                    Some(summary.iterations),
-                    context_envelope_id,
-                    None,
-                    run_started_at_ms,
-                    current_time_ms(),
-                ),
-            )
-            .await;
-
-            Ok(Json(response))
-        }
-        Ok(Ok(Err(e))) => {
-            let error_msg = e.to_string();
-            let context_envelope_id = {
-                let runtime_guard = runtime_entry.lock().await;
-                runtime_guard
-                    .last_context_envelope()
-                    .map(|envelope| envelope.id)
-            };
-
-            let sse_data = serde_json::json!({
-                "type": "TurnError",
-                "session_id": &session_id,
-                "error": error_msg,
-            });
-            event_bus
-                .broadcast(&session_id, &sse_data.to_string())
-                .await;
-            append_session_timeline_event_to_kernel(
-                &state.session_kernel,
-                &session_id,
-                "RuntimeRun",
-                runtime_run_completed_payload(
-                    &session_id,
-                    &run_id,
-                    run_profile,
-                    "failed",
-                    None,
-                    context_envelope_id,
-                    Some(error_msg.clone()),
-                    run_started_at_ms,
-                    current_time_ms(),
-                ),
-            )
-            .await;
-
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: error_msg }),
-            ))
-        }
-        Ok(Err(_elapsed)) => {
-            let error_msg = format!("turn timed out after {}s", TURN_TIMEOUT.as_secs());
-            let context_envelope_id = {
-                let runtime_guard = runtime_entry.lock().await;
-                runtime_guard
-                    .last_context_envelope()
-                    .map(|envelope| envelope.id)
-            };
-
-            let sse_data = serde_json::json!({
-                "type": "TurnError",
-                "session_id": &session_id,
-                "error": error_msg,
-            });
-            event_bus
-                .broadcast(&session_id, &sse_data.to_string())
-                .await;
-            append_session_timeline_event_to_kernel(
-                &state.session_kernel,
-                &session_id,
-                "RuntimeRun",
-                runtime_run_completed_payload(
-                    &session_id,
-                    &run_id,
-                    run_profile,
-                    "timeout",
-                    None,
-                    context_envelope_id,
-                    Some(error_msg.clone()),
-                    run_started_at_ms,
-                    current_time_ms(),
-                ),
-            )
-            .await;
-
-            Err((
-                StatusCode::REQUEST_TIMEOUT,
-                Json(ErrorResponse { error: error_msg }),
-            ))
-        }
-        Err(join_err) => {
-            let error_msg = format!("task join error: {join_err}");
-            append_session_timeline_event_to_kernel(
-                &state.session_kernel,
-                &session_id,
-                "RuntimeRun",
-                runtime_run_completed_payload(
-                    &session_id,
-                    &run_id,
-                    run_profile,
-                    "failed",
-                    None,
-                    None,
-                    Some(error_msg.clone()),
-                    run_started_at_ms,
-                    current_time_ms(),
-                ),
-            )
-            .await;
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: error_msg }),
-            ))
-        }
-    }
-}
-
-// ── Memory / Tools / Config handlers ───────────────────────────
-
-fn context_health_json(alert: RotAlert) -> serde_json::Value {
-    match alert {
-        RotAlert::None => serde_json::json!({
-            "level": "healthy",
-            "message": null,
-        }),
-        RotAlert::Warning(message) => serde_json::json!({
-            "level": "warning",
-            "message": message,
-        }),
-        RotAlert::Critical(message) => serde_json::json!({
-            "level": "critical",
-            "message": message,
-        }),
-    }
-}
-
-fn memory_kernel_health_json(health: memory::MemoryHealth) -> serde_json::Value {
-    let degraded_reasons: Vec<String> = health
-        .degraded
-        .iter()
-        .map(|reason| format!("{reason:?}"))
-        .collect();
-    serde_json::json!({
-        "degraded": health.is_degraded(),
-        "degraded_reasons": degraded_reasons,
-        "orientation_pressure": health.orientation_pressure,
-        "conflict_pressure": health.conflict_pressure,
-        "stale_pressure": health.stale_pressure,
-        "evidence_coverage": health.evidence_coverage,
-        "link_coverage": health.link_coverage,
-        "background_lag_ms": health.background_lag_ms,
-    })
-}
-
-async fn memory_status_value(state: &AppState) -> serde_json::Value {
-    if let Some(ref mgr) = state.memory_manager {
-        let layers = mgr.list_layers().await;
-        let kernel = MemoryKernel::new(Arc::clone(mgr));
-        let kernel_ctx = MemoryTurnContext::new("api-memory-status", "api");
-        let kernel_health = kernel
-            .health(&kernel_ctx)
-            .await
-            .map(memory_kernel_health_json)
-            .unwrap_or_else(|error| {
-                serde_json::json!({
-                    "degraded": true,
-                    "degraded_reasons": [format!("health failed: {error}")],
-                    "orientation_pressure": 0.0,
-                    "conflict_pressure": 0.0,
-                    "stale_pressure": 0.0,
-                    "evidence_coverage": 0.0,
-                    "link_coverage": 0.0,
-                    "background_lag_ms": null,
-                })
-            });
-        let vector_count = mgr.vector_index_count();
-        let total_entries: usize = layers
-            .iter()
-            .filter_map(|layer| layer.get("entry_count").and_then(|v| v.as_u64()))
-            .map(|count| count as usize)
-            .sum();
-        serde_json::json!({
-            "enabled": true,
-            "status": "ready",
-            "degraded": false,
-            "degraded_reason": null,
-            "layers": layers,
-            "total_entries": total_entries,
-            "vector_count": vector_count,
-            "session_store": true,
-            "context_health": context_health_json(mgr.ctx_health()),
-            "kernel_health": kernel_health,
-            "performance": mgr.performance_report(),
-        })
-    } else {
-        serde_json::json!({
-            "enabled": false,
-            "status": "disabled",
-            "degraded": false,
-            "degraded_reason": "memory not configured",
-            "layers": empty_memory_layers(),
-            "total_entries": 0,
-            "vector_count": 0,
-            "session_store": false,
-            "context_health": {
-                "level": "unavailable",
-                "message": "memory not configured",
-            },
-            "kernel_health": {
-                "degraded": true,
-                "degraded_reasons": ["memory not configured"],
-                "orientation_pressure": 0.0,
-                "conflict_pressure": 0.0,
-                "stale_pressure": 0.0,
-                "evidence_coverage": 0.0,
-                "link_coverage": 0.0,
-                "background_lag_ms": null,
-            },
-            "message": "memory not configured"
-        })
-    }
-}
-
-async fn memory_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(memory_status_value(&state).await)
-}
-
-async fn memory_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(memory_status_value(&state).await)
-}
-
-async fn memory_stats_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref mgr) = state.memory_manager {
-        let layers = mgr.list_layers().await;
-        let total_entries: usize = layers
-            .iter()
-            .filter_map(|layer| layer.get("entry_count").and_then(|v| v.as_u64()))
-            .map(|count| count as usize)
-            .sum();
-        let entity_count = mgr
-            .list_entities()
-            .await
-            .map(|v| v.len())
-            .unwrap_or_default();
-        let triple_count = mgr
-            .list_triples()
-            .await
-            .map(|v| v.len())
-            .unwrap_or_default();
-        Json(serde_json::json!({
-            "enabled": true,
-            "total_entries": total_entries,
-            "layers": layers,
-            "entity_count": entity_count,
-            "triple_count": triple_count,
-            "vector_count": mgr.vector_index_count(),
-            "performance": mgr.performance_report(),
-        }))
-    } else {
-        Json(serde_json::json!({
-            "enabled": false,
-            "total_entries": 0,
-            "layers": empty_memory_layers(),
-            "entity_count": 0,
-            "triple_count": 0,
-            "vector_count": 0,
-        }))
-    }
-}
-
-async fn memory_layers_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref mgr) = state.memory_manager {
-        Json(serde_json::json!({
-            "enabled": true,
-            "layers": mgr.list_layers().await,
-        }))
-    } else {
-        Json(serde_json::json!({
-            "enabled": false,
-            "layers": empty_memory_layers(),
-        }))
-    }
-}
-
-async fn memory_maintenance_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(query): Query<MemoryMaintenanceQuery>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
-        return Ok(Json(serde_json::json!({
-            "enabled": false,
-            "candidates": [],
-            "degraded_reason": "memory not configured",
-        })));
-    };
-    let status = match query.status.as_deref() {
-        Some(value) => Some(
-            parse_maintenance_status(value)
-                .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "invalid maintenance status"))?,
-        ),
-        None => None,
-    };
-    let kind = match query.kind.as_deref() {
-        Some(value) => Some(
-            parse_maintenance_kind(value)
-                .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "invalid maintenance kind"))?,
-        ),
-        None => None,
-    };
-    let candidates = mgr
-        .list_memory_maintenance(MaintenanceCandidateFilter {
-            status,
-            kind,
-            source: query.source.filter(|source| !source.trim().is_empty()),
-            limit: query.limit.map(|limit| limit.min(500)),
-        })
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "enabled": true,
-        "candidates": candidates,
-    })))
-}
-
-async fn scan_memory_maintenance_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<MemoryMaintenanceScanRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
-        return Ok(Json(serde_json::json!({
-            "enabled": false,
-            "candidates": [],
-            "degraded_reason": "memory not configured",
-        })));
-    };
-    let defaults = MaintenanceScanConfig::default();
-    let config = MaintenanceScanConfig {
-        stale_threshold: body.stale_threshold.unwrap_or(defaults.stale_threshold),
-        low_confidence_threshold: body
-            .low_confidence_threshold
-            .unwrap_or(defaults.low_confidence_threshold),
-        authority_confidence_threshold: body
-            .authority_confidence_threshold
-            .unwrap_or(defaults.authority_confidence_threshold),
-        max_candidates: body
-            .max_candidates
-            .unwrap_or(defaults.max_candidates)
-            .min(500),
-    };
-    let candidates = mgr
-        .scan_memory_maintenance(config)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "enabled": true,
-        "candidates": candidates,
-    })))
-}
-
-async fn update_memory_maintenance_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<UpdateMemoryMaintenanceRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "memory not configured",
-        ));
-    };
-    let status = parse_maintenance_status(&body.status)
-        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "invalid maintenance status"))?;
-    match mgr.transition_memory_maintenance(&id, status) {
-        Ok(Some(candidate)) => Ok(Json(serde_json::json!({
-            "enabled": true,
-            "candidate": candidate,
-        }))),
-        Ok(None) => Err(api_error(
-            StatusCode::NOT_FOUND,
-            "maintenance candidate not found",
-        )),
-        Err(e) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
-}
-
-async fn memory_layer_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(layer): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(layer) = parse_memory_layer(&layer) else {
-        return Err(api_error(StatusCode::BAD_REQUEST, "invalid memory layer"));
-    };
-
-    if let Some(ref mgr) = state.memory_manager {
-        match mgr.list_layer_full_entries(layer).await {
-            Ok(entries) => Ok(Json(serde_json::json!({
-                "enabled": true,
-                "layer": format!("{layer:?}"),
-                "entries": entries,
-            }))),
-            Err(e) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-        }
-    } else {
-        Ok(Json(serde_json::json!({
-            "enabled": false,
-            "layer": format!("{layer:?}"),
-            "entries": [],
-        })))
-    }
-}
-
-async fn create_memory_entry_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(layer): Path<String>,
-    Json(body): Json<CreateMemoryEntryRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(layer) = parse_memory_layer(&layer) else {
-        return Err(api_error(StatusCode::BAD_REQUEST, "invalid memory layer"));
-    };
-    let Some(ref mgr) = state.memory_manager else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "memory not configured",
-        ));
-    };
-    let content = body.content.trim();
-    if content.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "memory content is required",
-        ));
-    }
-    let category = body
-        .category
-        .as_deref()
-        .and_then(parse_memory_category)
-        .unwrap_or(MemoryCategory::Reference);
-    let priority = body
-        .priority
-        .as_deref()
-        .and_then(parse_memory_priority)
-        .unwrap_or(Priority::Normal);
-    let title = body
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| content.chars().take(64).collect());
-    let scope = body
-        .scope
-        .as_deref()
-        .and_then(|scope| scope.parse::<MemoryScope>().ok())
-        .unwrap_or_else(|| {
-            if layer == MemoryLayer::L4 {
-                MemoryScope::Global
-            } else {
-                MemoryScope::default()
-            }
-        });
-
-    let id = MemoryId::new_v4();
-    let entry = MemoryEntry {
-        id,
-        layer,
-        category,
-        priority,
-        source: MemorySource::UserExplicit,
-        title: title.clone(),
-        content: content.to_string(),
-        embedding: None,
-        tags: body.tags,
-        relations: vec![],
-        confidence: 1.0,
-        access_count: 0,
-        staleness: 0.0,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-        last_accessed_at: None,
-        scope,
-        session_id: None,
-        source_agent: None,
-        visibility: AgentVisibility::Shared,
-    };
-    let kernel = MemoryKernel::new(Arc::clone(mgr));
-    let memory_ctx = MemoryTurnContext::new("api-memory-create", "api");
-
-    match kernel.remember(&memory_ctx, entry).await {
-        Ok(()) => Ok((
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "id": id,
-                "layer": format!("{layer:?}"),
-                "title": title,
-            })),
-        )),
-        Err(e) => Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
-}
-
-async fn delete_memory_entry_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path((_layer, id)): Path<(String, String)>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "memory not configured",
-        ));
-    };
-    let memory_id = MemoryId::try_parse(&id)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid memory id"))?;
-    let kernel = MemoryKernel::new(Arc::clone(mgr));
-    let memory_ctx = MemoryTurnContext::new("api-memory-delete", "api");
-    kernel
-        .archive(&memory_ctx, memory_id, "archived by API delete request")
-        .await
-        .map(|_| StatusCode::NO_CONTENT)
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}
-
-async fn update_memory_entry_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<UpdateMemoryEntryRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "memory not configured",
-        ));
-    };
-
-    let content = body
-        .content
-        .map(|content| content.trim().to_string())
-        .filter(|content| !content.is_empty());
-    let priority = body.priority.as_deref().and_then(parse_memory_priority);
-
-    if content.is_none() && body.tags.is_none() && priority.is_none() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "content, tags, or priority is required",
-        ));
-    }
-
-    mgr.update_entry(&id, content, body.tags, priority)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(serde_json::json!({
-        "id": id,
-        "updated": true,
-    })))
-}
-
-async fn memory_entities_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref mgr) = state.memory_manager {
-        let entities = mgr.list_entities().await.unwrap_or_default();
-        Json(serde_json::json!({
-            "enabled": true,
-            "entities": entities,
-        }))
-    } else {
-        Json(serde_json::json!({
-            "enabled": false,
-            "entities": [],
-        }))
-    }
-}
-
-async fn memory_triples_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref mgr) = state.memory_manager {
-        let triples = mgr.list_triples().await.unwrap_or_default();
-        Json(serde_json::json!({
-            "enabled": true,
-            "triples": triples,
-        }))
-    } else {
-        Json(serde_json::json!({
-            "enabled": false,
-            "triples": [],
-        }))
-    }
-}
-
-async fn create_memory_symbol_link_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<CreateSymbolLinkRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "memory not configured",
-        ));
-    };
-    let symbol_id = body.symbol_id.trim();
-    if symbol_id.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "symbol_id is required"));
-    }
-    let memory_id = body
-        .memory_id
-        .parse::<uuid::Uuid>()
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "memory_id must be a valid UUID"))?;
-    let reference_type = body
-        .reference_type
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("reference");
-
-    mgr.link_symbol_to_memory(symbol_id, memory_id, body.turn_index, reference_type)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "symbol_id": symbol_id,
-            "memory_id": memory_id,
-            "reference_type": reference_type,
-        })),
-    ))
-}
-
-async fn memory_symbol_links_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(ref mgr) = state.memory_manager else {
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "memory not configured",
-        ));
-    };
-    let symbol = params
-        .get("symbol")
-        .or_else(|| params.get("q"))
-        .map(String::as_str)
-        .unwrap_or("")
-        .trim();
-    if symbol.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "symbol query is required",
-        ));
-    }
-
-    let entries = mgr
-        .find_memories_by_symbol(symbol)
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let total = entries.len();
-    Ok(Json(serde_json::json!({
-        "enabled": true,
-        "symbol": symbol,
-        "entries": entries,
-        "total": total,
-    })))
-}
-
-async fn memory_search_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let query = params.get("q").cloned().unwrap_or_default();
-    if let Some(ref mgr) = state.memory_manager {
-        match mgr.search(&query).await {
-            Ok(results) => Json(serde_json::json!({ "results": results })),
-            Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
-        }
-    } else {
-        Json(serde_json::json!({ "results": [] }))
-    }
-}
-
-async fn memory_recall_explain_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let query = params.get("q").cloned().unwrap_or_default();
-    let limit = params
-        .get("limit")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(10)
-        .clamp(1, 50);
-
-    let Some(ref mgr) = state.memory_manager else {
-        return Json(serde_json::json!({
-            "enabled": false,
-            "query": query,
-            "mode": "disabled",
-            "degraded": true,
-            "degraded_reason": "memory not configured",
-            "total": 0,
-            "results": [],
-            "keywords": [],
-            "categories": [],
-        }));
-    };
-
-    let request = SearchMemoriesRequest {
-        query: query.clone(),
-        limit,
-        with_snippets: true,
-        with_keywords: true,
-        ..Default::default()
-    };
-
-    match mgr.search_memories(request).await {
-        Ok(result) => {
-            let mode = result.search_mode.clone();
-            let results: Vec<_> = result
-                .entries
-                .into_iter()
-                .enumerate()
-                .map(|(index, entry)| {
-                    let snippet = result
-                        .snippets
-                        .get(index)
-                        .and_then(|snippet| snippet.as_ref())
-                        .map(|snippet| snippet.text.clone());
-                    serde_json::json!({
-                        "id": entry.id,
-                        "title": entry.title,
-                        "content": entry.content,
-                        "source_layer": format!("{:?}", entry.layer),
-                        "category": format!("{:?}", entry.category),
-                        "priority": format!("{:?}", entry.priority),
-                        "scope": entry.scope.to_string(),
-                        "score": entry.confidence,
-                        "mode": mode,
-                        "snippet": snippet,
-                        "tags": entry.tags,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({
-                "enabled": true,
-                "query": result.query,
-                "mode": mode,
-                "degraded": false,
-                "degraded_reason": null,
-                "total": result.total_matches,
-                "results": results,
-                "keywords": result.keywords,
-                "categories": result.categories_found,
-            }))
-        }
-        Err(e) => Json(serde_json::json!({
-            "enabled": true,
-            "query": query,
-            "mode": mgr.search_mode_label(),
-            "degraded": true,
-            "degraded_reason": e.to_string(),
-            "total": 0,
-            "results": [],
-            "keywords": [],
-            "categories": [],
-        })),
-    }
-}
-
-async fn memory_packet_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
-    let query = params.get("q").cloned().unwrap_or_default();
-    let max_items = params
-        .get("max_items")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(12)
-        .clamp(1, 64);
-    let max_tokens = params
-        .get("max_tokens")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(2_000)
-        .clamp(64, 32_000);
-
-    let Some(ref mgr) = state.memory_manager else {
-        return Json(serde_json::json!({
-            "enabled": false,
-            "query": query,
-            "packet": null,
-            "degraded": true,
-            "degraded_reason": "memory not configured",
-        }));
-    };
-
-    let mgr = Arc::clone(mgr);
-    let query_for_packet = query.clone();
-    let packet_result = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| err.to_string())?;
-        rt.block_on(async move {
-            let kernel = MemoryKernel::new(mgr);
-            let ctx = MemoryTurnContext::new("api-memory-packet", "api");
-            kernel
-                .context_packet(&ctx, &query_for_packet, &[], max_items, max_tokens)
-                .await
-                .map_err(|err| err.to_string())
-        })
-    })
-    .await
-    .map_err(|err| err.to_string())
-    .and_then(|result| result);
-
-    match packet_result {
-        Ok(packet) => Json(serde_json::json!({
-            "enabled": true,
-            "query": query,
-            "packet": packet,
-            "degraded": false,
-            "degraded_reason": null,
-        })),
-        Err(error) => Json(serde_json::json!({
-            "enabled": true,
-            "query": query,
-            "packet": null,
-            "degraded": true,
-            "degraded_reason": error,
-        })),
-    }
-}
-
-async fn memory_links_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    let Some(ref mgr) = state.memory_manager else {
-        return Json(serde_json::json!({
-            "enabled": false,
-            "links": [],
-            "degraded": true,
-            "degraded_reason": "memory not configured",
-        }));
-    };
-    let kernel = MemoryKernel::new(Arc::clone(mgr));
-    match kernel.links().await {
-        Ok(links) => Json(serde_json::json!({
-            "enabled": true,
-            "links": links,
-            "total": links.len(),
-            "degraded": false,
-            "degraded_reason": null,
-        })),
-        Err(error) => Json(serde_json::json!({
-            "enabled": true,
-            "links": [],
-            "total": 0,
-            "degraded": true,
-            "degraded_reason": error.to_string(),
-        })),
-    }
-}
-
-async fn performance_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    if let Some(ref mgr) = state.memory_manager {
-        let report = mgr.performance_report();
-        Json(serde_json::json!(report))
-    } else {
-        Json(serde_json::json!({
-            "error": "memory not configured",
-        }))
-    }
-}
-
-fn empty_memory_layers() -> Vec<serde_json::Value> {
-    ["L0", "L1", "L2", "L3", "L4"]
-        .into_iter()
-        .map(|layer| serde_json::json!({ "layer": layer, "entry_count": 0 }))
-        .collect()
-}
-
-fn parse_memory_layer(layer: &str) -> Option<MemoryLayer> {
-    match layer.to_ascii_uppercase().as_str() {
-        "L0" => Some(MemoryLayer::L0),
-        "L1" => Some(MemoryLayer::L1),
-        "L2" => Some(MemoryLayer::L2),
-        "L3" => Some(MemoryLayer::L3),
-        "L4" => Some(MemoryLayer::L4),
-        _ => None,
-    }
-}
-
-fn parse_memory_category(category: &str) -> Option<MemoryCategory> {
-    match category.to_ascii_lowercase().as_str() {
-        "userpreference" | "user_preference" => Some(MemoryCategory::UserPreference),
-        "projectconvention" | "project_convention" => Some(MemoryCategory::ProjectConvention),
-        "decision" => Some(MemoryCategory::Decision),
-        "reference" => Some(MemoryCategory::Reference),
-        "shared" => Some(MemoryCategory::Shared),
-        "compressedsummary" | "compressed_summary" => Some(MemoryCategory::CompressedSummary),
-        "projectknowledge" | "project_knowledge" => Some(MemoryCategory::ProjectKnowledge),
-        _ => None,
-    }
-}
-
-fn parse_memory_priority(priority: &str) -> Option<Priority> {
-    match priority.to_ascii_lowercase().as_str() {
-        "critical" => Some(Priority::Critical),
-        "high" => Some(Priority::High),
-        "normal" => Some(Priority::Normal),
-        "low" => Some(Priority::Low),
-        _ => None,
-    }
-}
-
-fn parse_maintenance_kind(kind: &str) -> Option<MaintenanceCandidateKind> {
-    match kind.to_ascii_lowercase().as_str() {
-        "conflict" => Some(MaintenanceCandidateKind::Conflict),
-        "stale" => Some(MaintenanceCandidateKind::Stale),
-        "duplicate" => Some(MaintenanceCandidateKind::Duplicate),
-        "authoritypromotion" | "authority_promotion" => {
-            Some(MaintenanceCandidateKind::AuthorityPromotion)
-        }
-        "relationshiprefresh" | "relationship_refresh" => {
-            Some(MaintenanceCandidateKind::RelationshipRefresh)
-        }
-        _ => None,
-    }
-}
-
-fn parse_maintenance_status(status: &str) -> Option<MaintenanceCandidateStatus> {
-    match status.to_ascii_lowercase().as_str() {
-        "open" => Some(MaintenanceCandidateStatus::Open),
-        "acknowledged" | "ack" => Some(MaintenanceCandidateStatus::Acknowledged),
-        "applied" => Some(MaintenanceCandidateStatus::Applied),
-        "dismissed" | "dismiss" => Some(MaintenanceCandidateStatus::Dismissed),
-        _ => None,
-    }
-}
-
 fn api_error(status: StatusCode, error: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     (
         status,
@@ -2691,1640 +338,90 @@ fn api_error(status: StatusCode, error: impl Into<String>) -> (StatusCode, Json<
     )
 }
 
-async fn tools_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let tools: Vec<serde_json::Value> = state
-        .tool_registry
-        .definitions(None)
-        .iter()
-        .map(|t| {
-            serde_json::json!({
-                "name": t.name,
-                "description": t.description,
-                "enabled": true,
-            })
-        })
-        .collect();
-    Json(serde_json::json!({ "tools": tools, "count": tools.len() }))
-}
-
-async fn config_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    match &state.config {
-        Some(config) => Json(config.clone()),
-        None => Json(serde_json::json!({
-            "error": "config not loaded",
-            "model": "unknown",
-            "version": env!("CARGO_PKG_VERSION"),
-        })),
-    }
-}
-
-async fn profiles_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let profiles = state.profile_manager.list_profiles();
-    Json(serde_json::json!({
-        "profiles": profiles,
-        "active_profile": state.profile_manager.active_id(),
-        "runtime_profile": state.profile_id,
-        "profiles_dir": state.profile_manager.profiles_dir().display().to_string(),
-    }))
-}
-
-async fn create_profile_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<CreateProfileRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let name = body.name.trim();
-    if name.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "profile name is required",
-        ));
-    }
-    let profile = state
-        .profile_manager
-        .create_profile(name)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "profile": {
-                "id": profile.id,
-                "name": profile.name,
-                "base_dir": profile.base_dir.display().to_string(),
-                "config_path": profile.config_path().display().to_string(),
-                "memory_dir": profile.memory_dir().display().to_string(),
-                "permissions_path": profile.permissions_path().display().to_string(),
-            },
-            "active_profile": state.profile_manager.active_id(),
-            "runtime_profile": state.profile_id,
-            "restart_required": false,
-        })),
-    ))
-}
-
-async fn switch_profile_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<SwitchProfileRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let profile = body.profile.trim();
-    if profile.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "profile is required"));
-    }
-    state
-        .profile_manager
-        .switch_profile(profile)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    Ok(Json(serde_json::json!({
-        "active_profile": state.profile_manager.active_id(),
-        "runtime_profile": state.profile_id,
-        "restart_required": state.profile_manager.active_id() != state.profile_id,
-        "message": "profile switch persisted; restart the daemon to move memory/session roots",
-    })))
-}
-
-async fn delete_profile_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .profile_manager
-        .delete_profile(&id)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    Ok(Json(serde_json::json!({
-        "deleted": id,
-        "active_profile": state.profile_manager.active_id(),
-        "runtime_profile": state.profile_id,
-    })))
-}
-
-async fn workspace_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let workspace_root = state.workspace_root.clone();
-    let workspace_canonical = workspace_root.canonicalize().ok();
-    Json(serde_json::json!({
-        "workspace_root": workspace_root.display().to_string(),
-        "workspace_canonical": workspace_canonical.map(|path| path.display().to_string()),
-        "profile_id": state.profile_id,
-        "config_home": state.config_home.display().to_string(),
-        "sessions_db": state.config_home.join("sessions.db").display().to_string(),
-        "memory_dir": state.config_home.join("memory").display().to_string(),
-    }))
-}
-
-async fn workspaces_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "workspaces": [{
-            "id": "current",
-            "name": state.workspace_root.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("workspace"),
-            "path": state.workspace_root.display().to_string(),
-            "active": true,
-            "profile_id": state.profile_id,
-        }]
-    }))
-}
-
-async fn workspace_files_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<WorkspaceFilesParams>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let root = workspace_root_canonical(&state.workspace_root)
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let dir = resolve_existing_workspace_path(&state.workspace_root, params.dir.as_deref())
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    if !dir.is_dir() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "path is not a directory",
-        ));
-    }
-
-    let mut files = fs::read_dir(&dir)
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .flatten()
-        .filter_map(|entry| workspace_file_item(&root, entry.path()))
-        .collect::<Vec<_>>();
-    files.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
-    files.truncate(500);
-
-    Ok(Json(serde_json::json!({
-        "workspace_root": state.workspace_root.display().to_string(),
-        "dir": workspace_relative_path(&root, &dir),
-        "files": files,
-    })))
-}
-
-async fn create_workspace_file_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<CreateWorkspaceFileRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let target = resolve_new_workspace_file_path(&state.workspace_root, &body.path)
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    if target.exists() && target.is_dir() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "path is a directory"));
-    }
-    fs::write(&target, body.content)
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let root = workspace_root_canonical(&state.workspace_root)
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "path": workspace_relative_path(&root, &target),
-            "created": true,
-        })),
-    ))
-}
-
-async fn raw_workspace_file_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<RawFileParams>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let file = resolve_existing_workspace_path(&state.workspace_root, Some(&params.path))
-        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    if !file.is_file() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "path is not a file"));
-    }
-    let bytes =
-        fs::read(&file).map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/octet-stream")],
-        bytes,
-    ))
-}
-
-async fn approval_pending_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let pending = match &state.approval_gate {
-        Some(gate) => gate.get_pending_requests().await,
-        None => Vec::new(),
-    };
-    Json(serde_json::json!(pending))
-}
-
-async fn approval_config_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let cfg = match &state.approval_gate {
-        Some(gate) => gate.config().read().await.clone(),
-        None => ApprovalConfig::default(),
-    };
-    Json(serde_json::json!(cfg))
-}
-
-async fn update_approval_config_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(config): Json<ApprovalConfig>,
-) -> impl IntoResponse {
-    if let Some(gate) = &state.approval_gate {
-        gate.update_config(config.clone()).await;
-    }
-    Json(serde_json::json!(config))
-}
-
-async fn toggle_solo_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    let mut cfg = match &state.approval_gate {
-        Some(gate) => gate.config().read().await.clone(),
-        None => ApprovalConfig::default(),
-    };
-    cfg.solo_mode = !cfg.solo_mode;
-    if let Some(gate) = &state.approval_gate {
-        gate.update_config(cfg.clone()).await;
-    }
-    Json(serde_json::json!(cfg))
-}
-
-async fn approval_history_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(50)
-        .min(200);
-    let offset = params
-        .get("offset")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let history = match &state.approval_gate {
-        Some(gate) => gate.history().list_history(limit, offset).await.0,
-        None => Vec::new(),
-    };
-    Json(serde_json::json!(history))
-}
-
-async fn audit_export_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(100)
-        .min(500);
-    let offset = params
-        .get("offset")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let source = params.get("source").map(String::as_str).unwrap_or("all");
-    let include_approval = matches!(source, "all" | "approval");
-    let include_memory = matches!(source, "all" | "memory");
-
-    let (approval, approval_total) = if include_approval {
-        match &state.approval_gate {
-            Some(gate) => gate.history().list_history(limit + offset, 0).await,
-            None => (Vec::new(), 0),
-        }
-    } else {
-        (Vec::new(), 0)
-    };
-    let memory = if include_memory {
-        match &state.memory_manager {
-            Some(manager) => manager.audit_entries(limit + offset).unwrap_or_default(),
-            None => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
-    let memory_total = memory.len();
-
-    let mut records = Vec::new();
-    for entry in &approval {
-        records.push(serde_json::json!({
-            "source": "approval",
-            "timestamp": entry.resolved_at,
-            "id": entry.id,
-            "summary": entry.command,
-            "record": entry,
-        }));
-    }
-    for entry in &memory {
-        records.push(serde_json::json!({
-            "source": "memory",
-            "timestamp": entry.timestamp,
-            "id": entry.entry_id,
-            "summary": entry.summary,
-            "record": entry,
-        }));
-    }
-    records.sort_by(|a, b| {
-        b.get("timestamp")
-            .and_then(|v| v.as_str())
-            .cmp(&a.get("timestamp").and_then(|v| v.as_str()))
-    });
-    let total = records.len();
-    let records = records
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>();
-
-    Json(serde_json::json!({
-        "kind": "audit_export",
-        "generated_at": chrono::Utc::now(),
-        "source": source,
-        "limit": limit,
-        "offset": offset,
-        "total": total,
-        "totals": {
-            "approval": approval_total,
-            "memory": memory_total,
-        },
-        "records": records,
-        "approval": approval,
-        "memory": memory,
-    }))
-}
-
-async fn approval_respond_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<ApprovalRespondRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(gate) = &state.approval_gate else {
-        return Err(api_error(
-            StatusCode::NOT_FOUND,
-            "approval gate not configured",
-        ));
-    };
-    let persistence = match body.persistence.as_deref().unwrap_or("once") {
-        "session" => ApprovalPersistence::Session,
-        "always" => ApprovalPersistence::Always,
-        _ => ApprovalPersistence::Once,
-    };
-    let verdict = if body.approved {
-        ApprovalVerdict::Approved
-    } else {
-        ApprovalVerdict::Denied {
-            reason: body.reason.unwrap_or_else(|| "denied by user".to_string()),
-        }
-    };
-    let Some(request) = gate.resolve_approval(&body.id, verdict, persistence).await else {
-        return Err(api_error(
-            StatusCode::NOT_FOUND,
-            "approval request not found",
-        ));
-    };
-    Ok(Json(serde_json::json!({
-        "id": body.id,
-        "resolved": true,
-        "approved": body.approved,
-        "tool": "bash",
-        "action": request.command,
-    })))
-}
-
-// ── Session messages handler ────────────────────────────────────
-
-async fn get_session_messages(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Query(params): Query<GetMessagesParams>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let offset = params.offset.unwrap_or(0);
-    let from_seq = params.from_seq;
-    let limit = params.limit.unwrap_or(50).min(500);
-
-    // Try unified store for DB-backed pagination
-    if state.has_unified_store() {
-        let total = state
-            .session_kernel
-            .stored_message_count(&id)
-            .await
-            .unwrap_or(Some(0))
-            .unwrap_or(0);
-        let db_messages = if let Some(seq) = from_seq {
-            state
-                .session_kernel
-                .stored_messages_from_sequence(&id, seq, limit)
-                .await
-                .unwrap_or(Some(Vec::new()))
-                .unwrap_or_default()
-        } else {
-            state
-                .session_kernel
-                .stored_messages(&id, offset, limit)
-                .await
-                .unwrap_or(Some(Vec::new()))
-                .unwrap_or_default()
-        };
-        let messages: Vec<serde_json::Value> = db_messages
-            .iter()
-            .map(|m| {
-                let blocks: Vec<serde_json::Value> =
-                    serde_json::from_str(&m.content_json).unwrap_or_default();
-                let mut val = serde_json::json!({
-                    "session_id": m.session_id,
-                    "sequence": m.sequence,
-                    "role": m.role,
-                    "blocks": blocks,
-                    "created_at_ms": m.created_at_ms,
-                });
-                if let Some(ref tu) = m.token_usage_json {
-                    if let Ok(usage) = serde_json::from_str::<serde_json::Value>(tu) {
-                        val["token_usage"] = usage;
-                    }
-                }
-                if let Some(ref tid) = m.tool_use_id {
-                    val["tool_use_id"] = serde_json::Value::String(tid.clone());
-                }
-                if let Some(ref tn) = m.tool_name {
-                    val["tool_name"] = serde_json::Value::String(tn.clone());
-                }
-                val
-            })
-            .collect();
-        let next_seq = db_messages.last().map(|m| m.sequence + 1);
-        let has_more = next_seq
-            .map(|seq| seq < total)
-            .unwrap_or_else(|| from_seq.unwrap_or(offset) < total);
-        return Ok(Json(serde_json::json!({
-            "session_id": id,
-            "messages": messages,
-            "total": total,
-            "offset": offset,
-            "from_seq": from_seq,
-            "next_seq": next_seq,
-            "limit": limit,
-            "has_more": has_more,
-        })));
-    }
-
-    // Fallback: in-memory session
-    let runtime_entry = state.active_runtime(&id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        )
-    })?;
-
-    let runtime_guard = runtime_entry.lock().await;
-    let session = runtime_guard.session();
-
-    let all_messages: Vec<serde_json::Value> = session
-        .messages
-        .iter()
-        .map(|msg| {
-            let role = match msg.role {
-                runtime::MessageRole::System => "system",
-                runtime::MessageRole::User => "user",
-                runtime::MessageRole::Assistant => "assistant",
-                runtime::MessageRole::Tool => "tool",
-            };
-            let blocks: Vec<serde_json::Value> = msg
-                .blocks
-                .iter()
-                .map(|block| match block {
-                    runtime::ContentBlock::Text { text } => {
-                        serde_json::json!({"type": "text", "text": text})
-                    }
-                    runtime::ContentBlock::Thinking { thinking, signature } => {
-                        let mut val = serde_json::json!({"type": "thinking", "thinking": thinking});
-                        if let Some(sig) = signature {
-                            val["signature"] = serde_json::Value::String(sig.clone());
-                        }
-                        val
-                    }
-                    runtime::ContentBlock::ToolUse { id, name, input } => {
-                        serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
-                    }
-                    runtime::ContentBlock::ToolResult { tool_use_id, tool_name, output, is_error } => {
-                        serde_json::json!({"type": "tool_result", "tool_use_id": tool_use_id, "tool_name": tool_name, "output": output, "is_error": is_error})
-                    }
-                })
-                .collect();
-
-            let mut val = serde_json::json!({"role": role, "blocks": blocks});
-            if let Some(usage) = &msg.usage {
-                val["usage"] = serde_json::json!({
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": usage.cache_read_input_tokens,
-                });
-            }
-            val
-        })
-        .collect();
-
-    let total = all_messages.len();
-    let start = from_seq.unwrap_or(offset);
-    let messages: Vec<serde_json::Value> =
-        all_messages.into_iter().skip(start).take(limit).collect();
-    let next_seq = (!messages.is_empty()).then_some(start + messages.len());
-    let has_more = next_seq.map(|seq| seq < total).unwrap_or(start < total);
-
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "messages": messages,
-        "total": total,
-        "offset": offset,
-        "from_seq": from_seq,
-        "next_seq": next_seq,
-        "limit": limit,
-        "has_more": has_more,
-    })))
-}
-
-async fn get_session_events(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Query(params): Query<GetEventsParams>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let from_seq = params.from_seq.unwrap_or(0);
-    let limit = params.limit.unwrap_or(100).min(500);
-    let Some((total, stored_events)) = state
-        .session_kernel
-        .stored_events_page(&id, from_seq, limit)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to load session events: {e}"),
-                }),
-            )
-        })?
-    else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "session store not available".to_string(),
-            }),
-        ));
-    };
-    let events: Vec<serde_json::Value> = stored_events
-        .into_iter()
-        .map(|event| {
-            let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
-                .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
-            serde_json::json!({
-                "session_id": event.session_id,
-                "type": event.event_type,
-                "sequence": event.sequence,
-                "created_at_ms": event.created_at_ms,
-                "payload": payload,
-            })
-        })
-        .collect();
-    let has_more = events.len() < total;
-
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "events": events,
-        "total": total,
-        "from_seq": from_seq,
-        "limit": limit,
-        "has_more": has_more,
-    })))
-}
-
-fn runtime_run_event_json(event: SessionEvent) -> serde_json::Value {
-    let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
-        .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
-    serde_json::json!({
-        "session_id": event.session_id,
-        "type": event.event_type,
-        "sequence": event.sequence,
-        "created_at_ms": event.created_at_ms,
-        "run": payload,
-    })
-}
-
-fn runtime_run_tree_summary(runs: &[serde_json::Value]) -> serde_json::Value {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    let mut parents: BTreeMap<String, Option<String>> = BTreeMap::new();
-    let mut children: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut latest_status: BTreeMap<String, String> = BTreeMap::new();
-    let mut failed_count = 0usize;
-    let mut completed_count = 0usize;
-    let mut running_count = 0usize;
-
-    for event in runs {
-        let run = &event["run"];
-        let Some(run_id) = run.get("run_id").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let parent = run
-            .get("parent_run_id")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-        parents.entry(run_id.to_string()).or_insert(parent.clone());
-        if let Some(parent_id) = parent {
-            children
-                .entry(parent_id)
-                .or_default()
-                .insert(run_id.to_string());
-        }
-        if let Some(status) = run.get("status").and_then(|value| value.as_str()) {
-            latest_status.insert(run_id.to_string(), status.to_string());
-        }
-    }
-
-    for status in latest_status.values() {
-        match status.as_str() {
-            "completed" => completed_count += 1,
-            "failed" | "timeout" | "cancelled" => failed_count += 1,
-            "running" => running_count += 1,
-            _ => {}
-        }
-    }
-
-    let roots = parents
-        .iter()
-        .filter_map(|(run_id, parent)| {
-            let is_root = match parent.as_ref() {
-                Some(parent_id) => !parents.contains_key(parent_id),
-                None => true,
-            };
-            if is_root {
-                Some(run_id.clone())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    let root_count = roots.len();
-    let child_map = children
-        .into_iter()
-        .map(|(parent, child_ids)| (parent, child_ids.into_iter().collect::<Vec<_>>()))
-        .collect::<BTreeMap<_, _>>();
-
-    serde_json::json!({
-        "roots": roots,
-        "children": child_map,
-        "summary": {
-            "event_count": runs.len(),
-            "span_count": parents.len(),
-            "root_count": root_count,
-            "completed_count": completed_count,
-            "failed_count": failed_count,
-            "running_count": running_count,
-        }
-    })
-}
-
-async fn get_session_runs(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Query(params): Query<GetEventsParams>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let from_seq = params.from_seq.unwrap_or(0);
-    let limit = params.limit.unwrap_or(50).min(200);
-    let Some((total, stored_events)) = state
-        .session_kernel
-        .stored_events_by_type_page(&id, "RuntimeRun", from_seq, limit)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to load runtime runs: {e}"),
-                }),
-            )
-        })?
-    else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "session store not available".to_string(),
-            }),
-        ));
-    };
-
-    let runs: Vec<serde_json::Value> = stored_events
-        .into_iter()
-        .map(runtime_run_event_json)
-        .collect();
-    let tree = runtime_run_tree_summary(&runs);
-    let next_seq = runs
-        .last()
-        .and_then(|event| event["sequence"].as_u64())
-        .map(|sequence| sequence as usize + 1);
-    let has_more = runs.len() < total;
-
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "runs": runs,
-        "tree": tree,
-        "total": total,
-        "from_seq": from_seq,
-        "next_seq": next_seq,
-        "limit": limit,
-        "has_more": has_more,
-    })))
-}
-
-fn context_envelope_event_json(event: SessionEvent) -> serde_json::Value {
-    let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
-        .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
-    let envelope = payload
-        .get("envelope")
-        .cloned()
-        .unwrap_or_else(|| payload.clone());
-    let envelope_id = payload
-        .get("envelope_id")
-        .cloned()
-        .or_else(|| envelope.get("id").cloned())
-        .unwrap_or(serde_json::Value::Null);
-    let run_id = payload
-        .get("run_id")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-
-    serde_json::json!({
-        "session_id": event.session_id,
-        "type": event.event_type,
-        "sequence": event.sequence,
-        "created_at_ms": event.created_at_ms,
-        "envelope_id": envelope_id,
-        "run_id": run_id,
-        "envelope": envelope,
-    })
-}
-
-async fn get_session_context_history(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Query(params): Query<GetEventsParams>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let from_seq = params.from_seq.unwrap_or(0);
-    let limit = params.limit.unwrap_or(50).min(200);
-    let Some((total, stored_events)) = state
-        .session_kernel
-        .stored_events_by_type_page(&id, "ContextEnvelope", from_seq, limit)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to load context timeline: {e}"),
-                }),
-            )
-        })?
-    else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "session store not available".to_string(),
-            }),
-        ));
-    };
-
-    let envelopes: Vec<serde_json::Value> = stored_events
-        .into_iter()
-        .map(context_envelope_event_json)
-        .collect();
-    let next_seq = envelopes
-        .last()
-        .and_then(|event| event["sequence"].as_u64())
-        .map(|sequence| sequence as usize + 1);
-    let has_more = envelopes.len() < total;
-
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "envelopes": envelopes,
-        "total": total,
-        "from_seq": from_seq,
-        "next_seq": next_seq,
-        "limit": limit,
-        "has_more": has_more,
-    })))
-}
-
-async fn get_context_envelope_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(envelope_id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if !state.has_unified_store() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "session store not available".to_string(),
-            }),
-        ));
-    }
-
-    let Some(event) = state
-        .session_kernel
-        .context_event_by_envelope_id(&envelope_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to load context envelope: {e}"),
-                }),
-            )
-        })?
-    else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("context envelope {envelope_id} not found"),
-            }),
-        ));
-    };
-
-    Ok(Json(serde_json::json!({
-        "enabled": true,
-        "source": "history",
-        "context": context_envelope_event_json(event),
-    })))
-}
-
-async fn get_context_recommendation_stats(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Query(params): Query<GetRecommendationStatsParams>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let from_seq = params.from_seq.unwrap_or(0);
-    let limit = params.limit.unwrap_or(200).min(500);
-    let Some((total, stored_events)) = state
-        .session_kernel
-        .stored_events_by_type_page(&id, "ContextRecommendationAction", from_seq, limit)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to load context recommendation stats: {e}"),
-                }),
-            )
-        })?
-    else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "session store not available".to_string(),
-            }),
-        ));
-    };
-
-    let event_count = stored_events.len();
-    let mut grouped: HashMap<String, serde_json::Value> = HashMap::new();
-    for event in stored_events {
-        let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
-            .unwrap_or_else(|_| serde_json::json!({}));
-        let Some(recommendation) = payload
-            .get("recommendation")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let action = payload
-            .get("action")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("acknowledged");
-        let entry = grouped.entry(recommendation.to_string()).or_insert_with(|| {
-            serde_json::json!({
-                "recommendation": recommendation,
-                "count": 0_u64,
-                "actions": {},
-                "latest_envelope_id": null,
-                "latest_created_at_ms": 0_u64,
-            })
-        });
-        let count = entry["count"].as_u64().unwrap_or(0) + 1;
-        entry["count"] = serde_json::json!(count);
-        let action_count = entry["actions"][action].as_u64().unwrap_or(0) + 1;
-        entry["actions"][action] = serde_json::json!(action_count);
-        if event.created_at_ms >= entry["latest_created_at_ms"].as_u64().unwrap_or(0) {
-            entry["latest_created_at_ms"] = serde_json::json!(event.created_at_ms);
-            entry["latest_envelope_id"] = payload
-                .get("envelope_id")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-        }
-    }
-
-    let mut recommendations: Vec<serde_json::Value> = grouped.into_values().collect();
-    recommendations.sort_by(|left, right| {
-        right["count"]
-            .as_u64()
-            .cmp(&left["count"].as_u64())
-            .then_with(|| {
-                left["recommendation"]
-                    .as_str()
-                    .cmp(&right["recommendation"].as_str())
-            })
-    });
-
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "recommendations": recommendations,
-        "total": total,
-        "from_seq": from_seq,
-        "limit": limit,
-        "has_more": event_count < total,
-    })))
-}
-
-async fn resolve_evidence_ref_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(reference) = params.get("ref").map(|value| value.trim()).filter(|value| !value.is_empty()) else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "ref query parameter is required".to_string(),
-            }),
-        ));
-    };
-    let session_id = params
-        .get("session_id")
-        .cloned()
-        .or_else(|| state.list_active_session_ids().into_iter().next());
-
-    let resolved = if let Some(path) = reference.strip_prefix("workspace://changed-file/") {
-        resolve_workspace_evidence(&state.workspace_root, reference, path)
-    } else if let Some(symbol) = reference.strip_prefix("workspace://symbol/") {
-        serde_json::json!({
-            "ref": reference,
-            "kind": "workspace_symbol",
-            "available": true,
-            "symbol": symbol,
-        })
-    } else if let Some(session_ref) = reference.strip_prefix("session://") {
-        resolve_session_evidence(&state, reference, session_ref).await
-    } else if reference.starts_with("tool://") {
-        resolve_tool_evidence(&state, reference, session_id.as_deref()).await
-    } else if reference.starts_with("agent://") {
-        serde_json::json!({
-            "ref": reference,
-            "kind": "agent",
-            "available": false,
-            "reason": "agent evidence payload drilldown is not persisted yet",
-        })
-    } else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("unsupported evidence ref: {reference}"),
-            }),
-        ));
-    };
-
-    Ok(Json(resolved))
-}
-
-fn resolve_workspace_evidence(root: &FsPath, reference: &str, relative: &str) -> serde_json::Value {
-    const MAX_BYTES: u64 = 256 * 1024;
-    const PREVIEW_BYTES: usize = 4096;
-
-    let path = root.join(relative);
-    let Ok(canonical_root) = root.canonicalize() else {
-        return serde_json::json!({
-            "ref": reference,
-            "kind": "workspace_file",
-            "available": false,
-            "reason": "workspace root unavailable",
-        });
-    };
-    let Ok(canonical_path) = path.canonicalize() else {
-        return serde_json::json!({
-            "ref": reference,
-            "kind": "workspace_file",
-            "available": false,
-            "reason": "file unavailable",
-        });
-    };
-    if !canonical_path.starts_with(&canonical_root) {
-        return serde_json::json!({
-            "ref": reference,
-            "kind": "workspace_file",
-            "available": false,
-            "reason": "file is outside workspace",
-        });
-    }
-    let Ok(metadata) = std::fs::metadata(&canonical_path) else {
-        return serde_json::json!({
-            "ref": reference,
-            "kind": "workspace_file",
-            "available": false,
-            "reason": "file metadata unavailable",
-        });
-    };
-    if !metadata.is_file() {
-        return serde_json::json!({
-            "ref": reference,
-            "kind": "workspace_file",
-            "available": false,
-            "reason": "path is not a file",
-        });
-    }
-    if metadata.len() > MAX_BYTES {
-        return serde_json::json!({
-            "ref": reference,
-            "kind": "workspace_file",
-            "available": true,
-            "truncated": true,
-            "size_bytes": metadata.len(),
-            "reason": "file exceeds preview limit",
-        });
-    }
-    let preview = std::fs::read_to_string(&canonical_path)
-        .map(|content| content.chars().take(PREVIEW_BYTES).collect::<String>())
-        .unwrap_or_default();
-    serde_json::json!({
-        "ref": reference,
-        "kind": "workspace_file",
-        "available": true,
-        "path": relative,
-        "size_bytes": metadata.len(),
-        "preview": preview,
-        "truncated": metadata.len() as usize > PREVIEW_BYTES,
-    })
-}
-
-async fn resolve_session_evidence(
-    state: &AppState,
-    reference: &str,
-    session_ref: &str,
-) -> serde_json::Value {
-    let session_id = session_ref.split('/').next().unwrap_or_default();
-    if session_id.is_empty() {
-        return serde_json::json!({
-            "ref": reference,
-            "kind": "session",
-            "available": false,
-            "reason": "missing session id",
-        });
-    }
-    match state.session_kernel.stored_session(session_id).await {
-        Ok(Some(session)) => serde_json::json!({
-            "ref": reference,
-            "kind": "session",
-            "available": true,
-            "session": {
-                "session_id": session.session_id,
-                "platform": session.platform,
-                "model": session.model,
-                "created_at": session.created_at,
-                "last_activity": session.last_activity,
-                "message_count": session.message_count,
-                "status": session.status,
-            },
-        }),
-        Ok(None) => serde_json::json!({
-            "ref": reference,
-            "kind": "session",
-            "available": false,
-            "reason": "session not found",
-        }),
-        Err(error) => serde_json::json!({
-            "ref": reference,
-            "kind": "session",
-            "available": false,
-            "reason": format!("session lookup failed: {error}"),
-        }),
-    }
-}
-
-async fn resolve_tool_evidence(
-    state: &AppState,
-    reference: &str,
-    session_id: Option<&str>,
-) -> serde_json::Value {
-    let Some(session_id) = session_id else {
-        return serde_json::json!({
-            "ref": reference,
-            "kind": "tool",
-            "available": false,
-            "reason": "session_id is required for tool evidence",
-        });
-    };
-    let tool_id = reference
-        .strip_prefix("tool://")
-        .and_then(|tail| tail.split('/').next())
-        .unwrap_or_default();
-    let Some((_, events)) = state
-        .session_kernel
-        .stored_events_page(session_id, 0, 500)
-        .await
-        .ok()
-        .flatten()
-    else {
-        return serde_json::json!({
-            "ref": reference,
-            "kind": "tool",
-            "available": false,
-            "reason": "session events unavailable",
-        });
-    };
-    let matches = events
-        .into_iter()
-        .filter_map(|event| {
-            let payload = serde_json::from_str::<serde_json::Value>(&event.event_json).ok()?;
-            let id_matches = payload
-                .get("id")
-                .and_then(|value| value.as_str())
-                .is_some_and(|id| id == tool_id)
-                || payload
-                    .get("tool_use_id")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|id| id == tool_id);
-            id_matches.then(|| serde_json::json!({
-                "type": event.event_type,
-                "sequence": event.sequence,
-                "created_at_ms": event.created_at_ms,
-                "payload": payload,
-            }))
-        })
-        .collect::<Vec<_>>();
-
-    serde_json::json!({
-        "ref": reference,
-        "kind": "tool",
-        "available": !matches.is_empty(),
-        "session_id": session_id,
-        "events": matches,
-    })
-}
-
-async fn record_context_recommendation_action(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<ContextRecommendationActionRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if body.envelope_id.trim().is_empty() || body.recommendation.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "envelope_id and recommendation are required".to_string(),
-            }),
-        ));
-    }
-    let action = if body.action.trim().is_empty() {
-        "acknowledged".to_string()
-    } else {
-        body.action
-    };
-    let payload = serde_json::json!({
-        "type": "ContextRecommendationAction",
-        "session_id": id.clone(),
-        "envelope_id": body.envelope_id,
-        "recommendation": body.recommendation,
-        "action": action,
-        "note": body.note,
-    });
-    state
-        .session_kernel
-        .append_timeline_event(&id, "ContextRecommendationAction", payload.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to record context recommendation action: {e}"),
-                }),
-            )
-        })?;
-
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "session_id": id,
-        "event": payload,
-    })))
-}
-
-// ── Session messages search handler ───────────────────────────────
-
-async fn search_messages_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Query(params): Query<SearchMessagesParams>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let Some(db_messages) = state
-        .session_kernel
-        .search_stored_messages(&params.q, params.limit)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("search failed: {e}"),
-                }),
-            )
-        })?
-    else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "session store not available".to_string(),
-            }),
-        ));
-    };
-
-    let results: Vec<SearchMessagesItem> = db_messages
-        .into_iter()
-        .map(|m| {
-            let blocks: Vec<serde_json::Value> =
-                serde_json::from_str(&m.content_json).unwrap_or_default();
-            let content_preview = blocks
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let preview = if content_preview.len() > 200 {
-                format!("{}...", &content_preview[..200])
-            } else {
-                content_preview
-            };
-            SearchMessagesItem {
-                session_id: m.session_id,
-                sequence: m.sequence,
-                role: m.role,
-                blocks,
-                content_preview: preview,
-                tool_use_id: m.tool_use_id,
-                tool_name: m.tool_name,
-                created_at_ms: m.created_at_ms,
-            }
-        })
-        .collect();
-
-    let total = results.len();
-    Ok(Json(SearchMessagesResponse {
-        query: params.q,
-        results,
-        total,
-    }))
-}
-
-// ── Session compaction handler ──────────────────────────────────
-
-async fn compact_session_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_entry = state.active_runtime(&id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        )
-    })?;
-
-    let mut runtime_guard = runtime_entry.lock().await;
-    let result = runtime_guard.compact(runtime::CompactionConfig::default());
-
-    // Apply the compacted session back if compaction actually happened
-    if result.removed_message_count > 0 {
-        *runtime_guard.session_mut() = result.compacted_session.clone();
-    }
-    let session_snapshot = runtime_guard.session().clone();
-    drop(runtime_guard);
-
-    state
-        .session_kernel
-        .sync_runtime_session_snapshot(&id, &session_snapshot)
-        .await
-        .map_err(|e| {
-            tracing::error!(session_id = %id, error = %e, "failed to sync compacted session to unified store");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("failed to sync compacted session: {e}"),
-                }),
-            )
-        })?;
-
-    tracing::info!(%id, removed = result.removed_message_count, "API session compacted");
-
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "compacted": result.removed_message_count > 0,
-        "removed_message_count": result.removed_message_count,
-        "summary": result.formatted_summary,
-    })))
-}
-
-// ── Session stats handler ────────────────────────────────────────
-
-async fn get_session_stats_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime_entry = state.active_runtime(&id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        )
-    })?;
-
-    let runtime_guard = runtime_entry.lock().await;
-    let session = runtime_guard.session();
-    let messages = &session.messages;
-
-    let user_count = messages
-        .iter()
-        .filter(|m| m.role == runtime::MessageRole::User)
-        .count();
-    let assistant_count = messages
-        .iter()
-        .filter(|m| m.role == runtime::MessageRole::Assistant)
-        .count();
-    let tool_count = messages
-        .iter()
-        .filter(|m| m.role == runtime::MessageRole::Tool)
-        .count();
-
-    let total_input_tokens: u32 = messages
-        .iter()
-        .filter_map(|m| m.usage.as_ref())
-        .map(|u| u.input_tokens)
-        .sum();
-    let total_output_tokens: u32 = messages
-        .iter()
-        .filter_map(|m| m.usage.as_ref())
-        .map(|u| u.output_tokens)
-        .sum();
-
-    let mut tool_usage: HashMap<String, usize> = HashMap::new();
-    for msg in messages {
-        if msg.role == runtime::MessageRole::Assistant {
-            for block in &msg.blocks {
-                if let runtime::ContentBlock::ToolUse { name, .. } = block {
-                    *tool_usage.entry(name.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-    }
-
-    let duration_ms = session.updated_at_ms.saturating_sub(session.created_at_ms);
-
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "message_count": messages.len(),
-        "message_counts": {
-            "user": user_count,
-            "assistant": assistant_count,
-            "tool": tool_count,
-        },
-        "tokens": {
-            "input": total_input_tokens,
-            "output": total_output_tokens,
-            "total": total_input_tokens + total_output_tokens,
-        },
-        "tool_usage": tool_usage,
-        "duration_ms": duration_ms,
-    })))
-}
-
-// ── Session PATCH / update handler ──────────────────────────────
-
-async fn update_session_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<UpdateSessionRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let mut found = false;
-
-    // Update active runtime if this session is currently loaded.
-    if let Some(runtime_entry) = state.active_runtime(&id) {
-        found = true;
-        let mut runtime_guard = runtime_entry.lock().await;
-        let mut session = runtime_guard.session_mut_async().await;
-        if let Some(ref model) = body.model {
-            session.model = Some(model.clone());
-        }
-    }
-
-    // Persist to UnifiedSessionStore if available (read-modify-write)
-    if state.has_unified_store() {
-        match state.session_kernel.stored_session(&id).await {
-            Ok(Some(mut record)) => {
-                found = true;
-                if let Some(ref model) = body.model {
-                    record.model = Some(model.clone());
-                }
-                if let Some(ref title) = body.title {
-                    let mut meta: serde_json::Value = record
-                        .metadata_json
-                        .as_deref()
-                        .and_then(|s| serde_json::from_str(s).ok())
-                        .unwrap_or(serde_json::json!({}));
-                    meta["title"] = serde_json::Value::String(title.clone());
-                    record.metadata_json = Some(serde_json::to_string(&meta).unwrap_or_default());
-                }
-                if let Some(ref metadata) = body.metadata {
-                    let mut meta: serde_json::Value = record
-                        .metadata_json
-                        .as_deref()
-                        .and_then(|s| serde_json::from_str(s).ok())
-                        .unwrap_or(serde_json::json!({}));
-                    if let Some(obj) = meta.as_object_mut() {
-                        if let Some(new_obj) = metadata.as_object() {
-                            for (k, v) in new_obj {
-                                obj.insert(k.clone(), v.clone());
-                            }
-                        }
-                    }
-                    record.metadata_json = Some(serde_json::to_string(&meta).unwrap_or_default());
-                }
-                state
-                    .session_kernel
-                    .update_stored_session(&record)
-                    .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse {
-                                error: format!("failed to update session: {e}"),
-                            }),
-                        )
-                    })?;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to load session: {e}"),
-                    }),
-                ));
-            }
-        }
-    }
-
-    if !found {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("session {id} not found"),
-            }),
-        ));
-    }
-
-    Ok(Json(serde_json::json!({
-        "session_id": id,
-        "updated": true,
-    })))
-}
-
-// ── Auth handlers (public) ──────────────────────────────────────
-
-async fn login_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<LoginRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    match &state.auth_token {
-        None => Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "auth not configured".to_string(),
-            }),
-        )),
-        Some(expected) if expected == &body.token => {
-            tracing::info!("API login successful");
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "token": body.token,
-            })))
-        }
-        Some(_) => Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "invalid token".to_string(),
-            }),
-        )),
-    }
-}
-
-async fn verify_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let auth_token = match &state.auth_token {
-        None => {
-            return Ok(Json(serde_json::json!({
-                "valid": true,
-                "auth_required": false,
-            })));
-        }
-        Some(token) => token,
-    };
-
-    let auth_header = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-
-    match auth_header {
-        Some(h) if h == format!("Bearer {auth_token}") => Ok(Json(serde_json::json!({
-            "valid": true,
-            "auth_required": true,
-        }))),
-        _ => Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "invalid or missing token".to_string(),
-            }),
-        )),
-    }
-}
-
-// ── SSE drop guard ───────────────────────────────────────────────
-
-/// Wraps an `UnboundedReceiverStream` and unsubscribes from the event bus
-/// when the stream is dropped (client disconnects), preventing sender leaks.
-struct SseStream {
-    rx: ReceiverStream<String>,
-    session_id: String,
-    event_bus: Arc<SessionEventBus>,
-    tx: mpsc::Sender<String>,
-}
-
-impl Stream for SseStream {
-    type Item = Result<Event, Infallible>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        match self.rx.poll_next_unpin(cx) {
-            std::task::Poll::Ready(Some(data)) => {
-                std::task::Poll::Ready(Some(Ok(Event::default().data(data))))
-            }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-}
-
-impl Drop for SseStream {
-    fn drop(&mut self) {
-        let event_bus = self.event_bus.clone();
-        let session_id = self.session_id.clone();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            event_bus.unsubscribe(&session_id, &tx).await;
-        });
-    }
-}
-
-// ── SSE stream handler ──────────────────────────────────────────
-
-async fn sse_stream_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(session_id): Path<String>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let (tx, rx) = mpsc::channel(256);
-    // Clone tx before subscribing — one copy moves into the event bus,
-    // the other stays with SseStream for cleanup on drop.
-    let bus_tx = tx.clone();
-    let event_bus = state.event_bus();
-    event_bus.subscribe(&session_id, bus_tx).await;
-    let _ = tx
-        .send(
-            serde_json::json!({
-                "type": "Connected",
-                "session_id": session_id,
-            })
-            .to_string(),
-        )
-        .await;
-
-    let stream = SseStream {
-        rx: ReceiverStream::new(rx),
-        session_id,
-        event_bus,
-        tx,
-    };
-
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(std::time::Duration::from_secs(15))
-            .text("keep-alive"),
-    )
-}
-
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{
-        body::Body,
         body::to_bytes,
+        body::Body,
         http::{Request, StatusCode},
     };
     use memory::config::{BudgetConfig, StoreConfig};
     use runtime::permission_enforcer::DestructivePatternDetector;
+    use runtime::platform::adapter::{
+        InboundMessage, OutboundMessage, PlatformAdapter, PlatformError, SendResult,
+    };
+    use runtime::platform::config::PlatformRuntimeConfig;
+    use runtime::platform::types::Platform;
+    use runtime::{ContextProfile, ResumeContextSource};
     use std::sync::Arc;
+    use tokio::time::Duration;
     use tower::ServiceExt;
+
+    #[derive(Clone, Default)]
+    struct CapturedTraceEvents {
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    static TRACE_CAPTURE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn trace_capture_lock() -> &'static tokio::sync::Mutex<()> {
+        TRACE_CAPTURE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    impl CapturedTraceEvents {
+        fn lines(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    struct TraceFieldVisitor {
+        fields: Vec<String>,
+    }
+
+    impl tracing::field::Visit for TraceFieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CapturedTraceEvents
+    where
+        S: tracing::Subscriber,
+    {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
+        fn enabled(
+            &self,
+            _metadata: &tracing::Metadata<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = TraceFieldVisitor { fields: Vec::new() };
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(format!(
+                "{} {} {}",
+                event.metadata().level(),
+                event.metadata().target(),
+                visitor.fields.join(" ")
+            ));
+        }
+    }
 
     fn test_profile_manager() -> Arc<ProfileManager> {
         let dir = std::env::temp_dir().join(format!("cowd-api-profiles-{}", uuid::Uuid::new_v4()));
@@ -4347,6 +444,165 @@ mod tests {
         Arc::new(TaskKernel::open(path).expect("task kernel should open"))
     }
 
+    struct MockPlatformAdapter {
+        name: String,
+        connected: bool,
+        sent: Arc<std::sync::Mutex<Vec<OutboundMessage>>>,
+        media_sent: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl MockPlatformAdapter {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                connected: false,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                media_sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn new_with_sent(name: &str, sent: Arc<std::sync::Mutex<Vec<OutboundMessage>>>) -> Self {
+            Self {
+                name: name.to_string(),
+                connected: false,
+                sent,
+                media_sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn new_with_media(name: &str, media_sent: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self {
+                name: name.to_string(),
+                connected: false,
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                media_sent,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PlatformAdapter for MockPlatformAdapter {
+        fn platform(&self) -> Platform {
+            Platform::Custom(self.name.clone())
+        }
+
+        fn platform_name(&self) -> &str {
+            &self.name
+        }
+
+        async fn connect(&mut self) -> Result<(), PlatformError> {
+            self.connected = true;
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> Result<(), PlatformError> {
+            self.connected = false;
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+
+        async fn receive(&mut self) -> Result<Option<InboundMessage>, PlatformError> {
+            Ok(None)
+        }
+
+        async fn send(&self, msg: &OutboundMessage) -> Result<SendResult, PlatformError> {
+            self.sent.lock().unwrap().push(msg.clone());
+            Ok(SendResult::success(Some(format!(
+                "mock-{}",
+                msg.session_key.user_id
+            ))))
+        }
+
+        async fn send_image(
+            &self,
+            chat_id: &str,
+            image_url: &str,
+            caption: Option<&str>,
+        ) -> Result<(), PlatformError> {
+            self.media_sent.lock().unwrap().push(format!(
+                "image-url:{chat_id}:{image_url}:{}",
+                caption.unwrap_or("")
+            ));
+            Ok(())
+        }
+
+        async fn send_image_file(
+            &self,
+            chat_id: &str,
+            image_path: &str,
+            caption: Option<&str>,
+        ) -> Result<(), PlatformError> {
+            self.media_sent.lock().unwrap().push(format!(
+                "image-file:{chat_id}:{image_path}:{}",
+                caption.unwrap_or("")
+            ));
+            Ok(())
+        }
+
+        async fn send_document(
+            &self,
+            chat_id: &str,
+            file_path: &str,
+            file_name: Option<&str>,
+            caption: Option<&str>,
+        ) -> Result<(), PlatformError> {
+            self.media_sent.lock().unwrap().push(format!(
+                "file:{chat_id}:{file_path}:{}:{}",
+                file_name.unwrap_or(""),
+                caption.unwrap_or("")
+            ));
+            Ok(())
+        }
+    }
+
+    async fn test_platform_runtime_with_bound_adapter(name: &str) -> Arc<PlatformRuntime> {
+        let runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
+        runtime
+            .register_adapter(Box::new(MockPlatformAdapter::new(name)))
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+        runtime
+    }
+
+    async fn test_platform_runtime_with_sent_adapter(
+        name: &str,
+    ) -> (
+        Arc<PlatformRuntime>,
+        Arc<std::sync::Mutex<Vec<OutboundMessage>>>,
+    ) {
+        let runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime
+            .register_adapter(Box::new(MockPlatformAdapter::new_with_sent(
+                name,
+                sent.clone(),
+            )))
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+        (runtime, sent)
+    }
+
+    async fn test_platform_runtime_with_media_adapter(
+        name: &str,
+    ) -> (Arc<PlatformRuntime>, Arc<std::sync::Mutex<Vec<String>>>) {
+        let runtime = Arc::new(PlatformRuntime::new(PlatformRuntimeConfig::default()));
+        let media_sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime
+            .register_adapter(Box::new(MockPlatformAdapter::new_with_media(
+                name,
+                media_sent.clone(),
+            )))
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+        (runtime, media_sent)
+    }
+
     fn test_state() -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
@@ -4358,6 +614,7 @@ mod tests {
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: None,
@@ -4366,6 +623,76 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
+        })
+    }
+
+    fn test_state_with_config(config: serde_json::Value) -> Arc<AppState> {
+        test_state_with_config_and_runtime(config, None)
+    }
+
+    fn test_state_with_lease_registry(
+        registry: Arc<crate::daemon::SessionLeaseRegistry>,
+    ) -> Arc<AppState> {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
+            sessions,
+            memory_manager: None,
+            unified_store: None,
+            tool_registry: tools,
+            config: None,
+            platform_runtime: None,
+            event_bus,
+            approval_gate: None,
+            auth_token: None,
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            config_home: default_config_home(),
+            profile_id: "default".to_string(),
+            profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
+            session_lease_registry: Some(registry),
+        })
+    }
+
+    fn test_state_with_config_and_runtime(
+        config: serde_json::Value,
+        platform_runtime: Option<Arc<PlatformRuntime>>,
+    ) -> Arc<AppState> {
+        test_state_with_config_runtime_and_workspace(
+            config,
+            platform_runtime,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        )
+    }
+
+    fn test_state_with_config_runtime_and_workspace(
+        config: serde_json::Value,
+        platform_runtime: Option<Arc<PlatformRuntime>>,
+        workspace_root: PathBuf,
+    ) -> Arc<AppState> {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
+            sessions,
+            memory_manager: None,
+            unified_store: None,
+            tool_registry: tools,
+            config: Some(config),
+            platform_runtime,
+            event_bus,
+            approval_gate: None,
+            auth_token: None,
+            workspace_root,
+            config_home: default_config_home(),
+            profile_id: "default".to_string(),
+            profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
@@ -4384,6 +711,7 @@ mod tests {
             unified_store: Some(store),
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: None,
@@ -4392,6 +720,39 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
+        })
+    }
+
+    fn test_state_with_store_and_workspace(
+        store: Arc<UnifiedSessionStore>,
+        workspace_root: PathBuf,
+        config_home: PathBuf,
+    ) -> Arc<AppState> {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        Arc::new(AppState {
+            session_kernel: test_session_kernel(
+                sessions.clone(),
+                Some(store.clone()),
+                event_bus.clone(),
+            ),
+            sessions,
+            memory_manager: None,
+            unified_store: Some(store),
+            tool_registry: tools,
+            config: None,
+            platform_runtime: None,
+            event_bus,
+            approval_gate: None,
+            auth_token: None,
+            workspace_root,
+            config_home,
+            profile_id: "enterprise".to_string(),
+            profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
@@ -4423,6 +784,7 @@ mod tests {
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: None,
@@ -4431,6 +793,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
@@ -4453,6 +816,7 @@ mod tests {
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: Some(gate),
             auth_token: None,
@@ -4461,6 +825,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
@@ -4475,6 +840,7 @@ mod tests {
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: None,
@@ -4483,6 +849,7 @@ mod tests {
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
@@ -4521,6 +888,7 @@ mod tests {
         let state = test_state();
         let app = api_router(state);
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -4912,13 +1280,11 @@ mod tests {
             .unwrap()
             .expect("stored session");
         assert_eq!(record.model.as_deref(), Some("patched-model"));
-        assert!(
-            record
-                .metadata_json
-                .as_deref()
-                .unwrap_or("")
-                .contains("Patch Session Title")
-        );
+        assert!(record
+            .metadata_json
+            .as_deref()
+            .unwrap_or("")
+            .contains("Patch Session Title"));
     }
 
     #[tokio::test]
@@ -5054,6 +1420,7 @@ mod tests {
         let state = test_state_with_store(store);
         let app = api_router(state);
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!(
@@ -5137,6 +1504,7 @@ mod tests {
         let state = test_state_with_store(store);
         let app = api_router(state);
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!(
@@ -5250,6 +1618,12 @@ mod tests {
                     "complementarity_score": 0.75,
                     "conflict_count": 1
                 },
+                "value_verdict": {
+                    "positive_lift": true,
+                    "continue_multi_agent": true,
+                    "value_score": 70,
+                    "reasons": ["positive_multi_agent_lift"]
+                },
                 "maintenance_candidates": [{"id": "candidate-summary"}]
             }),
             10,
@@ -5286,12 +1660,135 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["workgraph_summary"]["count"], 1);
-        assert_eq!(json["workgraph_summary"]["latest"]["graph_id"], "graph-summary");
-        assert_eq!(json["workgraph_summary"]["latest"]["board_id"], "board-summary");
+        assert_eq!(
+            json["workgraph_summary"]["latest"]["graph_id"],
+            "graph-summary"
+        );
+        assert_eq!(
+            json["workgraph_summary"]["latest"]["board_id"],
+            "board-summary"
+        );
         assert_eq!(json["workgraph_summary"]["latest"]["completion_rate"], 1.0);
+        assert_eq!(
+            json["workgraph_summary"]["latest"]["value_verdict"]["positive_lift"],
+            true
+        );
         assert_eq!(json["workgraph_summary"]["agent_tasks"], 1);
         assert_eq!(json["workgraph_summary"]["memory_candidates"], 1);
         assert_eq!(json["workgraph_summary"]["conflicts"], 1);
+        assert_eq!(json["agent_value"]["status"], "review_required");
+        assert_eq!(json["agent_value"]["recommendation"], "review_conflicts");
+        assert_eq!(json["agent_value"]["policy_passed"], false);
+        assert_eq!(json["agent_value"]["latest"]["agent_tasks"], 1);
+        assert_eq!(json["agent_value"]["latest"]["value_score"], 70);
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_projects_health_summary() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "runtime-health-summary-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&memory::RuntimeEvent::new(
+                session_id,
+                0,
+                memory::RuntimeEventScope::Task,
+                "task.started",
+                serde_json::json!({"task_id": "task-health"}),
+                10,
+            ))
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&memory::RuntimeEvent::new(
+                session_id,
+                1,
+                memory::RuntimeEventScope::Policy,
+                "runtime.policy.decided",
+                serde_json::json!({
+                    "agent_mode": "Parallel",
+                    "requires_review": false,
+                    "complexity": {
+                        "level": "Complex",
+                        "score": 72,
+                        "signals": [{"name": "verification_required"}]
+                    }
+                }),
+                11,
+            ))
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&memory::RuntimeEvent::new(
+                session_id,
+                2,
+                memory::RuntimeEventScope::Workgraph,
+                "agent.workgraph.reviewed",
+                serde_json::json!({
+                    "value_verdict": {
+                        "positive_lift": true,
+                        "continue_multi_agent": true,
+                        "value_score": 73,
+                        "reasons": ["positive_multi_agent_lift"]
+                    }
+                }),
+                12,
+            ))
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&memory::RuntimeEvent::new(
+                session_id,
+                3,
+                memory::RuntimeEventScope::Task,
+                "task.completed",
+                serde_json::json!({"task_id": "task-health"}),
+                13,
+            ))
+            .await
+            .unwrap();
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["health_summary"]["status"], "healthy");
+        assert_eq!(json["health_summary"]["event_count"], 4);
+        assert_eq!(json["health_summary"]["failed_events"], 0);
+        assert_eq!(json["health_summary"]["degraded_events"], 0);
+        assert_eq!(json["health_summary"]["open_tasks"], 0);
+        assert_eq!(json["health_summary"]["positive_agent_lift"], true);
+        assert_eq!(json["health_summary"]["latest_value_score"], 73);
+        assert_eq!(
+            json["health_summary"]["latest_policy"]["agent_mode"],
+            "Parallel"
+        );
+        assert_eq!(json["health_summary"]["scope_counts"]["task"], 2);
+        assert_eq!(json["health_summary"]["scope_counts"]["policy"], 1);
+        assert_eq!(json["health_summary"]["scope_counts"]["workgraph"], 1);
+        assert_eq!(json["value_loop"]["status"], "incomplete");
+        assert_eq!(json["value_loop"]["required_observed"], 3);
+        assert_eq!(json["value_loop"]["missing_required_count"], 4);
+        assert_eq!(json["value_loop"]["positive_agent_lift"], true);
     }
 
     #[tokio::test]
@@ -5313,6 +1810,703 @@ mod tests {
         assert_eq!(json["degraded"], true);
         assert_eq!(json["events"].as_array().unwrap().len(), 0);
         assert_eq!(json["workgraph_summary"]["count"], 0);
+        assert_eq!(json["health_summary"]["status"], "degraded");
+        assert_eq!(json["health_summary"]["score"], 35);
+        assert_eq!(json["health_summary"]["degraded_events"], 0);
+        assert_eq!(
+            json["health_summary"]["reasons"][0],
+            "session store not available"
+        );
+        assert_eq!(json["value_loop"]["status"], "degraded");
+        assert_eq!(json["value_loop"]["missing_required_count"], 7);
+        assert_eq!(
+            json["value_loop"]["reasons"][0],
+            "session store not available"
+        );
+        assert_eq!(json["agent_value"]["status"], "degraded");
+        assert_eq!(
+            json["agent_value"]["recommendation"],
+            "collect_workgraph_review"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_effective_config_exposes_default_control_policy() {
+        let root = test_temp_dir("runtime-control-default");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/config/effective")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source"], "default");
+        assert_eq!(json["scenario"], "coding");
+        assert_eq!(json["control_policy"]["enabled"], true);
+        assert_eq!(json["control_policy"]["agent"]["max_parallel_agents"], 4);
+        assert_eq!(
+            json["control_policy"]["task"]["thresholds"]["critical_min"],
+            80
+        );
+        assert!(json["warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_effective_config_exposes_configured_control_policy() {
+        let root = test_temp_dir("runtime-control-config");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            config_home.join("config.yaml"),
+            r#"
+runtime:
+  scenario: office
+  control:
+    enabled: false
+    agent:
+      max_parallel_agents: 2
+      min_collaboration_score: 77
+    context:
+      yolo_budget_tokens: 7000
+"#,
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/config/effective")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source"], "config");
+        assert_eq!(json["scenario"], "office");
+        assert_eq!(json["control_policy"]["enabled"], false);
+        assert_eq!(json["control_policy"]["agent"]["max_parallel_agents"], 2);
+        assert_eq!(
+            json["control_policy"]["agent"]["min_collaboration_score"],
+            77
+        );
+        assert_eq!(
+            json["control_policy"]["context"]["yolo_budget_tokens"],
+            7000
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_control_plane_reports_degraded_kernel_without_store() {
+        let root = test_temp_dir("runtime-control-plane-degraded");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/control-plane")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "runtime_control_plane");
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["status"], "degraded");
+        assert_eq!(json["degraded"], true);
+        assert_eq!(json["components"]["session"]["durable_store"], false);
+        assert_eq!(
+            json["components"]["session"]["source_of_truth"],
+            "unavailable"
+        );
+        assert_eq!(json["components"]["context"]["durable_history"], false);
+        assert_eq!(json["components"]["memory"]["status"], "unavailable");
+        assert_eq!(json["components"]["permissions"]["auth_required"], false);
+        assert_eq!(
+            json["components"]["session"]["leases"]["status"],
+            "unavailable"
+        );
+        assert_eq!(json["diagnostics"]["durable_session_store"], false);
+        assert_eq!(json["diagnostics"]["memory_attached"], false);
+        assert_eq!(
+            json["diagnostics"]["stored_sessions"],
+            serde_json::Value::Null
+        );
+        assert_eq!(json["diagnostics"]["component_count"], 10);
+        assert_eq!(json["diagnostics"]["degraded_component_count"], 2);
+        assert_eq!(json["diagnostics"]["attention_component_count"], 2);
+        assert_eq!(json["diagnostics"]["capability_count"], 24);
+        assert!(json["diagnostics"]["elapsed_ms"].as_u64().is_some());
+        assert!(matches!(
+            json["diagnostics"]["performance_status"].as_str(),
+            Some("healthy" | "attention" | "degraded")
+        ));
+        assert_eq!(json["diagnostics"]["provider_configured"], false);
+        assert_eq!(json["diagnostics"]["provider_count"], 0);
+        assert_eq!(json["diagnostics"]["provider_model_count"], 0);
+        assert_eq!(json["diagnostics"]["configured_model_resolved"], true);
+        assert_eq!(json["diagnostics"]["production_ready"], false);
+        assert_eq!(json["diagnostics"]["required_check_count"], 11);
+        assert_eq!(json["diagnostics"]["ready_required_count"], 7);
+        assert_eq!(json["diagnostics"]["blocked_required_count"], 4);
+        assert_eq!(json["readiness"]["production_ready"], false);
+        assert_eq!(json["readiness"]["score"], 63);
+        assert!(json["readiness"]["blocked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["id"] == "session.sqlite_source_of_truth"));
+        assert!(json["readiness"]["blocked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["id"] == "memory.manager"));
+        assert!(json["readiness"]["blocked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["id"] == "provider.registry"));
+        assert!(json["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action
+                .as_str()
+                .unwrap_or_default()
+                .contains("SQLite session store")));
+        assert!(json["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action
+                .as_str()
+                .unwrap_or_default()
+                .contains("runtime provider")));
+        assert!(json["degraded_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "session store not available"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_session_lease_routes_share_daemon_registry_projection() {
+        let registry = Arc::new(crate::daemon::SessionLeaseRegistry::default());
+        let app = api_router(test_state_with_lease_registry(registry));
+
+        let acquire = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/session-leases/acquire")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": "session-a",
+                            "owner": "tui:one",
+                            "mode": "exclusive"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(acquire.status(), StatusCode::OK);
+        let body = to_bytes(acquire.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["owner"], "tui:one");
+        assert_eq!(json["mode"], "exclusive");
+        assert!(json["acquired_at_ms"].as_u64().is_some());
+
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/session-leases")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let body = to_bytes(list.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "available");
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["leases"][0]["session_id"], "session-a");
+
+        let control = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/control-plane")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control.status(), StatusCode::OK);
+        let body = to_bytes(control.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["components"]["session"]["leases"]["attached"], true);
+        assert_eq!(json["components"]["session"]["leases"]["total"], 1);
+        assert_eq!(
+            json["components"]["session"]["leases"]["leases"][0]["owner"],
+            "tui:one"
+        );
+
+        let release = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/session-leases/release")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": "session-a",
+                            "owner": "tui:one"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(release.status(), StatusCode::OK);
+        let body = to_bytes(release.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["released"], true);
+    }
+
+    #[tokio::test]
+    async fn runtime_control_plane_reports_durable_store_and_task_state() {
+        let root = test_temp_dir("runtime-control-plane-durable");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let state = test_state_with_store_and_workspace(store, workspace, config_home);
+        state
+            .task_kernel
+            .start_goal("control plane smoke task", true)
+            .unwrap();
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/control-plane")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "runtime_control_plane");
+        assert_eq!(json["status"], "attention");
+        assert_eq!(json["degraded"], false);
+        assert_eq!(json["components"]["session"]["durable_store"], true);
+        assert_eq!(json["components"]["session"]["source_of_truth"], "sqlite");
+        assert_eq!(json["components"]["context"]["durable_history"], true);
+        assert_eq!(json["components"]["task"]["total"], 1);
+        assert_eq!(json["components"]["task"]["open"], 1);
+        assert_eq!(json["components"]["task"]["status_counts"]["running"], 1);
+        assert_eq!(json["diagnostics"]["durable_session_store"], true);
+        assert_eq!(json["diagnostics"]["memory_attached"], false);
+        assert_eq!(json["diagnostics"]["active_sessions"], 0);
+        assert_eq!(json["diagnostics"]["stored_sessions"], 0);
+        assert_eq!(json["diagnostics"]["open_tasks"], 1);
+        assert_eq!(json["diagnostics"]["component_count"], 10);
+        assert_eq!(json["diagnostics"]["degraded_component_count"], 0);
+        assert_eq!(json["diagnostics"]["attention_component_count"], 2);
+        assert!(json["diagnostics"]["elapsed_ms"].as_u64().is_some());
+        assert!(matches!(
+            json["diagnostics"]["performance_status"].as_str(),
+            Some("healthy" | "attention" | "degraded")
+        ));
+        assert_eq!(json["diagnostics"]["provider_configured"], false);
+        assert_eq!(json["components"]["provider"]["status"], "unconfigured");
+        assert_eq!(json["diagnostics"]["production_ready"], false);
+        assert_eq!(json["diagnostics"]["required_check_count"], 11);
+        assert_eq!(json["diagnostics"]["ready_required_count"], 9);
+        assert_eq!(json["diagnostics"]["blocked_required_count"], 2);
+        assert_eq!(json["readiness"]["production_ready"], false);
+        assert_eq!(json["readiness"]["score"], 81);
+        assert!(json["readiness"]["blocked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["id"] == "memory.manager"));
+        assert!(json["readiness"]["blocked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["id"] == "provider.registry"));
+        assert!(json["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action
+                .as_str()
+                .unwrap_or_default()
+                .contains("memory manager")));
+        assert_eq!(
+            json["components"]["channels"]["adapters"][0]["id"],
+            "wechat-ilink"
+        );
+        assert!(json["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "permission.cross_plane"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_control_plane_counts_file_backed_sqlite_sessions_after_reopen() {
+        let dir = test_temp_dir("runtime-control-plane-db");
+        let db_path = dir.join("sessions.db");
+        {
+            let store = UnifiedSessionStore::open(&db_path).unwrap();
+            store
+                .create_session(&new_api_session_record(
+                    "control-db-session-a",
+                    Some("model-a".into()),
+                ))
+                .await
+                .unwrap();
+            store
+                .create_session(&new_api_session_record(
+                    "control-db-session-b",
+                    Some("model-b".into()),
+                ))
+                .await
+                .unwrap();
+        }
+        assert!(
+            db_path.exists(),
+            "file-backed session database should exist"
+        );
+
+        let workspace = dir.join("workspace");
+        let config_home = dir.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        let reopened = Arc::new(UnifiedSessionStore::open(&db_path).unwrap());
+        let app = api_router(test_state_with_store_and_workspace(
+            reopened,
+            workspace,
+            config_home,
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/control-plane")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "runtime_control_plane");
+        assert_eq!(json["components"]["session"]["durable_store"], true);
+        assert_eq!(json["components"]["session"]["source_of_truth"], "sqlite");
+        assert_eq!(json["diagnostics"]["durable_session_store"], true);
+        assert_eq!(json["diagnostics"]["stored_sessions"], 2);
+        assert_eq!(json["diagnostics"]["active_sessions"], 0);
+        assert_eq!(json["diagnostics"]["open_tasks"], 0);
+        assert!(json["diagnostics"]["elapsed_ms"].as_u64().is_some());
+        assert!(matches!(
+            json["diagnostics"]["performance_status"].as_str(),
+            Some("healthy" | "attention" | "degraded")
+        ));
+        assert_eq!(json["diagnostics"]["production_ready"], false);
+        assert_eq!(json["diagnostics"]["required_check_count"], 11);
+        assert_eq!(json["diagnostics"]["ready_required_count"], 9);
+        assert_eq!(json["diagnostics"]["blocked_required_count"], 2);
+        assert_eq!(json["readiness"]["score"], 81);
+        assert!(json["readiness"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["id"] == "context.durable_history" && check["status"] == "ready"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn runtime_control_plane_reports_provider_config_without_secrets() {
+        let root = test_temp_dir("runtime-control-provider-config");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            config_home.join("config.yaml"),
+            r#"
+model: "sonnet-enterprise"
+providers:
+  anthropic:
+    base_url: "https://api.anthropic.example/v1"
+    api_key: "secret-provider-key"
+    models: ["sonnet-enterprise", "haiku-enterprise"]
+    protocol: "anthropic"
+"#,
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/control-plane")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["components"]["provider"]["status"], "available");
+        assert_eq!(json["components"]["provider"]["provider_count"], 1);
+        assert_eq!(json["components"]["provider"]["model_count"], 2);
+        assert_eq!(
+            json["components"]["provider"]["configured_model"],
+            "sonnet-enterprise"
+        );
+        assert_eq!(
+            json["components"]["provider"]["configured_model_provider"],
+            "anthropic"
+        );
+        assert_eq!(
+            json["components"]["provider"]["configured_model_resolved"],
+            true
+        );
+        assert_eq!(
+            json["components"]["provider"]["provider_names"]
+                .as_array()
+                .unwrap(),
+            &vec![serde_json::Value::from("anthropic")]
+        );
+        assert_eq!(json["diagnostics"]["provider_configured"], true);
+        assert_eq!(json["diagnostics"]["provider_count"], 1);
+        assert_eq!(json["diagnostics"]["provider_model_count"], 2);
+        assert_eq!(json["diagnostics"]["configured_model_resolved"], true);
+        assert!(json["readiness"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["id"] == "provider.registry" && check["status"] == "ready"));
+        assert!(json["readiness"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["id"] == "provider.model_routing" && check["status"] == "ready"));
+        assert!(!json.to_string().contains("secret-provider-key"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_provider_reload_replaces_global_registry_from_config() {
+        runtime::init_global_providers(runtime::ProvidersConfig::default());
+        let root = test_temp_dir("runtime-provider-reload");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            config_home.join("config.yaml"),
+            r#"
+model: "reload-model"
+providers:
+  reload:
+    base_url: "https://reload.example/v1"
+    api_key: "reload-secret-key"
+    models: ["reload-model", "reload-fast"]
+    protocol: "openai-compat"
+"#,
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/providers/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "runtime_provider_reload");
+        assert_eq!(json["status"], "applied");
+        assert_eq!(json["applied"], true);
+        assert_eq!(json["provider_count"], 1);
+        assert_eq!(json["provider_model_count"], 2);
+        assert_eq!(json["configured_model"], "reload-model");
+        assert_eq!(json["configured_model_provider"], "reload");
+        assert_eq!(json["configured_model_resolved"], true);
+        assert!(!json.to_string().contains("reload-secret-key"));
+        let provider = runtime::resolve_global_provider("reload-model")
+            .expect("reloaded provider should resolve model");
+        assert_eq!(provider.name, "reload");
+        assert_eq!(provider.models, vec!["reload-model", "reload-fast"]);
+
+        let invalid_root = test_temp_dir("runtime-provider-reload-invalid");
+        let invalid_workspace = invalid_root.join("workspace");
+        let invalid_config_home = invalid_root.join("home");
+        std::fs::create_dir_all(&invalid_workspace).unwrap();
+        std::fs::create_dir_all(&invalid_config_home).unwrap();
+        std::fs::write(
+            invalid_config_home.join("config.yaml"),
+            r#"
+model: "broken-model"
+providers:
+  broken:
+    base_url: "https://broken.example/v1"
+    api_key: "broken-secret-key"
+    models: ["broken-model"]
+    protocol: "unsupported-protocol"
+"#,
+        )
+        .unwrap();
+
+        let app = api_router(test_state_with_workspace(
+            invalid_workspace,
+            invalid_config_home,
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/providers/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "runtime_provider_reload");
+        assert_eq!(json["status"], "failed");
+        assert_eq!(json["applied"], false);
+        assert_eq!(json["configured_model_resolved"], false);
+        assert!(json["warnings"]
+            .to_string()
+            .contains("unsupported-protocol"));
+        assert!(!json.to_string().contains("broken-secret-key"));
+        assert!(runtime::resolve_global_provider("broken-model").is_none());
+        assert_eq!(
+            runtime::resolve_global_provider("reload-model")
+                .expect("existing provider should remain after failed reload")
+                .name,
+            "reload"
+        );
+
+        runtime::init_global_providers(runtime::ProvidersConfig::default());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(invalid_root);
+    }
+
+    #[tokio::test]
+    async fn runtime_control_plane_emits_structured_trace_event() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+
+        let root = test_temp_dir("runtime-control-plane-trace");
+        let workspace = root.join("workspace");
+        let config_home = root.join("home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let state = test_state_with_store_and_workspace(store, workspace, config_home);
+        state
+            .task_kernel
+            .start_goal("trace control plane", false)
+            .unwrap();
+        let _trace_guard = trace_capture_lock().lock().await;
+        let capture = CapturedTraceEvents::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        let Json(json) = runtime_routes::get_runtime_control_plane(AxumState(state))
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(json["kind"], "runtime_control_plane");
+        let lines = capture.lines();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("runtime control plane inspected"),
+            "expected control-plane trace event, got: {joined}"
+        );
+        assert!(joined.contains("cowd.runtime.control_plane"));
+        assert!(joined.contains("status=\"attention\""));
+        assert!(joined.contains("performance_status="));
+        assert!(joined.contains("elapsed_ms="));
+        assert!(joined.contains("production_ready=false"));
+        assert!(joined.contains("readiness_score=81"));
+        assert!(joined.contains("blocked_required_count=2"));
+        assert!(joined.contains("degraded=false"));
+        assert!(joined.contains("durable_session_store=true"));
+        assert!(joined.contains("memory_attached=false"));
+        assert!(joined.contains("provider_configured=false"));
+        assert!(joined.contains("provider_count=0"));
+        assert!(joined.contains("provider_model_count=0"));
+        assert!(joined.contains("configured_model_resolved=true"));
+        assert!(joined.contains("stored_sessions=0"));
+        assert!(joined.contains("open_tasks=1"));
+        assert!(joined.contains("component_count=10"));
+        assert!(joined.contains("capability_count=24"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn test_context_envelope(
@@ -5410,10 +2604,320 @@ mod tests {
         assert_eq!(json["session_id"], session_id);
         assert_eq!(json["total"], 2);
         assert_eq!(json["envelopes"].as_array().unwrap().len(), 2);
+        assert_eq!(json["summaries"].as_array().unwrap().len(), 2);
         assert_eq!(json["envelopes"][0]["sequence"], 1);
         assert_eq!(json["envelopes"][0]["envelope_id"], "env-1");
         assert_eq!(json["envelopes"][0]["run_id"], "run-env-1");
         assert_eq!(json["envelopes"][1]["envelope"]["intent"], "second");
+        assert_eq!(json["summaries"][0]["envelope_id"], "env-1");
+        assert_eq!(json["summaries"][0]["profile"], "MainTurn");
+        assert_eq!(json["summaries"][0]["intent"], "first");
+        assert_eq!(json["summaries"][0]["selected_count"], 1);
+        assert_eq!(json["summaries"][0]["omitted_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn session_context_history_can_return_summaries_without_full_envelopes() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "context-summary-only-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_event(&memory::SessionEvent {
+                session_id: session_id.to_string(),
+                event_type: "ContextEnvelope".to_string(),
+                event_json: test_context_envelope(session_id, "env-summary", "summary").to_string(),
+                sequence: 5,
+                created_at_ms: 5,
+            })
+            .await
+            .unwrap();
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions/{session_id}/context?include_envelopes=false"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["include_envelopes"], false);
+        assert_eq!(json["envelopes"].as_array().unwrap().len(), 0);
+        assert_eq!(json["summaries"].as_array().unwrap().len(), 1);
+        assert_eq!(json["summaries"][0]["envelope_id"], "env-summary");
+        assert_eq!(json["summaries"][0]["intent"], "summary");
+    }
+
+    #[tokio::test]
+    async fn session_context_history_paginates_summary_timeline() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "context-summary-page-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        for (sequence, envelope_id, intent) in [
+            (1, "env-page-1", "first"),
+            (3, "env-page-3", "second"),
+            (5, "env-page-5", "third"),
+        ] {
+            store
+                .append_event(&memory::SessionEvent {
+                    session_id: session_id.to_string(),
+                    event_type: "ContextEnvelope".to_string(),
+                    event_json: test_context_envelope(session_id, envelope_id, intent).to_string(),
+                    sequence,
+                    created_at_ms: sequence as u64,
+                })
+                .await
+                .unwrap();
+        }
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions/{session_id}/context?limit=2&include_envelopes=false"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["has_more"], true);
+        assert_eq!(json["next_seq"], 4);
+        assert_eq!(json["envelopes"].as_array().unwrap().len(), 0);
+        assert_eq!(json["summaries"].as_array().unwrap().len(), 2);
+        assert_eq!(json["summaries"][0]["envelope_id"], "env-page-1");
+        assert_eq!(json["summaries"][1]["envelope_id"], "env-page-3");
+    }
+
+    #[tokio::test]
+    async fn session_context_history_matches_sqlite_event_log() {
+        let dir = test_temp_dir("context-db-timeline");
+        let db_path = dir.join("sessions.sqlite");
+        let store = Arc::new(UnifiedSessionStore::open(&db_path).unwrap());
+        let session_id = "context-db-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        for (sequence, event_type, payload) in [
+            (
+                0,
+                "TextDelta",
+                serde_json::json!({"type":"TextDelta","content":"not context"}),
+            ),
+            (
+                1,
+                "ContextEnvelope",
+                test_context_envelope(session_id, "env-db-1", "first db context"),
+            ),
+            (
+                2,
+                "ToolComplete",
+                serde_json::json!({"type":"ToolComplete","summary":"not context"}),
+            ),
+            (
+                3,
+                "ContextEnvelope",
+                test_context_envelope(session_id, "env-db-3", "second db context"),
+            ),
+        ] {
+            store
+                .append_event(&memory::SessionEvent {
+                    session_id: session_id.to_string(),
+                    event_type: event_type.to_string(),
+                    event_json: payload.to_string(),
+                    sequence,
+                    created_at_ms: sequence as u64,
+                })
+                .await
+                .unwrap();
+        }
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let db_context_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = ?1 AND event_type = 'ContextEnvelope'",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let db_all_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions/{session_id}/context?limit=1&include_envelopes=false"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(db_all_count, 4);
+        assert_eq!(db_context_count, 2);
+        assert_eq!(json["total"], db_context_count);
+        assert_eq!(json["has_more"], true);
+        assert_eq!(json["next_seq"], 2);
+        assert_eq!(json["envelopes"].as_array().unwrap().len(), 0);
+        assert_eq!(json["summaries"].as_array().unwrap().len(), 1);
+        assert_eq!(json["summaries"][0]["sequence"], 1);
+        assert_eq!(json["summaries"][0]["envelope_id"], "env-db-1");
+
+        let detail_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/env-db-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
+        assert_eq!(detail_json["context"]["sequence"], 3);
+        assert_eq!(
+            detail_json["context"]["envelope"]["intent"],
+            "second db context"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn session_context_history_emits_structured_trace_events() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "context-log-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_event(&memory::SessionEvent {
+                session_id: session_id.to_string(),
+                event_type: "ContextEnvelope".to_string(),
+                event_json: test_context_envelope(session_id, "env-log-1", "logged").to_string(),
+                sequence: 7,
+                created_at_ms: 77,
+            })
+            .await
+            .unwrap();
+
+        let _trace_guard = trace_capture_lock().lock().await;
+        let capture = CapturedTraceEvents::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        async {
+            let history_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/sessions/{session_id}/context?include_envelopes=false"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(history_response.status(), StatusCode::OK);
+            let history_body = to_bytes(history_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let history_json: serde_json::Value = serde_json::from_slice(&history_body).unwrap();
+            assert_eq!(history_json["session_id"], session_id);
+            assert_eq!(history_json["include_envelopes"], false);
+            assert_eq!(history_json["total"], 1);
+            assert_eq!(history_json["summaries"].as_array().unwrap().len(), 1);
+
+            let detail_response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/context/env-log-1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(detail_response.status(), StatusCode::OK);
+            let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
+            assert_eq!(detail_json["context"]["envelope_id"], "env-log-1");
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        let lines = capture.lines();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("context history loaded") || joined.contains("context envelope loaded"),
+            "expected structured context trace event, got: {joined}"
+        );
+        assert!(joined.contains("context-log-session"));
+        if joined.contains("context history loaded") {
+            assert!(joined.contains("include_envelopes=false"));
+            assert!(joined.contains("total=1"));
+        } else {
+            assert!(joined.contains("envelope_id=env-log-1"));
+            assert!(joined.contains("sequence=7"));
+        }
     }
 
     #[tokio::test]
@@ -5556,12 +3060,12 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["session_id"], session_id);
         assert_eq!(json["total"], 2);
-        assert_eq!(json["recommendations"][0]["recommendation"], "Start a handoff");
-        assert_eq!(json["recommendations"][0]["count"], 2);
         assert_eq!(
-            json["recommendations"][0]["actions"]["acknowledged"],
-            1
+            json["recommendations"][0]["recommendation"],
+            "Start a handoff"
         );
+        assert_eq!(json["recommendations"][0]["count"], 2);
+        assert_eq!(json["recommendations"][0]["actions"]["acknowledged"], 1);
         assert_eq!(json["recommendations"][0]["actions"]["applied"], 1);
         assert_eq!(json["recommendations"][0]["latest_envelope_id"], "env-1");
     }
@@ -5586,22 +3090,18 @@ mod tests {
             .unwrap();
         let task = kernel.current().unwrap();
 
-        let packet = task_resume_context_packet("session-task", &task);
+        let packet = message_routes::task_resume_context_packet("session-task", &task);
 
         assert_eq!(packet.session_id, "session-task");
         assert_eq!(packet.source, ResumeContextSource::TaskRegistry);
-        assert!(
-            packet
-                .active_task
-                .as_deref()
-                .is_some_and(|task| task.contains("ship context runtime"))
-        );
-        assert!(
-            packet
-                .recent_decisions
-                .iter()
-                .any(|event| event.contains("artifact"))
-        );
+        assert!(packet
+            .active_task
+            .as_deref()
+            .is_some_and(|task| task.contains("ship context runtime")));
+        assert!(packet
+            .recent_decisions
+            .iter()
+            .any(|event| event.contains("artifact")));
         let _ = std::fs::remove_file(path);
     }
 
@@ -5654,12 +3154,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         let request_id = pending_json[0]["id"].as_str().unwrap().to_string();
-        assert!(
-            pending_json[0]["command"]
-                .as_str()
-                .unwrap()
-                .contains("rm -rf")
-        );
+        assert!(pending_json[0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("rm -rf"));
 
         let response = app
             .clone()
@@ -5764,6 +3262,1785 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn platform_readiness_defaults_to_disabled_without_config() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/platforms")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let platforms = json.as_array().unwrap();
+        assert!(platforms.iter().any(|item| item["name"] == "feishu"
+            && item["status"] == "disabled"
+            && item["credential_present"] == false));
+        assert!(platforms.iter().any(|item| item["name"] == "wechat-ilink"
+            && item["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("qr_login"))));
+    }
+
+    #[tokio::test]
+    async fn platform_readiness_reports_missing_fields_without_leaking_secrets() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [
+                    {
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "cli_app_id",
+                        "app_secret": ""
+                    }
+                ]
+            }
+        })));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/platforms/feishu")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["readiness"]["status"], "degraded");
+        assert_eq!(json["readiness"]["credential_present"], false);
+        assert!(json["readiness"]["missing_required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("app_secret")));
+        assert!(!json.to_string().contains("cli_app_id"));
+    }
+
+    #[tokio::test]
+    async fn connector_routes_expose_contract_snapshot_without_accounts() {
+        let app = api_router(test_state());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(summary["kind"], "connector_summary");
+        assert_eq!(summary["summary"]["account_count"], 0);
+        assert!(summary["summary"]["capability_count"].as_u64().unwrap() >= 8);
+        assert_eq!(summary["summary"]["resource_count"], 0);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let capabilities: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(capabilities["kind"], "connector_capabilities");
+        let list = capabilities["capabilities"].as_array().unwrap();
+        assert!(list
+            .iter()
+            .any(|item| item["capability_id"] == "channel.feishu.send_text"));
+        assert!(list
+            .iter()
+            .any(|item| item["capability_id"] == "governance.cross_plane.audit"));
+        assert!(list
+            .iter()
+            .any(|item| item["capability_id"] == "service.feishu.doc_ops"
+                && item["plane"] == "service"
+                && item["supports_commit"] == false));
+    }
+
+    #[tokio::test]
+    async fn connector_accounts_project_configured_platform_health_without_secrets() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [
+                    {
+                        "name": "feishu-main",
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "cli_app_id",
+                        "app_secret": ""
+                    }
+                ]
+            }
+        })));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/accounts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_accounts");
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["accounts"][0]["provider"], "feishu");
+        assert_eq!(json["accounts"][0]["account_id"], "feishu-main");
+        assert_eq!(json["accounts"][0]["auth_mode"], "app_secret");
+        assert_eq!(json["accounts"][0]["health"]["status"], "degraded");
+        assert!(json["accounts"][0]["enabled_bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "channel.feishu.send_file"));
+        assert!(!json.to_string().contains("cli_app_id"));
+    }
+
+    #[tokio::test]
+    async fn mock_docs_service_connector_executes_through_cross_plane_receipt() {
+        let app = api_router(test_state());
+        let tools = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/services/mock.docs/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tools.status(), StatusCode::OK);
+        let body = to_bytes(tools.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_service_tools");
+        assert_eq!(json["service"]["id"], "mock.docs");
+        assert!(json["tools"].as_array().unwrap().iter().any(|tool| {
+            tool["capability_id"] == "service.mock.docs.read" && tool["plane"] == "service"
+        }));
+
+        let key = format!("mock-docs-{}", uuid::Uuid::new_v4());
+        let request = serde_json::json!({
+            "actor_principal": format!("user:{key}"),
+            "tool_id": "service.mock.docs.read",
+            "resource_id": "doc-1",
+            "title": "Architecture",
+            "mode": "dry_run",
+            "idempotency_key": key
+        });
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first_json["kind"], "connector_service_execution");
+        assert_eq!(first_json["service"], "mock.docs");
+        assert_eq!(first_json["replayed"], false);
+        assert_eq!(
+            first_json["result"]["resource"]["reference"],
+            "service://mock.docs/document/doc-1"
+        );
+        assert_eq!(
+            first_json["receipt"]["action"]["requested_capability"],
+            "service.mock.docs.read"
+        );
+        assert_eq!(
+            first_json["receipt"]["action"]["resource_ref"],
+            "service://mock.docs/document/doc-1"
+        );
+        let receipt_id = first_json["receipt"]["id"].as_str().unwrap().to_string();
+
+        let resources = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/resources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resources.status(), StatusCode::OK);
+        let body = to_bytes(resources.into_body(), usize::MAX).await.unwrap();
+        let resources_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resources_json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |resource| resource["reference"] == "service://mock.docs/document/doc-1"
+                    && resource["title"] == "Architecture"
+            ));
+
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let body = to_bytes(replay.into_body(), usize::MAX).await.unwrap();
+        let replay_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(replay_json["replayed"], true);
+        assert_eq!(replay_json["receipt"]["id"], receipt_id);
+    }
+
+    #[tokio::test]
+    async fn cross_plane_single_use_grant_is_consumed_and_auditable() {
+        let app = api_router(test_state());
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:test-{suffix}");
+        let capability = format!("service.feishu.drive.download.{suffix}");
+        let grant_id = format!("grant-{suffix}");
+        let grant = serde_json::json!({
+            "id": grant_id,
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "single_use",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let action = serde_json::json!({
+            "actor_principal": principal,
+            "source_channel": "channel://wechat/chat/test",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": null,
+            "resource_ref": null,
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "verified"
+        });
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["decision"]["decision"], "allow");
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(
+            second_json["decision"]["decision"],
+            "require_single_approval"
+        );
+
+        let audit = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/audit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audit.status(), StatusCode::OK);
+        let audit_body = to_bytes(audit.into_body(), usize::MAX).await.unwrap();
+        let audit_json: serde_json::Value = serde_json::from_slice(&audit_body).unwrap();
+        let records = audit_json["records"].as_array().unwrap();
+        let consumed = records
+            .iter()
+            .find(|record| {
+                record["evidence"]["consumed_grant_id"].as_str() == Some(grant_id.as_str())
+            })
+            .expect("audit should include single-use grant consumption evidence");
+        assert_eq!(consumed["evidence"]["policy_version"], "cross-plane.v1");
+        assert_eq!(consumed["evidence"]["remaining_uses_after"], 0);
+    }
+
+    #[tokio::test]
+    async fn cross_plane_identity_resolve_matches_cross_channel_contact_key() {
+        let app = api_router(test_state());
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let email = format!("demo-{suffix}@example.com");
+        let principal = format!("user:demo-{suffix}");
+        let identity = serde_json::json!({
+            "id": format!("idb-{suffix}"),
+            "principal_id": principal,
+            "identity_ref": format!("channel://feishu/user/demo?email={email}"),
+            "trust": "verified",
+            "source": "test",
+            "created_at": "2026-06-07T00:00:00Z",
+            "expires_at": null
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/identities")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(identity.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = serde_json::json!({
+            "identity_ref": format!("channel://wechat/user/demo?email={email}")
+        });
+        let resolved = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/identity/resolve")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK);
+        let body = to_bytes(resolved.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "cross_plane_identity_resolution");
+        assert_eq!(json["resolved"]["principal_id"], principal);
+        assert_eq!(json["resolved"]["trust"], "verified");
+        assert_eq!(json["resolved"]["match_kind"], "contact_key");
+    }
+
+    #[tokio::test]
+    async fn cross_plane_policy_simulation_resolves_actor_identity_before_decision() {
+        let app = api_router(test_state());
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let email = format!("policy-{suffix}@example.com");
+        let principal = format!("user:policy-{suffix}");
+        let capability = format!("service.feishu.drive.download.{suffix}");
+
+        let identity = serde_json::json!({
+            "id": format!("idb-policy-{suffix}"),
+            "principal_id": principal,
+            "identity_ref": format!("channel://feishu/user/policy?email={email}"),
+            "trust": "verified",
+            "source": "test",
+            "created_at": "2026-06-07T00:00:00Z",
+            "expires_at": null
+        });
+        let grant = serde_json::json!({
+            "id": format!("grant-policy-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+
+        for (uri, body) in [
+            ("/api/cross-plane/identities", identity),
+            ("/api/cross-plane/grants", grant),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let action = serde_json::json!({
+            "actor_principal": "",
+            "actor_identity_ref": format!("channel://wechat/user/policy?email={email}"),
+            "source_channel": "channel://wechat/chat/test",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": null,
+            "resource_ref": null,
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "unknown"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["decision"]["decision"], "allow");
+        assert_eq!(json["action"]["actor_principal"], principal);
+        assert_eq!(
+            json["decision"]["matched_grant"]["principal_id"],
+            json["action"]["actor_principal"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_plane_preflight_combines_identity_policy_and_platform_without_consuming_grant() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [{
+                    "platformType": "feishu",
+                    "enabled": true,
+                    "app_id": "app-id",
+                    "app_secret": "app-secret"
+                }]
+            }
+        })));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let email = format!("preflight-{suffix}@example.com");
+        let principal = format!("user:preflight-{suffix}");
+        let capability = format!("service.feishu.drive.download.{suffix}");
+        let identity = serde_json::json!({
+            "id": format!("idb-preflight-{suffix}"),
+            "principal_id": principal,
+            "identity_ref": format!("channel://feishu/user/preflight?email={email}"),
+            "trust": "verified",
+            "source": "test",
+            "created_at": "2026-06-07T00:00:00Z",
+            "expires_at": null
+        });
+        let grant = serde_json::json!({
+            "id": format!("grant-preflight-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "single_use",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+
+        for (uri, body) in [
+            ("/api/cross-plane/identities", identity),
+            ("/api/cross-plane/grants", grant),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let action = serde_json::json!({
+            "actor_principal": "",
+            "actor_identity_ref": format!("channel://wechat/user/preflight?email={email}"),
+            "source_channel": "channel://wechat/chat/test",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": null,
+            "resource_ref": null,
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "unknown"
+        });
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/preflight")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        let preflight_body = to_bytes(preflight.into_body(), usize::MAX).await.unwrap();
+        let preflight_json: serde_json::Value = serde_json::from_slice(&preflight_body).unwrap();
+        assert_eq!(preflight_json["kind"], "cross_plane_action_preflight");
+        assert_eq!(preflight_json["executable"], true);
+        assert_eq!(preflight_json["target_platform"], "feishu");
+        assert_eq!(preflight_json["platform_readiness"]["status"], "ready");
+        assert_eq!(preflight_json["decision"]["decision"], "allow");
+        assert_eq!(preflight_json["action"]["actor_principal"], principal);
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["decision"]["decision"], "allow");
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(
+            second_json["decision"]["decision"],
+            "require_single_approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_dry_run_audits_without_consuming_grant() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [{
+                    "platformType": "feishu",
+                    "enabled": true,
+                    "app_id": "app-id",
+                    "app_secret": "app-secret"
+                }]
+            }
+        })));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:execute-dry-run-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant_id = format!("grant-execute-dry-run-{suffix}");
+        let grant = serde_json::json!({
+            "id": grant_id,
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "single_use",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let action = serde_json::json!({
+            "actor_principal": principal,
+            "actor_identity_ref": null,
+            "source_channel": "channel://wechat/chat/test",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": null,
+            "resource_ref": null,
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "verified"
+        });
+        let execute = serde_json::json!({
+            "mode": "dry_run",
+            "idempotency_key": format!("idem-{suffix}"),
+            "action": action
+        });
+        let executed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "cross_plane_action_execution");
+        assert_eq!(json["status"], "planned");
+        assert_eq!(json["dispatch_status"], "dry_run");
+        assert_eq!(json["executable"], true);
+        assert_eq!(json["dispatched"], false);
+        assert!(json["audit_record_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("cpa-"));
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json["action"].to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["decision"]["decision"], "allow");
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json["action"].to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(
+            second_json["decision"]["decision"],
+            "require_single_approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_replays_idempotency_key_without_duplicate_audit() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [{
+                    "platformType": "feishu",
+                    "enabled": true,
+                    "app_id": "app-id",
+                    "app_secret": "app-secret"
+                }]
+            }
+        })));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:execute-idempotent-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-execute-idempotent-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "dry_run",
+            "idempotency_key": format!("idem-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/test",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": null,
+                "resource_ref": null,
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["idempotent_replay"], false);
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(second_json["idempotent_replay"], true);
+        assert_eq!(
+            second_json["execution_receipt"]["id"],
+            first_json["execution_receipt"]["id"]
+        );
+        assert_eq!(
+            second_json["audit_record_id"],
+            first_json["audit_record_id"]
+        );
+
+        let executions = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/action/executions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let executions_body = to_bytes(executions.into_body(), usize::MAX).await.unwrap();
+        let executions_json: serde_json::Value = serde_json::from_slice(&executions_body).unwrap();
+        let matching = executions_json["executions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|receipt| receipt["id"] == first_json["execution_receipt"]["id"])
+            .count();
+        assert_eq!(matching, 1);
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_commit_blocks_without_live_adapter_and_preserves_grant() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [{
+                    "platformType": "feishu",
+                    "enabled": true,
+                    "app_id": "app-id",
+                    "app_secret": "app-secret"
+                }]
+            }
+        })));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:execute-commit-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-execute-commit-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "single_use",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let action = serde_json::json!({
+            "actor_principal": principal,
+            "actor_identity_ref": null,
+            "source_channel": "channel://wechat/chat/test",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": null,
+            "resource_ref": null,
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "verified"
+        });
+        let execute = serde_json::json!({
+            "mode": "commit",
+            "action": action
+        });
+        let executed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "blocked");
+        assert_eq!(json["dispatch_status"], "adapter_not_bound");
+        assert_eq!(json["executable"], false);
+        assert_eq!(json["adapter_capability"]["live_supported"], true);
+        assert_eq!(json["adapter_capability"]["adapter_bound"], false);
+        assert!(json["blockers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("dispatch:adapter_not_bound")));
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json["action"].to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["decision"]["decision"], "allow");
+    }
+
+    #[tokio::test]
+    async fn cross_plane_adapter_registry_reports_supported_and_unsupported_live_operations() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [
+                    {
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    },
+                    {
+                        "platformType": "wecom",
+                        "enabled": true,
+                        "corp_id": "corp",
+                        "corp_secret": "secret",
+                        "agent_id": "agent"
+                    }
+                ]
+            }
+        })));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/action/adapters")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "cross_plane_action_adapters");
+        let capabilities = json["capabilities"].as_array().unwrap();
+        assert!(capabilities.iter().any(|item| {
+            item["platform"] == "feishu"
+                && item["operation"] == "send_text"
+                && item["live_supported"] == true
+                && item["adapter_bound"] == false
+        }));
+        assert!(capabilities.iter().any(|item| {
+            item["platform"] == "wecom"
+                && item["operation"] == "callback"
+                && item["live_supported"] == false
+        }));
+    }
+
+    #[tokio::test]
+    async fn cross_plane_adapter_registry_and_preflight_use_bound_runtime_snapshot() {
+        let platform_runtime = test_platform_runtime_with_bound_adapter("feishu").await;
+        let app = api_router(test_state_with_config_and_runtime(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:bound-runtime-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-bound-runtime-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let adapters = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/action/adapters")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let adapters_body = to_bytes(adapters.into_body(), usize::MAX).await.unwrap();
+        let adapters_json: serde_json::Value = serde_json::from_slice(&adapters_body).unwrap();
+        assert!(adapters_json["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item["platform"] == "feishu"
+                    && item["operation"] == "send_text"
+                    && item["adapter_bound"] == true
+            }));
+
+        let action = serde_json::json!({
+            "actor_principal": principal,
+            "actor_identity_ref": null,
+            "source_channel": "channel://wechat/chat/test",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": null,
+            "resource_ref": null,
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "verified"
+        });
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/preflight")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let preflight_body = to_bytes(preflight.into_body(), usize::MAX).await.unwrap();
+        let preflight_json: serde_json::Value = serde_json::from_slice(&preflight_body).unwrap();
+        assert_eq!(preflight_json["adapter_capability"]["adapter_bound"], true);
+        assert_eq!(preflight_json["dispatch_target"]["ready"], false);
+        assert!(preflight_json["dispatch_target"]["blockers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("dispatch:target_ref_missing")));
+
+        let execute = serde_json::json!({
+            "mode": "commit",
+            "idempotency_key": format!("idem-bound-runtime-{suffix}"),
+            "action": action
+        });
+        let executed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+        assert_eq!(
+            executed_json["dispatch_status"],
+            "dispatch_target_not_ready"
+        );
+        assert_eq!(executed_json["adapter_capability"]["adapter_bound"], true);
+        assert!(executed_json["blockers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("dispatch:target_ref_missing")));
+
+        platform_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_plane_preflight_builds_dispatch_target_plan() {
+        let platform_runtime = test_platform_runtime_with_bound_adapter("feishu").await;
+        let app = api_router(test_state_with_config_and_runtime(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-target-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-target-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let action = serde_json::json!({
+            "actor_principal": principal,
+            "actor_identity_ref": null,
+            "source_channel": "channel://wechat/chat/source",
+            "session_id": "test-session",
+            "requested_capability": capability,
+            "provider_account": "feishu-main",
+            "target_ref": "channel://feishu/user/open-id-1/thread/chat-id-1",
+            "resource_ref": "text://hello from cross plane",
+            "risk": "high",
+            "data_classification": "internal",
+            "identity_trust": "verified"
+        });
+        let preflight = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/preflight")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        let body = to_bytes(preflight.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["dispatch_target"]["ready"], true);
+        assert_eq!(json["dispatch_target"]["platform"], "feishu");
+        assert_eq!(json["dispatch_target"]["operation"], "send_text");
+        assert_eq!(
+            json["dispatch_target"]["session_key"],
+            "feishu:open-id-1:chat-id-1"
+        );
+        assert_eq!(
+            json["dispatch_target"]["outbound_message"]["text"],
+            "hello from cross plane"
+        );
+        assert_eq!(
+            json["dispatch_target"]["outbound_message"]["metadata"]["requested_capability"],
+            capability
+        );
+
+        platform_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_persists_dispatch_target_snapshot() {
+        let platform_runtime = test_platform_runtime_with_bound_adapter("feishu").await;
+        let app = api_router(test_state_with_config_and_runtime(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-receipt-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-receipt-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "dry_run",
+            "idempotency_key": format!("idem-dispatch-receipt-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/source",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": "channel://feishu/chat/demo-chat",
+                "resource_ref": "text://receipt payload",
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+        let executed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_target"]["ready"],
+            true
+        );
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_target"]["session_key"],
+            "feishu:demo-chat"
+        );
+
+        let executions = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/action/executions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let executions_body = to_bytes(executions.into_body(), usize::MAX).await.unwrap();
+        let executions_json: serde_json::Value = serde_json::from_slice(&executions_body).unwrap();
+        assert!(executions_json["executions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|receipt| receipt["dispatch_target"]["session_key"] == "feishu:demo-chat"));
+
+        platform_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_commit_dispatches_ready_text_target() {
+        let (platform_runtime, sent) = test_platform_runtime_with_sent_adapter("feishu").await;
+        let app = api_router(test_state_with_config_and_runtime(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-live-{suffix}");
+        let capability = format!("channel.feishu.send_text.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-live-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "commit",
+            "idempotency_key": format!("idem-dispatch-live-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/source",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": "channel://feishu/chat/live-chat",
+                "resource_ref": "text://live payload",
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+        let executed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+
+        assert_eq!(executed_json["status"], "dispatched");
+        assert_eq!(executed_json["dispatch_status"], "sent");
+        assert_eq!(executed_json["dispatched"], true);
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_status"],
+            "sent"
+        );
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_target"]["session_key"],
+            "feishu:live-chat"
+        );
+        assert_eq!(executed_json["dispatch_outcome"]["status"], "sent");
+        assert_eq!(
+            executed_json["dispatch_outcome"]["provider_message_id"],
+            "mock-live-chat"
+        );
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_outcome"]["session_key"],
+            "feishu:live-chat"
+        );
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].session_key.as_str(), "feishu:live-chat");
+        assert_eq!(sent[0].text, "live payload");
+        drop(sent);
+
+        platform_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_commit_dispatches_ready_image_target() {
+        let (platform_runtime, media_sent) =
+            test_platform_runtime_with_media_adapter("feishu").await;
+        let app = api_router(test_state_with_config_and_runtime(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-image-{suffix}");
+        let capability = format!("channel.feishu.send_image.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-image-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "commit",
+            "idempotency_key": format!("idem-dispatch-image-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/source",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": "channel://feishu/chat/live-chat",
+                "resource_ref": "image://https://example.test/panel.png",
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+        let executed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+
+        assert_eq!(executed_json["status"], "dispatched");
+        assert_eq!(executed_json["dispatch_status"], "sent");
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
+                ["payload_kind"],
+            "image"
+        );
+        assert_eq!(executed_json["dispatch_outcome"]["operation"], "send_image");
+        let media_sent = media_sent.lock().unwrap();
+        assert_eq!(
+            media_sent.as_slice(),
+            ["image-url:live-chat:https://example.test/panel.png:"]
+        );
+        drop(media_sent);
+
+        platform_runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_commit_dispatches_workspace_file_target() {
+        let root = test_temp_dir("cross-plane-file-dispatch");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(workspace.join("reports")).unwrap();
+        let report_path = workspace.join("reports").join("panel.txt");
+        std::fs::write(&report_path, "dispatchable report").unwrap();
+        let (platform_runtime, media_sent) =
+            test_platform_runtime_with_media_adapter("feishu").await;
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+            workspace.clone(),
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-file-{suffix}");
+        let capability = format!("channel.feishu.send_file.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-file-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "commit",
+            "idempotency_key": format!("idem-dispatch-file-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/source",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": "channel://feishu/chat/live-chat",
+                "resource_ref": "file://reports/panel.txt",
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+        let executed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+
+        assert_eq!(executed_json["status"], "dispatched");
+        assert_eq!(executed_json["dispatch_status"], "sent");
+        assert_eq!(
+            executed_json["execution_receipt"]["dispatch_target"]["outbound_message"]
+                ["payload_kind"],
+            "file"
+        );
+        let media_sent = media_sent.lock().unwrap();
+        assert_eq!(
+            media_sent.as_slice(),
+            [format!(
+                "file:live-chat:{}:panel.txt:",
+                report_path.canonicalize().unwrap().display()
+            )]
+        );
+        drop(media_sent);
+
+        platform_runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cross_plane_execute_commit_blocks_file_outside_workspace() {
+        let root = test_temp_dir("cross-plane-file-block");
+        let workspace = root.join("workspace");
+        let outside = root.join("outside.txt");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&outside, "must not send").unwrap();
+        let (platform_runtime, media_sent) =
+            test_platform_runtime_with_media_adapter("feishu").await;
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "app-id",
+                        "app_secret": "app-secret"
+                    }]
+                }
+            }),
+            Some(platform_runtime.clone()),
+            workspace,
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:dispatch-file-block-{suffix}");
+        let capability = format!("channel.feishu.send_file.{suffix}");
+        let grant = serde_json::json!({
+            "id": format!("grant-dispatch-file-block-{suffix}"),
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "persistent",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let grant_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "mode": "commit",
+            "idempotency_key": format!("idem-dispatch-file-block-{suffix}"),
+            "action": {
+                "actor_principal": principal,
+                "actor_identity_ref": null,
+                "source_channel": "channel://wechat/chat/source",
+                "session_id": "test-session",
+                "requested_capability": capability,
+                "provider_account": "feishu-main",
+                "target_ref": "channel://feishu/chat/live-chat",
+                "resource_ref": format!("file://{}", outside.display()),
+                "risk": "high",
+                "data_classification": "internal",
+                "identity_trust": "verified"
+            }
+        });
+        let executed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/action/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let executed_body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let executed_json: serde_json::Value = serde_json::from_slice(&executed_body).unwrap();
+
+        assert_eq!(executed_json["status"], "blocked");
+        assert_eq!(executed_json["dispatch_status"], "dispatch_failed");
+        assert!(executed_json["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspace_payload_outside_root")));
+        assert!(media_sent.lock().unwrap().is_empty());
+
+        platform_runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn context_current_returns_degraded_envelope_without_memory() {
         let app = api_router(test_state());
         let response = app
@@ -5792,13 +5069,17 @@ mod tests {
         assert_eq!(json["lean_probe"]["envelope_id"], json["envelope"]["id"]);
         assert_eq!(json["lean_probe"]["pressure_level"], "Nominal");
         assert_eq!(json["lean_probe"]["degradation_path"], "SourceFallback");
-        assert_eq!(
-            json["policy_decision"]["action"],
-            "PreferOrientationPacket"
-        );
+        assert_eq!(json["policy_decision"]["action"], "PreferOrientationPacket");
         assert_eq!(
             json["policy_decision"]["stable_head_hash"],
             json["lean_probe"]["stable_head_hash"]
+        );
+        assert_eq!(json["cache_stability"]["stable_head_reusable"], true);
+        assert_eq!(json["mode_coverage"]["all_profiles_covered"], true);
+        assert_eq!(json["mode_coverage"]["all_stable_heads_reusable"], true);
+        assert_eq!(
+            json["mode_coverage"]["entries"].as_array().unwrap().len(),
+            8
         );
     }
 
@@ -5820,16 +5101,20 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["envelope"]["profile"], "YoloGoal");
         assert_eq!(json["envelope"]["identity"]["mode"], "YoloGoal");
-        assert_eq!(
-            json["envelope"]["budget"]["leases"][0]["source"],
-            "Task"
-        );
-        assert!(
-            json["envelope"]["assembled"]["runtime_header"][0]
-                .as_str()
-                .unwrap()
-                .contains("profile:YoloGoal")
-        );
+        assert_eq!(json["envelope"]["budget"]["leases"][0]["source"], "Task");
+        assert!(json["envelope"]["assembled"]["runtime_header"][0]
+            .as_str()
+            .unwrap()
+            .contains("profile:YoloGoal"));
+        assert!(json["envelope"]["assembled"]["runtime_header"][0]
+            .as_str()
+            .unwrap()
+            .contains("mode:YoloGoal"));
+        assert!(json["mode_coverage"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["profile"] == "SubAgent" && entry["mode"] == "SubAgent"));
     }
 
     #[tokio::test]
@@ -5852,7 +5137,7 @@ mod tests {
             (
                 1,
                 "RuntimeRun",
-                runtime_run_started_payload(
+                message_routes::runtime_run_started_payload(
                     session_id,
                     "run-1",
                     ContextProfile::MainTurn,
@@ -5863,7 +5148,7 @@ mod tests {
             (
                 2,
                 "RuntimeRun",
-                runtime_run_completed_payload(
+                message_routes::runtime_run_completed_payload(
                     session_id,
                     "run-1",
                     ContextProfile::MainTurn,
@@ -5931,11 +5216,252 @@ mod tests {
         assert_eq!(json["runs"][1]["run"]["status"], "completed");
         assert_eq!(json["runs"][1]["run"]["context_envelope_id"], "ctx-1");
         assert_eq!(json["runs"][1]["run"]["duration_ms"], 15);
-        assert_eq!(json["runs"][1]["run"]["refs"][0]["type"], "context_envelope");
+        assert_eq!(
+            json["runs"][1]["run"]["refs"][0]["type"],
+            "context_envelope"
+        );
         assert_eq!(json["tree"]["roots"][0], "run-1");
         assert_eq!(json["tree"]["children"]["run-1"][0], "agent-run-1");
         assert_eq!(json["tree"]["summary"]["span_count"], 2);
         assert_eq!(json["tree"]["summary"]["failed_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn session_runtime_run_context_reference_resolves_envelope_detail() {
+        let dir = test_temp_dir("runtime-context-link");
+        let db_path = dir.join("sessions.sqlite");
+        let store = Arc::new(UnifiedSessionStore::open(&db_path).unwrap());
+        let session_id = "runtime-context-link-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_event(&memory::SessionEvent {
+                session_id: session_id.to_string(),
+                event_type: "ContextEnvelope".to_string(),
+                event_json: test_context_envelope(
+                    session_id,
+                    "ctx-linked-runtime",
+                    "linked runtime context",
+                )
+                .to_string(),
+                sequence: 10,
+                created_at_ms: 10,
+            })
+            .await
+            .unwrap();
+        store
+            .append_event(&memory::SessionEvent {
+                session_id: session_id.to_string(),
+                event_type: "RuntimeRun".to_string(),
+                event_json: message_routes::runtime_run_completed_payload(
+                    session_id,
+                    "run-linked",
+                    ContextProfile::MainTurn,
+                    "completed",
+                    Some(1),
+                    Some("ctx-linked-runtime".to_string()),
+                    None,
+                    20,
+                    40,
+                )
+                .to_string(),
+                sequence: 20,
+                created_at_ms: 20,
+            })
+            .await
+            .unwrap();
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let runs_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}/runs?limit=5"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runs_response.status(), StatusCode::OK);
+        let body = to_bytes(runs_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let runs_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(runs_json["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            runs_json["runs"][0]["run"]["context_envelope_id"],
+            "ctx-linked-runtime"
+        );
+        assert_eq!(
+            runs_json["runs"][0]["run"]["refs"][0]["type"],
+            "context_envelope"
+        );
+        assert_eq!(runs_json["runs"][0]["run"]["duration_ms"], 20);
+
+        let detail_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/ctx-linked-runtime")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
+        assert_eq!(detail_json["context"]["session_id"], session_id);
+        assert_eq!(detail_json["context"]["sequence"], 10);
+        assert_eq!(
+            detail_json["context"]["envelope"]["intent"],
+            "linked runtime context"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_preserves_runtime_run_context_refs() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "runtime-context-ref-timeline";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .append_event(&memory::SessionEvent {
+                session_id: session_id.to_string(),
+                event_type: "message_appended".to_string(),
+                event_json: serde_json::json!({
+                    "type": "message_appended",
+                    "sequence": 0,
+                    "role": "user"
+                })
+                .to_string(),
+                sequence: 0,
+                created_at_ms: 10,
+            })
+            .await
+            .unwrap();
+        store
+            .append_event(&memory::SessionEvent {
+                session_id: session_id.to_string(),
+                event_type: "ContextEnvelope".to_string(),
+                event_json: test_context_envelope(
+                    session_id,
+                    "ctx-runtime-timeline",
+                    "timeline linked context",
+                )
+                .to_string(),
+                sequence: 1,
+                created_at_ms: 11,
+            })
+            .await
+            .unwrap();
+        store
+            .append_event(&memory::SessionEvent {
+                session_id: session_id.to_string(),
+                event_type: "RuntimeRun".to_string(),
+                event_json: message_routes::runtime_run_completed_payload(
+                    session_id,
+                    "run-runtime-timeline",
+                    ContextProfile::MainTurn,
+                    "completed",
+                    Some(1),
+                    Some("ctx-runtime-timeline".to_string()),
+                    None,
+                    20,
+                    30,
+                )
+                .to_string(),
+                sequence: 2,
+                created_at_ms: 12,
+            })
+            .await
+            .unwrap();
+        store
+            .append_runtime_event(&memory::RuntimeEvent::new(
+                session_id,
+                3,
+                memory::RuntimeEventScope::Policy,
+                "runtime.policy.decided",
+                serde_json::json!({
+                    "agent_mode": "Solo",
+                    "requires_review": false,
+                    "complexity": {"level": "Simple", "score": 30}
+                }),
+                13,
+            ))
+            .await
+            .unwrap();
+
+        let state = test_state_with_store(store);
+        let app = api_router(state);
+        let timeline_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timeline_response.status(), StatusCode::OK);
+        let timeline_body = to_bytes(timeline_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let timeline: serde_json::Value = serde_json::from_slice(&timeline_body).unwrap();
+        assert_eq!(timeline["total"], 4);
+        assert_eq!(timeline["events"][0]["kind"], "message_appended");
+        assert_eq!(timeline["events"][1]["kind"], "ContextEnvelope");
+        assert_eq!(timeline["events"][2]["kind"], "RuntimeRun");
+        assert_eq!(timeline["events"][2]["status"], "completed");
+        assert_eq!(timeline["events"][2]["refs"][0]["type"], "context_envelope");
+        assert_eq!(
+            timeline["events"][2]["refs"][0]["id"],
+            "ctx-runtime-timeline"
+        );
+        assert_eq!(
+            timeline["health_summary"]["latest_policy"]["agent_mode"],
+            "Solo"
+        );
+        assert_eq!(timeline["health_summary"]["scope_counts"]["turn"], 1);
+        assert_eq!(timeline["health_summary"]["scope_counts"]["context"], 1);
+        assert_eq!(timeline["health_summary"]["scope_counts"]["message"], 1);
+        assert_eq!(timeline["health_summary"]["scope_counts"]["policy"], 1);
+
+        let detail_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/ctx-runtime-timeline")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail_response.status(), StatusCode::OK);
+        let detail_body = to_bytes(detail_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let detail_json: serde_json::Value = serde_json::from_slice(&detail_body).unwrap();
+        assert_eq!(
+            detail_json["context"]["envelope"]["intent"],
+            "timeline linked context"
+        );
     }
 
     #[tokio::test]
@@ -5956,7 +5482,7 @@ mod tests {
                 .append_event(&memory::SessionEvent {
                     session_id: session_id.to_string(),
                     event_type: "RuntimeRun".to_string(),
-                    event_json: runtime_run_completed_payload(
+                    event_json: message_routes::runtime_run_completed_payload(
                         session_id,
                         &run_id,
                         ContextProfile::MainTurn,
@@ -6133,7 +5659,8 @@ mod tests {
 
     #[tokio::test]
     async fn task_api_records_phase_artifacts_and_review() {
-        let app = api_router(test_state());
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let app = api_router(test_state_with_store(store));
         let start_response = app
             .clone()
             .oneshot(
@@ -6213,6 +5740,7 @@ mod tests {
         assert_eq!(artifact_response.status(), StatusCode::OK);
 
         let review_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -6243,6 +5771,40 @@ mod tests {
         assert_eq!(reviewed_phase["status"], "completed");
         assert_eq!(reviewed_phase["review_result"], "accepted");
         assert_eq!(reviewed_phase["artifacts"][0]["label"], "playwright");
+
+        let timeline_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={task_id}&from_seq=0&limit=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timeline_response.status(), StatusCode::OK);
+        let timeline_body = to_bytes(timeline_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let timeline_json: serde_json::Value = serde_json::from_slice(&timeline_body).unwrap();
+        let kinds = timeline_json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "task.started",
+                "task.phase.started",
+                "task.phase.artifact.recorded",
+                "task.phase.reviewed",
+            ]
+        );
+        assert_eq!(timeline_json["events"][0]["scope"], "task");
+        assert_eq!(timeline_json["events"][3]["payload"]["status"], "reviewing");
     }
 
     #[tokio::test]
@@ -6293,10 +5855,8 @@ mod tests {
 
     #[tokio::test]
     async fn memory_maintenance_scan_and_transition() {
-        let dir = std::env::temp_dir().join(format!(
-            "cowd-api-maintenance-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cowd-api-maintenance-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let manager = Arc::new(
             CognitiveContextManager::new(test_memory_config(&dir.join("memory.db")))
@@ -6462,12 +6022,10 @@ mod tests {
         assert_eq!(json["results"][0]["category"], "ProjectKnowledge");
         assert!(json["results"][0]["score"].as_f64().is_some());
         assert!(json["results"][0]["mode"].as_str().is_some());
-        assert!(
-            json["results"][0]["snippet"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("SessionKernel")
-        );
+        assert!(json["results"][0]["snippet"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("SessionKernel"));
 
         std::fs::remove_dir_all(tmp).unwrap();
     }
@@ -6638,11 +6196,9 @@ mod tests {
         assert_eq!(status_json["context_health"]["level"], "healthy");
         assert_eq!(status_json["kernel_health"]["degraded"], false);
         assert_eq!(status_json["kernel_health"]["stale_pressure"], 0.0);
-        assert!(
-            status_json["kernel_health"]["evidence_coverage"]
-                .as_f64()
-                .is_some()
-        );
+        assert!(status_json["kernel_health"]["evidence_coverage"]
+            .as_f64()
+            .is_some());
 
         let layers_response = app
             .clone()
@@ -6945,6 +6501,7 @@ mod tests {
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: Some("test-token".into()),
@@ -6953,6 +6510,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         });
         let app = api_router(state);
 
@@ -6969,6 +6527,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_routes_stay_protected_when_auth_token_set() {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        let state = Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
+            sessions,
+            memory_manager: None,
+            unified_store: None,
+            tool_registry: tools,
+            config: None,
+            platform_runtime: None,
+            event_bus,
+            approval_gate: None,
+            auth_token: Some("test-token".into()),
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            config_home: default_config_home(),
+            profile_id: "default".to_string(),
+            profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
+            session_lease_registry: None,
+        });
+        let app = api_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn profile_and_workspace_routes_stay_protected_when_auth_token_set() {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        let state = Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
+            sessions,
+            memory_manager: None,
+            unified_store: None,
+            tool_registry: tools,
+            config: None,
+            platform_runtime: None,
+            event_bus,
+            approval_gate: None,
+            auth_token: Some("test-token".into()),
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            config_home: default_config_home(),
+            profile_id: "default".to_string(),
+            profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
+            session_lease_registry: None,
+        });
+        let app = api_router(state);
+
+        for uri in [
+            "/api/profiles",
+            "/api/workspace",
+            "/api/approval/pending",
+            "/api/cross-plane/summary",
+            "/api/channels/wechat-ilink/accounts",
+            "/api/memory/status",
+            "/api/tasks",
+            "/api/runtime/control-plane",
+            "/api/context/current",
+            "/api/evidence/resolve?ref=session%3A%2F%2Ftest",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
     async fn auth_passes_with_valid_token() {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
@@ -6980,6 +6621,7 @@ mod tests {
             unified_store: None,
             tool_registry: tools,
             config: None,
+            platform_runtime: None,
             event_bus,
             approval_gate: None,
             auth_token: Some("test-token".into()),
@@ -6988,6 +6630,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         });
         let app = api_router(state);
 

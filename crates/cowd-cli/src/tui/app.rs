@@ -1,5 +1,6 @@
 #![allow(dead_code)]
-use crate::tui::layout::{LayoutState, LayoutTree, build_default_layout};
+use crate::tui::layout::{build_default_layout, LayoutState, LayoutTree};
+use crate::tui::runtime_control_store::{DaemonApprovalSummary, DaemonTaskSummary};
 use ratatui::widgets::{Block, Borders};
 use runtime::CowdEvent;
 use std::collections::VecDeque;
@@ -188,6 +189,28 @@ pub struct App {
     pub server_uptime_secs: Option<u64>,
     /// Number of active API sessions.
     pub active_api_sessions: usize,
+    /// Daemon runtime readiness summary from the HTTP projection API.
+    pub daemon_runtime_readiness: Option<String>,
+    /// Daemon runtime component count from the HTTP projection API.
+    pub daemon_runtime_components: Option<u64>,
+    /// Number of tasks observed through the daemon projection API.
+    pub daemon_task_count: Option<u64>,
+    /// Daemon task summaries observed through the runtime control snapshot.
+    pub daemon_tasks: Vec<DaemonTaskSummary>,
+    /// Number of pending approvals observed through the daemon projection API.
+    pub daemon_pending_approvals: Option<u64>,
+    /// Pending daemon approval summaries observed through the daemon projection API.
+    pub daemon_approval_items: Vec<DaemonApprovalSummary>,
+    /// Number of active cross-plane grants observed through the daemon projection API.
+    pub daemon_cross_plane_grants_active: Option<u64>,
+    /// Number of cross-plane interop actions observed over the last 24h.
+    pub daemon_cross_plane_actions_24h: Option<u64>,
+    /// Degraded daemon projection/control reasons collected during snapshot refresh.
+    pub daemon_degraded_reasons: Vec<String>,
+    /// Current daemon session lease owner for the attached TUI session.
+    pub daemon_lease_owner: Option<String>,
+    /// Current daemon session lease mode for the attached TUI session.
+    pub daemon_lease_mode: Option<String>,
 
     pub scroll_offset: u16,
     pub auto_scroll: bool,
@@ -199,6 +222,7 @@ pub struct App {
     pub last_drawn_version: u64,
     pub context_window: u64,
     pub latest_context_envelope: Option<runtime::ContextEnvelope>,
+    pub latest_runtime_policy: Option<runtime::RuntimePolicyDecisionSummary>,
     pub latest_workgraph_summary: Option<runtime::RuntimeWorkGraphSummary>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -385,6 +409,17 @@ impl App {
             server_running: false,
             server_uptime_secs: None,
             active_api_sessions: 0,
+            daemon_runtime_readiness: None,
+            daemon_runtime_components: None,
+            daemon_task_count: None,
+            daemon_tasks: Vec::new(),
+            daemon_pending_approvals: None,
+            daemon_approval_items: Vec::new(),
+            daemon_cross_plane_grants_active: None,
+            daemon_cross_plane_actions_24h: None,
+            daemon_degraded_reasons: Vec::new(),
+            daemon_lease_owner: None,
+            daemon_lease_mode: None,
 
             scroll_offset: 0,
             auto_scroll: true,
@@ -396,6 +431,7 @@ impl App {
             last_drawn_version: u64::MAX,
             context_window: 0,
             latest_context_envelope: None,
+            latest_runtime_policy: None,
             latest_workgraph_summary: None,
             input_tokens: 0,
             output_tokens: 0,
@@ -1029,6 +1065,10 @@ impl App {
                 self.latest_context_envelope = Some(envelope);
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
+            CowdEvent::RuntimePolicyDecision { summary } => {
+                self.latest_runtime_policy = Some(summary);
+                self.msg_version = self.msg_version.wrapping_add(1);
+            }
             CowdEvent::WorkGraphSummary { summary } => {
                 self.latest_workgraph_summary = Some(summary);
                 self.msg_version = self.msg_version.wrapping_add(1);
@@ -1253,18 +1293,16 @@ mod tests {
         assert_eq!(app.timeline_pages.len(), 2);
 
         assert!(app.timeline_get(0).unwrap().full_text().contains("msg 0"));
-        assert!(
-            app.timeline_get(PAGE_SIZE - 1)
-                .unwrap()
-                .full_text()
-                .contains(&format!("msg {}", PAGE_SIZE - 1))
-        );
-        assert!(
-            app.timeline_get(PAGE_SIZE)
-                .unwrap()
-                .full_text()
-                .contains("overflow")
-        );
+        assert!(app
+            .timeline_get(PAGE_SIZE - 1)
+            .unwrap()
+            .full_text()
+            .contains(&format!("msg {}", PAGE_SIZE - 1)));
+        assert!(app
+            .timeline_get(PAGE_SIZE)
+            .unwrap()
+            .full_text()
+            .contains("overflow"));
 
         let count = app.timeline_iter().count();
         assert_eq!(count, PAGE_SIZE + 1);
@@ -1310,18 +1348,16 @@ mod tests {
         }
         assert_eq!(app.timeline_len(), PAGE_SIZE * 3 + 200);
         assert!(app.timeline_get(0).unwrap().full_text().contains("entry 0"));
-        assert!(
-            app.timeline_get(PAGE_SIZE)
-                .unwrap()
-                .full_text()
-                .contains(&format!("entry {}", PAGE_SIZE))
-        );
-        assert!(
-            app.timeline_get(PAGE_SIZE * 2 + 50)
-                .unwrap()
-                .full_text()
-                .contains(&format!("entry {}", PAGE_SIZE * 2 + 50))
-        );
+        assert!(app
+            .timeline_get(PAGE_SIZE)
+            .unwrap()
+            .full_text()
+            .contains(&format!("entry {}", PAGE_SIZE)));
+        assert!(app
+            .timeline_get(PAGE_SIZE * 2 + 50)
+            .unwrap()
+            .full_text()
+            .contains(&format!("entry {}", PAGE_SIZE * 2 + 50)));
     }
 
     #[test]

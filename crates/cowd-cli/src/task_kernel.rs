@@ -1,10 +1,10 @@
 use std::{
-    fs,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,12 +114,9 @@ pub(crate) struct TaskKernel {
 
 impl TaskKernel {
     pub(crate) fn open(path: PathBuf) -> Result<Self, String> {
-        let store = if path.is_file() {
-            let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            serde_json::from_str(&raw).map_err(|e| e.to_string())?
-        } else {
-            TaskStore::default()
-        };
+        let path = normalize_task_db_path(path);
+        ensure_schema(&path)?;
+        let store = load_store(&path)?;
         Ok(Self {
             path,
             store: Arc::new(Mutex::new(store)),
@@ -422,17 +419,83 @@ impl TaskKernel {
 
     fn persist(&self) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let raw = {
+        ensure_schema(&self.path)?;
+        let store = {
             let store = self
                 .store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            serde_json::to_string_pretty(&*store).map_err(|e| e.to_string())?
+            store.tasks.clone()
         };
-        fs::write(&self.path, raw).map_err(|e| e.to_string())
+        let mut conn = Connection::open(&self.path).map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM tasks", [])
+            .map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO tasks (id, status, created_at_ms, updated_at_ms, record_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|e| e.to_string())?;
+            for task in &store {
+                let record_json = serde_json::to_string(task).map_err(|e| e.to_string())?;
+                stmt.execute(params![
+                    task.id.as_str(),
+                    task.status.as_str(),
+                    task.created_at_ms as i64,
+                    task.updated_at_ms as i64,
+                    record_json,
+                ])
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
+}
+
+fn normalize_task_db_path(path: PathBuf) -> PathBuf {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+        return path.with_extension("db");
+    }
+    path
+}
+
+fn ensure_schema(path: &PathBuf) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY NOT NULL,
+            status TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            record_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tasks_status_updated
+            ON tasks(status, updated_at_ms DESC);",
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn load_store(path: &PathBuf) -> Result<TaskStore, String> {
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT record_json FROM tasks ORDER BY created_at_ms ASC, id ASC")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    let mut tasks = Vec::new();
+    for row in rows {
+        let raw = row.map_err(|e| e.to_string())?;
+        tasks.push(serde_json::from_str::<TaskRecord>(&raw).map_err(|e| e.to_string())?);
+    }
+    Ok(TaskStore { tasks })
 }
 
 fn now_ms() -> u64 {
@@ -447,6 +510,10 @@ mod tests {
     use super::{TaskKernel, TaskStatus};
 
     fn temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("cowd-task-{label}-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    fn legacy_temp_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("cowd-task-{label}-{}.json", uuid::Uuid::new_v4()))
     }
 
@@ -463,6 +530,21 @@ mod tests {
         assert!(current.yolo_mode);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn task_kernel_maps_legacy_json_path_to_sqlite_db_without_json_write() {
+        let legacy_path = legacy_temp_path("legacy-map");
+        let db_path = legacy_path.with_extension("db");
+        let kernel = TaskKernel::open(legacy_path.clone()).unwrap();
+        kernel.start_goal("Use sqlite task store", true).unwrap();
+
+        assert!(db_path.is_file());
+        assert!(!legacy_path.exists());
+        let restored = TaskKernel::open(legacy_path.clone()).unwrap();
+        assert_eq!(restored.list().len(), 1);
+
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[test]
@@ -560,12 +642,10 @@ mod tests {
             reviewed_phase.review_result.as_deref(),
             Some("accepted after gate")
         );
-        assert!(
-            reviewed
-                .audit
-                .iter()
-                .any(|event| event.event_type == "phase_reviewed")
-        );
+        assert!(reviewed
+            .audit
+            .iter()
+            .any(|event| event.event_type == "phase_reviewed"));
 
         let restored = TaskKernel::open(path.clone()).unwrap();
         let restored_task = restored

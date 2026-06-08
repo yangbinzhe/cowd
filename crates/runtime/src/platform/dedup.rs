@@ -262,7 +262,10 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_detection_within_ttl() {
         let store = DedupStore::new(10, 3600);
-        assert!(!store.is_duplicate("msg_1").await, "first sighting → not dup");
+        assert!(
+            !store.is_duplicate("msg_1").await,
+            "first sighting → not dup"
+        );
         assert!(store.is_duplicate("msg_1").await, "second sighting → dup");
         assert_eq!(store.len().await, 1);
     }
@@ -271,7 +274,10 @@ mod tests {
     async fn test_expired_entry_not_duplicate() {
         let store = DedupStore::new(10, 0); // ttl=0 → everything expires immediately
         assert!(!store.is_duplicate("msg_1").await, "first sighting");
-        assert!(!store.is_duplicate("msg_1").await, "expired → not dup, re-added");
+        assert!(
+            !store.is_duplicate("msg_1").await,
+            "expired → not dup, re-added"
+        );
         assert_eq!(store.len().await, 1);
     }
 
@@ -348,7 +354,10 @@ mod tests {
 
         store.mark_seen("explicit_msg").await;
         assert_eq!(store.len().await, 1);
-        assert!(store.is_duplicate("explicit_msg").await, "should be seen now");
+        assert!(
+            store.is_duplicate("explicit_msg").await,
+            "should be seen now"
+        );
     }
 
     #[tokio::test]
@@ -383,6 +392,9 @@ mod tests {
     async fn test_persist_without_state_path_is_noop() {
         let store = DedupStore::new(10, 3600);
         store.is_duplicate("some_msg").await;
-        store.persist().await.expect("persist without path is no-op");
+        store
+            .persist()
+            .await
+            .expect("persist without path is no-op");
     }
 }

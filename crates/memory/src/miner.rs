@@ -6,11 +6,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::legacy_jsonl::legacy_jsonl_session_import_enabled;
+
 /// Mining mode selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MiningMode {
     Project,       // Code/docs in a project directory
-    Conversations, // JSONL session files
+    Conversations, // Explicit legacy JSONL import/recovery files
     General,       // Free-text extraction
 }
 
@@ -38,8 +40,8 @@ pub enum MinedCategory {
 /// Memory miner with configurable chunk parameters.
 pub struct MemoryMiner {
     pub mode: MiningMode,
-    pub chunk_size: usize,      // Default 800 chars (MemPalace)
-    pub chunk_overlap: usize,   // Default 100 chars
+    pub chunk_size: usize,    // Default 800 chars (MemPalace)
+    pub chunk_overlap: usize, // Default 100 chars
     pub respect_gitignore: bool,
 }
 
@@ -86,7 +88,8 @@ impl MemoryMiner {
             }
 
             // Skip hidden files
-            let is_hidden = entry_path.file_name()
+            let is_hidden = entry_path
+                .file_name()
                 .and_then(|n| n.to_str())
                 .map(|n| n.starts_with('.'))
                 .unwrap_or(false);
@@ -100,7 +103,8 @@ impl MemoryMiner {
             }
 
             if let Ok(content) = tokio::fs::read_to_string(entry_path).await {
-                let relative = entry_path.strip_prefix(root)
+                let relative = entry_path
+                    .strip_prefix(root)
                     .unwrap_or(entry_path)
                     .to_string_lossy()
                     .to_string();
@@ -128,16 +132,27 @@ impl MemoryMiner {
         Ok(entries)
     }
 
-    /// Mine conversation JSONL files.
+    /// Mine explicitly imported legacy conversation JSONL files.
+    ///
+    /// Managed runtime sessions are stored in SQLite. This path is intentionally
+    /// gated and exists only for user-triggered legacy import/recovery flows.
     pub async fn mine_conversations(&self, session_dir: &Path) -> Result<Vec<MinedEntry>, String> {
+        if !legacy_jsonl_session_import_enabled() {
+            return Ok(Vec::new());
+        }
+
         if !session_dir.exists() {
-            return Err(format!("Session dir does not exist: {}", session_dir.display()));
+            return Err(format!(
+                "Session dir does not exist: {}",
+                session_dir.display()
+            ));
         }
 
         let mut entries = Vec::new();
 
-        // Read JSONL files
-        let mut dir_entries = tokio::fs::read_dir(session_dir).await
+        // Read explicit legacy JSONL files.
+        let mut dir_entries = tokio::fs::read_dir(session_dir)
+            .await
             .map_err(|e| e.to_string())?;
 
         while let Some(entry) = dir_entries.next_entry().await.map_err(|e| e.to_string())? {
@@ -147,7 +162,11 @@ impl MemoryMiner {
             }
 
             if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
 
                 // Parse conversation exchanges
                 let exchanges = parse_conversation_exchanges(&content);
@@ -247,14 +266,31 @@ fn classify_content(text: &str) -> MinedCategory {
     let lower = text.to_lowercase();
 
     let decision_signals: &[&str] = &["decided", "decision", "chose", "will use", "决定", "选择"];
-    let preference_signals: &[&str] = &["prefer", "like", "want", "always", "never", "喜欢", "偏好"];
-    let milestone_signals: &[&str] = &["completed", "finished", "released", "deployed", "完成", "上线"];
+    let preference_signals: &[&str] =
+        &["prefer", "like", "want", "always", "never", "喜欢", "偏好"];
+    let milestone_signals: &[&str] = &[
+        "completed",
+        "finished",
+        "released",
+        "deployed",
+        "完成",
+        "上线",
+    ];
     let code_signals: &[&str] = &["fn ", "func ", "def ", "class ", "impl ", "pub ", "import "];
     let api_signals: &[&str] = &["endpoint", "api", "route", "handler", "接口", "路由"];
 
-    let decision_count = decision_signals.iter().filter(|s| lower.contains(**s)).count();
-    let preference_count = preference_signals.iter().filter(|s| lower.contains(**s)).count();
-    let milestone_count = milestone_signals.iter().filter(|s| lower.contains(**s)).count();
+    let decision_count = decision_signals
+        .iter()
+        .filter(|s| lower.contains(**s))
+        .count();
+    let preference_count = preference_signals
+        .iter()
+        .filter(|s| lower.contains(**s))
+        .count();
+    let milestone_count = milestone_signals
+        .iter()
+        .filter(|s| lower.contains(**s))
+        .count();
     let code_count = code_signals.iter().filter(|s| text.contains(**s)).count();
     let api_count = api_signals.iter().filter(|s| lower.contains(**s)).count();
 
@@ -355,10 +391,40 @@ fn is_ignored(path: &Path, root: &Path, patterns: &[String]) -> bool {
 /// Check if a file is a text file based on extension.
 fn is_text_file(path: &Path) -> bool {
     let text_extensions = [
-        "rs", "toml", "json", "yaml", "yml", "md", "txt", "py", "js", "ts",
-        "jsx", "tsx", "html", "css", "scss", "go", "java", "c", "cpp", "h",
-        "sh", "bash", "zsh", "sql", "graphql", "proto", "dockerfile",
-        "gitignore", "env", "cfg", "ini", "conf", "xml", "csv",
+        "rs",
+        "toml",
+        "json",
+        "yaml",
+        "yml",
+        "md",
+        "txt",
+        "py",
+        "js",
+        "ts",
+        "jsx",
+        "tsx",
+        "html",
+        "css",
+        "scss",
+        "go",
+        "java",
+        "c",
+        "cpp",
+        "h",
+        "sh",
+        "bash",
+        "zsh",
+        "sql",
+        "graphql",
+        "proto",
+        "dockerfile",
+        "gitignore",
+        "env",
+        "cfg",
+        "ini",
+        "conf",
+        "xml",
+        "csv",
     ];
 
     path.extension()
@@ -370,6 +436,25 @@ fn is_text_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    struct LegacyJsonlEnvGuard(Option<String>);
+
+    impl LegacyJsonlEnvGuard {
+        fn disabled() -> Self {
+            let previous = std::env::var("COWD_ENABLE_LEGACY_JSONL_SESSION_IMPORT").ok();
+            std::env::remove_var("COWD_ENABLE_LEGACY_JSONL_SESSION_IMPORT");
+            Self(previous)
+        }
+    }
+
+    impl Drop for LegacyJsonlEnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                std::env::set_var("COWD_ENABLE_LEGACY_JSONL_SESSION_IMPORT", previous);
+            }
+        }
+    }
 
     #[test]
     fn test_chunk_text_small() {
@@ -390,9 +475,18 @@ mod tests {
 
     #[test]
     fn test_classify_content() {
-        assert_eq!(classify_content("We decided to use Rust for the backend"), MinedCategory::Decision);
-        assert_eq!(classify_content("fn main() { println!(\"hello\"); }\nimpl Foo for Bar { }"), MinedCategory::CodePattern);
-        assert_eq!(classify_content("I prefer dark mode for coding"), MinedCategory::Preference);
+        assert_eq!(
+            classify_content("We decided to use Rust for the backend"),
+            MinedCategory::Decision
+        );
+        assert_eq!(
+            classify_content("fn main() { println!(\"hello\"); }\nimpl Foo for Bar { }"),
+            MinedCategory::CodePattern
+        );
+        assert_eq!(
+            classify_content("I prefer dark mode for coding"),
+            MinedCategory::Preference
+        );
     }
 
     #[test]
@@ -401,5 +495,21 @@ mod tests {
         let text = "This is a test. We decided to use Axum for the web framework. ".repeat(20);
         let entries = miner.mine_general(&text);
         assert!(!entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mine_conversations_skips_legacy_jsonl_without_import_gate() {
+        let _env = LegacyJsonlEnvGuard::disabled();
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("legacy.jsonl"),
+            r#"{"type":"message","content":"We decided to keep SQLite as source of truth."}"#,
+        )
+        .unwrap();
+
+        let miner = MemoryMiner::new(MiningMode::Conversations);
+        let entries = miner.mine_conversations(tmp.path()).await.unwrap();
+
+        assert!(entries.is_empty());
     }
 }

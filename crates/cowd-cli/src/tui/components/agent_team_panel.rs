@@ -25,7 +25,7 @@ use ratatui::{
 
 use memory::{AgentDirectory, AgentInfo, AgentStatus};
 
-use crate::tui::app::App;
+use crate::tui::app::{App, DelegateTask};
 use crate::tui::components::{Component, EventResult, RenderContext};
 
 // ── AgentTeamPanel ─────────────────────────────────────────────────
@@ -51,6 +51,10 @@ pub struct AgentTeamPanel {
     pub scroll_offset: u16,
     /// Index of the agent whose detail view is expanded (None = collapsed).
     pub detail_idx: Option<usize>,
+    /// Latest workgraph summary emitted by the runtime.
+    pub workgraph_summary: Option<runtime::RuntimeWorkGraphSummary>,
+    /// Delegated task summaries from the current App state.
+    pub delegate_tasks: Vec<DelegateTask>,
 }
 
 impl AgentTeamPanel {
@@ -63,6 +67,8 @@ impl AgentTeamPanel {
             visible: false,
             scroll_offset: 0,
             detail_idx: None,
+            workgraph_summary: None,
+            delegate_tasks: Vec::new(),
         }
     }
 
@@ -84,10 +90,11 @@ impl AgentTeamPanel {
         }
     }
 
-    /// Sync from App state. Delegates to `self.sync()` since the
-    /// AgentDirectory is a global singleton, not stored on App.
-    pub fn sync_from_app(&mut self, _app: &App) {
+    /// Sync from App state and the global AgentDirectory.
+    pub fn sync_from_app(&mut self, app: &App) {
         self.sync();
+        self.workgraph_summary = app.latest_workgraph_summary.clone();
+        self.delegate_tasks = app.delegate_tasks.clone();
     }
 
     /// Toggle panel visibility.
@@ -312,6 +319,67 @@ impl AgentTeamPanel {
 
         lines
     }
+
+    fn render_collaboration_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        if let Some(summary) = self.workgraph_summary.as_ref() {
+            lines.push(Line::from(vec![
+                Span::styled("Workgraph: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(summary.status.clone(), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!(
+                        "  tasks {} memory {} conflicts {}",
+                        summary.agent_tasks, summary.memory_candidates, summary.conflicts
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            let lift = summary
+                .synthesis_lift
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "n/a".to_string());
+            let complementarity = summary
+                .complementarity_score
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "n/a".to_string());
+            let completion = summary
+                .completion_rate
+                .map(|v| format!("{:.0}%", v * 100.0))
+                .unwrap_or_else(|| "n/a".to_string());
+            lines.push(Line::from(vec![
+                Span::styled("Synthesis: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("lift {lift}  complement {complementarity}  done {completion}"),
+                    Style::default().fg(Color::Green),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "Workgraph: no collaboration summary yet",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        if !self.delegate_tasks.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("Delegates: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", self.delegate_tasks.len()),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+            for task in self.delegate_tasks.iter().take(3) {
+                lines.push(Line::from(vec![
+                    Span::styled("  - ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(task.status.clone(), Style::default().fg(Color::Yellow)),
+                    Span::raw(" "),
+                    Span::styled(preview(&task.description, 56), Style::default()),
+                ]));
+            }
+        }
+        lines.push(Line::raw(""));
+        lines
+    }
 }
 
 // ── Default impl ─────────────────────────────────────────────────
@@ -341,6 +409,7 @@ impl Component for AgentTeamPanel {
         let mut lines: Vec<Line> = Vec::new();
 
         // ── Header ───────────────────────────────────────────
+        lines.extend(self.render_collaboration_lines());
         if self.agents.is_empty() {
             lines.push(Line::from(Span::styled(
                 "No agents registered.",
@@ -540,6 +609,18 @@ impl Component for AgentTeamPanel {
     }
 }
 
+fn preview(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out = text
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -548,6 +629,16 @@ mod tests {
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
     use crossterm::event::KeyEvent;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static AGENT_DIRECTORY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn agent_directory_test_guard() -> MutexGuard<'static, ()> {
+        AGENT_DIRECTORY_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("agent directory test lock poisoned")
+    }
 
     fn dummy_agent(id: &str, role: &str, status: AgentStatus, caps: Vec<&str>) -> AgentInfo {
         AgentInfo {
@@ -591,6 +682,7 @@ mod tests {
 
     #[test]
     fn sync_populates_agents() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent(
@@ -610,6 +702,7 @@ mod tests {
 
     #[test]
     fn selected_agent_returns_correct_entry() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent(
@@ -711,6 +804,7 @@ mod tests {
 
     #[test]
     fn render_with_agents() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent(
@@ -744,6 +838,7 @@ mod tests {
 
     #[test]
     fn keyboard_navigation_jk() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent("a", "Planner", AgentStatus::Active, vec![]));
@@ -802,6 +897,7 @@ mod tests {
 
     #[test]
     fn keyboard_gg_jumps() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent("a", "P", AgentStatus::Active, vec![]));
@@ -833,6 +929,7 @@ mod tests {
 
     #[test]
     fn enter_toggles_detail() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent(
@@ -863,6 +960,7 @@ mod tests {
 
     #[test]
     fn esc_collapses_detail_then_hides() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent("esc", "Executor", AgentStatus::Active, vec![]));
@@ -923,6 +1021,7 @@ mod tests {
 
     #[test]
     fn sync_from_app_delegates_to_sync() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent(
@@ -944,7 +1043,56 @@ mod tests {
     }
 
     #[test]
+    fn sync_from_app_renders_workgraph_and_delegate_tasks() {
+        let _guard = agent_directory_test_guard();
+        let dir = AgentDirectory::global();
+        dir.clear_all();
+        dir.register(dummy_agent(
+            "planner-1",
+            "Planner",
+            AgentStatus::Active,
+            vec!["planning"],
+        ));
+
+        let mut app = App::new("m", "s");
+        app.latest_workgraph_summary = Some(runtime::RuntimeWorkGraphSummary {
+            graph_id: Some("graph-1".to_string()),
+            board_id: Some("board-1".to_string()),
+            status: "running".to_string(),
+            agent_tasks: 3,
+            memory_candidates: 2,
+            conflicts: 1,
+            completion_rate: Some(0.5),
+            synthesis_lift: Some(1.25),
+            complementarity_score: Some(0.82),
+        });
+        app.delegate_tasks = vec![DelegateTask {
+            id: "delegate-1".to_string(),
+            description: "review context-memory integration".to_string(),
+            status: "running".to_string(),
+        }];
+
+        let mut panel = AgentTeamPanel::new();
+        panel.visible = true;
+        panel.sync_from_app(&app);
+
+        let lines = render_panel(&mut panel, 92, 20);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Workgraph:"), "{joined}");
+        assert!(joined.contains("tasks 3 memory 2 conflicts 1"), "{joined}");
+        assert!(joined.contains("lift 1.25"), "{joined}");
+        assert!(joined.contains("Delegates:"), "{joined}");
+        assert!(
+            joined.contains("review context-memory integration"),
+            "{joined}"
+        );
+
+        dir.clear_all();
+    }
+
+    #[test]
     fn sync_resets_detail_when_roster_changes() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent("x", "E", AgentStatus::Active, vec![]));
@@ -976,6 +1124,7 @@ mod tests {
 
     #[test]
     fn selection_clamped_after_roster_shrinks() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent("a", "P", AgentStatus::Active, vec![]));
@@ -996,6 +1145,7 @@ mod tests {
 
     #[test]
     fn scroll_offset_tracks_selection_on_j() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         for i in 0..15 {

@@ -21,18 +21,28 @@ pub mod types;
 pub mod ws;
 
 // Re-export types from sibling modules
-pub use adapter::{FeishuAdapter, FeishuConfig, CardAction};
-pub use approval::{ApprovalCard, CardActionDedup, CARD_ACTION_DEDUP_TTL_SECONDS, APPROVAL_HEADER_TEXT, LABEL_ALLOW_ONCE, LABEL_APPROVE_SESSION, LABEL_APPROVE_ALWAYS, LABEL_DENY, HERMES_ACTION_APPROVE_ONCE, HERMES_ACTION_APPROVE_SESSION, HERMES_ACTION_APPROVE_ALWAYS, HERMES_ACTION_DENY};
+pub use adapter::{CardAction, FeishuAdapter, FeishuConfig};
+pub use approval::{
+    ApprovalCard, CardActionDedup, APPROVAL_HEADER_TEXT, CARD_ACTION_DEDUP_TTL_SECONDS,
+    HERMES_ACTION_APPROVE_ALWAYS, HERMES_ACTION_APPROVE_ONCE, HERMES_ACTION_APPROVE_SESSION,
+    HERMES_ACTION_DENY, LABEL_ALLOW_ONCE, LABEL_APPROVE_ALWAYS, LABEL_APPROVE_SESSION, LABEL_DENY,
+};
 pub use auth::*;
 pub use batch::*;
-pub use comment::{CommentHandler, CommentStatus, FeishuComment, CreateCommentRequest, ReplyCommentRequest, UpdateCommentRequest, CommentFilter};
-pub use doc::{DocumentClient, DocumentContent, DocumentMetadata, DocumentType, DocumentElement, SearchDocumentsRequest, SearchResult, SearchDocumentsResponse};
+pub use comment::{
+    CommentFilter, CommentHandler, CommentStatus, CreateCommentRequest, FeishuComment,
+    ReplyCommentRequest, UpdateCommentRequest,
+};
+pub use doc::{
+    DocumentClient, DocumentContent, DocumentElement, DocumentMetadata, DocumentType,
+    SearchDocumentsRequest, SearchDocumentsResponse, SearchResult,
+};
 pub use markdown::*;
 pub use media::*;
 pub use normalize::*;
 pub use processing::*;
 pub use reactions::*;
-pub use rules::{RulesEngine, RoutingRule, RuleCondition, RuleAction, RuleMatch};
+pub use rules::{RoutingRule, RuleAction, RuleCondition, RuleMatch, RulesEngine};
 pub use types::*;
 pub use ws::*;
 

@@ -280,7 +280,7 @@ impl Default for WaveConfig {
             max_parallel: 4,
             continue_on_failure: true,
             stop_on_wave_failure: false,
-            task_timeout_ms: 300000, // 5 minutes
+            task_timeout_ms: 300000,  // 5 minutes
             wave_timeout_ms: 1800000, // 30 minutes
             error_policy: ErrorPolicy::default(),
             safety_check_enabled: true,
@@ -346,12 +346,20 @@ pub trait WaveExecutor: Send + Sync + 'static {
 
     /// Called before a wave starts executing.
     fn on_wave_start(self: Arc<Self>, wave: Wave) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        Box::pin(async move { let _ = wave; })
+        Box::pin(async move {
+            let _ = wave;
+        })
     }
 
     /// Called after a wave completes.
-    fn on_wave_complete(self: Arc<Self>, wave: Wave, result: WaveResult) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        Box::pin(async move { let _ = (wave, result); })
+    fn on_wave_complete(
+        self: Arc<Self>,
+        wave: Wave,
+        result: WaveResult,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            let _ = (wave, result);
+        })
     }
 }
 
@@ -406,7 +414,8 @@ impl WaveExecutionState {
 
     /// Mark a task as running.
     pub fn set_running(&mut self, task_id: &TaskId) {
-        self.task_statuses.insert(task_id.clone(), TaskStatus::Running);
+        self.task_statuses
+            .insert(task_id.clone(), TaskStatus::Running);
     }
 
     /// Record a task result.
@@ -483,11 +492,8 @@ impl WaveOrchestrator {
 
         // Calculate in-degree for each task
         // For "task B depends on A", the edge is A -> B, so B's in-degree should increase
-        let mut in_degree: HashMap<TaskId, usize> = self
-            .tasks
-            .keys()
-            .map(|id| (id.clone(), 0))
-            .collect();
+        let mut in_degree: HashMap<TaskId, usize> =
+            self.tasks.keys().map(|id| (id.clone(), 0)).collect();
 
         for task in self.tasks.values() {
             // Each task's in-degree = number of dependencies (how many tasks it waits on)
@@ -671,8 +677,7 @@ impl WaveOrchestrator {
     pub fn get_wave_tasks(&self, wave_number: u32) -> Option<Vec<&WaveTask>> {
         let wave = self.get_wave(wave_number)?;
         Some(
-            wave
-                .tasks
+            wave.tasks
                 .iter()
                 .filter_map(|id| self.tasks.get(id))
                 .collect(),
@@ -705,7 +710,9 @@ impl WaveOrchestrator {
             }
 
             let wave = wave.clone();
-            state.wave_statuses.insert(wave.number, WaveStatus::Executing);
+            state
+                .wave_statuses
+                .insert(wave.number, WaveStatus::Executing);
 
             // Notify wave start
             executor.clone().on_wave_start(wave.clone()).await;
@@ -732,7 +739,10 @@ impl WaveOrchestrator {
             }
 
             // Notify wave complete
-            executor.clone().on_wave_complete(wave.clone(), wave_result.clone()).await;
+            executor
+                .clone()
+                .on_wave_complete(wave.clone(), wave_result.clone())
+                .await;
 
             wave_results.push(wave_result);
 
@@ -741,7 +751,9 @@ impl WaveOrchestrator {
                 // Mark remaining waves as cancelled
                 for remaining_wave in &self.waves {
                     if remaining_wave.number > wave.number {
-                        state.wave_statuses.insert(remaining_wave.number, WaveStatus::Cancelled);
+                        state
+                            .wave_statuses
+                            .insert(remaining_wave.number, WaveStatus::Cancelled);
                     }
                 }
                 break;
@@ -892,7 +904,6 @@ impl WaveOrchestrator {
         context: &TaskContext,
         timeout: Duration,
     ) -> Vec<TaskResult> {
-        
         let mut handles: Vec<tokio::task::JoinHandle<TaskResult>> = Vec::new();
 
         for task_id in task_ids {
@@ -995,8 +1006,7 @@ impl WaveOrchestrator {
                 "retrying failed tasks"
             );
 
-            let retry_ids: Vec<TaskId> =
-                still_failing.iter().map(|(id, _)| id.clone()).collect();
+            let retry_ids: Vec<TaskId> = still_failing.iter().map(|(id, _)| id.clone()).collect();
             let chunk_results = self
                 .execute_task_chunk(executor.clone(), &retry_ids, context, task_timeout)
                 .await;
@@ -1189,15 +1199,9 @@ mod tests {
 
         // Create tasks: A -> B -> C, D parallel with B
         orchestrator.add_task(WaveTask::new("a", "Task A"));
-        orchestrator.add_task(
-            WaveTask::new("b", "Task B").with_dependency(TaskId::new("a")),
-        );
-        orchestrator.add_task(
-            WaveTask::new("c", "Task C").with_dependency(TaskId::new("b")),
-        );
-        orchestrator.add_task(
-            WaveTask::new("d", "Task D").with_dependency(TaskId::new("a")),
-        );
+        orchestrator.add_task(WaveTask::new("b", "Task B").with_dependency(TaskId::new("a")));
+        orchestrator.add_task(WaveTask::new("c", "Task C").with_dependency(TaskId::new("b")));
+        orchestrator.add_task(WaveTask::new("d", "Task D").with_dependency(TaskId::new("a")));
 
         orchestrator.build_waves().unwrap();
 
@@ -1236,9 +1240,7 @@ mod tests {
         let mut orchestrator = WaveOrchestrator::new();
 
         orchestrator.add_task(WaveTask::new("a", "Task A"));
-        orchestrator.add_task(
-            WaveTask::new("b", "Task B").with_dependency(TaskId::new("a")),
-        );
+        orchestrator.add_task(WaveTask::new("b", "Task B").with_dependency(TaskId::new("a")));
 
         orchestrator.build_waves().unwrap();
 

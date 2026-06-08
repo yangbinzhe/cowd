@@ -359,6 +359,41 @@ pub struct StableHeadComparison {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCacheStabilityReport {
+    pub previous_envelope_id: String,
+    pub next_envelope_id: String,
+    pub stable_head_reusable: bool,
+    pub runtime_header_changed: bool,
+    pub dynamic_tail_changed: bool,
+    pub prompt_cache_friendly: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextModeCoverageEntry {
+    pub profile: ContextProfile,
+    pub mode: ContextMode,
+    pub envelope_id: String,
+    pub stable_head_hash: String,
+    pub runtime_header_hash: String,
+    pub dynamic_tail_hash: String,
+    pub stable_head_reusable: bool,
+    pub selected_count: usize,
+    pub omitted_count: usize,
+    pub pressure_bp: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextModeCoverageReport {
+    pub required_profiles: Vec<ContextProfile>,
+    pub covered_profiles: Vec<ContextProfile>,
+    pub stable_head_hash: String,
+    pub all_profiles_covered: bool,
+    pub all_stable_heads_reusable: bool,
+    pub entries: Vec<ContextModeCoverageEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssembledContext {
     pub stable_head: Vec<String>,
     pub runtime_header: Vec<String>,
@@ -406,11 +441,54 @@ pub struct ContextEnvelopeRequest {
 pub struct ContextRuntimeKernel;
 
 impl ContextRuntimeKernel {
+    pub fn mode_for_profile(profile: ContextProfile) -> ContextMode {
+        match profile {
+            ContextProfile::MainTurn => ContextMode::MainTurn,
+            ContextProfile::SoloGoal => ContextMode::SoloGoal,
+            ContextProfile::YoloGoal => ContextMode::YoloGoal,
+            ContextProfile::SubAgent => ContextMode::SubAgent,
+            ContextProfile::Collaboration => ContextMode::Collaboration,
+            ContextProfile::Review => ContextMode::Review,
+            ContextProfile::Resume => ContextMode::Resume,
+            ContextProfile::Cron => ContextMode::Cron,
+        }
+    }
+
+    pub fn required_profiles() -> Vec<ContextProfile> {
+        vec![
+            ContextProfile::MainTurn,
+            ContextProfile::SoloGoal,
+            ContextProfile::YoloGoal,
+            ContextProfile::SubAgent,
+            ContextProfile::Collaboration,
+            ContextProfile::Review,
+            ContextProfile::Resume,
+            ContextProfile::Cron,
+        ]
+    }
+
+    pub fn runtime_header(identity: &ContextIdentity, profile: ContextProfile) -> Vec<String> {
+        let project = identity.project_id.as_deref().unwrap_or("none");
+        let task = identity.task_id.as_deref().unwrap_or("none");
+        let parent = identity.parent_agent_id.as_deref().unwrap_or("none");
+        let team = identity.team_id.as_deref().unwrap_or("none");
+        vec![format!(
+            "session:{} agent:{} parent:{} project:{} task:{} team:{} mode:{:?} profile:{:?}",
+            identity.session_id,
+            identity.agent_id,
+            parent,
+            project,
+            task,
+            team,
+            identity.mode,
+            profile
+        )]
+    }
+
     pub fn build_envelope(request: ContextEnvelopeRequest) -> ContextEnvelope {
         let profile = request.profile;
         let leases = Self::default_leases(profile, request.total_budget_tokens);
-        let (dynamic_items, lease_omissions) =
-            Self::apply_leases(request.dynamic_items, &leases);
+        let (dynamic_items, lease_omissions) = Self::apply_leases(request.dynamic_items, &leases);
         let mut omitted = request.omitted;
         omitted.extend(lease_omissions);
         let dynamic_tail = dynamic_items
@@ -425,7 +503,7 @@ impl ContextRuntimeKernel {
             .sum::<u64>()
             + dynamic_items
                 .iter()
-            .map(|item| item.token_estimate)
+                .map(|item| item.token_estimate)
                 .sum::<u64>();
         let pressure_bp = if request.total_budget_tokens == 0 {
             0
@@ -531,12 +609,110 @@ impl ContextRuntimeKernel {
         StableHeadComparison {
             previous_hash: previous.diagnostics.stable_head_hash.clone(),
             next_hash: next.diagnostics.stable_head_hash.clone(),
-            reusable: previous.diagnostics.stable_head_hash
-                == next.diagnostics.stable_head_hash,
+            reusable: previous.diagnostics.stable_head_hash == next.diagnostics.stable_head_hash,
             runtime_header_changed: previous.diagnostics.runtime_header_hash
                 != next.diagnostics.runtime_header_hash,
             dynamic_tail_changed: previous.diagnostics.dynamic_tail_hash
                 != next.diagnostics.dynamic_tail_hash,
+        }
+    }
+
+    pub fn cache_stability_report(
+        previous: &ContextEnvelope,
+        next: &ContextEnvelope,
+    ) -> ContextCacheStabilityReport {
+        let comparison = Self::compare_stable_head(previous, next);
+        let prompt_cache_friendly = comparison.reusable;
+        let reason = if !comparison.reusable {
+            "stable head changed; provider prompt cache cannot safely reuse the prefix"
+        } else if comparison.runtime_header_changed {
+            "stable head is reusable; runtime header changed because identity or mode changed"
+        } else if comparison.dynamic_tail_changed {
+            "stable head and runtime header are reusable; only dynamic tail changed"
+        } else {
+            "stable head, runtime header, and dynamic tail are unchanged"
+        }
+        .to_string();
+        ContextCacheStabilityReport {
+            previous_envelope_id: previous.id.clone(),
+            next_envelope_id: next.id.clone(),
+            stable_head_reusable: comparison.reusable,
+            runtime_header_changed: comparison.runtime_header_changed,
+            dynamic_tail_changed: comparison.dynamic_tail_changed,
+            prompt_cache_friendly,
+            reason,
+        }
+    }
+
+    pub fn mode_coverage_report(
+        session_id: impl Into<String>,
+        intent: impl Into<String>,
+        stable_head: Vec<String>,
+        dynamic_items: Vec<ContextItem>,
+        total_budget_tokens: u64,
+    ) -> ContextModeCoverageReport {
+        let session_id = session_id.into();
+        let intent = intent.into();
+        let required_profiles = Self::required_profiles();
+        let mut entries = Vec::with_capacity(required_profiles.len());
+        let mut reference_stable_hash = None::<String>;
+
+        for profile in &required_profiles {
+            let mut identity = ContextIdentity::main(session_id.clone());
+            identity.mode = Self::mode_for_profile(*profile);
+            if matches!(profile, ContextProfile::SubAgent) {
+                identity.agent_id = "sub-agent".to_string();
+                identity.parent_agent_id = Some("primary".to_string());
+            }
+            let envelope = Self::build_envelope(ContextEnvelopeRequest {
+                profile: *profile,
+                runtime_header: Self::runtime_header(&identity, *profile),
+                identity,
+                intent: intent.clone(),
+                stable_head: stable_head.clone(),
+                dynamic_items: dynamic_items.clone(),
+                omitted: Vec::new(),
+                total_budget_tokens,
+            });
+            let stable_head_hash = envelope.diagnostics.stable_head_hash.clone();
+            let reference_hash =
+                reference_stable_hash.get_or_insert_with(|| stable_head_hash.clone());
+            let envelope_id = envelope.id.clone();
+            let runtime_header_hash = envelope.diagnostics.runtime_header_hash.clone();
+            let dynamic_tail_hash = envelope.diagnostics.dynamic_tail_hash.clone();
+            let selected_count = envelope.selected.len();
+            let omitted_count = envelope.omitted.len();
+            let pressure_bp = envelope.diagnostics.pressure_bp;
+            entries.push(ContextModeCoverageEntry {
+                profile: *profile,
+                mode: Self::mode_for_profile(*profile),
+                envelope_id,
+                stable_head_hash,
+                runtime_header_hash,
+                dynamic_tail_hash,
+                stable_head_reusable: *reference_hash == envelope.diagnostics.stable_head_hash,
+                selected_count,
+                omitted_count,
+                pressure_bp,
+            });
+        }
+
+        let covered_profiles = entries
+            .iter()
+            .map(|entry| entry.profile)
+            .collect::<Vec<_>>();
+        let all_profiles_covered = required_profiles
+            .iter()
+            .all(|profile| covered_profiles.contains(profile));
+        let all_stable_heads_reusable = entries.iter().all(|entry| entry.stable_head_reusable);
+
+        ContextModeCoverageReport {
+            required_profiles,
+            covered_profiles,
+            stable_head_hash: reference_stable_hash.unwrap_or_default(),
+            all_profiles_covered,
+            all_stable_heads_reusable,
+            entries,
         }
     }
 
@@ -605,44 +781,164 @@ impl ContextRuntimeKernel {
         let pct = |basis_points: u64| budget.saturating_mul(basis_points) / 10_000;
         match profile {
             ContextProfile::SubAgent => vec![
-                context_lease(ContextSourceKind::Task, pct(1_000), pct(2_000), pct(3_000), 95),
-                context_lease(ContextSourceKind::Memory, pct(1_000), pct(2_000), pct(3_000), 80),
+                context_lease(
+                    ContextSourceKind::Task,
+                    pct(1_000),
+                    pct(2_000),
+                    pct(3_000),
+                    95,
+                ),
+                context_lease(
+                    ContextSourceKind::Memory,
+                    pct(1_000),
+                    pct(2_000),
+                    pct(3_000),
+                    80,
+                ),
                 context_lease(ContextSourceKind::ToolTrace, 0, pct(1_000), pct(1_500), 70),
                 context_lease(ContextSourceKind::Workspace, 0, pct(800), pct(1_200), 65),
                 context_lease(ContextSourceKind::AgentPeer, 0, pct(500), pct(800), 40),
             ],
             ContextProfile::YoloGoal | ContextProfile::SoloGoal => vec![
-                context_lease(ContextSourceKind::Task, pct(1_500), pct(2_500), pct(3_500), 100),
-                context_lease(ContextSourceKind::ToolTrace, pct(500), pct(1_500), pct(2_500), 85),
-                context_lease(ContextSourceKind::Memory, pct(1_000), pct(2_000), pct(3_000), 80),
-                context_lease(ContextSourceKind::Workspace, pct(500), pct(1_500), pct(2_500), 75),
+                context_lease(
+                    ContextSourceKind::Task,
+                    pct(1_500),
+                    pct(2_500),
+                    pct(3_500),
+                    100,
+                ),
+                context_lease(
+                    ContextSourceKind::ToolTrace,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_500),
+                    85,
+                ),
+                context_lease(
+                    ContextSourceKind::Memory,
+                    pct(1_000),
+                    pct(2_000),
+                    pct(3_000),
+                    80,
+                ),
+                context_lease(
+                    ContextSourceKind::Workspace,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_500),
+                    75,
+                ),
                 context_lease(ContextSourceKind::AgentPeer, 0, pct(1_000), pct(1_500), 55),
             ],
             ContextProfile::Review => vec![
-                context_lease(ContextSourceKind::ToolTrace, pct(1_000), pct(2_500), pct(3_500), 100),
-                context_lease(ContextSourceKind::Workspace, pct(1_000), pct(2_500), pct(3_500), 95),
-                context_lease(ContextSourceKind::Task, pct(500), pct(1_500), pct(2_000), 85),
-                context_lease(ContextSourceKind::Memory, pct(500), pct(1_500), pct(2_000), 70),
+                context_lease(
+                    ContextSourceKind::ToolTrace,
+                    pct(1_000),
+                    pct(2_500),
+                    pct(3_500),
+                    100,
+                ),
+                context_lease(
+                    ContextSourceKind::Workspace,
+                    pct(1_000),
+                    pct(2_500),
+                    pct(3_500),
+                    95,
+                ),
+                context_lease(
+                    ContextSourceKind::Task,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_000),
+                    85,
+                ),
+                context_lease(
+                    ContextSourceKind::Memory,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_000),
+                    70,
+                ),
                 context_lease(ContextSourceKind::AgentPeer, 0, pct(1_000), pct(1_500), 65),
             ],
             ContextProfile::Resume => vec![
-                context_lease(ContextSourceKind::Handoff, pct(1_000), pct(2_000), pct(3_000), 100),
-                context_lease(ContextSourceKind::Conversation, pct(1_000), pct(2_000), pct(3_000), 95),
-                context_lease(ContextSourceKind::Task, pct(500), pct(1_500), pct(2_000), 90),
-                context_lease(ContextSourceKind::Memory, pct(500), pct(1_500), pct(2_500), 80),
+                context_lease(
+                    ContextSourceKind::Handoff,
+                    pct(1_000),
+                    pct(2_000),
+                    pct(3_000),
+                    100,
+                ),
+                context_lease(
+                    ContextSourceKind::Conversation,
+                    pct(1_000),
+                    pct(2_000),
+                    pct(3_000),
+                    95,
+                ),
+                context_lease(
+                    ContextSourceKind::Task,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_000),
+                    90,
+                ),
+                context_lease(
+                    ContextSourceKind::Memory,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_500),
+                    80,
+                ),
                 context_lease(ContextSourceKind::Workspace, 0, pct(800), pct(1_200), 60),
             ],
             ContextProfile::Collaboration => vec![
-                context_lease(ContextSourceKind::AgentPeer, pct(1_000), pct(2_500), pct(3_500), 100),
-                context_lease(ContextSourceKind::Task, pct(500), pct(1_500), pct(2_000), 90),
-                context_lease(ContextSourceKind::Memory, pct(500), pct(1_500), pct(2_500), 80),
+                context_lease(
+                    ContextSourceKind::AgentPeer,
+                    pct(1_000),
+                    pct(2_500),
+                    pct(3_500),
+                    100,
+                ),
+                context_lease(
+                    ContextSourceKind::Task,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_000),
+                    90,
+                ),
+                context_lease(
+                    ContextSourceKind::Memory,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_500),
+                    80,
+                ),
                 context_lease(ContextSourceKind::ToolTrace, 0, pct(1_000), pct(1_500), 70),
                 context_lease(ContextSourceKind::Workspace, 0, pct(1_000), pct(1_500), 65),
             ],
             ContextProfile::Cron | ContextProfile::MainTurn => vec![
-                context_lease(ContextSourceKind::Conversation, pct(1_000), pct(2_500), pct(3_500), 95),
-                context_lease(ContextSourceKind::Memory, pct(1_000), pct(2_000), pct(3_000), 85),
-                context_lease(ContextSourceKind::Task, pct(500), pct(1_500), pct(2_500), 80),
+                context_lease(
+                    ContextSourceKind::Conversation,
+                    pct(1_000),
+                    pct(2_500),
+                    pct(3_500),
+                    95,
+                ),
+                context_lease(
+                    ContextSourceKind::Memory,
+                    pct(1_000),
+                    pct(2_000),
+                    pct(3_000),
+                    85,
+                ),
+                context_lease(
+                    ContextSourceKind::Task,
+                    pct(500),
+                    pct(1_500),
+                    pct(2_500),
+                    80,
+                ),
                 context_lease(ContextSourceKind::ToolTrace, 0, pct(1_000), pct(1_500), 70),
                 context_lease(ContextSourceKind::Workspace, 0, pct(1_000), pct(1_500), 65),
                 context_lease(ContextSourceKind::AgentPeer, 0, pct(800), pct(1_200), 50),
@@ -900,7 +1196,10 @@ fn degradation_path_for(
 }
 
 fn context_policy_action(probe: &ContextLeanProbe) -> (ContextPolicyAction, String) {
-    if matches!(probe.degradation_path, ContextDegradationPath::SourceFallback) {
+    if matches!(
+        probe.degradation_path,
+        ContextDegradationPath::SourceFallback
+    ) {
         return (
             ContextPolicyAction::PreferOrientationPacket,
             "source fallback detected; prefer compact orientation before broad recall".to_string(),
@@ -913,12 +1212,10 @@ fn context_policy_action(probe: &ContextLeanProbe) -> (ContextPolicyAction, Stri
             "critical review pressure; keep evidence references and summarize bulky detail"
                 .to_string(),
         ),
-        (
-            ContextPressureLevel::Critical,
-            ContextProfile::YoloGoal | ContextProfile::SoloGoal,
-        ) => (
+        (ContextPressureLevel::Critical, ContextProfile::YoloGoal | ContextProfile::SoloGoal) => (
             ContextPolicyAction::WriteHandoff,
-            "critical goal pressure; preserve active task state with a handoff boundary".to_string(),
+            "critical goal pressure; preserve active task state with a handoff boundary"
+                .to_string(),
         ),
         (ContextPressureLevel::Critical, _) => (
             ContextPolicyAction::RecommendSessionBoundary,
@@ -928,10 +1225,7 @@ fn context_policy_action(probe: &ContextLeanProbe) -> (ContextPolicyAction, Stri
             ContextPolicyAction::SummarizeEvidence,
             "high review pressure; summarize evidence bodies while retaining refs".to_string(),
         ),
-        (
-            ContextPressureLevel::High,
-            ContextProfile::YoloGoal | ContextProfile::SoloGoal,
-        ) => (
+        (ContextPressureLevel::High, ContextProfile::YoloGoal | ContextProfile::SoloGoal) => (
             ContextPolicyAction::TrimToolTrace,
             "high goal pressure; trim tool trace before task and memory context".to_string(),
         ),
@@ -1153,16 +1447,68 @@ mod tests {
         assert!(comparison.reusable);
         assert!(!comparison.runtime_header_changed);
         assert!(comparison.dynamic_tail_changed);
-        assert_eq!(
-            comparison.previous_hash,
-            a.diagnostics.stable_head_hash
-        );
+        assert_eq!(comparison.previous_hash, a.diagnostics.stable_head_hash);
 
         let mut changed_request = request_with_dynamic("memory beta");
         changed_request.stable_head = vec!["system: changed stable instructions".to_string()];
         let changed = ContextRuntimeKernel::build_envelope(changed_request);
         let changed_comparison = ContextRuntimeKernel::compare_stable_head(&a, &changed);
         assert!(!changed_comparison.reusable);
+    }
+
+    #[test]
+    fn cache_stability_report_marks_dynamic_only_changes_cache_friendly() {
+        let a = ContextRuntimeKernel::build_envelope(request_with_dynamic("memory alpha"));
+        let b = ContextRuntimeKernel::build_envelope(request_with_dynamic("memory beta"));
+
+        let report = ContextRuntimeKernel::cache_stability_report(&a, &b);
+
+        assert!(report.stable_head_reusable);
+        assert!(!report.runtime_header_changed);
+        assert!(report.dynamic_tail_changed);
+        assert!(report.prompt_cache_friendly);
+        assert!(report.reason.contains("dynamic tail"));
+    }
+
+    #[test]
+    fn mode_coverage_report_proves_all_profiles_share_stable_head() {
+        let report = ContextRuntimeKernel::mode_coverage_report(
+            "session-coverage",
+            "continue safely",
+            vec!["system stable contract".to_string()],
+            vec![
+                ContextItem::new(
+                    "task-1",
+                    ContextSourceKind::Task,
+                    ContextRole::TaskState,
+                    "active task",
+                ),
+                ContextItem::new(
+                    "memory-1",
+                    ContextSourceKind::Memory,
+                    ContextRole::Orientation,
+                    "project memory",
+                ),
+            ],
+            10_000,
+        );
+
+        assert_eq!(
+            report.covered_profiles.len(),
+            ContextRuntimeKernel::required_profiles().len()
+        );
+        assert!(report.all_profiles_covered);
+        assert!(report.all_stable_heads_reusable);
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.profile == ContextProfile::YoloGoal
+                && entry.mode == ContextMode::YoloGoal));
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.profile == ContextProfile::SubAgent
+                && entry.mode == ContextMode::SubAgent));
     }
 
     #[test]
@@ -1278,12 +1624,16 @@ mod tests {
 
     #[test]
     fn lean_probe_distinguishes_source_fallback_from_pressure() {
-        let mut envelope = ContextRuntimeKernel::build_envelope(request_with_dynamic("tiny memory"));
+        let mut envelope =
+            ContextRuntimeKernel::build_envelope(request_with_dynamic("tiny memory"));
         envelope.diagnostics.degraded_sources = vec![ContextSourceKind::Memory];
         let probe = ContextRuntimeKernel::lean_probe(&envelope);
 
         assert_eq!(probe.pressure_level, ContextPressureLevel::Nominal);
-        assert_eq!(probe.degradation_path, ContextDegradationPath::SourceFallback);
+        assert_eq!(
+            probe.degradation_path,
+            ContextDegradationPath::SourceFallback
+        );
         assert_eq!(probe.degraded_sources, vec![ContextSourceKind::Memory]);
     }
 
@@ -1350,30 +1700,24 @@ mod tests {
 
         let envelope = ContextRuntimeKernel::build_envelope(request);
 
-        assert!(
-            envelope
-                .omitted
-                .iter()
-                .any(|item| item.reason == "context lease exhausted")
-        );
-        assert!(
-            envelope
-                .diagnostics
-                .recommendations
-                .iter()
-                .any(|item| item.contains("omitted"))
-        );
+        assert!(envelope
+            .omitted
+            .iter()
+            .any(|item| item.reason == "context lease exhausted"));
+        assert!(envelope
+            .diagnostics
+            .recommendations
+            .iter()
+            .any(|item| item.contains("omitted")));
     }
 
     #[test]
     fn high_pressure_recommendations_suggest_handoff() {
         let recommendations = context_recommendations(9_500, 3, 0);
 
-        assert!(
-            recommendations
-                .iter()
-                .any(|recommendation| recommendation.contains("handoff"))
-        );
+        assert!(recommendations
+            .iter()
+            .any(|recommendation| recommendation.contains("handoff")));
     }
 
     #[test]
@@ -1523,8 +1867,12 @@ mod tests {
         assert_eq!(trace_item.source, ContextSourceKind::ToolTrace);
         assert_eq!(trace_item.token_estimate, 12);
         assert!(trace_item.content.contains("parser"));
-        assert!(trace_item.evidence.contains(&"tool://tool-1/evidence/event-9".to_string()));
-        assert!(trace_item.evidence.contains(&"workspace://changed-file/src/parser.rs".to_string()));
+        assert!(trace_item
+            .evidence
+            .contains(&"tool://tool-1/evidence/event-9".to_string()));
+        assert!(trace_item
+            .evidence
+            .contains(&"workspace://changed-file/src/parser.rs".to_string()));
 
         let resume = ResumeContextPacket {
             session_id: "session-1".to_string(),
@@ -1663,9 +2011,9 @@ mod tests {
         assert_eq!(item.visibility, ContextVisibility::Shared);
         assert_eq!(item.token_estimate, 42);
         assert!(item.content.contains("ContextRuntimeKernel"));
-        assert!(item
-            .evidence
-            .contains(&"workspace://changed-file/crates/runtime/src/context_runtime.rs".to_string()));
+        assert!(item.evidence.contains(
+            &"workspace://changed-file/crates/runtime/src/context_runtime.rs".to_string()
+        ));
         assert!(item
             .evidence
             .contains(&"workspace://symbol/ContextRuntimeKernel".to_string()));

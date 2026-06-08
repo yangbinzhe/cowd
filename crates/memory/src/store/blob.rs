@@ -153,7 +153,10 @@ impl BlobStore {
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(MemoryError::Store(format!("delete {}: {e}", path.display()))),
+            Err(e) => Err(MemoryError::Store(format!(
+                "delete {}: {e}",
+                path.display()
+            ))),
         }
     }
 
@@ -200,9 +203,7 @@ impl BlobStore {
                 }
                 for file_entry in read_dir_entries(&cat_entry)? {
                     if file_entry.extension().and_then(|e| e.to_str()) == Some("md") {
-                        let file_size = fs::metadata(&file_entry)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
+                        let file_size = fs::metadata(&file_entry).map(|m| m.len()).unwrap_or(0);
                         layer_count += 1;
                         layer_bytes += file_size;
                     }
@@ -284,8 +285,8 @@ fn read_dir_entries(dir: &Path) -> Result<Vec<PathBuf>, MemoryError> {
         .map_err(|e| MemoryError::Store(format!("read dir {}: {e}", dir.display())))?;
     let mut entries = Vec::new();
     for entry in iter {
-        let entry =
-            entry.map_err(|e| MemoryError::Store(format!("dir entry in {}: {e}", dir.display())))?;
+        let entry = entry
+            .map_err(|e| MemoryError::Store(format!("dir entry in {}: {e}", dir.display())))?;
         entries.push(entry.path());
     }
     Ok(entries)
@@ -314,7 +315,12 @@ mod tests {
         let (store, _tmp) = make_store();
         let id = MemoryId::new_v4();
         store
-            .write(&id, MemoryLayer::L1, MemoryCategory::Decision, "hello world")
+            .write(
+                &id,
+                MemoryLayer::L1,
+                MemoryCategory::Decision,
+                "hello world",
+            )
             .unwrap();
         let content = store
             .read(&id, MemoryLayer::L1, MemoryCategory::Decision)

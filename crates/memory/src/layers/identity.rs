@@ -235,7 +235,13 @@ mod tests {
             visibility: crate::types::AgentVisibility::default(),
         };
         let id = layer.insert(entry).await.unwrap();
-        let got = layer.load().await.unwrap().into_iter().find(|e| e.id == id).unwrap();
+        let got = layer
+            .load()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == id)
+            .unwrap();
         assert_eq!(got.layer, MemoryLayer::L0);
         assert_eq!(got.priority, Priority::Critical);
     }
@@ -254,7 +260,14 @@ mod tests {
         let layer = IdentityLayer::new(in_memory());
         layer.set("T", &"x".repeat(1000)).await.unwrap(); // ~250 tokens
 
-        let budget = TokenBudget { total: 2000, reserved_system: 0, reserved_response: 0, allocated_memory: 0, allocated_conversation: 0, available: 200 };
+        let budget = TokenBudget {
+            total: 2000,
+            reserved_system: 0,
+            reserved_response: 0,
+            allocated_memory: 0,
+            allocated_conversation: 0,
+            available: 200,
+        };
         let ctx = layer.prepare_context(&budget).await.unwrap();
         // 250 tokens > 200 available, so entry should be cut
         assert!(ctx.entries.is_empty());
@@ -265,7 +278,14 @@ mod tests {
         let layer = IdentityLayer::new(in_memory());
         layer.set("Short", "hi").await.unwrap(); // ~1 token
 
-        let budget = TokenBudget { total: 1000, reserved_system: 0, reserved_response: 0, allocated_memory: 0, allocated_conversation: 0, available: 200 };
+        let budget = TokenBudget {
+            total: 1000,
+            reserved_system: 0,
+            reserved_response: 0,
+            allocated_memory: 0,
+            allocated_conversation: 0,
+            available: 200,
+        };
         let ctx = layer.prepare_context(&budget).await.unwrap();
         assert_eq!(ctx.entries.len(), 1);
     }

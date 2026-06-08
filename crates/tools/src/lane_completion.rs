@@ -85,7 +85,9 @@ pub(crate) fn evaluate_completed_lane(context: &mut LaneContext) -> Vec<PolicyAc
             "closeout-completed-lane",
             PolicyCondition::And(vec![
                 PolicyCondition::LaneCompleted,
-                PolicyCondition::GreenAt { level: GreenLevel::Workspace },
+                PolicyCondition::GreenAt {
+                    level: GreenLevel::Workspace,
+                },
             ]),
             PolicyAction::CloseoutLane,
             10,

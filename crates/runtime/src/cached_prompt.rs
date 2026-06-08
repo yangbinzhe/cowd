@@ -16,7 +16,13 @@ pub enum CacheLayer {
 impl CacheLayer {
     /// All five layers in priority order (L0 = highest).
     pub fn all() -> [CacheLayer; 5] {
-        [CacheLayer::L0, CacheLayer::L1, CacheLayer::L2, CacheLayer::L3, CacheLayer::L4]
+        [
+            CacheLayer::L0,
+            CacheLayer::L1,
+            CacheLayer::L2,
+            CacheLayer::L3,
+            CacheLayer::L4,
+        ]
     }
 }
 
@@ -59,16 +65,23 @@ struct CacheInner {
 impl CachedSystemPrompt {
     pub fn new(config_path: PathBuf, identity_path: PathBuf) -> Self {
         let check_interval: u32 = std::env::var("COWD_PROMPT_CACHE_CHECK_INTERVAL")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
         let max_age: u32 = std::env::var("COWD_PROMPT_CACHE_MAX_AGE")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
 
         let mut layers = HashMap::new();
         for &layer in &CacheLayer::all() {
-            layers.insert(layer, CachedPrompt {
-                prompt: Vec::new(),
-                memory_count: 0,
-            });
+            layers.insert(
+                layer,
+                CachedPrompt {
+                    prompt: Vec::new(),
+                    memory_count: 0,
+                },
+            );
         }
 
         Self {
@@ -127,7 +140,9 @@ impl CachedSystemPrompt {
             tracing::warn!("CachedSystemPrompt lock poisoned in needs_rebuild, recovering");
             poisoned.into_inner()
         });
-        let cached = inner.layers.get(&layer)
+        let cached = inner
+            .layers
+            .get(&layer)
             .expect("CacheLayer::all() guarantees every variant is initialised");
         cached.prompt.is_empty() || cached.memory_count != current_memory_count
     }
@@ -149,26 +164,32 @@ impl CachedSystemPrompt {
     /// Return the cached prompt fragment for a single layer, or an empty vec
     /// if the layer was never built.
     pub fn get_layer(&self, layer: CacheLayer) -> Vec<String> {
-        self.inner.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("CachedSystemPrompt lock poisoned in get_layer, recovering");
-            poisoned.into_inner()
-        })
-        .layers
-        .get(&layer)
-        .map(|c| c.prompt.clone())
-        .unwrap_or_default()
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("CachedSystemPrompt lock poisoned in get_layer, recovering");
+                poisoned.into_inner()
+            })
+            .layers
+            .get(&layer)
+            .map(|c| c.prompt.clone())
+            .unwrap_or_default()
     }
 
     /// Return the cached memory count for a layer.
     pub fn layer_memory_count(&self, layer: CacheLayer) -> usize {
-        self.inner.read().unwrap_or_else(|poisoned| {
-            tracing::warn!("CachedSystemPrompt lock poisoned in layer_memory_count, recovering");
-            poisoned.into_inner()
-        })
-        .layers
-        .get(&layer)
-        .map(|c| c.memory_count)
-        .unwrap_or(0)
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    "CachedSystemPrompt lock poisoned in layer_memory_count, recovering"
+                );
+                poisoned.into_inner()
+            })
+            .layers
+            .get(&layer)
+            .map(|c| c.memory_count)
+            .unwrap_or(0)
     }
 
     /// Compose the full system prompt from the base prompt plus all cached

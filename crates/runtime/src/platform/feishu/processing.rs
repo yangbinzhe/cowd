@@ -26,9 +26,7 @@ const DRAINER_POLL_INTERVAL_MS: u64 = 250;
 pub const DEFAULT_MAX_QUEUE_DEPTH: usize = 1000;
 
 type DrainHandler = Arc<
-    dyn Fn(String, serde_json::Value) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(String, serde_json::Value) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
 >;
 
 /// Decision returned by `try_process`.
@@ -89,11 +87,7 @@ impl ChatProcessingQueue {
     /// must call [`release`] afterwards). Returns `Queued` when the chat
     /// is busy and the event was enqueued. Returns `Dropped` when the
     /// queue is full and the oldest event was evicted.
-    pub async fn try_process(
-        &self,
-        chat_id: &str,
-        event: serde_json::Value,
-    ) -> ProcessingDecision {
+    pub async fn try_process(&self, chat_id: &str, event: serde_json::Value) -> ProcessingDecision {
         let chat_lock = {
             let locks = self.chat_locks.read().await;
             locks.get(chat_id).cloned()
@@ -269,7 +263,13 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    fn test_queue(max_depth: usize) -> (ChatProcessingQueue, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+    fn test_queue(
+        max_depth: usize,
+    ) -> (
+        ChatProcessingQueue,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let counter = Arc::new(AtomicUsize::new(0));
         let processed = Arc::new(Mutex::new(Vec::new()));
         let c = counter.clone();
@@ -305,7 +305,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert!(counter.load(Ordering::SeqCst) >= 1, "Drained event should be processed");
+        assert!(
+            counter.load(Ordering::SeqCst) >= 1,
+            "Drained event should be processed"
+        );
     }
 
     #[tokio::test]
@@ -352,7 +355,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(600)).await;
 
         let count = counter.load(Ordering::SeqCst);
-        assert!(count >= 2, "Expected at least 2 drained events, got {}", count);
+        assert!(
+            count >= 2,
+            "Expected at least 2 drained events, got {}",
+            count
+        );
     }
 
     #[tokio::test]
@@ -367,7 +374,12 @@ mod tests {
             let decision = queue
                 .try_process("chat-1", serde_json::json!({"msg": format!("event-{}", i)}))
                 .await;
-            assert_eq!(decision, ProcessingDecision::Queued, "event {} should be queued", i);
+            assert_eq!(
+                decision,
+                ProcessingDecision::Queued,
+                "event {} should be queued",
+                i
+            );
         }
 
         assert_eq!(queue.pending_events.lock().await.len(), 3);

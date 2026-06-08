@@ -288,7 +288,12 @@ impl CronRegistry {
     }
 
     /// Update an existing cron entry's schedule or prompt.
-    pub fn update(&self, cron_id: &str, schedule: Option<&str>, prompt: Option<&str>) -> Result<CronEntry, String> {
+    pub fn update(
+        &self,
+        cron_id: &str,
+        schedule: Option<&str>,
+        prompt: Option<&str>,
+    ) -> Result<CronEntry, String> {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("cron registry lock poisoned; recovering");
             poisoned.into_inner()
@@ -343,12 +348,12 @@ pub struct CronJob {
     pub schedule: ScheduleFormat,
     pub prompt: String,
     pub enabled: bool,
-    pub last_run_at: Option<String>,   // ISO8601
-    pub next_run_at: Option<String>,   // ISO8601
-    pub grace_window_secs: u64,        // Grace window (borrowed from hermes)
+    pub last_run_at: Option<String>, // ISO8601
+    pub next_run_at: Option<String>, // ISO8601
+    pub grace_window_secs: u64,      // Grace window (borrowed from hermes)
     pub run_count: u64,
-    pub created_at: String,            // ISO8601
-    pub updated_at: String,            // ISO8601
+    pub created_at: String, // ISO8601
+    pub updated_at: String, // ISO8601
 }
 
 /// Execution status of a cron job run.
@@ -380,8 +385,13 @@ pub fn parse_schedule(input: &str) -> Result<ScheduleFormat, String> {
     let trimmed = input.trim();
 
     // Try ISO8601 timestamp first: "2026-04-20T09:00:00Z" or "2026-04-20 09:00:00"
-    if trimmed.contains('T') || (trimmed.len() >= 16 && trimmed.chars().filter(|c| *c == '-' || *c == ':').count() >= 3) {
-        if DateTime::parse_from_rfc3339(trimmed).is_ok() || chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S").is_ok() || chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S").is_ok() {
+    if trimmed.contains('T')
+        || (trimmed.len() >= 16 && trimmed.chars().filter(|c| *c == '-' || *c == ':').count() >= 3)
+    {
+        if DateTime::parse_from_rfc3339(trimmed).is_ok()
+            || chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S").is_ok()
+            || chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S").is_ok()
+        {
             return Ok(ScheduleFormat::Timestamp(trimmed.to_string()));
         }
     }
@@ -393,7 +403,10 @@ pub fn parse_schedule(input: &str) -> Result<ScheduleFormat, String> {
         if parse_duration_secs(dur_str).is_some() {
             return Ok(ScheduleFormat::Interval(dur_str.to_string()));
         }
-        return Err(format!("Invalid interval format: '{}'. Use e.g. 'every 2h', 'every 30m'", dur_str));
+        return Err(format!(
+            "Invalid interval format: '{}'. Use e.g. 'every 2h', 'every 30m'",
+            dur_str
+        ));
     }
 
     // Standard cron: 5 fields separated by spaces
@@ -401,7 +414,9 @@ pub fn parse_schedule(input: &str) -> Result<ScheduleFormat, String> {
     if fields.len() == 5 {
         // Basic validation: each field should be a valid cron token
         let valid_chars = fields.iter().all(|f| {
-            f.chars().all(|c| c.is_ascii_digit() || c == '*' || c == ',' || c == '-' || c == '/' || c == '?')
+            f.chars().all(|c| {
+                c.is_ascii_digit() || c == '*' || c == ',' || c == '-' || c == '/' || c == '?'
+            })
         });
         if valid_chars {
             return Ok(ScheduleFormat::Cron(trimmed.to_string()));
@@ -476,10 +491,20 @@ pub fn compute_next_run(schedule: &ScheduleFormat, from: DateTime<Utc>) -> Optio
         ScheduleFormat::Timestamp(ts_str) => {
             // Exact timestamp
             if let Ok(dt) = ts_str.parse::<DateTime<Utc>>() {
-                if dt > from { Some(dt) } else { None }
-            } else if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S") {
+                if dt > from {
+                    Some(dt)
+                } else {
+                    None
+                }
+            } else if let Ok(ndt) =
+                chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S")
+            {
                 let dt = DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc);
-                if dt > from { Some(dt) } else { None }
+                if dt > from {
+                    Some(dt)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -509,8 +534,7 @@ fn compute_next_cron(expr: &str, from: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let limit = from + ChronoDuration::days(366);
     while candidate < limit {
         if !month.contains(&(candidate.month() as u8)) {
-            candidate = candidate.with_day(1)?
-                + ChronoDuration::days(31); // Skip to next month
+            candidate = candidate.with_day(1)? + ChronoDuration::days(31); // Skip to next month
             continue;
         }
         if !day_of_month.contains(&(candidate.day() as u8)) {
@@ -549,7 +573,9 @@ fn cron_field_values(field: &str, min: u8, max: u8) -> Option<Vec<u8>> {
             values.extend(min..=max);
         } else if part.contains('/') {
             let parts: Vec<&str> = part.split('/').collect();
-            if parts.len() != 2 { return None; }
+            if parts.len() != 2 {
+                return None;
+            }
             let step: u8 = parts[1].parse().ok()?;
             let base: Vec<u8> = if parts[0] == "*" {
                 (min..=max).collect()
@@ -560,7 +586,9 @@ fn cron_field_values(field: &str, min: u8, max: u8) -> Option<Vec<u8>> {
             values.extend((start..=max).step_by(step as usize));
         } else if part.contains('-') {
             let parts: Vec<&str> = part.split('-').collect();
-            if parts.len() != 2 { return None; }
+            if parts.len() != 2 {
+                return None;
+            }
             let start: u8 = parts[0].parse().ok()?;
             let end: u8 = parts[1].parse().ok()?;
             values.extend(start..=end);
@@ -621,13 +649,22 @@ impl CronScheduler {
     }
 
     /// Create a new cron job.
-    pub async fn create_job(&self, name: &str, schedule: &str, prompt: &str, grace_window_secs: u64) -> Result<CronJob, String> {
+    pub async fn create_job(
+        &self,
+        name: &str,
+        schedule: &str,
+        prompt: &str,
+        grace_window_secs: u64,
+    ) -> Result<CronJob, String> {
         let sched = parse_schedule(schedule)?;
         let now = Utc::now();
         let next_run = compute_next_run(&sched, now);
 
         let job = CronJob {
-            id: format!("cron_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]),
+            id: format!(
+                "cron_{}",
+                &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
+            ),
             name: name.to_string(),
             schedule: sched,
             prompt: prompt.to_string(),
@@ -659,7 +696,9 @@ impl CronScheduler {
     /// Delete a cron job.
     pub async fn delete_job(&self, id: &str) -> Result<CronJob, String> {
         let mut jobs = self.jobs.write().await;
-        let idx = jobs.iter().position(|j| j.id == id)
+        let idx = jobs
+            .iter()
+            .position(|j| j.id == id)
             .ok_or_else(|| format!("cron not found: {id}"))?;
         let removed = jobs.remove(idx);
         drop(jobs);
@@ -670,7 +709,9 @@ impl CronScheduler {
     /// Pause (disable) a cron job.
     pub async fn pause_job(&self, id: &str) -> Result<CronJob, String> {
         let mut jobs = self.jobs.write().await;
-        let job = jobs.iter_mut().find(|j| j.id == id)
+        let job = jobs
+            .iter_mut()
+            .find(|j| j.id == id)
             .ok_or_else(|| format!("cron not found: {id}"))?;
         job.enabled = false;
         job.updated_at = Utc::now().to_rfc3339();
@@ -683,7 +724,9 @@ impl CronScheduler {
     /// Resume (enable) a cron job.
     pub async fn resume_job(&self, id: &str) -> Result<CronJob, String> {
         let mut jobs = self.jobs.write().await;
-        let job = jobs.iter_mut().find(|j| j.id == id)
+        let job = jobs
+            .iter_mut()
+            .find(|j| j.id == id)
             .ok_or_else(|| format!("cron not found: {id}"))?;
         job.enabled = true;
         job.updated_at = Utc::now().to_rfc3339();
@@ -698,7 +741,9 @@ impl CronScheduler {
     /// Record a run (manual or scheduled).
     pub async fn record_run(&self, id: &str) -> Result<CronJob, String> {
         let mut jobs = self.jobs.write().await;
-        let job = jobs.iter_mut().find(|j| j.id == id)
+        let job = jobs
+            .iter_mut()
+            .find(|j| j.id == id)
             .ok_or_else(|| format!("cron not found: {id}"))?;
         let now = Utc::now();
         job.last_run_at = Some(now.to_rfc3339());
@@ -724,7 +769,9 @@ impl CronScheduler {
     ) -> Result<CronJob, String> {
         // Update job metadata (same as record_run)
         let mut jobs = self.jobs.write().await;
-        let job = jobs.iter_mut().find(|j| j.id == id)
+        let job = jobs
+            .iter_mut()
+            .find(|j| j.id == id)
             .ok_or_else(|| format!("cron not found: {id}"))?;
         let now = Utc::now();
         let started_at = now.to_rfc3339();
@@ -741,10 +788,18 @@ impl CronScheduler {
         let log_id = format!("cronlog_{:08x}", rand::random::<u32>());
         // Truncate output/error to 10KB
         let truncated_output = output.map(|o| {
-            if o.len() > 10240 { o[..10240].to_string() } else { o }
+            if o.len() > 10240 {
+                o[..10240].to_string()
+            } else {
+                o
+            }
         });
         let truncated_error = error.map(|e| {
-            if e.len() > 10240 { e[..10240].to_string() } else { e }
+            if e.len() > 10240 {
+                e[..10240].to_string()
+            } else {
+                e
+            }
         });
         let log = CronExecutionLog {
             id: log_id,
@@ -778,7 +833,9 @@ impl CronScheduler {
                             // Grace window check
                             if let Some(last_str) = &j.last_run_at {
                                 if let Ok(last) = last_str.parse::<DateTime<Utc>>() {
-                                    if last + ChronoDuration::seconds(j.grace_window_secs as i64) > now {
+                                    if last + ChronoDuration::seconds(j.grace_window_secs as i64)
+                                        > now
+                                    {
                                         return false;
                                     }
                                 }
@@ -854,12 +911,8 @@ impl CronLogStore {
         let logs = self.logs.read().await;
         if let Some(entries) = logs.get(cron_job_id) {
             let total = entries.len();
-            let page: Vec<CronExecutionLog> = entries
-                .iter()
-                .skip(offset)
-                .take(limit)
-                .cloned()
-                .collect();
+            let page: Vec<CronExecutionLog> =
+                entries.iter().skip(offset).take(limit).cloned().collect();
             (page, total)
         } else {
             (vec![], 0)
@@ -876,12 +929,8 @@ impl CronLogStore {
         let mut all: Vec<&CronExecutionLog> = logs.values().flatten().collect();
         all.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         let total = all.len();
-        let page: Vec<CronExecutionLog> = all
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .cloned()
-            .collect();
+        let page: Vec<CronExecutionLog> =
+            all.into_iter().skip(offset).take(limit).cloned().collect();
         (page, total)
     }
 }

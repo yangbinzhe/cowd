@@ -151,8 +151,14 @@ mod tests {
         assert_eq!(decoded.method, FRAME_DATA);
         assert_eq!(decoded.headers.len(), 3);
         assert_eq!(decoded.payload_encoding.as_deref(), Some("json"));
-        assert_eq!(decoded.payload_type.as_deref(), Some("im.message.receive_v1"));
-        assert_eq!(decoded.payload.as_deref(), Some(b"{\"event\":\"test\"}".as_ref()));
+        assert_eq!(
+            decoded.payload_type.as_deref(),
+            Some("im.message.receive_v1")
+        );
+        assert_eq!(
+            decoded.payload.as_deref(),
+            Some(b"{\"event\":\"test\"}".as_ref())
+        );
         assert_eq!(decoded.log_id_new.as_deref(), Some("new_log_001"));
     }
 

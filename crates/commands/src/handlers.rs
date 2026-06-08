@@ -1,14 +1,15 @@
-
 use runtime::{compact_session, CompactionConfig, Session};
 
 use crate::specs::SlashCommand;
-  // bring impl blocks into scope
-use crate::parser::{
-    render_slash_command_help, SlashCommandResult,
-};
+// bring impl blocks into scope
+use crate::parser::{render_slash_command_help, SlashCommandResult};
 /// Return a result that redirects the command to the agent alias system.
 /// The CLI picks up the message and sends it as an agent prompt.
-fn agent_alias(prompt_template: &str, _args: &str, session: &Session) -> Option<SlashCommandResult> {
+fn agent_alias(
+    prompt_template: &str,
+    _args: &str,
+    session: &Session,
+) -> Option<SlashCommandResult> {
     Some(SlashCommandResult {
         message: format!("Delegate to agent: {}", prompt_template),
         error: None,
@@ -64,9 +65,7 @@ pub fn handle_slash_command(
         SlashCommand::Context { action } => {
             agent_alias("/context", &action.unwrap_or_default(), session)
         }
-        SlashCommand::Branch { name } => {
-            agent_alias("/branch", &name.unwrap_or_default(), session)
-        }
+        SlashCommand::Branch { name } => agent_alias("/branch", &name.unwrap_or_default(), session),
         SlashCommand::AgentProfile { agent_id } => {
             let dir = memory::agent_directory::AgentDirectory::global();
             match agent_id {
@@ -81,7 +80,8 @@ pub fn handle_slash_command(
                     }
                     match found {
                         Some(info) => {
-                            let repscore = info.reputation
+                            let repscore = info
+                                .reputation
                                 .map(|r| format!("{:.3}", r.composite()))
                                 .unwrap_or_else(|| "N/A".to_string());
                             let caps = info.capabilities.join(", ");
@@ -116,16 +116,24 @@ pub fn handle_slash_command(
                             session: session.clone(),
                         })
                     } else {
-                        let lines: Vec<String> = active.iter().map(|info| {
-                            let repscore = info.reputation
-                                .map(|r| format!("{:.3}", r.composite()))
-                                .unwrap_or_else(|| "N/A".to_string());
-                            format!(
-                                "  {}  {:?}  {}  rep:{}",
-                                info.agent_id, info.status, info.role, repscore
-                            )
-                        }).collect();
-                        let msg = format!("Registered agents ({}):\n{}", active.len(), lines.join("\n"));
+                        let lines: Vec<String> = active
+                            .iter()
+                            .map(|info| {
+                                let repscore = info
+                                    .reputation
+                                    .map(|r| format!("{:.3}", r.composite()))
+                                    .unwrap_or_else(|| "N/A".to_string());
+                                format!(
+                                    "  {}  {:?}  {}  rep:{}",
+                                    info.agent_id, info.status, info.role, repscore
+                                )
+                            })
+                            .collect();
+                        let msg = format!(
+                            "Registered agents ({}):\n{}",
+                            active.len(),
+                            lines.join("\n")
+                        );
                         Some(SlashCommandResult {
                             message: msg,
                             error: None,
@@ -142,42 +150,51 @@ pub fn handle_slash_command(
         SlashCommand::Unknown(name)
             if matches!(
                 name.as_str(),
-                "git" | "test" | "build" | "run" | "search" | "explain" | "fix" | "refactor"
-                    | "docs" | "web" | "perf" | "format" | "lint" | "blame" | "log" | "stash"
+                "git"
+                    | "test"
+                    | "build"
+                    | "run"
+                    | "search"
+                    | "explain"
+                    | "fix"
+                    | "refactor"
+                    | "docs"
+                    | "web"
+                    | "perf"
+                    | "format"
+                    | "lint"
+                    | "blame"
+                    | "log"
+                    | "stash"
             ) =>
         {
             agent_alias(&name, "", session)
         }
-        _ => {
-            Some(SlashCommandResult {
-                message: format!("Command not yet implemented: {}", command.slash_name()),
-                error: Some("not_implemented".into()),
-                session: session.clone(),
-            })
-        }
+        _ => Some(SlashCommandResult {
+            message: format!("Command not yet implemented: {}", command.slash_name()),
+            error: Some("not_implemented".into()),
+            session: session.clone(),
+        }),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::handle_slash_command;
     use crate::parser::{
-        classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
-        handle_mcp_slash_command,
-        handle_plugins_slash_command, handle_skills_slash_command, handle_skills_slash_command_json,
-        load_agents_from_roots, load_skills_from_roots, render_agents_report,
-        render_agents_report_json, render_mcp_report_for, render_mcp_report_json_for,
-        render_plugins_report,
-        render_plugins_report_with_failures, render_skills_report, render_skills_report_json,
-        render_slash_command_help,
-        render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
-        slash_command_specs, suggest_slash_commands, validate_slash_command_input,
-        parse_skill_frontmatter, install_skill_into, render_skill_install_report,
-        DefinitionSource, SkillOrigin, SkillRoot,
+        classify_skills_slash_command, handle_agents_slash_command,
+        handle_agents_slash_command_json, handle_mcp_slash_command, handle_plugins_slash_command,
+        handle_skills_slash_command, handle_skills_slash_command_json, install_skill_into,
+        load_agents_from_roots, load_skills_from_roots, parse_skill_frontmatter,
+        render_agents_report, render_agents_report_json, render_mcp_report_for,
+        render_mcp_report_json_for, render_plugins_report, render_plugins_report_with_failures,
+        render_skill_install_report, render_skills_report, render_skills_report_json,
+        render_slash_command_help, render_slash_command_help_detail, resolve_skill_path,
+        resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
+        validate_slash_command_input, DefinitionSource, SkillOrigin, SkillRoot,
     };
     use crate::specs::{SkillSlashDispatch, SlashCommand};
-    
+
     use plugins::{
         PluginError, PluginKind, PluginLoadFailure, PluginManager, PluginManagerConfig,
         PluginMetadata, PluginSummary,
@@ -471,6 +488,24 @@ mod tests {
             }))
         );
         assert_eq!(
+            SlashCommand::parse("/approvals approve req-1"),
+            Ok(Some(SlashCommand::Approvals {
+                args: Some("approve req-1".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/approval reject req-2"),
+            Ok(Some(SlashCommand::Approvals {
+                args: Some("reject req-2".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/cross-plane preflight {\"operation\":\"send_text\"}"),
+            Ok(Some(SlashCommand::CrossPlane {
+                args: Some("preflight {\"operation\":\"send_text\"}".to_string())
+            }))
+        );
+        assert_eq!(
             SlashCommand::parse("/session fork incident-review"),
             Ok(Some(SlashCommand::Session {
                 action: Some("fork".to_string()),
@@ -681,7 +716,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 143);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -876,12 +911,9 @@ mod tests {
             CompactionConfig::default()
         )
         .is_some());
-        assert!(handle_slash_command(
-            "/resume latest",
-            &session,
-            CompactionConfig::default()
-        )
-        .is_some());
+        assert!(
+            handle_slash_command("/resume latest", &session, CompactionConfig::default()).is_some()
+        );
         assert!(handle_slash_command("/config", &session, CompactionConfig::default()).is_some());
         assert!(
             handle_slash_command("/config env", &session, CompactionConfig::default()).is_some()
@@ -1073,7 +1105,10 @@ mod tests {
         let help = handle_agents_slash_command_json(Some("help"), &workspace).expect("agents help");
         assert_eq!(help["kind"], "agents");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["direct_cli"], "cowd agents [list|discover <task>|help]");
+        assert_eq!(
+            help["usage"]["direct_cli"],
+            "cowd agents [list|discover <task>|help]"
+        );
 
         let unexpected = handle_agents_slash_command_json(Some("show planner"), &workspace)
             .expect("agents usage");
@@ -1180,9 +1215,8 @@ mod tests {
                 origin: SkillOrigin::SkillsDir,
             },
         ];
-        let report = render_skills_report_json(
-            &load_skills_from_roots(&roots).expect("skills should load"),
-        );
+        let report =
+            render_skills_report_json(&load_skills_from_roots(&roots).expect("skills should load"));
         assert_eq!(report["kind"], "skills");
         assert_eq!(report["action"], "list");
         assert_eq!(report["summary"]["active"], 3);
@@ -1210,8 +1244,7 @@ mod tests {
     fn agents_and_skills_usage_support_help_and_unexpected_args() {
         let cwd = temp_dir("slash-usage");
 
-        let agents_help =
-            handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
+        let agents_help = handle_agents_slash_command(Some("help"), &cwd).expect("agents help");
         assert!(agents_help.contains("Usage            /agents [list|discover <task>|help]"));
         assert!(agents_help.contains("Direct CLI       cowd agents"));
         assert!(agents_help
@@ -1221,8 +1254,7 @@ mod tests {
             handle_agents_slash_command(Some("show planner"), &cwd).expect("agents usage");
         assert!(agents_unexpected.contains("Unexpected       show planner"));
 
-        let skills_help =
-            handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
+        let skills_help = handle_skills_slash_command(Some("--help"), &cwd).expect("skills help");
         assert!(skills_help
             .contains("Usage            /skills [list|install <path>|help|<skill> [args]]"));
         assert!(skills_help.contains("Alias            /skill"));
@@ -1237,10 +1269,9 @@ mod tests {
             handle_skills_slash_command(Some("show help"), &cwd).expect("skills usage");
         assert!(skills_unexpected.contains("Unexpected       show"));
 
-        let skills_install_help = handle_skills_slash_command(Some("install --help"), &cwd)
-            .expect("nested skills help");
-        assert!(skills_install_help
-            .contains("Usage: /skill install <source>"));
+        let skills_install_help =
+            handle_skills_slash_command(Some("install --help"), &cwd).expect("nested skills help");
+        assert!(skills_install_help.contains("Usage: /skill install <source>"));
         assert!(skills_install_help.contains("Install a skill from a remote source"));
 
         let skills_unknown_help =
@@ -1310,8 +1341,7 @@ mod tests {
         assert!(report.contains("doctor-check · Claude config command guidance · legacy /commands"));
         assert!(report.contains("learned · Learned skill guidance"));
 
-        let help =
-            handle_skills_slash_command_json(Some("help"), &workspace).expect("skills help");
+        let help = handle_skills_slash_command_json(Some("help"), &workspace).expect("skills help");
         let sources = help["usage"]["sources"]
             .as_array()
             .expect("skills help sources");
@@ -1342,8 +1372,7 @@ mod tests {
             handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
         assert!(unexpected.contains("Unexpected       show alpha beta"));
 
-        let nested_help =
-            handle_mcp_slash_command(Some("show --help"), &cwd).expect("mcp help");
+        let nested_help = handle_mcp_slash_command(Some("show --help"), &cwd).expect("mcp help");
         assert!(nested_help.contains("Usage            /mcp [list|show <server>|help]"));
         assert!(nested_help.contains("Unexpected       show"));
 

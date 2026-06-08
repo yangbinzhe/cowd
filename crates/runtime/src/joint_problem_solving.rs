@@ -18,11 +18,11 @@ use crate::agent::{SubAgentConfig, SubAgentExecutor, SubAgentResult};
 use crate::agent_collaboration::{CollaborationOrchestrator, CollaborationTask};
 
 use memory::agent_directory::AgentDirectory;
-use memory::{MemoryKernel, MemoryTurnContext};
+use memory::project_scope::MemoryScope;
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
-use memory::project_scope::MemoryScope;
+use memory::{MemoryKernel, MemoryTurnContext};
 
 // ── ProblemStatement ────────────────────────────────────────────────────────
 
@@ -89,7 +89,12 @@ pub struct Solution {
 }
 
 impl Solution {
-    pub fn new(id: impl Into<String>, title: impl Into<String>, description: impl Into<String>, proposed_by: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        proposed_by: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             title: title.into(),
@@ -263,8 +268,10 @@ impl<E: SubAgentExecutor> AgentDiscussion<E> {
         if let Some(ref mem) = self.parent_memory {
             let kernel = MemoryKernel::new(Arc::clone(mem));
             for turn in &turns {
-                let memory_ctx =
-                    MemoryTurnContext::new("joint-problem-solving-discussion", turn.agent_id.clone());
+                let memory_ctx = MemoryTurnContext::new(
+                    "joint-problem-solving-discussion",
+                    turn.agent_id.clone(),
+                );
                 let entry = MemoryEntry {
                     id: MemoryId::new_v4(),
                     layer: MemoryLayer::L4,
@@ -454,16 +461,16 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
             }
 
             if perspectives.is_empty() {
-                perspectives.push("No agent perspectives collected — proceeding with direct framing.".to_string());
+                perspectives.push(
+                    "No agent perspectives collected — proceeding with direct framing.".to_string(),
+                );
             }
             perspectives
         } else {
             // No memory configured; synthetic framing.
             vec![format!(
                 "Problem framed: {}\nConstraints: {:?}\nCriteria: {:?}",
-                problem.description,
-                problem.constraints,
-                problem.success_criteria,
+                problem.description, problem.constraints, problem.success_criteria,
             )]
         };
 
@@ -482,7 +489,11 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
         perspectives: &[String],
     ) -> Vec<Solution> {
         let collab = CollaborationOrchestrator::<E>::new(Arc::clone(&self.executor));
-        let skills = vec!["planning".to_string(), "execution".to_string(), "refactoring".to_string()];
+        let skills = vec![
+            "planning".to_string(),
+            "execution".to_string(),
+            "refactoring".to_string(),
+        ];
 
         let perspective_text = perspectives.join("\n\n");
         let prompt = format!(
@@ -504,7 +515,9 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
             description: prompt.clone(),
             required_skills: skills.clone(),
             subtasks: subtasks.clone(),
-            review_criteria: Some("Solutions must be concrete, feasible, and respect constraints".to_string()),
+            review_criteria: Some(
+                "Solutions must be concrete, feasible, and respect constraints".to_string(),
+            ),
         };
 
         let team = match collab.assemble_team(&task) {
@@ -535,10 +548,8 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
         // Parse solutions from agent outputs.
         let mut all_solutions: Vec<Solution> = Vec::new();
         for (i, result) in results.iter().enumerate() {
-            let parsed = parse_solutions_from_text_single(
-                &result.output,
-                &format!("agent-{}", i + 1),
-            );
+            let parsed =
+                parse_solutions_from_text_single(&result.output, &format!("agent-{}", i + 1));
             all_solutions.extend(parsed);
         }
 
@@ -628,10 +639,9 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
         }
 
         // Run the discussion.
-        let turns = discussion.discuss(
-            "solution evaluation",
-            &agent_prompts,
-        ).await;
+        let turns = discussion
+            .discuss("solution evaluation", &agent_prompts)
+            .await;
 
         // Parse evaluations from discussion turns.
         for turn in &turns {
@@ -648,7 +658,9 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
                         evaluator: format!("{}-synthetic", agent_id),
                         scores: SolutionScore::default(),
                         average: 3.0,
-                        feedback: Some("Synthetic evaluation (no detailed scores parsed)".to_string()),
+                        feedback: Some(
+                            "Synthetic evaluation (no detailed scores parsed)".to_string(),
+                        ),
                     });
                 }
             }
@@ -847,9 +859,15 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
             result.solutions.len(),
             selected_text,
             result.execution_outputs.len(),
-            result.execution_outputs.iter().filter(|r| r.completed_normally).count(),
+            result
+                .execution_outputs
+                .iter()
+                .filter(|r| r.completed_normally)
+                .count(),
             result.review_summary.as_deref().unwrap_or("no review"),
-            result.phase_statuses.iter()
+            result
+                .phase_statuses
+                .iter()
                 .map(|(name, status)| format!("- {}: {:?}", name, status))
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -864,7 +882,10 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
             category: MemoryCategory::Shared,
             priority: Priority::High,
             source: MemorySource::Import,
-            title: format!("P8.3 pipeline: {}", truncate_str(&result.problem.description, 100)),
+            title: format!(
+                "P8.3 pipeline: {}",
+                truncate_str(&result.problem.description, 100)
+            ),
             content,
             embedding: None,
             tags: vec![
@@ -906,7 +927,9 @@ impl<E: SubAgentExecutor + 'static> ProblemSolvingPipeline<E> {
 
         // Phase 2: Solution Brainstorming
         phase_statuses.push(("SolutionBrainstorming".to_string(), PhaseStatus::Running));
-        let solutions = self.phase2_brainstorming(&problem, &framing.perspectives).await;
+        let solutions = self
+            .phase2_brainstorming(&problem, &framing.perspectives)
+            .await;
         phase_statuses.last_mut().unwrap().1 = PhaseStatus::Completed;
 
         if solutions.is_empty() {
@@ -1068,7 +1091,9 @@ fn parse_solutions_from_text(text: &str) -> Vec<Solution> {
                 counter += 1;
                 solutions.push(Solution::new(
                     format!("sol-{counter}"),
-                    current_title.take().unwrap_or_else(|| format!("Solution {counter}")),
+                    current_title
+                        .take()
+                        .unwrap_or_else(|| format!("Solution {counter}")),
                     desc,
                     "agent-0",
                 ));
@@ -1123,7 +1148,13 @@ fn parse_solutions_from_text_single(text: &str, agent_id: &str) -> Vec<Solution>
 /// Strip common header prefixes from solution titles.
 fn strip_header_prefix(s: &str) -> String {
     let s = s.trim();
-    for prefix in &["## Solution:", "### Solution:", "## Solution ", "### Solution ", "Solution: "] {
+    for prefix in &[
+        "## Solution:",
+        "### Solution:",
+        "## Solution ",
+        "### Solution ",
+        "Solution: ",
+    ] {
         if let Some(stripped) = s.strip_prefix(prefix) {
             return stripped.trim().to_string();
         }
@@ -1159,10 +1190,16 @@ fn parse_evaluations_from_text(
                 .map(String::from);
 
             let clarity = value.get("clarity").and_then(|v| v.as_f64()).unwrap_or(3.0) as f32;
-            let feasibility = value.get("feasibility").and_then(|v| v.as_f64()).unwrap_or(3.0) as f32;
+            let feasibility = value
+                .get("feasibility")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(3.0) as f32;
             let novelty = value.get("novelty").and_then(|v| v.as_f64()).unwrap_or(3.0) as f32;
             let impact = value.get("impact").and_then(|v| v.as_f64()).unwrap_or(3.0) as f32;
-            let efficiency = value.get("efficiency").and_then(|v| v.as_f64()).unwrap_or(3.0) as f32;
+            let efficiency = value
+                .get("efficiency")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(3.0) as f32;
             let feedback = value
                 .get("feedback")
                 .and_then(|v| v.as_str())
@@ -1383,7 +1420,8 @@ mod tests {
 
     #[test]
     fn parse_solutions_from_text_detects_headers() {
-        let text = "## Solution 1: Alpha\nDescription here\n\n## Solution 2: Beta\nOther description";
+        let text =
+            "## Solution 1: Alpha\nDescription here\n\n## Solution 2: Beta\nOther description";
         let solutions = parse_solutions_from_text(text);
         assert_eq!(solutions.len(), 2);
         assert!(solutions[0].title.contains("Alpha"));
@@ -1451,7 +1489,8 @@ mod tests {
                 &self,
                 _config: SubAgentConfig,
                 _task: &str,
-            ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
+            ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>>
+            {
                 async move {
                     Ok(SubAgentResult {
                         output: String::new(),
@@ -1464,7 +1503,9 @@ mod tests {
 
         // We can't easily test the full phase2 since it needs AgentDirectory,
         // but we can verify the executor works.
-        let result = EmptyExecutor.execute(SubAgentConfig::default(), "test").await;
+        let result = EmptyExecutor
+            .execute(SubAgentConfig::default(), "test")
+            .await;
         assert!(result.is_ok());
         assert!(result.unwrap().output.is_empty());
     }
@@ -1527,7 +1568,9 @@ mod tests {
             task: &str,
         ) -> impl std::future::Future<Output = Result<SubAgentResult, SubAgentError>> {
             // Return a response based on the agent role.
-            let output = if config.agent_role.contains("Brainstormer") || task.contains("brainstorm") {
+            let output = if config.agent_role.contains("Brainstormer")
+                || task.contains("brainstorm")
+            {
                 "## Solution 1: Quick Fix\nJust fix it quickly.\n\n## Solution 2: Refactor\nRefactor the whole thing.".to_string()
             } else if config.agent_role.contains("Evaluator") {
                 r#"{"solution_id": "sol-1", "clarity": 4, "feasibility": 5, "novelty": 2, "impact": 3, "efficiency": 4}
@@ -1537,7 +1580,8 @@ mod tests {
             } else if config.agent_role.contains("Reviewer") {
                 "Review: Implementation meets criteria. Approved.".to_string()
             } else if config.agent_role.contains("Analyst") {
-                "Analysis: The problem requires careful planning and systematic execution.".to_string()
+                "Analysis: The problem requires careful planning and systematic execution."
+                    .to_string()
             } else {
                 "Default response".to_string()
             };
@@ -1554,7 +1598,9 @@ mod tests {
 
     #[tokio::test]
     async fn full_pipeline_brainstorm_and_merge() {
-        let pipeline = ProblemSolvingPipeline::<IntegrationTestExecutor>::new(Arc::new(IntegrationTestExecutor { _responses: vec![] }));
+        let pipeline = ProblemSolvingPipeline::<IntegrationTestExecutor>::new(Arc::new(
+            IntegrationTestExecutor { _responses: vec![] },
+        ));
 
         let problem = ProblemStatement::new("build system is slow")
             .with_constraints(vec!["must not break CI".to_string()])
@@ -1565,7 +1611,10 @@ mod tests {
 
         let result = result.unwrap();
         // Verify phases completed.
-        let framing_status = result.phase_statuses.iter().find(|(n, _)| n == "ProblemFraming");
+        let framing_status = result
+            .phase_statuses
+            .iter()
+            .find(|(n, _)| n == "ProblemFraming");
         assert!(framing_status.is_some());
 
         // At minimum, we should have the problem and phase statuses.

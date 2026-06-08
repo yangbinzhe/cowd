@@ -3,11 +3,11 @@
 //! Tests that verbatim entries survive intact, never pass through compression,
 //! and remain searchable after restart.
 
-use cowd_memory::{ MemoryScope,
-    CognitiveContextManager, MemoryConfig, MemoryEntry, MemoryLayer, MemoryCategory,
+use cowd_memory::config::{BudgetConfig, StoreConfig};
+use cowd_memory::{
+    CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
     MemorySource, Priority,
 };
-use cowd_memory::config::{BudgetConfig, StoreConfig};
 
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
@@ -31,7 +31,9 @@ fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
 #[tokio::test]
 async fn test_verbatim_sink_stores_and_retrieves() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mgr = CognitiveContextManager::new(test_config(&tmp.path().join("vbs.db"))).await.unwrap();
+    let mgr = CognitiveContextManager::new(test_config(&tmp.path().join("vbs.db")))
+        .await
+        .unwrap();
 
     let entry = MemoryEntry {
         id: uuid::Uuid::new_v4(),
@@ -52,8 +54,8 @@ async fn test_verbatim_sink_stores_and_retrieves() {
         last_accessed_at: None,
         scope: MemoryScope::default(),
         session_id: None,
-            source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+        source_agent: None,
+        visibility: cowd_memory::AgentVisibility::default(),
     };
     let entry_id = entry.id;
     mgr.remember(entry).await.unwrap();
@@ -62,7 +64,10 @@ async fn test_verbatim_sink_stores_and_retrieves() {
     let retrieved = mgr.get_entry(&entry_id.to_string()).await.unwrap();
     assert!(retrieved.is_some(), "Entry should be retrievable");
     if let Some(e) = retrieved {
-        assert_eq!(e.content, "This exact raw content must never be compressed or summarized");
+        assert_eq!(
+            e.content,
+            "This exact raw content must never be compressed or summarized"
+        );
     }
 }
 
@@ -74,7 +79,9 @@ async fn test_verbatim_survives_restart() {
     let entry_id = uuid::Uuid::new_v4();
 
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path)).await.unwrap();
+        let mgr = CognitiveContextManager::new(test_config(&db_path))
+            .await
+            .unwrap();
         let entry = MemoryEntry {
             id: entry_id,
             layer: MemoryLayer::L3,
@@ -101,7 +108,9 @@ async fn test_verbatim_survives_restart() {
     }
 
     {
-        let mgr = CognitiveContextManager::new(test_config(&db_path)).await.unwrap();
+        let mgr = CognitiveContextManager::new(test_config(&db_path))
+            .await
+            .unwrap();
         let retrieved = mgr.get_entry(&entry_id.to_string()).await.unwrap();
         assert!(retrieved.is_some(), "Entry should survive restart");
         if let Some(e) = retrieved {

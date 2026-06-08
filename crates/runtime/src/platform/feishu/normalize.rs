@@ -70,10 +70,7 @@ pub struct MentionRef {
 /// # Unknown types
 ///
 /// Returns `text = "[Unknown message type: {type}]"` with no media.
-pub fn normalize_feishu_message(
-    raw_message: &Value,
-    bot_open_id: &str,
-) -> NormalizedMessage {
+pub fn normalize_feishu_message(raw_message: &Value, bot_open_id: &str) -> NormalizedMessage {
     let msg_type = raw_message
         .get("msg_type")
         .and_then(|v| v.as_str())
@@ -292,10 +289,7 @@ fn normalize_merge_forward(
     mentions: &[MentionRef],
     raw_message: &Value,
 ) -> NormalizedMessage {
-    let title = content
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let title = content.get("title").and_then(|v| v.as_str()).unwrap_or("");
 
     let mut text_parts: Vec<String> = vec![format!("[Forward: {}]\n", title)];
 
@@ -381,7 +375,8 @@ fn normalize_interactive_card(
                             }
                         }
                     }
-                    if let Some(t) = el.get("text")
+                    if let Some(t) = el
+                        .get("text")
                         .and_then(|t| t.get("content"))
                         .and_then(|v| v.as_str())
                     {
@@ -437,15 +432,20 @@ fn normalize_interactive_card(
 ///
 /// Self-detection: an entry is marked `is_self` when its `open_id` matches
 /// `bot_open_id`.
-pub fn build_mentions_map(
-    mentions: &[Value],
-    bot_open_id: &str,
-) -> Vec<MentionRef> {
+pub fn build_mentions_map(mentions: &[Value], bot_open_id: &str) -> Vec<MentionRef> {
     mentions
         .iter()
         .filter_map(|m| {
-            let key = m.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let key = m
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = m
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let open_id = m
                 .get("id")
                 .or_else(|| m.get("open_id"))
@@ -556,7 +556,10 @@ mod tests {
         });
 
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Text);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Text
+        );
         assert_eq!(result.text, "@Alice hello @Bob");
         assert_eq!(result.mentions.len(), 2);
         assert_eq!(result.mentions[0].name, "Alice");
@@ -573,7 +576,10 @@ mod tests {
         let result = normalize_feishu_message(&raw, "ou_bot");
         assert_eq!(result.text, "hello world");
         assert!(result.mentions.is_empty());
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Text);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Text
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -581,10 +587,16 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_post_message() {
-        let raw = make_msg("post", &json!({"zh_cn": {"content": [[{"tag": "text", "text": "Hello"}], [{"tag": "md", "text": "**world**"}]]}}));
+        let raw = make_msg(
+            "post",
+            &json!({"zh_cn": {"content": [[{"tag": "text", "text": "Hello"}], [{"tag": "md", "text": "**world**"}]]}}),
+        );
 
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Text);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Text
+        );
         assert_eq!(result.text, "Hello**world**");
     }
 
@@ -596,7 +608,10 @@ mod tests {
         let raw = make_msg("image", &json!({"image_key": "img_abc123"}));
 
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Photo);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Photo
+        );
         assert_eq!(result.text, "[Image]");
         assert_eq!(result.image_keys, vec!["img_abc123"]);
     }
@@ -606,10 +621,16 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_file_message() {
-        let raw = make_msg("file", &json!({"file_key": "file_xyz", "file_name": "report.pdf"}));
+        let raw = make_msg(
+            "file",
+            &json!({"file_key": "file_xyz", "file_name": "report.pdf"}),
+        );
 
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Document);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Document
+        );
         assert_eq!(result.text, "[File: report.pdf]");
         assert_eq!(result.media_refs.len(), 1);
         assert_eq!(result.media_refs[0].file_key, "file_xyz");
@@ -625,7 +646,10 @@ mod tests {
         let raw = make_msg("audio", &json!({"file_key": "audio_key_001"}));
 
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Voice);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Voice
+        );
         assert_eq!(result.text, "[Voice message]");
         assert_eq!(result.media_refs.len(), 1);
         assert_eq!(result.media_refs[0].resource_type, "audio");
@@ -639,7 +663,10 @@ mod tests {
         let raw = make_msg("media", &json!({"file_key": "video_key_001"}));
 
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Video);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Video
+        );
         assert_eq!(result.text, "[Video]");
         assert_eq!(result.media_refs.len(), 1);
         assert_eq!(result.media_refs[0].resource_type, "video");
@@ -656,7 +683,10 @@ mod tests {
         );
 
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Text);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Text
+        );
         assert!(result.text.contains("[Forward: Group Chat History]"));
         assert!(result.text.contains("- Alice: hello"));
         assert!(result.text.contains("- Bob: hi"));
@@ -673,7 +703,10 @@ mod tests {
         );
 
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Text);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Text
+        );
         assert_eq!(result.text, "[Shared Chat: Project Alpha (oc_alpha)]");
     }
 
@@ -696,7 +729,10 @@ mod tests {
         );
 
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Text);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Text
+        );
         assert!(result.text.contains("[Card: Confirmation]"));
         assert!(result.text.contains("Are you sure?"));
         assert!(result.text.contains("[Action: Yes]"));
@@ -758,7 +794,10 @@ mod tests {
         let raw = make_msg("sticker", &json!({"file_key": "sticker_001"}));
 
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Text);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Text
+        );
         assert_eq!(result.text, "[Unknown message type: sticker]");
         assert!(result.image_keys.is_empty());
         assert!(result.media_refs.is_empty());
@@ -825,7 +864,10 @@ mod tests {
     fn test_image_message_no_key() {
         let raw = make_msg("image", &json!({}));
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Photo);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Photo
+        );
         assert_eq!(result.text, "[Image]");
         assert!(result.image_keys.is_empty());
     }
@@ -834,7 +876,10 @@ mod tests {
     fn test_file_message_no_key() {
         let raw = make_msg("file", &json!({}));
         let result = normalize_feishu_message(&raw, "ou_bot");
-        assert_eq!(result.message_type, super::super::super::types::MessageType::Document);
+        assert_eq!(
+            result.message_type,
+            super::super::super::types::MessageType::Document
+        );
         assert_eq!(result.text, "[File: file]"); // fallback name
         assert!(result.media_refs.is_empty());
     }

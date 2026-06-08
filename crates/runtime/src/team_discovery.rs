@@ -44,8 +44,7 @@ impl TeamDiscoveryProtocol {
     ///
     /// The `teams` table is created on first open if it does not exist.
     pub fn with_db(db_path: &Path) -> Result<Self, String> {
-        let conn = rusqlite::Connection::open(db_path)
-            .map_err(|e| format!("open db: {e}"))?;
+        let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("open db: {e}"))?;
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
             .map_err(|e| format!("WAL pragma: {e}"))?;
         let _ = conn.execute("PRAGMA foreign_keys=ON", []);
@@ -227,12 +226,8 @@ impl TeamDiscoveryProtocol {
 
             // P9: Bidirectional sync — also update ReputationManager
             if let Some(mgr) = ReputationManager::global_opt() {
-                let _ = mgr.record_completion(
-                    agent_id,
-                    if success { 0.85 } else { 0.4 },
-                    success,
-                    &[],
-                );
+                let _ =
+                    mgr.record_completion(agent_id, if success { 0.85 } else { 0.4 }, success, &[]);
             }
 
             return;
@@ -295,7 +290,10 @@ mod tests {
         let pos_a2 = ranked.iter().position(|a| a.agent_id == "td1_a2");
         assert!(pos_a1.is_some(), "td1_a1 should be present");
         assert!(pos_a2.is_some(), "td1_a2 should be present");
-        assert!(pos_a1.unwrap() < pos_a2.unwrap(), "a1 (2 matches) should rank before a2 (1 match)");
+        assert!(
+            pos_a1.unwrap() < pos_a2.unwrap(),
+            "a1 (2 matches) should rank before a2 (1 match)"
+        );
 
         cleanup(&["td1_a1", "td1_a2"]);
     }
@@ -332,7 +330,10 @@ mod tests {
         let pos_b = ranked.iter().position(|a| a.agent_id == "td2_rep_b");
         assert!(pos_a.is_some(), "td2_rep_a should be present");
         assert!(pos_b.is_some(), "td2_rep_b should be present");
-        assert!(pos_a.unwrap() < pos_b.unwrap(), "high-rep agent should rank before low-rep agent");
+        assert!(
+            pos_a.unwrap() < pos_b.unwrap(),
+            "high-rep agent should rank before low-rep agent"
+        );
 
         cleanup(&["td2_rep_a", "td2_rep_b"]);
     }
@@ -349,14 +350,26 @@ mod tests {
 
         let proto = TeamDiscoveryProtocol::new();
         let team = proto
-            .auto_assemble("Build a Rust microservice", &["rust".into(), "planning".into()])
+            .auto_assemble(
+                "Build a Rust microservice",
+                &["rust".into(), "planning".into()],
+            )
             .expect("should assemble");
 
-        assert_eq!(team.leader.agent_id, "td3_lead", "lead-agent should be leader");
+        assert_eq!(
+            team.leader.agent_id, "td3_lead",
+            "lead-agent should be leader"
+        );
 
         let worker_ids: Vec<_> = team.workers.iter().map(|w| &w.agent_id).collect();
-        assert!(worker_ids.contains(&&"td3_wr".to_string()), "w-rust should be a worker");
-        assert!(!worker_ids.contains(&&"td3_wt".to_string()), "w-test should NOT be a worker (no matching skills)");
+        assert!(
+            worker_ids.contains(&&"td3_wr".to_string()),
+            "w-rust should be a worker"
+        );
+        assert!(
+            !worker_ids.contains(&&"td3_wt".to_string()),
+            "w-test should NOT be a worker (no matching skills)"
+        );
 
         cleanup(&["td3_lead", "td3_wr", "td3_wt"]);
     }

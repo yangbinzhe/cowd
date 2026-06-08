@@ -146,37 +146,51 @@ pub trait MemoryStore: Send + Sync {
 
     /// Persist a code symbol extracted from source code.
     async fn insert_symbol(&self, _sym: &CodeSymbol) -> Result<()> {
-        Err(MemoryError::Store("code symbol storage not supported by this backend".into()))
+        Err(MemoryError::Store(
+            "code symbol storage not supported by this backend".into(),
+        ))
     }
 
     /// Full-text search across indexed code symbols.
     async fn search_symbols(&self, _query: &str, _limit: usize) -> Result<Vec<CodeSymbol>> {
-        Err(MemoryError::Store("code symbol search not supported by this backend".into()))
+        Err(MemoryError::Store(
+            "code symbol search not supported by this backend".into(),
+        ))
     }
 
     /// Persist a code edge (call/import/extends/implements) between two symbols.
     async fn insert_edge(&self, _edge: &SymbolEdge) -> Result<()> {
-        Err(MemoryError::Store("code edge storage not supported by this backend".into()))
+        Err(MemoryError::Store(
+            "code edge storage not supported by this backend".into(),
+        ))
     }
 
     /// Find all symbols that call the given symbol (callers / upstream).
     async fn get_callers(&self, _symbol_id: &str) -> Result<Vec<CodeSymbol>> {
-        Err(MemoryError::Store("code symbol callers not supported by this backend".into()))
+        Err(MemoryError::Store(
+            "code symbol callers not supported by this backend".into(),
+        ))
     }
 
     /// Find all symbols called by the given symbol (callees / downstream).
     async fn get_callees(&self, _symbol_id: &str) -> Result<Vec<CodeSymbol>> {
-        Err(MemoryError::Store("code symbol callees not supported by this backend".into()))
+        Err(MemoryError::Store(
+            "code symbol callees not supported by this backend".into(),
+        ))
     }
 
     /// List all code symbols in the index (no filtering).
     async fn list_all_symbols(&self) -> Result<Vec<CodeSymbol>> {
-        Err(MemoryError::Store("code symbol listing not supported by this backend".into()))
+        Err(MemoryError::Store(
+            "code symbol listing not supported by this backend".into(),
+        ))
     }
 
     /// List all code edges in the index (no filtering).
     async fn list_all_edges(&self) -> Result<Vec<SymbolEdge>> {
-        Err(MemoryError::Store("code edge listing not supported by this backend".into()))
+        Err(MemoryError::Store(
+            "code edge listing not supported by this backend".into(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -196,7 +210,9 @@ pub trait MemoryStore: Send + Sync {
         _reference_type: &str,
         _timestamp: i64,
     ) -> Result<()> {
-        Err(MemoryError::Store("symbol↔memory linking not supported by this backend".into()))
+        Err(MemoryError::Store(
+            "symbol↔memory linking not supported by this backend".into(),
+        ))
     }
 
     /// Find all memory entries that reference a given code symbol.
@@ -204,7 +220,9 @@ pub trait MemoryStore: Send + Sync {
     /// Searches the `symbol_references` table for all memory IDs
     /// linked to `symbol_name` (matched case-insensitively).
     async fn find_memories_by_symbol(&self, _symbol_name: &str) -> Result<Vec<MemoryId>> {
-        Err(MemoryError::Store("symbol↔memory lookup not supported by this backend".into()))
+        Err(MemoryError::Store(
+            "symbol↔memory lookup not supported by this backend".into(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -214,11 +232,15 @@ pub trait MemoryStore: Send + Sync {
     /// Store a key-value pair. Replaces existing value if key exists.
     /// Used by Closet index, Seed registry, and other auxiliary data.
     async fn kv_put(&self, _key: &str, _value: &str) -> Result<()> {
-        Err(MemoryError::Store("kv store not supported by this backend".into()))
+        Err(MemoryError::Store(
+            "kv store not supported by this backend".into(),
+        ))
     }
 
     /// Retrieve a value by key. Returns None if key does not exist.
     async fn kv_get(&self, _key: &str) -> Result<Option<String>> {
-        Err(MemoryError::Store("kv store not supported by this backend".into()))
+        Err(MemoryError::Store(
+            "kv store not supported by this backend".into(),
+        ))
     }
 }

@@ -24,10 +24,7 @@ pub enum MemoryError {
     ContextExceeded { used: u64, total: u64 },
 
     #[error("write denied: source '{write_source}' cannot write to layer '{layer}'")]
-    WriteDenied {
-        layer: String,
-        write_source: String,
-    },
+    WriteDenied { layer: String, write_source: String },
 
     #[error("disk full: {details}. Try freeing up disk space.")]
     DiskFull { details: String },

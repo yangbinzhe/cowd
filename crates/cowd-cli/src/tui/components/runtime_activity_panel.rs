@@ -16,6 +16,11 @@ pub struct RuntimeActivityPanel {
     degradation_path: String,
     policy_action: String,
     policy_reason: String,
+    runtime_policy_level: String,
+    runtime_policy_score: u16,
+    runtime_policy_agent: String,
+    runtime_policy_review: bool,
+    runtime_policy_signals: usize,
     selected_count: usize,
     omitted_count: usize,
     stable_hash: String,
@@ -31,6 +36,14 @@ pub struct RuntimeActivityPanel {
     recent_activity: Vec<String>,
     yolo_mode: bool,
     session_id: String,
+    model: String,
+    provider_status: String,
+    provider_count: usize,
+    provider_model_count: usize,
+    provider_route: String,
+    provider_names: String,
+    control_plane_status: String,
+    control_plane_reason: String,
 }
 
 impl RuntimeActivityPanel {
@@ -41,6 +54,33 @@ impl RuntimeActivityPanel {
     pub fn sync_from_app(&mut self, app: &App) {
         self.yolo_mode = app.yolo_mode;
         self.session_id = app.session_id.clone();
+        self.model = app.model.clone();
+        let mut provider_names = runtime::list_all_providers();
+        provider_names.sort();
+        self.provider_count = provider_names.len();
+        self.provider_model_count = runtime::list_all_models().len();
+        self.provider_names = if provider_names.is_empty() {
+            "none".to_string()
+        } else {
+            preview(&provider_names.join(","), 40)
+        };
+        self.provider_route = runtime::resolve_global_provider(&app.model)
+            .map(|provider| {
+                format!(
+                    "{} ({})",
+                    provider.name,
+                    provider.protocol.as_deref().unwrap_or("openai-compat")
+                )
+            })
+            .unwrap_or_else(|| "unresolved".to_string());
+        self.provider_status = if self.provider_count == 0 {
+            "unconfigured".to_string()
+        } else if self.provider_route == "unresolved" {
+            "degraded".to_string()
+        } else {
+            "available".to_string()
+        };
+        let has_context = app.latest_context_envelope.is_some();
         if let Some(envelope) = &app.latest_context_envelope {
             let probe = runtime::ContextRuntimeKernel::lean_probe(envelope);
             let policy = runtime::ContextRuntimeKernel::policy_decision(&probe);
@@ -71,6 +111,19 @@ impl RuntimeActivityPanel {
             self.stable_hash = "n/a".to_string();
             self.runtime_hash = "n/a".to_string();
             self.dynamic_hash = "n/a".to_string();
+        }
+        if let Some(policy) = &app.latest_runtime_policy {
+            self.runtime_policy_level = policy.level.clone();
+            self.runtime_policy_score = policy.score;
+            self.runtime_policy_agent = policy.agent_mode.clone();
+            self.runtime_policy_review = policy.requires_review;
+            self.runtime_policy_signals = policy.signal_count;
+        } else {
+            self.runtime_policy_level = "Simple".to_string();
+            self.runtime_policy_score = 0;
+            self.runtime_policy_agent = "Off".to_string();
+            self.runtime_policy_review = false;
+            self.runtime_policy_signals = 0;
         }
         if let Some(summary) = &app.latest_workgraph_summary {
             self.workgraph_status = summary.status.clone();
@@ -107,6 +160,28 @@ impl RuntimeActivityPanel {
             .take(8)
             .map(activity_label)
             .collect();
+        self.control_plane_status = if self.session_id.trim().is_empty() {
+            "degraded".to_string()
+        } else if self.provider_status == "degraded" {
+            "degraded".to_string()
+        } else if !has_context || self.runtime_policy_agent == "Off" {
+            "attention".to_string()
+        } else {
+            "healthy".to_string()
+        };
+        self.control_plane_reason = format!(
+            "session {} context {} agent {} graph-agents {} provider {} yolo {}",
+            if self.session_id.trim().is_empty() {
+                "missing"
+            } else {
+                "active"
+            },
+            if has_context { "ready" } else { "pending" },
+            self.runtime_policy_agent,
+            self.workgraph_agent_tasks,
+            self.provider_status,
+            if self.yolo_mode { "on" } else { "off" }
+        );
     }
 }
 
@@ -115,18 +190,27 @@ impl Component for RuntimeActivityPanel {
         let mut lines = Vec::new();
         lines.push(Line::from(Span::styled(
             "Runtime Activity",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
             Span::styled("Session:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(short_id(&self.session_id), Style::default().fg(Color::White)),
+            Span::styled(
+                short_id(&self.session_id),
+                Style::default().fg(Color::White),
+            ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("Profile:  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 &self.profile,
-                Style::default().fg(if self.yolo_mode { Color::Yellow } else { Color::White }),
+                Style::default().fg(if self.yolo_mode {
+                    Color::Yellow
+                } else {
+                    Color::White
+                }),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -148,14 +232,86 @@ impl Component for RuntimeActivityPanel {
         lines.push(Line::from(vec![
             Span::styled("Context:  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("selected {} omitted {}", self.selected_count, self.omitted_count),
+                format!(
+                    "selected {} omitted {}",
+                    self.selected_count, self.omitted_count
+                ),
                 Style::default().fg(Color::White),
             ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("Policy:   ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{} - {}", self.policy_action, preview(&self.policy_reason, 72)),
+                format!(
+                    "{} - {}",
+                    self.policy_action,
+                    preview(&self.policy_reason, 72)
+                ),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Control:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} score {} agent {} review {} signals {}",
+                    self.runtime_policy_level,
+                    self.runtime_policy_score,
+                    self.runtime_policy_agent,
+                    if self.runtime_policy_review {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                    self.runtime_policy_signals
+                ),
+                Style::default().fg(if self.runtime_policy_review {
+                    Color::Yellow
+                } else if self.runtime_policy_agent == "Parallel"
+                    || self.runtime_policy_agent == "CriticalSwarm"
+                {
+                    Color::Cyan
+                } else {
+                    Color::White
+                }),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Kernel:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} - {}",
+                    self.control_plane_status,
+                    preview(&self.control_plane_reason, 72)
+                ),
+                Style::default().fg(match self.control_plane_status.as_str() {
+                    "healthy" => Color::Green,
+                    "degraded" => Color::Red,
+                    _ => Color::Yellow,
+                }),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Provider: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} providers {} models {} route {}",
+                    self.provider_status,
+                    self.provider_count,
+                    self.provider_model_count,
+                    preview(&self.provider_route, 36)
+                ),
+                Style::default().fg(match self.provider_status.as_str() {
+                    "available" => Color::Green,
+                    "degraded" => Color::Red,
+                    _ => Color::Yellow,
+                }),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Model:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} via {}", preview(&self.model, 42), self.provider_names),
                 Style::default().fg(Color::White),
             ),
         ]));
@@ -202,7 +358,9 @@ impl Component for RuntimeActivityPanel {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "Recent",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         if self.recent_activity.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -227,8 +385,12 @@ impl Component for RuntimeActivityPanel {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(" Runtime ");
-        ctx.frame_mut()
-            .render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+        ctx.frame_mut().render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
     }
 
     fn handle_event(&mut self, _event: &crossterm::event::Event) -> EventResult {
@@ -249,8 +411,14 @@ fn activity_label(entry: TimelineEntry) -> String {
         TimelineEntry::Message { role, content, .. } => {
             format!("{role}: {}", preview(&content, 64))
         }
-        TimelineEntry::Thinking { content, complete, .. } => {
-            format!("thinking{}: {}", if complete { "" } else { "*" }, preview(&content, 64))
+        TimelineEntry::Thinking {
+            content, complete, ..
+        } => {
+            format!(
+                "thinking{}: {}",
+                if complete { "" } else { "*" },
+                preview(&content, 64)
+            )
         }
         TimelineEntry::ToolCall {
             name,
@@ -261,10 +429,18 @@ fn activity_label(entry: TimelineEntry) -> String {
         } => {
             let status = exit_code
                 .map(|code| format!("exit {code}"))
-                .unwrap_or_else(|| if done { "done".to_string() } else { "running".to_string() });
+                .unwrap_or_else(|| {
+                    if done {
+                        "done".to_string()
+                    } else {
+                        "running".to_string()
+                    }
+                });
             format!("tool {name} {status}: {}", preview(&tool_preview, 48))
         }
-        TimelineEntry::SlashOutput { command, output, .. } => {
+        TimelineEntry::SlashOutput {
+            command, output, ..
+        } => {
             format!("/{command}: {}", preview(&output, 64))
         }
     }
@@ -300,6 +476,7 @@ mod tests {
     use super::*;
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
+    use std::collections::HashMap;
 
     fn render_panel(panel: &mut RuntimeActivityPanel, width: u16, height: u16) -> String {
         let mut terminal = MockTerminal::new(width, height);
@@ -313,6 +490,18 @@ mod tests {
 
     #[test]
     fn syncs_runtime_activity_from_app() {
+        runtime::init_global_providers(runtime::ProvidersConfig {
+            providers: HashMap::from([(
+                "anthropic".to_string(),
+                runtime::ProviderConfig {
+                    name: "anthropic".to_string(),
+                    base_url: "https://anthropic.example/v1".to_string(),
+                    api_key: "secret".to_string(),
+                    models: vec!["m".to_string(), "m-fast".to_string()],
+                    protocol: Some("anthropic".to_string()),
+                },
+            )]),
+        });
         let mut app = App::new("m", "session-runtime-123456789");
         app.yolo_mode = true;
         app.add_message("user", "ship the runtime console");
@@ -340,6 +529,16 @@ mod tests {
                 complementarity_score: Some(0.75),
             },
         });
+        app.apply_event(runtime::CowdEvent::RuntimePolicyDecision {
+            summary: runtime::RuntimePolicyDecisionSummary {
+                level: "Complex".to_string(),
+                score: 70,
+                recommended_profile: "Collaboration".to_string(),
+                agent_mode: "Parallel".to_string(),
+                requires_review: false,
+                signal_count: 3,
+            },
+        });
 
         let identity = runtime::ContextIdentity::main("session-runtime-123456789".to_string());
         app.latest_context_envelope = Some(runtime::ContextRuntimeKernel::build_envelope(
@@ -362,12 +561,20 @@ mod tests {
 
         let mut panel = RuntimeActivityPanel::new();
         panel.sync_from_app(&app);
-        let rendered = render_panel(&mut panel, 88, 24);
+        let rendered = render_panel(&mut panel, 96, 27);
 
         assert!(rendered.contains("Runtime Activity"));
         assert!(rendered.contains("YoloGoal"));
         assert!(rendered.contains("Nominal"));
         assert!(rendered.contains("None"));
+        assert!(rendered.contains("Complex score 70 agent Parallel"));
+        assert!(rendered.contains("Kernel"));
+        assert!(rendered.contains("healthy"));
+        assert!(rendered.contains("session active context ready agent Parallel"));
+        assert!(rendered.contains("Provider"));
+        assert!(rendered.contains("available providers 1 models 2 route anthropic"));
+        assert!(rendered.contains("Model"));
+        assert!(rendered.contains("m via anthropic"));
         assert!(rendered.contains("selected 1 omitted 0"));
         assert!(rendered.contains("WorkGraph"));
         assert!(rendered.contains("completed 100% agents 2"));
@@ -376,5 +583,6 @@ mod tests {
         assert!(rendered.contains("board-run"));
         assert!(rendered.contains("tool bash exit 0"));
         assert!(rendered.contains("user: ship the runtime console"));
+        runtime::init_global_providers(runtime::ProvidersConfig::default());
     }
 }

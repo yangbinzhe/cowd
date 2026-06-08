@@ -541,7 +541,11 @@ impl StreamState {
         for choice in chunk.choices {
             // DeepSeek thinking mode: reasoning_content comes before the final answer.
             // Emit a Thinking content block to preserve it for subsequent requests.
-            if let Some(reasoning) = choice.delta.reasoning_content.filter(|value| !value.is_empty()) {
+            if let Some(reasoning) = choice
+                .delta
+                .reasoning_content
+                .filter(|value| !value.is_empty())
+            {
                 if !self.reasoning_started {
                     self.reasoning_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -554,7 +558,9 @@ impl StreamState {
                 }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
                     index: 0,
-                    delta: ContentBlockDelta::ThinkingDelta { thinking: reasoning },
+                    delta: ContentBlockDelta::ThinkingDelta {
+                        thinking: reasoning,
+                    },
                 }));
             }
 
@@ -1009,7 +1015,9 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                         }
                     })),
                     InputContentBlock::ToolResult { .. } => {}
-                    InputContentBlock::Thinking { thinking: value, .. } => {
+                    InputContentBlock::Thinking {
+                        thinking: value, ..
+                    } => {
                         reasoning.push_str(value);
                     }
                     InputContentBlock::RedactedThinking { .. } => {}
@@ -1212,7 +1220,11 @@ fn normalize_response(
     let mut content = Vec::new();
     // DeepSeek thinking mode: reasoning_content must be preserved and
     // passed back in subsequent requests. Convert to Thinking block.
-    if let Some(reasoning) = choice.message.reasoning_content.filter(|value| !value.is_empty()) {
+    if let Some(reasoning) = choice
+        .message
+        .reasoning_content
+        .filter(|value| !value.is_empty())
+    {
         content.push(OutputContentBlock::Thinking {
             thinking: reasoning,
             signature: choice.message.signature,

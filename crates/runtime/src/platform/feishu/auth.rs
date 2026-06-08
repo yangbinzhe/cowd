@@ -287,9 +287,7 @@ impl AccessControl {
     /// Check bot sender against the global `AllowBots` policy.
     fn check_bot_sender(&self, bot_was_mentioned: bool) -> AdmitResult {
         match self.allow_bots {
-            AllowBots::None => {
-                AdmitResult::reject("bot sender filtered by allow_bots=none")
-            }
+            AllowBots::None => AdmitResult::reject("bot sender filtered by allow_bots=none"),
             AllowBots::Mentions => {
                 if bot_was_mentioned {
                     AdmitResult::admit()
@@ -383,10 +381,7 @@ mod tests {
     }
 
     /// Create an AccessControl with the given global require_mention and allow_bots.
-    fn ac_with(
-        require_mention: bool,
-        allow_bots: AllowBots,
-    ) -> AccessControl {
+    fn ac_with(require_mention: bool, allow_bots: AllowBots) -> AccessControl {
         let mut ac = AccessControl::new("bot_open_id", "TestBot");
         ac.require_mention = require_mention;
         ac.allow_bots = allow_bots;

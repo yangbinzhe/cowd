@@ -17,8 +17,8 @@ use tokio::sync::RwLock;
 
 use crate::error::MemoryError;
 use crate::handoff::HandoffManager;
-use crate::MemoryScope;
 use crate::types::{MemoryEntry, MemoryLayer, Priority};
+use crate::MemoryScope;
 
 /// Result type for fresh context operations.
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -184,7 +184,9 @@ impl FreshContextManager {
 
         // Sort by freshness score (descending)
         fresh_entries.sort_by(|a, b| {
-            b.freshness_score.partial_cmp(&a.freshness_score).unwrap_or(std::cmp::Ordering::Equal)
+            b.freshness_score
+                .partial_cmp(&a.freshness_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Get budget and allocate entries - need write lock to update
@@ -258,10 +260,7 @@ impl FreshContextManager {
             for decision in handoff_data.decisions {
                 let content = format!(
                     "## Decision: {}\n{}\n\n**Status:** {:?}\n**Made:** {}",
-                    decision.summary,
-                    decision.rationale,
-                    decision.status,
-                    decision.made_at
+                    decision.summary, decision.rationale, decision.status, decision.made_at
                 );
                 entries.push(MemoryEntry {
                     id: uuid::Uuid::new_v4(),
@@ -300,7 +299,10 @@ impl FreshContextManager {
                     category: crate::types::MemoryCategory::Reference,
                     priority: Priority::Critical,
                     source: crate::types::MemorySource::Import,
-                    title: format!("Blocker: {}", blocker.description.chars().take(50).collect::<String>()),
+                    title: format!(
+                        "Blocker: {}",
+                        blocker.description.chars().take(50).collect::<String>()
+                    ),
                     content,
                     embedding: None,
                     tags: vec!["handoff".to_string(), "blocker".to_string()],

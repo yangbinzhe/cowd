@@ -224,9 +224,7 @@ impl AuditLog {
     /// Append an audit entry.
     pub fn log(&self, entry: &AuditEntry) -> std::io::Result<()> {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&self.path)?;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
         let json = serde_json::to_string(entry)?;
         writeln!(file, "{}", json)?;
         Ok(())
@@ -412,7 +410,11 @@ mod tests {
             MemoryLayer::L3,
             MemoryLayer::L4,
         ] {
-            assert!(guard.is_write_allowed(layer), "User should write {:?}", layer);
+            assert!(
+                guard.is_write_allowed(layer),
+                "User should write {:?}",
+                layer
+            );
         }
     }
 
@@ -463,8 +465,7 @@ mod tests {
 
     #[test]
     fn custom_sub_agent_layers() {
-        let guard =
-            MemoryWriteGuard::for_sub_agent([MemoryLayer::L1]);
+        let guard = MemoryWriteGuard::for_sub_agent([MemoryLayer::L1]);
         assert!(guard.is_write_allowed(MemoryLayer::L2));
         assert!(guard.is_write_allowed(MemoryLayer::L1)); // extra layer
         assert!(!guard.is_write_allowed(MemoryLayer::L0));

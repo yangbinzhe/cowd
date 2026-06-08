@@ -17,7 +17,7 @@ use chrono::Utc;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::{error::MemoryError, store::Result};
 
@@ -227,6 +227,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
         r"CREATE INDEX IF NOT EXISTS idx_session_events_session_seq ON session_events(session_id, sequence)",
         r"CREATE INDEX IF NOT EXISTS idx_session_events_session_type_seq
             ON session_events(session_id, event_type, sequence)",
+        r"CREATE INDEX IF NOT EXISTS idx_session_events_context_envelope_id
+            ON session_events(json_extract(event_json, '$.envelope.id'))
+            WHERE event_type = 'ContextEnvelope'",
         r"CREATE TABLE IF NOT EXISTS session_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
@@ -801,6 +804,36 @@ impl SqliteSessionStore {
         Ok(records)
     }
 
+    /// List all sessions bound to a workspace root through metadata_json.
+    ///
+    /// This is the DB-backed replacement for the deprecated filesystem
+    /// `SessionStore` workspace namespace. Records without a
+    /// `metadata_json.workspace_root` value are intentionally excluded.
+    pub fn list_sessions_by_workspace_root(
+        &self,
+        workspace_root: &str,
+    ) -> Result<Vec<SessionRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                r"SELECT session_id, platform, chat_id, user_id, model,
+                          created_at, last_activity, message_count, reset_policy, metadata_json,
+                          input_tokens, output_tokens, estimated_cost_usd, status
+                   FROM sessions
+                  WHERE json_extract(metadata_json, '$.workspace_root') = ?1
+                  ORDER BY last_activity DESC, session_id ASC",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![workspace_root], row_to_record)
+            .map_err(sql_err)?;
+        let mut records = Vec::new();
+        for r in rows {
+            records.push(r.map_err(sql_err)?);
+        }
+        Ok(records)
+    }
+
     /// Search sessions using FTS5 full-text search.
     ///
     /// Searches across platform, chat_id, user_id, and metadata_json.
@@ -1196,6 +1229,62 @@ impl SqliteSessionStore {
         Ok(())
     }
 
+    /// Append a context envelope event only if this envelope id is not already present.
+    ///
+    /// Returns `true` when a row was inserted and `false` when an existing
+    /// `ContextEnvelope` row with the same `envelope.id` already exists.
+    pub fn append_context_envelope_event_if_absent(&self, event: &SessionEvent) -> Result<bool> {
+        if event.event_type != "ContextEnvelope" {
+            self.append_event(event)?;
+            return Ok(true);
+        }
+
+        let envelope_id = serde_json::from_str::<serde_json::Value>(&event.event_json)
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .pointer("/envelope/id")
+                    .or_else(|| payload.get("envelope_id"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            });
+
+        let Some(envelope_id) = envelope_id else {
+            self.append_event(event)?;
+            return Ok(true);
+        };
+
+        let conn = self.conn()?;
+        let exists: i64 = conn
+            .query_row(
+                r"SELECT COUNT(*)
+                  FROM session_events
+                  WHERE event_type = 'ContextEnvelope'
+                    AND json_extract(event_json, '$.envelope.id') = ?1",
+                params![envelope_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_err)?;
+        if exists > 0 {
+            return Ok(false);
+        }
+
+        conn.execute(
+            r"INSERT INTO session_events
+               (session_id, event_type, event_json, sequence, created_at_ms)
+              VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                event.session_id,
+                event.event_type,
+                event.event_json,
+                event.sequence as i64,
+                event.created_at_ms as i64,
+            ],
+        )
+        .map_err(sql_err)?;
+        Ok(true)
+    }
+
     /// Retrieve events for a session starting from `from_seq` (inclusive).
     /// Ordered by sequence ascending.
     pub fn get_events(&self, session_id: &str, from_seq: usize) -> Result<Vec<SessionEvent>> {
@@ -1578,6 +1667,41 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_by_workspace_root_filters_and_orders_by_activity() {
+        let (store, _dir) = make_store();
+        let workspace_a = "/tmp/cowd-workspace-a";
+        let workspace_b = "/tmp/cowd-workspace-b";
+
+        let mut older = make_record("workspace-a-older");
+        older.last_activity = "2024-01-01T00:00:00Z".to_string();
+        older.metadata_json = Some(serde_json::json!({"workspace_root": workspace_a}).to_string());
+        store.create_session(&older).unwrap();
+
+        let mut newer = make_record("workspace-a-newer");
+        newer.last_activity = "2024-01-02T00:00:00Z".to_string();
+        newer.metadata_json = Some(serde_json::json!({"workspace_root": workspace_a}).to_string());
+        store.create_session(&newer).unwrap();
+
+        let mut other_workspace = make_record("workspace-b");
+        other_workspace.last_activity = "2024-01-03T00:00:00Z".to_string();
+        other_workspace.metadata_json =
+            Some(serde_json::json!({"workspace_root": workspace_b}).to_string());
+        store.create_session(&other_workspace).unwrap();
+
+        let records = store
+            .list_sessions_by_workspace_root(workspace_a)
+            .expect("workspace sessions should list");
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["workspace-a-newer", "workspace-a-older"]
+        );
+    }
+
+    #[test]
     fn list_sessions_page_filters_sorts_and_counts_at_scale() {
         let (store, _dir) = make_store();
         {
@@ -1636,16 +1760,14 @@ mod tests {
 
         assert_eq!(page.total, 1667);
         assert_eq!(page.records.len(), 7);
-        assert!(
-            page.records
-                .windows(2)
-                .all(|pair| pair[0].last_activity >= pair[1].last_activity)
-        );
-        assert!(
-            page.records
-                .iter()
-                .all(|r| r.model.as_deref() == Some("claude-sonnet-4-6") && r.status == "active")
-        );
+        assert!(page
+            .records
+            .windows(2)
+            .all(|pair| pair[0].last_activity >= pair[1].last_activity));
+        assert!(page
+            .records
+            .iter()
+            .all(|r| r.model.as_deref() == Some("claude-sonnet-4-6") && r.status == "active"));
     }
 
     #[test]
@@ -1789,6 +1911,49 @@ mod tests {
     }
 
     #[test]
+    fn append_context_envelope_event_if_absent_skips_duplicate_envelope_id() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-context-once"))
+            .unwrap();
+        let first = SessionEvent {
+            session_id: "s-context-once".to_string(),
+            event_type: "ContextEnvelope".to_string(),
+            event_json: serde_json::json!({
+                "envelope_id": "env-once",
+                "envelope": {"id": "env-once", "intent": "first"}
+            })
+            .to_string(),
+            sequence: 1,
+            created_at_ms: 1,
+        };
+        let duplicate = SessionEvent {
+            sequence: 2,
+            created_at_ms: 2,
+            event_json: serde_json::json!({
+                "envelope_id": "env-once",
+                "envelope": {"id": "env-once", "intent": "duplicate"}
+            })
+            .to_string(),
+            ..first.clone()
+        };
+
+        assert!(store
+            .append_context_envelope_event_if_absent(&first)
+            .unwrap());
+        assert!(!store
+            .append_context_envelope_event_if_absent(&duplicate)
+            .unwrap());
+
+        let events = store
+            .get_events_by_type_limited("s-context-once", "ContextEnvelope", 0, 10)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 1);
+        assert!(events[0].event_json.contains("first"));
+    }
+
+    #[test]
     fn delete_events_from_removes_tail_only() {
         let (store, _dir) = make_store();
         store
@@ -1925,6 +2090,36 @@ mod tests {
         assert!(
             plan_text.contains("idx_session_events_session_type_seq"),
             "expected context event type index in query plan, got: {plan_text}"
+        );
+    }
+
+    #[test]
+    fn context_envelope_lookup_uses_envelope_id_index() {
+        let (store, _dir) = make_store();
+        store
+            .create_session(&make_record("s-context-envelope-index"))
+            .unwrap();
+        let conn = store.conn().unwrap();
+        let mut stmt = conn
+            .prepare(
+                r"EXPLAIN QUERY PLAN
+                  SELECT id, session_id, event_type, event_json, sequence, created_at_ms
+                  FROM session_events
+                  WHERE event_type = 'ContextEnvelope'
+                    AND json_extract(event_json, '$.envelope.id') = ?1
+                  ORDER BY created_at_ms DESC
+                  LIMIT 1",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["env-indexed"], |row| row.get(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let plan_text = plan.join(" | ");
+        assert!(
+            plan_text.contains("idx_session_events_context_envelope_id"),
+            "expected context envelope id index in query plan, got: {plan_text}"
         );
     }
 

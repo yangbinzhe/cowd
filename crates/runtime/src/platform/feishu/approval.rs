@@ -116,8 +116,16 @@ impl ApprovalCard {
         // Build action buttons
         let actions = vec![
             self.build_button(LABEL_ALLOW_ONCE, HERMES_ACTION_APPROVE_ONCE, "primary"),
-            self.build_button(LABEL_APPROVE_SESSION, HERMES_ACTION_APPROVE_SESSION, "default"),
-            self.build_button(LABEL_APPROVE_ALWAYS, HERMES_ACTION_APPROVE_ALWAYS, "default"),
+            self.build_button(
+                LABEL_APPROVE_SESSION,
+                HERMES_ACTION_APPROVE_SESSION,
+                "default",
+            ),
+            self.build_button(
+                LABEL_APPROVE_ALWAYS,
+                HERMES_ACTION_APPROVE_ALWAYS,
+                "default",
+            ),
             self.build_button(LABEL_DENY, HERMES_ACTION_DENY, "danger"),
         ];
 
@@ -243,10 +251,7 @@ impl CardActionDedup {
         }
 
         // Insert/update the token.
-        map.insert(
-            token.to_string(),
-            now + CARD_ACTION_DEDUP_TTL_SECONDS,
-        );
+        map.insert(token.to_string(), now + CARD_ACTION_DEDUP_TTL_SECONDS);
         false
     }
 
@@ -313,10 +318,7 @@ mod tests {
         assert_eq!(v["config"]["wide_screen_mode"], true);
 
         // Header
-        assert_eq!(
-            v["header"]["title"]["content"],
-            APPROVAL_HEADER_TEXT
-        );
+        assert_eq!(v["header"]["title"]["content"], APPROVAL_HEADER_TEXT);
         assert_eq!(v["header"]["template"], "orange");
 
         // Elements
@@ -340,8 +342,16 @@ mod tests {
         // Verify each button
         let expected: Vec<(&str, &str, &str)> = vec![
             (LABEL_ALLOW_ONCE, HERMES_ACTION_APPROVE_ONCE, "primary"),
-            (LABEL_APPROVE_SESSION, HERMES_ACTION_APPROVE_SESSION, "default"),
-            (LABEL_APPROVE_ALWAYS, HERMES_ACTION_APPROVE_ALWAYS, "default"),
+            (
+                LABEL_APPROVE_SESSION,
+                HERMES_ACTION_APPROVE_SESSION,
+                "default",
+            ),
+            (
+                LABEL_APPROVE_ALWAYS,
+                HERMES_ACTION_APPROVE_ALWAYS,
+                "default",
+            ),
             (LABEL_DENY, HERMES_ACTION_DENY, "danger"),
         ];
 
@@ -358,8 +368,8 @@ mod tests {
 
     #[test]
     fn test_build_card_with_description() {
-        let card = ApprovalCard::new(1, "echo hello")
-            .with_description("Prints a greeting to stdout");
+        let card =
+            ApprovalCard::new(1, "echo hello").with_description("Prints a greeting to stdout");
         let payload = card.build();
         let v: Value = serde_json::from_str(&payload).expect("valid JSON");
 
@@ -465,7 +475,8 @@ mod tests {
             let v: Value = serde_json::from_str(&payload).unwrap();
             assert_eq!(
                 v["header"]["template"], "red",
-                "variant '{}' should be red", variant
+                "variant '{}' should be red",
+                variant
             );
         }
     }

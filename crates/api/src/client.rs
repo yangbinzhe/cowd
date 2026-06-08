@@ -52,19 +52,16 @@ impl ProviderClient {
             "anthropic" => {
                 let auth = AuthSource::ApiKey(provider.api_key.clone());
                 Ok(Self::Anthropic(
-                    AnthropicClient::from_auth(auth)
-                        .with_base_url(&provider.base_url)
+                    AnthropicClient::from_auth(auth).with_base_url(&provider.base_url),
                 ))
             }
             "openai-compat" => {
                 let url = Self::normalize_openai_url(&provider.base_url);
-                Ok(Self::OpenAi(
-                    OpenAiCompatClient::new_custom(
-                        provider.api_key.clone(),
-                        url,
-                        &provider.name,
-                    )
-                ))
+                Ok(Self::OpenAi(OpenAiCompatClient::new_custom(
+                    provider.api_key.clone(),
+                    url,
+                    &provider.name,
+                )))
             }
             other => Err(ApiError::InvalidProviderConfig {
                 provider: provider.name.clone(),

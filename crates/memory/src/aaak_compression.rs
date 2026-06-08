@@ -18,9 +18,9 @@
 //! - Adaptive: Learns abbreviations from content
 //! - Streaming: Supports incremental compression
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use serde::{Deserialize, Serialize};
 
 /// Entity type for classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -54,16 +54,24 @@ pub enum EntityType {
 impl EntityType {
     /// Predict entity type from the token string.
     pub fn from_token(token: &str) -> Self {
-        if token.starts_with('/') || token.ends_with(".rs")
-            || token.ends_with(".json") || token.ends_with(".yaml")
-            || token.ends_with(".yml") || token.ends_with(".md")
-            || token.ends_with(".toml") || token.ends_with(".txt")
-            || token.contains('/') && token.len() > 3 {
+        if token.starts_with('/')
+            || token.ends_with(".rs")
+            || token.ends_with(".json")
+            || token.ends_with(".yaml")
+            || token.ends_with(".yml")
+            || token.ends_with(".md")
+            || token.ends_with(".toml")
+            || token.ends_with(".txt")
+            || token.contains('/') && token.len() > 3
+        {
             return EntityType::Path;
         }
 
-        if token.starts_with("http://") || token.starts_with("https://")
-            || token.starts_with("ws://") || token.starts_with("wss://") {
+        if token.starts_with("http://")
+            || token.starts_with("https://")
+            || token.starts_with("ws://")
+            || token.starts_with("wss://")
+        {
             return EntityType::Url;
         }
 
@@ -75,29 +83,96 @@ impl EntityType {
             return EntityType::Number;
         }
 
-        if token.starts_with('"') || token.starts_with('\'')
-            || (token.starts_with('`') && token.ends_with('`')) {
+        if token.starts_with('"')
+            || token.starts_with('\'')
+            || (token.starts_with('`') && token.ends_with('`'))
+        {
             return EntityType::String;
         }
 
         let keywords = [
-            "fn", "let", "mut", "const", "static", "struct", "enum", "impl",
-            "trait", "type", "use", "mod", "pub", "crate", "self", "super",
-            "if", "else", "match", "for", "while", "loop", "break", "continue",
-            "return", "async", "await", "move", "ref", "where", "as", "in",
-            "true", "false", "None", "Some", "Ok", "Err",
-            "class", "def", "import", "from", "export", "default",
-            "function", "var", "const", "let", "new", "this", "extends",
-            "public", "private", "protected", "static", "void", "int", "bool",
-            "string", "float", "double", "byte", "char", "long", "short",
-            "abstract", "interface", "package", "throws", "try", "catch", "finally",
+            "fn",
+            "let",
+            "mut",
+            "const",
+            "static",
+            "struct",
+            "enum",
+            "impl",
+            "trait",
+            "type",
+            "use",
+            "mod",
+            "pub",
+            "crate",
+            "self",
+            "super",
+            "if",
+            "else",
+            "match",
+            "for",
+            "while",
+            "loop",
+            "break",
+            "continue",
+            "return",
+            "async",
+            "await",
+            "move",
+            "ref",
+            "where",
+            "as",
+            "in",
+            "true",
+            "false",
+            "None",
+            "Some",
+            "Ok",
+            "Err",
+            "class",
+            "def",
+            "import",
+            "from",
+            "export",
+            "default",
+            "function",
+            "var",
+            "const",
+            "let",
+            "new",
+            "this",
+            "extends",
+            "public",
+            "private",
+            "protected",
+            "static",
+            "void",
+            "int",
+            "bool",
+            "string",
+            "float",
+            "double",
+            "byte",
+            "char",
+            "long",
+            "short",
+            "abstract",
+            "interface",
+            "package",
+            "throws",
+            "try",
+            "catch",
+            "finally",
         ];
         if keywords.contains(&token) {
             return EntityType::Keyword;
         }
 
-        if token.starts_with("//") || token.starts_with("/*")
-            || token.starts_with("#") || token.starts_with("<!--") {
+        if token.starts_with("//")
+            || token.starts_with("/*")
+            || token.starts_with("#")
+            || token.starts_with("<!--")
+        {
             return EntityType::Comment;
         }
 
@@ -105,8 +180,13 @@ impl EntityType {
             return EntityType::Function;
         }
 
-        if token.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-            && token.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        if token
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false)
+            && token.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
             return EntityType::Class;
         }
 
@@ -202,10 +282,14 @@ impl AaakDictionary {
 
     /// Get overall compression statistics.
     pub fn stats(&self) -> AaakStats {
-        let total_original = self.abbreviations.values()
+        let total_original = self
+            .abbreviations
+            .values()
             .map(|a| a.full.len())
             .sum::<usize>();
-        let total_compressed = self.abbreviations.values()
+        let total_compressed = self
+            .abbreviations
+            .values()
             .map(|a| a.short.len())
             .sum::<usize>();
 
@@ -274,7 +358,8 @@ pub struct AaakCompressed {
 impl AaakCompressed {
     /// Get the decompressed text.
     pub fn decompress(&self) -> String {
-        self.tokens.iter()
+        self.tokens
+            .iter()
             .map(|token| match token {
                 CompressedToken::Raw(s) => s.clone(),
                 CompressedToken::Abbreviated(short) => {
@@ -308,8 +393,14 @@ impl AaakCompressed {
                 Some(format!(
                     "Mismatch at position {}: expected '{}', got '{}'",
                     self.find_first_diff(original, &decompressed),
-                    &original.chars().nth(self.find_first_diff(original, &decompressed)).unwrap_or('?'),
-                    &decompressed.chars().nth(self.find_first_diff(original, &decompressed)).unwrap_or('?')
+                    &original
+                        .chars()
+                        .nth(self.find_first_diff(original, &decompressed))
+                        .unwrap_or('?'),
+                    &decompressed
+                        .chars()
+                        .nth(self.find_first_diff(original, &decompressed))
+                        .unwrap_or('?')
                 ))
             } else {
                 None
@@ -382,7 +473,8 @@ impl Default for AaakConfig {
                 EntityType::Class,
                 EntityType::Module,
                 EntityType::Variable,
-            ].into(),
+            ]
+            .into(),
             aggressive: false,
         }
     }
@@ -390,11 +482,7 @@ impl Default for AaakConfig {
 
 impl AaakConfig {
     /// Create a new config with custom settings.
-    pub fn new(
-        min_frequency: usize,
-        min_length: usize,
-        max_abbreviation_len: usize,
-    ) -> Self {
+    pub fn new(min_frequency: usize, min_length: usize, max_abbreviation_len: usize) -> Self {
         Self {
             min_frequency,
             min_length,
@@ -446,7 +534,15 @@ impl AaakCompressor {
         let mut _pos = 0;
 
         for ch in text.chars() {
-            if ch.is_alphanumeric() || ch == '_' || ch == '/' || ch == '.' || ch == ':' || ch == '#' || ch == '@' || ch == '-' {
+            if ch.is_alphanumeric()
+                || ch == '_'
+                || ch == '/'
+                || ch == '.'
+                || ch == ':'
+                || ch == '#'
+                || ch == '@'
+                || ch == '-'
+            {
                 current.push(ch);
             } else {
                 if !current.is_empty() {
@@ -483,8 +579,12 @@ impl AaakCompressor {
     fn build_frequencies(&mut self, tokens: &[Token]) {
         for (idx, token) in tokens.iter().enumerate() {
             *self.frequency.entry(token.text.clone()).or_insert(0) += 1;
-            self.entity_types.insert(token.text.clone(), token.entity_type);
-            self.positions.entry(token.text.clone()).or_insert_with(Vec::new).push(idx);
+            self.entity_types
+                .insert(token.text.clone(), token.entity_type);
+            self.positions
+                .entry(token.text.clone())
+                .or_insert_with(Vec::new)
+                .push(idx);
         }
     }
 
@@ -494,9 +594,15 @@ impl AaakCompressor {
         let mut used_shorts: HashSet<String> = HashSet::new();
 
         // Filter and sort tokens by frequency
-        let mut candidates: Vec<_> = self.frequency.iter()
+        let mut candidates: Vec<_> = self
+            .frequency
+            .iter()
             .filter(|(token, freq)| {
-                let entity_type = self.entity_types.get(*token).copied().unwrap_or(EntityType::Generic);
+                let entity_type = self
+                    .entity_types
+                    .get(*token)
+                    .copied()
+                    .unwrap_or(EntityType::Generic);
                 let long_enough = token.len() >= self.config.min_length;
                 let frequent_enough = *freq >= &self.config.min_frequency;
                 let should_compress = self.config.compress_entity_types.contains(&entity_type)
@@ -514,7 +620,11 @@ impl AaakCompressor {
 
         for (token, _freq) in candidates {
             let short = self.create_abbreviation(token, &mut used_shorts);
-            let entity_type = self.entity_types.get(token).copied().unwrap_or(EntityType::Generic);
+            let entity_type = self
+                .entity_types
+                .get(token)
+                .copied()
+                .unwrap_or(EntityType::Generic);
             dict.add_abbreviation(token.clone(), short, entity_type);
         }
 
@@ -531,7 +641,8 @@ impl AaakCompressor {
         );
 
         // Strategy 2: CamelCase extraction
-        let camel = token.chars()
+        let camel = token
+            .chars()
             .filter(|c| c.is_uppercase() || *c == '_')
             .take(self.config.max_abbreviation_len)
             .collect::<String>();
@@ -585,7 +696,8 @@ impl AaakCompressor {
         let dict = self.generate_abbreviations();
 
         // Compress tokens
-        let compressed_tokens: Vec<CompressedToken> = tokens.iter()
+        let compressed_tokens: Vec<CompressedToken> = tokens
+            .iter()
             .map(|token| {
                 if let Some(short) = dict.get_short_form(&token.text) {
                     CompressedToken::Abbreviated(short.to_string())
@@ -614,12 +726,13 @@ impl AaakCompressor {
     /// Detect content type: Code or Narrative.
     pub fn detect_content_type(content: &str) -> CompressionMode {
         let code_signals: &[&str] = &[
-            "fn ", "func ", "def ", "class ", "import ", "pub ",
-            "let ", "const ", "impl ", "mod ", "use ",
-            "struct ", "enum ", "trait ", "async fn",
-            "=>", "->", "::", "{}", "();",
+            "fn ", "func ", "def ", "class ", "import ", "pub ", "let ", "const ", "impl ", "mod ",
+            "use ", "struct ", "enum ", "trait ", "async fn", "=>", "->", "::", "{}", "();",
         ];
-        let code_ratio = code_signals.iter().filter(|s| content.contains(**s)).count();
+        let code_ratio = code_signals
+            .iter()
+            .filter(|s| content.contains(**s))
+            .count();
         if code_ratio >= 2 {
             CompressionMode::Code
         } else {
@@ -670,14 +783,18 @@ impl AaakCompressor {
     /// Code mode: lossless compression - preserve all semantics.
     /// Only removes excessive blank lines and trivial comments.
     fn compress_code(&mut self, text: &str) -> String {
-        let lines: Vec<&str> = text.lines()
+        let lines: Vec<&str> = text
+            .lines()
             .filter(|l| {
                 // Keep all lines except pure comment lines without TODO/FIXME/HACK
                 let trimmed = l.trim();
                 if trimmed.starts_with("//") || trimmed.starts_with('#') {
-                    trimmed.contains("TODO") || trimmed.contains("FIXME")
-                        || trimmed.contains("HACK") || trimmed.contains("NOTE")
-                        || trimmed.contains("SAFETY") || trimmed.contains("XXX")
+                    trimmed.contains("TODO")
+                        || trimmed.contains("FIXME")
+                        || trimmed.contains("HACK")
+                        || trimmed.contains("NOTE")
+                        || trimmed.contains("SAFETY")
+                        || trimmed.contains("XXX")
                 } else {
                     true
                 }
@@ -703,7 +820,8 @@ impl AaakCompressor {
     /// Target compression ratio: 30-50%.
     fn compress_narrative(&self, text: &str) -> String {
         // 1. Split into sentences
-        let sentences: Vec<&str> = text.split_inclusive(|c: char| c == '.' || c == '!' || c == '?' || c == '\n')
+        let sentences: Vec<&str> = text
+            .split_inclusive(|c: char| c == '.' || c == '!' || c == '?' || c == '\n')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
@@ -713,37 +831,64 @@ impl AaakCompressor {
         }
 
         // 2. Score sentences by importance (keywords, entities, numbers)
-        let scored: Vec<(usize, &str, f64)> = sentences.iter().enumerate().map(|(i, s)| {
-            let mut score: f64 = 0.0;
-            // First and last sentences are important
-            if i == 0 || i == sentences.len() - 1 { score += 2.0; }
-            // Contains numbers → likely factual
-            if s.chars().any(|c| c.is_ascii_digit()) { score += 1.0; }
-            // Longer sentences often carry more information
-            if s.len() > 50 { score += 0.5; }
-            // Contains decision/preference signals
-            let signals = ["decided", "decision", "prefer", "important", "决定", "选择", "偏好", "关键", "重要"];
-            for sig in &signals {
-                if s.to_lowercase().contains(sig) { score += 2.0; break; }
-            }
-            // Contains entity-like patterns (CamelCase, paths)
-            if s.contains('_') || s.contains("::") || s.contains('/') { score += 0.5; }
-            (i, *s, score)
-        }).collect();
+        let scored: Vec<(usize, &str, f64)> = sentences
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut score: f64 = 0.0;
+                // First and last sentences are important
+                if i == 0 || i == sentences.len() - 1 {
+                    score += 2.0;
+                }
+                // Contains numbers → likely factual
+                if s.chars().any(|c| c.is_ascii_digit()) {
+                    score += 1.0;
+                }
+                // Longer sentences often carry more information
+                if s.len() > 50 {
+                    score += 0.5;
+                }
+                // Contains decision/preference signals
+                let signals = [
+                    "decided",
+                    "decision",
+                    "prefer",
+                    "important",
+                    "决定",
+                    "选择",
+                    "偏好",
+                    "关键",
+                    "重要",
+                ];
+                for sig in &signals {
+                    if s.to_lowercase().contains(sig) {
+                        score += 2.0;
+                        break;
+                    }
+                }
+                // Contains entity-like patterns (CamelCase, paths)
+                if s.contains('_') || s.contains("::") || s.contains('/') {
+                    score += 0.5;
+                }
+                (i, *s, score)
+            })
+            .collect();
 
         // 3. Select top sentences (target ~40% of original)
         let mut sorted = scored.clone();
         sorted.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
         let target_count = (sentences.len() as f64 * 0.4).max(1.0) as usize;
-        let mut selected_indices: Vec<usize> = sorted.iter()
+        let mut selected_indices: Vec<usize> = sorted
+            .iter()
             .take(target_count)
             .map(|(i, _, _)| *i)
             .collect();
         selected_indices.sort();
 
         // 4. Reconstruct in original order
-        selected_indices.iter()
+        selected_indices
+            .iter()
             .filter_map(|&i| sentences.get(i))
             .cloned()
             .collect::<Vec<&str>>()
@@ -763,7 +908,8 @@ impl AaakCompressor {
                 .filter(|w| {
                     w.len() >= 2
                         && w.chars().next().map_or(false, |c| c.is_uppercase())
-                        && w.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                        && w.chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
                 })
                 .collect();
             caps.sort();
@@ -813,8 +959,11 @@ impl AaakCompressor {
         if lower.contains("decision") || lower.contains("决定") || lower.contains("选择") {
             flags.push("D");
         }
-        if lower.contains("technical") || lower.contains("技术")
-            || lower.contains("config") || lower.contains("fn ") || lower.contains("def ")
+        if lower.contains("technical")
+            || lower.contains("技术")
+            || lower.contains("config")
+            || lower.contains("fn ")
+            || lower.contains("def ")
         {
             flags.push("T");
         }
@@ -936,8 +1085,12 @@ mod tests {
     #[test]
     fn test_abbreviation_generation() {
         let mut compressor = AaakCompressor::default_compressor();
-        compressor.frequency.insert("handle_session_create".to_string(), 5);
-        compressor.entity_types.insert("handle_session_create".to_string(), EntityType::Function);
+        compressor
+            .frequency
+            .insert("handle_session_create".to_string(), 5);
+        compressor
+            .entity_types
+            .insert("handle_session_create".to_string(), EntityType::Function);
 
         let dict = compressor.generate_abbreviations();
         assert!(dict.has_abbreviation("handle_session_create"));
@@ -962,13 +1115,11 @@ mod tests {
             next_action: "Write tests".to_string(),
             files: vec!["src/lib.rs".to_string()],
             abbreviations: AaakDictionary::new(),
-            priority_items: vec![
-                PriorityItem {
-                    description: "Write unit tests".to_string(),
-                    status: "pending".to_string(),
-                    priority: 1,
-                }
-            ],
+            priority_items: vec![PriorityItem {
+                description: "Write unit tests".to_string(),
+                status: "pending".to_string(),
+                priority: 1,
+            }],
         };
 
         let data = serde_json::to_string(&ctx).unwrap();
@@ -1031,9 +1182,10 @@ mod tests {
 
         // Verify with different original
         let verification = compressed.verify_lossless("different");
-        assert!(!verification.is_lossless,
-            "Should detect mismatch");
-        assert!(verification.error_message.is_some(),
-            "Should have error message for mismatch");
+        assert!(!verification.is_lossless, "Should detect mismatch");
+        assert!(
+            verification.error_message.is_some(),
+            "Should have error message for mismatch"
+        );
     }
 }

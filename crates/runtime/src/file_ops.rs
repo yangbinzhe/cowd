@@ -584,14 +584,6 @@ fn lexically_resolve(path: &Path) -> PathBuf {
     resolved
 }
 
-
-
-
-
-
-
-
-
 /// Expand shell-style brace groups in a glob pattern.
 ///
 /// Handles one level of braces: `foo.{a,b,c}` → `["foo.a", "foo.b", "foo.c"]`.
@@ -619,8 +611,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        edit_file, expand_braces, glob_search, grep_search, read_file,
-        write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        edit_file, expand_braces, glob_search, grep_search, read_file, write_file, GrepSearchInput,
+        MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {

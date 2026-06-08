@@ -135,22 +135,24 @@ impl Default for ActiveSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
-    fn ensure_test_provider() {
-        let mut map = std::collections::HashMap::new();
-        map.insert("test-provider".to_string(), runtime::ProviderConfig {
-            name: "test-provider".to_string(),
-            base_url: "http://localhost:9999/v1".to_string(),
-            api_key: "test-key".to_string(),
-            models: vec!["test-model".to_string()],
-            protocol: Some("anthropic".to_string()),
+    fn init_test_provider() {
+        runtime::init_global_providers(runtime::ProvidersConfig {
+            providers: std::collections::HashMap::from([(
+                "test-provider".to_string(),
+                runtime::ProviderConfig {
+                    name: "test-provider".to_string(),
+                    base_url: "http://127.0.0.1:9".to_string(),
+                    api_key: "test-dummy-key".to_string(),
+                    models: vec!["test-model".to_string()],
+                    protocol: Some("openai-compat".to_string()),
+                },
+            )]),
         });
-        runtime::set_test_providers(map);
     }
 
     fn dummy_runtime() -> crate::BuiltRuntime {
-        ensure_test_provider();
+        init_test_provider();
         let session = runtime::Session::new();
         crate::build_runtime(
             session,
@@ -174,7 +176,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn register_and_get() {
         let sessions = ActiveSessions::new();
         let rt = dummy_runtime();
@@ -184,7 +185,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn list_returns_sorted_ids() {
         let sessions = ActiveSessions::new();
         sessions.register("b".into(), dummy_runtime()).unwrap();
@@ -195,7 +195,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn remove_drops_session() {
         let sessions = ActiveSessions::new();
         sessions.register("sess-1".into(), dummy_runtime()).unwrap();
@@ -220,7 +219,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn register_overwrite() {
         let sessions = ActiveSessions::new();
         sessions.register("sess-1".into(), dummy_runtime()).unwrap();

@@ -11,20 +11,18 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use std::{
-    collections::HashSet,
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 use uuid::Uuid;
 
 use crate::{
     config::DriftConfig,
     layers::{LayerManager, Result},
     project_scope::MemoryScope,
+    search::semantic_query_variants,
     store::MemoryStore,
     types::{
-        MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource,
-        PreparedContext, Priority, TokenBudget,
+        MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, PreparedContext,
+        Priority, TokenBudget,
     },
 };
 
@@ -88,11 +86,33 @@ impl DeepLayer {
             Vec::new()
         };
 
+        let semantic_results = if fts_results.len() + vec_results.len() < self.search_limit {
+            let mut bridged = Vec::new();
+            for variant in semantic_query_variants(query, 4) {
+                let results = self
+                    .store
+                    .search_fts(&variant, self.search_limit)
+                    .await
+                    .unwrap_or_default();
+                bridged.extend(results);
+                if bridged.len() >= self.search_limit {
+                    break;
+                }
+            }
+            bridged
+        } else {
+            Vec::new()
+        };
+
         // 3. Merge, restrict to L3, de-duplicate.
         let mut seen: HashSet<MemoryId> = already_surfaced.clone();
         let mut merged: Vec<MemoryEntry> = Vec::new();
 
-        for entry in fts_results.into_iter().chain(vec_results) {
+        for entry in fts_results
+            .into_iter()
+            .chain(vec_results)
+            .chain(semantic_results)
+        {
             if entry.layer != MemoryLayer::L3 {
                 continue;
             }
@@ -261,7 +281,13 @@ mod tests {
     async fn store_entry_creates_l3_entry() {
         let layer = DeepLayer::new(in_memory());
         let id = layer
-            .store_entry("Rust patterns", "Use Result for errors", MemorySource::Compression, vec!["rust".into()], MemoryScope::default())
+            .store_entry(
+                "Rust patterns",
+                "Use Result for errors",
+                MemorySource::Compression,
+                vec!["rust".into()],
+                MemoryScope::default(),
+            )
             .await
             .unwrap();
 
@@ -277,13 +303,26 @@ mod tests {
     async fn insert_overrides_layer_to_l3() {
         let layer = DeepLayer::new(in_memory());
         let entry = MemoryEntry {
-            id: uuid::Uuid::new_v4(), layer: MemoryLayer::L0, category: MemoryCategory::Decision,
-            priority: Priority::Normal, source: MemorySource::AutoExtracted,
-            title: "t".into(), content: "c".into(), embedding: None,
-            tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
-            staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            last_accessed_at: None, scope: MemoryScope::default(), session_id: None,
-            source_agent: None, visibility: crate::types::AgentVisibility::default(),
+            id: uuid::Uuid::new_v4(),
+            layer: MemoryLayer::L0,
+            category: MemoryCategory::Decision,
+            priority: Priority::Normal,
+            source: MemorySource::AutoExtracted,
+            title: "t".into(),
+            content: "c".into(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed_at: None,
+            scope: MemoryScope::default(),
+            session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
         let id = layer.insert(entry).await.unwrap();
         let all = layer.store.search_by_layer(MemoryLayer::L3).await.unwrap();
@@ -295,22 +334,45 @@ mod tests {
     async fn prepare_context_respects_budget() {
         let layer = DeepLayer::with_config(in_memory(), 5, DriftConfig::default());
         let entry1 = MemoryEntry {
-            id: uuid::Uuid::new_v4(), layer: MemoryLayer::L0, category: MemoryCategory::CompressedSummary,
-            priority: Priority::Normal, source: MemorySource::Compression,
-            title: "t".into(), content: "unique_findable_content_key".into(), embedding: None,
-            tags: vec![], relations: vec![], confidence: 1.0, access_count: 0,
-            staleness: 0.0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
-            last_accessed_at: None, scope: MemoryScope::default(), session_id: None,
-            source_agent: None, visibility: crate::types::AgentVisibility::default(),
+            id: uuid::Uuid::new_v4(),
+            layer: MemoryLayer::L0,
+            category: MemoryCategory::CompressedSummary,
+            priority: Priority::Normal,
+            source: MemorySource::Compression,
+            title: "t".into(),
+            content: "unique_findable_content_key".into(),
+            embedding: None,
+            tags: vec![],
+            relations: vec![],
+            confidence: 1.0,
+            access_count: 0,
+            staleness: 0.0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed_at: None,
+            scope: MemoryScope::default(),
+            session_id: None,
+            source_agent: None,
+            visibility: crate::types::AgentVisibility::default(),
         };
         layer.insert(entry1).await.unwrap();
 
         let surf = std::collections::HashSet::new();
-        let results = layer.recall("unique_findable_content_key", None, &surf).await.unwrap();
+        let results = layer
+            .recall("unique_findable_content_key", None, &surf)
+            .await
+            .unwrap();
         // DeepLayer overrides all entries to L3, so recall finds them
-        assert!(!results.is_empty(), "DeepLayer stores entries as L3, so recall must find them");
+        assert!(
+            !results.is_empty(),
+            "DeepLayer stores entries as L3, so recall must find them"
+        );
         for e in &results {
-            assert_eq!(e.layer, MemoryLayer::L3, "All entries in DeepLayer must be L3");
+            assert_eq!(
+                e.layer,
+                MemoryLayer::L3,
+                "All entries in DeepLayer must be L3"
+            );
         }
     }
 
@@ -322,16 +384,49 @@ mod tests {
             ..Default::default()
         };
         let layer = DeepLayer::with_config(in_memory(), 5, drift);
-        layer.store_entry("T", "C", MemorySource::Compression, vec![], MemoryScope::default()).await.unwrap();
+        layer
+            .store_entry(
+                "T",
+                "C",
+                MemorySource::Compression,
+                vec![],
+                MemoryScope::default(),
+            )
+            .await
+            .unwrap();
         layer.tick().await.unwrap();
-        assert_eq!(layer.store.search_by_layer(MemoryLayer::L3).await.unwrap().len(), 0);
+        assert_eq!(
+            layer
+                .store
+                .search_by_layer(MemoryLayer::L3)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn prepare_context_returns_empty() {
         let layer = DeepLayer::new(in_memory());
-        layer.store_entry("T", "C", MemorySource::Compression, vec![], MemoryScope::default()).await.unwrap();
-        let budget = TokenBudget { total: 1000, reserved_system: 0, reserved_response: 0, allocated_memory: 0, allocated_conversation: 0, available: 1000 };
+        layer
+            .store_entry(
+                "T",
+                "C",
+                MemorySource::Compression,
+                vec![],
+                MemoryScope::default(),
+            )
+            .await
+            .unwrap();
+        let budget = TokenBudget {
+            total: 1000,
+            reserved_system: 0,
+            reserved_response: 0,
+            allocated_memory: 0,
+            allocated_conversation: 0,
+            available: 1000,
+        };
         let ctx = layer.prepare_context(&budget).await.unwrap();
         assert!(ctx.entries.is_empty());
     }

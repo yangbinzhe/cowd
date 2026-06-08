@@ -11,11 +11,11 @@
 //! - scope isolation
 //! - peer perception (each agent can see prior agents' L4 entries)
 
+use cowd_memory::config::{BudgetConfig, StoreConfig};
 use cowd_memory::{
     AgentVisibility, CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry,
     MemoryLayer, MemoryScope, MemorySource, Priority,
 };
-use cowd_memory::config::{BudgetConfig, StoreConfig};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -123,10 +123,7 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
         own_task.as_ref().unwrap().source_agent.as_deref(),
         Some("agent-planner")
     );
-    assert_eq!(
-        own_task.unwrap().visibility,
-        AgentVisibility::Shared
-    );
+    assert_eq!(own_task.unwrap().visibility, AgentVisibility::Shared);
 
     // =====================================================================
     // Phase 2: Agent Executor reads task, executes, writes result
@@ -141,9 +138,7 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
     );
 
     // Executor should find the Planner's task (via L4 recall since visibility is Shared)
-    let found_task = tasks
-        .iter()
-        .find(|e| e.id == planner_task_id);
+    let found_task = tasks.iter().find(|e| e.id == planner_task_id);
     assert!(
         found_task.is_some(),
         "Executor should see Planner's shared task. Found entries: {}",
@@ -169,7 +164,12 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
          - Structured audit logs to `auth_events` table. \
          Status: DONE. Tests: 23/23 pass.",
         MemoryCategory::Decision,
-        vec!["e2e".into(), lifecycle_tag.clone(), "result".into(), "task-complete".into()],
+        vec![
+            "e2e".into(),
+            lifecycle_tag.clone(),
+            "result".into(),
+            "task-complete".into(),
+        ],
         project_scope.clone(),
         MemoryLayer::L4,
     );
@@ -187,10 +187,7 @@ async fn test_swarm_e2e_planner_executor_reviewer_lifecycle() {
 
     // Reviewer searches for all entries in this lifecycle
     let all_entries = mgr.recall(&lifecycle_tag, 10).await.unwrap();
-    eprintln!(
-        "[Reviewer] Found {} lifecycle entries",
-        all_entries.len()
-    );
+    eprintln!("[Reviewer] Found {} lifecycle entries", all_entries.len());
     assert!(
         all_entries.len() >= 2,
         "Reviewer should see at least 2 entries (task + result), got {}",
@@ -352,10 +349,9 @@ async fn test_swarm_e2e_peer_perception() {
         peer_tasks.len()
     );
 
-    let found_alpha_task = peer_tasks.iter().any(|e| {
-        e.source_agent.as_deref() == Some("agent-alpha")
-            && e.id == task_id
-    });
+    let found_alpha_task = peer_tasks
+        .iter()
+        .any(|e| e.source_agent.as_deref() == Some("agent-alpha") && e.id == task_id);
     assert!(
         found_alpha_task,
         "Agent Bravo should perceive Agent Alpha's shared task"
@@ -445,8 +441,14 @@ async fn test_swarm_e2e_peer_perception() {
         .any(|e| e.source_agent.as_deref() == Some("agent-alpha"));
 
     assert!(has_alpha, "Alpha should see own task");
-    assert!(has_bravo, "Alpha should see Bravo's result (peer perception)");
-    assert!(has_charlie, "Alpha should see Charlie's review (peer perception)");
+    assert!(
+        has_bravo,
+        "Alpha should see Bravo's result (peer perception)"
+    );
+    assert!(
+        has_charlie,
+        "Alpha should see Charlie's review (peer perception)"
+    );
 
     // Verify all entries share the same scope
     if !final_view.is_empty() {

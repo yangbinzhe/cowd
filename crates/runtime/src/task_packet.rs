@@ -165,9 +165,7 @@ fn validate_scope_requirements(
     match scope {
         TaskScope::Module | TaskScope::SingleFile => {
             if scope_path.as_ref().is_none_or(|p| p.trim().is_empty()) {
-                errors.push(format!(
-                    "scope_path is required when scope is {scope}"
-                ));
+                errors.push(format!("scope_path is required when scope is {scope}"));
             }
         }
         TaskScope::Workspace | TaskScope::Custom(_) => {}
@@ -297,7 +295,10 @@ mod tests {
     fn backward_compat_old_json_deserializes() {
         let json = r#"{"objective":"obj","scope":"runtime/task system","repo":"r","branch_policy":"bp","acceptance_tests":[],"commit_policy":"cp","reporting_contract":"rc","escalation_policy":"ep"}"#;
         let pkt: TaskPacket = serde_json::from_str(json).unwrap();
-        assert_eq!(pkt.scope, TaskScope::Custom("runtime/task system".to_string()));
+        assert_eq!(
+            pkt.scope,
+            TaskScope::Custom("runtime/task system".to_string())
+        );
         assert_eq!(pkt.scope_path, None);
         assert_eq!(pkt.worktree, None);
     }
@@ -317,7 +318,10 @@ mod tests {
             escalation_policy: "ep".to_string(),
         };
         let err = validate_packet(packet).expect_err("Module without scope_path should fail");
-        assert!(err.errors().iter().any(|e| e.contains("scope_path is required")));
+        assert!(err
+            .errors()
+            .iter()
+            .any(|e| e.contains("scope_path is required")));
     }
 
     #[test]

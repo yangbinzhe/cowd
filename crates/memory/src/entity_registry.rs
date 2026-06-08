@@ -230,7 +230,9 @@ impl EntityRegistry {
         if let Some(ctx) = context {
             for e in entries {
                 match &e.key {
-                    DisambiguationKey::ProjectScope(scope) if ctx.contains(scope) => return Some(e),
+                    DisambiguationKey::ProjectScope(scope) if ctx.contains(scope) => {
+                        return Some(e)
+                    }
                     DisambiguationKey::DobContext(dob) if ctx.contains(dob) => return Some(e),
                     DisambiguationKey::Id(id) if ctx.contains(id) => return Some(e),
                     _ => {}
@@ -253,19 +255,17 @@ impl EntityRegistry {
         let rows = store.get_entity_timeline(entity_name, 200)?;
         Ok(rows
             .into_iter()
-            .map(
-                |(id, en, ek, ai, ov, nv, cf, op, ts)| EvolutionRecord {
-                    id,
-                    entity_name: en,
-                    entity_key: ek,
-                    agent_id: ai,
-                    old_value: ov,
-                    new_value: nv,
-                    confidence: cf,
-                    operation: op,
-                    recorded_at_ms: ts,
-                },
-            )
+            .map(|(id, en, ek, ai, ov, nv, cf, op, ts)| EvolutionRecord {
+                id,
+                entity_name: en,
+                entity_key: ek,
+                agent_id: ai,
+                old_value: ov,
+                new_value: nv,
+                confidence: cf,
+                operation: op,
+                recorded_at_ms: ts,
+            })
             .collect())
     }
 
@@ -318,19 +318,17 @@ impl EntityRegistry {
         let rows = store.get_recent_evolutions(limit)?;
         Ok(rows
             .into_iter()
-            .map(
-                |(id, en, ek, ai, ov, nv, cf, op, ts)| EvolutionRecord {
-                    id,
-                    entity_name: en,
-                    entity_key: ek,
-                    agent_id: ai,
-                    old_value: ov,
-                    new_value: nv,
-                    confidence: cf,
-                    operation: op,
-                    recorded_at_ms: ts,
-                },
-            )
+            .map(|(id, en, ek, ai, ov, nv, cf, op, ts)| EvolutionRecord {
+                id,
+                entity_name: en,
+                entity_key: ek,
+                agent_id: ai,
+                old_value: ov,
+                new_value: nv,
+                confidence: cf,
+                operation: op,
+                recorded_at_ms: ts,
+            })
             .collect())
     }
 
@@ -364,18 +362,31 @@ mod tests {
         r.register("张三", DisambiguationKey::DobContext("1990".into()), 0.9);
         let e85 = r.resolve("张三", Some("生于1985年"));
         let e90 = r.resolve("张三", Some("1990年出生"));
-        assert_eq!(e85.unwrap().key, DisambiguationKey::DobContext("1985".into()));
-        assert_eq!(e90.unwrap().key, DisambiguationKey::DobContext("1990".into()));
+        assert_eq!(
+            e85.unwrap().key,
+            DisambiguationKey::DobContext("1985".into())
+        );
+        assert_eq!(
+            e90.unwrap().key,
+            DisambiguationKey::DobContext("1990".into())
+        );
     }
 
     #[test]
     fn t04_project_disambiguation() {
         let mut r = EntityRegistry::new();
         r.register("张三", DisambiguationKey::ProjectScope("cowd".into()), 0.9);
-        r.register("李四", DisambiguationKey::ProjectScope("hermes".into()), 0.8);
+        r.register(
+            "李四",
+            DisambiguationKey::ProjectScope("hermes".into()),
+            0.8,
+        );
         let e = r.resolve("张三", Some("working on cowd project"));
         assert!(e.is_some());
-        assert_eq!(e.unwrap().key, DisambiguationKey::ProjectScope("cowd".into()));
+        assert_eq!(
+            e.unwrap().key,
+            DisambiguationKey::ProjectScope("cowd".into())
+        );
     }
 
     #[test]
@@ -472,20 +483,10 @@ mod tests {
         let store = SqliteStore::open_in_memory().expect("open in-memory store");
         let mut r = EntityRegistry::new().with_store(store);
 
-        r.register_persistent(
-            "e1",
-            DisambiguationKey::Id("e1".into()),
-            0.9,
-            "AgentA",
-        )
-        .unwrap();
-        r.register_persistent(
-            "e2",
-            DisambiguationKey::Id("e2".into()),
-            0.8,
-            "AgentB",
-        )
-        .unwrap();
+        r.register_persistent("e1", DisambiguationKey::Id("e1".into()), 0.9, "AgentA")
+            .unwrap();
+        r.register_persistent("e2", DisambiguationKey::Id("e2".into()), 0.8, "AgentB")
+            .unwrap();
 
         let recent = r.get_recent_evolutions(10).expect("recent evolutions");
         assert_eq!(recent.len(), 2);

@@ -246,6 +246,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "platforms",
         expected: FieldType::Object,
     },
+    FieldSpec {
+        name: "runtime",
+        expected: FieldType::Object,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -492,6 +496,135 @@ const APPROVAL_FIELDS: &[FieldSpec] = &[
     },
 ];
 
+const RUNTIME_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "scenario",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "control",
+        expected: FieldType::Object,
+    },
+];
+
+const RUNTIME_CONTROL_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "agent",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "task",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "context",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "memory",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "permission",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "observability",
+        expected: FieldType::Object,
+    },
+];
+
+const RUNTIME_CONTROL_AGENT_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "enabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "max_parallel_agents",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "review_on_conflict",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "require_positive_lift",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "min_collaboration_score",
+        expected: FieldType::Number,
+    },
+];
+
+const RUNTIME_CONTROL_TASK_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "auto_phase_for_yolo",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "review_after_each_phase",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "max_failures_before_review",
+        expected: FieldType::Number,
+    },
+];
+
+const RUNTIME_CONTROL_CONTEXT_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "preserve_stable_head",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "yolo_budget_tokens",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "collaboration_budget_tokens",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "review_budget_tokens",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "degrade_on_pressure_bp",
+        expected: FieldType::Number,
+    },
+];
+
+const RUNTIME_CONTROL_MEMORY_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "emit_pulses_from_workgraph",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "review_conflicts",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "max_candidates_per_turn",
+        expected: FieldType::Number,
+    },
+];
+
+const RUNTIME_CONTROL_PERMISSION_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "solo_honor_critical",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "review_critical_actions",
+        expected: FieldType::Bool,
+    },
+];
+
 const DEPRECATED_FIELDS: &[DeprecatedField] = &[
     DeprecatedField {
         name: "permissionMode",
@@ -702,7 +835,10 @@ pub fn validate_config_file(
         ));
     }
     if let Some(permissions_obj) = object.get("permissions").and_then(JsonValue::as_object) {
-        if let Some(approval) = permissions_obj.get("approval").and_then(JsonValue::as_object) {
+        if let Some(approval) = permissions_obj
+            .get("approval")
+            .and_then(JsonValue::as_object)
+        {
             result.merge(validate_object_keys(
                 approval,
                 APPROVAL_FIELDS,
@@ -710,6 +846,69 @@ pub fn validate_config_file(
                 source,
                 &path_display,
             ));
+        }
+    }
+    if let Some(runtime) = object.get("runtime").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            runtime,
+            RUNTIME_FIELDS,
+            "runtime",
+            source,
+            &path_display,
+        ));
+        if let Some(control) = runtime.get("control").and_then(JsonValue::as_object) {
+            result.merge(validate_object_keys(
+                control,
+                RUNTIME_CONTROL_FIELDS,
+                "runtime.control",
+                source,
+                &path_display,
+            ));
+            if let Some(agent) = control.get("agent").and_then(JsonValue::as_object) {
+                result.merge(validate_object_keys(
+                    agent,
+                    RUNTIME_CONTROL_AGENT_FIELDS,
+                    "runtime.control.agent",
+                    source,
+                    &path_display,
+                ));
+            }
+            if let Some(task) = control.get("task").and_then(JsonValue::as_object) {
+                result.merge(validate_object_keys(
+                    task,
+                    RUNTIME_CONTROL_TASK_FIELDS,
+                    "runtime.control.task",
+                    source,
+                    &path_display,
+                ));
+            }
+            if let Some(context) = control.get("context").and_then(JsonValue::as_object) {
+                result.merge(validate_object_keys(
+                    context,
+                    RUNTIME_CONTROL_CONTEXT_FIELDS,
+                    "runtime.control.context",
+                    source,
+                    &path_display,
+                ));
+            }
+            if let Some(memory) = control.get("memory").and_then(JsonValue::as_object) {
+                result.merge(validate_object_keys(
+                    memory,
+                    RUNTIME_CONTROL_MEMORY_FIELDS,
+                    "runtime.control.memory",
+                    source,
+                    &path_display,
+                ));
+            }
+            if let Some(permission) = control.get("permission").and_then(JsonValue::as_object) {
+                result.merge(validate_object_keys(
+                    permission,
+                    RUNTIME_CONTROL_PERMISSION_FIELDS,
+                    "runtime.control.permission",
+                    source,
+                    &path_display,
+                ));
+            }
         }
     }
 
@@ -832,6 +1031,30 @@ mod tests {
                 replacement: "plugins.enabled"
             }
         ));
+    }
+
+    #[test]
+    fn accepts_runtime_control_schema() {
+        let source = r#"{
+          "runtime": {
+            "scenario": "coding",
+            "control": {
+              "enabled": true,
+              "agent": {"enabled": true, "max_parallel_agents": 4, "min_collaboration_score": 50},
+              "task": {"auto_phase_for_yolo": true, "max_failures_before_review": 2},
+              "context": {"preserve_stable_head": true, "yolo_budget_tokens": 12000},
+              "memory": {"emit_pulses_from_workgraph": true, "max_candidates_per_turn": 8},
+              "permission": {"solo_honor_critical": true, "review_critical_actions": true}
+            }
+          }
+        }"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+
+        let result = validate_config_file(object, source, &test_path());
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 
     #[test]

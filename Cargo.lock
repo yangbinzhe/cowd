@@ -69,7 +69,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "api"
-version = "0.8.18"
+version = "0.9.32"
 dependencies = [
  "reqwest",
  "runtime",
@@ -455,10 +455,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "bytemuck"
+version = "1.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
+name = "byteorder-lite"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 
 [[package]]
 name = "bytes"
@@ -558,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.8.18"
+version = "0.9.32"
 dependencies = [
  "chrono",
  "cowd-memory",
@@ -587,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "compat-harness"
-version = "0.8.18"
+version = "0.9.32"
 dependencies = [
  "commands",
  "runtime",
@@ -631,9 +643,10 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cowd-cli"
-version = "0.8.18"
+version = "0.9.32"
 dependencies = [
  "api",
+ "async-trait",
  "axum",
  "chrono",
  "commands",
@@ -645,12 +658,16 @@ dependencies = [
  "mock-anthropic-service",
  "plugins",
  "pulldown-cmark",
+ "qrcode",
  "ratatui",
+ "reqwest",
  "runtime",
+ "rusqlite",
  "rustyline",
  "serde",
  "serde_json",
  "serde_yaml",
+ "serial_test",
  "syntect",
  "thiserror 2.0.18",
  "tokio",
@@ -669,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "cowd-memory"
-version = "0.8.18"
+version = "0.9.32"
 dependencies = [
  "async-trait",
  "chrono",
@@ -683,6 +700,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "serial_test",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1707,6 +1725,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "image"
+version = "0.25.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
+dependencies = [
+ "bytemuck",
+ "byteorder-lite",
+ "moxcms",
+ "num-traits",
+]
+
+[[package]]
 name = "imap"
 version = "3.0.0-alpha.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2132,11 +2162,21 @@ dependencies = [
 
 [[package]]
 name = "mock-anthropic-service"
-version = "0.8.18"
+version = "0.9.32"
 dependencies = [
  "api",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "moxcms"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
+dependencies = [
+ "num-traits",
+ "pxfm",
 ]
 
 [[package]]
@@ -2467,7 +2507,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.8.18"
+version = "0.9.32"
 dependencies = [
  "serde",
  "serde_json",
@@ -2590,6 +2630,21 @@ name = "pulldown-cmark-escape"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
+
+[[package]]
+name = "pxfm"
+version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+dependencies = [
+ "image",
+]
 
 [[package]]
 name = "quick-xml"
@@ -2897,12 +2952,14 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
 ]
@@ -2923,7 +2980,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.8.18"
+version = "0.9.32"
 dependencies = [
  "aes",
  "async-trait",
@@ -2938,6 +2995,7 @@ dependencies = [
  "imap",
  "imap-proto",
  "lettre",
+ "libc",
  "lru",
  "mail-parser",
  "native-tls",
@@ -3247,6 +3305,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial_test"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "699f4197115b8a7e7ff19c9a315a4bd6fffec26cc4626ef45ecaea389e081c6d"
+dependencies = [
+ "futures-executor",
+ "futures-util",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "serial_test_derive",
+]
+
+[[package]]
+name = "serial_test_derive"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94e153fc76e1c6a068703d6d29c508a0b15c061c4b7e43da59cc097bc342673c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3526,7 +3609,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.8.18"
+version = "0.9.32"
 dependencies = [
  "serde",
  "serde_json",
@@ -3799,7 +3882,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.8.18"
+version = "0.9.32"
 dependencies = [
  "api",
  "base64 0.22.1",
@@ -4344,6 +4427,19 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

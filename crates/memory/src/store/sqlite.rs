@@ -23,15 +23,15 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::{
-        code_indexer::{CodeSymbol, FileFingerprint, SymbolEdge, SymbolEdgeType, SymbolKind},
+    code_indexer::{CodeSymbol, FileFingerprint, SymbolEdge, SymbolEdgeType, SymbolKind},
     config::StoreConfig,
     entity::{Entity, Triple},
     error::MemoryError,
     project_scope::MemoryScope,
     store::{FtsSearchOptions, FtsSearchResult, MemoryStore, Result, VerbatimEntry},
     types::{
-        AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta, MemorySource, Priority,
-        Relation,
+        AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta,
+        MemorySource, Priority, Relation,
     },
 };
 
@@ -246,8 +246,10 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     let relations: Vec<Relation> = serde_json::from_str(&relations_json).unwrap_or_default();
 
-    let created_at = DateTime::parse_from_rfc3339(&created_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
-    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+        .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
+        .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
     let last_accessed_at = last_accessed_str
         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Utc));
@@ -315,8 +317,10 @@ fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryMeta> {
         )
     })?;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-    let created_at = DateTime::parse_from_rfc3339(&created_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
-    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+        .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
+        .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
     Ok(MemoryMeta {
         id,
@@ -588,7 +592,10 @@ impl SqliteStore {
 
     /// Get a connection from the pool.
     fn conn(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
-        let conn = self.pool.get().map_err(|e| MemoryError::Store(e.to_string()))?;
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemoryError::Store(e.to_string()))?;
         exec_pragma(&conn, "PRAGMA foreign_keys=ON")?;
         exec_pragma(&conn, "PRAGMA busy_timeout=5000")?;
         Ok(conn)
@@ -737,7 +744,8 @@ impl SqliteStore {
             .chars()
             .map(|c| match c {
                 // FTS5 special characters that alter query behavior — replace with spaces
-                '*' | '^' | '"' | '(' | ')' | ':' | '~' | '+' | '-' | '!' | '{' | '}' | '[' | ']' => ' ',
+                '*' | '^' | '"' | '(' | ')' | ':' | '~' | '+' | '-' | '!' | '{' | '}' | '['
+                | ']' => ' ',
                 _ => c,
             })
             .collect::<String>()
@@ -748,7 +756,12 @@ impl SqliteStore {
             .join(" AND ")
     }
 
-    fn do_search_fts(conn: &Connection, query: &str, limit: usize, scope: Option<&str>) -> Result<Vec<MemoryEntry>> {
+    fn do_search_fts(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+        scope: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
         let sql = if scope.is_some() {
             r"
             SELECT m.id, m.layer, m.category, m.priority, m.source, m.title, m.content,
@@ -829,9 +842,15 @@ impl SqliteStore {
         let mut stmt = conn.prepare(&sql).map_err(sql_err)?;
 
         let limit_param: Box<dyn rusqlite::ToSql> = Box::new(limit as i64);
-        let all_params: Vec<&dyn rusqlite::ToSql> = param_refs.iter().map(|p| *p).chain(std::iter::once(limit_param.as_ref())).collect();
+        let all_params: Vec<&dyn rusqlite::ToSql> = param_refs
+            .iter()
+            .map(|p| *p)
+            .chain(std::iter::once(limit_param.as_ref()))
+            .collect();
 
-        let rows = stmt.query_map(all_params.as_slice(), row_to_entry).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(all_params.as_slice(), row_to_entry)
+            .map_err(sql_err)?;
         let mut entries = Vec::new();
         for r in rows {
             entries.push(r.map_err(sql_err)?);
@@ -857,7 +876,9 @@ impl SqliteStore {
             );
             let mut stmt = conn.prepare(&snippet_sql).map_err(sql_err)?;
             let snippet_rows = stmt
-                .query_map(params![query, limit as i64], |row| row.get::<_, Option<String>>(0))
+                .query_map(params![query, limit as i64], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
                 .map_err(sql_err)?;
             let mut result = Vec::new();
             for r in snippet_rows {
@@ -896,7 +917,8 @@ impl SqliteStore {
             })
             .map_err(sql_err)?;
 
-        let mut keyword_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut keyword_counts: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
 
         for r in rows {
             let (_, title_hl, content_hl) = r.map_err(sql_err)?;
@@ -1129,11 +1151,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn do_traverse(
-        conn: &Connection,
-        start_id: &str,
-        max_hops: u32,
-    ) -> Result<Vec<String>> {
+    fn do_traverse(conn: &Connection, start_id: &str, max_hops: u32) -> Result<Vec<String>> {
         let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut frontier: Vec<String> = vec![start_id.to_string()];
         visited.insert(start_id.to_string());
@@ -1276,14 +1294,19 @@ impl SqliteStore {
         } else {
             // SQLite parameter limit is 999; for large sets we chunk.
             for chunk in keep_ids.chunks(900) {
-                let placeholders: Vec<String> =
-                    chunk.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+                let placeholders: Vec<String> = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect();
                 let sql = format!(
                     "DELETE FROM vector_embeddings WHERE memory_id NOT IN ({})",
                     placeholders.join(",")
                 );
-                let params: Vec<&dyn rusqlite::types::ToSql> =
-                    chunk.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+                let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                    .iter()
+                    .map(|s| s as &dyn rusqlite::types::ToSql)
+                    .collect();
                 tx.execute(&sql, params.as_slice()).map_err(sql_err)?;
             }
         }
@@ -1351,11 +1374,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn do_search_symbols(
-        conn: &Connection,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<CodeSymbol>> {
+    fn do_search_symbols(conn: &Connection, query: &str, limit: usize) -> Result<Vec<CodeSymbol>> {
         let sanitized = Self::sanitize_fts_query(query);
         if sanitized.is_empty() {
             return Ok(Vec::new());
@@ -1374,7 +1393,8 @@ impl SqliteStore {
                 Ok(CodeSymbol {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?).unwrap_or(SymbolKind::Function),
+                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?)
+                        .unwrap_or(SymbolKind::Function),
                     file_path: row.get(3)?,
                     line: row.get::<_, i64>(4)? as usize,
                     signature: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
@@ -1402,7 +1422,8 @@ impl SqliteStore {
                 Ok(CodeSymbol {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?).unwrap_or(SymbolKind::Function),
+                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?)
+                        .unwrap_or(SymbolKind::Function),
                     file_path: row.get(3)?,
                     line: row.get::<_, i64>(4)? as usize,
                     signature: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
@@ -1430,7 +1451,8 @@ impl SqliteStore {
                 Ok(CodeSymbol {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?).unwrap_or(SymbolKind::Function),
+                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?)
+                        .unwrap_or(SymbolKind::Function),
                     file_path: row.get(3)?,
                     line: row.get::<_, i64>(4)? as usize,
                     signature: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
@@ -1453,7 +1475,8 @@ impl SqliteStore {
                 Ok(CodeSymbol {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?).unwrap_or(SymbolKind::Function),
+                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?)
+                        .unwrap_or(SymbolKind::Function),
                     file_path: row.get(3)?,
                     line: row.get::<_, i64>(4)? as usize,
                     signature: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
@@ -1647,7 +1670,19 @@ impl SqliteStore {
         conn: &Connection,
         entity_name: &str,
         limit: usize,
-    ) -> Result<Vec<(i64, String, String, String, Option<String>, Option<String>, Option<f32>, String, i64)>> {
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<f32>,
+            String,
+            i64,
+        )>,
+    > {
         let mut stmt = conn
             .prepare(
                 r"SELECT id, entity_name, entity_key, agent_id, old_value, new_value, confidence, operation, recorded_at_ms
@@ -1682,7 +1717,19 @@ impl SqliteStore {
     fn do_get_recent_evolutions(
         conn: &Connection,
         limit: usize,
-    ) -> Result<Vec<(i64, String, String, String, Option<String>, Option<String>, Option<f32>, String, i64)>> {
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<f32>,
+            String,
+            i64,
+        )>,
+    > {
         let mut stmt = conn
             .prepare(
                 r"SELECT id, entity_name, entity_key, agent_id, old_value, new_value, confidence, operation, recorded_at_ms
@@ -1744,7 +1791,19 @@ impl SqliteStore {
         &self,
         entity_name: &str,
         limit: usize,
-    ) -> Result<Vec<(i64, String, String, String, Option<String>, Option<String>, Option<f32>, String, i64)>> {
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<f32>,
+            String,
+            i64,
+        )>,
+    > {
         let conn = self.conn()?;
         Self::do_get_entity_timeline(&conn, entity_name, limit)
     }
@@ -1753,7 +1812,19 @@ impl SqliteStore {
     pub fn get_recent_evolutions(
         &self,
         limit: usize,
-    ) -> Result<Vec<(i64, String, String, String, Option<String>, Option<String>, Option<f32>, String, i64)>> {
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<f32>,
+            String,
+            i64,
+        )>,
+    > {
         let conn = self.conn()?;
         Self::do_get_recent_evolutions(&conn, limit)
     }
@@ -1883,7 +1954,12 @@ impl MemoryStore for SqliteStore {
         let store = self.clone();
         let sanitized = Self::sanitize_fts_query(query);
         if sanitized.is_empty() {
-            return Ok(FtsSearchResult { entries: Vec::new(), snippets: Vec::new(), total_matches: 0, keywords: Vec::new() });
+            return Ok(FtsSearchResult {
+                entries: Vec::new(),
+                snippets: Vec::new(),
+                total_matches: 0,
+                keywords: Vec::new(),
+            });
         }
         let category_str = options.category.map(category_to_str);
         let layer_int = options.layer.map(layer_to_int);
@@ -2427,9 +2503,18 @@ mod tests {
     #[tokio::test]
     async fn search_by_layer_filters_correctly() {
         let store = open_store();
-        store.insert(&entry("a", "A", "aa", MemoryLayer::L1)).await.unwrap();
-        store.insert(&entry("b", "B", "bb", MemoryLayer::L2)).await.unwrap();
-        store.insert(&entry("c", "C", "cc", MemoryLayer::L1)).await.unwrap();
+        store
+            .insert(&entry("a", "A", "aa", MemoryLayer::L1))
+            .await
+            .unwrap();
+        store
+            .insert(&entry("b", "B", "bb", MemoryLayer::L2))
+            .await
+            .unwrap();
+        store
+            .insert(&entry("c", "C", "cc", MemoryLayer::L1))
+            .await
+            .unwrap();
 
         let l1 = store.search_by_layer(MemoryLayer::L1).await.unwrap();
         assert_eq!(l1.len(), 2);
@@ -2449,7 +2534,10 @@ mod tests {
         store.insert(&e1).await.unwrap();
         store.insert(&e2).await.unwrap();
 
-        let decisions = store.search_by_category(MemoryCategory::Decision).await.unwrap();
+        let decisions = store
+            .search_by_category(MemoryCategory::Decision)
+            .await
+            .unwrap();
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].id, e1_id);
     }
@@ -2457,10 +2545,23 @@ mod tests {
     #[tokio::test]
     async fn search_fts_finds_by_content() {
         let store = open_store();
-        let e1 = entry("fts1", "Rust Guide", "Learn Rust programming language", MemoryLayer::L1);
+        let e1 = entry(
+            "fts1",
+            "Rust Guide",
+            "Learn Rust programming language",
+            MemoryLayer::L1,
+        );
         let e1_id = e1.id;
         store.insert(&e1).await.unwrap();
-        store.insert(&entry("fts2", "Python Notes", "Data science with Python", MemoryLayer::L1)).await.unwrap();
+        store
+            .insert(&entry(
+                "fts2",
+                "Python Notes",
+                "Data science with Python",
+                MemoryLayer::L1,
+            ))
+            .await
+            .unwrap();
 
         let results = store.search_fts("Rust", 10).await;
         match results {
@@ -2480,7 +2581,10 @@ mod tests {
     #[tokio::test]
     async fn search_fts_returns_empty_for_no_match() {
         let store = open_store();
-        store.insert(&entry("fts3", "Rust", "content", MemoryLayer::L1)).await.unwrap();
+        store
+            .insert(&entry("fts3", "Rust", "content", MemoryLayer::L1))
+            .await
+            .unwrap();
 
         let results = store.search_fts("zzzzzzzzzzzz", 10).await;
         if let Ok(r) = results {
@@ -2503,8 +2607,14 @@ mod tests {
     #[tokio::test]
     async fn list_metas_all_layers() {
         let store = open_store();
-        store.insert(&entry("meta2", "A", "aa", MemoryLayer::L1)).await.unwrap();
-        store.insert(&entry("meta3", "B", "bb", MemoryLayer::L2)).await.unwrap();
+        store
+            .insert(&entry("meta2", "A", "aa", MemoryLayer::L1))
+            .await
+            .unwrap();
+        store
+            .insert(&entry("meta3", "B", "bb", MemoryLayer::L2))
+            .await
+            .unwrap();
 
         let metas = store.list_metas(None).await.unwrap();
         assert_eq!(metas.len(), 2);
@@ -2513,8 +2623,14 @@ mod tests {
     #[tokio::test]
     async fn list_all_returns_all_entries() {
         let store = open_store();
-        store.insert(&entry("all1", "A", "aa", MemoryLayer::L1)).await.unwrap();
-        store.insert(&entry("all2", "B", "bb", MemoryLayer::L2)).await.unwrap();
+        store
+            .insert(&entry("all1", "A", "aa", MemoryLayer::L1))
+            .await
+            .unwrap();
+        store
+            .insert(&entry("all2", "B", "bb", MemoryLayer::L2))
+            .await
+            .unwrap();
 
         let all = store.list_all().await.unwrap();
         assert_eq!(all.len(), 2);
@@ -2587,7 +2703,13 @@ mod tests {
     // Code symbol persistence tests (T2)
     // -------------------------------------------------------------------
 
-    fn make_symbol(id: &str, name: &str, kind: SymbolKind, file_path: &str, line: usize) -> CodeSymbol {
+    fn make_symbol(
+        id: &str,
+        name: &str,
+        kind: SymbolKind,
+        file_path: &str,
+        line: usize,
+    ) -> CodeSymbol {
         CodeSymbol {
             id: id.to_string(),
             name: name.to_string(),
@@ -2611,9 +2733,18 @@ mod tests {
     #[tokio::test]
     async fn test_insert_and_query_symbol() {
         let store = open_store();
-        let sym = make_symbol("src/main.rs:hello:10", "hello", SymbolKind::Function, "src/main.rs", 10);
+        let sym = make_symbol(
+            "src/main.rs:hello:10",
+            "hello",
+            SymbolKind::Function,
+            "src/main.rs",
+            10,
+        );
 
-        store.insert_symbol(&sym).await.expect("insert symbol should succeed");
+        store
+            .insert_symbol(&sym)
+            .await
+            .expect("insert symbol should succeed");
 
         let results = store
             .search_symbols("hello", 10)
@@ -2628,9 +2759,36 @@ mod tests {
     async fn test_fts5_search() {
         let store = open_store();
 
-        store.insert_symbol(&make_symbol("a:alpha_func:1", "alpha_func", SymbolKind::Function, "a.rs", 1)).await.unwrap();
-        store.insert_symbol(&make_symbol("b:bravo:2", "bravoClass", SymbolKind::Class, "b.rs", 2)).await.unwrap();
-        store.insert_symbol(&make_symbol("c:setup:3", "setupServer", SymbolKind::Function, "c.rs", 3)).await.unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "a:alpha_func:1",
+                "alpha_func",
+                SymbolKind::Function,
+                "a.rs",
+                1,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "b:bravo:2",
+                "bravoClass",
+                SymbolKind::Class,
+                "b.rs",
+                2,
+            ))
+            .await
+            .unwrap();
+        store
+            .insert_symbol(&make_symbol(
+                "c:setup:3",
+                "setupServer",
+                SymbolKind::Function,
+                "c.rs",
+                3,
+            ))
+            .await
+            .unwrap();
 
         // FTS5 search: case-insensitive token matching
         let results = store.search_symbols("alpha_func", 10).await;
@@ -2640,7 +2798,10 @@ mod tests {
                 assert_eq!(r[0].name, "alpha_func");
             }
             Err(_) => {
-                let no_match = store.search_symbols("zzzzzzz_nonexistent", 1).await.unwrap();
+                let no_match = store
+                    .search_symbols("zzzzzzz_nonexistent", 1)
+                    .await
+                    .unwrap();
                 assert!(no_match.is_empty());
             }
         }
@@ -2673,7 +2834,9 @@ mod tests {
         let edge = make_edge("a:caller:1", "b:callee:1", SymbolEdgeType::Calls, "a.rs");
 
         // Insert edge via batch method
-        store.index_file_symbols("a.rs", &[caller], &[edge]).unwrap();
+        store
+            .index_file_symbols("a.rs", &[caller], &[edge])
+            .unwrap();
 
         let callers = store.get_callers("b:callee:1").await.unwrap();
         assert_eq!(callers.len(), 1, "should find one caller");
@@ -2697,7 +2860,9 @@ mod tests {
             make_edge("a:call_main:1", "a:bar:9", SymbolEdgeType::Calls, "a.rs"),
         ];
 
-        store.index_file_symbols("a.rs", &[caller, callee1, callee2], &edges).unwrap();
+        store
+            .index_file_symbols("a.rs", &[caller, callee1, callee2], &edges)
+            .unwrap();
 
         let callees = store.get_callees("a:call_main:1").await.unwrap();
         assert_eq!(callees.len(), 2, "main should call foo and bar");
@@ -2730,7 +2895,10 @@ mod tests {
             .unwrap();
 
         // Find memories by symbol
-        let mem_ids = store.find_memories_by_symbol("authenticate_user").await.unwrap();
+        let mem_ids = store
+            .find_memories_by_symbol("authenticate_user")
+            .await
+            .unwrap();
         assert!(!mem_ids.is_empty(), "should find the linked memory");
         assert!(mem_ids.contains(&memory_id));
     }
@@ -2745,29 +2913,58 @@ mod tests {
 
         // Link symbol A to two different memories
         store
-            .link_symbol_to_memory("src/auth.rs:authenticate_user:10", &mem1, Some(1), "tool_call", now)
+            .link_symbol_to_memory(
+                "src/auth.rs:authenticate_user:10",
+                &mem1,
+                Some(1),
+                "tool_call",
+                now,
+            )
             .await
             .unwrap();
         store
-            .link_symbol_to_memory("src/auth.rs:authenticate_user:10", &mem2, Some(2), "reference", now + 1)
+            .link_symbol_to_memory(
+                "src/auth.rs:authenticate_user:10",
+                &mem2,
+                Some(2),
+                "reference",
+                now + 1,
+            )
             .await
             .unwrap();
 
         // Link a different symbol to mem1
         store
-            .link_symbol_to_memory("src/auth.rs:TokenManager:25", &mem1, Some(2), "tool_call", now + 2)
+            .link_symbol_to_memory(
+                "src/auth.rs:TokenManager:25",
+                &mem1,
+                Some(2),
+                "tool_call",
+                now + 2,
+            )
             .await
             .unwrap();
 
         // Find memories by authenticate_user
-        let auth_mems = store.find_memories_by_symbol("authenticate_user").await.unwrap();
-        assert_eq!(auth_mems.len(), 2, "authenticate_user should be linked to two memories");
+        let auth_mems = store
+            .find_memories_by_symbol("authenticate_user")
+            .await
+            .unwrap();
+        assert_eq!(
+            auth_mems.len(),
+            2,
+            "authenticate_user should be linked to two memories"
+        );
         assert!(auth_mems.contains(&mem1));
         assert!(auth_mems.contains(&mem2));
 
         // Find memories by TokenManager
         let token_mems = store.find_memories_by_symbol("TokenManager").await.unwrap();
-        assert_eq!(token_mems.len(), 1, "TokenManager should be linked to one memory");
+        assert_eq!(
+            token_mems.len(),
+            1,
+            "TokenManager should be linked to one memory"
+        );
         assert_eq!(token_mems[0], mem1);
 
         // Find by non-existent symbol

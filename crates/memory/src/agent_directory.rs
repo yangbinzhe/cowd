@@ -3,8 +3,8 @@
 //! Provides a global, thread-safe registry where sub-agents can discover
 //! each other and query "who can help with X" based on declared capabilities.
 
-use std::collections::HashMap;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 static DIRECTORY: OnceLock<AgentDirectory> = OnceLock::new();
@@ -207,7 +207,10 @@ mod tests {
     fn discover_by_capability() {
         let dir = AgentDirectory::global();
         dir.clear_all(); // ensure clean state
-        dir.register(dummy_agent("a1", vec!["rust".to_string(), "testing".to_string()]));
+        dir.register(dummy_agent(
+            "a1",
+            vec!["rust".to_string(), "testing".to_string()],
+        ));
         dir.register(dummy_agent("a2", vec!["python".to_string()]));
 
         let rust_agents = dir.discover(&["rust".to_string()]);

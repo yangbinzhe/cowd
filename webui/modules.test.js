@@ -163,7 +163,9 @@ describe('API module', () => {
     const mockF = vi.fn(() =>
       Promise.resolve({
         ok: true,
-        json: () => Promise.resolve({ envelopes: [{ envelope_id: 'ctx-1' }] })
+        json: () => Promise.resolve({
+          summaries: [{ envelope_id: 'ctx-1', profile: 'MainTurn', intent: 'ship', pressure_bp: 150 }]
+        })
       })
     );
     vi.stubGlobal('fetch', mockF);
@@ -171,9 +173,28 @@ describe('API module', () => {
     const history = await window.Api.contextHistory('s1', { from_seq: 10, limit: 8 });
     await window.Api.contextEnvelope('ctx-1');
 
-    expect(String(mockF.mock.calls[0][0])).toBe('/api/sessions/s1/context?from_seq=10&limit=8');
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/sessions/s1/context?from_seq=10&limit=8&include_envelopes=false');
     expect(String(mockF.mock.calls[1][0])).toBe('/api/context/ctx-1');
-    expect(history.envelopes[0].envelope_id).toBe('ctx-1');
+    expect(history.summaries[0].envelope_id).toBe('ctx-1');
+  });
+
+  it('context history can request the next summary page', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          summaries: [{ envelope_id: 'ctx-2', profile: 'Review', intent: 'continue', pressure_bp: 80 }],
+          next_seq: 20,
+          has_more: false,
+        })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const history = await window.Api.contextHistory('s1', { from_seq: 12, limit: 8 });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/sessions/s1/context?from_seq=12&limit=8&include_envelopes=false');
+    expect(history.summaries[0].envelope_id).toBe('ctx-2');
   });
 
   it('runtimeRuns reads session run timeline', async () => {
@@ -195,7 +216,10 @@ describe('API module', () => {
     const mockF = vi.fn(() =>
       Promise.resolve({
         ok: true,
-        json: () => Promise.resolve({ events: [{ kind: 'ToolStart' }] })
+        json: () => Promise.resolve({
+          events: [{ kind: 'ToolStart' }],
+          value_loop: { status: 'incomplete', required_observed: 1, required_total: 7 }
+        })
       })
     );
     vi.stubGlobal('fetch', mockF);
@@ -204,6 +228,55 @@ describe('API module', () => {
 
     expect(String(mockF.mock.calls[0][0])).toBe('/api/runtime/timeline?session_id=s1&from_seq=3&limit=12');
     expect(timeline.events[0].kind).toBe('ToolStart');
+    expect(timeline.value_loop.status).toBe('incomplete');
+  });
+
+  it('runtimeEffectiveConfig reads active runtime control policy', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ control_policy: { enabled: true } })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const config = await window.Api.runtimeEffectiveConfig();
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/runtime/config/effective');
+    expect(config.control_policy.enabled).toBe(true);
+  });
+
+  it('runtimeControlPlane reads unified runtime control-plane state', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ kind: 'runtime_control_plane', status: 'healthy' })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const plane = await window.Api.runtimeControlPlane();
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/runtime/control-plane');
+    expect(plane.kind).toBe('runtime_control_plane');
+    expect(plane.status).toBe('healthy');
+  });
+
+  it('runtimeReloadProviders posts provider reload request', async () => {
+    const mockF = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ kind: 'runtime_provider_reload', applied: true })
+      })
+    );
+    vi.stubGlobal('fetch', mockF);
+
+    const result = await window.Api.runtimeReloadProviders();
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/runtime/providers/reload');
+    expect(mockF.mock.calls[0][1].method).toBe('POST');
+    expect(result.kind).toBe('runtime_provider_reload');
+    expect(result.applied).toBe(true);
   });
 
   it('resolveEvidence encodes refs and session id', async () => {
@@ -368,6 +441,163 @@ describe('API module', () => {
     expect(String(mockF.mock.calls[0][0])).toBe('/api/audit/export?source=memory&limit=25&offset=50');
     expect(data.kind).toBe('audit_export');
     expect(data.records[0].source).toBe('memory');
+  });
+
+  it('cross-plane policy endpoints use the management route contract', async () => {
+    const mockF = vi.fn((url, opts) => {
+      const path = String(url);
+      if (path.includes('/api/cross-plane/policy/simulate')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ kind: 'cross_plane_policy_simulation', decision: { decision: 'allow' } })
+        });
+      }
+      if (path.includes('/api/cross-plane/action/preflight')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ kind: 'cross_plane_action_preflight', executable: true })
+        });
+      }
+      if (path.includes('/api/cross-plane/action/execute')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ kind: 'cross_plane_action_execution', status: 'planned', dispatch_status: 'dry_run' })
+        });
+      }
+      if (path.includes('/api/cross-plane/action/adapters')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ kind: 'cross_plane_action_adapters', capabilities: [{ platform: 'feishu', operation: 'send_text' }] })
+        });
+      }
+      if (path.includes('/api/cross-plane/action/executions')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ kind: 'cross_plane_action_executions', executions: [{ id: 'cpx-1' }] })
+        });
+      }
+      if (path.includes('/api/cross-plane/identity/resolve')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ kind: 'cross_plane_identity_resolution', resolved: { principal_id: 'user:demo' } })
+        });
+      }
+      if (path.includes('/api/cross-plane/identities')) {
+        if ((opts && opts.method) === 'POST') {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'cross_plane_identity', identity: { id: 'idb-1' } }) });
+        }
+        if ((opts && opts.method) === 'DELETE') {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'cross_plane_identity_revoked', revoked: true }) });
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'cross_plane_identities', identities: [] }) });
+      }
+      if (path.includes('/api/cross-plane/grants')) {
+        if ((opts && opts.method) === 'POST') {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'cross_plane_grant', grant: { id: 'grant-1' } }) });
+        }
+        if ((opts && opts.method) === 'DELETE') {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'cross_plane_grant_revoked', revoked: true }) });
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'cross_plane_grants', grants: [] }) });
+      }
+      if (path.includes('/api/cross-plane/audit')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'cross_plane_audit', records: [] }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'cross_plane_summary' }) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.crossPlaneSummary();
+    await window.Api.crossPlaneIdentities();
+    await window.Api.createCrossPlaneIdentity({ id: 'idb-1', principal_id: 'user:demo', identity_ref: 'channel://feishu/user/demo', trust: 'verified' });
+    await window.Api.revokeCrossPlaneIdentity('idb-1');
+    await window.Api.crossPlaneGrants();
+    await window.Api.createCrossPlaneGrant({ id: 'grant-1', principal_id: 'user:demo', capability: 'channel.feishu.send_text' });
+    await window.Api.revokeCrossPlaneGrant('grant-1');
+    await window.Api.crossPlaneAudit();
+    const adapters = await window.Api.crossPlaneActionAdapters();
+    const executions = await window.Api.crossPlaneActionExecutions();
+    const resolved = await window.Api.resolveCrossPlaneIdentity('channel://wechat/user/demo?email=demo@example.com');
+    const preflight = await window.Api.preflightCrossPlaneAction({
+      actor_principal: 'user:demo',
+      requested_capability: 'channel.feishu.send_text',
+      risk: 'low',
+      data_classification: 'internal',
+      identity_trust: 'verified'
+    });
+    const execution = await window.Api.executeCrossPlaneAction({
+      mode: 'dry_run',
+      action: {
+        actor_principal: 'user:demo',
+        requested_capability: 'channel.feishu.send_text',
+        risk: 'low',
+        data_classification: 'internal',
+        identity_trust: 'verified'
+      }
+    });
+    const result = await window.Api.simulateCrossPlanePolicy({
+      actor_principal: 'user:demo',
+      requested_capability: 'channel.feishu.send_text',
+      risk: 'low',
+      data_classification: 'internal',
+      identity_trust: 'verified'
+    });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/cross-plane/summary');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/cross-plane/identities');
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/cross-plane/identities');
+    expect(mockF.mock.calls[2][1].method).toBe('POST');
+    expect(String(mockF.mock.calls[3][0])).toBe('/api/cross-plane/identities/idb-1');
+    expect(mockF.mock.calls[3][1].method).toBe('DELETE');
+    expect(String(mockF.mock.calls[4][0])).toBe('/api/cross-plane/grants');
+    expect(String(mockF.mock.calls[5][0])).toBe('/api/cross-plane/grants');
+    expect(mockF.mock.calls[5][1].method).toBe('POST');
+    expect(String(mockF.mock.calls[6][0])).toBe('/api/cross-plane/grants/grant-1');
+    expect(mockF.mock.calls[6][1].method).toBe('DELETE');
+    expect(String(mockF.mock.calls[7][0])).toBe('/api/cross-plane/audit');
+    expect(String(mockF.mock.calls[8][0])).toBe('/api/cross-plane/action/adapters');
+    expect(String(mockF.mock.calls[9][0])).toBe('/api/cross-plane/action/executions');
+    expect(String(mockF.mock.calls[10][0])).toBe('/api/cross-plane/identity/resolve');
+    expect(JSON.parse(mockF.mock.calls[10][1].body).identity_ref).toContain('demo@example.com');
+    expect(String(mockF.mock.calls[11][0])).toBe('/api/cross-plane/action/preflight');
+    expect(JSON.parse(mockF.mock.calls[11][1].body).requested_capability).toBe('channel.feishu.send_text');
+    expect(String(mockF.mock.calls[12][0])).toBe('/api/cross-plane/action/execute');
+    expect(JSON.parse(mockF.mock.calls[12][1].body).action.requested_capability).toBe('channel.feishu.send_text');
+    expect(String(mockF.mock.calls[13][0])).toBe('/api/cross-plane/policy/simulate');
+    expect(JSON.parse(mockF.mock.calls[13][1].body).requested_capability).toBe('channel.feishu.send_text');
+    expect(adapters.capabilities[0].operation).toBe('send_text');
+    expect(executions.executions[0].id).toBe('cpx-1');
+    expect(resolved.resolved.principal_id).toBe('user:demo');
+    expect(preflight.executable).toBe(true);
+    expect(execution.status).toBe('planned');
+    expect(result.decision.decision).toBe('allow');
+  });
+
+  it('wechat ilink qr endpoints use the channel route contract', async () => {
+    const mockF = vi.fn((url, opts = {}) => {
+      const path = String(url);
+      if (path === '/api/channels/wechat-ilink/accounts') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ accounts: [] }) });
+      }
+      if (path === '/api/channels/wechat-ilink/qr') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ qrcode: 'qr1', scan_data: 'scan' }) });
+      }
+      if (path === '/api/channels/wechat-ilink/qr/poll') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ status: 'wait' }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.wechatIlinkAccounts();
+    await window.Api.startWechatIlinkQr({ bot_type: '3' });
+    await window.Api.pollWechatIlinkQr({ qrcode: 'qr1', base_url: 'https://ilinkai.weixin.qq.com' });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/channels/wechat-ilink/accounts');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/channels/wechat-ilink/qr');
+    expect(mockF.mock.calls[1][1].method).toBe('POST');
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/channels/wechat-ilink/qr/poll');
+    expect(JSON.parse(mockF.mock.calls[2][1].body).qrcode).toBe('qr1');
   });
 
   it('profile endpoints use the enterprise profile route contract', async () => {
@@ -609,6 +839,278 @@ describe('API module', () => {
     expect(typeof window.Panels.renderCCUsage).toBe('function');
   });
 
+  it('renders gateway platform readiness without secrets', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    vi.stubGlobal('fetch', vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/cross-plane/summary')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: [], grants: [], decisions: [] }) });
+      }
+      if (path.includes('/api/channels/wechat-ilink/accounts')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ accounts: [] }) });
+      }
+      if (path.includes('/api/cross-plane/identities')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          identities: [{
+            id: 'idb-demo',
+            principal_id: 'user:demo',
+            identity_ref: 'channel://feishu/user/demo?email=demo@example.com',
+            trust: 'verified',
+          }],
+        }) });
+      }
+      if (path.includes('/api/cross-plane/audit')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          records: [{
+            result: 'allow',
+            summary: 'matched_grant',
+            action: { requested_capability: 'service.feishu.drive.download' },
+            decision: { decision: 'allow' },
+            evidence: {
+              policy_version: 'cross-plane.v1',
+              matched_grant_id: 'grant-once',
+              consumed_grant_id: 'grant-once',
+              remaining_uses_after: 0,
+            },
+          }],
+        }) });
+      }
+      if (path.includes('/api/cross-plane/action/adapters')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          capabilities: [{
+            platform: 'feishu',
+            operation: 'send_text',
+            live_supported: true,
+            adapter_bound: false,
+          }],
+        }) });
+      }
+      if (path.includes('/api/cross-plane/action/executions')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          executions: [{
+            id: 'cpx-demo',
+            mode: 'dry_run',
+            status: 'planned',
+            dispatch_status: 'dry_run',
+            idempotency_key: 'idem-demo',
+            action: { requested_capability: 'channel.feishu.send_text' },
+            dispatch_target: {
+              ready: true,
+              platform: 'feishu',
+              operation: 'send_text',
+              session_key: 'feishu:open-id:chat-id',
+              blockers: [],
+              outbound_message: { text: 'hello from test' },
+            },
+            dispatch_outcome: {
+              status: 'sent',
+              platform: 'feishu',
+              operation: 'send_text',
+              session_key: 'feishu:open-id:chat-id',
+            },
+          }],
+        }) });
+      }
+      if (path === '/api/platforms') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve([
+          {
+            name: 'feishu',
+            status: 'degraded',
+            enabled: true,
+            credential_present: false,
+            missing_required: ['app_secret'],
+            capabilities: ['send_text', 'doc_ops'],
+          }
+        ]) });
+      }
+      if (path === '/api/platforms/feishu') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ readiness: { status: 'degraded' }, sessions: [] }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    }));
+
+    await window.Panels.renderGateway();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const text = document.getElementById('panel-content').textContent;
+    expect(text).toContain('Gateway Platforms');
+    expect(text).toContain('feishu');
+    expect(text).toContain('degraded');
+    expect(text).toContain('Missing app_secret');
+    expect(text).toContain('Capabilities send_text · doc_ops');
+    expect(text).toContain('Identity Bindings');
+    expect(text).toContain('user:demo');
+    expect(text).toContain('demo@example.com');
+    expect(text).toContain('Recent Policy Evidence');
+    expect(text).toContain('service.feishu.drive.download');
+    expect(text).toContain('remaining 0');
+    expect(text).toContain('Adapter Capability');
+    expect(text).toContain('send_text');
+    expect(text).toContain('live supported');
+    expect(text).toContain('not bound');
+    expect(text).toContain('Execution Receipts');
+    expect(text).toContain('channel.feishu.send_text');
+    expect(text).toContain('idem idem-demo');
+    expect(text).toContain('Action Composer');
+    expect(text).toContain('Preflight action');
+    expect(text).toContain('Execute action');
+    expect(text).toContain('Dispatch Target');
+    expect(text).toContain('session feishu:open-id:chat-id');
+    expect(text).toContain('payload hello from test');
+    expect(text).toContain('Dispatch Outcome');
+    expect(text).toContain('sent');
+    expect(text).not.toContain('cli_app_secret');
+  });
+
+  it('gateway composer preflights and executes typed media actions', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    const mockF = vi.fn((url, options = {}) => {
+      const path = String(url);
+      if (path.includes('/api/cross-plane/summary')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: {}, grants: {}, interop: {} }) });
+      if (path.includes('/api/channels/wechat-ilink/accounts')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ accounts: [] }) });
+      if (path.includes('/api/cross-plane/identities')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: [] }) });
+      if (path.includes('/api/cross-plane/grants')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ grants: [] }) });
+      if (path.includes('/api/cross-plane/audit')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ records: [] }) });
+      if (path.includes('/api/cross-plane/action/adapters')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ capabilities: [{ platform: 'feishu', operation: 'send_image', live_supported: true, adapter_bound: true }] }) });
+      if (path.includes('/api/cross-plane/action/executions')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ executions: [] }) });
+      if (path.includes('/api/cross-plane/action/preflight')) {
+        const body = JSON.parse(options.body);
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          dispatch_target: {
+            ready: true,
+            platform: 'feishu',
+            operation: body.requested_capability.split('.').pop(),
+            session_key: 'feishu:demo',
+            blockers: [],
+            outbound_message: { payload_kind: 'image', payload_ref: body.resource_ref, text: body.resource_ref },
+          },
+        }) });
+      }
+      if (path.includes('/api/cross-plane/action/execute')) {
+        const body = JSON.parse(options.body);
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          status: 'planned',
+          dispatch_status: 'dry_run',
+          dispatched: false,
+          dispatch_target: {
+            ready: true,
+            platform: 'feishu',
+            operation: body.action.requested_capability.split('.').pop(),
+            session_key: 'feishu:demo',
+            blockers: [],
+            outbound_message: { payload_kind: 'image', payload_ref: body.action.resource_ref, text: body.action.resource_ref },
+          },
+        }) });
+      }
+      if (path === '/api/platforms') return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderGateway();
+    const selects = [...document.querySelectorAll('.cross-plane-composer select')];
+    selects[0].value = 'send_image';
+    selects[0].dispatchEvent(new Event('change'));
+    document.querySelector('.cross-plane-composer textarea').value = 'https://example.test/panel.png';
+
+    document.querySelector('.cross-plane-actions button').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    let preflightBody = JSON.parse(mockF.mock.calls.find(call => String(call[0]).includes('/api/cross-plane/action/preflight'))[1].body);
+    expect(preflightBody.requested_capability).toBe('channel.feishu.send_image');
+    expect(preflightBody.resource_ref).toBe('image://https://example.test/panel.png');
+    expect(document.getElementById('panel-content').textContent).toContain('Preflight Result');
+
+    document.querySelectorAll('.cross-plane-actions button')[1].click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const executeBody = JSON.parse(mockF.mock.calls.find(call => String(call[0]).includes('/api/cross-plane/action/execute'))[1].body);
+    expect(executeBody.mode).toBe('dry_run');
+    expect(executeBody.action.requested_capability).toBe('channel.feishu.send_image');
+    expect(executeBody.action.resource_ref).toBe('image://https://example.test/panel.png');
+    expect(document.getElementById('panel-content').textContent).toContain('Execution Result');
+  });
+
+  it('gateway composer picks workspace files for typed file actions', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    const mockF = vi.fn((url, options = {}) => {
+      const path = String(url);
+      if (path.includes('/api/workspace/files')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          workspace_root: '/repo',
+          dir: '',
+          files: [
+            { name: 'reports', path: 'reports', is_dir: true, type: 'dir' },
+            { name: 'panel.txt', path: 'reports/panel.txt', is_dir: false, type: 'file' },
+          ],
+        }) });
+      }
+      if (path.includes('/api/cross-plane/summary')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: {}, grants: {}, interop: {} }) });
+      if (path.includes('/api/channels/wechat-ilink/accounts')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ accounts: [] }) });
+      if (path.includes('/api/cross-plane/identities')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: [] }) });
+      if (path.includes('/api/cross-plane/grants')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ grants: [] }) });
+      if (path.includes('/api/cross-plane/audit')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ records: [] }) });
+      if (path.includes('/api/cross-plane/action/adapters')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ capabilities: [{ platform: 'feishu', operation: 'send_file', live_supported: true, adapter_bound: true }] }) });
+      if (path.includes('/api/cross-plane/action/executions')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ executions: [] }) });
+      if (path.includes('/api/cross-plane/action/preflight')) {
+        const body = JSON.parse(options.body);
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          dispatch_target: {
+            ready: true,
+            platform: 'feishu',
+            operation: 'send_file',
+            session_key: 'feishu:demo',
+            blockers: [],
+            outbound_message: { payload_kind: 'file', payload_ref: body.resource_ref, text: body.resource_ref },
+          },
+        }) });
+      }
+      if (path.includes('/api/cross-plane/action/execute')) {
+        const body = JSON.parse(options.body);
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          status: 'planned',
+          dispatch_status: 'dry_run',
+          dispatched: false,
+          dispatch_target: {
+            ready: true,
+            platform: 'feishu',
+            operation: 'send_file',
+            session_key: 'feishu:demo',
+            blockers: [],
+            outbound_message: { payload_kind: 'file', payload_ref: body.action.resource_ref, text: body.action.resource_ref },
+          },
+        }) });
+      }
+      if (path === '/api/platforms') return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderGateway();
+    const operation = document.querySelector('.cross-plane-composer select[aria-label="Operation"]');
+    operation.value = 'send_file';
+    operation.dispatchEvent(new Event('change'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const fileSelect = document.querySelector('.cross-plane-file-picker select');
+    expect(document.querySelector('.cross-plane-file-picker').classList.contains('hidden')).toBe(false);
+    expect([...fileSelect.options].map(opt => opt.value)).toContain('reports/panel.txt');
+    fileSelect.value = 'reports/panel.txt';
+    fileSelect.dispatchEvent(new Event('change'));
+    expect(document.querySelector('.cross-plane-composer textarea').value).toBe('workspace://file/reports/panel.txt');
+
+    document.querySelector('.cross-plane-actions button').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const preflightBody = JSON.parse(mockF.mock.calls.find(call => String(call[0]).includes('/api/cross-plane/action/preflight'))[1].body);
+    expect(preflightBody.requested_capability).toBe('channel.feishu.send_file');
+    expect(preflightBody.resource_ref).toBe('workspace://file/reports/panel.txt');
+
+    document.querySelectorAll('.cross-plane-actions button')[1].click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const executeBody = JSON.parse(mockF.mock.calls.find(call => String(call[0]).includes('/api/cross-plane/action/execute'))[1].body);
+    expect(executeBody.action.resource_ref).toBe('workspace://file/reports/panel.txt');
+    expect(document.getElementById('panel-content').textContent).toContain('Execution Result');
+  });
+
   it('index exposes the context panel tab and slash command', () => {
     const html = fs.readFileSync('index.html', 'utf8');
     expect(html).toContain('data-panel="context"');
@@ -808,12 +1310,16 @@ describe('API module', () => {
         return Promise.resolve({
           ok: true,
           json: () => Promise.resolve({
-            envelopes: [{
+            summaries: [{
               envelope_id: 'ctx-1',
               run_id: 'run-1',
               sequence: 4,
               created_at_ms: 1000,
-              envelope: { id: 'ctx-1', profile: 'MainTurn', intent: 'ship now', diagnostics: { pressure_bp: 150 } },
+              profile: 'MainTurn',
+              intent: 'ship now',
+              pressure_bp: 150,
+              selected_count: 1,
+              omitted_count: 0,
             }]
           })
         });
@@ -864,6 +1370,21 @@ describe('API module', () => {
             action: 'PreferOrientationPacket',
             reason: 'source fallback detected; prefer compact orientation before broad recall',
           },
+          cache_stability: {
+            prompt_cache_friendly: true,
+            reason: 'stable head and runtime header are reusable; only dynamic tail changed',
+          },
+          mode_coverage: {
+            required_profiles: ['MainTurn', 'SoloGoal', 'YoloGoal', 'SubAgent'],
+            all_profiles_covered: true,
+            all_stable_heads_reusable: true,
+            entries: [
+              { profile: 'MainTurn', mode: 'MainTurn', stable_head_reusable: true, pressure_bp: 150 },
+              { profile: 'SoloGoal', mode: 'SoloGoal', stable_head_reusable: true, pressure_bp: 180 },
+              { profile: 'YoloGoal', mode: 'YoloGoal', stable_head_reusable: true, pressure_bp: 200 },
+              { profile: 'SubAgent', mode: 'SubAgent', stable_head_reusable: true, pressure_bp: 90 },
+            ],
+          },
         })
       });
     }));
@@ -875,8 +1396,11 @@ describe('API module', () => {
     const text = document.getElementById('panel-content').textContent;
     expect(text).toContain('Context Runtime');
     expect(text).toContain('Runtime Probe');
+    expect(text).toContain('Mode Coverage');
     expect(text).toContain('SourceFallback');
     expect(text).toContain('PreferOrientationPacket');
+    expect(text).toContain('friendly');
+    expect(text).toContain('SubAgent');
     expect(text).toContain('runtime');
     expect(text).toContain('SessionKernel owns durable sessions');
     expect(text).toContain('session://s1/memory/mem-1');
@@ -894,10 +1418,116 @@ describe('API module', () => {
     expect(text).toContain('ship now');
     expect(text).toContain('historical cargo test passed');
     expect(text).toContain('tool://test/evidence/event-1');
+    expect(document.querySelector('.runtime-context-link').textContent).toContain('ctx-1');
+
+    document.querySelector('.runtime-context-link').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(document.getElementById('panel-content').textContent).toContain('historical cargo test passed');
 
     document.querySelector('.context-evidence-ref').click();
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(document.getElementById('panel-content').textContent).toContain('"available": true');
+  });
+
+  it('renders paginated context history and appends older summary pages', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    window.Api.sid = 's1';
+    const mockF = vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/sessions/s1/context/recommendations')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ recommendations: [] }) });
+      }
+      if (path.includes('/api/sessions/s1/runs')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ runs: [] }) });
+      }
+      if (path.includes('/api/context/ctx-a')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            context: {
+              envelope_id: 'ctx-a',
+              envelope: {
+                id: 'ctx-a',
+                profile: 'MainTurn',
+                diagnostics: { pressure_bp: 120 },
+                selected: [{ role: 'Evidence', source: 'Memory', content: 'first page detail', score: 0.9 }],
+                omitted: [],
+              },
+            },
+          })
+        });
+      }
+      if (path.includes('/api/sessions/s1/context?from_seq=12')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            summaries: [{
+              envelope_id: 'ctx-b',
+              run_id: 'run-b',
+              sequence: 12,
+              created_at_ms: 1200,
+              profile: 'Review',
+              intent: 'second page context',
+              pressure_bp: 90,
+            }],
+            next_seq: 13,
+            has_more: false,
+          })
+        });
+      }
+      if (path.includes('/api/sessions/s1/context')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            summaries: [{
+              envelope_id: 'ctx-a',
+              run_id: 'run-a',
+              sequence: 4,
+              created_at_ms: 1000,
+              profile: 'MainTurn',
+              intent: 'first page context',
+              pressure_bp: 120,
+            }],
+            next_seq: 12,
+            has_more: true,
+          })
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          enabled: true,
+          source: 'runtime',
+          envelope: {
+            id: 'ctx-current',
+            profile: 'MainTurn',
+            selected: [],
+            omitted: [],
+            budget: { total_tokens: 8000, used_tokens: 0 },
+            diagnostics: {},
+            assembled: {},
+          },
+        })
+      });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderContext();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(document.getElementById('panel-content').textContent).toContain('first page context');
+    const more = document.querySelector('.context-history-more');
+    expect(more).not.toBeNull();
+    more.click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(String(mockF.mock.calls.find(call => String(call[0]).includes('from_seq=12'))[0]))
+      .toBe('/api/sessions/s1/context?from_seq=12&limit=8&include_envelopes=false');
+    expect(document.getElementById('panel-content').textContent).toContain('second page context');
+    expect(document.querySelector('.context-history-more')).toBeNull();
   });
 
   it('renders the runtime console as a unified operational view', async () => {
@@ -932,13 +1562,74 @@ describe('API module', () => {
           })
         });
       }
+      if (path.includes('/api/context/ctx-console-1')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            context: {
+              envelope_id: 'ctx-console-1',
+              run_id: 'run-console-1',
+              sequence: 13,
+              envelope: {
+                id: 'ctx-console-1',
+                profile: 'YoloGoal',
+                diagnostics: { pressure_bp: 650 },
+                selected: [{
+                  role: 'Evidence',
+                  source: 'RuntimeTimeline',
+                  content: 'Runtime timeline context detail loaded',
+                  score: 0.92,
+                }],
+                omitted: [],
+              },
+            },
+          })
+        });
+      }
       if (path.includes('/api/runtime/timeline')) {
         return Promise.resolve({
           ok: true,
           json: () => Promise.resolve({
-            total: 2,
+            total: 3,
             next_seq: 12,
             degraded: false,
+            health_summary: {
+              status: 'healthy',
+              score: 100,
+              event_count: 3,
+              failed_events: 0,
+              degraded_events: 0,
+              open_tasks: 0,
+              positive_agent_lift: true,
+              latest_value_score: 72,
+              reasons: ['runtime event spine is coherent'],
+              scope_counts: { policy: 1, tool: 1, workgraph: 1 },
+            },
+            value_loop: {
+              status: 'complete',
+              score: 100,
+              event_count: 8,
+              required_total: 7,
+              required_observed: 7,
+              missing_required_count: 0,
+              failed_events: 0,
+              degraded_events: 0,
+              open_tasks: 0,
+              positive_agent_lift: true,
+              latest_value_score: 72,
+              stages: [
+                { id: 'intake', label: 'Intake', required: true, status: 'observed', event_count: 1 },
+                { id: 'context', label: 'Context', required: true, status: 'observed', event_count: 1 },
+                { id: 'memory', label: 'Memory', required: true, status: 'observed', event_count: 1 },
+                { id: 'governance', label: 'Governance', required: true, status: 'observed', event_count: 1 },
+                { id: 'task', label: 'Task', required: true, status: 'observed', event_count: 2 },
+                { id: 'execution', label: 'Execution', required: true, status: 'observed', event_count: 1 },
+                { id: 'agent', label: 'Agent', required: true, status: 'observed', event_count: 1 },
+                { id: 'channel', label: 'Channel', required: false, status: 'optional', event_count: 0 },
+              ],
+              reasons: ['runtime value loop has all required stages and no blocking defects'],
+              next_actions: ['no blocking action required for the selected runtime timeline'],
+            },
             workgraph_summary: {
               count: 1,
               latest: {
@@ -950,18 +1641,69 @@ describe('API module', () => {
                 completion_rate: 1,
                 synthesis_lift: 1.2,
                 complementarity_score: 0.75,
+                value_verdict: {
+                  positive_lift: true,
+                  continue_multi_agent: true,
+                  value_score: 72,
+                  reasons: ['positive_multi_agent_lift'],
+                },
               },
               agent_tasks: 1,
               memory_candidates: 1,
               conflicts: 1,
             },
+            agent_value: {
+              status: 'review_required',
+              recommendation: 'review_conflicts',
+              policy_passed: false,
+              policy: {
+                enabled: true,
+                max_parallel_agents: 4,
+                review_on_conflict: true,
+                require_positive_lift: true,
+                min_collaboration_score: 50,
+              },
+              latest: {
+                sequence: 12,
+                kind: 'agent.workgraph.reviewed',
+                value_score: 72,
+                positive_lift: true,
+                continue_multi_agent: true,
+                completion_rate: 1,
+                synthesis_lift: 1.2,
+                complementarity_score: 0.75,
+                conflict_count: 1,
+                agent_tasks: 1,
+              },
+              reasons: ['1 conflict(s) require review', 'positive_multi_agent_lift'],
+            },
             events: [
+              {
+                kind: 'runtime.policy.decided',
+                scope: 'policy',
+                status: 'completed',
+                sequence: 10,
+                created_at_ms: 1008,
+                payload: {
+                  complexity: {
+                    level: 'Complex',
+                    score: 70,
+                    signals: [{ name: 'engineering_change' }, { name: 'verification_required' }],
+                  },
+                  agent_mode: 'Parallel',
+                  requires_review: false,
+                  recommended_profile: 'Collaboration',
+                },
+              },
               {
                 kind: 'ToolComplete',
                 scope: 'tool',
                 sequence: 11,
                 created_at_ms: 1010,
-                refs: [{ type: 'runtime_run', id: 'run-console-1' }],
+                refs: [
+                  { type: 'runtime_run', id: 'run-console-1' },
+                  { type: 'context_envelope', id: 'ctx-console-1' },
+                ],
                 payload: { summary: 'cargo test completed' },
               },
               {
@@ -991,10 +1733,98 @@ describe('API module', () => {
                     complementarity_score: 0.75,
                     conflict_count: 1,
                   },
+                  value_verdict: {
+                    positive_lift: true,
+                    continue_multi_agent: true,
+                    value_score: 72,
+                    reasons: ['positive_multi_agent_lift'],
+                  },
                   maintenance_candidates: [{ id: 'maint-graph' }],
                 },
               },
             ]
+          })
+        });
+      }
+      if (path.includes('/api/runtime/config/effective')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            source: 'default',
+            control_policy: {
+              enabled: true,
+              agent: { max_parallel_agents: 4 },
+            },
+          })
+        });
+      }
+      if (path.includes('/api/runtime/control-plane')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            kind: 'runtime_control_plane',
+            status: 'healthy',
+            degraded: false,
+            profile_id: 'default',
+            config: { source: 'default', scenario: 'coding' },
+            diagnostics: {
+              component_count: 8,
+              capability_count: 9,
+              stored_sessions: 2,
+              open_tasks: 1,
+              elapsed_ms: 7,
+              performance_status: 'healthy',
+              production_ready: true,
+              readiness_score: 100,
+              required_check_count: 10,
+              ready_required_count: 10,
+              blocked_required_count: 0,
+              provider_configured: true,
+              provider_count: 1,
+              provider_model_count: 2,
+              configured_model_resolved: true,
+            },
+            readiness: {
+              production_ready: true,
+              score: 100,
+              required_total: 10,
+              required_ready: 10,
+              required_blocked: 0,
+              checks: [{ id: 'session.sqlite_source_of_truth', status: 'ready', required: true }],
+              blocked: [],
+            },
+            components: {
+              session: { source_of_truth: 'sqlite', active_count: 1, durable_store: true },
+              memory: { status: 'available', search_mode: 'hybrid' },
+              context: { durable_history: true },
+              agent: { status: 'available', max_parallel_agents: 4 },
+              task: { open: 1 },
+              permissions: { auth_required: false, approval_gate: true },
+              provider: {
+                status: 'available',
+                provider_count: 1,
+                model_count: 2,
+                configured_model: 'sonnet-enterprise',
+                configured_model_provider: 'anthropic',
+                configured_model_resolved: true,
+              },
+              channels: { adapters: [{ id: 'wechat-ilink' }, { id: 'cross-plane' }] },
+            },
+            capabilities: ['session.sqlite_source_of_truth', 'permission.cross_plane'],
+            degraded_reasons: [],
+          })
+        });
+      }
+      if (path.includes('/api/runtime/providers/reload')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            kind: 'runtime_provider_reload',
+            status: 'applied',
+            applied: true,
+            provider_count: 1,
+            provider_model_count: 2,
+            configured_model_resolved: true,
           })
         });
       }
@@ -1062,6 +1892,22 @@ describe('API module', () => {
     const text = document.getElementById('panel-content').textContent;
     expect(text).toContain('Runtime Console');
     expect(text).toContain('Runtime State');
+    expect(text).toContain('Control Plane');
+    expect(text).toContain('sqlite');
+    expect(text).toContain('hybrid');
+    expect(text).toContain('permission.cross_plane');
+    expect(text).toContain('channels');
+    expect(text).toContain('stored');
+    expect(text).toContain('latency');
+    expect(text).toContain('perf');
+    expect(text).toContain('ready');
+    expect(text).toContain('blocked');
+    expect(text).toContain('provider');
+    expect(text).toContain('models');
+    expect(text).toContain('route');
+    expect(text).toContain('Reload providers');
+    expect(text).toContain('components');
+    expect(text).toContain('caps');
     expect(text).toContain('Runtime Probe');
     expect(text).toContain('TrimDynamicTail');
     expect(text).toContain('TrimToolTrace');
@@ -1070,11 +1916,29 @@ describe('API module', () => {
     expect(text).toContain('spans');
     expect(text).toContain('run-console-1');
     expect(text).toContain('Runtime Timeline');
+    expect(text).toContain('Value Loop');
+    expect(text).toContain('complete');
+    expect(text).toContain('Intake');
+    expect(text).toContain('Governance');
+    expect(text).toContain('Runtime Health');
+    expect(text).toContain('healthy');
+    expect(text).toContain('agent lift');
+    expect(text).toContain('runtime event spine is coherent');
+    expect(text).toContain('Runtime Control');
+    expect(text).toContain('Complex');
+    expect(text).toContain('Parallel');
+    expect(text).toContain('runtime.policy.decided');
     expect(text).toContain('ToolComplete');
     expect(text).toContain('agent.workgraph.reviewed');
     expect(text).toContain('runtime_run:run-console-1');
+    expect(text).toContain('context_envelope:ctx-console-1');
+    expect(document.querySelector('.runtime-timeline .runtime-context-link').textContent).toContain('ctx-console-1');
     expect(text).toContain('workgraph:workgraph-1');
     expect(text).toContain('Agent WorkGraph');
+    expect(text).toContain('Agent Value');
+    expect(text).toContain('review_conflicts');
+    expect(text).toContain('threshold');
+    expect(text).toContain('positive yes');
     expect(text).toContain('100%');
     expect(text).toContain('conflicts');
     expect(text).toContain('candidates');
@@ -1082,6 +1946,21 @@ describe('API module', () => {
     expect(text).toContain('Runtime console should show unified state');
     expect(text).toContain('Memory Maintenance');
     expect(text).toContain('Review stale memory');
+
+    const reloadButton = Array.from(document.querySelectorAll('button'))
+      .find(button => button.textContent.includes('Reload providers'));
+    expect(reloadButton).toBeTruthy();
+    reloadButton.click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/runtime/providers/reload',
+      expect.objectContaining({ method: 'POST' })
+    );
+
+    document.querySelector('.runtime-timeline .runtime-context-link').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(document.getElementById('panel-content').textContent).toContain('Runtime timeline context detail loaded');
   });
 
   it('renders recall explain metadata in the memory panel', async () => {

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -35,8 +35,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: None,
             prepare: prepare_noop,
             assert: assert_streaming_text,
-            extra_env: None,
-            resume_session: None,
         },
         ScenarioCase {
             name: "read_file_roundtrip",
@@ -45,8 +43,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: None,
             prepare: prepare_read_fixture,
             assert: assert_read_file_roundtrip,
-            extra_env: None,
-            resume_session: None,
         },
         ScenarioCase {
             name: "grep_chunk_assembly",
@@ -55,8 +51,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: None,
             prepare: prepare_grep_fixture,
             assert: assert_grep_chunk_assembly,
-            extra_env: None,
-            resume_session: None,
         },
         ScenarioCase {
             name: "write_file_allowed",
@@ -65,8 +59,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: None,
             prepare: prepare_noop,
             assert: assert_write_file_allowed,
-            extra_env: None,
-            resume_session: None,
         },
         ScenarioCase {
             name: "write_file_denied",
@@ -75,8 +67,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: None,
             prepare: prepare_noop,
             assert: assert_write_file_denied,
-            extra_env: None,
-            resume_session: None,
         },
         ScenarioCase {
             name: "multi_tool_turn_roundtrip",
@@ -85,8 +75,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: None,
             prepare: prepare_multi_tool_fixture,
             assert: assert_multi_tool_turn_roundtrip,
-            extra_env: None,
-            resume_session: None,
         },
         ScenarioCase {
             name: "bash_stdout_roundtrip",
@@ -95,8 +83,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: None,
             prepare: prepare_noop,
             assert: assert_bash_stdout_roundtrip,
-            extra_env: None,
-            resume_session: None,
         },
         ScenarioCase {
             name: "bash_permission_prompt_approved",
@@ -105,8 +91,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: Some("y\n"),
             prepare: prepare_noop,
             assert: assert_bash_permission_prompt_approved,
-            extra_env: None,
-            resume_session: None,
         },
         ScenarioCase {
             name: "bash_permission_prompt_denied",
@@ -115,8 +99,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: Some("n\n"),
             prepare: prepare_noop,
             assert: assert_bash_permission_prompt_denied,
-            extra_env: None,
-            resume_session: None,
         },
         ScenarioCase {
             name: "plugin_tool_roundtrip",
@@ -125,8 +107,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: None,
             prepare: prepare_plugin_fixture,
             assert: assert_plugin_tool_roundtrip,
-            extra_env: None,
-            resume_session: None,
         },
         ScenarioCase {
             name: "auto_compact_triggered",
@@ -135,8 +115,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: None,
             prepare: prepare_noop,
             assert: assert_auto_compact_triggered,
-            extra_env: None,
-            resume_session: None,
         },
         ScenarioCase {
             name: "token_cost_reporting",
@@ -145,8 +123,6 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             stdin: None,
             prepare: prepare_noop,
             assert: assert_token_cost_reporting,
-            extra_env: None,
-            resume_session: None,
         },
     ];
 
@@ -271,8 +247,6 @@ struct ScenarioCase {
     stdin: Option<&'static str>,
     prepare: fn(&HarnessWorkspace),
     assert: fn(&HarnessWorkspace, &ScenarioRun),
-    extra_env: Option<(&'static str, &'static str)>,
-    resume_session: Option<&'static str>,
 }
 
 struct HarnessWorkspace {
@@ -364,12 +338,6 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
     if let Some(allowed_tools) = case.allowed_tools {
         command.args(["--allowedTools", allowed_tools]);
     }
-    if let Some((key, value)) = case.extra_env {
-        command.env(key, value);
-    }
-    if let Some(session_id) = case.resume_session {
-        command.args(["--resume", session_id]);
-    }
 
     let prompt = format!("{SCENARIO_PREFIX}{}", case.name);
     command.arg(prompt);
@@ -398,28 +366,6 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         response: parse_json_output(&stdout),
         stdout,
     }
-}
-
-#[allow(dead_code)]
-fn prepare_auto_compact_fixture(workspace: &HarnessWorkspace) {
-    let sessions_dir = workspace.root.join(".cowd").join("sessions");
-    fs::create_dir_all(&sessions_dir).expect("sessions dir should exist");
-
-    // Write a pre-seeded session with 6 messages so auto-compact can remove them
-    let session_id = "parity-auto-compact-seed";
-    let session_jsonl = r#"{"type":"session_meta","version":3,"session_id":"parity-auto-compact-seed","created_at_ms":1743724800000,"updated_at_ms":1743724800000}
-{"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"step one of the parity scenario"}]}}
-{"type":"message","message":{"role":"assistant","blocks":[{"type":"text","text":"acknowledged step one"}]}}
-{"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"step two of the parity scenario"}]}}
-{"type":"message","message":{"role":"assistant","blocks":[{"type":"text","text":"acknowledged step two"}]}}
-{"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"step three of the parity scenario"}]}}
-{"type":"message","message":{"role":"assistant","blocks":[{"type":"text","text":"acknowledged step three"}]}}
-"#;
-    fs::write(
-        sessions_dir.join(format!("{session_id}.jsonl")),
-        session_jsonl,
-    )
-    .expect("pre-seeded session should write");
 }
 
 fn prepare_noop(_: &HarnessWorkspace) {}
@@ -522,12 +468,10 @@ fn assert_read_file_roundtrip(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_uses"][0]["input"],
         Value::String(r#"{"path":"fixture.txt"}"#.to_string())
     );
-    assert!(
-        run.response["message"]
-            .as_str()
-            .expect("message text")
-            .contains("alpha parity line")
-    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("alpha parity line"));
     let output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
@@ -547,12 +491,10 @@ fn assert_grep_chunk_assembly(_: &HarnessWorkspace, run: &ScenarioRun) {
             r#"{"pattern":"parity","path":"fixture.txt","output_mode":"count"}"#.to_string()
         )
     );
-    assert!(
-        run.response["message"]
-            .as_str()
-            .expect("message text")
-            .contains("2 occurrences")
-    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("2 occurrences"));
     assert_eq!(
         run.response["tool_results"][0]["is_error"],
         Value::Bool(false)
@@ -565,12 +507,10 @@ fn assert_write_file_allowed(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_uses"][0]["name"],
         Value::String("write_file".to_string())
     );
-    assert!(
-        run.response["message"]
-            .as_str()
-            .expect("message text")
-            .contains("generated/output.txt")
-    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("generated/output.txt"));
     let generated = workspace.root.join("generated").join("output.txt");
     let contents = fs::read_to_string(&generated).expect("generated file should exist");
     assert_eq!(contents, "created by mock service\n");
@@ -594,12 +534,10 @@ fn assert_write_file_denied(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_results"][0]["is_error"],
         Value::Bool(true)
     );
-    assert!(
-        run.response["message"]
-            .as_str()
-            .expect("message text")
-            .contains("denied as expected")
-    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("denied as expected"));
     assert!(!workspace.root.join("generated").join("denied.txt").exists());
 }
 
@@ -626,18 +564,14 @@ fn assert_multi_tool_turn_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
         2,
         "expected two tool results in a single turn"
     );
-    assert!(
-        run.response["message"]
-            .as_str()
-            .expect("message text")
-            .contains("alpha parity line")
-    );
-    assert!(
-        run.response["message"]
-            .as_str()
-            .expect("message text")
-            .contains("2 occurrences")
-    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("alpha parity line"));
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("2 occurrences"));
 }
 
 fn assert_bash_stdout_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -659,12 +593,10 @@ fn assert_bash_stdout_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_results"][0]["is_error"],
         Value::Bool(false)
     );
-    assert!(
-        run.response["message"]
-            .as_str()
-            .expect("message text")
-            .contains("alpha from bash")
-    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("alpha from bash"));
 }
 
 fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -683,12 +615,10 @@ fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRu
         parsed["stdout"],
         Value::String("approved via prompt".to_string())
     );
-    assert!(
-        run.response["message"]
-            .as_str()
-            .expect("message text")
-            .contains("approved and executed")
-    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("approved and executed"));
 }
 
 fn assert_bash_permission_prompt_denied(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -703,12 +633,10 @@ fn assert_bash_permission_prompt_denied(_: &HarnessWorkspace, run: &ScenarioRun)
         run.response["tool_results"][0]["is_error"],
         Value::Bool(true)
     );
-    assert!(
-        run.response["message"]
-            .as_str()
-            .expect("message text")
-            .contains("denied as expected")
-    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("denied as expected"));
 }
 
 fn assert_plugin_tool_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -730,12 +658,10 @@ fn assert_plugin_tool_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
         parsed["input"]["message"],
         Value::String("hello from plugin parity".to_string())
     );
-    assert!(
-        run.response["message"]
-            .as_str()
-            .expect("message text")
-            .contains("hello from plugin parity")
-    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("hello from plugin parity"));
 }
 
 fn assert_auto_compact_triggered(_: &HarnessWorkspace, run: &ScenarioRun) {
@@ -770,12 +696,10 @@ fn assert_auto_compact_triggered(_: &HarnessWorkspace, run: &ScenarioRun) {
 
 fn assert_token_cost_reporting(_: &HarnessWorkspace, run: &ScenarioRun) {
     assert_eq!(run.response["iterations"], Value::from(1));
-    assert!(
-        run.response["message"]
-            .as_str()
-            .expect("message text")
-            .contains("token cost reporting parity complete."),
-    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("token cost reporting parity complete."),);
     let usage = &run.response["usage"];
     assert!(
         usage["input_tokens"].as_u64().unwrap_or(0) > 0,

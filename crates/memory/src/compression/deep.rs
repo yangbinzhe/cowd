@@ -17,17 +17,14 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use crate::{
-    MemoryScope,
-    compression::{
-        llm_summarizer::LlmSummarizer,
-        Result,
-    },
+    compression::{llm_summarizer::LlmSummarizer, Result},
     config::CompressionConfig,
     orchestrator::MemoryOrchestrator,
     types::{
         CompactionResult, MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Message,
         MessageRole, Priority,
     },
+    MemoryScope,
 };
 
 // ---------------------------------------------------------------------------
@@ -207,7 +204,11 @@ impl DeepCompactor {
     /// When an LLM summariser is available, it is used to generate a semantic
     /// summary. On failure (or when no summariser is configured), the method
     /// falls back to the template-based heuristic.
-    async fn build_deep_summary(&self, messages: &[Message], previous_summary: Option<&str>) -> String {
+    async fn build_deep_summary(
+        &self,
+        messages: &[Message],
+        previous_summary: Option<&str>,
+    ) -> String {
         // Try LLM summariser first
         if let Some(ref summarizer) = self.llm_summarizer {
             let content: String = messages
@@ -228,7 +229,8 @@ impl DeepCompactor {
                 None => "Generate a comprehensive deep compression summary of the following \
                           conversation. Include all key decisions, open questions, important \
                           code changes, and a content digest. Be thorough and preserve all \
-                          critical information.".to_string(),
+                          critical information."
+                    .to_string(),
             };
 
             match summarizer.summarize(&prompt, &content).await {
@@ -243,7 +245,10 @@ impl DeepCompactor {
                     tracing::warn!("LLM returned empty deep summary, falling back to template");
                 }
                 Err(e) => {
-                    tracing::warn!("LLM deep summarisation failed, falling back to template: {}", e);
+                    tracing::warn!(
+                        "LLM deep summarisation failed, falling back to template: {}",
+                        e
+                    );
                 }
             }
         }
@@ -253,7 +258,11 @@ impl DeepCompactor {
     }
 
     /// Template-based heuristic deep summary generation (fallback).
-    fn build_deep_summary_template(&self, messages: &[Message], previous_summary: Option<&str>) -> String {
+    fn build_deep_summary_template(
+        &self,
+        messages: &[Message],
+        previous_summary: Option<&str>,
+    ) -> String {
         let incremental = self.generate_incremental_summary(messages);
 
         match previous_summary {
@@ -301,7 +310,11 @@ impl DeepCompactor {
         }
     }
 
-    fn merge_summaries(&self, previous: &str, incremental: &IncrementalSummary) -> IncrementalSummary {
+    fn merge_summaries(
+        &self,
+        previous: &str,
+        incremental: &IncrementalSummary,
+    ) -> IncrementalSummary {
         // Blend previous-summary decisions with newly discovered ones.
         let mut merged_decisions: Vec<String> = extract_decisions_from_text(previous);
         for d in &incremental.decisions {
@@ -339,7 +352,11 @@ impl DeepCompactor {
         previous_summary: Option<&str>,
     ) -> String {
         let is_iterative = previous_summary.is_some();
-        let mode = if is_iterative { "iterative update" } else { "initial deep compression" };
+        let mode = if is_iterative {
+            "iterative update"
+        } else {
+            "initial deep compression"
+        };
 
         let decisions_text = if summary.decisions.is_empty() {
             "No key decisions identified.".into()
@@ -387,7 +404,10 @@ impl DeepCompactor {
             tools = summary.tool_calls,
             decisions = decisions_text,
             questions = questions_text,
-            digest = &summary.content_digest[..summary.content_digest.len().min(self.config.max_summary_chars)],
+            digest = &summary.content_digest[..summary
+                .content_digest
+                .len()
+                .min(self.config.max_summary_chars)],
             aggressiveness = self.config.aggressiveness,
         )
     }
@@ -427,13 +447,11 @@ impl DeepCompressor {
 
         let mut sorted = entries;
         sorted.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
-                .then_with(|| {
-                    a.staleness
-                        .partial_cmp(&b.staleness)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+            b.priority.cmp(&a.priority).then_with(|| {
+                a.staleness
+                    .partial_cmp(&b.staleness)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
         sorted.truncate(keep);
         Ok(sorted)
@@ -460,7 +478,12 @@ fn estimate_tokens(messages: &[Message]) -> u32 {
 
 fn extract_decisions(messages: &[Message]) -> Vec<String> {
     let keywords = [
-        "decided", "chosen", "agreed", "will use", "we should", "let's use",
+        "decided",
+        "chosen",
+        "agreed",
+        "will use",
+        "we should",
+        "let's use",
     ];
     let mut decisions = Vec::new();
     for msg in messages {
@@ -481,7 +504,12 @@ fn extract_decisions(messages: &[Message]) -> Vec<String> {
 
 fn extract_decisions_from_text(text: &str) -> Vec<String> {
     let keywords = [
-        "decided", "chosen", "agreed", "will use", "we should", "let's use",
+        "decided",
+        "chosen",
+        "agreed",
+        "will use",
+        "we should",
+        "let's use",
     ];
     let mut decisions = Vec::new();
     for line in text.lines() {
@@ -516,7 +544,14 @@ mod tests {
     use crate::types::{Message, MessageRole};
 
     fn msg(role: MessageRole, content: &str) -> Message {
-        Message { turn_index: 0, role, content: content.into(), tool_use_id: None, tool_name: None, pinned: false }
+        Message {
+            turn_index: 0,
+            role,
+            content: content.into(),
+            tool_use_id: None,
+            tool_name: None,
+            pinned: false,
+        }
     }
 
     #[test]
@@ -529,7 +564,10 @@ mod tests {
 
     #[test]
     fn from_config_reads_aggressiveness() {
-        let cc = CompressionConfig { aggressiveness: 0.5, ..Default::default() };
+        let cc = CompressionConfig {
+            aggressiveness: 0.5,
+            ..Default::default()
+        };
         let cfg = DeepCompactConfig::from_config(&cc);
         assert_eq!(cfg.aggressiveness, 0.5);
     }

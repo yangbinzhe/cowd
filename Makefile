@@ -21,7 +21,7 @@ help:
 	@echo "  Build jobs: $(SAFE_BUILD_JOBS)  |  Test threads: $(SAFE_TEST_THREADS)  |  CC_NUM_JOBS: $(CC_NUM_JOBS)"
 	@echo ""
 	@echo "  make check       - cargo check --workspace"
-	@echo "  make test        - cargo test -p config"
+	@echo "  make test        - lightweight runtime config + logging smoke tests"
 	@echo "  make test-all    - cargo test --workspace"
 	@echo "  make build       - cargo build --workspace"
 	@echo "  make tui-smoke   - run tmux-backed TUI startup smoke test"
@@ -33,12 +33,14 @@ check:
 	cargo check --workspace -j $(SAFE_BUILD_JOBS)
 
 test:
-	@echo "=== cargo test -p config ($(SAFE_TEST_THREADS) threads) ==="
-	cargo test -p config -- --test-threads=$(SAFE_TEST_THREADS)
+	@echo "=== cargo test -p runtime config ($(SAFE_TEST_THREADS) threads) ==="
+	cargo test -p runtime config -- --test-threads=$(SAFE_TEST_THREADS)
+	@echo "=== cargo test -p cowd-cli logging::tests ($(SAFE_TEST_THREADS) threads) ==="
+	cargo test -p cowd-cli logging::tests:: -- --test-threads=$(SAFE_TEST_THREADS)
 
 test-config:
-	@echo "=== cargo test -p config ($(SAFE_TEST_THREADS) threads) ==="
-	cargo test -p config -- --test-threads=$(SAFE_TEST_THREADS)
+	@echo "=== cargo test -p runtime config ($(SAFE_TEST_THREADS) threads) ==="
+	cargo test -p runtime config -- --test-threads=$(SAFE_TEST_THREADS)
 
 test-all:
 	@echo "=== cargo test --workspace (jobs=$(SAFE_BUILD_JOBS), threads=$(SAFE_TEST_THREADS)) ==="

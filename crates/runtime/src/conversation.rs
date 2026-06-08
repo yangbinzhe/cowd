@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{RwLock, Semaphore};
@@ -38,17 +38,18 @@ use crate::agent::{SubAgentConfig, SubAgentRuntime};
 use crate::agent_collaboration::{CollaborationContextResult, CollaborationOps};
 use crate::agent_discussion::DiscussionEngine;
 use crate::compact::{
-    CompactionConfig, CompactionResult, compact_session, estimate_session_tokens,
+    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::context_runtime::{
     ContextAuthority, ContextEnvelope, ContextEnvelopeRequest, ContextIdentity, ContextItem,
-    ContextMode, ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
+    ContextOmission, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind,
     ContextVisibility, ResumeContextPacket, ToolTracePacket, ToolTraceStatus,
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::joint_problem_solving::{JpsOps, ProblemStatement};
 use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
+use crate::runtime_control::{RuntimeControlPolicy, TaskComplexityInput, TaskComplexityProfile};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::wave::{TaskId, TaskResult, WaveError, WaveExecutor, WaveTask};
@@ -176,19 +177,6 @@ pub trait MemoryCallback: Send + Sync {
     fn on_memory_stats(&self, total_entries: usize, vector_count: usize, layers: Vec<String>);
 }
 
-fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
-    match profile {
-        ContextProfile::MainTurn => ContextMode::MainTurn,
-        ContextProfile::SoloGoal => ContextMode::SoloGoal,
-        ContextProfile::YoloGoal => ContextMode::YoloGoal,
-        ContextProfile::SubAgent => ContextMode::SubAgent,
-        ContextProfile::Collaboration => ContextMode::Collaboration,
-        ContextProfile::Review => ContextMode::Review,
-        ContextProfile::Resume => ContextMode::Resume,
-        ContextProfile::Cron => ContextMode::Cron,
-    }
-}
-
 /// Error returned when a tool invocation fails locally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError {
@@ -290,7 +278,7 @@ pub struct ConversationRuntime<C, T> {
     memory_status: Option<String>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
-    /// Optional session store for message dual-write (JSONL + SQLite).
+    /// Optional managed SQLite session store for messages and runtime events.
     session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
     /// Optional event log for time-travel debugging and session rebuild.
     event_log: Option<std::sync::Mutex<SessionEventLog>>,
@@ -325,6 +313,8 @@ pub struct ConversationRuntime<C, T> {
     last_context_envelope: std::sync::Mutex<Option<ContextEnvelope>>,
     /// Active context profile used to assemble the next runtime envelope.
     context_profile: std::sync::Mutex<ContextProfile>,
+    /// Effective runtime control policy loaded from configuration.
+    runtime_control_policy: RuntimeControlPolicy,
     /// Runtime-owned context supplied by outer orchestration layers.
     external_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// Latest multi-agent collaboration packet for outer persistence.
@@ -501,6 +491,7 @@ where
             tool_orchestrator: crate::tool_orchestrator::ToolOrchestrator::default(),
             last_context_envelope: std::sync::Mutex::new(None),
             context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
+            runtime_control_policy: feature_config.runtime_control().policy.clone(),
             external_context_items: std::sync::Mutex::new(Vec::new()),
             last_collaboration_result: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
@@ -694,9 +685,67 @@ where
         if let Ok(mut guard) = self.last_context_envelope.lock() {
             *guard = Some(envelope.clone());
         }
+        self.persist_context_envelope(envelope.clone());
         if let Some(cowd) = self.cowd_bus() {
             cowd.emit(crate::cowd_event::CowdEvent::ContextEnvelope { envelope });
         }
+    }
+
+    fn persist_context_envelope(&self, envelope: ContextEnvelope) {
+        let Some(store) = self.session_store.as_ref() else {
+            return;
+        };
+        let session_id = envelope.identity.session_id.clone();
+        let envelope_id = envelope.id.clone();
+        let payload = serde_json::json!({
+            "type": "ContextEnvelope",
+            "envelope_id": envelope_id,
+            "session_id": session_id,
+            "agent_id": envelope.identity.agent_id.clone(),
+            "profile": envelope.profile,
+            "diagnostics": envelope.diagnostics.clone(),
+            "budget": envelope.budget.clone(),
+            "hashes": {
+                "stable_head": envelope.diagnostics.stable_head_hash,
+                "runtime_header": envelope.diagnostics.runtime_header_hash,
+                "dynamic_tail": envelope.diagnostics.dynamic_tail_hash,
+            },
+            "envelope": envelope,
+        });
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            let sequence = match store.next_event_sequence(&session_id).await {
+                Ok(sequence) => sequence,
+                Err(error) => {
+                    tracing::warn!(%error, session_id, "context envelope sequence allocation failed");
+                    return;
+                }
+            };
+            let created_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            let event = memory::SessionEvent {
+                session_id: session_id.clone(),
+                event_type: "ContextEnvelope".to_string(),
+                event_json: payload.to_string(),
+                sequence,
+                created_at_ms,
+            };
+            match store.append_context_envelope_event_if_absent(&event).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        session_id,
+                        sequence,
+                        "context envelope event already persisted"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, session_id, sequence, "context envelope event append failed");
+                }
+            }
+        });
     }
 
     fn context_budget_tokens(&self) -> u64 {
@@ -717,18 +766,16 @@ where
         let session_id = self.session().session_id;
         let profile = self.context_profile();
         let mut identity = ContextIdentity::main(session_id.clone());
-        identity.mode = context_mode_for_profile(profile);
+        identity.mode = ContextRuntimeKernel::mode_for_profile(profile);
         let mut selected_items = self.external_context_items();
         selected_items.extend(self.tool_trace_context_items());
         selected_items.extend(dynamic_items);
         let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
             profile,
+            runtime_header: ContextRuntimeKernel::runtime_header(&identity, profile),
             identity,
             intent: user_input.to_string(),
             stable_head: self.system_prompt.clone(),
-            runtime_header: vec![format!(
-                "session:{session_id} agent:primary profile:{profile:?}"
-            )],
             dynamic_items: selected_items,
             omitted,
             total_budget_tokens: self.context_budget_tokens(),
@@ -898,6 +945,12 @@ where
         self
     }
 
+    #[must_use]
+    pub fn with_runtime_control_policy(mut self, policy: RuntimeControlPolicy) -> Self {
+        self.runtime_control_policy = policy;
+        self
+    }
+
     /// P2-10: Register an EffectHandler for side-effect tracking.
     ///
     /// # Safety
@@ -1039,6 +1092,7 @@ where
             sub_rt.model = Some(m.clone());
         }
         sub_rt.set_context_profile(ContextProfile::SubAgent);
+        sub_rt.runtime_control_policy = self.runtime_control_policy.clone();
         sub_rt = sub_rt.with_model_context_window(lease.max_tokens.min(u64::from(u32::MAX)) as u32);
         sub_rt.max_iterations = config.max_turns;
         sub_rt.tool_orchestrator = self.tool_orchestrator.clone();
@@ -1068,30 +1122,12 @@ where
     }
 
     /// Determine whether the current user message warrants multi-agent collaboration.
-    ///
-    /// Uses a simple keyword heuristic; can be upgraded to LLM-based classification.
     fn should_use_collaboration(&self, user_message: &str) -> bool {
-        let multi_step_keywords = [
-            "multi-step",
-            "parallel",
-            "refactor",
-            "重构",
-            "migrate",
-            "迁移",
-            "deploy",
-            "部署",
-            "analyze",
-            "分析",
-            "implement",
-            "实现",
-        ];
-        let lower = user_message.to_lowercase();
-        multi_step_keywords.iter().any(|k| lower.contains(k))
-            || user_message
-                .split(|c: char| c.is_ascii_punctuation() || c == '\n')
-                .filter(|s| !s.trim().is_empty())
-                .count()
-                > 5
+        self.runtime_control_policy
+            .should_collaborate(&TaskComplexityInput::new(
+                user_message,
+                self.context_profile(),
+            ))
     }
 
     /// Infer required capability keywords from a task description.
@@ -1342,10 +1378,18 @@ where
             .await
             .push_user_text(user_input.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let user_sequence = self.session().messages.len().wrapping_sub(1);
         self.dual_write_message(
             &ConversationMessage::user_text(user_input.clone()),
-            self.session().messages.len().wrapping_sub(1),
+            user_sequence,
         );
+        let complexity = self
+            .runtime_control_policy
+            .profile_task(&TaskComplexityInput::new(
+                user_input.clone(),
+                self.context_profile(),
+            ));
+        self.record_runtime_policy_decision(&complexity, user_sequence);
 
         let mut effective_system_prompt = self.prepare_memory_context(&user_input).await;
 
@@ -1712,7 +1756,7 @@ where
             // Phase 2: Parallel+serial tool dispatch based on safety categories
             let mut callback_inject = None;
             {
-                use crate::tool_dispatch::{ToolRequest, categorize};
+                use crate::tool_dispatch::{categorize, ToolRequest};
                 use futures::stream::{FuturesUnordered, StreamExt};
 
                 let requests: Vec<ToolRequest> = pending_tool_uses
@@ -2301,7 +2345,11 @@ where
                         tool_name.to_string(),
                         effective_input.clone(),
                     ));
-                    if r.success { Some(r.data) } else { None }
+                    if r.success {
+                        Some(r.data)
+                    } else {
+                        None
+                    }
                 });
 
                 let start = Instant::now();
@@ -3028,8 +3076,10 @@ where
         Ok(())
     }
 
-    /// Write a message to the SQLite session store via a spawned background task.
-    /// JSONL is the canonical source; SQLite failure is logged and retried once.
+    /// Write a message to the durable SQLite session store via a spawned
+    /// background task. The in-memory session remains the hot turn state;
+    /// SQLite is the managed session source of truth. JSONL is only used by
+    /// explicit import/export codecs.
     fn dual_write_message(&self, msg: &crate::session::ConversationMessage, sequence: usize) {
         // Record the message in the event log for time-travel debugging.
         if let Some(ref log) = self.event_log {
@@ -3058,6 +3108,62 @@ where
                 }
             });
         }
+    }
+
+    fn record_runtime_policy_decision(&self, profile: &TaskComplexityProfile, sequence: usize) {
+        if let Some(ref cowd) = self.cowd_bus {
+            cowd.emit(crate::cowd_event::CowdEvent::RuntimePolicyDecision {
+                summary: crate::cowd_event::RuntimePolicyDecisionSummary {
+                    level: format!("{:?}", profile.level),
+                    score: profile.score,
+                    recommended_profile: format!("{:?}", profile.recommended_profile),
+                    agent_mode: format!("{:?}", profile.recommended_agent_mode),
+                    requires_review: profile.requires_review,
+                    signal_count: profile.signals.len(),
+                },
+            });
+        }
+
+        let Some(ref store) = self.session_store else {
+            return;
+        };
+        let session_id = self.session().session_id;
+        let payload = serde_json::json!({
+            "complexity": {
+                "level": format!("{:?}", profile.level),
+                "score": profile.score,
+                "signals": profile.signals,
+            },
+            "recommended_profile": format!("{:?}", profile.recommended_profile),
+            "agent_mode": format!("{:?}", profile.recommended_agent_mode),
+            "requires_review": profile.requires_review,
+        });
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let mut event = memory::RuntimeEvent::new(
+            session_id.clone(),
+            sequence,
+            memory::RuntimeEventScope::Policy,
+            "runtime.policy.decided",
+            payload,
+            created_at_ms,
+        );
+        event.status = Some("completed".to_string());
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            match event.to_session_event() {
+                Ok(record) => {
+                    if let Err(error) = store.append_event(&record).await {
+                        tracing::warn!(%error, session_id, sequence, "runtime policy event append failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, session_id, sequence, "runtime policy event serialization failed");
+                }
+            }
+        });
     }
 }
 
@@ -3336,18 +3442,16 @@ mod tests {
         ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
         PromptCacheEvent, RuntimeError, StaticToolExecutor,
     };
-    use crate::SubAgentConfig;
-    use crate::ToolError;
-    use crate::compact::CompactionConfig;
-    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::agent_collaboration::{
         AgentTeam, CollaborationContextResult, CollaborationOps, CollaborationReviewPacket,
         CollaborationScorecard, CollaborationTask, SubTask,
     };
     use crate::agent_workgraph::AgentWorkGraph;
+    use crate::compact::CompactionConfig;
+    use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
     use crate::context_runtime::{
-        ContextAuthority, ContextItem, ContextMode, ContextProfile, ContextRole,
-        ContextSourceKind, ResumeContextPacket, ResumeContextSource,
+        ContextAuthority, ContextItem, ContextMode, ContextProfile, ContextRole, ContextSourceKind,
+        ResumeContextPacket, ResumeContextSource,
     };
     use crate::permissions::{
         PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
@@ -3356,6 +3460,8 @@ mod tests {
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
+    use crate::SubAgentConfig;
+    use crate::ToolError;
     use futures::stream::Stream;
     use std::fs;
     use std::future::Future;
@@ -3391,12 +3497,10 @@ mod tests {
             self.call_count += 1;
             let events = match self.call_count {
                 1 => {
-                    assert!(
-                        request
-                            .messages
-                            .iter()
-                            .any(|message| message.role == MessageRole::User)
-                    );
+                    assert!(request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == MessageRole::User));
                     vec![
                         AssistantEvent::TextDelta("Let me calculate that.".to_string()),
                         AssistantEvent::ToolUse {
@@ -3828,12 +3932,10 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(
-                            request
-                                .messages
-                                .iter()
-                                .any(|message| message.role == MessageRole::Tool)
-                        );
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
                         to_stream(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -3911,12 +4013,10 @@ mod tests {
                         AssistantEvent::MessageStop,
                     ]),
                     2 => {
-                        assert!(
-                            request
-                                .messages
-                                .iter()
-                                .any(|message| message.role == MessageRole::Tool)
-                        );
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
                         to_stream(vec![
                             AssistantEvent::TextDelta("done".to_string()),
                             AssistantEvent::MessageStop,
@@ -4075,7 +4175,7 @@ mod tests {
     }
 
     #[test]
-    fn persists_conversation_turn_messages_to_jsonl_session() {
+    fn legacy_jsonl_persistence_remains_explicit_codec_only() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -4109,7 +4209,7 @@ mod tests {
 
         drop(runtime);
 
-        // Read back and verify through Session::load_from_path
+        // Read back and verify through the explicit local import/export codec.
         let restored = Session::load_from_path(&path).expect("persisted session should reload");
         assert_eq!(restored.messages.len(), 2); // user + assistant
         assert_eq!(restored.messages[0].role, MessageRole::User);
@@ -4119,7 +4219,7 @@ mod tests {
     }
 
     #[test]
-    fn dual_write_persists_messages_and_session_events() {
+    fn sqlite_session_store_is_runtime_turn_source_of_truth() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -4175,7 +4275,22 @@ mod tests {
                 .expect("turn should succeed");
 
             for _ in 0..20 {
-                if store.get_events(&session_id, 0).await.unwrap().len() >= 2 {
+                if store.get_events(&session_id, 0).await.unwrap().len() >= 3 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+
+            let envelope = runtime
+                .last_context_envelope()
+                .expect("context envelope should be remembered");
+            for _ in 0..20 {
+                if store
+                    .get_context_event_by_envelope_id(&envelope.id)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -4183,18 +4298,54 @@ mod tests {
 
             let messages = store.get_messages(&session_id, 0, 10).await.unwrap();
             let events = store.get_events(&session_id, 0).await.unwrap();
+            let stored_count = store.get_message_count(&session_id).await.unwrap();
+            let record = store
+                .get_session(&session_id)
+                .await
+                .unwrap()
+                .expect("session record should remain queryable");
+            let context_event = store
+                .get_context_event_by_envelope_id(&envelope.id)
+                .await
+                .unwrap()
+                .expect("context envelope should be persisted");
+            let context_json: serde_json::Value =
+                serde_json::from_str(&context_event.event_json).expect("context event json");
 
             assert_eq!(messages.len(), 2);
-            assert_eq!(events.len(), 2);
-            assert_eq!(events[0].event_type, "message_appended");
-            assert_eq!(events[0].sequence, 0);
-            assert_eq!(events[1].sequence, 1);
+            assert_eq!(stored_count, 2);
+            assert_eq!(record.session_id, session_id);
+            assert_eq!(record.chat_id, session_id);
+            assert!(events.len() >= 3);
+            assert!(events
+                .iter()
+                .any(|event| event.event_type == memory::RUNTIME_EVENT_TYPE));
 
+            let user_event = events
+                .iter()
+                .find(|event| event.event_type == "message_appended" && event.sequence == 0)
+                .expect("user message event");
             let event_json: serde_json::Value =
-                serde_json::from_str(&events[0].event_json).expect("event json");
+                serde_json::from_str(&user_event.event_json).expect("event json");
             assert_eq!(event_json["role"], "user");
             assert_eq!(event_json["message"]["role"], "user");
             assert_eq!(event_json["message"]["blocks"][0]["text"], "persist events");
+            assert_eq!(context_event.event_type, "ContextEnvelope");
+            assert_eq!(context_json["type"], "ContextEnvelope");
+            assert_eq!(context_json["envelope_id"], envelope.id);
+            assert_eq!(context_json["envelope"]["id"], envelope.id);
+            assert_eq!(context_json["session_id"], session_id);
+
+            let policy = events
+                .iter()
+                .find(|event| event.event_type == memory::RUNTIME_EVENT_TYPE)
+                .and_then(|event| memory::RuntimeEvent::from_session_event(event).ok())
+                .expect("runtime policy event");
+            assert_eq!(policy.scope, memory::RuntimeEventScope::Policy);
+            assert_eq!(policy.kind, "runtime.policy.decided");
+            assert_eq!(policy.payload["complexity"]["level"], "Simple");
+            assert_eq!(policy.payload["agent_mode"], "Off");
+            assert_eq!(policy.payload["requires_review"], false);
         });
     }
 
@@ -4322,6 +4473,32 @@ mod tests {
     }
 
     #[test]
+    fn runtime_control_policy_disables_collaboration_routing() {
+        let session = Session::new();
+        let mut policy = crate::runtime_control::RuntimeControlPolicy::default();
+        policy.agent.enabled = false;
+        let features = RuntimeFeatureConfig::default().with_runtime_control(
+            crate::config::RuntimeControlConfig {
+                scenario: crate::config::DomainProfile::Coding,
+                policy,
+            },
+        );
+        let runtime = ConversationRuntime::new_with_features(
+            session,
+            MockApi,
+            Arc::new(StaticToolExecutor::new()),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+            &features,
+        )
+        .without_memory();
+
+        assert!(!runtime.should_use_collaboration(
+            "please refactor the architecture, design a multi agent plan, implement tests, and review risks"
+        ));
+    }
+
+    #[test]
     fn m2_layer_priority_l0_before_l3() {
         use memory::types::MemoryLayer;
         let rank = |l: MemoryLayer| match l {
@@ -4427,11 +4604,9 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert!(
-            prompt
-                .iter()
-                .any(|segment| segment.contains("continue v0.8.13 context work"))
-        );
+        assert!(prompt
+            .iter()
+            .any(|segment| segment.contains("continue v0.8.13 context work")));
         assert_eq!(envelope.selected.len(), 1);
         assert_eq!(envelope.selected[0].source, ContextSourceKind::Handoff);
         assert_eq!(envelope.selected[0].authority, ContextAuthority::Session);
@@ -4463,17 +4638,13 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert!(
-            prompt
-                .iter()
-                .any(|segment| segment.contains("cargo test passed"))
-        );
-        assert!(
-            envelope
-                .selected
-                .iter()
-                .any(|item| item.source == ContextSourceKind::ToolTrace)
-        );
+        assert!(prompt
+            .iter()
+            .any(|segment| segment.contains("cargo test passed")));
+        assert!(envelope
+            .selected
+            .iter()
+            .any(|item| item.source == ContextSourceKind::ToolTrace));
     }
 
     #[tokio::test(flavor = "multi_thread")]

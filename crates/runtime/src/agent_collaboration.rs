@@ -95,6 +95,14 @@ pub struct CollaborationScorecard {
     pub surfaced_conflicts: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationValueVerdict {
+    pub positive_lift: bool,
+    pub continue_multi_agent: bool,
+    pub value_score: u16,
+    pub reasons: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentTaskTrace {
     pub task_id: String,
@@ -130,6 +138,50 @@ impl CollaborationScorecard {
     pub fn needs_memory_pulse(&self) -> bool {
         self.memory_pulse_count > 0 || self.conflict_count > 0
     }
+
+    #[must_use]
+    pub fn value_verdict(&self) -> CollaborationValueVerdict {
+        let completion = (self.completion_rate.clamp(0.0, 1.0) * 35.0).round() as u16;
+        let lift = (((self.synthesis_lift - 1.0).max(0.0).min(1.0)) * 35.0).round() as u16;
+        let complement = (self.complementarity_score.clamp(0.0, 1.0) * 20.0).round() as u16;
+        let memory = (self.active_memory_score.clamp(0.0, 1.0) * 10.0).round() as u16;
+        let conflict_penalty = (self.conflict_count as u16).saturating_mul(8).min(24);
+        let value_score = completion
+            .saturating_add(lift)
+            .saturating_add(complement)
+            .saturating_add(memory)
+            .saturating_sub(conflict_penalty)
+            .min(100);
+
+        let positive_lift = self.shows_multi_agent_lift()
+            && self.completion_rate >= 0.66
+            && value_score >= 50
+            && self.conflict_count <= 2;
+        let continue_multi_agent = positive_lift || (value_score >= 65 && self.conflict_count <= 1);
+        let mut reasons = Vec::new();
+        if self.completion_rate < 0.66 {
+            reasons.push("low_completion_rate".to_string());
+        }
+        if self.synthesis_lift <= 1.0 {
+            reasons.push("no_synthesis_lift".to_string());
+        }
+        if self.complementarity_score <= 0.0 {
+            reasons.push("no_complementarity".to_string());
+        }
+        if self.conflict_count > 2 {
+            reasons.push("excessive_conflict".to_string());
+        }
+        if reasons.is_empty() {
+            reasons.push("positive_multi_agent_lift".to_string());
+        }
+
+        CollaborationValueVerdict {
+            positive_lift,
+            continue_multi_agent,
+            value_score,
+            reasons,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -145,7 +197,10 @@ impl CollaborationBoard {
         for conflict in &self.scorecard.surfaced_conflicts {
             candidates.push(collaboration_maintenance_candidate(
                 MaintenanceCandidateKind::Conflict,
-                format!("Review multi-agent conflict: {}", truncate_for_candidate(conflict)),
+                format!(
+                    "Review multi-agent conflict: {}",
+                    truncate_for_candidate(conflict)
+                ),
                 conflict.clone(),
                 self.scorecard_candidate_confidence(),
                 &self.board_id,
@@ -1090,7 +1145,11 @@ fn agent_task_traces_from_results(
                 result_summary: truncate_for_candidate(&result.output),
                 evidence_refs: extract_prefixed_lines(&result.output, &["Evidence:", "evidence:"]),
                 collaboration_board_id: board_id.to_string(),
-                confidence: if result.completed_normally { 0.75 } else { 0.25 },
+                confidence: if result.completed_normally {
+                    0.75
+                } else {
+                    0.25
+                },
                 conflicts: extract_prefixed_lines(&result.output, &["Conflict:", "conflict:"]),
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -1385,7 +1444,9 @@ Retire: stale local jsonl resume assumptions"
         assert!(candidates
             .iter()
             .all(|candidate| candidate.status == MaintenanceCandidateStatus::Open));
-        assert!(candidates.iter().all(|candidate| candidate.entry_ids.is_empty()));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.entry_ids.is_empty()));
         assert!(candidates
             .iter()
             .all(|candidate| candidate.source.as_deref() == Some("collaboration_board")));
@@ -1434,11 +1495,53 @@ Promote: stable head policy verified by tests"
         assert_eq!(packet.board_id, board.board_id);
         assert_eq!(packet.parent_run_id.as_deref(), Some("run-parent"));
         assert_eq!(packet.agent_tasks.len(), 1);
-        assert_eq!(packet.agent_tasks[0].collaboration_board_id, packet.board_id);
+        assert_eq!(
+            packet.agent_tasks[0].collaboration_board_id,
+            packet.board_id
+        );
         assert!(!packet.maintenance_candidates.is_empty());
         assert!(packet.maintenance_candidates.iter().all(|candidate| {
             candidate.source_ref.as_deref() == Some(packet.board_id.as_str())
         }));
+    }
+
+    #[test]
+    fn scorecard_value_verdict_detects_positive_lift() {
+        let scorecard = CollaborationScorecard {
+            completion_rate: 1.0,
+            synthesis_lift: 1.25,
+            complementarity_score: 0.7,
+            active_memory_score: 0.5,
+            conflict_count: 0,
+            memory_pulse_count: 1,
+            surfaced_conflicts: Vec::new(),
+        };
+
+        let verdict = scorecard.value_verdict();
+        assert!(verdict.positive_lift);
+        assert!(verdict.continue_multi_agent);
+        assert!(verdict.value_score >= 50);
+        assert_eq!(verdict.reasons, vec!["positive_multi_agent_lift"]);
+    }
+
+    #[test]
+    fn scorecard_value_verdict_detects_non_lift_and_conflict() {
+        let scorecard = CollaborationScorecard {
+            completion_rate: 0.5,
+            synthesis_lift: 1.0,
+            complementarity_score: 0.0,
+            active_memory_score: 0.0,
+            conflict_count: 4,
+            memory_pulse_count: 0,
+            surfaced_conflicts: vec!["agents disagree".to_string()],
+        };
+
+        let verdict = scorecard.value_verdict();
+        assert!(!verdict.positive_lift);
+        assert!(!verdict.continue_multi_agent);
+        assert!(verdict.reasons.contains(&"low_completion_rate".to_string()));
+        assert!(verdict.reasons.contains(&"no_synthesis_lift".to_string()));
+        assert!(verdict.reasons.contains(&"excessive_conflict".to_string()));
     }
 
     #[test]

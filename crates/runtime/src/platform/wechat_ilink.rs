@@ -19,15 +19,21 @@ use crate::platform::adapter::{
     PlatformError, PlatformEvent, PlatformResult,
 };
 use crate::platform::dedup::DedupStore;
-use crate::platform::types::SessionKey;
+use crate::platform::types::{SendResult, SessionKey};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 /// Default iLink API base URL.
 pub const ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+pub const ILINK_APP_ID: &str = "bot";
+pub const ILINK_APP_CLIENT_VERSION: &str = "131584";
+const QR_TIMEOUT_SECS: u64 = 8;
+const API_TIMEOUT_SECS: u64 = 15;
 
 /// Default long-polling timeout in seconds.
 pub const DEFAULT_LONG_POLLING_TIMEOUT: u64 = 30;
@@ -39,6 +45,18 @@ pub struct WeChatLinkConfig {
     pub bot_id: String,
     /// Bot secret for authentication.
     pub bot_secret: String,
+    /// QR-authorized iLink account id, when using personal WeChat login.
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// QR-authorized bot token. Kept out of normal config files; loaded from account store.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// QR-authorized user id returned by iLink.
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// Use Hermes-compatible QR token protocol instead of bot_id/bot_secret exchange.
+    #[serde(default)]
+    pub qr_token_mode: bool,
     /// Base URL for the iLink API.
     /// Default: `https://ilinkai.weixin.qq.com`
     pub base_url: String,
@@ -50,7 +68,11 @@ impl WeChatLinkConfig {
         Self {
             bot_id: bot_id.into(),
             bot_secret: bot_secret.into(),
+            account_id: None,
+            token: None,
+            user_id: None,
             base_url: ILINK_BASE_URL.to_string(),
+            qr_token_mode: false,
         }
     }
 
@@ -59,6 +81,315 @@ impl WeChatLinkConfig {
         self.base_url = base_url.into();
         self
     }
+
+    pub fn from_qr_account(
+        account_id: impl Into<String>,
+        token: impl Into<String>,
+        base_url: impl Into<String>,
+        user_id: Option<String>,
+    ) -> Self {
+        Self {
+            bot_id: String::new(),
+            bot_secret: String::new(),
+            account_id: Some(account_id.into()),
+            token: Some(token.into()),
+            user_id,
+            base_url: base_url.into(),
+            qr_token_mode: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WeChatQrCode {
+    pub qrcode: String,
+    pub scan_data: String,
+    pub qrcode_img_content: Option<String>,
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WeChatQrStatus {
+    pub status: String,
+    pub redirect_host: Option<String>,
+    pub credentials: Option<WeChatQrCredentials>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WeChatQrCredentials {
+    pub account_id: String,
+    pub token: String,
+    pub base_url: String,
+    pub user_id: Option<String>,
+    pub saved_at: String,
+}
+
+fn wechat_account_dir(base: Option<&Path>) -> PathBuf {
+    base.map(Path::to_path_buf).unwrap_or_else(|| {
+        crate::cowd_dirs::config_home_dir()
+            .join("channels")
+            .join("wechat-ilink")
+            .join("accounts")
+    })
+}
+
+pub fn save_wechat_qr_account(
+    credentials: &WeChatQrCredentials,
+    base: Option<&Path>,
+) -> PlatformResult<PathBuf> {
+    let dir = wechat_account_dir(base);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| PlatformError::ConfigError(format!("create wechat account dir: {e}")))?;
+    let path = dir.join(format!(
+        "{}.json",
+        sanitize_account_id(&credentials.account_id)
+    ));
+    let data = serde_json::to_vec_pretty(credentials)
+        .map_err(|e| PlatformError::ConfigError(format!("serialize wechat account: {e}")))?;
+    std::fs::write(&path, data)
+        .map_err(|e| PlatformError::ConfigError(format!("write wechat account: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
+}
+
+pub fn load_wechat_qr_account(
+    account_id: &str,
+    base: Option<&Path>,
+) -> PlatformResult<WeChatQrCredentials> {
+    let path = wechat_account_dir(base).join(format!("{}.json", sanitize_account_id(account_id)));
+    let data = std::fs::read(&path).map_err(|e| {
+        PlatformError::ConfigError(format!("read wechat account {}: {e}", path.display()))
+    })?;
+    serde_json::from_slice(&data).map_err(|e| {
+        PlatformError::ConfigError(format!("parse wechat account {}: {e}", path.display()))
+    })
+}
+
+pub fn list_wechat_qr_accounts(base: Option<&Path>) -> PlatformResult<Vec<WeChatQrCredentials>> {
+    let dir = wechat_account_dir(base);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut accounts = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .map_err(|e| PlatformError::ConfigError(format!("read wechat account dir: {e}")))?
+    {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(data) = std::fs::read(&path) {
+            if let Ok(account) = serde_json::from_slice::<WeChatQrCredentials>(&data) {
+                accounts.push(account);
+            }
+        }
+    }
+    accounts.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
+    Ok(accounts)
+}
+
+fn sanitize_account_id(account_id: &str) -> String {
+    account_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '@' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn ilink_headers(token: Option<&str>, body_len: Option<usize>) -> reqwest::header::HeaderMap {
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+    let mut headers = HeaderMap::new();
+    headers.insert("iLink-App-Id", HeaderValue::from_static(ILINK_APP_ID));
+    headers.insert(
+        "iLink-App-ClientVersion",
+        HeaderValue::from_static(ILINK_APP_CLIENT_VERSION),
+    );
+    if let Some(len) = body_len {
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
+            headers.insert(CONTENT_LENGTH, value);
+        }
+    }
+    if let Some(token) = token.filter(|t| !t.is_empty()) {
+        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) {
+            headers.insert(AUTHORIZATION, value);
+        }
+    }
+    headers
+}
+
+async fn ilink_get_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    endpoint: &str,
+) -> Result<serde_json::Value, String> {
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        endpoint.trim_start_matches('/')
+    );
+    let response = client
+        .get(url)
+        .headers(ilink_headers(None, None))
+        .timeout(std::time::Duration::from_secs(QR_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    let value = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("parse ilink response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("iLink HTTP {status}: {value}"));
+    }
+    Ok(value)
+}
+
+async fn ilink_post_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    endpoint: &str,
+    payload: serde_json::Value,
+    token: Option<&str>,
+    timeout_secs: u64,
+) -> Result<serde_json::Value, String> {
+    let mut body = payload.as_object().cloned().unwrap_or_default();
+    body.insert(
+        "base_info".to_string(),
+        serde_json::json!({"channel_version": "2.2.0"}),
+    );
+    let body = serde_json::Value::Object(body).to_string();
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        endpoint.trim_start_matches('/')
+    );
+    let response = client
+        .post(url)
+        .headers(ilink_headers(token, Some(body.len())))
+        .body(body)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    let value = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("parse ilink response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("iLink HTTP {status}: {value}"));
+    }
+    Ok(value)
+}
+
+pub async fn request_wechat_qr_login(bot_type: &str) -> PlatformResult<WeChatQrCode> {
+    let client = reqwest::Client::new();
+    let endpoint = format!("ilink/bot/get_bot_qrcode?bot_type={}", bot_type.trim());
+    let value = ilink_get_json(&client, ILINK_BASE_URL, &endpoint)
+        .await
+        .map_err(PlatformError::AuthenticationFailed)?;
+    let qrcode = value
+        .get("qrcode")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            PlatformError::AuthenticationFailed("QR response missing qrcode".to_string())
+        })?
+        .to_string();
+    let qrcode_img_content = value
+        .get("qrcode_img_content")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let scan_data = qrcode_img_content.clone().unwrap_or_else(|| qrcode.clone());
+    Ok(WeChatQrCode {
+        qrcode,
+        scan_data,
+        qrcode_img_content,
+        base_url: ILINK_BASE_URL.to_string(),
+    })
+}
+
+pub async fn poll_wechat_qr_login(
+    qrcode: &str,
+    base_url: Option<&str>,
+) -> PlatformResult<WeChatQrStatus> {
+    let client = reqwest::Client::new();
+    let base_url = base_url.unwrap_or(ILINK_BASE_URL);
+    let endpoint = format!("ilink/bot/get_qrcode_status?qrcode={qrcode}");
+    let value = match ilink_get_json(&client, base_url, &endpoint).await {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(WeChatQrStatus {
+                status: "wait".to_string(),
+                redirect_host: None,
+                credentials: None,
+            });
+        }
+    };
+    let status = value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("wait")
+        .to_string();
+    let redirect_host = value
+        .get("redirect_host")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let credentials = if status == "confirmed" {
+        let account_id = value
+            .get("ilink_bot_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                PlatformError::AuthenticationFailed("QR confirmed without ilink_bot_id".to_string())
+            })?
+            .to_string();
+        let token = value
+            .get("bot_token")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                PlatformError::AuthenticationFailed("QR confirmed without bot_token".to_string())
+            })?
+            .to_string();
+        Some(WeChatQrCredentials {
+            account_id,
+            token,
+            base_url: value
+                .get("baseurl")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(ILINK_BASE_URL)
+                .to_string(),
+            user_id: value
+                .get("ilink_user_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string),
+            saved_at: Utc::now().to_rfc3339(),
+        })
+    } else {
+        None
+    };
+    Ok(WeChatQrStatus {
+        status,
+        redirect_host,
+        credentials,
+    })
 }
 
 /// WeChat iLink platform adapter.
@@ -91,6 +422,17 @@ impl WeChatLinkAdapter {
         }
     }
 
+    pub async fn request_qr_login(bot_type: &str) -> PlatformResult<WeChatQrCode> {
+        request_wechat_qr_login(bot_type).await
+    }
+
+    pub async fn poll_qr_login(
+        qrcode: &str,
+        base_url: Option<&str>,
+    ) -> PlatformResult<WeChatQrStatus> {
+        poll_wechat_qr_login(qrcode, base_url).await
+    }
+
     // ------------------------------------------------------------------
     // iLink API methods
     // ------------------------------------------------------------------
@@ -100,6 +442,20 @@ impl WeChatLinkAdapter {
     /// POST `/ilink/bot/gettoken` with bot_id + bot_secret.
     /// Returns the token string on success.
     pub async fn authenticate(&self) -> PlatformResult<String> {
+        if self.config.qr_token_mode {
+            return self
+                .config
+                .token
+                .clone()
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| {
+                    PlatformError::AuthenticationFailed(
+                        "missing QR-authorized wechat token; run `cowd gateway wechat-qr`"
+                            .to_string(),
+                    )
+                });
+        }
+
         let client = reqwest::Client::new();
         let url = format!("{}/ilink/bot/gettoken", self.config.base_url);
 
@@ -172,10 +528,38 @@ impl WeChatLinkAdapter {
     pub async fn get_updates(&self) -> PlatformResult<Vec<serde_json::Value>> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
-        let url = format!("{}/ilink/bot/getupdates", self.config.base_url);
 
         // Read the current context_token to echo back
         let ctx_token = self.context_token.read().await.clone();
+
+        if self.config.qr_token_mode {
+            let json = ilink_post_json(
+                &client,
+                &self.config.base_url,
+                "ilink/bot/getupdates",
+                serde_json::json!({"get_updates_buf": ctx_token}),
+                Some(&token),
+                DEFAULT_LONG_POLLING_TIMEOUT,
+            )
+            .await
+            .map_err(|e| PlatformError::ReceiveFailed(e.to_string()))?;
+
+            if let Some(new_ctx) = json
+                .get("get_updates_buf")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                *self.context_token.write().await = new_ctx.to_string();
+            }
+
+            return Ok(json
+                .get("msgs")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default());
+        }
+
+        let url = format!("{}/ilink/bot/getupdates", self.config.base_url);
 
         let response = client
             .get(&url)
@@ -246,6 +630,17 @@ impl WeChatLinkAdapter {
             "text" => msg
                 .get("text")
                 .and_then(|v| v.as_str())
+                .or_else(|| {
+                    msg.get("item_list")
+                        .and_then(|v| v.as_array())
+                        .and_then(|items| {
+                            items.iter().find_map(|item| {
+                                item.get("text_item")
+                                    .and_then(|v| v.get("text"))
+                                    .and_then(|v| v.as_str())
+                            })
+                        })
+                })
                 .map(|s| s.to_string())
                 .unwrap_or_default(),
             "image" => "[Image]".to_string(),
@@ -264,6 +659,7 @@ impl WeChatLinkAdapter {
         let from_user = msg
             .get("from_user")
             .and_then(|v| v.as_str())
+            .or_else(|| msg.get("from_user_id").and_then(|v| v.as_str()))
             .unwrap_or("");
         if from_user.is_empty() {
             return None;
@@ -272,6 +668,7 @@ impl WeChatLinkAdapter {
         let message_id = msg
             .get("message_id")
             .and_then(|v| v.as_str())
+            .or_else(|| msg.get("client_id").and_then(|v| v.as_str()))
             .map(|s| s.to_string());
 
         let msg_timestamp = msg
@@ -321,6 +718,37 @@ impl WeChatLinkAdapter {
     pub async fn send_text(&self, to_user: &str, text: &str) -> PlatformResult<String> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
+
+        if self.config.qr_token_mode {
+            let client_id = format!("cowd-weixin-{}", Uuid::new_v4().simple());
+            let ctx_token = self.context_token.read().await.clone();
+            let mut msg = serde_json::json!({
+                "from_user_id": "",
+                "to_user_id": to_user,
+                "client_id": client_id,
+                "message_type": 2,
+                "message_state": 2,
+                "item_list": [{
+                    "type": 1,
+                    "text_item": {"text": text}
+                }]
+            });
+            if !ctx_token.is_empty() {
+                msg["context_token"] = serde_json::Value::String(ctx_token);
+            }
+            ilink_post_json(
+                &client,
+                &self.config.base_url,
+                "ilink/bot/sendmessage",
+                serde_json::json!({"msg": msg}),
+                Some(&token),
+                API_TIMEOUT_SECS,
+            )
+            .await
+            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+            return Ok(client_id);
+        }
+
         let url = format!("{}/ilink/bot/sendmessage", self.config.base_url);
 
         let response = client
@@ -367,6 +795,21 @@ impl WeChatLinkAdapter {
     pub async fn send_typing_indicator(&self, to_user: &str) -> PlatformResult<()> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
+
+        if self.config.qr_token_mode {
+            let _ = ilink_post_json(
+                &client,
+                &self.config.base_url,
+                "ilink/bot/sendtyping",
+                serde_json::json!({"ilink_user_id": to_user, "status": 1}),
+                Some(&token),
+                API_TIMEOUT_SECS,
+            )
+            .await
+            .map_err(|e| PlatformError::SendFailed(e.to_string()))?;
+            return Ok(());
+        }
+
         let url = format!("{}/ilink/bot/sendtyping", self.config.base_url);
 
         let response = client
@@ -572,10 +1015,10 @@ impl PlatformAdapter for WeChatLinkAdapter {
         Ok(None)
     }
 
-    async fn send(&self, msg: &OutboundMessage) -> PlatformResult<()> {
+    async fn send(&self, msg: &OutboundMessage) -> PlatformResult<SendResult> {
         let to_user = &msg.session_key.user_id;
         self.send_text(to_user, &msg.text).await?;
-        Ok(())
+        Ok(SendResult::success(None))
     }
 
     async fn send_typing(&self, chat_id: &str) -> Result<(), PlatformError> {
@@ -586,7 +1029,12 @@ impl PlatformAdapter for WeChatLinkAdapter {
     // Unimplemented methods (same pattern as FeishuAdapter)
     // ------------------------------------------------------------------
 
-    async fn send_image(&self, chat_id: &str, image_url: &str, caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_image(
+        &self,
+        chat_id: &str,
+        image_url: &str,
+        caption: Option<&str>,
+    ) -> PlatformResult<()> {
         let token = self.ensure_token().await?;
         let client = reqwest::Client::new();
 
@@ -681,27 +1129,58 @@ impl PlatformAdapter for WeChatLinkAdapter {
         Ok(())
     }
 
-    async fn send_image_file(&self, _chat_id: &str, _image_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_image_file(
+        &self,
+        _chat_id: &str,
+        _image_path: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_image_file".into()))
     }
 
-    async fn send_voice(&self, _chat_id: &str, _audio_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_voice(
+        &self,
+        _chat_id: &str,
+        _audio_path: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_voice".into()))
     }
 
-    async fn send_document(&self, _chat_id: &str, _file_path: &str, _file_name: Option<&str>, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_document(
+        &self,
+        _chat_id: &str,
+        _file_path: &str,
+        _file_name: Option<&str>,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_document".into()))
     }
 
-    async fn send_video(&self, _chat_id: &str, _video_path: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_video(
+        &self,
+        _chat_id: &str,
+        _video_path: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_video".into()))
     }
 
-    async fn send_animation(&self, _chat_id: &str, _animation_url: &str, _caption: Option<&str>) -> PlatformResult<()> {
+    async fn send_animation(
+        &self,
+        _chat_id: &str,
+        _animation_url: &str,
+        _caption: Option<&str>,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("send_animation".into()))
     }
 
-    async fn edit_message(&self, _chat_id: &str, _message_id: &str, _content: &str) -> PlatformResult<()> {
+    async fn edit_message(
+        &self,
+        _chat_id: &str,
+        _message_id: &str,
+        _content: &str,
+    ) -> PlatformResult<()> {
         Err(PlatformError::NotImplemented("edit_message".into()))
     }
 
@@ -727,7 +1206,33 @@ impl PlatformAdapter for WeChatLinkAdapter {
 }
 
 /// Create a WeChat iLink adapter from config settings.
-pub fn create_wechat_ilink_adapter(settings: &serde_json::Value) -> PlatformResult<WeChatLinkAdapter> {
+pub fn create_wechat_ilink_adapter(
+    settings: &serde_json::Value,
+) -> PlatformResult<WeChatLinkAdapter> {
+    let credential_source = settings
+        .get("credential_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if credential_source == "qr_account" || settings.get("account_id").is_some() {
+        let account_id = settings
+            .get("account_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| PlatformError::ConfigError("missing account_id".to_string()))?;
+        let account_store_dir = settings
+            .get("account_store_dir")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+        let account = load_wechat_qr_account(account_id, account_store_dir.as_deref())?;
+        let config = WeChatLinkConfig::from_qr_account(
+            account.account_id,
+            account.token,
+            account.base_url,
+            account.user_id,
+        );
+        return Ok(WeChatLinkAdapter::new(config));
+    }
+
     let bot_id = settings
         .get("bot_id")
         .and_then(|v| v.as_str())
@@ -780,8 +1285,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_disconnect_state() {
-        let config = WeChatLinkConfig::new("test_bot", "test_secret")
-            .with_base_url("https://localhost:1"); // unreachable, will fail auth
+        let config =
+            WeChatLinkConfig::new("test_bot", "test_secret").with_base_url("https://localhost:1"); // unreachable, will fail auth
         let mut adapter = WeChatLinkAdapter::new(config);
 
         // Initially not connected (check directly via RwLock, avoid
@@ -848,8 +1353,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_updates_request_format() {
-        let config = WeChatLinkConfig::new("test_bot", "test_secret")
-            .with_base_url("https://localhost:1");
+        let config =
+            WeChatLinkConfig::new("test_bot", "test_secret").with_base_url("https://localhost:1");
         let adapter = WeChatLinkAdapter::new(config);
 
         // Set a dummy token so ensure_token doesn't try to auth
@@ -873,8 +1378,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_text_request_format() {
-        let config = WeChatLinkConfig::new("test_bot", "test_secret")
-            .with_base_url("https://localhost:1");
+        let config =
+            WeChatLinkConfig::new("test_bot", "test_secret").with_base_url("https://localhost:1");
         let adapter = WeChatLinkAdapter::new(config);
 
         // Set a dummy token
@@ -908,8 +1413,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_typing_delegates_to_indicator() {
-        let config = WeChatLinkConfig::new("test_bot", "test_secret")
-            .with_base_url("https://localhost:1");
+        let config =
+            WeChatLinkConfig::new("test_bot", "test_secret").with_base_url("https://localhost:1");
         let adapter = WeChatLinkAdapter::new(config);
 
         // Set a dummy token
@@ -925,8 +1430,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_delegates_to_send_text() {
-        let config = WeChatLinkConfig::new("test_bot", "test_secret")
-            .with_base_url("https://localhost:1");
+        let config =
+            WeChatLinkConfig::new("test_bot", "test_secret").with_base_url("https://localhost:1");
         let adapter = WeChatLinkAdapter::new(config);
 
         // Set a dummy token

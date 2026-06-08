@@ -8,8 +8,8 @@
 //! - Data exfiltration patterns
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::fs;
+use std::path::Path;
 
 /// Security scan result
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,11 +115,26 @@ fn scan_credentials(content: &str) -> Vec<SecurityFinding> {
 
     // Patterns for common credential formats
     let credential_patterns: Vec<(&str, &str)> = vec![
-        (r"(?i)(api[_-]?key)\s*[:=]\s*[a-zA-Z0-9_-]{20,}", "Potential API key"),
-        (r"(?i)(password|passwd|pwd)\s*[:=]\s*[^\s]+", "Hardcoded password"),
-        (r"(?i)(secret|token|auth)\s*[:=]\s*[a-zA-Z0-9_-]{20,}", "Potential secret/token"),
-        (r"(?i)bearer\s+[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+", "JWT token"),
-        (r"(?i)(aws[_-]?access[_-]?key|aws[_-]?secret)", "AWS credential reference"),
+        (
+            r"(?i)(api[_-]?key)\s*[:=]\s*[a-zA-Z0-9_-]{20,}",
+            "Potential API key",
+        ),
+        (
+            r"(?i)(password|passwd|pwd)\s*[:=]\s*[^\s]+",
+            "Hardcoded password",
+        ),
+        (
+            r"(?i)(secret|token|auth)\s*[:=]\s*[a-zA-Z0-9_-]{20,}",
+            "Potential secret/token",
+        ),
+        (
+            r"(?i)bearer\s+[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+",
+            "JWT token",
+        ),
+        (
+            r"(?i)(aws[_-]?access[_-]?key|aws[_-]?secret)",
+            "AWS credential reference",
+        ),
         (r"ghp_[a-zA-Z0-9]{36}", "GitHub Personal Access Token"),
         (r"sk-[a-zA-Z0-9]{48}", "OpenAI API Key"),
         (r"sk-proj-[a-zA-Z0-9_-]{48,}", "OpenAI Project Key"),
@@ -134,7 +149,10 @@ fn scan_credentials(content: &str) -> Vec<SecurityFinding> {
                         category: FindingCategory::CredentialExposure,
                         description: format!("{} detected in skill content", description),
                         location: Some(format!("line {}", line_num + 1)),
-                        suggestion: Some("Use environment variables instead of hardcoded credentials".to_string()),
+                        suggestion: Some(
+                            "Use environment variables instead of hardcoded credentials"
+                                .to_string(),
+                        ),
                     });
                 }
             }
@@ -149,10 +167,22 @@ fn scan_command_injection(content: &str) -> Vec<SecurityFinding> {
     let mut findings = Vec::new();
 
     let injection_patterns = [
-        (r"(?i)\brm\s+-rf\s+(/\*|/home|/etc|/var)", "Destructive command with root path"),
-        (r"(?i);\s*(rm|del|format)\b", "Command chaining with destructive command"),
-        (r"(?i)\|\s*(bash|sh|cmd|powershell)\b", "Pipe to shell execution"),
-        (r"(?i)\$\([^)]{50,}\)", "Command substitution with long content"),
+        (
+            r"(?i)\brm\s+-rf\s+(/\*|/home|/etc|/var)",
+            "Destructive command with root path",
+        ),
+        (
+            r"(?i);\s*(rm|del|format)\b",
+            "Command chaining with destructive command",
+        ),
+        (
+            r"(?i)\|\s*(bash|sh|cmd|powershell)\b",
+            "Pipe to shell execution",
+        ),
+        (
+            r"(?i)\$\([^)]{50,}\)",
+            "Command substitution with long content",
+        ),
         (r"(?i)eval\s*\(\s*\$", "Eval with variable interpolation"),
         (r"(?i)`[^`]{50,}`", "Backtick command substitution"),
     ];
@@ -166,7 +196,10 @@ fn scan_command_injection(content: &str) -> Vec<SecurityFinding> {
                         category: FindingCategory::CommandInjection,
                         description: description.to_string(),
                         location: Some(format!("line {}", line_num + 1)),
-                        suggestion: Some("Validate and sanitize all user inputs before command execution".to_string()),
+                        suggestion: Some(
+                            "Validate and sanitize all user inputs before command execution"
+                                .to_string(),
+                        ),
                     });
                 }
             }
@@ -181,8 +214,14 @@ fn scan_external_resources(content: &str) -> Vec<SecurityFinding> {
     let mut findings = Vec::new();
 
     let external_patterns: Vec<(&str, &str)> = vec![
-        (r"https?://[a-zA-Z0-9.-]+\.(tk|ml|ga|cf|gq)\b", "External domain (.tk, .ml, etc.)"),
-        (r"https?://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}", "IP address URL"),
+        (
+            r"https?://[a-zA-Z0-9.-]+\.(tk|ml|ga|cf|gq)\b",
+            "External domain (.tk, .ml, etc.)",
+        ),
+        (
+            r"https?://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}",
+            "IP address URL",
+        ),
         (r"(?i)(curl|wget)\s+https?://", "External download"),
         (r"(?i)fetch\s*\(\s*https?://", "External fetch request"),
     ];
@@ -196,7 +235,9 @@ fn scan_external_resources(content: &str) -> Vec<SecurityFinding> {
                         category: FindingCategory::ExternalResource,
                         description: description.to_string(),
                         location: Some(format!("line {}", line_num + 1)),
-                        suggestion: Some("Verify external URLs are from trusted sources".to_string()),
+                        suggestion: Some(
+                            "Verify external URLs are from trusted sources".to_string(),
+                        ),
                     });
                 }
             }
@@ -212,7 +253,10 @@ fn scan_permission_escalation(content: &str) -> Vec<SecurityFinding> {
 
     let escalation_patterns = [
         (r"(?i)sudo\s+", "Sudo command execution"),
-        (r"(?i)(chmod|chown)\s+777\b", "Overly permissive file permissions"),
+        (
+            r"(?i)(chmod|chown)\s+777\b",
+            "Overly permissive file permissions",
+        ),
         (r"(?i)su\s+root", "Root user switch"),
         (r"(?i)--privileged", "Privileged container mode"),
         (r"(?i)--cap-add\s+ALL", "All capabilities added"),
@@ -227,7 +271,9 @@ fn scan_permission_escalation(content: &str) -> Vec<SecurityFinding> {
                         category: FindingCategory::PermissionEscalation,
                         description: description.to_string(),
                         location: Some(format!("line {}", line_num + 1)),
-                        suggestion: Some("Use least-privilege principle for permissions".to_string()),
+                        suggestion: Some(
+                            "Use least-privilege principle for permissions".to_string(),
+                        ),
                     });
                 }
             }
@@ -242,9 +288,18 @@ fn scan_data_exfiltration(content: &str) -> Vec<SecurityFinding> {
     let mut findings = Vec::new();
 
     let exfiltration_patterns = [
-        (r"(?i)(curl|wget).*\$?(HOME|USER|PATH|SECRET|TOKEN|KEY)", "Potential env data exfiltration"),
-        (r"(?i)base64.*\$(HOME|USER|SECRET|TOKEN)", "Encoded env data exfiltration"),
-        (r"(?i)(cat|read)\s+\.(ssh|aws|config|env)", "Reading sensitive files"),
+        (
+            r"(?i)(curl|wget).*\$?(HOME|USER|PATH|SECRET|TOKEN|KEY)",
+            "Potential env data exfiltration",
+        ),
+        (
+            r"(?i)base64.*\$(HOME|USER|SECRET|TOKEN)",
+            "Encoded env data exfiltration",
+        ),
+        (
+            r"(?i)(cat|read)\s+\.(ssh|aws|config|env)",
+            "Reading sensitive files",
+        ),
     ];
 
     for (pattern, description) in &exfiltration_patterns {
@@ -256,7 +311,9 @@ fn scan_data_exfiltration(content: &str) -> Vec<SecurityFinding> {
                         category: FindingCategory::DataExfiltration,
                         description: description.to_string(),
                         location: Some(format!("line {}", line_num + 1)),
-                        suggestion: Some("Avoid exfiltrating sensitive environment data".to_string()),
+                        suggestion: Some(
+                            "Avoid exfiltrating sensitive environment data".to_string(),
+                        ),
                     });
                 }
             }
@@ -296,7 +353,8 @@ mod tests {
 
     #[test]
     fn test_safe_content() {
-        let content = "# My Skill\n\nA simple skill for demonstration.\n\n## Usage\nRun this when needed.";
+        let content =
+            "# My Skill\n\nA simple skill for demonstration.\n\n## Usage\nRun this when needed.";
         let result = scan_skill_content(content, "test-skill");
         assert_eq!(result.status, SecurityStatus::Safe);
     }
@@ -309,7 +367,10 @@ Set API_KEY=sk-1234567890abcdefghij
         "#;
         let result = scan_skill_content(content, "api-skill");
         assert!(!result.findings.is_empty());
-        assert_eq!(result.findings[0].category, FindingCategory::CredentialExposure);
+        assert_eq!(
+            result.findings[0].category,
+            FindingCategory::CredentialExposure
+        );
     }
 
     #[test]
@@ -320,6 +381,9 @@ rm -rf /home/*
         "#;
         let result = scan_skill_content(content, "shell-skill");
         assert!(!result.findings.is_empty());
-        assert_eq!(result.findings[0].category, FindingCategory::CommandInjection);
+        assert_eq!(
+            result.findings[0].category,
+            FindingCategory::CommandInjection
+        );
     }
 }

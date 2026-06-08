@@ -7,12 +7,11 @@
 //! Current state: FactChecker is designed but NOT wired into remember().
 //! These tests SHOULD FAIL until the GREEN implementation is complete.
 
-use cowd_memory::{ MemoryScope,
-    CognitiveContextManager, MemoryConfig,
-    MemoryEntry, MemoryLayer, MemoryCategory, MemorySource, Priority,
-    FactChecker,
-};
 use cowd_memory::config::{BudgetConfig, StoreConfig};
+use cowd_memory::{
+    CognitiveContextManager, FactChecker, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer,
+    MemoryScope, MemorySource, Priority,
+};
 
 /// 创建一个基础的测试配置
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
@@ -66,15 +65,23 @@ fn test_fact_checker_detects_contradiction() {
 
     let result = checker.check_triple(&triple);
 
-    eprintln!("Fact check result: is_consistent={}, confidence={:.2}",
-        result.is_consistent, result.confidence);
+    eprintln!(
+        "Fact check result: is_consistent={}, confidence={:.2}",
+        result.is_consistent, result.confidence
+    );
     if let Some(ref c) = result.contradiction {
         eprintln!("Contradiction: {}", c);
     }
 
-    assert!(!result.is_consistent, "Should detect contradiction: Alice parent=Bob but triple says Charlie");
+    assert!(
+        !result.is_consistent,
+        "Should detect contradiction: Alice parent=Bob but triple says Charlie"
+    );
     assert!(result.confidence < 1.0, "Confidence should be downgraded");
-    assert!(result.contradiction.is_some(), "Should describe the contradiction");
+    assert!(
+        result.contradiction.is_some(),
+        "Should describe the contradiction"
+    );
 }
 
 // =========================================================================
@@ -95,7 +102,8 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = test_config(&tmp.path().join("test.db"));
 
-    let mgr = CognitiveContextManager::new(config).await
+    let mgr = CognitiveContextManager::new(config)
+        .await
         .expect("Should create CognitiveContextManager");
 
     // First, register the baseline fact: Alice's parent is Bob
@@ -118,10 +126,11 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
         last_accessed_at: None,
         scope: MemoryScope::default(),
         session_id: None,
-            source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+        source_agent: None,
+        visibility: cowd_memory::AgentVisibility::default(),
     };
-    mgr.remember(identity_entry).await
+    mgr.remember(identity_entry)
+        .await
         .expect("Should remember identity entry");
 
     // Now write the contradictory entry: FactChecker should detect the conflict
@@ -145,12 +154,13 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
         last_accessed_at: None,
         scope: MemoryScope::default(),
         session_id: None,
-            source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+        source_agent: None,
+        visibility: cowd_memory::AgentVisibility::default(),
     };
 
     let original_confidence = contradictory_entry.confidence;
-    mgr.remember(contradictory_entry).await
+    mgr.remember(contradictory_entry)
+        .await
         .expect("Should remember contradictory entry (FactChecker only downgrades, never rejects)");
 
     let layers = mgr.list_layers().await;
@@ -195,7 +205,8 @@ async fn test_remember_accepts_consistent_entry() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = test_config(&tmp.path().join("test.db"));
 
-    let mgr = CognitiveContextManager::new(config).await
+    let mgr = CognitiveContextManager::new(config)
+        .await
         .expect("Should create CognitiveContextManager");
 
     let entry_id = uuid::Uuid::new_v4();
@@ -220,14 +231,15 @@ async fn test_remember_accepts_consistent_entry() {
         last_accessed_at: None,
         scope: MemoryScope::default(),
         session_id: None,
-            source_agent: None,
-            visibility: cowd_memory::AgentVisibility::default(),
+        source_agent: None,
+        visibility: cowd_memory::AgentVisibility::default(),
     };
 
-    mgr.remember(entry).await
-        .expect("Should remember entry");
+    mgr.remember(entry).await.expect("Should remember entry");
 
-    let retrieved = mgr.get_entry(&entry_id.to_string()).await
+    let retrieved = mgr
+        .get_entry(&entry_id.to_string())
+        .await
         .expect("Should get entry")
         .expect("Entry should exist");
 
