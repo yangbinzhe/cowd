@@ -639,6 +639,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         let lease_registry = lease_registry.clone();
         let task_kernel = app_state.task_kernel.clone();
         let approval_gate = app_state.approval_gate.clone();
+        let app_state_for_socket = app_state.clone();
         let started_at = started_at;
         tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
@@ -652,6 +653,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
                             let lease_registry = lease_registry.clone();
                             let task_kernel = task_kernel.clone();
                             let approval_gate = approval_gate.clone();
+                            let app_state = app_state_for_socket.clone();
                             handle_unix_client(
                                 stream,
                                 sessions,
@@ -660,6 +662,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
                                 lease_registry,
                                 task_kernel,
                                 approval_gate,
+                                app_state,
                                 started_at,
                             )
                             .await;
@@ -731,6 +734,9 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
 ///   {"cmd":"task_complete","id":"..."}
 ///   {"cmd":"approval_pending"}
 ///   {"cmd":"approval_respond","id":"...","approved":true,"persistence":"once|session|always","reason":"..."}
+///   {"cmd":"connector_resource_list","limit":20,"offset":0,"q":"..."}
+///   {"cmd":"connector_resource_revalidate","reference":"...","state":"indexed|stale"}
+///   {"cmd":"connector_resource_promote_memory","reference":"...","session_id":"..."}
 ///   {"cmd":"ensure_session","session_id":"...","model":"..."}
 ///   {"cmd":"subscribe_session","session_id":"..."}
 ///   {"cmd":"acquire_session_lease","session_id":"...","owner":"...","mode":"collaborative|exclusive|takeover"}
@@ -746,6 +752,7 @@ async fn handle_unix_client(
     lease_registry: Arc<SessionLeaseRegistry>,
     task_kernel: Arc<crate::task_kernel::TaskKernel>,
     approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
+    app_state: Arc<api_routes::AppState>,
     started_at: Instant,
 ) {
     let (reader, mut writer) = stream.into_split();
@@ -907,6 +914,46 @@ async fn handle_unix_client(
                                 }
                                 None => return_json_error("approval gate not configured"),
                             },
+                            Some("connector_resource_list") => {
+                                let limit = cmd
+                                    .get("limit")
+                                    .and_then(|value| value.as_u64())
+                                    .map(|value| value as usize);
+                                let offset = cmd
+                                    .get("offset")
+                                    .and_then(|value| value.as_u64())
+                                    .map(|value| value as usize);
+                                let query = cmd.get("q").and_then(|value| value.as_str());
+                                api_routes::connector_routes::connector_resources_snapshot(
+                                    &app_state, limit, offset, query,
+                                )
+                            }
+                            Some("connector_resource_revalidate") => {
+                                let reference = cmd
+                                    .get("reference")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or_default();
+                                let state = cmd.get("state").and_then(|value| value.as_str());
+                                api_routes::connector_routes::connector_resource_revalidate_snapshot(
+                                    &app_state, reference, state,
+                                )
+                            }
+                            Some("connector_resource_promote_memory") => {
+                                let reference = cmd
+                                    .get("reference")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or_default();
+                                let session_id = cmd
+                                    .get("session_id")
+                                    .and_then(|value| value.as_str())
+                                    .map(ToOwned::to_owned);
+                                api_routes::connector_routes::connector_resource_promote_memory_snapshot(
+                                    &app_state,
+                                    reference,
+                                    session_id,
+                                )
+                                .await
+                            }
                             Some("acquire_session_lease") => {
                                 let session_id = cmd
                                     .get("session_id")

@@ -597,38 +597,64 @@ async fn connector_resources_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(query): Query<ConnectorResourceQuery>,
 ) -> impl IntoResponse {
-    let limit = query
-        .limit
+    Json(connector_resources_snapshot(
+        &state,
+        query.limit,
+        query.offset,
+        query.q.as_deref(),
+    ))
+}
+
+pub(crate) fn connector_resources_snapshot(
+    state: &AppState,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    query: Option<&str>,
+) -> serde_json::Value {
+    let limit = limit
         .unwrap_or(DEFAULT_CONNECTOR_RESOURCE_PAGE)
         .clamp(1, MAX_CONNECTOR_RESOURCE_PAGE);
-    let offset = query.offset.unwrap_or(0);
-    let (resources, error) = list_durable_resources(&state, limit, offset, query.q.as_deref());
+    let offset = offset.unwrap_or(0);
+    let (resources, error) = list_durable_resources(state, limit, offset, query);
     let total = resources.len();
-    Json(serde_json::json!({
+    serde_json::json!({
         "kind": "connector_resources",
+        "ok": error.is_none(),
         "status": if error.is_some() { "degraded" } else { "available" },
         "degraded_reason": error,
         "limit": limit,
         "offset": offset,
         "resources": resources,
         "total": total,
-    }))
+    })
 }
 
 async fn connector_resource_revalidate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<ConnectorResourceRevalidateRequest>,
 ) -> impl IntoResponse {
-    let reference = request.reference.trim();
+    Json(connector_resource_revalidate_snapshot(
+        &state,
+        &request.reference,
+        request.state.as_deref(),
+    ))
+}
+
+pub(crate) fn connector_resource_revalidate_snapshot(
+    state: &AppState,
+    reference: &str,
+    state_value: Option<&str>,
+) -> serde_json::Value {
+    let reference = reference.trim();
     if reference.is_empty() {
-        return Json(serde_json::json!({
+        return serde_json::json!({
             "kind": "connector_resource_revalidation",
             "ok": false,
             "reason": "reference is required",
-        }));
+        });
     }
-    let desired_state = request.state.as_deref().unwrap_or("indexed");
-    let result = durable_resource_directory(&state).and_then(|directory| {
+    let desired_state = state_value.unwrap_or("indexed");
+    let result = durable_resource_directory(state).and_then(|directory| {
         let changed = match desired_state {
             "indexed" => directory.mark_indexed(reference)?,
             "stale" => directory.mark_stale(reference)?,
@@ -640,22 +666,22 @@ async fn connector_resource_revalidate_handler(
         Ok((changed, resource, None))
     });
     match result {
-        Ok((changed, resource, reason)) => Json(serde_json::json!({
+        Ok((changed, resource, reason)) => serde_json::json!({
             "kind": "connector_resource_revalidation",
             "ok": changed && reason.is_none(),
             "state": desired_state,
             "changed": changed,
             "resource": resource,
             "reason": reason,
-        })),
-        Err(error) => Json(serde_json::json!({
+        }),
+        Err(error) => serde_json::json!({
             "kind": "connector_resource_revalidation",
             "ok": false,
             "state": desired_state,
             "changed": false,
             "resource": null,
             "reason": error.to_string(),
-        })),
+        }),
     }
 }
 
@@ -663,43 +689,54 @@ async fn connector_resource_promote_memory_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<ConnectorResourcePromoteMemoryRequest>,
 ) -> impl IntoResponse {
+    Json(
+        connector_resource_promote_memory_snapshot(&state, &request.reference, request.session_id)
+            .await,
+    )
+}
+
+pub(crate) async fn connector_resource_promote_memory_snapshot(
+    state: &AppState,
+    reference: &str,
+    session_id: Option<String>,
+) -> serde_json::Value {
     let Some(memory_manager) = state.memory_manager.as_ref() else {
-        return Json(serde_json::json!({
+        return serde_json::json!({
             "kind": "connector_resource_memory_promotion",
             "ok": false,
             "reason": "memory not configured",
-        }));
+        });
     };
-    let reference = request.reference.trim();
+    let reference = reference.trim();
     if reference.is_empty() {
-        return Json(serde_json::json!({
+        return serde_json::json!({
             "kind": "connector_resource_memory_promotion",
             "ok": false,
             "reason": "reference is required",
-        }));
+        });
     }
     let resource =
         match durable_resource_directory(&state).and_then(|directory| directory.get(reference)) {
             Ok(Some(resource)) => resource,
             Ok(None) => {
-                return Json(serde_json::json!({
+                return serde_json::json!({
                     "kind": "connector_resource_memory_promotion",
                     "ok": false,
                     "reason": "resource ref not found",
-                }));
+                });
             }
             Err(error) => {
-                return Json(serde_json::json!({
+                return serde_json::json!({
                     "kind": "connector_resource_memory_promotion",
                     "ok": false,
                     "reason": error.to_string(),
-                }));
+                });
             }
         };
     let content = connector_resource_memory_content(&resource);
     match find_existing_connector_resource_memory(memory_manager, reference).await {
         Ok(Some(existing_id)) => {
-            return Json(serde_json::json!({
+            return serde_json::json!({
                 "kind": "connector_resource_memory_promotion",
                 "ok": true,
                 "replayed": true,
@@ -707,16 +744,16 @@ async fn connector_resource_promote_memory_handler(
                 "layer": "L3",
                 "reference": reference,
                 "reason": "resource memory already exists",
-            }));
+            });
         }
         Ok(None) => {}
         Err(error) => {
-            return Json(serde_json::json!({
+            return serde_json::json!({
                 "kind": "connector_resource_memory_promotion",
                 "ok": false,
                 "reference": reference,
                 "reason": format!("memory dedup failed: {error}"),
-            }));
+            });
         }
     }
 
@@ -746,30 +783,29 @@ async fn connector_resource_promote_memory_handler(
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         last_accessed_at: None,
-        scope: request
-            .session_id
+        scope: session_id
             .clone()
             .map(MemoryScope::Session)
             .unwrap_or_else(|| MemoryScope::Project("connector-resource".to_string())),
-        session_id: request.session_id,
+        session_id,
         source_agent: Some("connector-resource-bridge".to_string()),
         visibility: AgentVisibility::Shared,
     };
     let kernel = MemoryKernel::new(Arc::clone(memory_manager));
     let memory_ctx = MemoryTurnContext::new("connector-resource-bridge", "api");
     match kernel.remember(&memory_ctx, entry).await {
-        Ok(()) => Json(serde_json::json!({
+        Ok(()) => serde_json::json!({
             "kind": "connector_resource_memory_promotion",
             "ok": true,
             "memory_id": id,
             "layer": "L3",
             "reference": reference,
-        })),
-        Err(error) => Json(serde_json::json!({
+        }),
+        Err(error) => serde_json::json!({
             "kind": "connector_resource_memory_promotion",
             "ok": false,
             "reason": error.to_string(),
-        })),
+        }),
     }
 }
 

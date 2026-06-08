@@ -47,7 +47,7 @@ use memory::MemoryScope;
 mod approval_routes;
 mod audit_routes;
 mod channel_routes;
-mod connector_routes;
+pub(crate) mod connector_routes;
 mod context_routes;
 mod cross_plane_routes;
 mod memory_routes;

@@ -1886,10 +1886,19 @@ impl TuiState {
             Action::RevalidateConnectorResource { reference, state } => {
                 let resource_ref = reference.clone();
                 let desired_state = state.clone();
-                let result = run_daemon_projection_blocking(move |client| async move {
+                let projection_ref = reference.clone();
+                let projection_state = state.clone();
+                let result = run_daemon_control_blocking(move |client| async move {
                     client
                         .revalidate_connector_resource(&reference, &state)
                         .await
+                })
+                .or_else(move |_| {
+                    run_daemon_projection_blocking(move |client| async move {
+                        client
+                            .revalidate_connector_resource(&projection_ref, &projection_state)
+                            .await
+                    })
                 });
                 match result {
                     Ok(value)
@@ -1928,10 +1937,22 @@ impl TuiState {
                 let session_id = session_id
                     .clone()
                     .or_else(|| Some(self.app.session_id.clone()));
-                let result = run_daemon_projection_blocking(move |client| async move {
+                let projection_ref = reference.clone();
+                let projection_session_id = session_id.clone();
+                let result = run_daemon_control_blocking(move |client| async move {
                     client
                         .promote_connector_resource_to_memory(&reference, session_id.as_deref())
                         .await
+                })
+                .or_else(move |_| {
+                    run_daemon_projection_blocking(move |client| async move {
+                        client
+                            .promote_connector_resource_to_memory(
+                                &projection_ref,
+                                projection_session_id.as_deref(),
+                            )
+                            .await
+                    })
                 });
                 match result {
                     Ok(value)
@@ -2535,6 +2556,7 @@ mod tests {
     use crate::tui::layout::LayoutNode;
     use crate::tui::test_utils::MockTerminal;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serial_test::serial;
     use std::time::Duration;
 
     fn test_memory_config(path: &std::path::Path) -> memory::MemoryConfig {
@@ -2658,6 +2680,92 @@ mod tests {
             state.app.daemon_connector_resources[0].indexed_state,
             "stale"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn connector_resource_actions_prefer_socket_control() {
+        use std::io::{BufRead, Write};
+
+        let dir = unique_temp_dir("cowd-tui-connector-socket");
+        let socket = dir.join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+        let server = std::thread::spawn(move || {
+            for expected in [
+                "connector_resource_revalidate",
+                "connector_resource_promote_memory",
+            ] {
+                let (stream, _) = listener.accept().expect("accept socket");
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read command");
+                let command: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("command json");
+                assert_eq!(
+                    command.get("cmd").and_then(|value| value.as_str()),
+                    Some(expected)
+                );
+                assert_eq!(
+                    command.get("reference").and_then(|value| value.as_str()),
+                    Some("service://mock.docs/document/tui-doc")
+                );
+                let stream = reader.get_mut();
+                match expected {
+                    "connector_resource_revalidate" => {
+                        assert_eq!(
+                            command.get("state").and_then(|value| value.as_str()),
+                            Some("stale")
+                        );
+                        stream
+                            .write_all(br#"{"ok":true,"changed":true,"state":"stale"}"#)
+                            .expect("write response");
+                    }
+                    _ => {
+                        assert_eq!(
+                            command.get("session_id").and_then(|value| value.as_str()),
+                            Some("test-session")
+                        );
+                        stream
+                            .write_all(br#"{"ok":true,"memory_id":"mem-1","layer":"L3"}"#)
+                            .expect("write response");
+                    }
+                }
+                stream.write_all(b"\n").expect("write newline");
+            }
+        });
+
+        unsafe {
+            std::env::set_var("COWD_DAEMON_SOCKET", &socket);
+        }
+        let mut state = TuiState::new("test-model", "test-session");
+        state.app.daemon_connector_resources = vec![
+            crate::tui::runtime_control_store::ConnectorResourceSummary {
+                reference: "service://mock.docs/document/tui-doc".to_string(),
+                provider: "mock.docs".to_string(),
+                resource_type: "document".to_string(),
+                title: "TUI Doc".to_string(),
+                indexed_state: "indexed".to_string(),
+            },
+        ];
+
+        state.dispatch_action(Action::RevalidateConnectorResource {
+            reference: "service://mock.docs/document/tui-doc".to_string(),
+            state: "stale".to_string(),
+        });
+        state.dispatch_action(Action::PromoteConnectorResourceToMemory {
+            reference: "service://mock.docs/document/tui-doc".to_string(),
+            session_id: None,
+        });
+
+        unsafe {
+            std::env::remove_var("COWD_DAEMON_SOCKET");
+        }
+        server.join().expect("server thread");
+        assert_eq!(
+            state.app.daemon_connector_resources[0].indexed_state,
+            "stale"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

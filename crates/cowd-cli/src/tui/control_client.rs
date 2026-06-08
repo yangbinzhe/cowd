@@ -337,6 +337,59 @@ impl DaemonControlClient {
         )
     }
 
+    pub async fn connector_resources(
+        &self,
+        query: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "connector_resource_list",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "q": query,
+                "limit": limit,
+                "offset": offset,
+            }))
+            .await?,
+            "daemon rejected connector_resource_list request",
+        )
+    }
+
+    pub async fn revalidate_connector_resource(
+        &self,
+        reference: &str,
+        state: &str,
+    ) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "connector_resource_revalidate",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "reference": reference,
+                "state": state,
+            }))
+            .await?,
+            "daemon rejected connector_resource_revalidate request",
+        )
+    }
+
+    pub async fn promote_connector_resource_to_memory(
+        &self,
+        reference: &str,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "connector_resource_promote_memory",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "reference": reference,
+                "session_id": session_id,
+            }))
+            .await?,
+            "daemon rejected connector_resource_promote_memory request",
+        )
+    }
+
     pub async fn chat_session(
         &self,
         session_id: &str,
@@ -785,6 +838,88 @@ mod tests {
             .await
             .expect_err("status should reject");
         assert!(matches!(err, DaemonControlError::Rejected(_)));
+
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn connector_resource_control_client_sends_socket_commands() {
+        let socket = temp_socket("connector-resource-control");
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let server = tokio::spawn(async move {
+            for expected in [
+                "connector_resource_list",
+                "connector_resource_revalidate",
+                "connector_resource_promote_memory",
+            ] {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("read command");
+                let command: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("command json");
+                assert_eq!(command.get("cmd").and_then(|v| v.as_str()), Some(expected));
+                match expected {
+                    "connector_resource_list" => {
+                        assert_eq!(command.get("limit").and_then(|v| v.as_u64()), Some(25));
+                        assert_eq!(command.get("offset").and_then(|v| v.as_u64()), Some(5));
+                        assert_eq!(command.get("q").and_then(|v| v.as_str()), Some("doc"));
+                        writer
+                            .write_all(br#"{"ok":true,"resources":[]}"#)
+                            .await
+                            .expect("write response");
+                    }
+                    "connector_resource_revalidate" => {
+                        assert_eq!(
+                            command.get("reference").and_then(|v| v.as_str()),
+                            Some("service://mock.docs/document/1")
+                        );
+                        assert_eq!(command.get("state").and_then(|v| v.as_str()), Some("stale"));
+                        writer
+                            .write_all(br#"{"ok":true,"changed":true,"state":"stale"}"#)
+                            .await
+                            .expect("write response");
+                    }
+                    _ => {
+                        assert_eq!(
+                            command.get("reference").and_then(|v| v.as_str()),
+                            Some("service://mock.docs/document/1")
+                        );
+                        assert_eq!(
+                            command.get("session_id").and_then(|v| v.as_str()),
+                            Some("session-1")
+                        );
+                        writer
+                            .write_all(br#"{"ok":true,"memory_id":"mem-1"}"#)
+                            .await
+                            .expect("write response");
+                    }
+                }
+                writer.write_all(b"\n").await.expect("write newline");
+            }
+        });
+
+        let client = DaemonControlClient::new(&socket).with_timeout(Duration::from_secs(1));
+        let resources = client
+            .connector_resources(Some("doc"), 25, 5)
+            .await
+            .expect("list resources");
+        assert_eq!(resources["ok"], true);
+        let revalidated = client
+            .revalidate_connector_resource("service://mock.docs/document/1", "stale")
+            .await
+            .expect("revalidate resource");
+        assert_eq!(revalidated["state"], "stale");
+        let promoted = client
+            .promote_connector_resource_to_memory(
+                "service://mock.docs/document/1",
+                Some("session-1"),
+            )
+            .await
+            .expect("promote resource");
+        assert_eq!(promoted["memory_id"], "mem-1");
 
         server.await.expect("server task");
         let _ = std::fs::remove_file(socket);
