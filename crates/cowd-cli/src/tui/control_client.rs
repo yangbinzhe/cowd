@@ -47,6 +47,28 @@ pub struct DaemonSessionLease {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DaemonRuntimeSnapshot {
+    pub ok: bool,
+    pub kind: String,
+    pub protocol_version: u32,
+    pub daemon: String,
+    pub active_sessions: usize,
+    pub uptime_secs: u64,
+    #[serde(default)]
+    pub sessions: Vec<String>,
+    #[serde(default)]
+    pub leases: DaemonLeaseSnapshot,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DaemonLeaseSnapshot {
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default)]
+    pub items: Vec<DaemonSessionLease>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DaemonChatResponse {
     pub ok: bool,
     pub response: String,
@@ -99,6 +121,27 @@ impl DaemonControlClient {
                     .get("error")
                     .and_then(|v| v.as_str())
                     .unwrap_or("daemon rejected status request")
+                    .to_string(),
+            ));
+        }
+
+        serde_json::from_value(value).map_err(DaemonControlError::Json)
+    }
+
+    pub async fn runtime_snapshot(&self) -> Result<DaemonRuntimeSnapshot, DaemonControlError> {
+        let value = self
+            .send_json(serde_json::json!({
+                "cmd": "runtime_snapshot",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+            }))
+            .await?;
+
+        if !value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(DaemonControlError::Rejected(
+                value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("daemon rejected runtime_snapshot request")
                     .to_string(),
             ));
         }
@@ -501,6 +544,45 @@ mod tests {
         assert_eq!(status.protocol_version, 1);
         assert_eq!(status.active_sessions, 2);
         assert_eq!(status.uptime_secs, 7);
+
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_reads_sessions_and_leases() {
+        let socket = temp_socket("runtime-snapshot");
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read command");
+            let command: serde_json::Value =
+                serde_json::from_str(line.trim()).expect("command json");
+            assert_eq!(
+                command.get("cmd").and_then(|v| v.as_str()),
+                Some("runtime_snapshot")
+            );
+            writer
+                .write_all(
+                    br#"{"ok":true,"kind":"daemon_runtime_snapshot","protocol_version":1,"daemon":"cowd","active_sessions":1,"uptime_secs":9,"sessions":["s1"],"leases":{"total":1,"items":[{"ok":true,"session_id":"s1","owner":"tui:test","mode":"collaborative"}]}}"#,
+                )
+                .await
+                .expect("write response");
+            writer.write_all(b"\n").await.expect("write newline");
+        });
+
+        let snapshot = DaemonControlClient::new(&socket)
+            .with_timeout(Duration::from_secs(1))
+            .runtime_snapshot()
+            .await
+            .expect("runtime snapshot");
+        assert_eq!(snapshot.active_sessions, 1);
+        assert_eq!(snapshot.sessions, vec!["s1"]);
+        assert_eq!(snapshot.leases.total, 1);
+        assert_eq!(snapshot.leases.items[0].owner, "tui:test");
 
         server.await.expect("server task");
         let _ = std::fs::remove_file(socket);

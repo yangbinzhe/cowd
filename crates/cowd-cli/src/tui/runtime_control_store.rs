@@ -1,5 +1,7 @@
 use crate::tui::app::App;
-use crate::tui::control_client::{DaemonControlClient, DaemonSessionLease, DaemonStatus};
+use crate::tui::control_client::{
+    DaemonControlClient, DaemonRuntimeSnapshot, DaemonSessionLease, DaemonStatus,
+};
 use crate::tui::projection_client::DaemonProjectionClient;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,6 +87,20 @@ impl RuntimeControlSnapshot {
             uptime_secs: Some(status.uptime_secs),
             ..Self::default()
         }
+    }
+
+    pub fn from_daemon_snapshot(snapshot: &DaemonRuntimeSnapshot) -> Self {
+        let mut state = Self {
+            daemon_running: true,
+            active_sessions: snapshot.active_sessions,
+            uptime_secs: Some(snapshot.uptime_secs),
+            session_ids: snapshot.sessions.clone(),
+            ..Self::default()
+        };
+        if let Some(lease) = snapshot.leases.items.first() {
+            state.apply_lease(lease);
+        }
+        state
     }
 
     pub fn from_app(app: &App) -> Self {
@@ -464,18 +480,27 @@ pub async fn refresh_runtime_control_snapshot(
     projection_client: Option<&DaemonProjectionClient>,
     session_id: Option<&str>,
 ) -> RuntimeControlSnapshot {
-    let mut snapshot = match control_client.status().await {
-        Ok(status) => RuntimeControlSnapshot::from_status(&status),
-        Err(err) => {
-            let mut snapshot = RuntimeControlSnapshot::default();
-            snapshot.degrade(format!("daemon control unavailable: {err}"));
-            return snapshot;
-        }
+    let mut snapshot = match control_client.runtime_snapshot().await {
+        Ok(value) => RuntimeControlSnapshot::from_daemon_snapshot(&value),
+        Err(err) => match control_client.status().await {
+            Ok(status) => {
+                let mut snapshot = RuntimeControlSnapshot::from_status(&status);
+                snapshot.degrade(format!("daemon runtime snapshot unavailable: {err}"));
+                snapshot
+            }
+            Err(status_err) => {
+                let mut snapshot = RuntimeControlSnapshot::default();
+                snapshot.degrade(format!("daemon control unavailable: {status_err}"));
+                return snapshot;
+            }
+        },
     };
 
-    match control_client.list_sessions().await {
-        Ok(list) => snapshot.ingest_session_ids(list.sessions),
-        Err(err) => snapshot.degrade(format!("session list unavailable: {err}")),
+    if snapshot.session_ids.is_empty() {
+        match control_client.list_sessions().await {
+            Ok(list) => snapshot.ingest_session_ids(list.sessions),
+            Err(err) => snapshot.degrade(format!("session list unavailable: {err}")),
+        }
     }
 
     let Some(projection) = projection_client else {
@@ -630,6 +655,35 @@ mod tests {
             snapshot.connector_degraded_reasons[0],
             "resource directory unavailable"
         );
+    }
+
+    #[test]
+    fn snapshot_prefers_daemon_socket_runtime_snapshot() {
+        let snapshot = RuntimeControlSnapshot::from_daemon_snapshot(&DaemonRuntimeSnapshot {
+            ok: true,
+            kind: "daemon_runtime_snapshot".to_string(),
+            protocol_version: 1,
+            daemon: "cowd".to_string(),
+            active_sessions: 2,
+            uptime_secs: 42,
+            sessions: vec!["s1".to_string(), "s2".to_string()],
+            leases: crate::tui::control_client::DaemonLeaseSnapshot {
+                total: 1,
+                items: vec![DaemonSessionLease {
+                    ok: true,
+                    session_id: "s1".to_string(),
+                    owner: "tui:fast".to_string(),
+                    mode: "collaborative".to_string(),
+                }],
+            },
+        });
+
+        assert!(snapshot.daemon_running);
+        assert_eq!(snapshot.active_sessions, 2);
+        assert_eq!(snapshot.uptime_secs, Some(42));
+        assert_eq!(snapshot.session_ids, vec!["s1", "s2"]);
+        assert_eq!(snapshot.lease_owner.as_deref(), Some("tui:fast"));
+        assert_eq!(snapshot.lease_mode.as_deref(), Some("collaborative"));
     }
 
     #[test]

@@ -717,6 +717,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
 /// Reads newline-delimited JSON commands and writes JSON responses.
 /// Supported commands:
 ///   {"cmd":"status"}
+///   {"cmd":"runtime_snapshot"}
 ///   {"cmd":"ensure_session","session_id":"...","model":"..."}
 ///   {"cmd":"subscribe_session","session_id":"..."}
 ///   {"cmd":"acquire_session_lease","session_id":"...","owner":"...","mode":"collaborative|exclusive|takeover"}
@@ -767,6 +768,10 @@ async fn handle_unix_client(
 
                         match cmd.get("cmd").and_then(|c| c.as_str()) {
                             Some("status") => daemon_control_status(&sessions, started_at),
+                            Some("runtime_snapshot") => {
+                                daemon_runtime_snapshot(&sessions, &lease_registry, started_at)
+                                    .await
+                            }
                             Some("acquire_session_lease") => {
                                 let session_id = cmd
                                     .get("session_id")
@@ -1120,6 +1125,33 @@ fn daemon_control_status(sessions: &ActiveSessions, started_at: Instant) -> serd
     })
 }
 
+async fn daemon_runtime_snapshot(
+    sessions: &ActiveSessions,
+    lease_registry: &SessionLeaseRegistry,
+    started_at: Instant,
+) -> serde_json::Value {
+    let mut session_ids = sessions.list();
+    session_ids.sort();
+    let leases = lease_registry.list().await;
+    serde_json::json!({
+        "ok": true,
+        "kind": "daemon_runtime_snapshot",
+        "protocol_version": 1,
+        "daemon": "cowd",
+        "active_sessions": session_ids.len(),
+        "uptime_secs": started_at.elapsed().as_secs(),
+        "sessions": session_ids,
+        "leases": {
+            "total": leases.len(),
+            "items": leases,
+        },
+        "transport": {
+            "control": "unix_socket",
+            "projection": "http_optional",
+        },
+    })
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1179,6 +1211,38 @@ mod tests {
             Some(0)
         );
         assert!(status.get("uptime_secs").and_then(|v| v.as_u64()).is_some());
+    }
+
+    #[tokio::test]
+    async fn daemon_runtime_snapshot_reports_sessions_leases_and_transport() {
+        let sessions = ActiveSessions::new();
+        let registry = SessionLeaseRegistry::default();
+        let lease = registry
+            .acquire("session-a", "tui:test", "collaborative")
+            .await;
+        assert_eq!(lease.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let snapshot = daemon_runtime_snapshot(&sessions, &registry, Instant::now()).await;
+        assert_eq!(
+            snapshot.get("kind").and_then(|v| v.as_str()),
+            Some("daemon_runtime_snapshot")
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/transport/control")
+                .and_then(|v| v.as_str()),
+            Some("unix_socket")
+        );
+        assert_eq!(
+            snapshot.pointer("/leases/total").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/leases/items/0/owner")
+                .and_then(|v| v.as_str()),
+            Some("tui:test")
+        );
     }
 
     #[tokio::test]
