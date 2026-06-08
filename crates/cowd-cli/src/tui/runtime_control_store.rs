@@ -3,6 +3,16 @@ use crate::tui::control_client::{DaemonControlClient, DaemonSessionLease, Daemon
 use crate::tui::projection_client::DaemonProjectionClient;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonTaskSummary {
+    pub id: String,
+    pub objective: String,
+    pub status: String,
+    pub current_phase: Option<String>,
+    pub yolo_mode: bool,
+    pub failure_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeControlSnapshot {
     pub daemon_running: bool,
     pub active_sessions: usize,
@@ -11,6 +21,7 @@ pub struct RuntimeControlSnapshot {
     pub runtime_readiness: Option<String>,
     pub runtime_components: Option<u64>,
     pub task_count: Option<u64>,
+    pub tasks: Vec<DaemonTaskSummary>,
     pub pending_approvals: Option<u64>,
     pub lease_owner: Option<String>,
     pub lease_mode: Option<String>,
@@ -38,6 +49,7 @@ impl RuntimeControlSnapshot {
             runtime_readiness: app.daemon_runtime_readiness.clone(),
             runtime_components: app.daemon_runtime_components,
             task_count: app.daemon_task_count,
+            tasks: app.daemon_tasks.clone(),
             pending_approvals: app.daemon_pending_approvals,
             lease_owner: app.daemon_lease_owner.clone(),
             lease_mode: app.daemon_lease_mode.clone(),
@@ -57,6 +69,7 @@ impl RuntimeControlSnapshot {
         app.daemon_runtime_readiness = self.runtime_readiness.clone();
         app.daemon_runtime_components = self.runtime_components;
         app.daemon_task_count = self.task_count;
+        app.daemon_tasks = self.tasks.clone();
         app.daemon_pending_approvals = self.pending_approvals;
         app.daemon_lease_owner = self.lease_owner.clone();
         app.daemon_lease_mode = self.lease_mode.clone();
@@ -80,10 +93,17 @@ impl RuntimeControlSnapshot {
     }
 
     pub fn ingest_task_status(&mut self, value: &serde_json::Value) {
-        self.task_count = value
+        self.tasks = value
             .get("tasks")
             .and_then(serde_json::Value::as_array)
-            .map(|tasks| tasks.len() as u64);
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .filter_map(task_summary_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.task_count = Some(self.tasks.len() as u64);
     }
 
     pub fn ingest_pending_approvals(&mut self, value: &serde_json::Value) {
@@ -114,6 +134,45 @@ impl RuntimeControlSnapshot {
     pub fn degrade(&mut self, reason: impl Into<String>) {
         self.degraded_reasons.push(reason.into());
     }
+}
+
+fn task_summary_from_json(value: &serde_json::Value) -> Option<DaemonTaskSummary> {
+    let id = value.get("id").and_then(serde_json::Value::as_str)?;
+    let objective = value
+        .get("objective")
+        .or_else(|| value.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let status = value
+        .get("status")
+        .or_else(|| value.get("phase"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let current_phase = value
+        .get("current_phase")
+        .or_else(|| value.get("currentPhase"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let yolo_mode = value
+        .get("yolo_mode")
+        .or_else(|| value.get("yoloMode"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let failure_count = value
+        .get("failure_count")
+        .or_else(|| value.get("failureCount"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    Some(DaemonTaskSummary {
+        id: id.to_string(),
+        objective,
+        status,
+        current_phase,
+        yolo_mode,
+        failure_count,
+    })
 }
 
 pub async fn refresh_runtime_control_snapshot(
@@ -213,6 +272,8 @@ mod tests {
         assert_eq!(snapshot.runtime_readiness.as_deref(), Some("87%"));
         assert_eq!(snapshot.runtime_components, Some(12));
         assert_eq!(snapshot.task_count, Some(2));
+        assert_eq!(snapshot.tasks.len(), 2);
+        assert_eq!(snapshot.tasks[0].id, "t1");
         assert_eq!(snapshot.pending_approvals, Some(1));
         assert_eq!(snapshot.memory_status.as_deref(), Some("available"));
         assert_eq!(snapshot.cross_plane_grants_active, Some(4));

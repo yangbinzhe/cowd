@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use crate::tui::layout::{build_default_layout, LayoutState, LayoutTree};
+use crate::tui::runtime_control_store::DaemonTaskSummary;
 use ratatui::widgets::{Block, Borders};
 use runtime::CowdEvent;
 use std::collections::VecDeque;
@@ -194,6 +195,8 @@ pub struct App {
     pub daemon_runtime_components: Option<u64>,
     /// Number of tasks observed through the daemon projection API.
     pub daemon_task_count: Option<u64>,
+    /// Daemon task summaries observed through the runtime control snapshot.
+    pub daemon_tasks: Vec<DaemonTaskSummary>,
     /// Number of pending approvals observed through the daemon projection API.
     pub daemon_pending_approvals: Option<u64>,
     /// Current daemon session lease owner for the attached TUI session.
@@ -401,6 +404,7 @@ impl App {
             daemon_runtime_readiness: None,
             daemon_runtime_components: None,
             daemon_task_count: None,
+            daemon_tasks: Vec::new(),
             daemon_pending_approvals: None,
             daemon_lease_owner: None,
             daemon_lease_mode: None,

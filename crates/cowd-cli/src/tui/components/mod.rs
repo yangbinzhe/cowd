@@ -16,6 +16,7 @@ pub mod export_dialog;
 pub mod file_changes_panel;
 pub mod file_tree;
 pub mod gateway_panel;
+pub mod goal_workbench_panel;
 pub mod l4_knowledge_view;
 pub mod memory_panel;
 pub mod performance_dashboard;
