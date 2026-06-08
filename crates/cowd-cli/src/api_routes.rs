@@ -3667,6 +3667,170 @@ providers:
     }
 
     #[tokio::test]
+    async fn feishu_readonly_service_blocks_without_ready_account() {
+        let workspace = unique_test_workspace("feishu-readonly-blocked");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
+        let tools = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/services/feishu.readonly/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tools.status(), StatusCode::OK);
+        let body = to_bytes(tools.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["service"]["id"], "feishu.readonly");
+        assert_eq!(json["health"]["status"], "degraded");
+        assert!(json["tools"].as_array().unwrap().iter().any(|tool| {
+            tool["capability_id"] == "service.feishu.docx.read"
+                && tool["supports_commit"] == true
+                && tool["requires_approval"] == false
+        }));
+
+        let request = serde_json::json!({
+            "actor_principal": "user:feishu-readonly-blocked",
+            "tool_id": "service.feishu.docx.read",
+            "resource_id": "doccn-blocked",
+            "title": "Blocked Feishu Doc",
+            "mode": "commit",
+            "idempotency_key": format!("feishu-blocked-{}", uuid::Uuid::new_v4())
+        });
+        let execute = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/feishu.readonly/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execute.status(), StatusCode::OK);
+        let body = to_bytes(execute.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["result"]["status"], "blocked");
+        assert_eq!(json["receipt"]["status"], "blocked");
+        assert!(json["receipt"]["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker
+                .as_str()
+                .unwrap_or_default()
+                .contains("no ready provider account")));
+        assert_eq!(json["resource_persisted"], false);
+    }
+
+    #[tokio::test]
+    async fn feishu_readonly_service_executes_with_ready_account_and_persists_resource() {
+        let workspace = unique_test_workspace("feishu-readonly-ready");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "name": "feishu-main",
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "cli_xxx",
+                        "app_secret": "secret_xxx"
+                    }]
+                }
+            }),
+            None,
+            workspace,
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let actor_principal = format!("user:feishu-readonly-ready-{suffix}");
+        let actor_identity_ref =
+            format!("channel://feishu/user/ready?email=ready-{suffix}@example.com");
+        let identity = serde_json::json!({
+            "id": format!("idb-feishu-readonly-ready-{suffix}"),
+            "principal_id": actor_principal,
+            "identity_ref": actor_identity_ref,
+            "trust": "verified",
+            "source": "test",
+            "created_at": "2026-06-08T00:00:00Z",
+            "expires_at": null
+        });
+        let identity_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/identities")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(identity.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity_response.status(), StatusCode::OK);
+
+        let request = serde_json::json!({
+            "actor_principal": actor_principal,
+            "actor_identity_ref": actor_identity_ref,
+            "source_channel": "channel://feishu/chat/ready",
+            "session_id": "feishu-readonly-ready-session",
+            "tool_id": "service.feishu.docx.read",
+            "resource_id": "doccn-ready",
+            "title": "Ready Feishu Doc",
+            "mode": "commit",
+            "idempotency_key": format!("feishu-ready-{}", uuid::Uuid::new_v4())
+        });
+        let execute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/feishu.readonly/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execute.status(), StatusCode::OK);
+        let body = to_bytes(execute.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["health"]["status"], "ready");
+        assert_eq!(json["result"]["status"], "ok");
+        assert_eq!(
+            json["result"]["resource"]["reference"],
+            "service://feishu/docx/doccn-ready"
+        );
+        assert_eq!(json["result"]["output"]["body_included"], false);
+        assert_eq!(json["resource_persisted"], true);
+        assert!(!json.to_string().contains("secret_xxx"));
+
+        let resources = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/resources?q=Ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resources.status(), StatusCode::OK);
+        let body = to_bytes(resources.into_body(), usize::MAX).await.unwrap();
+        let resources_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resources_json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resource| resource["reference"] == "service://feishu/docx/doccn-ready"));
+    }
+
+    #[tokio::test]
     async fn cross_plane_single_use_grant_is_consumed_and_auditable() {
         let app = api_router(test_state());
         let suffix = uuid::Uuid::new_v4().to_string();

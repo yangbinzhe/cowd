@@ -207,6 +207,28 @@ impl CapabilityManifest {
     }
 
     #[must_use]
+    pub fn service_readonly(provider: impl Into<String>, operation: impl Into<String>) -> Self {
+        let provider = provider.into();
+        let operation = operation.into();
+        Self {
+            capability_id: format!("service.{provider}.{operation}"),
+            family: format!("service.{provider}"),
+            provider,
+            plane: ConnectorPlane::Service,
+            required_scopes: Vec::new(),
+            risk: CrossPlaneRisk::Low,
+            data_classification: DataClassification::Internal,
+            supports_dry_run: true,
+            supports_commit: true,
+            requires_approval: false,
+            input_schema_ref: Some(format!(
+                "schema://connector/service/{operation}/readonly/input"
+            )),
+            output_schema_ref: Some("schema://connector/service/resource/output".to_string()),
+        }
+    }
+
+    #[must_use]
     pub fn governance(capability_id: impl Into<String>) -> Self {
         let capability_id = capability_id.into();
         Self {
@@ -790,6 +812,19 @@ pub struct ServiceToolResult {
 pub trait ServiceConnector {
     fn metadata(&self) -> ServiceConnectorMetadata;
     fn capabilities(&self) -> Vec<CapabilityManifest>;
+    fn probe(&self, accounts: &[ProviderAccount]) -> ConnectorHealth {
+        if accounts.iter().any(|account| {
+            account.provider == self.metadata().provider
+                && matches!(account.health.status, ConnectorHealthStatus::Ready)
+        }) {
+            ConnectorHealth::ready()
+        } else {
+            ConnectorHealth::degraded(format!(
+                "no ready provider account for {}",
+                self.metadata().provider
+            ))
+        }
+    }
     fn execute_tool(&self, request: ServiceToolRequest) -> ServiceToolResult;
 }
 
@@ -848,6 +883,79 @@ impl ServiceConnector for MockDocsServiceConnector {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct FeishuReadOnlyServiceConnector;
+
+impl FeishuReadOnlyServiceConnector {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn resource_type_for_tool(tool_id: &str) -> &'static str {
+        if tool_id.contains(".drive.") {
+            "drive"
+        } else if tool_id.contains(".wiki.") {
+            "wiki"
+        } else {
+            "docx"
+        }
+    }
+}
+
+impl ServiceConnector for FeishuReadOnlyServiceConnector {
+    fn metadata(&self) -> ServiceConnectorMetadata {
+        ServiceConnectorMetadata {
+            id: "feishu.readonly".to_string(),
+            provider: "feishu".to_string(),
+            family: "service.feishu".to_string(),
+            display_name: "Feishu Read-only".to_string(),
+            read_only: true,
+        }
+    }
+
+    fn capabilities(&self) -> Vec<CapabilityManifest> {
+        [
+            "docx.read",
+            "drive.metadata",
+            "drive.download_readonly",
+            "wiki.node_readonly",
+        ]
+        .into_iter()
+        .map(|operation| CapabilityManifest::service_readonly("feishu", operation))
+        .collect()
+    }
+
+    fn execute_tool(&self, request: ServiceToolRequest) -> ServiceToolResult {
+        let ServiceToolRequest {
+            tool_id,
+            resource_id,
+            title,
+            input,
+        } = request;
+        let resource_type = Self::resource_type_for_tool(&tool_id);
+        let mut resource = ExternalResourceRef::new("feishu", resource_type, &resource_id, &title);
+        resource.permissions_summary = Some(
+            "Feishu read-only connector; body fetch requires configured app scope".to_string(),
+        );
+        resource.source = input
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some(format!("feishu://{resource_type}/{resource_id}")));
+        ServiceToolResult {
+            status: "ok".to_string(),
+            tool_id,
+            resource: Some(resource.clone()),
+            output: serde_json::json!({
+                "summary": format!("Feishu {resource_type} resource resolved as {}", resource.reference),
+                "read_only": true,
+                "body_included": false,
+            }),
+        }
+    }
+}
+
 #[must_use]
 pub fn default_capabilities() -> Vec<CapabilityManifest> {
     let mut capabilities = vec![
@@ -869,6 +977,16 @@ pub fn default_capabilities() -> Vec<CapabilityManifest> {
         ]
         .into_iter()
         .map(|(provider, operation)| CapabilityManifest::channel(provider, operation)),
+    );
+    capabilities.extend(
+        [
+            "docx.read",
+            "drive.metadata",
+            "drive.download_readonly",
+            "wiki.node_readonly",
+        ]
+        .into_iter()
+        .map(|operation| CapabilityManifest::service_readonly("feishu", operation)),
     );
     capabilities.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
     capabilities
@@ -1001,6 +1119,40 @@ mod tests {
             result.resource.unwrap().reference,
             "service://mock.docs/document/doc-1"
         );
+    }
+
+    #[test]
+    fn feishu_readonly_connector_declares_low_risk_read_capabilities() {
+        let connector = FeishuReadOnlyServiceConnector::new();
+        let capabilities = connector.capabilities();
+
+        assert!(capabilities.iter().any(|capability| {
+            capability.capability_id == "service.feishu.docx.read"
+                && capability.supports_commit
+                && !capability.requires_approval
+                && capability.risk == CrossPlaneRisk::Low
+        }));
+        assert!(matches!(
+            connector.probe(&[]).status,
+            ConnectorHealthStatus::Degraded
+        ));
+    }
+
+    #[test]
+    fn feishu_readonly_connector_returns_canonical_resource_ref_without_body() {
+        let result = FeishuReadOnlyServiceConnector::new().execute_tool(ServiceToolRequest {
+            tool_id: "service.feishu.docx.read".to_string(),
+            resource_id: "doccn123".to_string(),
+            title: "Feishu Plan".to_string(),
+            input: serde_json::json!({}),
+        });
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(
+            result.resource.unwrap().reference,
+            "service://feishu/docx/doccn123"
+        );
+        assert_eq!(result.output["body_included"], false);
     }
 
     #[test]

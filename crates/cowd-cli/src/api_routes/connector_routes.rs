@@ -10,9 +10,9 @@ use axum::{
 };
 use runtime::{
     CapabilityManifest, ConnectorHealth, ConnectorRegistrySnapshot, CrossPlaneAction,
-    CrossPlaneExecutionReceipt, ExternalResourceRef, MockDocsServiceConnector, PolicyDecisionKind,
-    ProviderAccount, ServiceConnector, ServiceToolRequest, ServiceToolResult,
-    SqliteResourceDirectory,
+    CrossPlaneExecutionReceipt, ExternalResourceRef, FeishuReadOnlyServiceConnector,
+    MockDocsServiceConnector, PolicyDecisionKind, ProviderAccount, ServiceConnector,
+    ServiceToolRequest, ServiceToolResult, SqliteResourceDirectory,
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,11 +38,25 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/connectors/services/mock.docs/execute",
             axum::routing::post(mock_docs_execute_handler),
         )
+        .route(
+            "/api/connectors/services/feishu.readonly/tools",
+            get(feishu_readonly_tools_handler),
+        )
+        .route(
+            "/api/connectors/services/feishu.readonly/execute",
+            axum::routing::post(feishu_readonly_execute_handler),
+        )
 }
 
 #[derive(Debug, Deserialize)]
 struct MockDocsExecuteRequest {
     actor_principal: String,
+    #[serde(default)]
+    actor_identity_ref: Option<String>,
+    #[serde(default)]
+    source_channel: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
     tool_id: String,
     resource_id: String,
     title: String,
@@ -368,6 +382,9 @@ async fn mock_docs_execute_handler(
         &service_request.title,
     );
     let mut action = CrossPlaneAction::new(request.actor_principal, request.tool_id);
+    action.actor_identity_ref = request.actor_identity_ref;
+    action.source_channel = request.source_channel;
+    action.session_id = request.session_id;
     action.provider_account = Some("mock.docs".to_string());
     action.resource_ref = Some(preview_resource.reference.clone());
 
@@ -435,6 +452,152 @@ async fn mock_docs_execute_handler(
         "kind": "connector_service_execution",
         "service": "mock.docs",
         "replayed": false,
+        "result": service_result,
+        "resource_persisted": resource_persisted,
+        "resource_degraded_reason": resource_degraded_reason,
+        "receipt": receipt,
+    }))
+}
+
+async fn feishu_readonly_tools_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> impl IntoResponse {
+    let connector = FeishuReadOnlyServiceConnector::new();
+    let snapshot = connector_snapshot(&state);
+    Json(serde_json::json!({
+        "kind": "connector_service_tools",
+        "service": connector.metadata(),
+        "health": connector.probe(&snapshot.accounts),
+        "tools": connector.capabilities(),
+    }))
+}
+
+async fn feishu_readonly_execute_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<MockDocsExecuteRequest>,
+) -> impl IntoResponse {
+    cross_plane_routes::ensure_cross_plane_loaded(&state);
+    let connector = FeishuReadOnlyServiceConnector::new();
+    let snapshot = connector_snapshot(&state);
+    let health = connector.probe(&snapshot.accounts);
+    let account_ready = matches!(health.status, runtime::ConnectorHealthStatus::Ready);
+    let mode = request.mode.as_deref().unwrap_or("dry_run");
+    let idempotency_key = request
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(key) = &idempotency_key {
+        if let Some(receipt) =
+            cross_plane_routes::cross_plane_control().find_execution_by_idempotency_key(key)
+        {
+            return Json(serde_json::json!({
+                "kind": "connector_service_execution",
+                "service": "feishu.readonly",
+                "replayed": true,
+                "receipt": receipt,
+            }));
+        }
+    }
+
+    let service_request = ServiceToolRequest {
+        tool_id: request.tool_id.clone(),
+        resource_id: request.resource_id,
+        title: request.title,
+        input: serde_json::json!({ "source": "feishu.readonly" }),
+    };
+    let preview_result = connector.execute_tool(service_request.clone());
+    let preview_resource = preview_result.resource.clone();
+    let mut action = CrossPlaneAction::new(request.actor_principal, request.tool_id);
+    action.actor_identity_ref = request.actor_identity_ref;
+    action.source_channel = request.source_channel;
+    action.session_id = request.session_id;
+    action.provider_account = Some("feishu".to_string());
+    action.resource_ref = preview_resource
+        .as_ref()
+        .map(|resource| resource.reference.clone());
+
+    let (action, decision) = cross_plane_routes::cross_plane_control()
+        .decide_and_audit_with_action(action, chrono::Utc::now());
+    cross_plane_routes::save_cross_plane_state(&state);
+
+    let policy_allowed = decision.decision == PolicyDecisionKind::Allow;
+    let allowed = account_ready && policy_allowed;
+    let status = if mode == "commit" && allowed {
+        "executed"
+    } else if allowed {
+        "dry_run"
+    } else {
+        "blocked"
+    };
+    let dispatch_status = if mode == "commit" && allowed {
+        "service_feishu_readonly_resolved"
+    } else {
+        "not_dispatched"
+    };
+    let mut blockers = Vec::new();
+    if !policy_allowed {
+        blockers.push(format!("policy:{}", decision.reason));
+    }
+    if !account_ready {
+        blockers.push(format!(
+            "connector:{}",
+            health
+                .reason
+                .clone()
+                .unwrap_or_else(|| "no ready feishu account".to_string())
+        ));
+    }
+    let receipt = CrossPlaneExecutionReceipt::new(
+        idempotency_key,
+        mode,
+        status,
+        dispatch_status,
+        action,
+        decision,
+        blockers,
+        None,
+    );
+    cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
+    cross_plane_routes::save_cross_plane_state(&state);
+    let service_result = if allowed {
+        connector.execute_tool(service_request)
+    } else {
+        ServiceToolResult {
+            status: status.to_string(),
+            tool_id: receipt.action.requested_capability.clone(),
+            resource: preview_resource,
+            output: serde_json::json!({
+                "summary": "Feishu read-only request was blocked before external access",
+                "read_only": true,
+                "body_included": false,
+            }),
+        }
+    };
+    let mut resource_persisted = false;
+    let mut resource_degraded_reason = None;
+    if allowed {
+        if let Some(resource) = service_result.resource.clone() {
+            match durable_resource_directory(&state)
+                .and_then(|directory| directory.upsert(&resource))
+            {
+                Ok(_) => {
+                    resource_persisted = true;
+                }
+                Err(error) => {
+                    resource_degraded_reason =
+                        Some(format!("resource directory unavailable: {error}"));
+                }
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "kind": "connector_service_execution",
+        "service": "feishu.readonly",
+        "replayed": false,
+        "health": health,
         "result": service_result,
         "resource_persisted": resource_persisted,
         "resource_degraded_reason": resource_degraded_reason,
