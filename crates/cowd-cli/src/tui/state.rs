@@ -2210,6 +2210,7 @@ impl Default for L4KnowledgeView {
 mod tests {
     use super::*;
     use crate::tui::layout::LayoutNode;
+    use crate::tui::test_utils::MockTerminal;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
 
@@ -2684,6 +2685,32 @@ providers:
         assert_eq!(compact[4], "Appr");
         assert_eq!(full[0], "Runtime");
         assert_eq!(full[4], "Approvals");
+    }
+
+    #[test]
+    fn renders_every_sidebar_tab_in_wide_and_compact_layouts() {
+        for (width, height) in [(140, 38), (88, 32)] {
+            for tab in 0..SIDEBAR_TAB_COUNT {
+                let mut state = TuiState::new("m", "scenario-session");
+                state.app.server_running = true;
+                state.app.active_api_sessions = 1;
+                state.app.daemon_runtime_readiness = Some("92%".to_string());
+                state.app.daemon_task_count = Some(1);
+                state.app.daemon_pending_approvals = Some(1);
+                state.app.daemon_cross_plane_grants_active = Some(1);
+                state.app.memory_status = Some("available".to_string());
+                state.sidebar_active_tab = tab;
+
+                let mut terminal = MockTerminal::new(width, height);
+                terminal.draw(|frame| state.render(frame));
+                let joined = terminal.buffer_lines().join("\n");
+
+                assert!(
+                    !joined.trim().is_empty(),
+                    "tab {tab} at {width}x{height} rendered an empty buffer"
+                );
+            }
+        }
     }
 
     // ── startup_loading ─────────────────────────────────────────
