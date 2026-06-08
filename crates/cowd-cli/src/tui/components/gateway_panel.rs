@@ -327,6 +327,14 @@ impl Component for GatewayPanel {
                 ]));
             }
 
+            lines.push(Line::from(vec![
+                Span::styled("Transport: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "control socket · projection http",
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+
             if let Some(readiness) = self.runtime_readiness.as_ref() {
                 lines.push(Line::from(vec![
                     Span::styled("Runtime: ", Style::default().fg(Color::DarkGray)),
@@ -597,10 +605,10 @@ impl Component for GatewayPanel {
             }
         }
 
-        // ── API Endpoints ──────────────────────────────────────
+        // ── HTTP Projection Endpoints ──────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "─ API Endpoints ─",
+            "─ HTTP Projection Endpoints ─",
             Style::default().fg(Color::Cyan),
         )));
         lines.push(Line::from(""));
@@ -872,6 +880,10 @@ mod tests {
             "Should show sessions, got: {joined}"
         );
         assert!(
+            joined.contains("Transport") && joined.contains("control socket"),
+            "Should show socket/http transport split, got: {joined}"
+        );
+        assert!(
             joined.contains("Runtime") && joined.contains("87%"),
             "Should show runtime projection summary, got: {joined}"
         );
@@ -899,6 +911,10 @@ mod tests {
         });
         let lines = terminal.buffer_lines();
         let joined = lines.join("\n");
+        assert!(
+            joined.contains("HTTP Projection Endpoints"),
+            "Should show HTTP projection endpoint section, got: {joined}"
+        );
         assert!(
             joined.contains("/health"),
             "Should show /health endpoint, got: {joined}"
