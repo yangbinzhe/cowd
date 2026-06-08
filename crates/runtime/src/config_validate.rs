@@ -462,12 +462,10 @@ const COMPRESSION_FIELDS: &[FieldSpec] = &[
     },
 ];
 
-const MCP_FIELDS: &[FieldSpec] = &[
-    FieldSpec {
-        name: "servers",
-        expected: FieldType::Object,
-    },
-];
+const MCP_FIELDS: &[FieldSpec] = &[FieldSpec {
+    name: "servers",
+    expected: FieldType::Object,
+}];
 
 const APPROVAL_FIELDS: &[FieldSpec] = &[
     FieldSpec {

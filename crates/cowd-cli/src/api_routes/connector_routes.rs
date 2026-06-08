@@ -6,7 +6,7 @@ use runtime::{
     CrossPlaneExecutionReceipt, ExternalResourceRef, MockDocsServiceConnector, PolicyDecisionKind,
     ProviderAccount, ResourceDirectory, ServiceConnector, ServiceToolRequest, ServiceToolResult,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{channel_routes, cross_plane_routes, AppState};
 
@@ -52,11 +52,13 @@ fn resource_directory() -> &'static ResourceDirectory {
 
 pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot {
     let platforms = channel_routes::configured_platforms(state.config.as_ref());
-    let accounts = platforms
+    let mut accounts = platforms
         .iter()
         .filter(|platform| platform.enabled || platform.configured)
         .map(account_from_platform)
         .collect::<Vec<_>>();
+    let mcp_servers = configured_mcp_servers(state.config.as_ref());
+    accounts.extend(mcp_servers.iter().map(account_from_mcp_server));
     let mut capabilities = runtime::default_capabilities();
     for platform in platforms {
         for operation in platform.capabilities {
@@ -69,6 +71,20 @@ pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot 
             }
         }
     }
+    for server in &mcp_servers {
+        let capability = CapabilityManifest::mcp_server(&server.name);
+        if !capabilities
+            .iter()
+            .any(|item| item.capability_id == capability.capability_id)
+        {
+            capabilities.push(capability);
+        }
+    }
+    accounts.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.account_id.cmp(&right.account_id))
+    });
     capabilities.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
     ConnectorRegistrySnapshot::new(
         accounts,
@@ -118,6 +134,121 @@ fn auth_mode_for_platform(platform_type: &str) -> &'static str {
         "email" => "smtp_imap",
         _ => "config",
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct McpServerReadiness {
+    name: String,
+    transport: String,
+    enabled: bool,
+    status: &'static str,
+    configured: bool,
+    missing_required: Vec<String>,
+    diagnostics: Vec<String>,
+}
+
+fn configured_mcp_servers(config: Option<&serde_json::Value>) -> Vec<McpServerReadiness> {
+    let Some(servers) = config
+        .and_then(|value| value.get("mcpServers"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Vec::new();
+    };
+
+    let mut items = servers
+        .iter()
+        .map(|(name, value)| mcp_server_readiness_from_value(name, value))
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.name.cmp(&right.name));
+    items
+}
+
+fn mcp_server_readiness_from_value(name: &str, value: &serde_json::Value) -> McpServerReadiness {
+    let transport = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| infer_mcp_transport(value).to_string());
+    let enabled = value
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let missing_required = missing_mcp_required_fields(&transport, value);
+    let configured = missing_required.is_empty();
+    let status = if !enabled {
+        "disabled"
+    } else if configured {
+        "ready"
+    } else {
+        "degraded"
+    };
+    let diagnostics = if configured {
+        vec![
+            "MCP server declared; live discovery is evaluated outside control-plane snapshot"
+                .to_string(),
+        ]
+    } else {
+        vec![format!(
+            "missing required fields: {}",
+            missing_required.join(", ")
+        )]
+    };
+    McpServerReadiness {
+        name: name.to_string(),
+        transport,
+        enabled,
+        status,
+        configured,
+        missing_required,
+        diagnostics,
+    }
+}
+
+fn infer_mcp_transport(value: &serde_json::Value) -> &'static str {
+    if value.get("command").is_some() {
+        "stdio"
+    } else if value.get("url").is_some() {
+        "http"
+    } else if value.get("name").is_some() {
+        "sdk"
+    } else {
+        "unknown"
+    }
+}
+
+fn missing_mcp_required_fields(transport: &str, value: &serde_json::Value) -> Vec<String> {
+    let required: &[&str] = match transport {
+        "stdio" => &["command"],
+        "http" | "sse" | "ws" | "claudeai-proxy" => &["url"],
+        "sdk" => &["name"],
+        _ => &["type"],
+    };
+    required
+        .iter()
+        .filter(|field| !has_non_empty(value, field))
+        .map(|field| (*field).to_string())
+        .collect()
+}
+
+fn has_non_empty(value: &serde_json::Value, field: &str) -> bool {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .is_some_and(|item| !item.is_empty())
+}
+
+fn account_from_mcp_server(server: &McpServerReadiness) -> ProviderAccount {
+    let health = match server.status {
+        "ready" => ConnectorHealth::ready(),
+        "disabled" => ConnectorHealth::disabled("MCP server is disabled"),
+        "degraded" => ConnectorHealth::degraded(format!(
+            "missing required fields: {}",
+            server.missing_required.join(", ")
+        )),
+        other => ConnectorHealth::degraded(format!("MCP server status is {other}")),
+    };
+    ProviderAccount::mcp_server(server.name.clone(), server.transport.clone(), health)
 }
 
 async fn connector_summary_handler(

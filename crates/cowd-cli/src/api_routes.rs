@@ -3414,6 +3414,82 @@ providers:
     }
 
     #[tokio::test]
+    async fn connector_routes_project_configured_mcp_servers_into_runtime_contract() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "mcpServers": {
+                "github.com": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-github"],
+                    "env": {
+                        "GITHUB_TOKEN": "secret-token"
+                    }
+                },
+                "broken": {
+                    "type": "stdio"
+                }
+            }
+        })));
+
+        let accounts = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/accounts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accounts.status(), StatusCode::OK);
+        let body = to_bytes(accounts.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_accounts");
+        assert_eq!(json["total"], 2);
+        assert!(json["accounts"].as_array().unwrap().iter().any(|account| {
+            account["provider"] == "mcp"
+                && account["account_id"] == "github.com"
+                && account["auth_mode"] == "stdio"
+                && account["health"]["status"] == "ready"
+                && account["enabled_bindings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item == "mcp.github_com.server")
+        }));
+        assert!(json["accounts"].as_array().unwrap().iter().any(|account| {
+            account["provider"] == "mcp"
+                && account["account_id"] == "broken"
+                && account["health"]["status"] == "degraded"
+        }));
+        assert!(!json.to_string().contains("secret-token"));
+
+        let capabilities = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capabilities.status(), StatusCode::OK);
+        let body = to_bytes(capabilities.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |capability| capability["capability_id"] == "mcp.github_com.server"
+                    && capability["plane"] == "mcp"
+                    && capability["supports_commit"] == false
+            ));
+    }
+
+    #[tokio::test]
     async fn mock_docs_service_connector_executes_through_cross_plane_receipt() {
         let app = api_router(test_state());
         let tools = app

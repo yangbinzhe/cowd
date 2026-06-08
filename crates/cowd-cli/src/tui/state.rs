@@ -778,8 +778,6 @@ impl TuiState {
             }
         }
 
-
-
         // 2. Render status bar at bottom (reuses main_ctx)
         {
             let status_area =

@@ -125,6 +125,20 @@ impl ProviderAccount {
             .map(String::as_str)
             .collect()
     }
+
+    #[must_use]
+    pub fn mcp_server(
+        server_name: impl Into<String>,
+        transport: impl Into<String>,
+        health: ConnectorHealth,
+    ) -> Self {
+        let server_name = server_name.into();
+        let mut account = Self::new("mcp", server_name.clone(), transport);
+        account.secret_refs = vec![format!("config://mcpServers/{server_name}")];
+        account.enabled_bindings = vec![CapabilityManifest::mcp_server(&server_name).capability_id];
+        account.health = health;
+        account
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +224,67 @@ impl CapabilityManifest {
     }
 
     #[must_use]
+    pub fn mcp_server(server_name: impl AsRef<str>) -> Self {
+        let normalized_server = crate::mcp::normalize_name_for_mcp(server_name.as_ref());
+        Self {
+            capability_id: format!("mcp.{normalized_server}.server"),
+            family: format!("mcp.{normalized_server}"),
+            provider: "mcp".to_string(),
+            plane: ConnectorPlane::Mcp,
+            required_scopes: Vec::new(),
+            risk: CrossPlaneRisk::Low,
+            data_classification: DataClassification::Internal,
+            supports_dry_run: true,
+            supports_commit: false,
+            requires_approval: false,
+            input_schema_ref: Some("schema://connector/mcp/server/input".to_string()),
+            output_schema_ref: Some("schema://connector/mcp/server/output".to_string()),
+        }
+    }
+
+    #[must_use]
+    pub fn mcp_tool(server_name: impl AsRef<str>, tool_name: impl AsRef<str>) -> Self {
+        let normalized_server = crate::mcp::normalize_name_for_mcp(server_name.as_ref());
+        let normalized_tool = crate::mcp::normalize_name_for_mcp(tool_name.as_ref());
+        Self {
+            capability_id: format!("mcp.{normalized_server}.tool.{normalized_tool}"),
+            family: format!("mcp.{normalized_server}"),
+            provider: "mcp".to_string(),
+            plane: ConnectorPlane::Mcp,
+            required_scopes: Vec::new(),
+            risk: CrossPlaneRisk::Medium,
+            data_classification: DataClassification::Internal,
+            supports_dry_run: false,
+            supports_commit: true,
+            requires_approval: true,
+            input_schema_ref: Some(format!(
+                "schema://connector/mcp/{normalized_server}/tool/{normalized_tool}/input"
+            )),
+            output_schema_ref: Some("schema://connector/mcp/tool/output".to_string()),
+        }
+    }
+
+    #[must_use]
+    pub fn mcp_resource(server_name: impl AsRef<str>, resource_kind: impl AsRef<str>) -> Self {
+        let normalized_server = crate::mcp::normalize_name_for_mcp(server_name.as_ref());
+        let normalized_kind = crate::mcp::normalize_name_for_mcp(resource_kind.as_ref());
+        Self {
+            capability_id: format!("mcp.{normalized_server}.resource.{normalized_kind}"),
+            family: format!("mcp.{normalized_server}"),
+            provider: "mcp".to_string(),
+            plane: ConnectorPlane::Mcp,
+            required_scopes: Vec::new(),
+            risk: CrossPlaneRisk::Low,
+            data_classification: DataClassification::Internal,
+            supports_dry_run: true,
+            supports_commit: false,
+            requires_approval: false,
+            input_schema_ref: Some("schema://connector/mcp/resource/input".to_string()),
+            output_schema_ref: Some("schema://connector/mcp/resource/output".to_string()),
+        }
+    }
+
+    #[must_use]
     pub fn missing_scopes<'a>(&'a self, account: &'a ProviderAccount) -> Vec<&'a str> {
         account.missing_scopes(&self.required_scopes)
     }
@@ -258,7 +333,34 @@ impl ExternalResourceRef {
 
     #[must_use]
     pub fn is_canonical(&self) -> bool {
-        self.reference.starts_with("service://") || self.reference.starts_with("channel://")
+        self.reference.starts_with("service://")
+            || self.reference.starts_with("channel://")
+            || self.reference.starts_with("mcp://")
+    }
+
+    #[must_use]
+    pub fn mcp_resource(
+        server_name: impl AsRef<str>,
+        uri: impl AsRef<str>,
+        title: impl Into<String>,
+    ) -> Self {
+        let server_name = server_name.as_ref();
+        let normalized_server = crate::mcp::normalize_name_for_mcp(server_name);
+        let uri = uri.as_ref();
+        let digest = stable_hex_hash(uri);
+        Self {
+            reference: format!("mcp://{normalized_server}/{digest}"),
+            provider: "mcp".to_string(),
+            account_id: Some(server_name.to_string()),
+            resource_type: "resource".to_string(),
+            title: title.into(),
+            source: Some(uri.to_string()),
+            permissions_summary: Some(
+                "MCP resource access is governed by server configuration".to_string(),
+            ),
+            digest: Some(digest),
+            indexed_state: "unknown".to_string(),
+        }
     }
 }
 
@@ -332,6 +434,11 @@ impl ConnectorRegistrySnapshot {
             .iter()
             .filter(|capability| capability.plane == ConnectorPlane::Governance)
             .count();
+        let mcp_capabilities = self
+            .capabilities
+            .iter()
+            .filter(|capability| capability.plane == ConnectorPlane::Mcp)
+            .count();
         ConnectorSummary {
             account_count: self.accounts.len(),
             capability_count: self.capabilities.len(),
@@ -339,6 +446,7 @@ impl ConnectorRegistrySnapshot {
             channel_capabilities,
             service_capabilities,
             governance_capabilities,
+            mcp_capabilities,
             degraded: self.degraded,
             degraded_reasons: self.degraded_reasons.clone(),
         }
@@ -353,6 +461,7 @@ pub struct ConnectorSummary {
     pub channel_capabilities: usize,
     pub service_capabilities: usize,
     pub governance_capabilities: usize,
+    pub mcp_capabilities: usize,
     pub degraded: bool,
     pub degraded_reasons: Vec<String>,
 }
@@ -546,6 +655,15 @@ fn risk_for_channel_operation(operation: &str) -> CrossPlaneRisk {
     }
 }
 
+fn stable_hex_hash(value: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,6 +694,43 @@ mod tests {
         let resource = ExternalResourceRef::new("feishu", "docx", "doccn123", "Design");
 
         assert_eq!(resource.reference, "service://feishu/docx/doccn123");
+        assert!(resource.is_canonical());
+    }
+
+    #[test]
+    fn mcp_capability_contracts_are_stable() {
+        let server = CapabilityManifest::mcp_server("github.com");
+        assert_eq!(server.capability_id, "mcp.github_com.server");
+        assert_eq!(server.plane, ConnectorPlane::Mcp);
+        assert!(!server.requires_approval);
+
+        let tool = CapabilityManifest::mcp_tool("github.com", "create issue");
+        assert_eq!(tool.capability_id, "mcp.github_com.tool.create_issue");
+        assert_eq!(tool.family, "mcp.github_com");
+        assert!(tool.supports_commit);
+        assert!(tool.requires_approval);
+
+        let account = ProviderAccount::mcp_server("github.com", "stdio", ConnectorHealth::ready());
+        assert_eq!(account.provider, "mcp");
+        assert_eq!(account.account_id, "github.com");
+        assert_eq!(account.enabled_bindings, vec!["mcp.github_com.server"]);
+    }
+
+    #[test]
+    fn mcp_resource_ref_uses_canonical_scheme_without_exposing_uri_as_id() {
+        let resource = ExternalResourceRef::mcp_resource(
+            "github.com",
+            "repo://owner/project/issues/1",
+            "Issue 1",
+        );
+
+        assert!(resource.reference.starts_with("mcp://github_com/"));
+        assert_eq!(resource.provider, "mcp");
+        assert_eq!(resource.account_id.as_deref(), Some("github.com"));
+        assert_eq!(
+            resource.source.as_deref(),
+            Some("repo://owner/project/issues/1")
+        );
         assert!(resource.is_canonical());
     }
 
