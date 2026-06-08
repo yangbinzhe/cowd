@@ -487,6 +487,71 @@ impl CommandPalette {
             ));
         }
 
+        if !snapshot.connector_resources.is_empty() {
+            self.all_commands.push(CommandEntry::dynamic(
+                "Search Connector Resources",
+                format!(
+                    "{} external resources indexed",
+                    snapshot.connector_resources.len()
+                ),
+                Action::Execute("/context".into()),
+            ));
+        }
+
+        if !snapshot.connector_accounts.is_empty() || !snapshot.connector_capabilities.is_empty() {
+            self.all_commands.push(CommandEntry::dynamic(
+                "Probe Connectors",
+                format!(
+                    "{} accounts, {} capabilities",
+                    snapshot.connector_accounts.len(),
+                    snapshot.connector_capabilities.len()
+                ),
+                Action::Execute("/status".into()),
+            ));
+        }
+
+        if snapshot
+            .connector_capabilities
+            .iter()
+            .any(|capability| capability.capability_id == "service.mock.docs.read")
+        {
+            self.all_commands.push(CommandEntry::dynamic(
+                "Mock Docs Dry Run",
+                "Use connector console contract for a non-destructive service read",
+                Action::Execute("/cross-plane".into()),
+            ));
+            self.all_commands.push(CommandEntry::dynamic(
+                "Mock Docs Commit",
+                "Commit a governed mock docs read and persist the resource ref",
+                Action::Execute("/cross-plane".into()),
+            ));
+        }
+
+        if !snapshot.connector_degraded_reasons.is_empty()
+            || snapshot
+                .connector_accounts
+                .iter()
+                .any(|account| account.status == "degraded")
+        {
+            let reason = snapshot
+                .connector_degraded_reasons
+                .first()
+                .cloned()
+                .or_else(|| {
+                    snapshot
+                        .connector_accounts
+                        .iter()
+                        .find(|account| account.status == "degraded")
+                        .and_then(|account| account.reason.clone())
+                })
+                .unwrap_or_else(|| "connector degraded".to_string());
+            self.all_commands.push(CommandEntry::dynamic(
+                "Inspect Degraded Connector",
+                reason,
+                Action::Execute("/status".into()),
+            ));
+        }
+
         if !snapshot.degraded_reasons.is_empty() {
             self.all_commands.push(CommandEntry::dynamic(
                 "Inspect Daemon Degradation",
@@ -1150,6 +1215,74 @@ mod tests {
         }));
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic && entry.action == Action::Execute("/cross-plane".into())
+        }));
+    }
+
+    #[test]
+    fn sync_runtime_actions_adds_connector_entries() {
+        let mut p = setup_palette();
+        let snapshot = RuntimeControlSnapshot {
+            daemon_running: true,
+            task_count: Some(0),
+            connector_accounts: vec![crate::tui::runtime_control_store::ConnectorAccountSummary {
+                provider: "feishu".to_string(),
+                account_id: "feishu-main".to_string(),
+                auth_mode: "app_secret".to_string(),
+                status: "degraded".to_string(),
+                reason: Some("missing required fields: app_secret".to_string()),
+                binding_count: 1,
+            }],
+            connector_capabilities: vec![
+                crate::tui::runtime_control_store::ConnectorCapabilitySummary {
+                    capability_id: "service.mock.docs.read".to_string(),
+                    provider: "mock".to_string(),
+                    plane: "service".to_string(),
+                    risk: "low".to_string(),
+                    supports_commit: true,
+                    requires_approval: false,
+                },
+                crate::tui::runtime_control_store::ConnectorCapabilitySummary {
+                    capability_id: "service.feishu.docx.read".to_string(),
+                    provider: "feishu".to_string(),
+                    plane: "service".to_string(),
+                    risk: "low".to_string(),
+                    supports_commit: true,
+                    requires_approval: false,
+                },
+            ],
+            connector_resources: vec![
+                crate::tui::runtime_control_store::ConnectorResourceSummary {
+                    reference: "service://feishu/docx/doccn-ready".to_string(),
+                    provider: "feishu".to_string(),
+                    resource_type: "docx".to_string(),
+                    title: "Ready Feishu Doc".to_string(),
+                    indexed_state: "indexed".to_string(),
+                },
+            ],
+            connector_degraded_reasons: vec!["resource_directory: locked".to_string()],
+            ..RuntimeControlSnapshot::default()
+        };
+
+        p.sync_runtime_actions(&snapshot);
+
+        for name in [
+            "Search Connector Resources",
+            "Probe Connectors",
+            "Mock Docs Dry Run",
+            "Mock Docs Commit",
+            "Inspect Degraded Connector",
+        ] {
+            assert!(
+                p.all_commands
+                    .iter()
+                    .any(|entry| entry.dynamic && entry.name == name),
+                "missing dynamic connector command {name}"
+            );
+        }
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic
+                && entry.name == "Inspect Degraded Connector"
+                && entry.description.contains("resource_directory")
         }));
     }
 

@@ -17,8 +17,13 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use crate::tui::app::App;
 use crate::tui::components::{Component, EventResult, RenderContext};
+use crate::tui::{
+    app::App,
+    runtime_control_store::{
+        ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
+    },
+};
 
 /// Panel showing backend daemon/API gateway status.
 ///
@@ -51,6 +56,14 @@ pub struct GatewayPanel {
     pub execution_receipts: Vec<GatewayExecutionReceipt>,
     /// Recent dispatch target readiness summaries.
     pub dispatch_targets: Vec<GatewayDispatchTarget>,
+    /// Connector provider account summaries.
+    pub connector_accounts: Vec<ConnectorAccountSummary>,
+    /// Connector capability summaries.
+    pub connector_capabilities: Vec<ConnectorCapabilitySummary>,
+    /// Connector resource summaries.
+    pub connector_resources: Vec<ConnectorResourceSummary>,
+    /// Connector-specific degraded reasons.
+    pub connector_degraded_reasons: Vec<String>,
     /// Scroll offset for content overflow.
     pub scroll_offset: u16,
 }
@@ -128,6 +141,10 @@ impl GatewayPanel {
             adapter_capabilities: Vec::new(),
             execution_receipts: Vec::new(),
             dispatch_targets: Vec::new(),
+            connector_accounts: Vec::new(),
+            connector_capabilities: Vec::new(),
+            connector_resources: Vec::new(),
+            connector_degraded_reasons: Vec::new(),
             scroll_offset: 0,
         }
     }
@@ -147,6 +164,10 @@ impl GatewayPanel {
         self.pending_approvals = app.daemon_pending_approvals;
         self.lease_owner = app.daemon_lease_owner.clone();
         self.lease_mode = app.daemon_lease_mode.clone();
+        self.connector_accounts = app.daemon_connector_accounts.clone();
+        self.connector_capabilities = app.daemon_connector_capabilities.clone();
+        self.connector_resources = app.daemon_connector_resources.clone();
+        self.connector_degraded_reasons = app.daemon_connector_degraded_reasons.clone();
         if app.server_running {
             self.health_status = Some("Healthy".to_string());
         } else {
@@ -190,6 +211,22 @@ impl GatewayPanel {
 
     pub fn set_dispatch_targets(&mut self, targets: Vec<GatewayDispatchTarget>) {
         self.dispatch_targets = targets;
+    }
+
+    pub fn set_connector_accounts(&mut self, accounts: Vec<ConnectorAccountSummary>) {
+        self.connector_accounts = accounts;
+    }
+
+    pub fn set_connector_capabilities(&mut self, capabilities: Vec<ConnectorCapabilitySummary>) {
+        self.connector_capabilities = capabilities;
+    }
+
+    pub fn set_connector_resources(&mut self, resources: Vec<ConnectorResourceSummary>) {
+        self.connector_resources = resources;
+    }
+
+    pub fn set_connector_degraded_reasons(&mut self, reasons: Vec<String>) {
+        self.connector_degraded_reasons = reasons;
     }
 
     // ── Rendering helpers ────────────────────────────────────────
@@ -429,6 +466,133 @@ impl Component for GatewayPanel {
             }
         }
 
+        if !self.connector_accounts.is_empty()
+            || !self.connector_capabilities.is_empty()
+            || !self.connector_resources.is_empty()
+            || !self.connector_degraded_reasons.is_empty()
+        {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "─ Connector Console ─",
+                Style::default().fg(Color::Cyan),
+            )));
+            lines.push(Line::from(vec![
+                Span::styled("Accounts: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", self.connector_accounts.len()),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("  Capabilities: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", self.connector_capabilities.len()),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("  Resources: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", self.connector_resources.len()),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+
+            for account in self.connector_accounts.iter().take(4) {
+                let color = match account.status.as_str() {
+                    "ready" => Color::Green,
+                    "disabled" => Color::DarkGray,
+                    "degraded" => Color::Yellow,
+                    _ => Color::White,
+                };
+                let detail = account
+                    .reason
+                    .as_deref()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("{} bindings", account.binding_count));
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:8}", account.status), Style::default().fg(color)),
+                    Span::styled(
+                        format!("{:10}", account.provider),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(
+                        format!("{:18}", account.account_id),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(detail, Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+
+            if !self.connector_capabilities.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "Capabilities",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for capability in self.connector_capabilities.iter().take(5) {
+                    let approval = if capability.requires_approval {
+                        "approval"
+                    } else {
+                        "open"
+                    };
+                    let commit = if capability.supports_commit {
+                        "commit"
+                    } else {
+                        "dry-run"
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:8}", capability.plane),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("{:34}", capability.capability_id),
+                            Style::default().fg(Color::White),
+                        ),
+                        Span::styled(
+                            format!("{} · {} · {}", capability.risk, commit, approval),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+            }
+
+            if !self.connector_resources.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "Resources",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for resource in self.connector_resources.iter().take(4) {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:10}", resource.provider),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(
+                            format!("{:10}", resource.resource_type),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("{:18}", resource.indexed_state),
+                            Style::default().fg(Color::Green),
+                        ),
+                        Span::styled(resource.title.clone(), Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
+            }
+
+            if !self.connector_degraded_reasons.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Connector degraded: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        self.connector_degraded_reasons
+                            .iter()
+                            .take(2)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+
         // ── API Endpoints ──────────────────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -437,7 +601,7 @@ impl Component for GatewayPanel {
         )));
         lines.push(Line::from(""));
 
-        let endpoints: [(&str, &str); 16] = [
+        let endpoints: [(&str, &str); 22] = [
             ("GET  /health", "Server health check"),
             ("GET  /api/sessions", "List sessions"),
             ("POST /api/sessions", "Create session"),
@@ -457,6 +621,21 @@ impl Component for GatewayPanel {
             (
                 "GET  /api/cross-plane/action/executions",
                 "Interop execution receipts",
+            ),
+            ("GET  /api/connectors/summary", "Connector summary"),
+            ("GET  /api/connectors/accounts", "Connector accounts"),
+            (
+                "GET  /api/connectors/capabilities",
+                "Connector capabilities",
+            ),
+            ("GET  /api/connectors/resources", "Connector resources"),
+            (
+                "GET  /api/connectors/services/mock.docs/tools",
+                "Mock docs service tools",
+            ),
+            (
+                "POST /api/connectors/services/mock.docs/execute",
+                "Mock docs dry-run/commit",
             ),
             (
                 "POST /api/cross-plane/policy/simulate",
@@ -825,11 +1004,11 @@ mod tests {
         use crate::tui::test_utils::MockTerminal;
 
         let mut panel = GatewayPanel::new();
-        let mut terminal = MockTerminal::new(118, 32);
+        let mut terminal = MockTerminal::new(118, 40);
         let skin = SkinConfig::default();
         terminal.draw(|f: &mut ratatui::Frame| {
             let mut ctx = RenderContext::new(f, &skin);
-            panel.render(&mut ctx, Rect::new(0, 0, 118, 32));
+            panel.render(&mut ctx, Rect::new(0, 0, 118, 40));
         });
         let joined = terminal.buffer_lines().join("\n");
         assert!(
@@ -849,6 +1028,86 @@ mod tests {
         assert!(
             joined.contains("/api/cross-plane/action/execute"),
             "Should show execute endpoint, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn render_shows_connector_console_state() {
+        use crate::tui::skin::SkinConfig;
+        use crate::tui::test_utils::MockTerminal;
+
+        let mut panel = GatewayPanel::new();
+        panel.set_connector_accounts(vec![
+            ConnectorAccountSummary {
+                provider: "feishu".to_string(),
+                account_id: "feishu-main".to_string(),
+                auth_mode: "app_secret".to_string(),
+                status: "degraded".to_string(),
+                reason: Some("missing required fields: app_secret".to_string()),
+                binding_count: 1,
+            },
+            ConnectorAccountSummary {
+                provider: "mock".to_string(),
+                account_id: "mock.docs".to_string(),
+                auth_mode: "none".to_string(),
+                status: "ready".to_string(),
+                reason: None,
+                binding_count: 1,
+            },
+        ]);
+        panel.set_connector_capabilities(vec![
+            ConnectorCapabilitySummary {
+                capability_id: "service.feishu.docx.read".to_string(),
+                provider: "feishu".to_string(),
+                plane: "service".to_string(),
+                risk: "low".to_string(),
+                supports_commit: true,
+                requires_approval: false,
+            },
+            ConnectorCapabilitySummary {
+                capability_id: "mcp.filesystem.server".to_string(),
+                provider: "filesystem".to_string(),
+                plane: "mcp".to_string(),
+                risk: "low".to_string(),
+                supports_commit: false,
+                requires_approval: false,
+            },
+        ]);
+        panel.set_connector_resources(vec![ConnectorResourceSummary {
+            reference: "service://feishu/docx/doccn-ready".to_string(),
+            provider: "feishu".to_string(),
+            resource_type: "docx".to_string(),
+            title: "Ready Feishu Doc".to_string(),
+            indexed_state: "indexed".to_string(),
+        }]);
+        panel.set_connector_degraded_reasons(vec!["resource_directory: locked".to_string()]);
+
+        let mut terminal = MockTerminal::new(112, 34);
+        let skin = SkinConfig::default();
+        terminal.draw(|f: &mut ratatui::Frame| {
+            let mut ctx = RenderContext::new(f, &skin);
+            panel.render(&mut ctx, Rect::new(0, 0, 112, 34));
+        });
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(
+            joined.contains("Connector Console"),
+            "Should show connector section, got: {joined}"
+        );
+        assert!(
+            joined.contains("feishu-main") && joined.contains("missing required fields"),
+            "Should show degraded account reason, got: {joined}"
+        );
+        assert!(
+            joined.contains("service.feishu.docx.read") && joined.contains("mcp.filesystem.server"),
+            "Should show connector capabilities, got: {joined}"
+        );
+        assert!(
+            joined.contains("Ready Feishu Doc") && joined.contains("indexed"),
+            "Should show connector resources, got: {joined}"
+        );
+        assert!(
+            joined.contains("resource_directory: locked"),
+            "Should show connector degraded reasons, got: {joined}"
         );
     }
 
