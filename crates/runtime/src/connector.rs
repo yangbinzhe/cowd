@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -828,6 +829,158 @@ pub trait ServiceConnector {
     fn execute_tool(&self, request: ServiceToolRequest) -> ServiceToolResult;
 }
 
+#[derive(Debug)]
+pub struct ConnectorBulkhead {
+    max_in_flight_per_provider: usize,
+    failure_threshold: u32,
+    cooldown: Duration,
+    providers: Mutex<HashMap<String, ConnectorProviderBulkheadState>>,
+}
+
+#[derive(Debug, Clone)]
+struct ConnectorProviderBulkheadState {
+    in_flight: usize,
+    consecutive_failures: u32,
+    cooldown_until: Option<Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectorBulkheadRejection {
+    Busy {
+        provider: String,
+        in_flight: usize,
+        max_in_flight: usize,
+    },
+    CoolingDown {
+        provider: String,
+    },
+}
+
+#[derive(Debug)]
+pub struct ConnectorBulkheadGuard<'a> {
+    provider: String,
+    bulkhead: &'a ConnectorBulkhead,
+}
+
+impl ConnectorBulkhead {
+    #[must_use]
+    pub fn new(
+        max_in_flight_per_provider: usize,
+        failure_threshold: u32,
+        cooldown: Duration,
+    ) -> Self {
+        Self {
+            max_in_flight_per_provider: max_in_flight_per_provider.max(1),
+            failure_threshold: failure_threshold.max(1),
+            cooldown,
+            providers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn default_service_gate() -> Self {
+        Self::new(4, 3, Duration::from_secs(30))
+    }
+
+    pub fn try_acquire(
+        &self,
+        provider: impl Into<String>,
+    ) -> Result<ConnectorBulkheadGuard<'_>, ConnectorBulkheadRejection> {
+        let provider = provider.into();
+        let now = Instant::now();
+        let mut providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = providers
+            .entry(provider.clone())
+            .or_insert_with(ConnectorProviderBulkheadState::default);
+        if state.cooldown_until.is_some_and(|until| until > now) {
+            return Err(ConnectorBulkheadRejection::CoolingDown { provider });
+        }
+        if state.in_flight >= self.max_in_flight_per_provider {
+            return Err(ConnectorBulkheadRejection::Busy {
+                provider,
+                in_flight: state.in_flight,
+                max_in_flight: self.max_in_flight_per_provider,
+            });
+        }
+        state.in_flight += 1;
+        Ok(ConnectorBulkheadGuard {
+            provider,
+            bulkhead: self,
+        })
+    }
+
+    pub fn record_success(&self, provider: &str) {
+        let mut providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = providers
+            .entry(provider.to_string())
+            .or_insert_with(ConnectorProviderBulkheadState::default);
+        state.consecutive_failures = 0;
+        state.cooldown_until = None;
+    }
+
+    pub fn record_failure(&self, provider: &str) {
+        let mut providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = providers
+            .entry(provider.to_string())
+            .or_insert_with(ConnectorProviderBulkheadState::default);
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= self.failure_threshold {
+            state.cooldown_until = Some(Instant::now() + self.cooldown);
+        }
+    }
+
+    #[must_use]
+    pub fn in_flight(&self, provider: &str) -> usize {
+        self.providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(provider)
+            .map(|state| state.in_flight)
+            .unwrap_or(0)
+    }
+
+    fn release(&self, provider: &str) {
+        let mut providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = providers.get_mut(provider) {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+    }
+}
+
+impl Default for ConnectorBulkhead {
+    fn default() -> Self {
+        Self::default_service_gate()
+    }
+}
+
+impl Default for ConnectorProviderBulkheadState {
+    fn default() -> Self {
+        Self {
+            in_flight: 0,
+            consecutive_failures: 0,
+            cooldown_until: None,
+        }
+    }
+}
+
+impl Drop for ConnectorBulkheadGuard<'_> {
+    fn drop(&mut self) {
+        self.bulkhead.release(&self.provider);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MockDocsServiceConnector;
 
@@ -1130,6 +1283,47 @@ mod tests {
             result.resource.unwrap().reference,
             "service://mock.docs/document/doc-1"
         );
+    }
+
+    #[test]
+    fn connector_bulkhead_rejects_when_provider_is_at_capacity() {
+        let bulkhead = ConnectorBulkhead::new(1, 3, Duration::from_secs(30));
+        let guard = bulkhead.try_acquire("feishu").unwrap();
+
+        let rejected = bulkhead.try_acquire("feishu").unwrap_err();
+
+        assert_eq!(
+            rejected,
+            ConnectorBulkheadRejection::Busy {
+                provider: "feishu".to_string(),
+                in_flight: 1,
+                max_in_flight: 1,
+            }
+        );
+        assert_eq!(bulkhead.in_flight("feishu"), 1);
+        drop(guard);
+        assert_eq!(bulkhead.in_flight("feishu"), 0);
+        assert!(bulkhead.try_acquire("feishu").is_ok());
+    }
+
+    #[test]
+    fn connector_bulkhead_enters_cooldown_after_repeated_failures() {
+        let bulkhead = ConnectorBulkhead::new(2, 2, Duration::from_secs(30));
+
+        bulkhead.record_failure("feishu");
+        assert!(bulkhead.try_acquire("feishu").is_ok());
+        bulkhead.record_failure("feishu");
+
+        let rejected = bulkhead.try_acquire("feishu").unwrap_err();
+
+        assert_eq!(
+            rejected,
+            ConnectorBulkheadRejection::CoolingDown {
+                provider: "feishu".to_string(),
+            }
+        );
+        bulkhead.record_success("feishu");
+        assert!(bulkhead.try_acquire("feishu").is_ok());
     }
 
     #[test]

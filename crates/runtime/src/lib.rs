@@ -123,8 +123,9 @@ pub use config_validate::{
     DiagnosticKind, ValidationResult,
 };
 pub use connector::{
-    default_capabilities, CapabilityManifest, ConnectorHealth, ConnectorHealthStatus,
-    ConnectorPlane, ConnectorRegistrySnapshot, ConnectorSummary, ExternalResourceRef,
+    default_capabilities, CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadGuard,
+    ConnectorBulkheadRejection, ConnectorHealth, ConnectorHealthStatus, ConnectorPlane,
+    ConnectorRegistrySnapshot, ConnectorSummary, ExternalResourceRef,
     FeishuReadOnlyServiceConnector, MockDocsServiceConnector, ProviderAccount, ResourceDirectory,
     ServiceConnector, ServiceConnectorMetadata, ServiceToolRequest, ServiceToolResult,
     SqliteResourceDirectory,

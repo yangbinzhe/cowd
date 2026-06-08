@@ -69,7 +69,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "api"
-version = "0.9.39"
+version = "0.9.40"
 dependencies = [
  "reqwest",
  "runtime",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.9.39"
+version = "0.9.40"
 dependencies = [
  "chrono",
  "cowd-memory",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "compat-harness"
-version = "0.9.39"
+version = "0.9.40"
 dependencies = [
  "commands",
  "runtime",
@@ -643,7 +643,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cowd-cli"
-version = "0.9.39"
+version = "0.9.40"
 dependencies = [
  "api",
  "async-trait",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "cowd-memory"
-version = "0.9.39"
+version = "0.9.40"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2162,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "mock-anthropic-service"
-version = "0.9.39"
+version = "0.9.40"
 dependencies = [
  "api",
  "serde_json",
@@ -2507,7 +2507,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.39"
+version = "0.9.40"
 dependencies = [
  "serde",
  "serde_json",
@@ -2980,7 +2980,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.39"
+version = "0.9.40"
 dependencies = [
  "aes",
  "async-trait",
@@ -3609,7 +3609,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.9.39"
+version = "0.9.40"
 dependencies = [
  "serde",
  "serde_json",
@@ -3882,7 +3882,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.39"
+version = "0.9.40"
 dependencies = [
  "api",
  "base64 0.22.1",

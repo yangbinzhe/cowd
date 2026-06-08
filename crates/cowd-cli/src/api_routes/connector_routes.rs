@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{
     extract::{Query, State as AxumState},
@@ -9,10 +9,10 @@ use axum::{
     Json, Router,
 };
 use runtime::{
-    CapabilityManifest, ConnectorHealth, ConnectorRegistrySnapshot, CrossPlaneAction,
-    CrossPlaneExecutionReceipt, ExternalResourceRef, FeishuReadOnlyServiceConnector,
-    MockDocsServiceConnector, PolicyDecisionKind, ProviderAccount, ServiceConnector,
-    ServiceToolRequest, ServiceToolResult, SqliteResourceDirectory,
+    CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadRejection, ConnectorHealth,
+    ConnectorRegistrySnapshot, CrossPlaneAction, CrossPlaneExecutionReceipt, ExternalResourceRef,
+    FeishuReadOnlyServiceConnector, MockDocsServiceConnector, PolicyDecisionKind, ProviderAccount,
+    ServiceConnector, ServiceToolRequest, ServiceToolResult, SqliteResourceDirectory,
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,15 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/connectors/services/feishu.readonly/execute",
             axum::routing::post(feishu_readonly_execute_handler),
         )
+}
+
+const MAX_CONNECTOR_RESOURCE_PAGE: usize = 200;
+const DEFAULT_CONNECTOR_RESOURCE_PAGE: usize = 100;
+
+static CONNECTOR_SERVICE_BULKHEAD: OnceLock<ConnectorBulkhead> = OnceLock::new();
+
+fn connector_service_bulkhead() -> &'static ConnectorBulkhead {
+    CONNECTOR_SERVICE_BULKHEAD.get_or_init(ConnectorBulkhead::default_service_gate)
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,8 +96,7 @@ pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot 
     accounts.extend(mcp_servers.iter().map(account_from_mcp_server));
     let mock_docs = MockDocsServiceConnector::new();
     accounts.push(account_from_service_connector(&mock_docs));
-    let mut capabilities = runtime::default_capabilities();
-    capabilities.extend(mock_docs.capabilities());
+    let mut capabilities = base_connector_capabilities().to_vec();
     for platform in platforms {
         for operation in platform.capabilities {
             let capability = manifest_from_platform_capability(&platform.platform_type, operation);
@@ -124,6 +132,17 @@ pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot 
             .push(format!("resource_directory:{error}"));
     }
     snapshot
+}
+
+fn base_connector_capabilities() -> &'static [CapabilityManifest] {
+    static BASE_CONNECTOR_CAPABILITIES: OnceLock<Vec<CapabilityManifest>> = OnceLock::new();
+    BASE_CONNECTOR_CAPABILITIES.get_or_init(|| {
+        let mut capabilities = runtime::default_capabilities();
+        capabilities.extend(MockDocsServiceConnector::new().capabilities());
+        capabilities.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
+        capabilities.dedup_by(|left, right| left.capability_id == right.capability_id);
+        capabilities
+    })
 }
 
 fn account_from_service_connector(connector: &impl ServiceConnector) -> ProviderAccount {
@@ -344,7 +363,10 @@ async fn connector_resources_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(query): Query<ConnectorResourceQuery>,
 ) -> impl IntoResponse {
-    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_CONNECTOR_RESOURCE_PAGE)
+        .clamp(1, MAX_CONNECTOR_RESOURCE_PAGE);
     let offset = query.offset.unwrap_or(0);
     let (resources, error) = list_durable_resources(&state, limit, offset, query.q.as_deref());
     let total = resources.len();
@@ -420,7 +442,21 @@ async fn mock_docs_execute_handler(
     );
     cross_plane_routes::save_cross_plane_state(&state);
 
-    let allowed = decision.decision == PolicyDecisionKind::Allow;
+    let policy_allowed = decision.decision == PolicyDecisionKind::Allow;
+    let mut allowed = policy_allowed;
+    let mut bulkhead_guard = None;
+    let mut bulkhead_blocker = None;
+    if mode == "commit" && allowed {
+        match connector_service_bulkhead().try_acquire("mock.docs") {
+            Ok(guard) => {
+                bulkhead_guard = Some(guard);
+            }
+            Err(error) => {
+                allowed = false;
+                bulkhead_blocker = Some(connector_bulkhead_blocker(error));
+            }
+        }
+    }
     let status = if mode == "commit" && allowed {
         "executed"
     } else if allowed {
@@ -433,11 +469,13 @@ async fn mock_docs_execute_handler(
     } else {
         "not_dispatched"
     };
-    let blockers = if allowed {
-        Vec::new()
-    } else {
-        vec![format!("policy:{}", decision.reason)]
-    };
+    let mut blockers = Vec::new();
+    if !policy_allowed {
+        blockers.push(format!("policy:{}", decision.reason));
+    }
+    if let Some(blocker) = bulkhead_blocker {
+        blockers.push(blocker);
+    }
     let receipt = CrossPlaneExecutionReceipt::new(
         idempotency_key,
         mode,
@@ -451,7 +489,10 @@ async fn mock_docs_execute_handler(
     cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
     cross_plane_routes::save_cross_plane_state(&state);
     let service_result = if mode == "commit" && allowed {
-        MockDocsServiceConnector::new().execute_tool(service_request)
+        let result = MockDocsServiceConnector::new().execute_tool(service_request);
+        connector_service_bulkhead().record_success("mock.docs");
+        drop(bulkhead_guard);
+        result
     } else {
         ServiceToolResult {
             status: status.to_string(),
@@ -555,7 +596,20 @@ async fn feishu_readonly_execute_handler(
     cross_plane_routes::save_cross_plane_state(&state);
 
     let policy_allowed = decision.decision == PolicyDecisionKind::Allow;
-    let allowed = account_ready && policy_allowed;
+    let mut allowed = account_ready && policy_allowed;
+    let mut bulkhead_guard = None;
+    let mut bulkhead_blocker = None;
+    if mode == "commit" && allowed {
+        match connector_service_bulkhead().try_acquire("feishu") {
+            Ok(guard) => {
+                bulkhead_guard = Some(guard);
+            }
+            Err(error) => {
+                allowed = false;
+                bulkhead_blocker = Some(connector_bulkhead_blocker(error));
+            }
+        }
+    }
     let status = if mode == "commit" && allowed {
         "executed"
     } else if allowed {
@@ -581,6 +635,9 @@ async fn feishu_readonly_execute_handler(
                 .unwrap_or_else(|| "no ready feishu account".to_string())
         ));
     }
+    if let Some(blocker) = bulkhead_blocker {
+        blockers.push(blocker);
+    }
     let receipt = CrossPlaneExecutionReceipt::new(
         idempotency_key,
         mode,
@@ -594,7 +651,10 @@ async fn feishu_readonly_execute_handler(
     cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
     cross_plane_routes::save_cross_plane_state(&state);
     let service_result = if allowed {
-        connector.execute_tool(service_request)
+        let result = connector.execute_tool(service_request);
+        connector_service_bulkhead().record_success("feishu");
+        drop(bulkhead_guard);
+        result
     } else {
         ServiceToolResult {
             status: status.to_string(),
@@ -650,6 +710,19 @@ fn list_durable_resources(
     }) {
         Ok(resources) => (resources, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
+    }
+}
+
+fn connector_bulkhead_blocker(error: ConnectorBulkheadRejection) -> String {
+    match error {
+        ConnectorBulkheadRejection::Busy {
+            provider,
+            in_flight,
+            max_in_flight,
+        } => format!("connector.bulkhead:{provider}:busy:{in_flight}/{max_in_flight}"),
+        ConnectorBulkheadRejection::CoolingDown { provider } => {
+            format!("connector.bulkhead:{provider}:cooling_down")
+        }
     }
 }
 

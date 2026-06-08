@@ -3671,6 +3671,32 @@ providers:
     }
 
     #[tokio::test]
+    async fn connector_resources_clamp_large_page_requests() {
+        let workspace = unique_test_workspace("connector-resource-page-limit");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/resources?limit=999&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_resources");
+        assert_eq!(json["limit"], 200);
+    }
+
+    #[tokio::test]
     async fn feishu_readonly_service_blocks_without_ready_account() {
         let workspace = unique_test_workspace("feishu-readonly-blocked");
         let app = api_router(test_state_with_config_runtime_and_workspace(
