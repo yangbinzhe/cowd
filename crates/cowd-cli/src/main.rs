@@ -395,6 +395,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => run_import_session(&path, output_format)?,
         CliAction::Repl {
             model,
+            session_id,
             allowed_tools,
             permission_mode,
             base_commit,
@@ -440,6 +441,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             tracing::debug!("starting TUI REPL");
             run_repl(
                 model,
+                session_id,
                 allowed_tools,
                 permission_mode,
                 base_commit,
@@ -817,6 +819,7 @@ pub(crate) enum CliAction {
     },
     Repl {
         model: String,
+        session_id: Option<String>,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         base_commit: Option<String>,
@@ -885,6 +888,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
     let mut base_commit: Option<String> = None;
+    let mut session_id: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
     let mut yolo_mode = false;
@@ -976,6 +980,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             flag if flag.starts_with("--base-commit=") => {
                 base_commit = Some(flag[14..].to_string());
+                index += 1;
+            }
+            "--session" if rest.is_empty() => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --session".to_string())?;
+                session_id = Some(value.clone());
+                index += 2;
+            }
+            flag if rest.is_empty() && flag.starts_with("--session=") => {
+                session_id = Some(flag[10..].to_string());
                 index += 1;
             }
             "--reasoning-effort" => {
@@ -1079,6 +1094,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         return Ok(CliAction::Repl {
             model,
+            session_id,
             allowed_tools,
             permission_mode,
             base_commit,
@@ -1117,6 +1133,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             match classify_skills_slash_command(args.as_deref()) {
                 SkillSlashDispatch::Invoke(_prompt) => Ok(CliAction::Repl {
                     model,
+                    session_id: session_id.clone(),
                     allowed_tools,
                     permission_mode,
                     base_commit,
@@ -1183,6 +1200,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         ),
         _other => Ok(CliAction::Repl {
             model,
+            session_id,
             allowed_tools,
             permission_mode,
             base_commit,
@@ -1326,6 +1344,7 @@ fn parse_direct_slash_cli_action(
             match classify_skills_slash_command(args.as_deref()) {
                 SkillSlashDispatch::Invoke(_prompt) => Ok(CliAction::Repl {
                     model,
+                    session_id: None,
                     allowed_tools,
                     permission_mode,
                     base_commit,
@@ -2865,6 +2884,7 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
 #[allow(clippy::needless_pass_by_value)]
 fn run_repl(
     model: String,
+    session_id: Option<String>,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     base_commit: Option<String>,
@@ -2881,6 +2901,7 @@ fn run_repl(
     tracing::debug!(model = %resolved_model, "run_repl: creating LiveCli");
     let mut cli = LiveCli::new(
         resolved_model,
+        session_id,
         true,
         allowed_tools,
         permission_mode,
@@ -4830,14 +4851,14 @@ fn current_task_summary_from_record(
 impl LiveCli {
     fn new(
         model: String,
+        session_id: Option<String>,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
         yolo_mode: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt_for_mode(yolo_mode)?;
-        let session_state = new_cli_session()?;
-        let session = create_managed_session_handle(&session_state.session_id)?;
+        let (session, session_state) = load_or_create_live_session(session_id)?;
         let runtime = build_runtime(
             session_state,
             &session.id,
@@ -6529,6 +6550,27 @@ fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 pub(crate) fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
     Ok(Session::new().with_workspace_root(env::current_dir()?))
+}
+
+fn load_or_create_live_session(
+    session_id: Option<String>,
+) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
+    let Some(session_id) = session_id else {
+        let session_state = new_cli_session()?;
+        let handle = create_managed_session_handle(&session_state.session_id)?;
+        return Ok((handle, session_state));
+    };
+
+    match load_session_reference(&session_id) {
+        Ok((handle, session)) => Ok((handle, session)),
+        Err(error) if error.to_string().contains("session not found") => {
+            let mut session_state = new_cli_session()?;
+            session_state.session_id = session_id.clone();
+            let handle = create_managed_session_handle(&session_id)?;
+            Ok((handle, session_state))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Create a managed session handle and register its metadata in SQLite.
@@ -10783,7 +10825,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Usage:")?;
     writeln!(
         out,
-        "  cowd [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
+        "  cowd [--model MODEL] [--session SESSION] [--allowedTools TOOL[,TOOL...]]"
     )?;
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
@@ -10850,6 +10892,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --model MODEL              Override the active model"
+    )?;
+    writeln!(
+        out,
+        "  --session SESSION          Start or attach the interactive TUI to a managed session id"
     )?;
     writeln!(
         out,
@@ -11472,6 +11518,7 @@ mod tests {
             parse_args(&[]).expect("args should parse"),
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
+                session_id: None,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
                 base_commit: None,
@@ -11748,8 +11795,46 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
+                session_id: None,
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+                yolo_mode: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_repl_session_flag() {
+        let _guard = env_lock();
+        let _cfg_guard = ConfigHomeGuard::new();
+        std::env::remove_var("COWD_PERMISSION_MODE");
+
+        assert_eq!(
+            parse_args(&["--session".to_string(), "session-alpha".to_string()])
+                .expect("session flag should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                session_id: Some("session-alpha".to_string()),
+                allowed_tools: None,
+                permission_mode: PermissionMode::WorkspaceWrite,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+                yolo_mode: false,
+            }
+        );
+
+        assert_eq!(
+            parse_args(&["--session=session-beta".to_string()])
+                .expect("inline session flag should parse"),
+            CliAction::Repl {
+                model: DEFAULT_MODEL.to_string(),
+                session_id: Some("session-beta".to_string()),
+                allowed_tools: None,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -11771,6 +11856,7 @@ mod tests {
             parsed,
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
+                session_id: None,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
@@ -11794,6 +11880,7 @@ mod tests {
             parsed,
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
+                session_id: None,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
                 base_commit: None,
@@ -11861,6 +11948,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
+                session_id: None,
                 allowed_tools: Some(
                     ["glob_search", "read_file", "write_file"]
                         .into_iter()
@@ -11968,6 +12056,7 @@ mod tests {
             .expect("skills help overview should invoke"),
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
+                session_id: None,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 base_commit: None,
@@ -12424,6 +12513,7 @@ mod tests {
             .expect("/skills help overview should invoke"),
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
+                session_id: None,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 base_commit: None,
@@ -12449,6 +12539,7 @@ mod tests {
                 .expect("/skills /test should normalize to a single skill prompt prefix"),
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
+                session_id: None,
                 allowed_tools: None,
                 permission_mode: crate::default_permission_mode(),
                 base_commit: None,
@@ -13849,6 +13940,7 @@ UU conflicted.rs",
 
         let mut cli = LiveCli::new(
             "claude-sonnet-4-6".to_string(),
+            None,
             true,
             None,
             PermissionMode::DangerFullAccess,

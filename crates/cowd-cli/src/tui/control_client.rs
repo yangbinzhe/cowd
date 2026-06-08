@@ -40,6 +40,7 @@ pub struct DaemonEnsureSession {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DaemonSessionLease {
+    #[serde(default = "default_true")]
     pub ok: bool,
     pub session_id: String,
     pub owner: String,
@@ -82,6 +83,10 @@ pub enum DaemonControlError {
     Timeout,
     Rejected(String),
     Protocol(String),
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl DaemonControlClient {
@@ -747,7 +752,7 @@ mod tests {
             );
             writer
                 .write_all(
-                    br#"{"ok":true,"kind":"daemon_runtime_snapshot","protocol_version":1,"daemon":"cowd","active_sessions":1,"uptime_secs":9,"sessions":["s1"],"leases":{"total":1,"items":[{"ok":true,"session_id":"s1","owner":"tui:test","mode":"collaborative"}]}}"#,
+                    br#"{"ok":true,"kind":"daemon_runtime_snapshot","protocol_version":1,"daemon":"cowd","active_sessions":1,"uptime_secs":9,"sessions":["s1"],"leases":{"total":1,"items":[{"session_id":"s1","owner":"tui:test","mode":"collaborative"}]}}"#,
                 )
                 .await
                 .expect("write response");
