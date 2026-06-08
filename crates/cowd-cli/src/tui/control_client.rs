@@ -71,7 +71,9 @@ impl DaemonControlClient {
     }
 
     pub fn default_local() -> Self {
-        Self::new(DEFAULT_DAEMON_SOCKET)
+        Self::new(
+            std::env::var("COWD_DAEMON_SOCKET").unwrap_or_else(|_| DEFAULT_DAEMON_SOCKET.into()),
+        )
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -441,6 +443,7 @@ impl std::error::Error for DaemonControlError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tokio::net::UnixListener;
 
     fn temp_socket(label: &str) -> PathBuf {
@@ -452,6 +455,20 @@ mod tests {
                 .expect("system time")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_control_client_default_local_uses_env_socket() {
+        let socket = temp_socket("env-default");
+        unsafe {
+            std::env::set_var("COWD_DAEMON_SOCKET", &socket);
+        }
+        let client = DaemonControlClient::default_local();
+        assert_eq!(client.socket_path(), socket.as_path());
+        unsafe {
+            std::env::remove_var("COWD_DAEMON_SOCKET");
+        }
     }
 
     #[tokio::test]

@@ -403,7 +403,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             yolo_mode,
         } => {
             // Auto-start daemon if not already running
-            let sock = std::path::Path::new("/tmp/cowd.sock");
+            let sock_path = daemon_socket_path();
+            let sock = sock_path.as_path();
             let daemon_autostart_disabled = std::env::var("COWD_DISABLE_DAEMON_AUTOSTART").is_ok();
             if !sock.exists() && !daemon_autostart_disabled {
                 tracing::info!("daemon not running, auto-starting...");
@@ -591,7 +592,7 @@ fn run_gateway_action(
 
             let daemon_config = daemon::DaemonConfig {
                 http_addr: format!("{effective_host}:{effective_port}"),
-                unix_sock_path: "/tmp/cowd.sock".to_string(),
+                unix_sock_path: daemon_socket_path().display().to_string(),
                 memory_config,
                 platform_configs,
                 runtime_config: runtime_config_json,
@@ -1371,6 +1372,12 @@ fn config_aliases_for_current_dir() -> std::collections::HashMap<String, String>
         Ok(config) => config.aliases().clone().into_iter().collect(),
         Err(_) => std::collections::HashMap::new(),
     }
+}
+
+fn daemon_socket_path() -> PathBuf {
+    std::env::var_os("COWD_DAEMON_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/cowd.sock"))
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
