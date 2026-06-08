@@ -1747,6 +1747,68 @@ impl TuiState {
                 self.app
                     .show_notification("Command prepared. Press Enter to run.");
             }
+            Action::RespondDaemonApproval { id, approved } => {
+                let result = run_daemon_projection_blocking(move |client| async move {
+                    client
+                        .respond_approval(&id, approved, Some("once"), None)
+                        .await
+                });
+                match result {
+                    Ok(_) => {
+                        let verdict = if approved { "approved" } else { "rejected" };
+                        self.toast_manager.push(
+                            ToastVariant::Success,
+                            Some("Approval".into()),
+                            format!("Daemon approval {verdict}"),
+                            2000,
+                        );
+                    }
+                    Err(err) => self.toast_manager.push(
+                        ToastVariant::Warning,
+                        Some("Approval".into()),
+                        err,
+                        3000,
+                    ),
+                }
+            }
+            Action::CancelDaemonTask(id) => {
+                let result = run_daemon_projection_blocking(move |client| async move {
+                    client.cancel_task(&id).await
+                });
+                match result {
+                    Ok(_) => self.toast_manager.push(
+                        ToastVariant::Success,
+                        Some("Task".into()),
+                        "Daemon task canceled".into(),
+                        2000,
+                    ),
+                    Err(err) => self.toast_manager.push(
+                        ToastVariant::Warning,
+                        Some("Task".into()),
+                        err,
+                        3000,
+                    ),
+                }
+            }
+            Action::CompleteDaemonTask(id) => {
+                let result = run_daemon_projection_blocking(move |client| async move {
+                    client.complete_task(&id).await
+                });
+                match result {
+                    Ok(_) => self.toast_manager.push(
+                        ToastVariant::Success,
+                        Some("Task".into()),
+                        "Daemon task completed".into(),
+                        2000,
+                    ),
+                    Err(err) => self.toast_manager.push(
+                        ToastVariant::Warning,
+                        Some("Task".into()),
+                        err,
+                        3000,
+                    ),
+                }
+            }
             Action::TogglePanel(ref _name) => {}
             Action::ApplyPreset(preset) => {
                 self.layout_tree.apply_preset(preset);
@@ -2169,6 +2231,47 @@ impl L4KnowledgeView {
 
         let paragraph = Paragraph::new(lines).block(block);
         ctx.frame_mut().render_widget(paragraph, rect);
+    }
+}
+
+fn daemon_projection_auth_token() -> Option<String> {
+    std::env::var("COWD_API_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("COWD_AUTH_TOKEN").ok())
+}
+
+fn run_daemon_projection_blocking<F, Fut>(operation: F) -> Result<serde_json::Value, String>
+where
+    F: FnOnce(crate::tui::projection_client::DaemonProjectionClient) -> Fut + Send + 'static,
+    Fut: std::future::Future<
+            Output = Result<serde_json::Value, crate::tui::projection_client::ProjectionError>,
+        > + Send
+        + 'static,
+{
+    let run = move || {
+        let Some(client) =
+            crate::tui::projection_client::DaemonProjectionClient::from_running_gateway(
+                daemon_projection_auth_token(),
+            )
+            .map_err(|err| err.to_string())?
+        else {
+            return Err("daemon gateway is not running".to_string());
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())?;
+        runtime
+            .block_on(operation(client))
+            .map_err(|err| err.to_string())
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(run)
+            .join()
+            .map_err(|_| "daemon projection worker panicked".to_string())?
+    } else {
+        run()
     }
 }
 

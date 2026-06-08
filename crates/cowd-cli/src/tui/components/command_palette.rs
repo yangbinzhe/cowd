@@ -413,8 +413,8 @@ impl CommandPalette {
             {
                 self.all_commands.push(CommandEntry::dynamic(
                     "Cancel Problem Task",
-                    format!("Prepare cancel for {}: {}", task.id, task.objective),
-                    Action::Execute(format!("/tasks cancel {}", task.id)),
+                    format!("Cancel {} directly: {}", task.id, task.objective),
+                    Action::CancelDaemonTask(task.id.clone()),
                 ));
             }
             if let Some(task) = snapshot.tasks.iter().find(|task| {
@@ -425,10 +425,10 @@ impl CommandPalette {
                 self.all_commands.push(CommandEntry::dynamic(
                     "Complete Reviewed Task",
                     format!(
-                        "Prepare completion for {} with {} artifacts",
+                        "Complete {} directly with {} artifacts",
                         task.id, task.artifact_count
                     ),
-                    Action::Execute(format!("/tasks complete {}", task.id)),
+                    Action::CompleteDaemonTask(task.id.clone()),
                 ));
             }
         } else {
@@ -457,12 +457,18 @@ impl CommandPalette {
                         approval.risk.as_deref().unwrap_or("unknown"),
                         approval.input_preview
                     ),
-                    Action::Execute(format!("/approvals approve {}", approval.id)),
+                    Action::RespondDaemonApproval {
+                        id: approval.id.clone(),
+                        approved: true,
+                    },
                 ));
                 self.all_commands.push(CommandEntry::dynamic(
                     "Reject First Pending Request",
                     format!("Reject {}", approval.id),
-                    Action::Execute(format!("/approvals reject {}", approval.id)),
+                    Action::RespondDaemonApproval {
+                        id: approval.id.clone(),
+                        approved: false,
+                    },
                 ));
             }
         }
@@ -1121,16 +1127,26 @@ mod tests {
             entry.dynamic && entry.action == Action::Execute("/approvals".into())
         }));
         assert!(p.all_commands.iter().any(|entry| {
-            entry.dynamic && entry.action == Action::Execute("/approvals approve approval-1".into())
+            entry.dynamic
+                && entry.action
+                    == Action::RespondDaemonApproval {
+                        id: "approval-1".to_string(),
+                        approved: true,
+                    }
         }));
         assert!(p.all_commands.iter().any(|entry| {
-            entry.dynamic && entry.action == Action::Execute("/approvals reject approval-1".into())
+            entry.dynamic
+                && entry.action
+                    == Action::RespondDaemonApproval {
+                        id: "approval-1".to_string(),
+                        approved: false,
+                    }
         }));
         assert!(p.all_commands.iter().any(|entry| {
-            entry.dynamic && entry.action == Action::Execute("/tasks cancel task-blocked".into())
+            entry.dynamic && entry.action == Action::CancelDaemonTask("task-blocked".into())
         }));
         assert!(p.all_commands.iter().any(|entry| {
-            entry.dynamic && entry.action == Action::Execute("/tasks complete task-reviewed".into())
+            entry.dynamic && entry.action == Action::CompleteDaemonTask("task-reviewed".into())
         }));
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic && entry.action == Action::Execute("/cross-plane".into())
