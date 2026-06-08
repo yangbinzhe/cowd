@@ -380,6 +380,7 @@ window.Api = (()=>{
     async connectorSummary(){return req('GET','/api/connectors/summary')},
     async connectorAccounts(){return req('GET','/api/connectors/accounts')},
     async connectorCapabilities(){return req('GET','/api/connectors/capabilities')},
+    async connectorMcpServers(){return req('GET','/api/connectors/mcp/servers')},
     async connectorResources(opts){
       const o=opts||{};
       const params=new URLSearchParams();

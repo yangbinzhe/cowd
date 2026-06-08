@@ -2184,10 +2184,11 @@ window.Panels = (()=>{
     const sec=UI.el('div','panel-section connector-console');
     sec.innerHTML='<h3>Connector Console</h3>';
     try{
-      const [summaryData,accountsData,capabilitiesData,resourcesData,executionsData,mockTools,feishuTools]=await Promise.all([
+      const [summaryData,accountsData,capabilitiesData,mcpData,resourcesData,executionsData,mockTools,feishuTools]=await Promise.all([
         Api.connectorSummary().catch(function(e){return {error:e.message,summary:{}}}),
         Api.connectorAccounts().catch(function(e){return {error:e.message,accounts:[]}}),
         Api.connectorCapabilities().catch(function(e){return {error:e.message,capabilities:[]}}),
+        Api.connectorMcpServers().catch(function(e){return {error:e.message,servers:[],summary:{}}}),
         Api.connectorResources({limit:20,offset:0}).catch(function(e){return {error:e.message,resources:[],status:'degraded'}}),
         Api.crossPlaneActionExecutions().catch(function(){return {executions:[]}}),
         Api.connectorServiceTools('mock.docs').catch(function(e){return {error:e.message,tools:[]}}),
@@ -2225,6 +2226,25 @@ window.Panels = (()=>{
         capSec.appendChild(connectorRow(cap.provider||cap.plane,cap.capability_id,meta,cap.risk==='low'?'ready':'degraded'));
       });
       sec.appendChild(capSec);
+
+      const mcpSec=UI.el('div','panel-section connector-mcp-operators');
+      const mcpSummary=mcpData.summary||{};
+      const mcpServers=mcpData.servers||[];
+      mcpSec.innerHTML='<h3>MCP Operators</h3>'
+        +'<div class="audit-metrics">'
+        +'<span><b>'+UI.esc(mcpSummary.total??mcpServers.length)+'</b><small>servers</small></span>'
+        +'<span><b>'+UI.esc(mcpSummary.ready??0)+'</b><small>ready</small></span>'
+        +'<span><b>'+UI.esc(mcpSummary.degraded??0)+'</b><small>degraded</small></span>'
+        +'<span><b>'+UI.esc(mcpSummary.disabled??0)+'</b><small>disabled</small></span>'
+        +'</div>';
+      if(mcpData.error)mcpSec.appendChild(UI.el('div','panel-empty','MCP status unavailable: '+mcpData.error));
+      if(!mcpServers.length)mcpSec.appendChild(UI.el('div','panel-empty','No MCP servers configured'));
+      mcpServers.slice(0,8).forEach(function(server){
+        const missing=(server.missing_required||[]).length?('missing '+server.missing_required.join(',')):'configured';
+        const meta=[server.transport,missing,(server.diagnostics||[]).slice(0,2).join(' · ')].filter(Boolean).join(' · ');
+        mcpSec.appendChild(connectorRow(server.status||'unknown',server.name||'mcp server',meta,server.status));
+      });
+      sec.appendChild(mcpSec);
 
       sec.appendChild(renderConnectorServiceTools(mockTools,'Services · Mock Docs'));
       sec.appendChild(renderConnectorServiceTools(feishuTools,'Services · Feishu Read-only'));

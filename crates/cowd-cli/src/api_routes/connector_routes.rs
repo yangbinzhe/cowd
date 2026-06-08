@@ -26,6 +26,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/connectors/capabilities",
             get(connector_capabilities_handler),
         )
+        .route("/api/connectors/mcp/servers", get(mcp_servers_handler))
         .route(
             "/api/connectors/resources",
             get(connector_resources_handler),
@@ -356,6 +357,32 @@ async fn connector_capabilities_handler(
         "kind": "connector_capabilities",
         "capabilities": snapshot.capabilities,
         "total": total,
+    }))
+}
+
+async fn mcp_servers_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    let servers = configured_mcp_servers(state.config.as_ref());
+    let ready = servers
+        .iter()
+        .filter(|server| server.status == "ready")
+        .count();
+    let degraded = servers
+        .iter()
+        .filter(|server| server.status == "degraded")
+        .count();
+    let disabled = servers
+        .iter()
+        .filter(|server| server.status == "disabled")
+        .count();
+    Json(serde_json::json!({
+        "kind": "connector_mcp_servers",
+        "summary": {
+            "total": servers.len(),
+            "ready": ready,
+            "degraded": degraded,
+            "disabled": disabled,
+        },
+        "servers": servers,
     }))
 }
 

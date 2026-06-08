@@ -631,6 +631,9 @@ describe('API module', () => {
       if (path.includes('/api/connectors/capabilities')) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_capabilities', capabilities: [{ capability_id: 'service.feishu.docx.read' }] }) });
       }
+      if (path.includes('/api/connectors/mcp/servers')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_mcp_servers', servers: [{ name: 'filesystem' }] }) });
+      }
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_summary', summary: { accounts: 1 } }) });
     });
     vi.stubGlobal('fetch', mockF);
@@ -638,6 +641,7 @@ describe('API module', () => {
     await window.Api.connectorSummary();
     await window.Api.connectorAccounts();
     await window.Api.connectorCapabilities();
+    await window.Api.connectorMcpServers();
     await window.Api.connectorResources({ q: 'Doc', limit: 20, offset: 40 });
     await window.Api.connectorServiceTools('mock.docs');
     const execution = await window.Api.executeConnectorService('mock.docs', {
@@ -651,11 +655,12 @@ describe('API module', () => {
     expect(String(mockF.mock.calls[0][0])).toBe('/api/connectors/summary');
     expect(String(mockF.mock.calls[1][0])).toBe('/api/connectors/accounts');
     expect(String(mockF.mock.calls[2][0])).toBe('/api/connectors/capabilities');
-    expect(String(mockF.mock.calls[3][0])).toBe('/api/connectors/resources?q=Doc&limit=20&offset=40');
-    expect(String(mockF.mock.calls[4][0])).toBe('/api/connectors/services/mock.docs/tools');
-    expect(String(mockF.mock.calls[5][0])).toBe('/api/connectors/services/mock.docs/execute');
-    expect(mockF.mock.calls[5][1].method).toBe('POST');
-    expect(JSON.parse(mockF.mock.calls[5][1].body).tool_id).toBe('service.mock.docs.read');
+    expect(String(mockF.mock.calls[3][0])).toBe('/api/connectors/mcp/servers');
+    expect(String(mockF.mock.calls[4][0])).toBe('/api/connectors/resources?q=Doc&limit=20&offset=40');
+    expect(String(mockF.mock.calls[5][0])).toBe('/api/connectors/services/mock.docs/tools');
+    expect(String(mockF.mock.calls[6][0])).toBe('/api/connectors/services/mock.docs/execute');
+    expect(mockF.mock.calls[6][1].method).toBe('POST');
+    expect(JSON.parse(mockF.mock.calls[6][1].body).tool_id).toBe('service.mock.docs.read');
     expect(execution.result.status).toBe('ok');
   });
 
@@ -1109,6 +1114,15 @@ describe('API module', () => {
           ],
         }) });
       }
+      if (path.includes('/api/connectors/mcp/servers')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          summary: { total: 2, ready: 1, degraded: 1, disabled: 0 },
+          servers: [
+            { name: 'filesystem', transport: 'stdio', status: 'ready', missing_required: [], diagnostics: ['MCP server declared; live discovery is evaluated outside control-plane snapshot'] },
+            { name: 'remote', transport: 'http', status: 'degraded', missing_required: ['url'], diagnostics: ['missing url'] },
+          ],
+        }) });
+      }
       if (path.includes('/api/cross-plane/action/executions')) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({
           executions: [{ status: 'dry_run', mode: 'dry_run', dispatch_status: 'not_dispatched', idempotency_key: 'idem-connector', action: { requested_capability: 'service.mock.docs.read' } }],
@@ -1133,6 +1147,10 @@ describe('API module', () => {
     expect(panel.textContent).toContain('Connector Console');
     expect(panel.textContent).toContain('Accounts');
     expect(panel.textContent).toContain('Capabilities');
+    expect(panel.textContent).toContain('MCP Operators');
+    expect(panel.textContent).toContain('filesystem');
+    expect(panel.textContent).toContain('remote');
+    expect(panel.textContent).toContain('missing url');
     expect(panel.textContent).toContain('Services · Feishu Read-only');
     expect(panel.textContent).toContain('no ready provider account for feishu');
     expect(panel.textContent).toContain('Mock Runtime Doc');

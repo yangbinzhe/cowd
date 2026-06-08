@@ -3487,6 +3487,7 @@ providers:
         assert!(!json.to_string().contains("secret-token"));
 
         let capabilities = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/connectors/capabilities")
@@ -3509,6 +3510,33 @@ providers:
                     && capability["plane"] == "mcp"
                     && capability["supports_commit"] == false
             ));
+
+        let mcp_servers = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/mcp/servers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp_servers.status(), StatusCode::OK);
+        let body = to_bytes(mcp_servers.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_mcp_servers");
+        assert_eq!(json["summary"]["total"], 2);
+        assert_eq!(json["summary"]["ready"], 1);
+        assert_eq!(json["summary"]["degraded"], 1);
+        assert!(json["servers"].as_array().unwrap().iter().any(|server| {
+            server["name"] == "broken"
+                && server["status"] == "degraded"
+                && server["missing_required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item == "command")
+        }));
+        assert!(!json.to_string().contains("secret-token"));
     }
 
     #[tokio::test]
