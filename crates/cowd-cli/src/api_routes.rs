@@ -3846,6 +3846,11 @@ providers:
             "service://feishu/docx/doccn-ready"
         );
         assert_eq!(json["result"]["output"]["body_included"], false);
+        assert_eq!(json["result"]["output"]["body_policy"], "metadata_only");
+        assert_eq!(
+            json["result"]["output"]["retrieval_capability"],
+            "service.feishu.docx.read"
+        );
         assert_eq!(json["resource_persisted"], true);
         assert!(!json.to_string().contains("secret_xxx"));
 
@@ -3883,6 +3888,7 @@ providers:
         );
 
         let resources = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/connectors/resources?q=Ready")
@@ -3899,6 +3905,30 @@ providers:
             .unwrap()
             .iter()
             .any(|resource| resource["reference"] == "service://feishu/docx/doccn-ready"));
+
+        let evidence = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/evidence/resolve?ref=service%3A%2F%2Ffeishu%2Fdocx%2Fdoccn-ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.status(), StatusCode::OK);
+        let body = to_bytes(evidence.into_body(), usize::MAX).await.unwrap();
+        let evidence_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(evidence_json["body"], serde_json::Value::Null);
+        assert_eq!(evidence_json["body_policy"], "metadata_only");
+        assert_eq!(
+            evidence_json["retrieval_capability"],
+            "service.feishu.docx.read"
+        );
+        assert!(evidence_json["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "fetch_body_through_connector_before_context_injection"));
     }
 
     #[tokio::test]

@@ -1096,6 +1096,7 @@ impl ServiceConnector for FeishuReadOnlyServiceConnector {
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| Some(format!("feishu://{resource_type}/{resource_id}")));
+        let retrieval_capability = tool_id.clone();
         ServiceToolResult {
             status: "ok".to_string(),
             tool_id,
@@ -1104,6 +1105,12 @@ impl ServiceConnector for FeishuReadOnlyServiceConnector {
                 "summary": format!("Feishu {resource_type} resource resolved as {}", resource.reference),
                 "read_only": true,
                 "body_included": false,
+                "body_policy": "metadata_only",
+                "retrieval_capability": retrieval_capability,
+                "next_actions": [
+                    "resolve_evidence_for_metadata",
+                    "use_authorized_feishu_read_capability_for_body"
+                ],
             }),
         }
     }
@@ -1361,6 +1368,11 @@ mod tests {
             "service://feishu/docx/doccn123"
         );
         assert_eq!(result.output["body_included"], false);
+        assert_eq!(result.output["body_policy"], "metadata_only");
+        assert_eq!(
+            result.output["retrieval_capability"],
+            "service.feishu.docx.read"
+        );
     }
 
     #[test]

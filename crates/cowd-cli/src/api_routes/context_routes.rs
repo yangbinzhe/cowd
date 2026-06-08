@@ -602,6 +602,9 @@ fn resource_context_item(resource: ExternalResourceRef) -> ContextItem {
     if matches!(resource.indexed_state.as_str(), "stale" | "degraded") {
         content.push_str("\nwarning: resource metadata may be stale or degraded; resolve evidence before relying on details");
     }
+    if resource.provider == "feishu" {
+        content.push_str("\nbody_policy: metadata_only\nretrieval: use an authorized Feishu read capability before injecting body content");
+    }
     let mut item = ContextItem::new(
         resource.reference.clone(),
         ContextSourceKind::Workspace,
@@ -637,6 +640,9 @@ fn resolve_resource_evidence(state: &AppState, reference: &str) -> serde_json::V
             "resource": resource,
             "body": null,
             "reason": "resource evidence resolves metadata only; fetch/read must go through connector capability",
+            "body_policy": if resource.provider == "feishu" { "metadata_only" } else { "not_persisted" },
+            "retrieval_capability": resource_retrieval_capability(&resource),
+            "next_actions": resource_next_actions(&resource),
         }),
         Ok(None) => serde_json::json!({
             "ref": reference,
@@ -650,6 +656,31 @@ fn resolve_resource_evidence(state: &AppState, reference: &str) -> serde_json::V
             "available": false,
             "reason": format!("resource lookup failed: {error}"),
         }),
+    }
+}
+
+fn resource_retrieval_capability(resource: &ExternalResourceRef) -> Option<String> {
+    if resource.provider != "feishu" {
+        return None;
+    }
+    let operation = match resource.resource_type.as_str() {
+        "drive" => "drive.metadata",
+        "wiki" => "wiki.node_readonly",
+        "docx" => "docx.read",
+        other => other,
+    };
+    Some(format!("service.feishu.{operation}"))
+}
+
+fn resource_next_actions(resource: &ExternalResourceRef) -> Vec<&'static str> {
+    if resource.provider == "feishu" {
+        vec![
+            "review_metadata_and_permissions",
+            "request_or_use_feishu_read_scope",
+            "fetch_body_through_connector_before_context_injection",
+        ]
+    } else {
+        vec!["review_metadata", "fetch_body_through_connector_if_needed"]
     }
 }
 
