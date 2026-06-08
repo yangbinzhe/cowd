@@ -279,6 +279,46 @@ describe('API module', () => {
     expect(result.applied).toBe(true);
   });
 
+  it('runtime session lease APIs use the control-plane route contract', async () => {
+    const mockF = vi.fn((path) => {
+      if (String(path).includes('/api/runtime/session-leases/acquire')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ ok: true, lease: { session_id: 's1', owner: 'webui:s1', mode: 'collaborative' } })
+        });
+      }
+      if (String(path).includes('/api/runtime/session-leases/release')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ ok: true, released: true })
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ kind: 'runtime_session_leases', total: 1, leases: [] })
+      });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.runtimeSessionLeases();
+    await window.Api.acquireRuntimeSessionLease('s1', 'webui:s1', 'collaborative');
+    await window.Api.releaseRuntimeSessionLease('s1', 'webui:s1');
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/runtime/session-leases');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/runtime/session-leases/acquire');
+    expect(mockF.mock.calls[1][1].method).toBe('POST');
+    expect(JSON.parse(mockF.mock.calls[1][1].body)).toEqual({
+      session_id: 's1',
+      owner: 'webui:s1',
+      mode: 'collaborative',
+    });
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/runtime/session-leases/release');
+    expect(JSON.parse(mockF.mock.calls[2][1].body)).toEqual({
+      session_id: 's1',
+      owner: 'webui:s1',
+    });
+  });
+
   it('resolveEvidence encodes refs and session id', async () => {
     const mockF = vi.fn(() =>
       Promise.resolve({
@@ -1945,7 +1985,18 @@ describe('API module', () => {
               blocked: [],
             },
             components: {
-              session: { source_of_truth: 'sqlite', active_count: 1, durable_store: true },
+              session: {
+                source_of_truth: 'sqlite',
+                active_count: 1,
+                durable_store: true,
+                leases: {
+                  kind: 'runtime_session_leases',
+                  status: 'available',
+                  attached: true,
+                  total: 1,
+                  leases: [{ session_id: 's1', owner: 'webui:s1', mode: 'collaborative', acquired_at_ms: 1780900000000 }],
+                },
+              },
               memory: { status: 'available', search_mode: 'hybrid' },
               context: { durable_history: true },
               agent: { status: 'available', max_parallel_agents: 4 },
@@ -1977,6 +2028,18 @@ describe('API module', () => {
             provider_model_count: 2,
             configured_model_resolved: true,
           })
+        });
+      }
+      if (path.includes('/api/runtime/session-leases/acquire')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ ok: true, lease: { session_id: 's1', owner: 'webui:s1', mode: 'collaborative' } })
+        });
+      }
+      if (path.includes('/api/runtime/session-leases/release')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ ok: true, released: true })
         });
       }
       if (path.includes('/api/memory/maintenance')) {
@@ -2057,6 +2120,11 @@ describe('API module', () => {
     expect(text).toContain('models');
     expect(text).toContain('route');
     expect(text).toContain('Reload providers');
+    expect(text).toContain('Acquire lease');
+    expect(text).toContain('Release lease');
+    expect(text).toContain('Session Leases');
+    expect(text).toContain('webui:s1');
+    expect(text).toContain('collaborative');
     expect(text).toContain('components');
     expect(text).toContain('caps');
     expect(text).toContain('Runtime Probe');
@@ -2105,6 +2173,16 @@ describe('API module', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(fetch).toHaveBeenCalledWith(
       '/api/runtime/providers/reload',
+      expect.objectContaining({ method: 'POST' })
+    );
+
+    const acquireButton = Array.from(document.querySelectorAll('button'))
+      .find(button => button.textContent.includes('Acquire lease'));
+    expect(acquireButton).toBeTruthy();
+    acquireButton.click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/runtime/session-leases/acquire',
       expect.objectContaining({ method: 'POST' })
     );
 

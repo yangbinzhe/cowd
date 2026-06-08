@@ -219,6 +219,22 @@ window.Api = (()=>{
     async runtimeReloadProviders(){
       return req('POST','/api/runtime/providers/reload');
     },
+    async runtimeSessionLeases(){
+      return req('GET','/api/runtime/session-leases');
+    },
+    async acquireRuntimeSessionLease(sessionId,owner,mode){
+      return req('POST','/api/runtime/session-leases/acquire',{
+        session_id:sessionId||sid||'webui-session',
+        owner:owner||'webui',
+        mode:mode||'collaborative',
+      });
+    },
+    async releaseRuntimeSessionLease(sessionId,owner){
+      return req('POST','/api/runtime/session-leases/release',{
+        session_id:sessionId||sid||'webui-session',
+        owner:owner||'webui',
+      });
+    },
     async contextEnvelope(envelopeId){
       return req('GET','/api/context/'+encodeURIComponent(envelopeId));
     },

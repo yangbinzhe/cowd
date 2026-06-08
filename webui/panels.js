@@ -719,6 +719,26 @@ window.Panels = (()=>{
       reasons.textContent='degraded: '+plane.degraded_reasons.slice(0,3).join(' · ');
       sec.appendChild(reasons);
     }
+    const leaseProjection=(session.leases)||{};
+    const leases=leaseProjection.leases||[];
+    const leaseSec=UI.el('div','runtime-control-plane-leases');
+    leaseSec.innerHTML='<h4>Session Leases</h4>';
+    const leaseMetrics=UI.el('div','memory-metrics');
+    leaseMetrics.appendChild(renderMemoryMetric('status',leaseProjection.status||'unknown',leaseProjection.attached?'attached':'detached'));
+    leaseMetrics.appendChild(renderMemoryMetric('active',leaseProjection.total??leases.length,'leases'));
+    leaseSec.appendChild(leaseMetrics);
+    if(leases.length){
+      leases.slice(0,4).forEach(function(lease){
+        const item=UI.el('div','panel-item audit-record');
+        const mode=lease.mode||'unknown';
+        const acquired=lease.acquired_at_ms?new Date(lease.acquired_at_ms).toLocaleTimeString():'';
+        item.innerHTML='<span class="audit-source">'+UI.esc(mode)+'</span><b>'+UI.esc(lease.owner||'unknown owner')+'</b><small>'+UI.esc([lease.session_id,acquired].filter(Boolean).join(' · '))+'</small>';
+        leaseSec.appendChild(item);
+      });
+    }else{
+      leaseSec.appendChild(UI.el('div','panel-empty','No active session leases'));
+    }
+    sec.appendChild(leaseSec);
     const blocked=(readiness.blocked||[]).slice(0,3);
     if(blocked.length){
       const blockedRow=UI.el('div','runtime-control-plane-reasons');
@@ -1422,9 +1442,15 @@ window.Panels = (()=>{
     profile.innerHTML='<option value="MainTurn">Main</option><option value="SoloGoal">Solo</option><option value="YoloGoal">Yolo</option><option value="Review">Review</option><option value="Resume">Resume</option><option value="SubAgent">SubAgent</option><option value="Collaboration">Collab</option><option value="Cron">Cron</option>';
     const refresh=UI.el('button','btn-secondary btn-sm');
     refresh.textContent='Refresh';
+    const acquireLease=UI.el('button','btn-secondary btn-sm');
+    acquireLease.textContent='Acquire lease';
+    const releaseLease=UI.el('button','btn-secondary btn-sm');
+    releaseLease.textContent='Release lease';
     controls.appendChild(input);
     controls.appendChild(profile);
     controls.appendChild(refresh);
+    controls.appendChild(acquireLease);
+    controls.appendChild(releaseLease);
     hdr.appendChild(controls);
     c.appendChild(hdr);
 
@@ -1457,6 +1483,8 @@ window.Panels = (()=>{
       runtimeDetailMount.innerHTML='';
       const opts={q:input.value||'',profile:profile.value};
       if(Api.sid)opts.session_id=Api.sid;
+      const leaseSessionId=Api.sid||'webui-runtime-console';
+      const leaseOwner='webui:'+leaseSessionId;
 
       async function showRuntimeContext(envelopeId){
         runtimeDetailMount.innerHTML='';
@@ -1493,6 +1521,30 @@ window.Panels = (()=>{
       try{
         controlPlane=await Api.runtimeControlPlane();
       }catch(e){}
+      acquireLease.onclick=async function(){
+        acquireLease.disabled=true;
+        try{
+          await Api.acquireRuntimeSessionLease(leaseSessionId,leaseOwner,'collaborative');
+          UI.showToast('Session lease acquired','success');
+          await load();
+        }catch(err){
+          UI.showToast(err.message,'error');
+        }finally{
+          acquireLease.disabled=false;
+        }
+      };
+      releaseLease.onclick=async function(){
+        releaseLease.disabled=true;
+        try{
+          await Api.releaseRuntimeSessionLease(leaseSessionId,leaseOwner);
+          UI.showToast('Session lease released','success');
+          await load();
+        }catch(err){
+          UI.showToast(err.message,'error');
+        }finally{
+          releaseLease.disabled=false;
+        }
+      };
 
       const metrics=UI.el('div','memory-metrics');
       metrics.appendChild(renderMemoryMetric('profile',envelope.profile||profile.value,'mode'));

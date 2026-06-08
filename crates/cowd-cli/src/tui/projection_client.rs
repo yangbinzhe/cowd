@@ -46,6 +46,42 @@ impl DaemonProjectionClient {
         self.get_json("/api/runtime/control-plane").await
     }
 
+    pub async fn runtime_session_leases(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/runtime/session-leases").await
+    }
+
+    pub async fn acquire_runtime_session_lease(
+        &self,
+        session_id: &str,
+        owner: &str,
+        mode: &str,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            "/api/runtime/session-leases/acquire",
+            serde_json::json!({
+                "session_id": session_id,
+                "owner": owner,
+                "mode": mode,
+            }),
+        )
+        .await
+    }
+
+    pub async fn release_runtime_session_lease(
+        &self,
+        session_id: &str,
+        owner: &str,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            "/api/runtime/session-leases/release",
+            serde_json::json!({
+                "session_id": session_id,
+                "owner": owner,
+            }),
+        )
+        .await
+    }
+
     pub async fn runtime_effective_config(&self) -> Result<serde_json::Value, ProjectionError> {
         self.get_json("/api/runtime/config/effective").await
     }
@@ -295,6 +331,55 @@ mod tests {
                 .expect("client");
         let json = client.runtime_control_plane().await.expect("json");
         assert_eq!(json["ok"], true);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn runtime_session_lease_control_uses_http_routes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept acquire");
+            let mut buf = vec![0; 4096];
+            let n = socket.read(&mut buf).await.expect("read acquire");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("POST /api/runtime/session-leases/acquire HTTP/1.1"));
+            assert!(req.contains("\"session_id\":\"session-1\""));
+            assert!(req.contains("\"owner\":\"tui:1\""));
+            assert!(req.contains("\"mode\":\"collaborative\""));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 22\r\n\r\n{\"ok\":true,\"lease\":{}}",
+                )
+                .await
+                .expect("write acquire");
+
+            let (mut socket, _) = listener.accept().await.expect("accept release");
+            let mut buf = vec![0; 4096];
+            let n = socket.read(&mut buf).await.expect("read release");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("POST /api/runtime/session-leases/release HTTP/1.1"));
+            assert!(req.contains("\"session_id\":\"session-1\""));
+            assert!(req.contains("\"owner\":\"tui:1\""));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 27\r\n\r\n{\"ok\":true,\"released\":true}",
+                )
+                .await
+                .expect("write release");
+        });
+
+        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let acquired = client
+            .acquire_runtime_session_lease("session-1", "tui:1", "collaborative")
+            .await
+            .expect("acquire");
+        assert_eq!(acquired["ok"], true);
+        let released = client
+            .release_runtime_session_lease("session-1", "tui:1")
+            .await
+            .expect("release");
+        assert_eq!(released["released"], true);
         server.await.expect("server task");
     }
 
