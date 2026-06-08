@@ -82,7 +82,7 @@ async fn send_message_posts_json_and_parses_response() {
     );
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/0.1.0")
+        Some(concat!("claude-code/", env!("CARGO_PKG_VERSION")))
     );
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
@@ -120,7 +120,7 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
             messages: vec![InputMessage {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
-                    text: "x".repeat(600_000),
+                    text: "x".repeat(4_000_000),
                 }],
             }],
             system: Some("Keep the answer short.".to_string()),
@@ -719,7 +719,7 @@ async fn send_message_tracks_unexpected_prompt_cache_breaks() {
     assert_eq!(cache_stats.unexpected_cache_breaks, 1);
     assert_eq!(
         cache_stats.last_break_reason.as_deref(),
-        Some("cache read tokens dropped while prompt fingerprint remained stable")
+        Some("cache read tokens dropped (component hashes stable)")
     );
 
     std::fs::remove_dir_all(temp_root).expect("cleanup temp root");

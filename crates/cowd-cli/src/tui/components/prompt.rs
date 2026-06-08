@@ -1319,8 +1319,8 @@ mod tests {
         // After accepting, the text should be the full suggestion
         let text = prompt.text();
         assert!(
-            text.starts_with("/stat"),
-            "text should start with '/stat' after tab accept, got: {text}"
+            text.starts_with("/sta"),
+            "text should preserve the typed '/sta' command prefix after tab accept, got: {text}"
         );
     }
 

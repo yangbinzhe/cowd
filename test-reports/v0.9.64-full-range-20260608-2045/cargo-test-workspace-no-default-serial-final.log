@@ -1,0 +1,96 @@
+   Compiling value-bag v1.12.0
+   Compiling crossbeam-utils v0.8.21
+   Compiling rustix v1.1.4
+   Compiling linux-raw-sys v0.12.1
+   Compiling futures-util v0.3.32
+   Compiling parking v2.2.1
+   Compiling libc v0.2.186
+   Compiling memchr v2.8.1
+   Compiling async-io v2.6.0
+   Compiling crunchy v0.2.4
+   Compiling regex-syntax v0.8.10
+   Compiling smallvec v1.15.1
+   Compiling siphasher v1.0.3
+   Compiling async-task v4.7.1
+   Compiling tiny-keccak v2.0.2
+   Compiling new_debug_unreachable v1.0.6
+   Compiling fixedbitset v0.4.2
+   Compiling syn v1.0.109
+   Compiling precomputed-hash v0.1.1
+   Compiling log v0.4.30
+   Compiling bit-vec v0.6.3
+   Compiling itertools v0.11.0
+   Compiling piper v0.2.5
+error: failed to write `/media/yi/Datas/workspace/cowd/.test-target-full/debug/.fingerprint/bit-vec-0752886916a306db/invoked.timestamp`
+
+Caused by:
+  No space left on device (os error 28)
+warning: build failed, waiting for other jobs to finish...
+error: failed to write `/media/yi/Datas/workspace/cowd/.test-target-full/debug/.fingerprint/itertools-4809a6b49baa0d8d/invoked.timestamp`
+
+Caused by:
+  No space left on device (os error 28)
+error: couldn't create a temp dir: No space left on device (os error 28) at path "/media/yi/Datas/workspace/cowd/.test-target-full/debug/build/async-io-707668286b228837/rmeta6Z2B2F"
+
+error: could not write output to /media/yi/Datas/workspace/cowd/.test-target-full/debug/build/crunchy-2c9702b1888e8a71/build_script_build-2c9702b1888e8a71.2mc0ryoazwufvral4pf4zdb5y.rcgu.o: No space left on device
+
+error: failed to write `/media/yi/Datas/workspace/cowd/.test-target-full/debug/.fingerprint/piper-4a6c0daf449e3765/invoked.timestamp`
+
+Caused by:
+  No space left on device (os error 28)
+error: couldn't create a temp dir: No space left on device (os error 28) at path "/media/yi/Datas/workspace/cowd/.test-target-full/debug/build/libc-183beaf70c7ea928/rmetaHVzXdm"
+
+error: couldn't create a temp dir: No space left on device (os error 28) at path "/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/rmeta5UQdP2"
+
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/siphasher-a5a0b532dc5ef792.d`: No space left on device (os error 28)
+
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/smallvec-3a5228efce56b2c3.d`: No space left on device (os error 28)
+
+error: could not compile `crunchy` (build script) due to 1 previous error
+error: couldn't create a temp dir: No space left on device (os error 28) at path "/media/yi/Datas/workspace/cowd/.test-target-full/debug/build/crossbeam-utils-2dd7e9a10f471ce2/rustcRftE6M"
+
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/debug_unreachable-f313183b276353e9.d`: No space left on device (os error 28)
+
+error: could not compile `siphasher` (lib) due to 1 previous error
+error: could not compile `parking` (lib) due to 1 previous error
+error: could not compile `libc` (build script) due to 1 previous error
+error: could not compile `async-io` (build script) due to 1 previous error
+error: could not compile `smallvec` (lib) due to 1 previous error
+error: could not write output to /media/yi/Datas/workspace/cowd/.test-target-full/debug/build/rustix-45910f28b4f58459/build_script_build-45910f28b4f58459.8paxp6ovb677klgle6ixe9228.rcgu.o: No space left on device
+
+error: could not compile `new_debug_unreachable` (lib) due to 1 previous error
+error: could not compile `crossbeam-utils` (build script) due to 1 previous error
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/fixedbitset-c608323ea8ece07d.d`: No space left on device (os error 28)
+
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/memchr-3b99a9cd11d9a99a.d`: No space left on device (os error 28)
+
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/build/tiny-keccak-1035cfce138e1ab4/build_script_build-1035cfce138e1ab4.d`: No space left on device (os error 28)
+
+error: could not compile `rustix` (build script) due to 1 previous error
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/build/syn-7bf85e86f2298850/build_script_build-7bf85e86f2298850.d`: No space left on device (os error 28)
+
+error: could not compile `fixedbitset` (lib) due to 1 previous error
+error: could not compile `syn` (build script) due to 1 previous error
+error: could not compile `memchr` (lib) due to 1 previous error
+error: could not compile `tiny-keccak` (build script) due to 1 previous error
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/async_task-3e3770c4756b50af.d`: No space left on device (os error 28)
+
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/precomputed_hash-b86b9f75171d546a.d`: No space left on device (os error 28)
+
+error: could not compile `async-task` (lib) due to 1 previous error
+error: could not compile `precomputed-hash` (lib) due to 1 previous error
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/log-437ae28e93ce17d5.d`: No space left on device (os error 28)
+
+error: could not compile `log` (lib) due to 1 previous error
+error: couldn't create a temp dir: No space left on device (os error 28) at path "/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/rmetaC8rPAL"
+
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/linux_raw_sys-6496224af60f2072.d`: No space left on device (os error 28)
+
+error: could not compile `value-bag` (lib) due to 1 previous error
+error: could not compile `linux-raw-sys` (lib) due to 1 previous error
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/regex_syntax-b4cd8f9c9984659e.d`: No space left on device (os error 28)
+
+error: could not compile `regex-syntax` (lib) due to 1 previous error
+error: error writing dependencies to `/media/yi/Datas/workspace/cowd/.test-target-full/debug/deps/futures_util-23aa2235fa387818.d`: No space left on device (os error 28)
+
+error: could not compile `futures-util` (lib) due to 1 previous error

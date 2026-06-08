@@ -1,0 +1,14 @@
+   Compiling api v0.9.64 (/media/yi/Datas/workspace/cowd/crates/api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.75s
+     Running tests/openai_compat_integration.rs (/tmp/cowd-master-full-target/debug/deps/openai_compat_integration-6b5ee5f35030be94)
+
+running 6 tests
+test provider_client_dispatches_xai_requests_from_env ... ok
+test openai_streaming_requests_opt_into_usage_chunks ... ok
+test stream_message_normalizes_text_and_multiple_tool_calls ... ok
+test send_message_accepts_full_chat_completions_endpoint_override ... ok
+test send_message_uses_openai_compatible_endpoint_and_auth ... ok
+test send_message_blocks_oversized_xai_requests_before_the_http_call ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+

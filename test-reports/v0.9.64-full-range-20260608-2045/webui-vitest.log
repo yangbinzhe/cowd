@@ -1,0 +1,5 @@
+
+> test
+> vitest run --runInBand
+
+sh: 1: vitest: not found

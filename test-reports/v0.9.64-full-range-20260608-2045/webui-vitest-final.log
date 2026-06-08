@@ -1,0 +1,14 @@
+
+> test
+> vitest run --run
+
+
+ RUN  v2.1.9 /media/yi/Datas/workspace/cowd/webui
+
+ ✓ modules.test.js (71 tests) 449ms
+
+ Test Files  1 passed (1)
+      Tests  71 passed (71)
+   Start at  21:12:50
+   Duration  1.17s (transform 90ms, setup 13ms, collect 103ms, tests 449ms, environment 342ms, prepare 108ms)
+

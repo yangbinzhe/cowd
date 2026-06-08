@@ -81,7 +81,7 @@ async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
             messages: vec![InputMessage {
                 role: "user".to_string(),
                 content: vec![InputContentBlock::Text {
-                    text: "x".repeat(300_000),
+                    text: "x".repeat(4_000_000),
                 }],
             }],
             system: Some("Keep the answer short.".to_string()),

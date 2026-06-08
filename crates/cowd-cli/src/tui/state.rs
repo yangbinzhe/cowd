@@ -72,7 +72,7 @@ pub enum ProcessedKey {
     Nothing,
 }
 
-const SIDEBAR_TAB_COUNT: usize = 12;
+pub(crate) const SIDEBAR_TAB_COUNT: usize = 12;
 
 fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
     if width < 96 {

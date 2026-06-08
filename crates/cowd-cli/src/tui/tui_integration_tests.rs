@@ -19,7 +19,7 @@
 // -------------------------------------------------------------------
 
 use crate::tui::app::App;
-use crate::tui::state::{ProcessedKey, TuiState};
+use crate::tui::state::{ProcessedKey, TuiState, SIDEBAR_TAB_COUNT};
 use crate::tui::test_utils::MockTerminal;
 use runtime::CowdEvent;
 
@@ -86,15 +86,15 @@ fn integration_panel_switch() {
     // Default tab is Chat (index 0)
     assert_eq!(state.sidebar_active_tab, 0);
 
-    // Tab cycles through 9 sidebar tabs: 0→1→2→3→4→5→6→7→8→0
-    for expected in 1..9 {
+    // Tab cycles through every registered sidebar tab and then wraps.
+    for expected in 1..SIDEBAR_TAB_COUNT {
         state.handle_input(key(KeyCode::Tab));
         assert_eq!(
             state.sidebar_active_tab, expected,
             "Tab cycle step to tab {expected}"
         );
     }
-    // 9th Tab wraps back to 0
+    // Final Tab wraps back to 0.
     state.handle_input(key(KeyCode::Tab));
     assert_eq!(state.sidebar_active_tab, 0);
 }

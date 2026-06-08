@@ -1,0 +1,155 @@
+   Compiling libc v0.2.186
+   Compiling value-bag v1.12.0
+   Compiling crossbeam-utils v0.8.21
+   Compiling serde_core v1.0.228
+   Compiling rustix v1.1.4
+   Compiling linux-raw-sys v0.12.1
+   Compiling tracing-core v0.1.36
+   Compiling serde_json v1.0.150
+   Compiling futures-util v0.3.32
+   Compiling num-traits v0.2.19
+   Compiling regex-automata v0.4.14
+   Compiling parking v2.2.1
+   Compiling memchr v2.8.1
+   Compiling prost v0.13.5
+   Compiling async-io v2.6.0
+   Compiling regex-syntax v0.8.10
+   Compiling smallvec v1.15.1
+   Compiling crunchy v0.2.4
+   Compiling async-task v4.7.1
+   Compiling tiny-keccak v2.0.2
+   Compiling siphasher v1.0.3
+   Compiling new_debug_unreachable v1.0.6
+   Compiling syn v1.0.109
+   Compiling precomputed-hash v0.1.1
+   Compiling futures-lite v2.6.1
+   Compiling log v0.4.30
+   Compiling bit-vec v0.6.3
+   Compiling fixedbitset v0.4.2
+   Compiling phf_shared v0.11.3
+   Compiling itertools v0.11.0
+   Compiling piper v0.2.5
+   Compiling bit-set v0.5.3
+   Compiling ena v0.14.4
+   Compiling unicode-xid v0.2.6
+   Compiling petgraph v0.6.5
+   Compiling pico-args v0.5.0
+   Compiling event-listener v2.5.3
+   Compiling http v0.2.12
+   Compiling pin-utils v0.1.0
+   Compiling tracing v0.1.44
+   Compiling kv-log-macro v1.0.7
+   Compiling lalrpop-util v0.20.2
+   Compiling levenshtein v1.0.5
+   Compiling base64 v0.21.7
+   Compiling similar v2.7.0
+   Compiling aho-corasick v1.1.4
+   Compiling crossbeam-channel v0.5.15
+   Compiling concurrent-queue v2.5.0
+   Compiling event-listener v5.4.1
+   Compiling async-channel v1.9.0
+   Compiling event-listener-strategy v0.5.4
+   Compiling async-executor v1.14.0
+   Compiling http-body v0.4.6
+   Compiling async-channel v2.5.0
+   Compiling async-lock v3.4.2
+   Compiling parking_lot_core v0.9.12
+   Compiling errno v0.3.14
+   Compiling mio v1.2.1
+   Compiling socket2 v0.6.4
+   Compiling getrandom v0.2.17
+   Compiling openssl-sys v0.9.116
+   Compiling getrandom v0.4.2
+   Compiling inotify-sys v0.1.5
+   Compiling filetime v0.2.29
+   Compiling signal-hook-registry v1.4.8
+   Compiling mio v0.8.11
+   Compiling dirs-sys-next v0.1.2
+   Compiling fs2 v0.4.3
+   Compiling ring v0.17.14
+   Compiling parking_lot v0.12.5
+   Compiling rand v0.10.1
+   Compiling inotify v0.9.6
+   Compiling rand_core v0.6.4
+   Compiling dirs-next v2.0.0
+   Compiling blocking v1.6.2
+   Compiling term v0.7.0
+   Compiling socket2 v0.5.10
+   Compiling rand_chacha v0.3.1
+   Compiling tokio v1.52.3
+   Compiling scheduled-thread-pool v0.2.7
+   Compiling notify v6.1.1
+   Compiling rand v0.8.6
+   Compiling ascii-canvas v3.0.0
+   Compiling r2d2 v0.8.10
+   Compiling openssl v0.10.80
+   Compiling string_cache v0.8.9
+   Compiling regex v1.12.3
+   Compiling futures-executor v0.3.32
+   Compiling rustls-webpki v0.103.13
+   Compiling async-attributes v1.1.2
+   Compiling serial_test v3.5.0
+   Compiling futures v0.3.32
+   Compiling tree-sitter v0.24.7
+   Compiling serde v1.0.228
+   Compiling uuid v1.23.1
+   Compiling csv v1.4.0
+   Compiling rustls v0.23.40
+   Compiling chrono v0.4.44
+   Compiling serde_urlencoded v0.7.1
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling serde_regex v1.1.0
+   Compiling plugins v0.9.64 (/media/yi/Datas/workspace/cowd/crates/plugins)
+   Compiling telemetry v0.9.64 (/media/yi/Datas/workspace/cowd/crates/telemetry)
+   Compiling assert-json-diff v2.0.2
+   Compiling lalrpop v0.20.2
+   Compiling rusqlite v0.31.0
+   Compiling native-tls v0.2.18
+   Compiling tungstenite v0.24.0
+   Compiling imap v3.0.0-alpha.15
+   Compiling tokio-util v0.7.18
+   Compiling tokio-native-tls v0.3.1
+   Compiling tower v0.5.3
+   Compiling hyper v0.14.32
+   Compiling r2d2_sqlite v0.24.0
+   Compiling tokio-tungstenite v0.24.0
+   Compiling tempfile v3.27.0
+   Compiling polling v3.11.0
+   Compiling tower-http v0.6.11
+   Compiling h2 v0.4.14
+   Compiling async-signal v0.2.14
+   Compiling async-global-executor v2.4.1
+   Compiling async-process v2.5.0
+   Compiling tokio-rustls v0.26.4
+   Compiling async-std v1.13.2
+   Compiling lettre v0.11.22
+   Compiling async-object-pool v0.1.5
+   Compiling hyper v1.10.0
+   Compiling hyper-util v0.1.20
+   Compiling basic-cookies v0.1.5
+   Compiling httpmock v0.7.0
+   Compiling hyper-rustls v0.27.9
+   Compiling hyper-tls v0.6.0
+   Compiling reqwest v0.12.28
+   Compiling cowd-memory v0.9.64 (/media/yi/Datas/workspace/cowd/crates/memory)
+   Compiling runtime v0.9.64 (/media/yi/Datas/workspace/cowd/crates/runtime)
+   Compiling commands v0.9.64 (/media/yi/Datas/workspace/cowd/crates/commands)
+   Compiling api v0.9.64 (/media/yi/Datas/workspace/cowd/crates/api)
+   Compiling tools v0.9.64 (/media/yi/Datas/workspace/cowd/crates/tools)
+rustc-LLVM ERROR: IO failure on output stream: Disk quota exceeded
+error: could not compile `tools` (lib test)
+
+Caused by:
+  Disk quota exceeded (os error 122)
+
+Caused by:
+  failed to parse process output: `/home/yi/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name tools --edition=2021 crates/tools/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--allow=clippy::pedantic' '--warn=clippy::unwrap_used' '--warn=clippy::expect_used' '--warn=clippy::all' --warn=unused_variables --warn=unused_imports --forbid=unsafe_code --warn=dead_code --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=02505e1f3959ff5e -C extra-filename=-638924c37b15a09c --out-dir /tmp/cowd-test-cli/debug/deps -C incremental=/tmp/cowd-test-cli/debug/incremental -L dependency=/tmp/cowd-test-cli/debug/deps --extern api=/tmp/cowd-test-cli/debug/deps/libapi-d2580f2062ac5d45.rlib --extern base64=/tmp/cowd-test-cli/debug/deps/libbase64-e5cc050039038c59.rlib --extern commands=/tmp/cowd-test-cli/debug/deps/libcommands-a836a84f155f4691.rlib --extern flate2=/tmp/cowd-test-cli/debug/deps/libflate2-1e7f32de878f0726.rlib --extern futures=/tmp/cowd-test-cli/debug/deps/libfutures-9f83efac22540420.rlib --extern plugins=/tmp/cowd-test-cli/debug/deps/libplugins-d38e81a2dd9073ea.rlib --extern reqwest=/tmp/cowd-test-cli/debug/deps/libreqwest-4c69a9f57ec30971.rlib --extern runtime=/tmp/cowd-test-cli/debug/deps/libruntime-ffabb6502452761c.rlib --extern serde=/tmp/cowd-test-cli/debug/deps/libserde-6f3365918123bbe0.rlib --extern serde_json=/tmp/cowd-test-cli/debug/deps/libserde_json-41e364632bd51d02.rlib --extern serde_yaml=/tmp/cowd-test-cli/debug/deps/libserde_yaml-b28319a017530800.rlib --extern thiserror=/tmp/cowd-test-cli/debug/deps/libthiserror-6d7f09e165ac8499.rlib --extern tokio=/tmp/cowd-test-cli/debug/deps/libtokio-f7ff27e751e9c290.rlib --extern tracing=/tmp/cowd-test-cli/debug/deps/libtracing-9ea8147a8dc80fe3.rlib --extern urlencoding=/tmp/cowd-test-cli/debug/deps/liburlencoding-859294d5170dadde.rlib -L native=/tmp/cowd-test-cli/debug/build/ring-5eb86ff69fb4a9f2/out -L native=/tmp/cowd-test-cli/debug/build/libsqlite3-sys-f4554aac51163817/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-3dcf66fffbada104/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-go-ded7f7d118e3c51e/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-java-a9aba7df66792934/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-python-e6c535646eae4ae1/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-rust-a25cdfe3af5c36e6/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-typescript-9fc275c36ecb4eed/out` (exit status: 101)
+warning: build failed, waiting for other jobs to finish...
+rustc-LLVM ERROR: IO failure on output stream: Disk quota exceeded
+error: could not compile `runtime` (lib test)
+
+Caused by:
+  Disk quota exceeded (os error 122)
+
+Caused by:
+  failed to parse process output: `/home/yi/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc --crate-name runtime --edition=2021 crates/runtime/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 '--allow=clippy::pedantic' '--warn=clippy::unwrap_used' '--warn=clippy::expect_used' '--warn=clippy::all' --warn=unused_variables --warn=unused_imports --allow=unsafe_code --warn=dead_code --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=2c9d3ad0b4930a9c -C extra-filename=-fbf444286ab38029 --out-dir /tmp/cowd-test-cli/debug/deps -C incremental=/tmp/cowd-test-cli/debug/incremental -L dependency=/tmp/cowd-test-cli/debug/deps --extern aes=/tmp/cowd-test-cli/debug/deps/libaes-cf871fa0801f77e5.rlib --extern async_trait=/tmp/cowd-test-cli/debug/deps/libasync_trait-ee5a13cb59ed0262.so --extern base64=/tmp/cowd-test-cli/debug/deps/libbase64-e5cc050039038c59.rlib --extern cbc=/tmp/cowd-test-cli/debug/deps/libcbc-71eccb08dcc2834e.rlib --extern chrono=/tmp/cowd-test-cli/debug/deps/libchrono-fa14696a0894cc24.rlib --extern memory=/tmp/cowd-test-cli/debug/deps/libcowd_memory-9d4781a3dbb7ae1d.rlib --extern fs2=/tmp/cowd-test-cli/debug/deps/libfs2-8fef3a8fbc6ec23f.rlib --extern futures=/tmp/cowd-test-cli/debug/deps/libfutures-9f83efac22540420.rlib --extern glob=/tmp/cowd-test-cli/debug/deps/libglob-0b5d8d37a714610e.rlib --extern httpmock=/tmp/cowd-test-cli/debug/deps/libhttpmock-c76246ac03516091.rlib --extern imap=/tmp/cowd-test-cli/debug/deps/libimap-aca7e57db75a2827.rlib --extern imap_proto=/tmp/cowd-test-cli/debug/deps/libimap_proto-191ed7b29b9b5603.rlib --extern lettre=/tmp/cowd-test-cli/debug/deps/liblettre-8e9c4b1764d820de.rlib --extern libc=/tmp/cowd-test-cli/debug/deps/liblibc-500fac2c5d86c526.rlib --extern lru=/tmp/cowd-test-cli/debug/deps/liblru-4cac3292a1c5c098.rlib --extern mail_parser=/tmp/cowd-test-cli/debug/deps/libmail_parser-20068fcc342cb988.rlib --extern native_tls=/tmp/cowd-test-cli/debug/deps/libnative_tls-b17bd223dc854097.rlib --extern plugins=/tmp/cowd-test-cli/debug/deps/libplugins-d38e81a2dd9073ea.rlib --extern prost=/tmp/cowd-test-cli/debug/deps/libprost-946ead608bc36eba.rlib --extern r2d2=/tmp/cowd-test-cli/debug/deps/libr2d2-73ec06480db9bc49.rlib --extern r2d2_sqlite=/tmp/cowd-test-cli/debug/deps/libr2d2_sqlite-5f1512f1a3bae937.rlib --extern rand=/tmp/cowd-test-cli/debug/deps/librand-07236c5dfac7c071.rlib --extern regex=/tmp/cowd-test-cli/debug/deps/libregex-a24b8083ffbd993d.rlib --extern reqwest=/tmp/cowd-test-cli/debug/deps/libreqwest-4c69a9f57ec30971.rlib --extern rusqlite=/tmp/cowd-test-cli/debug/deps/librusqlite-a4d51a01448d6649.rlib --extern serde=/tmp/cowd-test-cli/debug/deps/libserde-6f3365918123bbe0.rlib --extern serde_json=/tmp/cowd-test-cli/debug/deps/libserde_json-41e364632bd51d02.rlib --extern serde_yaml=/tmp/cowd-test-cli/debug/deps/libserde_yaml-b28319a017530800.rlib --extern sha1=/tmp/cowd-test-cli/debug/deps/libsha1-7d148d0830b87321.rlib --extern sha2=/tmp/cowd-test-cli/debug/deps/libsha2-6cb1dc317e93368f.rlib --extern telemetry=/tmp/cowd-test-cli/debug/deps/libtelemetry-bc88651f0723f7ca.rlib --extern tempfile=/tmp/cowd-test-cli/debug/deps/libtempfile-5e7af0c05baadd4b.rlib --extern thiserror=/tmp/cowd-test-cli/debug/deps/libthiserror-6d7f09e165ac8499.rlib --extern tokio=/tmp/cowd-test-cli/debug/deps/libtokio-f7ff27e751e9c290.rlib --extern tokio_tungstenite=/tmp/cowd-test-cli/debug/deps/libtokio_tungstenite-b00926685c100fbb.rlib --extern tracing=/tmp/cowd-test-cli/debug/deps/libtracing-9ea8147a8dc80fe3.rlib --extern uuid=/tmp/cowd-test-cli/debug/deps/libuuid-d37ef60cccd91677.rlib --extern walkdir=/tmp/cowd-test-cli/debug/deps/libwalkdir-da2c001b7e5eddd2.rlib -L native=/tmp/cowd-test-cli/debug/build/libsqlite3-sys-f4554aac51163817/out -L native=/tmp/cowd-test-cli/debug/build/ring-5eb86ff69fb4a9f2/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-3dcf66fffbada104/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-go-ded7f7d118e3c51e/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-java-a9aba7df66792934/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-python-e6c535646eae4ae1/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-rust-a25cdfe3af5c36e6/out -L native=/tmp/cowd-test-cli/debug/build/tree-sitter-typescript-9fc275c36ecb4eed/out` (exit status: 101)

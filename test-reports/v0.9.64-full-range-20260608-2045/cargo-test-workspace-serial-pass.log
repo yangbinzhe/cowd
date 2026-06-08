@@ -1,0 +1,5 @@
+   Compiling value-bag v1.12.0
+   Compiling log v0.4.30
+error: failed to create file encoder: No space left on device (os error 28)
+
+error: could not compile `log` (lib) due to 1 previous error

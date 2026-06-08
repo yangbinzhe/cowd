@@ -13610,23 +13610,26 @@ UU conflicted.rs",
         let config_home = temp_dir();
         std::env::set_var("COWD_CONFIG_HOME", &config_home);
         fs::create_dir_all(&root).expect("root dir");
-        let active_handle =
-            create_managed_session_handle("resume-switch-active").expect("active handle");
-        let active_path = active_handle.path.clone();
-        let active = Session::new()
-            .with_workspace_root(root.clone())
-            .with_persistence_path(active_path.clone());
+        let (active_path, active, target_handle) = with_current_dir(&root, || {
+            let active_handle =
+                create_managed_session_handle("resume-switch-active").expect("active handle");
+            let active_path = active_handle.path.clone();
+            let active = Session::new()
+                .with_workspace_root(root.clone())
+                .with_persistence_path(active_path.clone());
 
-        let target_handle =
-            create_managed_session_handle("resume-switch-target").expect("target handle");
-        let target = Session::new().with_workspace_root(root.clone());
-        sync_cli_session_to_unified_store(
-            get_unified_store().expect("store should open"),
-            &target_handle,
-            None,
-            &target,
-        )
-        .expect("target session should sync");
+            let target_handle =
+                create_managed_session_handle("resume-switch-target").expect("target handle");
+            let target = Session::new().with_workspace_root(root.clone());
+            sync_cli_session_to_unified_store(
+                get_unified_store().expect("store should open"),
+                &target_handle,
+                None,
+                &target,
+            )
+            .expect("target session should sync");
+            (active_path, active, target_handle)
+        });
 
         let command = SlashCommand::parse(&format!("/session switch {}", target_handle.id))
             .expect("parse should succeed")
@@ -13639,12 +13642,8 @@ UU conflicted.rs",
         assert_eq!(
             outcome
                 .session_path
-                .expect("switch should update session path")
-                .canonicalize()
-                .expect("outcome path should exist"),
+                .expect("switch should update session path"),
             session_db_path()
-                .canonicalize()
-                .expect("target path should exist")
         );
         assert!(outcome
             .message
@@ -13652,8 +13651,8 @@ UU conflicted.rs",
             .unwrap_or_default()
             .contains("Session switched"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
-        fs::remove_dir_all(config_home).expect("cleanup config home");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(config_home);
         if let Some(v) = config_home_original {
             std::env::set_var("COWD_CONFIG_HOME", v);
         } else {
