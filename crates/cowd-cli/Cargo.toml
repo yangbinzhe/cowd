@@ -24,6 +24,7 @@ qrcode = "0.14"
 rustyline = "15"
 rusqlite = { version = "0.31", features = ["bundled"] }
 ratatui = "0.29"
+reqwest.workspace = true
 tui-textarea = "0.7"
 runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }

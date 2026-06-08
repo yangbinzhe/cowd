@@ -33,6 +33,18 @@ pub struct GatewayPanel {
     pub uptime_secs: Option<u64>,
     /// Number of active sessions.
     pub active_sessions: usize,
+    /// Runtime readiness score or status from daemon projection API.
+    pub runtime_readiness: Option<String>,
+    /// Number of runtime control-plane components.
+    pub runtime_components: Option<u64>,
+    /// Number of daemon tasks visible to the TUI.
+    pub task_count: Option<u64>,
+    /// Number of pending daemon approval requests.
+    pub pending_approvals: Option<u64>,
+    /// Current daemon session lease owner.
+    pub lease_owner: Option<String>,
+    /// Current daemon session lease mode.
+    pub lease_mode: Option<String>,
     /// Cross-plane adapter capability summaries.
     pub adapter_capabilities: Vec<GatewayAdapterCapability>,
     /// Recent cross-plane execution receipts.
@@ -107,6 +119,12 @@ impl GatewayPanel {
             health_status: None,
             uptime_secs: None,
             active_sessions: 0,
+            runtime_readiness: None,
+            runtime_components: None,
+            task_count: None,
+            pending_approvals: None,
+            lease_owner: None,
+            lease_mode: None,
             adapter_capabilities: Vec::new(),
             execution_receipts: Vec::new(),
             dispatch_targets: Vec::new(),
@@ -123,6 +141,12 @@ impl GatewayPanel {
         self.server_running = app.server_running;
         self.uptime_secs = app.server_uptime_secs;
         self.active_sessions = app.active_api_sessions;
+        self.runtime_readiness = app.daemon_runtime_readiness.clone();
+        self.runtime_components = app.daemon_runtime_components;
+        self.task_count = app.daemon_task_count;
+        self.pending_approvals = app.daemon_pending_approvals;
+        self.lease_owner = app.daemon_lease_owner.clone();
+        self.lease_mode = app.daemon_lease_mode.clone();
         if app.server_running {
             self.health_status = Some("Healthy".to_string());
         } else {
@@ -262,6 +286,47 @@ impl Component for GatewayPanel {
                     Span::styled(
                         format!("{}", self.active_sessions),
                         Style::default().fg(Color::Cyan),
+                    ),
+                ]));
+            }
+
+            if let Some(readiness) = self.runtime_readiness.as_ref() {
+                lines.push(Line::from(vec![
+                    Span::styled("Runtime: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "ready {readiness}, components {}",
+                            self.runtime_components.unwrap_or_default()
+                        ),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]));
+            }
+
+            if self.task_count.is_some() || self.pending_approvals.is_some() {
+                lines.push(Line::from(vec![
+                    Span::styled("Control: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "tasks {}, approvals {}",
+                            self.task_count.unwrap_or_default(),
+                            self.pending_approvals.unwrap_or_default()
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+            }
+
+            if let Some(owner) = self.lease_owner.as_ref() {
+                lines.push(Line::from(vec![
+                    Span::styled("Lease: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!(
+                            "{} ({})",
+                            owner,
+                            self.lease_mode.as_deref().unwrap_or("unknown")
+                        ),
+                        Style::default().fg(Color::Magenta),
                     ),
                 ]));
             }
@@ -592,6 +657,12 @@ mod tests {
         panel.update_health("Healthy - all systems operational".into());
         panel.set_uptime(3600);
         panel.set_active_sessions(2);
+        panel.runtime_readiness = Some("87%".to_string());
+        panel.runtime_components = Some(12);
+        panel.task_count = Some(3);
+        panel.pending_approvals = Some(1);
+        panel.lease_owner = Some("tui:42".to_string());
+        panel.lease_mode = Some("collaborative".to_string());
 
         let mut terminal = MockTerminal::new(60, 20);
         let skin = SkinConfig::default();
@@ -616,6 +687,18 @@ mod tests {
         assert!(
             joined.contains("Sessions"),
             "Should show sessions, got: {joined}"
+        );
+        assert!(
+            joined.contains("Runtime") && joined.contains("87%"),
+            "Should show runtime projection summary, got: {joined}"
+        );
+        assert!(
+            joined.contains("Control") && joined.contains("approvals 1"),
+            "Should show daemon control summary, got: {joined}"
+        );
+        assert!(
+            joined.contains("Lease") && joined.contains("tui:42"),
+            "Should show daemon lease summary, got: {joined}"
         );
     }
 

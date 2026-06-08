@@ -2732,6 +2732,8 @@ fn run_resume_command(
         | SlashCommand::Plan { .. }
         | SlashCommand::Review { .. }
         | SlashCommand::Tasks { .. }
+        | SlashCommand::Approvals { .. }
+        | SlashCommand::CrossPlane { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
         | SlashCommand::Usage { .. }
@@ -3144,6 +3146,146 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     state.app.current_task = cli.yolo_task.as_ref().map(current_task_summary_from_record);
     state.add_message("system", &cli.startup_banner());
     state.add_message("system", &format_connected_line(&cli.model));
+    let daemon_client = tui::control_client::DaemonControlClient::default_local();
+    let mut daemon_session_ids: Vec<String> = Vec::new();
+    let mut daemon_session_attached = false;
+    let mut daemon_lease_owner: Option<String> = None;
+    match SHARED_RT.block_on(daemon_client.status()) {
+        Ok(status) => {
+            state.app.server_running = true;
+            state.app.active_api_sessions = status.active_sessions;
+            state.app.server_uptime_secs = Some(status.uptime_secs);
+            state.add_message(
+                "system",
+                &format!(
+                    "Daemon control connected: {} active sessions, uptime {}s",
+                    status.active_sessions, status.uptime_secs
+                ),
+            );
+            match SHARED_RT.block_on(daemon_client.ensure_session(&session_id, &cli.model)) {
+                Ok(ensured) => {
+                    state.app.active_api_sessions = ensured.active_sessions;
+                    daemon_session_attached = true;
+                    let action = if ensured.created {
+                        "created"
+                    } else {
+                        "attached"
+                    };
+                    state.add_message(
+                        "system",
+                        &format!("Daemon session {action}: {}", ensured.session_id),
+                    );
+                    let lease_owner = format!("tui:{}", std::process::id());
+                    match SHARED_RT.block_on(daemon_client.acquire_session_lease(
+                        &ensured.session_id,
+                        &lease_owner,
+                        "collaborative",
+                    )) {
+                        Ok(lease) => {
+                            daemon_lease_owner = Some(lease.owner.clone());
+                            state.app.daemon_lease_owner = Some(lease.owner.clone());
+                            state.app.daemon_lease_mode = Some(lease.mode.clone());
+                            state.add_message(
+                                "system",
+                                &format!(
+                                    "Daemon session lease acquired: owner={}, mode={}",
+                                    lease.owner, lease.mode
+                                ),
+                            );
+                        }
+                        Err(err) => state.add_message(
+                            "system",
+                            &format!("Daemon session lease unavailable: {err}"),
+                        ),
+                    }
+                }
+                Err(err) => {
+                    state.add_message(
+                        "system",
+                        &format!(
+                            "Daemon session attach failed; local runtime remains active: {err}"
+                        ),
+                    );
+                }
+            }
+            if let Ok(list) = SHARED_RT.block_on(daemon_client.list_sessions()) {
+                daemon_session_ids = list.sessions;
+                state.app.active_api_sessions = daemon_session_ids.len();
+            }
+            match tui::projection_client::DaemonProjectionClient::from_running_gateway(
+                daemon_projection_auth_token(),
+            ) {
+                Ok(Some(projection)) => {
+                    match SHARED_RT.block_on(projection.runtime_control_plane()) {
+                        Ok(control_plane) => {
+                            let readiness = control_plane
+                                .pointer("/readiness/score")
+                                .or_else(|| control_plane.pointer("/diagnostics/readiness_score"))
+                                .and_then(|v| v.as_u64())
+                                .map(|score| format!("{score}%"))
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let components = control_plane
+                                .pointer("/diagnostics/component_count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or_default();
+                            state.app.daemon_runtime_readiness = Some(readiness.clone());
+                            state.app.daemon_runtime_components = Some(components);
+                            state.add_message(
+                                "system",
+                                &format!(
+                                    "Daemon runtime projection connected: readiness={readiness}, components={components}"
+                                ),
+                            );
+                        }
+                        Err(err) => state.add_message(
+                            "system",
+                            &format!("Daemon runtime projection unavailable: {err}"),
+                        ),
+                    }
+                    if let Ok(task_status) = SHARED_RT.block_on(projection.task_status()) {
+                        state.app.daemon_task_count = task_status
+                            .get("tasks")
+                            .and_then(|v| v.as_array())
+                            .map(|tasks| tasks.len() as u64);
+                    }
+                    if let Ok(pending) = SHARED_RT.block_on(projection.pending_approvals()) {
+                        state.app.daemon_pending_approvals =
+                            pending.as_array().map(|items| items.len() as u64);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => state.add_message(
+                    "system",
+                    &format!("Daemon projection client unavailable: {err}"),
+                ),
+            }
+            if daemon_session_attached {
+                let event_client = daemon_client.clone();
+                let event_session_id = session_id.clone();
+                let event_tx = tui_tx.clone();
+                let _event_bridge = SHARED_RT.spawn(async move {
+                    if let Err(err) = event_client
+                        .subscribe_session_events(&event_session_id, event_tx.clone())
+                        .await
+                    {
+                        let _ = event_tx.send(runtime::CowdEvent::TurnError {
+                            error: format!("Daemon event bridge stopped: {err}"),
+                        });
+                    }
+                });
+                state.add_message("system", "Daemon event bridge subscribed for this session");
+            }
+        }
+        Err(err) => {
+            state.app.server_running = false;
+            state.app.active_api_sessions = 0;
+            state.app.server_uptime_secs = None;
+            state.add_message(
+                "system",
+                &format!("Daemon control unavailable; using local TUI runtime fallback: {err}"),
+            );
+        }
+    }
     terminal.draw(|f| state.render(f))?;
 
     tracing::debug!("tui init: wiring memory manager");
@@ -3208,13 +3350,20 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                 .unwrap_or_default(),
             Err(_) => Vec::new(),
         };
-        let session_list: Vec<(String, String, String)> = sessions
+        let mut session_list: Vec<(String, String, String)> = sessions
             .iter()
             .map(|r| {
                 let name = format!("cli [{}]", &r.session_id[..r.session_id.len().min(8)]);
                 (r.session_id.clone(), name, r.created_at.clone())
             })
             .collect();
+        for id in daemon_session_ids {
+            if session_list.iter().any(|(existing, _, _)| existing == &id) {
+                continue;
+            }
+            let short = id[..id.len().min(8)].to_string();
+            session_list.push((id, format!("daemon [{short}]"), "live".to_string()));
+        }
         let _ = tui_tx.send(runtime::CowdEvent::SessionList {
             sessions: session_list,
         });
@@ -3298,6 +3447,22 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                                     }
                                     state.add_message("user", &text);
                                     state.is_loading = true;
+                                    if daemon_session_attached {
+                                        let event_client = daemon_client.clone();
+                                        let event_session_id = session_id.clone();
+                                        let event_tx = tui_tx.clone();
+                                        SHARED_RT.spawn(async move {
+                                            if let Err(err) = event_client
+                                                .chat_session(&event_session_id, &text)
+                                                .await
+                                            {
+                                                let _ = event_tx.send(runtime::CowdEvent::TurnError {
+                                                    error: format!("Daemon chat failed: {err}"),
+                                                });
+                                            }
+                                        });
+                                        continue;
+                                    }
 
                                     let callback: std::sync::Arc<dyn runtime::ToolCallback> =
                                         std::sync::Arc::new(tui::TuiToolCallback::new(
@@ -3386,6 +3551,13 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
         Ok::<(), Box<dyn std::error::Error>>(())
     });
 
+    if let Some(owner) = daemon_lease_owner.as_deref() {
+        if let Err(err) =
+            SHARED_RT.block_on(daemon_client.release_session_lease(&session_id, owner))
+        {
+            tracing::warn!(error = %err, session_id = %session_id, owner, "failed to release daemon session lease");
+        }
+    }
     cli.persist_session()?;
     if raw_mode_enabled {
         disable_raw_mode()?;
@@ -4207,6 +4379,311 @@ fn mcp_annotation_flag(tool: &McpTool, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonTaskSlashCommand {
+    List,
+    Start { objective: String, yolo_mode: bool },
+    Cancel { id: String },
+    Complete { id: String },
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonApprovalSlashCommand {
+    List,
+    Respond {
+        id: String,
+        approved: bool,
+        persistence: Option<String>,
+        reason: Option<String>,
+    },
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonContextSlashCommand {
+    Current,
+    Runtime,
+    Config,
+    Memory,
+    CrossPlane,
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonCrossPlaneSlashCommand {
+    Summary,
+    Preflight(String),
+    Execute(String),
+    Help,
+}
+
+fn parse_daemon_task_slash_command(args: Option<&str>) -> Result<DaemonTaskSlashCommand, String> {
+    let raw = args.unwrap_or_default().trim();
+    if raw.is_empty() || matches!(raw, "list" | "status") {
+        return Ok(DaemonTaskSlashCommand::List);
+    }
+    if matches!(raw, "-h" | "--help" | "help") {
+        return Ok(DaemonTaskSlashCommand::Help);
+    }
+
+    let mut parts = raw.split_whitespace();
+    let Some(action) = parts.next() else {
+        return Ok(DaemonTaskSlashCommand::List);
+    };
+
+    match action {
+        "start" => {
+            let mut yolo_mode = false;
+            let mut objective = Vec::new();
+            for part in parts {
+                if part == "--yolo" {
+                    yolo_mode = true;
+                } else {
+                    objective.push(part);
+                }
+            }
+            let objective = objective.join(" ").trim().to_string();
+            if objective.is_empty() {
+                return Err("usage: /tasks start [--yolo] <objective>".to_string());
+            }
+            Ok(DaemonTaskSlashCommand::Start {
+                objective,
+                yolo_mode,
+            })
+        }
+        "cancel" => {
+            let id = parts.next().unwrap_or_default().trim().to_string();
+            if id.is_empty() {
+                return Err("usage: /tasks cancel <task-id>".to_string());
+            }
+            Ok(DaemonTaskSlashCommand::Cancel { id })
+        }
+        "complete" => {
+            let id = parts.next().unwrap_or_default().trim().to_string();
+            if id.is_empty() {
+                return Err("usage: /tasks complete <task-id>".to_string());
+            }
+            Ok(DaemonTaskSlashCommand::Complete { id })
+        }
+        other => Err(format!(
+            "unknown /tasks action `{other}`; use /tasks --help"
+        )),
+    }
+}
+
+fn parse_daemon_approval_slash_command(
+    args: Option<&str>,
+) -> Result<DaemonApprovalSlashCommand, String> {
+    let raw = args.unwrap_or_default().trim();
+    if raw.is_empty() || matches!(raw, "list" | "pending" | "status") {
+        return Ok(DaemonApprovalSlashCommand::List);
+    }
+    if matches!(raw, "-h" | "--help" | "help") {
+        return Ok(DaemonApprovalSlashCommand::Help);
+    }
+
+    let mut parts = raw.split_whitespace();
+    let action = parts.next().unwrap_or_default();
+    let approved = match action {
+        "approve" | "allow" => true,
+        "reject" | "deny" => false,
+        other => {
+            return Err(format!(
+                "unknown /approvals action `{other}`; use /approvals --help"
+            ));
+        }
+    };
+    let id = parts.next().unwrap_or_default().trim().to_string();
+    if id.is_empty() {
+        return Err("usage: /approvals approve|reject <request-id>".to_string());
+    }
+
+    let mut persistence = None;
+    let mut reason = None;
+    let mut rest = parts.peekable();
+    while let Some(part) = rest.next() {
+        match part {
+            "--persist" | "--persistence" => {
+                let Some(value) = rest.next() else {
+                    return Err("usage: --persist <once|session|forever>".to_string());
+                };
+                persistence = Some(value.to_string());
+            }
+            "--reason" => {
+                let value = rest.collect::<Vec<_>>().join(" ");
+                if !value.trim().is_empty() {
+                    reason = Some(value);
+                }
+                break;
+            }
+            other => {
+                return Err(format!(
+                    "unknown /approvals option `{other}`; use /approvals --help"
+                ));
+            }
+        }
+    }
+
+    Ok(DaemonApprovalSlashCommand::Respond {
+        id,
+        approved,
+        persistence,
+        reason,
+    })
+}
+
+fn parse_daemon_context_slash_command(
+    args: Option<&str>,
+) -> Result<DaemonContextSlashCommand, String> {
+    let raw = args.unwrap_or_default().trim();
+    if raw.is_empty() || matches!(raw, "current" | "status") {
+        return Ok(DaemonContextSlashCommand::Current);
+    }
+    if matches!(raw, "-h" | "--help" | "help") {
+        return Ok(DaemonContextSlashCommand::Help);
+    }
+    match raw {
+        "runtime" | "control-plane" => Ok(DaemonContextSlashCommand::Runtime),
+        "config" | "effective-config" => Ok(DaemonContextSlashCommand::Config),
+        "memory" => Ok(DaemonContextSlashCommand::Memory),
+        "cross-plane" | "channels" => Ok(DaemonContextSlashCommand::CrossPlane),
+        other => Err(format!(
+            "unknown /context action `{other}`; use /context --help"
+        )),
+    }
+}
+
+fn parse_daemon_cross_plane_slash_command(
+    args: Option<&str>,
+) -> Result<DaemonCrossPlaneSlashCommand, String> {
+    let raw = args.unwrap_or_default().trim();
+    if raw.is_empty() || matches!(raw, "summary" | "status") {
+        return Ok(DaemonCrossPlaneSlashCommand::Summary);
+    }
+    if matches!(raw, "-h" | "--help" | "help") {
+        return Ok(DaemonCrossPlaneSlashCommand::Help);
+    }
+
+    let Some(split_at) = raw.find(char::is_whitespace) else {
+        return Err("usage: /cross-plane preflight|execute <json>".to_string());
+    };
+    let (action, payload) = raw.split_at(split_at);
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return Err("usage: /cross-plane preflight|execute <json>".to_string());
+    }
+    match action {
+        "preflight" => Ok(DaemonCrossPlaneSlashCommand::Preflight(payload.to_string())),
+        "execute" => Ok(DaemonCrossPlaneSlashCommand::Execute(payload.to_string())),
+        other => Err(format!(
+            "unknown /cross-plane action `{other}`; use /cross-plane --help"
+        )),
+    }
+}
+
+fn daemon_projection_auth_token() -> Option<String> {
+    std::env::var("COWD_API_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("COWD_AUTH_TOKEN").ok())
+}
+
+fn running_daemon_projection_client(
+) -> Result<tui::projection_client::DaemonProjectionClient, Box<dyn std::error::Error>> {
+    let Some(client) = tui::projection_client::DaemonProjectionClient::from_running_gateway(
+        daemon_projection_auth_token(),
+    )?
+    else {
+        return Err("daemon gateway is not running; start cowd daemon first".into());
+    };
+    Ok(client)
+}
+
+fn print_daemon_task_status(value: &serde_json::Value) {
+    println!("## Daemon Tasks");
+    let Some(tasks) = value.get("tasks").and_then(serde_json::Value::as_array) else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        );
+        return;
+    };
+    if tasks.is_empty() {
+        println!("No active daemon tasks.");
+        return;
+    }
+    for task in tasks {
+        let id = task
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let status = task
+            .get("status")
+            .or_else(|| task.get("phase"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let objective = task
+            .get("objective")
+            .or_else(|| task.get("title"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if objective.is_empty() {
+            println!("- {id}: {status}");
+        } else {
+            println!("- {id}: {status} - {objective}");
+        }
+    }
+}
+
+fn print_daemon_approval_status(value: &serde_json::Value) {
+    println!("## Pending Approvals");
+    let approvals = value
+        .as_array()
+        .or_else(|| value.get("approvals").and_then(serde_json::Value::as_array))
+        .or_else(|| value.get("pending").and_then(serde_json::Value::as_array));
+    let Some(approvals) = approvals else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        );
+        return;
+    };
+    if approvals.is_empty() {
+        println!("No pending approvals.");
+        return;
+    }
+    for approval in approvals {
+        let id = approval
+            .get("id")
+            .or_else(|| approval.get("request_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let capability = approval
+            .get("capability")
+            .or_else(|| approval.get("operation"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("approval");
+        let summary = approval
+            .get("summary")
+            .or_else(|| approval.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if summary.is_empty() {
+            println!("- {id}: {capability}");
+        } else {
+            println!("- {id}: {capability} - {summary}");
+        }
+    }
+}
+
+fn print_daemon_projection_response(title: &str, value: &serde_json::Value) {
+    println!("## {title}");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    );
+}
+
 struct HookAbortMonitor {
     stop_tx: Option<Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
@@ -4516,6 +4993,162 @@ impl LiveCli {
         }
     }
 
+    fn handle_daemon_tasks_command(
+        &mut self,
+        args: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let command = parse_daemon_task_slash_command(args)?;
+        if command == DaemonTaskSlashCommand::Help {
+            println!("## Daemon Tasks");
+            println!("/tasks");
+            println!("/tasks start [--yolo] <objective>");
+            println!("/tasks cancel <task-id>");
+            println!("/tasks complete <task-id>");
+            return Ok(());
+        }
+
+        let client = running_daemon_projection_client()?;
+        match command {
+            DaemonTaskSlashCommand::List => {
+                let value = SHARED_RT.block_on(client.task_status())?;
+                print_daemon_task_status(&value);
+            }
+            DaemonTaskSlashCommand::Start {
+                objective,
+                yolo_mode,
+            } => {
+                let value = SHARED_RT.block_on(client.start_task(&objective, yolo_mode))?;
+                print_daemon_projection_response("Task Started", &value);
+            }
+            DaemonTaskSlashCommand::Cancel { id } => {
+                let value = SHARED_RT.block_on(client.cancel_task(&id))?;
+                print_daemon_projection_response("Task Cancelled", &value);
+            }
+            DaemonTaskSlashCommand::Complete { id } => {
+                let value = SHARED_RT.block_on(client.complete_task(&id))?;
+                print_daemon_projection_response("Task Completed", &value);
+            }
+            DaemonTaskSlashCommand::Help => {}
+        }
+        Ok(())
+    }
+
+    fn handle_daemon_approvals_command(
+        &mut self,
+        args: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let command = parse_daemon_approval_slash_command(args)?;
+        if command == DaemonApprovalSlashCommand::Help {
+            println!("## Daemon Approvals");
+            println!("/approvals");
+            println!(
+                "/approvals approve <request-id> [--persist once|session|forever] [--reason text]"
+            );
+            println!("/approvals reject <request-id> [--reason text]");
+            return Ok(());
+        }
+
+        let client = running_daemon_projection_client()?;
+        match command {
+            DaemonApprovalSlashCommand::List => {
+                let value = SHARED_RT.block_on(client.pending_approvals())?;
+                print_daemon_approval_status(&value);
+            }
+            DaemonApprovalSlashCommand::Respond {
+                id,
+                approved,
+                persistence,
+                reason,
+            } => {
+                let value = SHARED_RT.block_on(client.respond_approval(
+                    &id,
+                    approved,
+                    persistence.as_deref(),
+                    reason.as_deref(),
+                ))?;
+                print_daemon_projection_response("Approval Responded", &value);
+            }
+            DaemonApprovalSlashCommand::Help => {}
+        }
+        Ok(())
+    }
+
+    fn handle_daemon_context_command(
+        &mut self,
+        args: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let command = parse_daemon_context_slash_command(args)?;
+        if command == DaemonContextSlashCommand::Help {
+            println!("## Daemon Context");
+            println!("/context");
+            println!("/context runtime");
+            println!("/context config");
+            println!("/context memory");
+            println!("/context cross-plane");
+            return Ok(());
+        }
+
+        let client = running_daemon_projection_client()?;
+        let (title, value) = match command {
+            DaemonContextSlashCommand::Current => (
+                "Current Context",
+                SHARED_RT.block_on(client.current_context(Some(&self.session.id)))?,
+            ),
+            DaemonContextSlashCommand::Runtime => (
+                "Runtime Control Plane",
+                SHARED_RT.block_on(client.runtime_control_plane())?,
+            ),
+            DaemonContextSlashCommand::Config => (
+                "Runtime Effective Config",
+                SHARED_RT.block_on(client.runtime_effective_config())?,
+            ),
+            DaemonContextSlashCommand::Memory => {
+                ("Memory Status", SHARED_RT.block_on(client.memory_status())?)
+            }
+            DaemonContextSlashCommand::CrossPlane => (
+                "Cross-Plane Summary",
+                SHARED_RT.block_on(client.cross_plane_summary())?,
+            ),
+            DaemonContextSlashCommand::Help => unreachable!("help returned above"),
+        };
+        print_daemon_projection_response(title, &value);
+        Ok(())
+    }
+
+    fn handle_daemon_cross_plane_command(
+        &mut self,
+        args: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let command = parse_daemon_cross_plane_slash_command(args)?;
+        if command == DaemonCrossPlaneSlashCommand::Help {
+            println!("## Cross-Plane");
+            println!("/cross-plane");
+            println!("/cross-plane preflight <json>");
+            println!("/cross-plane execute <json>");
+            return Ok(());
+        }
+
+        let client = running_daemon_projection_client()?;
+        match command {
+            DaemonCrossPlaneSlashCommand::Summary => {
+                let value = SHARED_RT.block_on(client.cross_plane_summary())?;
+                print_daemon_projection_response("Cross-Plane Summary", &value);
+            }
+            DaemonCrossPlaneSlashCommand::Preflight(payload) => {
+                let request: serde_json::Value = serde_json::from_str(&payload)?;
+                let value = SHARED_RT.block_on(client.preflight_cross_plane_action(request))?;
+                print_daemon_projection_response("Cross-Plane Preflight", &value);
+            }
+            DaemonCrossPlaneSlashCommand::Execute(payload) => {
+                let request: serde_json::Value = serde_json::from_str(&payload)?;
+                let value = SHARED_RT.block_on(client.execute_cross_plane_action(request))?;
+                print_daemon_projection_response("Cross-Plane Execute", &value);
+            }
+            DaemonCrossPlaneSlashCommand::Help => {}
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_repl_command(
         &mut self,
@@ -4529,6 +5162,7 @@ impl LiveCli {
                 );
                 println!("**Memory**: /memory /closet /sandbox");
                 println!("**Agent**: /subagent /pipeline /agents");
+                println!("**Daemon**: /tasks /approvals /context /cross-plane");
                 println!("**Project**: /state /diff /commit /init /config /title");
                 println!("**Model**: use --model or config aliases (main/fast/coder/reasoning)");
                 println!("Type /<command> --help for details.");
@@ -4643,6 +5277,22 @@ impl LiveCli {
                 self.print_prompt_history(count.as_deref());
                 false
             }
+            SlashCommand::Tasks { args } => {
+                self.handle_daemon_tasks_command(args.as_deref())?;
+                false
+            }
+            SlashCommand::Approvals { args } => {
+                self.handle_daemon_approvals_command(args.as_deref())?;
+                false
+            }
+            SlashCommand::Context { action } => {
+                self.handle_daemon_context_command(action.as_deref())?;
+                false
+            }
+            SlashCommand::CrossPlane { args } => {
+                self.handle_daemon_cross_plane_command(args.as_deref())?;
+                false
+            }
             SlashCommand::Stats => {
                 let usage = UsageTracker::from_session(&self.runtime.session()).cumulative_usage();
                 println!("{}", format_cost_report(usage));
@@ -4670,14 +5320,12 @@ impl LiveCli {
             | SlashCommand::PrivacySettings
             | SlashCommand::Plan { .. }
             | SlashCommand::Review { .. }
-            | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
             | SlashCommand::Usage { .. }
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
-            | SlashCommand::Context { .. }
             | SlashCommand::Color { .. }
             | SlashCommand::Effort { .. }
             | SlashCommand::Branch { .. }
@@ -6220,6 +6868,10 @@ fn render_repl_help() -> String {
         "  Resume latest        /resume latest".to_string(),
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
+        "  Daemon tasks         /tasks [start|cancel|complete]".to_string(),
+        "  Daemon approvals     /approvals [approve|reject]".to_string(),
+        "  Daemon context       /context [runtime|config|memory|cross-plane]".to_string(),
+        "  Cross-plane action   /cross-plane [preflight|execute] <json>".to_string(),
         String::new(),
         render_slash_command_help_filtered(STUB_COMMANDS),
     ]
@@ -10328,7 +10980,9 @@ mod tests {
         format_unknown_slash_command_message, format_user_visible_api_error,
         gateway_auth_token_from_platform, get_unified_store, handoff_resume_context_packet,
         hydrate_session_from_unified_store, import_local_session_file, jsonl_sessions_dir,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
+        merge_prompt_with_stdin, normalize_permission_mode, parse_args,
+        parse_daemon_approval_slash_command, parse_daemon_context_slash_command,
+        parse_daemon_cross_plane_slash_command, parse_daemon_task_slash_command, parse_export_args,
         parse_gateway_args, parse_git_status_branch, parse_git_status_metadata_for,
         parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
         push_output_block, render_config_report, render_diff_report, render_diff_report_for,
@@ -10340,9 +10994,10 @@ mod tests {
         suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
         sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
         workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
-        CliToolExecutor, GatewayAction, GitWorkspaceSummary, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SessionHandle, SlashCommand, StatusUsage, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, SHARED_RT, STUB_COMMANDS,
+        CliToolExecutor, DaemonApprovalSlashCommand, DaemonContextSlashCommand,
+        DaemonCrossPlaneSlashCommand, DaemonTaskSlashCommand, GatewayAction, GitWorkspaceSummary,
+        LiveCli, LocalHelpTopic, PromptHistoryEntry, SessionHandle, SlashCommand, StatusUsage,
+        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT, STUB_COMMANDS,
     };
     use crate::task_kernel::{
         TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
@@ -10398,6 +11053,108 @@ mod tests {
             gateway_auth_token_from_platform(&platform).as_deref(),
             Some("secret-token")
         );
+    }
+
+    #[test]
+    fn parse_daemon_task_slash_command_maps_core_actions() {
+        assert_eq!(
+            parse_daemon_task_slash_command(None).unwrap(),
+            DaemonTaskSlashCommand::List
+        );
+        assert_eq!(
+            parse_daemon_task_slash_command(Some("status")).unwrap(),
+            DaemonTaskSlashCommand::List
+        );
+        assert_eq!(
+            parse_daemon_task_slash_command(Some("start --yolo finish daemon parity")).unwrap(),
+            DaemonTaskSlashCommand::Start {
+                objective: "finish daemon parity".to_string(),
+                yolo_mode: true,
+            }
+        );
+        assert_eq!(
+            parse_daemon_task_slash_command(Some("cancel task-1")).unwrap(),
+            DaemonTaskSlashCommand::Cancel {
+                id: "task-1".to_string(),
+            }
+        );
+        assert!(parse_daemon_task_slash_command(Some("start --yolo")).is_err());
+        assert!(parse_daemon_task_slash_command(Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn parse_daemon_approval_slash_command_maps_core_actions() {
+        assert_eq!(
+            parse_daemon_approval_slash_command(None).unwrap(),
+            DaemonApprovalSlashCommand::List
+        );
+        assert_eq!(
+            parse_daemon_approval_slash_command(Some(
+                "approve req-1 --persist session --reason trusted channel"
+            ))
+            .unwrap(),
+            DaemonApprovalSlashCommand::Respond {
+                id: "req-1".to_string(),
+                approved: true,
+                persistence: Some("session".to_string()),
+                reason: Some("trusted channel".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_daemon_approval_slash_command(Some("reject req-2")).unwrap(),
+            DaemonApprovalSlashCommand::Respond {
+                id: "req-2".to_string(),
+                approved: false,
+                persistence: None,
+                reason: None,
+            }
+        );
+        assert!(parse_daemon_approval_slash_command(Some("approve")).is_err());
+        assert!(parse_daemon_approval_slash_command(Some("maybe req-1")).is_err());
+    }
+
+    #[test]
+    fn parse_daemon_context_slash_command_maps_core_actions() {
+        assert_eq!(
+            parse_daemon_context_slash_command(None).unwrap(),
+            DaemonContextSlashCommand::Current
+        );
+        assert_eq!(
+            parse_daemon_context_slash_command(Some("runtime")).unwrap(),
+            DaemonContextSlashCommand::Runtime
+        );
+        assert_eq!(
+            parse_daemon_context_slash_command(Some("effective-config")).unwrap(),
+            DaemonContextSlashCommand::Config
+        );
+        assert_eq!(
+            parse_daemon_context_slash_command(Some("memory")).unwrap(),
+            DaemonContextSlashCommand::Memory
+        );
+        assert_eq!(
+            parse_daemon_context_slash_command(Some("channels")).unwrap(),
+            DaemonContextSlashCommand::CrossPlane
+        );
+        assert!(parse_daemon_context_slash_command(Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn parse_daemon_cross_plane_slash_command_maps_core_actions() {
+        assert_eq!(
+            parse_daemon_cross_plane_slash_command(None).unwrap(),
+            DaemonCrossPlaneSlashCommand::Summary
+        );
+        assert_eq!(
+            parse_daemon_cross_plane_slash_command(Some("preflight {\"operation\":\"send_text\"}"))
+                .unwrap(),
+            DaemonCrossPlaneSlashCommand::Preflight("{\"operation\":\"send_text\"}".to_string())
+        );
+        assert_eq!(
+            parse_daemon_cross_plane_slash_command(Some("execute {\"id\":\"req-1\"}")).unwrap(),
+            DaemonCrossPlaneSlashCommand::Execute("{\"id\":\"req-1\"}".to_string())
+        );
+        assert!(parse_daemon_cross_plane_slash_command(Some("execute")).is_err());
+        assert!(parse_daemon_cross_plane_slash_command(Some("unknown {}")).is_err());
     }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
@@ -13293,6 +14050,10 @@ UU conflicted.rs",
         assert!(help.contains("Ctrl-R"));
         assert!(help.contains("Reverse-search prompt history"));
         assert!(help.contains("/history [count]"));
+        assert!(help.contains("/tasks [start|cancel|complete]"));
+        assert!(help.contains("/approvals [approve|reject]"));
+        assert!(help.contains("/context [runtime|config|memory|cross-plane]"));
+        assert!(help.contains("/cross-plane [preflight|execute] <json>"));
     }
 
     #[test]

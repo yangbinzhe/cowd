@@ -488,6 +488,24 @@ mod tests {
             }))
         );
         assert_eq!(
+            SlashCommand::parse("/approvals approve req-1"),
+            Ok(Some(SlashCommand::Approvals {
+                args: Some("approve req-1".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/approval reject req-2"),
+            Ok(Some(SlashCommand::Approvals {
+                args: Some("reject req-2".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/cross-plane preflight {\"operation\":\"send_text\"}"),
+            Ok(Some(SlashCommand::CrossPlane {
+                args: Some("preflight {\"operation\":\"send_text\"}".to_string())
+            }))
+        );
+        assert_eq!(
             SlashCommand::parse("/session fork incident-review"),
             Ok(Some(SlashCommand::Session {
                 action: Some("fork".to_string()),
@@ -698,7 +716,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 143);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

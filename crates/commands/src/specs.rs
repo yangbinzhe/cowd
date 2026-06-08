@@ -271,7 +271,21 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "tasks",
         aliases: &[],
         summary: "List and manage background tasks",
-        argument_hint: Some("[list|get <id>|stop <id>]"),
+        argument_hint: Some("[list|start [--yolo] <objective>|cancel <id>|complete <id>]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "approvals",
+        aliases: &["approval"],
+        summary: "List and answer daemon approval requests",
+        argument_hint: Some("[list|approve <id>|reject <id>]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "cross-plane",
+        aliases: &["xplane"],
+        summary: "Inspect and execute cross-channel daemon actions",
+        argument_hint: Some("[summary|preflight <json>|execute <json>]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1135,6 +1149,12 @@ pub enum SlashCommand {
         scope: Option<String>,
     },
     Tasks {
+        args: Option<String>,
+    },
+    Approvals {
+        args: Option<String>,
+    },
+    CrossPlane {
         args: Option<String>,
     },
     Theme {

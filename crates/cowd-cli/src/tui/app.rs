@@ -188,6 +188,18 @@ pub struct App {
     pub server_uptime_secs: Option<u64>,
     /// Number of active API sessions.
     pub active_api_sessions: usize,
+    /// Daemon runtime readiness summary from the HTTP projection API.
+    pub daemon_runtime_readiness: Option<String>,
+    /// Daemon runtime component count from the HTTP projection API.
+    pub daemon_runtime_components: Option<u64>,
+    /// Number of tasks observed through the daemon projection API.
+    pub daemon_task_count: Option<u64>,
+    /// Number of pending approvals observed through the daemon projection API.
+    pub daemon_pending_approvals: Option<u64>,
+    /// Current daemon session lease owner for the attached TUI session.
+    pub daemon_lease_owner: Option<String>,
+    /// Current daemon session lease mode for the attached TUI session.
+    pub daemon_lease_mode: Option<String>,
 
     pub scroll_offset: u16,
     pub auto_scroll: bool,
@@ -386,6 +398,12 @@ impl App {
             server_running: false,
             server_uptime_secs: None,
             active_api_sessions: 0,
+            daemon_runtime_readiness: None,
+            daemon_runtime_components: None,
+            daemon_task_count: None,
+            daemon_pending_approvals: None,
+            daemon_lease_owner: None,
+            daemon_lease_mode: None,
 
             scroll_offset: 0,
             auto_scroll: true,

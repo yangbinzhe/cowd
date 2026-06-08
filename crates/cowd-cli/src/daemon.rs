@@ -5,8 +5,9 @@
 //   - Platform adapters (feishu, wechat_ilink, email)
 // Shared state: ActiveSessions, CognitiveContextManager, GlobalToolRegistry, SessionEventBus
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -15,6 +16,7 @@ use std::{
 use axum::http::{header, HeaderValue};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
@@ -34,6 +36,95 @@ use tools::GlobalToolRegistry;
 use runtime::session_lifecycle::{
     EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionLease {
+    session_id: String,
+    owner: String,
+    mode: String,
+}
+
+#[derive(Default)]
+struct SessionLeaseRegistry {
+    leases: tokio::sync::RwLock<HashMap<String, SessionLease>>,
+}
+
+impl SessionLeaseRegistry {
+    async fn acquire(&self, session_id: &str, owner: &str, mode: &str) -> serde_json::Value {
+        if session_id.trim().is_empty() || owner.trim().is_empty() {
+            return serde_json::json!({
+                "ok": false,
+                "error": "session_id and owner are required",
+            });
+        }
+
+        let normalized_mode = match mode {
+            "exclusive" | "collaborative" | "takeover" => mode,
+            _ => "collaborative",
+        };
+
+        let mut leases = self.leases.write().await;
+        if let Some(existing) = leases.get(session_id) {
+            let same_owner = existing.owner == owner;
+            let compatible = existing.mode == "collaborative" && normalized_mode == "collaborative";
+            let takeover = normalized_mode == "takeover";
+            if !same_owner && !compatible && !takeover {
+                return serde_json::json!({
+                    "ok": false,
+                    "error": "session lease is held by another owner",
+                    "session_id": session_id,
+                    "owner": existing.owner,
+                    "mode": existing.mode,
+                });
+            }
+        }
+
+        let effective_mode = if normalized_mode == "takeover" {
+            "exclusive"
+        } else {
+            normalized_mode
+        };
+        let lease = SessionLease {
+            session_id: session_id.to_string(),
+            owner: owner.to_string(),
+            mode: effective_mode.to_string(),
+        };
+        leases.insert(session_id.to_string(), lease.clone());
+
+        serde_json::json!({
+            "ok": true,
+            "session_id": lease.session_id,
+            "owner": lease.owner,
+            "mode": lease.mode,
+        })
+    }
+
+    async fn release(&self, session_id: &str, owner: &str) -> serde_json::Value {
+        let mut leases = self.leases.write().await;
+        match leases.get(session_id) {
+            Some(existing) if existing.owner == owner => {
+                leases.remove(session_id);
+                serde_json::json!({
+                    "ok": true,
+                    "session_id": session_id,
+                    "released": true,
+                })
+            }
+            Some(existing) => serde_json::json!({
+                "ok": false,
+                "error": "session lease is held by another owner",
+                "session_id": session_id,
+                "owner": existing.owner,
+                "mode": existing.mode,
+            }),
+            None => serde_json::json!({
+                "ok": true,
+                "session_id": session_id,
+                "released": false,
+            }),
+        }
+    }
+}
 
 // ── Background session cleanup task ────────────────────────────
 
@@ -269,6 +360,7 @@ impl Drop for PidFileGuard {
 // ── Daemon entry point ─────────────────────────────────────────
 
 pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
+    let started_at = Instant::now();
     // 0. Write PID file (removed on drop via guard)
     let _pid_guard = PidFileGuard::new()?;
 
@@ -288,6 +380,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     };
 
     let event_bus = SessionEventBus::new();
+    let lease_registry = Arc::new(SessionLeaseRegistry::default());
 
     let unified_store = crate::get_unified_store().ok().map(|s| Arc::new(s.clone()));
     let session_kernel = Arc::new(SessionKernel::new(
@@ -519,6 +612,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         let sessions = sessions.clone();
         let event_bus = event_bus.clone();
         let unified_store = unified_store.clone();
+        let lease_registry = lease_registry.clone();
+        let started_at = started_at;
         tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(async move {
@@ -528,7 +623,16 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
                             let sessions = sessions.clone();
                             let event_bus = event_bus.clone();
                             let unified_store = unified_store.clone();
-                            handle_unix_client(stream, sessions, event_bus, unified_store).await;
+                            let lease_registry = lease_registry.clone();
+                            handle_unix_client(
+                                stream,
+                                sessions,
+                                event_bus,
+                                unified_store,
+                                lease_registry,
+                                started_at,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             tracing::warn!("unix socket accept error: {e}");
@@ -589,6 +693,11 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
 /// Handle a single Unix socket client connection.
 /// Reads newline-delimited JSON commands and writes JSON responses.
 /// Supported commands:
+///   {"cmd":"status"}
+///   {"cmd":"ensure_session","session_id":"...","model":"..."}
+///   {"cmd":"subscribe_session","session_id":"..."}
+///   {"cmd":"acquire_session_lease","session_id":"...","owner":"...","mode":"collaborative|exclusive|takeover"}
+///   {"cmd":"release_session_lease","session_id":"...","owner":"..."}
 ///   {"cmd":"create_session","model":"..."}
 ///   {"cmd":"chat","session_id":"...","content":"..."}
 ///   {"cmd":"list_sessions"}
@@ -597,6 +706,8 @@ async fn handle_unix_client(
     sessions: Arc<ActiveSessions>,
     event_bus: Arc<SessionEventBus>,
     unified_store: Option<Arc<UnifiedSessionStore>>,
+    lease_registry: Arc<SessionLeaseRegistry>,
+    started_at: Instant,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
@@ -616,180 +727,220 @@ async fn handle_unix_client(
                 }
 
                 let response = match serde_json::from_str::<serde_json::Value>(trimmed) {
-                    Ok(cmd) => match cmd.get("cmd").and_then(|c| c.as_str()) {
-                        Some("create_session") => {
-                            let model = cmd
-                                .get("model")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("claude-sonnet-4-6");
-                            let session_id = uuid::Uuid::new_v4().to_string();
-                            let session = runtime::Session::new();
-                            let runtime_result = if let Some(ref store) = unified_store {
-                                crate::build_runtime_with_session_store(
-                                    store.clone(),
-                                    session,
-                                    &session_id,
-                                    model.to_string(),
-                                    vec![],
-                                    true,
-                                    true,
-                                    None,
-                                    runtime::PermissionMode::WorkspaceWrite,
-                                    None,
-                                    None,
-                                )
-                            } else {
-                                crate::build_runtime(
-                                    session,
-                                    &session_id,
-                                    model.to_string(),
-                                    vec![],
-                                    true,
-                                    true,
-                                    None,
-                                    runtime::PermissionMode::WorkspaceWrite,
-                                    None,
-                                    None,
-                                )
-                            };
-                            match runtime_result {
-                                Ok(runtime) => {
-                                    if let Some(ref store) = unified_store {
-                                        let record = crate::api_routes::new_api_session_record(
-                                            &session_id,
-                                            Some(model.to_string()),
-                                        );
-                                        if let Err(e) = store.upsert_session(&record).await {
-                                            tracing::warn!(session_id = %session_id, error = %e, "failed to persist daemon session");
-                                        }
-                                    }
-                                    let _ = sessions.register(session_id.clone(), runtime);
-                                    serde_json::json!({
-                                        "ok": true,
-                                        "session_id": session_id,
-                                    })
-                                }
-                                Err(e) => {
-                                    serde_json::json!({
-                                        "ok": false,
-                                        "error": format!("failed to build runtime: {e}"),
-                                    })
-                                }
-                            }
-                        }
-                        Some("chat") => {
+                    Ok(cmd) => {
+                        if cmd.get("cmd").and_then(|c| c.as_str()) == Some("subscribe_session") {
                             let session_id = cmd
                                 .get("session_id")
                                 .and_then(|s| s.as_str())
                                 .unwrap_or_default();
-                            let content = cmd
-                                .get("content")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or_default();
+                            handle_unix_event_subscription(
+                                &mut writer,
+                                event_bus.clone(),
+                                session_id,
+                            )
+                            .await;
+                            break;
+                        }
 
-                            if session_id.is_empty() || content.is_empty() {
-                                serde_json::json!({
-                                    "ok": false,
-                                    "error": "session_id and content are required",
-                                })
-                            } else {
-                                match sessions.get(session_id) {
-                                    Some(entry) => {
-                                        let mut guard = entry.lock().await;
-                                        match guard
-                                            .run_turn_async(
-                                                content,
-                                                &runtime::permissions::SharedPrompter::none(),
-                                            )
-                                            .await
-                                        {
-                                            Ok(summary) => {
-                                                if let Some(ref store) = unified_store {
-                                                    let session_snapshot = guard.session().clone();
-                                                    if let Err(e) = crate::api_routes::sync_runtime_session_metadata_to_store(
+                        match cmd.get("cmd").and_then(|c| c.as_str()) {
+                            Some("status") => daemon_control_status(&sessions, started_at),
+                            Some("acquire_session_lease") => {
+                                let session_id = cmd
+                                    .get("session_id")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or_default();
+                                let owner = cmd
+                                    .get("owner")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or_default();
+                                let mode = cmd
+                                    .get("mode")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("collaborative");
+                                lease_registry.acquire(session_id, owner, mode).await
+                            }
+                            Some("release_session_lease") => {
+                                let session_id = cmd
+                                    .get("session_id")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or_default();
+                                let owner = cmd
+                                    .get("owner")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or_default();
+                                lease_registry.release(session_id, owner).await
+                            }
+                            Some("ensure_session") => {
+                                let session_id = cmd
+                                    .get("session_id")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or_default();
+                                let model = cmd
+                                    .get("model")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("claude-sonnet-4-6");
+                                ensure_daemon_session(
+                                    &sessions,
+                                    unified_store.as_ref(),
+                                    session_id,
+                                    model,
+                                )
+                                .await
+                            }
+                            Some("create_session") => {
+                                let model = cmd
+                                    .get("model")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("claude-sonnet-4-6");
+                                let session_id = uuid::Uuid::new_v4().to_string();
+                                ensure_daemon_session(
+                                    &sessions,
+                                    unified_store.as_ref(),
+                                    &session_id,
+                                    model,
+                                )
+                                .await
+                            }
+                            Some("chat") => {
+                                let session_id = cmd
+                                    .get("session_id")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or_default();
+                                let content = cmd
+                                    .get("content")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or_default();
+
+                                if session_id.is_empty() || content.is_empty() {
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "error": "session_id and content are required",
+                                    })
+                                } else {
+                                    match sessions.get(session_id) {
+                                        Some(entry) => {
+                                            let started_data = serde_json::json!({
+                                                "type": "TurnStarted",
+                                                "session_id": session_id,
+                                            });
+                                            event_bus
+                                                .broadcast(session_id, &started_data.to_string())
+                                                .await;
+                                            let mut guard = entry.lock().await;
+                                            match guard
+                                                .run_turn_async(
+                                                    content,
+                                                    &runtime::permissions::SharedPrompter::none(),
+                                                )
+                                                .await
+                                            {
+                                                Ok(summary) => {
+                                                    if let Some(ref store) = unified_store {
+                                                        let session_snapshot =
+                                                            guard.session().clone();
+                                                        if let Err(e) = crate::api_routes::sync_runtime_session_metadata_to_store(
                                                             store,
                                                             session_id,
                                                             &session_snapshot,
                                                         ).await {
                                                             tracing::warn!(session_id = %session_id, error = %e, "failed to sync daemon session metadata");
                                                         }
-                                                }
-                                                let final_text = summary
-                                                    .assistant_messages
-                                                    .last()
-                                                    .map(|msg| {
-                                                        msg.blocks
-                                                            .iter()
-                                                            .filter_map(|block| match block {
+                                                    }
+                                                    let final_text = summary
+                                                        .assistant_messages
+                                                        .last()
+                                                        .map(|msg| {
+                                                            msg.blocks
+                                                                .iter()
+                                                                .filter_map(|block| {
+                                                                    match block {
                                                                 runtime::ContentBlock::Text {
                                                                     text,
                                                                 } => Some(text.as_str()),
                                                                 _ => None,
-                                                            })
-                                                            .collect::<Vec<_>>()
-                                                            .join("")
+                                                            }
+                                                                })
+                                                                .collect::<Vec<_>>()
+                                                                .join("")
+                                                        })
+                                                        .unwrap_or_default();
+
+                                                    let sse_data = serde_json::json!({
+                                                        "type": "TurnComplete",
+                                                        "session_id": session_id,
+                                                        "response": final_text,
+                                                        "iterations": summary.iterations,
+                                                    });
+                                                    let thinking_done = serde_json::json!({
+                                                        "type": "ThinkingComplete",
+                                                        "session_id": session_id,
+                                                    });
+                                                    event_bus
+                                                        .broadcast(
+                                                            session_id,
+                                                            &thinking_done.to_string(),
+                                                        )
+                                                        .await;
+                                                    event_bus
+                                                        .broadcast(
+                                                            session_id,
+                                                            &sse_data.to_string(),
+                                                        )
+                                                        .await;
+
+                                                    serde_json::json!({
+                                                        "ok": true,
+                                                        "response": final_text,
+                                                        "iterations": summary.iterations,
                                                     })
-                                                    .unwrap_or_default();
-
-                                                let sse_data = serde_json::json!({
-                                                    "type": "TurnComplete",
-                                                    "session_id": session_id,
-                                                    "response": final_text,
-                                                    "iterations": summary.iterations,
-                                                });
-                                                event_bus
-                                                    .broadcast(session_id, &sse_data.to_string())
-                                                    .await;
-
-                                                serde_json::json!({
-                                                    "ok": true,
-                                                    "response": final_text,
-                                                    "iterations": summary.iterations,
-                                                })
-                                            }
-                                            Err(e) => {
-                                                let err_msg = e.to_string();
-                                                let sse_data = serde_json::json!({
-                                                    "type": "TurnError",
-                                                    "session_id": session_id,
-                                                    "error": err_msg,
-                                                });
-                                                event_bus
-                                                    .broadcast(session_id, &sse_data.to_string())
-                                                    .await;
-                                                serde_json::json!({
-                                                    "ok": false,
-                                                    "error": err_msg,
-                                                })
+                                                }
+                                                Err(e) => {
+                                                    let err_msg = e.to_string();
+                                                    let sse_data = serde_json::json!({
+                                                        "type": "TurnError",
+                                                        "session_id": session_id,
+                                                        "error": err_msg,
+                                                    });
+                                                    event_bus
+                                                        .broadcast(
+                                                            session_id,
+                                                            &sse_data.to_string(),
+                                                        )
+                                                        .await;
+                                                    serde_json::json!({
+                                                        "ok": false,
+                                                        "error": err_msg,
+                                                    })
+                                                }
                                             }
                                         }
-                                    }
-                                    None => {
-                                        serde_json::json!({
-                                            "ok": false,
-                                            "error": format!("session {session_id} not found"),
-                                        })
+                                        None => {
+                                            serde_json::json!({
+                                                "ok": false,
+                                                "error": format!("session {session_id} not found"),
+                                            })
+                                        }
                                     }
                                 }
                             }
+                            Some("list_sessions") => {
+                                let ids = sessions.list();
+                                serde_json::json!({ "ok": true, "sessions": ids })
+                            }
+                            Some(other) => {
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error": format!("unknown command: {other}"),
+                                })
+                            }
+                            None => {
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error": "missing 'cmd' field",
+                                })
+                            }
                         }
-                        Some("list_sessions") => {
-                            let ids = sessions.list();
-                            serde_json::json!({ "ok": true, "sessions": ids })
-                        }
-                        Some(other) => {
-                            serde_json::json!({
-                                "ok": false,
-                                "error": format!("unknown command: {other}"),
-                            })
-                        }
-                        None => {
-                            serde_json::json!({
-                                "ok": false,
-                                "error": "missing 'cmd' field",
-                            })
-                        }
-                    },
+                    }
                     Err(e) => {
                         serde_json::json!({
                             "ok": false,
@@ -811,6 +962,139 @@ async fn handle_unix_client(
             }
         }
     }
+}
+
+async fn handle_unix_event_subscription(
+    writer: &mut OwnedWriteHalf,
+    event_bus: Arc<SessionEventBus>,
+    session_id: &str,
+) {
+    if session_id.trim().is_empty() {
+        let response = serde_json::json!({
+            "ok": false,
+            "error": "session_id is required",
+        });
+        let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
+        bytes.push(b'\n');
+        let _ = writer.write_all(&bytes).await;
+        return;
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    event_bus.subscribe(session_id, tx.clone()).await;
+
+    let connected = serde_json::json!({
+        "ok": true,
+        "type": "Subscribed",
+        "session_id": session_id,
+    });
+    let mut bytes = serde_json::to_vec(&connected).unwrap_or_default();
+    bytes.push(b'\n');
+    if writer.write_all(&bytes).await.is_err() {
+        event_bus.unsubscribe(session_id, &tx).await;
+        return;
+    }
+
+    while let Some(event) = rx.recv().await {
+        let mut bytes = event.into_bytes();
+        bytes.push(b'\n');
+        if writer.write_all(&bytes).await.is_err() {
+            break;
+        }
+    }
+
+    event_bus.unsubscribe(session_id, &tx).await;
+}
+
+async fn ensure_daemon_session(
+    sessions: &ActiveSessions,
+    unified_store: Option<&Arc<UnifiedSessionStore>>,
+    session_id: &str,
+    model: &str,
+) -> serde_json::Value {
+    if session_id.trim().is_empty() {
+        return serde_json::json!({
+            "ok": false,
+            "error": "session_id is required",
+        });
+    }
+
+    if sessions.get(session_id).is_some() {
+        return serde_json::json!({
+            "ok": true,
+            "session_id": session_id,
+            "created": false,
+            "active_sessions": sessions.list().len(),
+        });
+    }
+
+    let session = runtime::Session::new();
+    let runtime_result = if let Some(store) = unified_store {
+        crate::build_runtime_with_session_store(
+            (*store).clone(),
+            session,
+            session_id,
+            model.to_string(),
+            vec![],
+            true,
+            true,
+            None,
+            runtime::PermissionMode::WorkspaceWrite,
+            None,
+            None,
+        )
+    } else {
+        crate::build_runtime(
+            session,
+            session_id,
+            model.to_string(),
+            vec![],
+            true,
+            true,
+            None,
+            runtime::PermissionMode::WorkspaceWrite,
+            None,
+            None,
+        )
+    };
+
+    match runtime_result {
+        Ok(runtime) => {
+            if let Some(store) = unified_store {
+                let record =
+                    crate::api_routes::new_api_session_record(session_id, Some(model.to_string()));
+                if let Err(e) = store.upsert_session(&record).await {
+                    tracing::warn!(session_id = %session_id, error = %e, "failed to persist daemon session");
+                }
+            }
+            match sessions.register(session_id.to_string(), runtime) {
+                Ok(_) => serde_json::json!({
+                    "ok": true,
+                    "session_id": session_id,
+                    "created": true,
+                    "active_sessions": sessions.list().len(),
+                }),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "error": format!("failed to register daemon session: {e}"),
+                }),
+            }
+        }
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "error": format!("failed to build runtime: {e}"),
+        }),
+    }
+}
+
+fn daemon_control_status(sessions: &ActiveSessions, started_at: Instant) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "protocol_version": 1,
+        "daemon": "cowd",
+        "active_sessions": sessions.list().len(),
+        "uptime_secs": started_at.elapsed().as_secs(),
+    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -855,6 +1139,45 @@ mod tests {
         assert!(config.memory_config.is_none());
         assert!(config.platform_configs.is_empty());
         assert!(config.auth_token.is_none());
+    }
+
+    #[test]
+    fn daemon_control_status_reports_protocol_and_sessions() {
+        let sessions = ActiveSessions::new();
+        let status = daemon_control_status(&sessions, Instant::now());
+        assert_eq!(status.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            status.get("protocol_version").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(status.get("daemon").and_then(|v| v.as_str()), Some("cowd"));
+        assert_eq!(
+            status.get("active_sessions").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert!(status.get("uptime_secs").and_then(|v| v.as_u64()).is_some());
+    }
+
+    #[tokio::test]
+    async fn session_lease_rejects_conflicting_exclusive_owner_and_allows_takeover() {
+        let registry = SessionLeaseRegistry::default();
+        let first = registry.acquire("s1", "tui:1", "exclusive").await;
+        assert_eq!(first.get("ok").and_then(|v| v.as_bool()), Some(true));
+
+        let second = registry.acquire("s1", "tui:2", "exclusive").await;
+        assert_eq!(second.get("ok").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(second.get("owner").and_then(|v| v.as_str()), Some("tui:1"));
+
+        let takeover = registry.acquire("s1", "tui:2", "takeover").await;
+        assert_eq!(takeover.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            takeover.get("owner").and_then(|v| v.as_str()),
+            Some("tui:2")
+        );
+        assert_eq!(
+            takeover.get("mode").and_then(|v| v.as_str()),
+            Some("exclusive")
+        );
     }
 
     #[test]
