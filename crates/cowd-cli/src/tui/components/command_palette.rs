@@ -406,6 +406,31 @@ impl CommandPalette {
                 ),
                 Action::Execute("/tasks".into()),
             ));
+            if let Some(task) = snapshot
+                .tasks
+                .iter()
+                .find(|task| task.status == "blocked" || task.failure_count > 0)
+            {
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Cancel Problem Task",
+                    format!("Prepare cancel for {}: {}", task.id, task.objective),
+                    Action::Execute(format!("/tasks cancel {}", task.id)),
+                ));
+            }
+            if let Some(task) = snapshot.tasks.iter().find(|task| {
+                task.review_result.as_deref() == Some("accepted")
+                    || task.status == "reviewed"
+                    || task.status == "completed"
+            }) {
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Complete Reviewed Task",
+                    format!(
+                        "Prepare completion for {} with {} artifacts",
+                        task.id, task.artifact_count
+                    ),
+                    Action::Execute(format!("/tasks complete {}", task.id)),
+                ));
+            }
         } else {
             self.all_commands.push(CommandEntry::dynamic(
                 "Start YOLO Goal",
@@ -423,6 +448,23 @@ impl CommandPalette {
                 ),
                 Action::Execute("/approvals".into()),
             ));
+            if let Some(approval) = snapshot.approval_items.first() {
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Approve First Pending Request",
+                    format!(
+                        "{} [{}] {}",
+                        approval.tool_name,
+                        approval.risk.as_deref().unwrap_or("unknown"),
+                        approval.input_preview
+                    ),
+                    Action::Execute(format!("/approvals approve {}", approval.id)),
+                ));
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Reject First Pending Request",
+                    format!("Reject {}", approval.id),
+                    Action::Execute(format!("/approvals reject {}", approval.id)),
+                ));
+            }
         }
 
         if snapshot.cross_plane_grants_active.unwrap_or_default() > 0
@@ -1027,7 +1069,38 @@ mod tests {
             runtime_readiness: Some("92%".to_string()),
             runtime_components: Some(9),
             task_count: Some(2),
+            tasks: vec![
+                crate::tui::runtime_control_store::DaemonTaskSummary {
+                    id: "task-blocked".to_string(),
+                    objective: "blocked task".to_string(),
+                    status: "blocked".to_string(),
+                    current_phase: Some("verify".to_string()),
+                    yolo_mode: false,
+                    failure_count: 1,
+                    review_result: None,
+                    artifact_count: 0,
+                    blocker_reason: Some("approval".to_string()),
+                },
+                crate::tui::runtime_control_store::DaemonTaskSummary {
+                    id: "task-reviewed".to_string(),
+                    objective: "reviewed task".to_string(),
+                    status: "reviewed".to_string(),
+                    current_phase: Some("review".to_string()),
+                    yolo_mode: true,
+                    failure_count: 0,
+                    review_result: Some("accepted".to_string()),
+                    artifact_count: 2,
+                    blocker_reason: None,
+                },
+            ],
             pending_approvals: Some(1),
+            approval_items: vec![crate::tui::runtime_control_store::DaemonApprovalSummary {
+                id: "approval-1".to_string(),
+                tool_name: "bash".to_string(),
+                risk: Some("high".to_string()),
+                requester: Some("session".to_string()),
+                input_preview: "rm -rf /tmp/example".to_string(),
+            }],
             cross_plane_grants_active: Some(3),
             cross_plane_actions_24h: Some(5),
             ..RuntimeControlSnapshot::default()
@@ -1046,6 +1119,18 @@ mod tests {
             .any(|entry| { entry.dynamic && entry.action == Action::Execute("/tasks".into()) }));
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic && entry.action == Action::Execute("/approvals".into())
+        }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic && entry.action == Action::Execute("/approvals approve approval-1".into())
+        }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic && entry.action == Action::Execute("/approvals reject approval-1".into())
+        }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic && entry.action == Action::Execute("/tasks cancel task-blocked".into())
+        }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic && entry.action == Action::Execute("/tasks complete task-reviewed".into())
         }));
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic && entry.action == Action::Execute("/cross-plane".into())
