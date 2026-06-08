@@ -18,6 +18,10 @@ Thumbs.db
 # Node.js dependencies (should be installed via npm, never committed)
 node_modules/
 
+# Playwright test artifacts
+webui/test-results/
+webui/playwright-report/
+
 # Build artifact — auto-populated by build.rs (copied from webui/)
 crates/cowd-cli/static/
 
