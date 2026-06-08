@@ -117,6 +117,17 @@ impl Component for GoalWorkbenchPanel {
                 format!("   phase: {phase}  failures: {}", task.failure_count),
                 Style::default().fg(Color::DarkGray),
             )));
+            let review = task.review_result.as_deref().unwrap_or("pending");
+            lines.push(Line::from(Span::styled(
+                format!("   review: {review}  artifacts: {}", task.artifact_count),
+                Style::default().fg(Color::DarkGray),
+            )));
+            if let Some(blocker) = task.blocker_reason.as_deref() {
+                lines.push(Line::from(Span::styled(
+                    format!("   blocker: {}", truncate(blocker, 58)),
+                    Style::default().fg(Color::Red),
+                )));
+            }
         }
 
         if self.pending_approvals.unwrap_or_default() > 0 {
@@ -219,6 +230,9 @@ mod tests {
             current_phase: Some("implementation".to_string()),
             yolo_mode: true,
             failure_count: 0,
+            review_result: Some("accepted".to_string()),
+            artifact_count: 2,
+            blocker_reason: None,
         }];
         panel.sync_from_app(&app);
 
@@ -230,6 +244,31 @@ mod tests {
             "{joined}"
         );
         assert!(joined.contains("implementation"), "{joined}");
+        assert!(joined.contains("accepted"), "{joined}");
+        assert!(joined.contains("artifacts: 2"), "{joined}");
+    }
+
+    #[test]
+    fn renders_daemon_task_blocker_reason() {
+        let mut panel = GoalWorkbenchPanel::new();
+        let mut app = App::new("model", "session");
+        app.daemon_tasks = vec![DaemonTaskSummary {
+            id: "task-blocked".to_string(),
+            objective: "finish migration".to_string(),
+            status: "blocked".to_string(),
+            current_phase: Some("verification".to_string()),
+            yolo_mode: false,
+            failure_count: 3,
+            review_result: None,
+            artifact_count: 0,
+            blocker_reason: Some("waiting for approval".to_string()),
+        }];
+        panel.sync_from_app(&app);
+
+        let lines = render_panel(&mut panel, 80, 16);
+        let joined = lines.join("\n");
+        assert!(joined.contains("blocked"), "{joined}");
+        assert!(joined.contains("waiting for approval"), "{joined}");
     }
 
     #[test]

@@ -10,6 +10,9 @@ pub struct DaemonTaskSummary {
     pub current_phase: Option<String>,
     pub yolo_mode: bool,
     pub failure_count: u64,
+    pub review_result: Option<String>,
+    pub artifact_count: u64,
+    pub blocker_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -190,6 +193,29 @@ fn task_summary_from_json(value: &serde_json::Value) -> Option<DaemonTaskSummary
         .or_else(|| value.get("failureCount"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or_default();
+    let review_result = value
+        .get("review_result")
+        .or_else(|| value.get("reviewResult"))
+        .or_else(|| value.get("review"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let artifact_count = value
+        .get("artifact_count")
+        .or_else(|| value.get("artifactCount"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            value
+                .get("artifacts")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len() as u64)
+        })
+        .unwrap_or_default();
+    let blocker_reason = value
+        .get("blocker_reason")
+        .or_else(|| value.get("blockerReason"))
+        .or_else(|| value.get("blocker"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
     Some(DaemonTaskSummary {
         id: id.to_string(),
         objective,
@@ -197,6 +223,9 @@ fn task_summary_from_json(value: &serde_json::Value) -> Option<DaemonTaskSummary
         current_phase,
         yolo_mode,
         failure_count,
+        review_result,
+        artifact_count,
+        blocker_reason,
     })
 }
 
@@ -323,7 +352,15 @@ mod tests {
             }
         }));
         snapshot.ingest_task_status(&serde_json::json!({
-            "tasks": [{"id": "t1"}, {"id": "t2"}]
+            "tasks": [
+                {
+                    "id": "t1",
+                    "review_result": "accepted",
+                    "artifacts": [{"path": "report.md"}],
+                    "blocker_reason": "none"
+                },
+                {"id": "t2"}
+            ]
         }));
         snapshot.ingest_pending_approvals(&serde_json::json!([
             {"id": "a1", "tool_name": "bash", "risk": "high", "preview": "rm -rf /tmp/x"}
@@ -343,6 +380,9 @@ mod tests {
         assert_eq!(snapshot.task_count, Some(2));
         assert_eq!(snapshot.tasks.len(), 2);
         assert_eq!(snapshot.tasks[0].id, "t1");
+        assert_eq!(snapshot.tasks[0].review_result.as_deref(), Some("accepted"));
+        assert_eq!(snapshot.tasks[0].artifact_count, 1);
+        assert_eq!(snapshot.tasks[0].blocker_reason.as_deref(), Some("none"));
         assert_eq!(snapshot.pending_approvals, Some(1));
         assert_eq!(snapshot.approval_items.len(), 1);
         assert_eq!(snapshot.approval_items[0].tool_name, "bash");
