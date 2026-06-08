@@ -3539,6 +3539,7 @@ providers:
             ));
 
         let mcp_servers = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/connectors/mcp/servers")
@@ -3562,6 +3563,33 @@ providers:
                     .unwrap()
                     .iter()
                     .any(|item| item == "command")
+        }));
+        assert!(!json.to_string().contains("secret-token"));
+
+        let mcp_probe = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/mcp/servers?probe=true&timeout_ms=75")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp_probe.status(), StatusCode::OK);
+        let body = to_bytes(mcp_probe.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["probe"]["requested"], true);
+        assert_eq!(json["probe"]["timeout_ms"], 75);
+        assert!(json["servers"].as_array().unwrap().iter().any(|server| {
+            server["name"] == "github.com"
+                && server["probe"]["requested"] == true
+                && server["probe"]["mode"] == "config_only"
+                && server["probe"]["status"] == "declared"
+        }));
+        assert!(json["servers"].as_array().unwrap().iter().any(|server| {
+            server["name"] == "broken"
+                && server["probe"]["requested"] == true
+                && server["probe"]["status"] == "degraded"
         }));
         assert!(!json.to_string().contains("secret-token"));
     }
