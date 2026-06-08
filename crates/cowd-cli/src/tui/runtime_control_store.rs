@@ -116,6 +116,7 @@ impl RuntimeControlSnapshot {
             approval_items: app.daemon_approval_items.clone(),
             lease_owner: app.daemon_lease_owner.clone(),
             lease_mode: app.daemon_lease_mode.clone(),
+            memory_status: app.memory_status.clone(),
             cross_plane_grants_active: app.daemon_cross_plane_grants_active,
             cross_plane_actions_24h: app.daemon_cross_plane_actions_24h,
             connector_accounts: app.daemon_connector_accounts.clone(),
@@ -142,6 +143,7 @@ impl RuntimeControlSnapshot {
         app.daemon_tasks = self.tasks.clone();
         app.daemon_pending_approvals = self.pending_approvals;
         app.daemon_approval_items = self.approval_items.clone();
+        app.memory_status = self.memory_status.clone();
         app.daemon_cross_plane_grants_active = self.cross_plane_grants_active;
         app.daemon_cross_plane_actions_24h = self.cross_plane_actions_24h;
         app.daemon_connector_accounts = self.connector_accounts.clone();
@@ -737,5 +739,20 @@ mod tests {
             .degraded_reasons
             .iter()
             .any(|reason| reason.contains("task")));
+    }
+
+    #[test]
+    fn snapshot_round_trips_memory_status_through_app() {
+        let mut app = App::new("claude-sonnet-4-6", "session-memory-status");
+        let mut snapshot = RuntimeControlSnapshot::from_status(&status());
+        snapshot.ingest_memory_status(&serde_json::json!({
+            "status": "available"
+        }));
+
+        snapshot.apply_to_app(&mut app);
+        assert_eq!(app.memory_status.as_deref(), Some("available"));
+
+        let restored = RuntimeControlSnapshot::from_app(&app);
+        assert_eq!(restored.memory_status.as_deref(), Some("available"));
     }
 }

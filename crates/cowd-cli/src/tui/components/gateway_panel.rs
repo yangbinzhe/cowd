@@ -50,6 +50,8 @@ pub struct GatewayPanel {
     pub lease_owner: Option<String>,
     /// Current daemon session lease mode.
     pub lease_mode: Option<String>,
+    /// Memory/kernel status visible through runtime control.
+    pub memory_status: Option<String>,
     /// Cross-plane adapter capability summaries.
     pub adapter_capabilities: Vec<GatewayAdapterCapability>,
     /// Recent cross-plane execution receipts.
@@ -64,6 +66,8 @@ pub struct GatewayPanel {
     pub connector_resources: Vec<ConnectorResourceSummary>,
     /// Connector-specific degraded reasons.
     pub connector_degraded_reasons: Vec<String>,
+    /// Global runtime/control degradation reasons.
+    pub degraded_reasons: Vec<String>,
     /// Scroll offset for content overflow.
     pub scroll_offset: u16,
 }
@@ -138,6 +142,7 @@ impl GatewayPanel {
             pending_approvals: None,
             lease_owner: None,
             lease_mode: None,
+            memory_status: None,
             adapter_capabilities: Vec::new(),
             execution_receipts: Vec::new(),
             dispatch_targets: Vec::new(),
@@ -145,6 +150,7 @@ impl GatewayPanel {
             connector_capabilities: Vec::new(),
             connector_resources: Vec::new(),
             connector_degraded_reasons: Vec::new(),
+            degraded_reasons: Vec::new(),
             scroll_offset: 0,
         }
     }
@@ -164,10 +170,12 @@ impl GatewayPanel {
         self.pending_approvals = app.daemon_pending_approvals;
         self.lease_owner = app.daemon_lease_owner.clone();
         self.lease_mode = app.daemon_lease_mode.clone();
+        self.memory_status = app.memory_status.clone();
         self.connector_accounts = app.daemon_connector_accounts.clone();
         self.connector_capabilities = app.daemon_connector_capabilities.clone();
         self.connector_resources = app.daemon_connector_resources.clone();
         self.connector_degraded_reasons = app.daemon_connector_degraded_reasons.clone();
+        self.degraded_reasons = app.daemon_degraded_reasons.clone();
         if app.server_running {
             self.health_status = Some("Healthy".to_string());
         } else {
@@ -188,6 +196,7 @@ impl GatewayPanel {
             self.health_status = None;
             self.uptime_secs = None;
             self.active_sessions = 0;
+            self.memory_status = None;
         }
     }
 
@@ -280,6 +289,10 @@ impl Component for GatewayPanel {
         let mut lines: Vec<Line> = Vec::new();
 
         // ── Status indicator ───────────────────────────────────
+        lines.push(Line::from(Span::styled(
+            "─ Core Runtime ─",
+            Style::default().fg(Color::Cyan),
+        )));
         let status = if self.server_running {
             Span::styled("● RUNNING", Style::default().fg(Color::Green))
         } else {
@@ -336,6 +349,11 @@ impl Component for GatewayPanel {
             ]));
 
             if let Some(readiness) = self.runtime_readiness.as_ref() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "─ AI Context ─",
+                    Style::default().fg(Color::Cyan),
+                )));
                 lines.push(Line::from(vec![
                     Span::styled("Runtime: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
@@ -348,7 +366,19 @@ impl Component for GatewayPanel {
                 ]));
             }
 
+            if let Some(memory_status) = self.memory_status.as_ref() {
+                lines.push(Line::from(vec![
+                    Span::styled("Memory: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(memory_status.clone(), Style::default().fg(Color::Green)),
+                ]));
+            }
+
             if self.task_count.is_some() || self.pending_approvals.is_some() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "─ Work Control ─",
+                    Style::default().fg(Color::Cyan),
+                )));
                 lines.push(Line::from(vec![
                     Span::styled("Control: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
@@ -372,6 +402,22 @@ impl Component for GatewayPanel {
                             self.lease_mode.as_deref().unwrap_or("unknown")
                         ),
                         Style::default().fg(Color::Magenta),
+                    ),
+                ]));
+            }
+
+            if !self.degraded_reasons.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("Degraded: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        self.degraded_reasons
+                            .iter()
+                            .take(2)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                        Style::default().fg(Color::DarkGray),
                     ),
                 ]));
             }
@@ -481,7 +527,7 @@ impl Component for GatewayPanel {
         {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "─ Connector Console ─",
+                "─ Connector Plane ─",
                 Style::default().fg(Color::Cyan),
             )));
             lines.push(Line::from(vec![
@@ -1057,6 +1103,13 @@ mod tests {
         use crate::tui::test_utils::MockTerminal;
 
         let mut panel = GatewayPanel::new();
+        panel.server_running = true;
+        panel.health_status = Some("Healthy".to_string());
+        panel.runtime_readiness = Some("91%".to_string());
+        panel.task_count = Some(2);
+        panel.pending_approvals = Some(1);
+        panel.memory_status = Some("available".to_string());
+        panel.degraded_reasons = vec!["context socket degraded".to_string()];
         panel.set_connector_accounts(vec![
             ConnectorAccountSummary {
                 provider: "feishu".to_string(),
@@ -1110,7 +1163,22 @@ mod tests {
         });
         let joined = terminal.buffer_lines().join("\n");
         assert!(
-            joined.contains("Connector Console"),
+            joined.contains("Core Runtime")
+                && joined.contains("AI Context")
+                && joined.contains("Work Control")
+                && joined.contains("Connector Plane"),
+            "Should show organized runtime command center sections, got: {joined}"
+        );
+        assert!(
+            joined.contains("Memory") && joined.contains("available"),
+            "Should show memory status in AI Context, got: {joined}"
+        );
+        assert!(
+            joined.contains("Degraded") && joined.contains("context socket degraded"),
+            "Should show global degradation reasons, got: {joined}"
+        );
+        assert!(
+            joined.contains("Connector Plane"),
             "Should show connector section, got: {joined}"
         );
         assert!(
