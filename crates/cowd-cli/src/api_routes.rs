@@ -3885,6 +3885,27 @@ providers:
         assert_eq!(json["kind"], "connector_resource_memory_promotion");
         assert_eq!(json["ok"], true);
         assert_eq!(json["layer"], "L3");
+        let first_memory_id = json["memory_id"].clone();
+
+        let replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/resources/promote-memory")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(promote.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let body = to_bytes(replay.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_resource_memory_promotion");
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["replayed"], true);
+        assert_eq!(json["memory_id"], first_memory_id);
 
         let entries = app
             .oneshot(
@@ -3908,6 +3929,18 @@ providers:
         assert!(content.contains("service://mock.docs/document/memory-doc"));
         assert!(content.contains("body_policy: metadata_only"));
         assert!(!content.contains("external document body"));
+        let duplicate_count = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("ref: service://mock.docs/document/memory-doc")
+            })
+            .count();
+        assert_eq!(duplicate_count, 1);
         std::fs::remove_dir_all(tmp).ok();
     }
 

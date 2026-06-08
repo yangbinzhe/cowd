@@ -11,7 +11,7 @@ use axum::{
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
-use memory::{MemoryKernel, MemoryScope, MemoryTurnContext};
+use memory::{CognitiveContextManager, MemoryKernel, MemoryScope, MemoryTurnContext};
 use runtime::{
     CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadRejection, ConnectorHealth,
     ConnectorRegistrySnapshot, CrossPlaneAction, CrossPlaneExecutionReceipt, ExternalResourceRef,
@@ -515,8 +515,31 @@ async fn connector_resource_promote_memory_handler(
                 }));
             }
         };
-    let id = MemoryId::new_v4();
     let content = connector_resource_memory_content(&resource);
+    match find_existing_connector_resource_memory(memory_manager, reference).await {
+        Ok(Some(existing_id)) => {
+            return Json(serde_json::json!({
+                "kind": "connector_resource_memory_promotion",
+                "ok": true,
+                "replayed": true,
+                "memory_id": existing_id,
+                "layer": "L3",
+                "reference": reference,
+                "reason": "resource memory already exists",
+            }));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Json(serde_json::json!({
+                "kind": "connector_resource_memory_promotion",
+                "ok": false,
+                "reference": reference,
+                "reason": format!("memory dedup failed: {error}"),
+            }));
+        }
+    }
+
+    let id = MemoryId::new_v4();
     let entry = MemoryEntry {
         id,
         layer: MemoryLayer::L3,
@@ -567,6 +590,26 @@ async fn connector_resource_promote_memory_handler(
             "reason": error.to_string(),
         })),
     }
+}
+
+async fn find_existing_connector_resource_memory(
+    memory_manager: &Arc<CognitiveContextManager>,
+    reference: &str,
+) -> Result<Option<MemoryId>, String> {
+    let ref_line = format!("ref: {reference}");
+    let entries = memory_manager
+        .list_all_entries()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(entries
+        .into_iter()
+        .find(|entry| {
+            entry.layer == MemoryLayer::L3
+                && entry.tags.iter().any(|tag| tag == "connector_resource")
+                && entry.source_agent.as_deref() == Some("connector-resource-bridge")
+                && entry.content.lines().any(|line| line.trim() == ref_line)
+        })
+        .map(|entry| entry.id))
 }
 
 async fn mock_docs_tools_handler() -> impl IntoResponse {
