@@ -187,6 +187,29 @@ impl DaemonProjectionClient {
         self.get_json(&path).await
     }
 
+    pub async fn connector_service_tools(
+        &self,
+        service: &str,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json(&format!(
+            "/api/connectors/services/{}/tools",
+            url_encode(service)
+        ))
+        .await
+    }
+
+    pub async fn execute_connector_service(
+        &self,
+        service: &str,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            &format!("/api/connectors/services/{}/execute", url_encode(service)),
+            request,
+        )
+        .await
+    }
+
     pub async fn preflight_cross_plane_action(
         &self,
         action: serde_json::Value,
@@ -499,6 +522,61 @@ mod tests {
             .await
             .expect("json");
         assert!(json["resources"].as_array().unwrap().is_empty());
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn connector_service_tools_and_execute_use_management_routes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept tools");
+            let mut buf = vec![0; 4096];
+            let n = socket.read(&mut buf).await.expect("read tools");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("GET /api/connectors/services/mock.docs/tools HTTP/1.1"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 12\r\n\r\n{\"tools\":[]}",
+                )
+                .await
+                .expect("write tools");
+
+            let (mut socket, _) = listener.accept().await.expect("accept execute");
+            let mut buf = vec![0; 4096];
+            let n = socket.read(&mut buf).await.expect("read execute");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("POST /api/connectors/services/mock.docs/execute HTTP/1.1"));
+            assert!(req.contains("\"tool_id\":\"service.mock.docs.read\""));
+            assert!(req.contains("\"mode\":\"dry_run\""));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}",
+                )
+                .await
+                .expect("write execute");
+        });
+
+        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let tools = client
+            .connector_service_tools("mock.docs")
+            .await
+            .expect("tools");
+        assert!(tools["tools"].as_array().unwrap().is_empty());
+        let result = client
+            .execute_connector_service(
+                "mock.docs",
+                serde_json::json!({
+                    "actor_principal": "tui:operator",
+                    "tool_id": "service.mock.docs.read",
+                    "resource_id": "tui-doc",
+                    "title": "TUI Doc",
+                    "mode": "dry_run",
+                }),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(result["ok"], true);
         server.await.expect("server task");
     }
 }
