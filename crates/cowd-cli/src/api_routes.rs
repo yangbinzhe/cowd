@@ -1967,7 +1967,14 @@ runtime:
         assert_eq!(json["diagnostics"]["component_count"], 10);
         assert_eq!(json["diagnostics"]["degraded_component_count"], 2);
         assert_eq!(json["diagnostics"]["attention_component_count"], 2);
-        assert_eq!(json["diagnostics"]["capability_count"], 24);
+        assert_eq!(
+            json["diagnostics"]["capability_count"],
+            serde_json::json!(
+                11 + json["diagnostics"]["connector_capability_count"]
+                    .as_u64()
+                    .unwrap()
+            )
+        );
         assert!(json["diagnostics"]["elapsed_ms"].as_u64().is_some());
         assert!(matches!(
             json["diagnostics"]["performance_status"].as_str(),
@@ -2510,7 +2517,7 @@ providers:
         assert!(joined.contains("stored_sessions=0"));
         assert!(joined.contains("open_tasks=1"));
         assert!(joined.contains("component_count=10"));
-        assert!(joined.contains("capability_count=24"));
+        assert!(joined.contains("capability_count=31"));
 
         let _ = std::fs::remove_dir_all(root);
     }

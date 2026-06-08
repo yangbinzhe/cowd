@@ -1005,7 +1005,7 @@ impl ServiceConnector for MockDocsServiceConnector {
     fn capabilities(&self) -> Vec<CapabilityManifest> {
         ["read", "export", "summarize_ref"]
             .into_iter()
-            .map(|operation| CapabilityManifest::service("mock.docs", operation))
+            .map(|operation| CapabilityManifest::service_readonly("mock.docs", operation))
             .collect()
     }
 
@@ -1269,6 +1269,8 @@ mod tests {
             .any(
                 |capability| capability.capability_id == "service.mock.docs.read"
                     && capability.plane == ConnectorPlane::Service
+                    && capability.supports_commit
+                    && !capability.requires_approval
             ));
 
         let result = connector.execute_tool(ServiceToolRequest {
