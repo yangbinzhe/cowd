@@ -13,6 +13,15 @@ pub struct DaemonTaskSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonApprovalSummary {
+    pub id: String,
+    pub tool_name: String,
+    pub risk: Option<String>,
+    pub requester: Option<String>,
+    pub input_preview: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeControlSnapshot {
     pub daemon_running: bool,
     pub active_sessions: usize,
@@ -23,6 +32,7 @@ pub struct RuntimeControlSnapshot {
     pub task_count: Option<u64>,
     pub tasks: Vec<DaemonTaskSummary>,
     pub pending_approvals: Option<u64>,
+    pub approval_items: Vec<DaemonApprovalSummary>,
     pub lease_owner: Option<String>,
     pub lease_mode: Option<String>,
     pub memory_status: Option<String>,
@@ -51,6 +61,7 @@ impl RuntimeControlSnapshot {
             task_count: app.daemon_task_count,
             tasks: app.daemon_tasks.clone(),
             pending_approvals: app.daemon_pending_approvals,
+            approval_items: app.daemon_approval_items.clone(),
             lease_owner: app.daemon_lease_owner.clone(),
             lease_mode: app.daemon_lease_mode.clone(),
             cross_plane_grants_active: app.daemon_cross_plane_grants_active,
@@ -74,6 +85,7 @@ impl RuntimeControlSnapshot {
         app.daemon_task_count = self.task_count;
         app.daemon_tasks = self.tasks.clone();
         app.daemon_pending_approvals = self.pending_approvals;
+        app.daemon_approval_items = self.approval_items.clone();
         app.daemon_cross_plane_grants_active = self.cross_plane_grants_active;
         app.daemon_cross_plane_actions_24h = self.cross_plane_actions_24h;
         app.daemon_degraded_reasons = self.degraded_reasons.clone();
@@ -113,11 +125,18 @@ impl RuntimeControlSnapshot {
     }
 
     pub fn ingest_pending_approvals(&mut self, value: &serde_json::Value) {
-        self.pending_approvals = value
+        self.approval_items = value
             .as_array()
             .or_else(|| value.get("approvals").and_then(serde_json::Value::as_array))
             .or_else(|| value.get("pending").and_then(serde_json::Value::as_array))
-            .map(|items| items.len() as u64);
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(approval_summary_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.pending_approvals = Some(self.approval_items.len() as u64);
     }
 
     pub fn ingest_memory_status(&mut self, value: &serde_json::Value) {
@@ -178,6 +197,50 @@ fn task_summary_from_json(value: &serde_json::Value) -> Option<DaemonTaskSummary
         current_phase,
         yolo_mode,
         failure_count,
+    })
+}
+
+fn approval_summary_from_json(value: &serde_json::Value) -> Option<DaemonApprovalSummary> {
+    let id = value
+        .get("id")
+        .or_else(|| value.get("approval_id"))
+        .or_else(|| value.get("approvalId"))
+        .and_then(serde_json::Value::as_str)?;
+    let tool_name = value
+        .get("tool_name")
+        .or_else(|| value.get("toolName"))
+        .or_else(|| value.get("tool"))
+        .or_else(|| value.get("capability"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let risk = value
+        .get("risk")
+        .or_else(|| value.get("risk_level"))
+        .or_else(|| value.get("riskLevel"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let requester = value
+        .get("requester")
+        .or_else(|| value.get("session_id"))
+        .or_else(|| value.get("sessionId"))
+        .or_else(|| value.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let input_preview = value
+        .get("input_preview")
+        .or_else(|| value.get("inputPreview"))
+        .or_else(|| value.get("preview"))
+        .or_else(|| value.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some(DaemonApprovalSummary {
+        id: id.to_string(),
+        tool_name,
+        risk,
+        requester,
+        input_preview,
     })
 }
 
@@ -263,7 +326,7 @@ mod tests {
             "tasks": [{"id": "t1"}, {"id": "t2"}]
         }));
         snapshot.ingest_pending_approvals(&serde_json::json!([
-            {"id": "a1"}
+            {"id": "a1", "tool_name": "bash", "risk": "high", "preview": "rm -rf /tmp/x"}
         ]));
         snapshot.ingest_memory_status(&serde_json::json!({
             "status": "available"
@@ -281,6 +344,8 @@ mod tests {
         assert_eq!(snapshot.tasks.len(), 2);
         assert_eq!(snapshot.tasks[0].id, "t1");
         assert_eq!(snapshot.pending_approvals, Some(1));
+        assert_eq!(snapshot.approval_items.len(), 1);
+        assert_eq!(snapshot.approval_items[0].tool_name, "bash");
         assert_eq!(snapshot.memory_status.as_deref(), Some("available"));
         assert_eq!(snapshot.cross_plane_grants_active, Some(4));
         assert_eq!(snapshot.cross_plane_actions_24h, Some(7));

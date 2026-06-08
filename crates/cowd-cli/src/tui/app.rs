@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use crate::tui::layout::{build_default_layout, LayoutState, LayoutTree};
-use crate::tui::runtime_control_store::DaemonTaskSummary;
+use crate::tui::runtime_control_store::{DaemonApprovalSummary, DaemonTaskSummary};
 use ratatui::widgets::{Block, Borders};
 use runtime::CowdEvent;
 use std::collections::VecDeque;
@@ -199,6 +199,8 @@ pub struct App {
     pub daemon_tasks: Vec<DaemonTaskSummary>,
     /// Number of pending approvals observed through the daemon projection API.
     pub daemon_pending_approvals: Option<u64>,
+    /// Pending daemon approval summaries observed through the daemon projection API.
+    pub daemon_approval_items: Vec<DaemonApprovalSummary>,
     /// Number of active cross-plane grants observed through the daemon projection API.
     pub daemon_cross_plane_grants_active: Option<u64>,
     /// Number of cross-plane interop actions observed over the last 24h.
@@ -412,6 +414,7 @@ impl App {
             daemon_task_count: None,
             daemon_tasks: Vec::new(),
             daemon_pending_approvals: None,
+            daemon_approval_items: Vec::new(),
             daemon_cross_plane_grants_active: None,
             daemon_cross_plane_actions_24h: None,
             daemon_degraded_reasons: Vec::new(),

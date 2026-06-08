@@ -7,10 +7,12 @@ use ratatui::{
 
 use crate::tui::app::{App, ApprovalRequest};
 use crate::tui::components::{Component, EventResult, RenderContext};
+use crate::tui::runtime_control_store::DaemonApprovalSummary;
 
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalCockpitPanel {
     local_approval: Option<ApprovalRequest>,
+    approval_items: Vec<DaemonApprovalSummary>,
     permission_count: usize,
     pending_approvals: Option<u64>,
     cross_plane_grants_active: Option<u64>,
@@ -29,6 +31,7 @@ impl ApprovalCockpitPanel {
 
     pub fn sync_from_app(&mut self, app: &App) {
         self.local_approval = app.approval.clone();
+        self.approval_items = app.daemon_approval_items.clone();
         self.permission_count = app.permission_count;
         self.pending_approvals = app.daemon_pending_approvals;
         self.cross_plane_grants_active = app.daemon_cross_plane_grants_active;
@@ -39,7 +42,7 @@ impl ApprovalCockpitPanel {
         self.daemon_running = app.server_running;
     }
 
-    fn render_lines(&self) -> Text<'static> {
+    fn render_lines(&self) -> Text<'_> {
         let pending = self.pending_approvals.unwrap_or_default();
         let grants = self.cross_plane_grants_active.unwrap_or_default();
         let actions = self.cross_plane_actions_24h.unwrap_or_default();
@@ -87,6 +90,31 @@ impl ApprovalCockpitPanel {
                 "Input: {}",
                 truncate(&req.input_preview, 58)
             )));
+        }
+        if !self.approval_items.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Daemon queue",
+                Style::default().fg(Color::Cyan),
+            )));
+            for item in self.approval_items.iter().take(3) {
+                let risk = item.risk.as_deref().unwrap_or("unknown");
+                let requester = item.requester.as_deref().unwrap_or("unknown");
+                lines.push(Line::from(vec![
+                    Span::styled(short_id(&item.id), Style::default().fg(Color::Cyan)),
+                    Span::raw(" "),
+                    Span::styled(item.tool_name.clone(), Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!(" [{risk}] {requester}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                if !item.input_preview.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", truncate(&item.input_preview, 64)),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
         }
 
         lines.extend([
@@ -174,6 +202,10 @@ fn truncate(value: &str, max_chars: usize) -> String {
     out
 }
 
+fn short_id(id: &str) -> &str {
+    id.get(..id.len().min(10)).unwrap_or(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +229,13 @@ mod tests {
         app.server_running = true;
         app.permission_count = 2;
         app.daemon_pending_approvals = Some(1);
+        app.daemon_approval_items = vec![DaemonApprovalSummary {
+            id: "approval-123456789".to_string(),
+            tool_name: "bash".to_string(),
+            risk: Some("high".to_string()),
+            requester: Some("session".to_string()),
+            input_preview: "rm -rf /tmp/example".to_string(),
+        }];
         app.daemon_cross_plane_grants_active = Some(3);
         app.daemon_cross_plane_actions_24h = Some(9);
         app.daemon_lease_owner = Some("tui:session".to_string());
@@ -218,6 +257,8 @@ mod tests {
         );
         assert!(rendered.contains("Active grants: 3"), "{rendered}");
         assert!(rendered.contains("bash"), "{rendered}");
+        assert!(rendered.contains("approval-1"), "{rendered}");
+        assert!(rendered.contains("high"), "{rendered}");
     }
 
     #[test]
