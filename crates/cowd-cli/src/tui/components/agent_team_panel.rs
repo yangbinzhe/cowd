@@ -629,6 +629,16 @@ mod tests {
     use crate::tui::skin::SkinConfig;
     use crate::tui::test_utils::MockTerminal;
     use crossterm::event::KeyEvent;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static AGENT_DIRECTORY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn agent_directory_test_guard() -> MutexGuard<'static, ()> {
+        AGENT_DIRECTORY_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("agent directory test lock poisoned")
+    }
 
     fn dummy_agent(id: &str, role: &str, status: AgentStatus, caps: Vec<&str>) -> AgentInfo {
         AgentInfo {
@@ -672,6 +682,7 @@ mod tests {
 
     #[test]
     fn sync_populates_agents() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent(
@@ -691,6 +702,7 @@ mod tests {
 
     #[test]
     fn selected_agent_returns_correct_entry() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent(
@@ -792,6 +804,7 @@ mod tests {
 
     #[test]
     fn render_with_agents() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent(
@@ -825,6 +838,7 @@ mod tests {
 
     #[test]
     fn keyboard_navigation_jk() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent("a", "Planner", AgentStatus::Active, vec![]));
@@ -883,6 +897,7 @@ mod tests {
 
     #[test]
     fn keyboard_gg_jumps() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent("a", "P", AgentStatus::Active, vec![]));
@@ -914,6 +929,7 @@ mod tests {
 
     #[test]
     fn enter_toggles_detail() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent(
@@ -944,6 +960,7 @@ mod tests {
 
     #[test]
     fn esc_collapses_detail_then_hides() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent("esc", "Executor", AgentStatus::Active, vec![]));
@@ -1004,6 +1021,7 @@ mod tests {
 
     #[test]
     fn sync_from_app_delegates_to_sync() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent(
@@ -1026,6 +1044,7 @@ mod tests {
 
     #[test]
     fn sync_from_app_renders_workgraph_and_delegate_tasks() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent(
@@ -1073,6 +1092,7 @@ mod tests {
 
     #[test]
     fn sync_resets_detail_when_roster_changes() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent("x", "E", AgentStatus::Active, vec![]));
@@ -1104,6 +1124,7 @@ mod tests {
 
     #[test]
     fn selection_clamped_after_roster_shrinks() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         dir.register(dummy_agent("a", "P", AgentStatus::Active, vec![]));
@@ -1124,6 +1145,7 @@ mod tests {
 
     #[test]
     fn scroll_offset_tracks_selection_on_j() {
+        let _guard = agent_directory_test_guard();
         let dir = AgentDirectory::global();
         dir.clear_all();
         for i in 0..15 {
