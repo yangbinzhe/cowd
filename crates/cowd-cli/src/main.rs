@@ -3150,6 +3150,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     let mut daemon_session_ids: Vec<String> = Vec::new();
     let mut daemon_session_attached = false;
     let mut daemon_lease_owner: Option<String> = None;
+    let mut daemon_session_lease: Option<tui::control_client::DaemonSessionLease> = None;
     match SHARED_RT.block_on(daemon_client.status()) {
         Ok(status) => {
             state.app.server_running = true;
@@ -3183,6 +3184,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                     )) {
                         Ok(lease) => {
                             daemon_lease_owner = Some(lease.owner.clone());
+                            daemon_session_lease = Some(lease.clone());
                             state.app.daemon_lease_owner = Some(lease.owner.clone());
                             state.app.daemon_lease_mode = Some(lease.mode.clone());
                             state.add_message(
@@ -3208,56 +3210,44 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                     );
                 }
             }
-            if let Ok(list) = SHARED_RT.block_on(daemon_client.list_sessions()) {
-                daemon_session_ids = list.sessions;
-                state.app.active_api_sessions = daemon_session_ids.len();
-            }
-            match tui::projection_client::DaemonProjectionClient::from_running_gateway(
-                daemon_projection_auth_token(),
-            ) {
-                Ok(Some(projection)) => {
-                    match SHARED_RT.block_on(projection.runtime_control_plane()) {
-                        Ok(control_plane) => {
-                            let readiness = control_plane
-                                .pointer("/readiness/score")
-                                .or_else(|| control_plane.pointer("/diagnostics/readiness_score"))
-                                .and_then(|v| v.as_u64())
-                                .map(|score| format!("{score}%"))
-                                .unwrap_or_else(|| "unknown".to_string());
-                            let components = control_plane
-                                .pointer("/diagnostics/component_count")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or_default();
-                            state.app.daemon_runtime_readiness = Some(readiness.clone());
-                            state.app.daemon_runtime_components = Some(components);
-                            state.add_message(
-                                "system",
-                                &format!(
-                                    "Daemon runtime projection connected: readiness={readiness}, components={components}"
-                                ),
-                            );
-                        }
-                        Err(err) => state.add_message(
+            let projection =
+                match tui::projection_client::DaemonProjectionClient::from_running_gateway(
+                    daemon_projection_auth_token(),
+                ) {
+                    Ok(client) => client,
+                    Err(err) => {
+                        state.add_message(
                             "system",
-                            &format!("Daemon runtime projection unavailable: {err}"),
-                        ),
+                            &format!("Daemon projection client unavailable: {err}"),
+                        );
+                        None
                     }
-                    if let Ok(task_status) = SHARED_RT.block_on(projection.task_status()) {
-                        state.app.daemon_task_count = task_status
-                            .get("tasks")
-                            .and_then(|v| v.as_array())
-                            .map(|tasks| tasks.len() as u64);
-                    }
-                    if let Ok(pending) = SHARED_RT.block_on(projection.pending_approvals()) {
-                        state.app.daemon_pending_approvals =
-                            pending.as_array().map(|items| items.len() as u64);
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => state.add_message(
-                    "system",
-                    &format!("Daemon projection client unavailable: {err}"),
+                };
+            let mut snapshot = SHARED_RT.block_on(
+                tui::runtime_control_store::refresh_runtime_control_snapshot(
+                    &daemon_client,
+                    projection.as_ref(),
+                    Some(&session_id),
                 ),
+            );
+            if let Some(lease) = daemon_session_lease.as_ref() {
+                snapshot.apply_lease(lease);
+            }
+            daemon_session_ids = snapshot.session_ids.clone();
+            let readiness = snapshot.runtime_readiness.clone();
+            let components = snapshot.runtime_components.unwrap_or_default();
+            let degraded_reasons = snapshot.degraded_reasons.clone();
+            snapshot.apply_to_app(&mut state.app);
+            if let Some(readiness) = readiness {
+                state.add_message(
+                    "system",
+                    &format!(
+                        "Daemon runtime projection connected: readiness={readiness}, components={components}"
+                    ),
+                );
+            }
+            for reason in degraded_reasons.into_iter().take(3) {
+                state.add_message("system", &format!("Daemon projection degraded: {reason}"));
             }
             if daemon_session_attached {
                 let event_client = daemon_client.clone();

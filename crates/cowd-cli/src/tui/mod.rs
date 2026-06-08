@@ -17,6 +17,7 @@ pub mod profiler;
 pub mod projection_client;
 pub mod render;
 pub mod runner;
+pub mod runtime_control_store;
 pub mod scroll_state;
 pub mod skin;
 pub mod state;
