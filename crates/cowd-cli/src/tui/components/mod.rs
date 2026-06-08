@@ -4,6 +4,7 @@
 
 pub mod agent_team_panel;
 pub mod agents_overlay;
+pub mod approval_cockpit_panel;
 pub mod base;
 pub mod chat_view;
 pub mod command_palette;

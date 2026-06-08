@@ -199,6 +199,12 @@ pub struct App {
     pub daemon_tasks: Vec<DaemonTaskSummary>,
     /// Number of pending approvals observed through the daemon projection API.
     pub daemon_pending_approvals: Option<u64>,
+    /// Number of active cross-plane grants observed through the daemon projection API.
+    pub daemon_cross_plane_grants_active: Option<u64>,
+    /// Number of cross-plane interop actions observed over the last 24h.
+    pub daemon_cross_plane_actions_24h: Option<u64>,
+    /// Degraded daemon projection/control reasons collected during snapshot refresh.
+    pub daemon_degraded_reasons: Vec<String>,
     /// Current daemon session lease owner for the attached TUI session.
     pub daemon_lease_owner: Option<String>,
     /// Current daemon session lease mode for the attached TUI session.
@@ -406,6 +412,9 @@ impl App {
             daemon_task_count: None,
             daemon_tasks: Vec::new(),
             daemon_pending_approvals: None,
+            daemon_cross_plane_grants_active: None,
+            daemon_cross_plane_actions_24h: None,
+            daemon_degraded_reasons: Vec::new(),
             daemon_lease_owner: None,
             daemon_lease_mode: None,
 

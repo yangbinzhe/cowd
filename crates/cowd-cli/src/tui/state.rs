@@ -27,6 +27,7 @@ use crate::tui::animation::{AnimationEngine, AnimationKind};
 use crate::tui::app::App;
 use crate::tui::components::agent_team_panel::AgentTeamPanel;
 use crate::tui::components::agents_overlay::AgentsOverlay;
+use crate::tui::components::approval_cockpit_panel::ApprovalCockpitPanel;
 use crate::tui::components::chat_view::ChatView;
 use crate::tui::components::command_palette::CommandPalette;
 use crate::tui::components::context_panel::ContextPanel;
@@ -161,6 +162,9 @@ pub struct TuiState {
     /// Goal workbench showing daemon task and YOLO/solo goal progress.
     pub goal_workbench_panel: GoalWorkbenchPanel,
 
+    /// Approval and cross-plane permission cockpit.
+    pub approval_cockpit_panel: ApprovalCockpitPanel,
+
     /// Diff viewer component for unified/split diff display.
     pub diff_viewer: DiffViewer,
 
@@ -188,7 +192,7 @@ pub struct TuiState {
     /// Runtime activity panel summarizing run/context/tool state.
     pub runtime_activity_panel: RuntimeActivityPanel,
 
-    /// Active tab index in the sidebar (0=Runtime, 1=Context, 2=Changes, 3=Goals, 4=Todo, 5=Diff, 6=Files, 7=Sessions, 8=Memory, 9=Skills, 10=Gateway).
+    /// Active tab index in the sidebar (0=Runtime, 1=Context, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Diff, 7=Files, 8=Sessions, 9=Memory, 10=Skills, 11=Gateway).
     pub sidebar_active_tab: usize,
 
     /// Status bar at the bottom showing model, tokens, and system info.
@@ -265,6 +269,7 @@ impl TuiState {
         let file_changes_panel = FileChangesPanel::new();
         let todo_panel = TodoPanel::new();
         let goal_workbench_panel = GoalWorkbenchPanel::new();
+        let approval_cockpit_panel = ApprovalCockpitPanel::new();
         let status_bar = StatusBar::with_default_sections();
         let animation_engine = AnimationEngine::new();
         let frame_timer = FrameTimer::new();
@@ -309,6 +314,7 @@ impl TuiState {
             file_changes_panel,
             todo_panel,
             goal_workbench_panel,
+            approval_cockpit_panel,
             status_bar,
             animation_engine,
             frame_timer,
@@ -460,6 +466,9 @@ impl TuiState {
         // Sync goal workbench from daemon runtime state.
         self.goal_workbench_panel.sync_from_app(&self.app);
 
+        // Sync approval/permission cockpit from daemon runtime state.
+        self.approval_cockpit_panel.sync_from_app(&self.app);
+
         // Sync diff viewer from App (extract diff text from timeline ToolCall outputs)
         self.diff_viewer.sync_from_app(&self.app);
 
@@ -477,7 +486,7 @@ impl TuiState {
 
         // Sync memory panel from the real cognitive store only when the tab is
         // visible. Keep App fallback for memory-disabled sessions.
-        if self.sidebar_active_tab == 8 && self.memory_panel.memory_manager.is_some() {
+        if self.sidebar_active_tab == 9 && self.memory_panel.memory_manager.is_some() {
             let should_sync = self
                 .memory_panel_last_sync
                 .map(|last| last.elapsed() >= Duration::from_millis(750))
@@ -567,8 +576,18 @@ impl TuiState {
             // Render sidebar: tab bar + active panel
             let tab_height = 1u16;
             let tab_labels = [
-                "Runtime", "Context", "Changes", "Goals", "Todo", "Diff", "Files", "Sessions",
-                "Memory", "Skills", "Gateway",
+                "Runtime",
+                "Context",
+                "Changes",
+                "Goals",
+                "Approvals",
+                "Todo",
+                "Diff",
+                "Files",
+                "Sessions",
+                "Memory",
+                "Skills",
+                "Gateway",
             ];
             let tab_area = ratatui::layout::Rect::new(
                 sidebar_area.x,
@@ -651,13 +670,22 @@ impl TuiState {
                 }
                 4 => {
                     let _ = error_recovery::catch_render_panic(
+                        "approval_cockpit_panel",
+                        AssertUnwindSafe(|| {
+                            self.approval_cockpit_panel
+                                .render(&mut main_ctx, panel_area);
+                        }),
+                    );
+                }
+                5 => {
+                    let _ = error_recovery::catch_render_panic(
                         "todo_panel",
                         AssertUnwindSafe(|| {
                             self.todo_panel.render(&mut main_ctx, panel_area);
                         }),
                     );
                 }
-                5 => {
+                6 => {
                     let _guard = self.render_profiler.guard("diff_viewer");
                     let _ = error_recovery::catch_render_panic(
                         "diff_viewer",
@@ -666,7 +694,7 @@ impl TuiState {
                         }),
                     );
                 }
-                6 => {
+                7 => {
                     let _guard = self.render_profiler.guard("file_tree");
                     let _ = error_recovery::catch_render_panic(
                         "file_tree",
@@ -675,7 +703,7 @@ impl TuiState {
                         }),
                     );
                 }
-                7 => {
+                8 => {
                     let _guard = self.render_profiler.guard("session_sidebar");
                     let _ = error_recovery::catch_render_panic(
                         "session_sidebar",
@@ -684,7 +712,7 @@ impl TuiState {
                         }),
                     );
                 }
-                8 => {
+                9 => {
                     let _guard = self.render_profiler.guard("memory_panel");
                     let _ = error_recovery::catch_render_panic(
                         "memory_panel",
@@ -693,7 +721,7 @@ impl TuiState {
                         }),
                     );
                 }
-                9 => {
+                10 => {
                     let _ = error_recovery::catch_render_panic(
                         "skills_panel",
                         AssertUnwindSafe(|| {
@@ -701,7 +729,7 @@ impl TuiState {
                         }),
                     );
                 }
-                10 => {
+                11 => {
                     let _ = error_recovery::catch_render_panic(
                         "gateway_panel",
                         AssertUnwindSafe(|| {
@@ -1061,12 +1089,12 @@ impl TuiState {
         // 1.75. Tab/BackTab sidebar cycling (before keybind engine which maps Tab to no-op NextPanel)
         match event.code {
             KeyCode::Tab => {
-                const SIDEBAR_TAB_COUNT: usize = 11;
+                const SIDEBAR_TAB_COUNT: usize = 12;
                 self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
                 return true;
             }
             KeyCode::BackTab => {
-                const SIDEBAR_TAB_COUNT: usize = 11;
+                const SIDEBAR_TAB_COUNT: usize = 12;
                 self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
                     SIDEBAR_TAB_COUNT - 1
                 } else {
@@ -1264,7 +1292,7 @@ impl TuiState {
 
         // ── Sidebar tab switching ──
         // Tab / Shift+Tab: cycle through sidebar tabs.
-        const SIDEBAR_TAB_COUNT: usize = 11;
+        const SIDEBAR_TAB_COUNT: usize = 12;
         if key.code == KeyCode::Tab {
             self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
             return ProcessedKey::Nothing;
@@ -1688,13 +1716,13 @@ impl TuiState {
                 }
             }
             Action::FocusDiff => {
-                self.sidebar_active_tab = 5;
-            }
-            Action::FocusFileTree => {
                 self.sidebar_active_tab = 6;
             }
-            Action::FocusSessions => {
+            Action::FocusFileTree => {
                 self.sidebar_active_tab = 7;
+            }
+            Action::FocusSessions => {
+                self.sidebar_active_tab = 8;
             }
             Action::Execute(ref cmd) => {
                 let mut input = tui_textarea::TextArea::default();

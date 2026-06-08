@@ -53,6 +53,9 @@ impl RuntimeControlSnapshot {
             pending_approvals: app.daemon_pending_approvals,
             lease_owner: app.daemon_lease_owner.clone(),
             lease_mode: app.daemon_lease_mode.clone(),
+            cross_plane_grants_active: app.daemon_cross_plane_grants_active,
+            cross_plane_actions_24h: app.daemon_cross_plane_actions_24h,
+            degraded_reasons: app.daemon_degraded_reasons.clone(),
             ..Self::default()
         }
     }
@@ -71,6 +74,9 @@ impl RuntimeControlSnapshot {
         app.daemon_task_count = self.task_count;
         app.daemon_tasks = self.tasks.clone();
         app.daemon_pending_approvals = self.pending_approvals;
+        app.daemon_cross_plane_grants_active = self.cross_plane_grants_active;
+        app.daemon_cross_plane_actions_24h = self.cross_plane_actions_24h;
+        app.daemon_degraded_reasons = self.degraded_reasons.clone();
         app.daemon_lease_owner = self.lease_owner.clone();
         app.daemon_lease_mode = self.lease_mode.clone();
     }
