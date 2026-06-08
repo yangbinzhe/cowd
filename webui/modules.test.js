@@ -1063,6 +1063,9 @@ describe('API module', () => {
         if (path.includes('/api/connectors/resources/revalidate')) {
           return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_resource_revalidation', ok: true }) });
         }
+        if (path.includes('/api/connectors/resources/promote-memory')) {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_resource_memory_promotion', ok: true, memory_id: 'mem-resource' }) });
+        }
         const query = path.includes('q=Ready') ? 'Ready Feishu Doc' : 'Mock Runtime Doc';
         return Promise.resolve({ ok: true, json: () => Promise.resolve({
           kind: 'connector_resources',
@@ -1170,6 +1173,10 @@ describe('API module', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     const revalidateCall = mockF.mock.calls.find(call => String(call[0]).includes('/api/connectors/resources/revalidate'));
     expect(JSON.parse(revalidateCall[1].body).state).toBe('indexed');
+    document.querySelectorAll('.connector-resource-list .runtime-ref-actions button')[2].click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const promoteCall = mockF.mock.calls.find(call => String(call[0]).includes('/api/connectors/resources/promote-memory'));
+    expect(JSON.parse(promoteCall[1].body).reference).toContain('service://feishu/docx/doccn-ready');
 
     document.querySelector('.connector-service-executor button').click();
     await new Promise(resolve => setTimeout(resolve, 0));

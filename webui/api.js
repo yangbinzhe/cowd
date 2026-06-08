@@ -393,6 +393,13 @@ window.Api = (()=>{
     async revalidateConnectorResource(reference,state){
       return req('POST','/api/connectors/resources/revalidate',{reference,state:state||'indexed'});
     },
+    async promoteConnectorResourceToMemory(reference,opts){
+      const o=opts||{};
+      return req('POST','/api/connectors/resources/promote-memory',{
+        reference,
+        session_id:o.session_id||sid||undefined,
+      });
+    },
     async connectorServiceTools(service){return req('GET','/api/connectors/services/'+encodeURIComponent(service)+'/tools')},
     async executeConnectorService(service,body){return req('POST','/api/connectors/services/'+encodeURIComponent(service)+'/execute',body||{})},
 

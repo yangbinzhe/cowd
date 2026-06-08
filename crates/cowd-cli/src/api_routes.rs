@@ -803,6 +803,33 @@ mod tests {
         })
     }
 
+    fn test_state_with_memory_and_workspace(
+        memory_manager: Arc<CognitiveContextManager>,
+        workspace_root: PathBuf,
+    ) -> Arc<AppState> {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
+            sessions,
+            memory_manager: Some(memory_manager),
+            unified_store: None,
+            tool_registry: tools,
+            config: None,
+            platform_runtime: None,
+            event_bus,
+            approval_gate: None,
+            auth_token: None,
+            workspace_root,
+            config_home: default_config_home(),
+            profile_id: "default".to_string(),
+            profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
+            session_lease_registry: None,
+        })
+    }
+
     fn test_approval_gate() -> Arc<SmartApprovalGate> {
         Arc::new(SmartApprovalGate::new(
             Arc::new(DestructivePatternDetector::new(std::env::temp_dir())),
@@ -3801,6 +3828,87 @@ providers:
             .unwrap()
             .iter()
             .any(|resource| resource["indexed_state"] == "stale"));
+    }
+
+    #[tokio::test]
+    async fn connector_resource_promote_memory_creates_metadata_only_memory() {
+        let tmp =
+            std::env::temp_dir().join(format!("cowd-api-resource-memory-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manager = Arc::new(
+            CognitiveContextManager::new(test_memory_config(&tmp.join("memory.db")))
+                .await
+                .unwrap(),
+        );
+        let app = api_router(test_state_with_memory_and_workspace(manager, tmp.clone()));
+        let request = serde_json::json!({
+            "actor_principal": "user:connector-resource-memory",
+            "tool_id": "service.mock.docs.read",
+            "resource_id": "memory-doc",
+            "title": "Memory Bridge Doc",
+            "mode": "commit",
+            "idempotency_key": format!("memory-bridge-{}", uuid::Uuid::new_v4())
+        });
+        let execute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execute.status(), StatusCode::OK);
+
+        let promote = serde_json::json!({
+            "reference": "service://mock.docs/document/memory-doc",
+            "session_id": "resource-memory-session"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/resources/promote-memory")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(promote.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_resource_memory_promotion");
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["layer"], "L3");
+
+        let entries = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/memory/L3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entries.status(), StatusCode::OK);
+        let body = to_bytes(entries.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entry = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["title"] == "Connector resource: Memory Bridge Doc")
+            .expect("promoted resource memory should exist");
+        let content = entry["content"].as_str().unwrap_or_default();
+        assert!(content.contains("service://mock.docs/document/memory-doc"));
+        assert!(content.contains("body_policy: metadata_only"));
+        assert!(!content.contains("external document body"));
+        std::fs::remove_dir_all(tmp).ok();
     }
 
     #[tokio::test]

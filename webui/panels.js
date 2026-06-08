@@ -2294,6 +2294,20 @@ window.Panels = (()=>{
               };
               actions.appendChild(btn);
             });
+            const remember=UI.el('button','runtime-context-link');
+            remember.textContent='Remember';
+            remember.onclick=async function(){
+              remember.disabled=true;
+              try{
+                const result=await Api.promoteConnectorResourceToMemory(resource.reference,{session_id:Api.sid});
+                UI.showToast(result.ok?'Resource promoted to memory':'Memory promotion skipped');
+              }catch(e){
+                UI.showToast('Memory promotion failed: '+e.message);
+              }finally{
+                remember.disabled=false;
+              }
+            };
+            actions.appendChild(remember);
             row.appendChild(actions);
             list.appendChild(row);
           });
