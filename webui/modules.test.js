@@ -573,6 +573,52 @@ describe('API module', () => {
     expect(result.decision.decision).toBe('allow');
   });
 
+  it('connector runtime endpoints use the management route contract', async () => {
+    const mockF = vi.fn((url, opts = {}) => {
+      const path = String(url);
+      if (path.includes('/api/connectors/resources')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_resources', resources: [{ reference: 'service://mock.docs/document/doc-1' }] }) });
+      }
+      if (path.includes('/api/connectors/services/mock.docs/tools')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_service_tools', tools: [{ capability_id: 'service.mock.docs.read' }] }) });
+      }
+      if (path.includes('/api/connectors/services/mock.docs/execute')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_service_execution', result: { status: 'ok' } }) });
+      }
+      if (path.includes('/api/connectors/accounts')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_accounts', accounts: [{ provider: 'feishu' }] }) });
+      }
+      if (path.includes('/api/connectors/capabilities')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_capabilities', capabilities: [{ capability_id: 'service.feishu.docx.read' }] }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'connector_summary', summary: { accounts: 1 } }) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.connectorSummary();
+    await window.Api.connectorAccounts();
+    await window.Api.connectorCapabilities();
+    await window.Api.connectorResources({ q: 'Doc', limit: 20, offset: 40 });
+    await window.Api.connectorServiceTools('mock.docs');
+    const execution = await window.Api.executeConnectorService('mock.docs', {
+      actor_principal: 'user:webui',
+      tool_id: 'service.mock.docs.read',
+      resource_id: 'doc-1',
+      title: 'Doc 1',
+      mode: 'dry_run',
+    });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/connectors/summary');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/connectors/accounts');
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/connectors/capabilities');
+    expect(String(mockF.mock.calls[3][0])).toBe('/api/connectors/resources?q=Doc&limit=20&offset=40');
+    expect(String(mockF.mock.calls[4][0])).toBe('/api/connectors/services/mock.docs/tools');
+    expect(String(mockF.mock.calls[5][0])).toBe('/api/connectors/services/mock.docs/execute');
+    expect(mockF.mock.calls[5][1].method).toBe('POST');
+    expect(JSON.parse(mockF.mock.calls[5][1].body).tool_id).toBe('service.mock.docs.read');
+    expect(execution.result.status).toBe('ok');
+  });
+
   it('wechat ilink qr endpoints use the channel route contract', async () => {
     const mockF = vi.fn((url, opts = {}) => {
       const path = String(url);
@@ -961,6 +1007,111 @@ describe('API module', () => {
     expect(text).toContain('Dispatch Outcome');
     expect(text).toContain('sent');
     expect(text).not.toContain('cli_app_secret');
+  });
+
+  it('renders connector console resources and service execution controls', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    const mockF = vi.fn((url, options = {}) => {
+      const path = String(url);
+      if (path.includes('/api/connectors/resources')) {
+        const query = path.includes('q=Ready') ? 'Ready Feishu Doc' : 'Mock Runtime Doc';
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'connector_resources',
+          status: 'available',
+          resources: [{
+            reference: path.includes('q=Ready') ? 'service://feishu/docx/doccn-ready' : 'service://mock.docs/document/webui-doc',
+            provider: path.includes('q=Ready') ? 'feishu' : 'mock.docs',
+            resource_type: path.includes('q=Ready') ? 'docx' : 'document',
+            title: query,
+            source: 'connector_runtime',
+            indexed_state: 'indexed',
+          }],
+        }) });
+      }
+      if (path.includes('/api/connectors/services/mock.docs/tools')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          service: { id: 'mock.docs', display_name: 'Mock Docs' },
+          tools: [{ capability_id: 'service.mock.docs.read', provider: 'mock', plane: 'service', risk: 'low', supports_commit: true, requires_approval: false }],
+        }) });
+      }
+      if (path.includes('/api/connectors/services/feishu.readonly/tools')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          service: { id: 'feishu.readonly', display_name: 'Feishu Read-only' },
+          health: { status: 'degraded', reason: 'no ready provider account for feishu' },
+          tools: [{ capability_id: 'service.feishu.docx.read', provider: 'feishu', plane: 'service', risk: 'low', supports_commit: true, requires_approval: false }],
+        }) });
+      }
+      if (path.includes('/api/connectors/services/mock.docs/execute')) {
+        const body = JSON.parse(options.body);
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          result: { status: 'ok', resource: { reference: 'service://mock.docs/document/' + body.resource_id } },
+          receipt: { status: 'dry_run', dispatch_status: 'not_dispatched', action: { requested_capability: body.tool_id }, blockers: [] },
+          resource_persisted: true,
+        }) });
+      }
+      if (path.includes('/api/connectors/summary')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ summary: { accounts: 2, capabilities: 6, resources: 1, degraded: false } }) });
+      }
+      if (path.includes('/api/connectors/accounts')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          accounts: [
+            { provider: 'feishu', account_id: 'feishu-main', auth_mode: 'app_secret', enabled_bindings: ['service.feishu.docx.read'], health: { status: 'ready' } },
+            { provider: 'mcp', account_id: 'filesystem', auth_mode: 'mcp_stdio', enabled_bindings: ['mcp.filesystem.server'], health: { status: 'degraded', reason: 'missing command' } },
+          ],
+        }) });
+      }
+      if (path.includes('/api/connectors/capabilities')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          capabilities: [
+            { capability_id: 'service.feishu.docx.read', provider: 'feishu', family: 'service.feishu', plane: 'service', risk: 'low', supports_commit: true, requires_approval: false },
+            { capability_id: 'mcp.filesystem.server', provider: 'filesystem', family: 'mcp.filesystem', plane: 'mcp', risk: 'low', supports_commit: false, requires_approval: false },
+          ],
+        }) });
+      }
+      if (path.includes('/api/cross-plane/action/executions')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          executions: [{ status: 'dry_run', mode: 'dry_run', dispatch_status: 'not_dispatched', idempotency_key: 'idem-connector', action: { requested_capability: 'service.mock.docs.read' } }],
+        }) });
+      }
+      if (path.includes('/api/cross-plane/summary')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: {}, grants: {}, interop: {} }) });
+      if (path.includes('/api/channels/wechat-ilink/accounts')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ accounts: [] }) });
+      if (path.includes('/api/cross-plane/identities')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ identities: [] }) });
+      if (path.includes('/api/cross-plane/grants')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ grants: [] }) });
+      if (path.includes('/api/cross-plane/audit')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ records: [] }) });
+      if (path.includes('/api/cross-plane/action/adapters')) return Promise.resolve({ ok: true, json: () => Promise.resolve({ capabilities: [] }) });
+      if (path === '/api/platforms') return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderGateway();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const panel = document.getElementById('panel-content');
+    expect(panel.textContent).toContain('Connector Console');
+    expect(panel.textContent).toContain('Accounts');
+    expect(panel.textContent).toContain('Capabilities');
+    expect(panel.textContent).toContain('Services · Feishu Read-only');
+    expect(panel.textContent).toContain('no ready provider account for feishu');
+    expect(panel.textContent).toContain('Mock Runtime Doc');
+    expect(panel.textContent).toContain('Receipts / Audit');
+    expect(panel.textContent).toContain('idem idem-connector');
+
+    const search = document.querySelector('.connector-resources input');
+    search.value = 'Ready';
+    search.dispatchEvent(new Event('input'));
+    await new Promise(resolve => setTimeout(resolve, 240));
+    expect(panel.textContent).toContain('Ready Feishu Doc');
+    expect(String(mockF.mock.calls.find(call => String(call[0]).includes('/api/connectors/resources?q=Ready'))[0])).toContain('offset=0');
+
+    document.querySelector('.connector-service-executor button').click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const executeCall = mockF.mock.calls.find(call => String(call[0]).includes('/api/connectors/services/mock.docs/execute'));
+    expect(JSON.parse(executeCall[1].body).source_channel).toBe('local:webui');
+    expect(panel.textContent).toContain('Service Result');
+    expect(panel.textContent).toContain('service://mock.docs/document/webui-doc');
   });
 
   it('gateway composer preflights and executes typed media actions', async () => {
