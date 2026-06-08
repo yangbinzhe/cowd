@@ -2152,7 +2152,7 @@ window.Panels = (()=>{
           actor_principal:principal.value.trim()||'user:webui',
           actor_identity_ref:identity.value.trim()||undefined,
           source_channel:'local:webui',
-          session_id:'webui-connector-console',
+          session_id:Api.sid||'webui-connector-console',
           tool_id:tool.value.trim(),
           resource_id:resource.value.trim(),
           title:title.value.trim()||resource.value.trim(),

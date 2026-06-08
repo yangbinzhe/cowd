@@ -1051,6 +1051,7 @@ describe('API module', () => {
 
   it('renders connector console resources and service execution controls', async () => {
     document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    window.Api.sid = 'session-webui-connector';
     const mockF = vi.fn((url, options = {}) => {
       const path = String(url);
       if (path.includes('/api/connectors/resources')) {
@@ -1150,6 +1151,7 @@ describe('API module', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
     const executeCall = mockF.mock.calls.find(call => String(call[0]).includes('/api/connectors/services/mock.docs/execute'));
     expect(JSON.parse(executeCall[1].body).source_channel).toBe('local:webui');
+    expect(JSON.parse(executeCall[1].body).session_id).toBe('session-webui-connector');
     expect(panel.textContent).toContain('Service Result');
     expect(panel.textContent).toContain('service://mock.docs/document/webui-doc');
   });
