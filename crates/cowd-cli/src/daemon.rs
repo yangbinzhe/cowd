@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -37,20 +37,26 @@ use runtime::session_lifecycle::{
     EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager, SessionStatus,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionLease {
-    session_id: String,
-    owner: String,
-    mode: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionLease {
+    pub(crate) session_id: String,
+    pub(crate) owner: String,
+    pub(crate) mode: String,
+    pub(crate) acquired_at_ms: u64,
 }
 
 #[derive(Default)]
-struct SessionLeaseRegistry {
+pub(crate) struct SessionLeaseRegistry {
     leases: tokio::sync::RwLock<HashMap<String, SessionLease>>,
 }
 
 impl SessionLeaseRegistry {
-    async fn acquire(&self, session_id: &str, owner: &str, mode: &str) -> serde_json::Value {
+    pub(crate) async fn acquire(
+        &self,
+        session_id: &str,
+        owner: &str,
+        mode: &str,
+    ) -> serde_json::Value {
         if session_id.trim().is_empty() || owner.trim().is_empty() {
             return serde_json::json!({
                 "ok": false,
@@ -88,6 +94,7 @@ impl SessionLeaseRegistry {
             session_id: session_id.to_string(),
             owner: owner.to_string(),
             mode: effective_mode.to_string(),
+            acquired_at_ms: current_epoch_ms(),
         };
         leases.insert(session_id.to_string(), lease.clone());
 
@@ -96,10 +103,11 @@ impl SessionLeaseRegistry {
             "session_id": lease.session_id,
             "owner": lease.owner,
             "mode": lease.mode,
+            "acquired_at_ms": lease.acquired_at_ms,
         })
     }
 
-    async fn release(&self, session_id: &str, owner: &str) -> serde_json::Value {
+    pub(crate) async fn release(&self, session_id: &str, owner: &str) -> serde_json::Value {
         let mut leases = self.leases.write().await;
         match leases.get(session_id) {
             Some(existing) if existing.owner == owner => {
@@ -124,6 +132,20 @@ impl SessionLeaseRegistry {
             }),
         }
     }
+
+    pub(crate) async fn list(&self) -> Vec<SessionLease> {
+        let leases = self.leases.read().await;
+        let mut items = leases.values().cloned().collect::<Vec<_>>();
+        items.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        items
+    }
+}
+
+fn current_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ── Background session cleanup task ────────────────────────────
@@ -469,6 +491,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         profile_id,
         profile_manager,
         task_kernel,
+        session_lease_registry: Some(lease_registry.clone()),
     });
 
     // 2. Build HTTP router (reuse api_routes + SSE)

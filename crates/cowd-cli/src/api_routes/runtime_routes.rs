@@ -13,7 +13,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{AppState, ErrorResponse};
+use super::{connector_routes, AppState, ErrorResponse};
 use memory::store::session::SessionListOptions;
 use memory::RuntimeEvent;
 use runtime::{init_global_providers, AgentControlPolicy, ConfigLoader, RuntimeConfig};
@@ -30,6 +30,18 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(reload_runtime_providers),
         )
         .route("/api/runtime/control-plane", get(get_runtime_control_plane))
+        .route(
+            "/api/runtime/session-leases",
+            get(get_runtime_session_leases),
+        )
+        .route(
+            "/api/runtime/session-leases/acquire",
+            post(acquire_runtime_session_lease),
+        )
+        .route(
+            "/api/runtime/session-leases/release",
+            post(release_runtime_session_lease),
+        )
 }
 
 #[derive(Deserialize)]
@@ -39,6 +51,20 @@ pub(super) struct RuntimeTimelineParams {
     from_seq: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeSessionLeaseAcquireRequest {
+    session_id: String,
+    owner: String,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeSessionLeaseReleaseRequest {
+    session_id: String,
+    owner: String,
 }
 
 pub(super) async fn get_runtime_timeline(
@@ -232,6 +258,41 @@ pub(super) async fn reload_runtime_providers(
     }
 }
 
+async fn get_runtime_session_leases(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {
+    Json(session_lease_projection(&state).await)
+}
+
+async fn acquire_runtime_session_lease(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<RuntimeSessionLeaseAcquireRequest>,
+) -> Json<Value> {
+    let Some(registry) = state.session_lease_registry.as_ref() else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": "session lease registry is not attached",
+        }));
+    };
+    let mode = request.mode.as_deref().unwrap_or("collaborative");
+    Json(
+        registry
+            .acquire(&request.session_id, &request.owner, mode)
+            .await,
+    )
+}
+
+async fn release_runtime_session_lease(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<RuntimeSessionLeaseReleaseRequest>,
+) -> Json<Value> {
+    let Some(registry) = state.session_lease_registry.as_ref() else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": "session lease registry is not attached",
+        }));
+    };
+    Json(registry.release(&request.session_id, &request.owner).await)
+}
+
 pub(super) async fn get_runtime_control_plane(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<Value> {
@@ -324,10 +385,19 @@ pub(super) async fn get_runtime_control_plane(
         })
     };
 
+    let connector_snapshot = connector_routes::connector_snapshot(&state);
+    let connector_summary = connector_snapshot.summary();
+    let connector_ready = !connector_summary.degraded;
     let mut degraded_reasons = config_warnings.clone();
     if !durable_session_store {
         degraded_reasons.push("session store not available".to_string());
     }
+    degraded_reasons.extend(
+        connector_summary
+            .degraded_reasons
+            .iter()
+            .map(|reason| format!("connector runtime: {reason}")),
+    );
     let degraded = !degraded_reasons.is_empty();
     let status = if degraded {
         "degraded"
@@ -349,14 +419,16 @@ pub(super) async fn get_runtime_control_plane(
             acc.insert(key, Value::from(next));
             acc
         });
+    let session_lease_projection = session_lease_projection(&state).await;
     let memory_attached = state.memory_manager.is_some();
-    let component_count = 9usize;
-    let degraded_component_count = usize::from(!durable_session_store) * 2;
+    let component_count = 10usize;
+    let degraded_component_count =
+        usize::from(!durable_session_store) * 2 + usize::from(!connector_ready);
     let attention_component_count = usize::from(!memory_attached)
         + usize::from(!control.policy.enabled)
         + usize::from(!provider_configured)
         + usize::from(!configured_model_resolved);
-    let capability_count = 11usize;
+    let capability_count = 11usize + connector_summary.capability_count;
     let generated_at_ms = now_ms();
     let elapsed_ms = started_at.elapsed().as_millis() as u64;
     let performance_status = if elapsed_ms <= 50 {
@@ -410,6 +482,17 @@ pub(super) async fn get_runtime_control_plane(
             "required": true,
             "status": "ready",
             "reason": "channel and cross-plane adapters are registered",
+        }),
+        serde_json::json!({
+            "id": "connector.contract",
+            "label": "Connector runtime contract",
+            "required": true,
+            "status": if connector_ready { "ready" } else { "blocked" },
+            "reason": if connector_ready {
+                format!("{} connector capabilities are declared", connector_summary.capability_count)
+            } else {
+                format!("connector runtime is degraded: {}", connector_summary.degraded_reasons.join("; "))
+            },
         }),
         serde_json::json!({
             "id": "observability.control",
@@ -568,6 +651,9 @@ pub(super) async fn get_runtime_control_plane(
             "provider_count": provider_count,
             "provider_model_count": provider_model_count,
             "configured_model_resolved": configured_model_resolved,
+            "connector_account_count": connector_summary.account_count,
+            "connector_capability_count": connector_summary.capability_count,
+            "connector_resource_count": connector_summary.resource_count,
         },
         "readiness": {
             "production_ready": production_ready,
@@ -586,6 +672,7 @@ pub(super) async fn get_runtime_control_plane(
                 "active_session_ids": active_session_ids,
                 "event_bus": true,
                 "source_of_truth": if durable_session_store { "sqlite" } else { "unavailable" },
+                "leases": session_lease_projection,
             },
             "memory": memory,
             "context": {
@@ -641,6 +728,13 @@ pub(super) async fn get_runtime_control_plane(
                     }
                 ]
             },
+            "connectors": {
+                "status": if connector_ready { "available" } else { "degraded" },
+                "accounts": connector_snapshot.accounts,
+                "capabilities": connector_snapshot.capabilities,
+                "resources": connector_snapshot.resources,
+                "summary": connector_summary,
+            },
             "observability": {
                 "status": "available",
                 "emit_events": control.policy.observability.emit_events,
@@ -659,12 +753,33 @@ pub(super) async fn get_runtime_control_plane(
             "agent.complexity_policy",
             "task.phase_control",
             "permission.cross_plane",
+            "connector.runtime_contract",
             "channel.wechat_ilink_qr",
             "provider.registry",
             "provider.model_routing"
         ],
         "next_actions": next_actions
     }))
+}
+
+async fn session_lease_projection(state: &AppState) -> Value {
+    let Some(registry) = state.session_lease_registry.as_ref() else {
+        return serde_json::json!({
+            "kind": "runtime_session_leases",
+            "status": "unavailable",
+            "attached": false,
+            "leases": [],
+            "total": 0,
+        });
+    };
+    let leases = registry.list().await;
+    serde_json::json!({
+        "kind": "runtime_session_leases",
+        "status": "available",
+        "attached": true,
+        "total": leases.len(),
+        "leases": leases,
+    })
 }
 
 fn now_ms() -> u64 {

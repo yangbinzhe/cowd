@@ -61,6 +61,7 @@ pub mod agent_collaboration;
 pub mod agent_discussion;
 pub mod agent_workgraph;
 pub mod approval_gate;
+pub mod connector;
 pub mod cowd_event;
 pub mod cross_plane_policy;
 pub mod joint_problem_solving;
@@ -120,6 +121,12 @@ pub use config::{
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
     DiagnosticKind, ValidationResult,
+};
+pub use connector::{
+    default_capabilities, CapabilityManifest, ConnectorHealth, ConnectorHealthStatus,
+    ConnectorPlane, ConnectorRegistrySnapshot, ConnectorSummary, ExternalResourceRef,
+    MockDocsServiceConnector, ProviderAccount, ResourceDirectory, ServiceConnector,
+    ServiceConnectorMetadata, ServiceToolRequest, ServiceToolResult,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, build_cc_memory_config, ApiClient, ApiRequest,

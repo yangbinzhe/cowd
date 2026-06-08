@@ -107,7 +107,7 @@ fn default_execute_mode() -> String {
 
 static CROSS_PLANE_CONTROL: OnceLock<CrossPlaneControlPlane> = OnceLock::new();
 
-fn cross_plane_control() -> &'static CrossPlaneControlPlane {
+pub(super) fn cross_plane_control() -> &'static CrossPlaneControlPlane {
     CROSS_PLANE_CONTROL.get_or_init(CrossPlaneControlPlane::new)
 }
 
@@ -118,14 +118,14 @@ fn cross_plane_state_path(state: &AppState) -> PathBuf {
         .join("control-state.json")
 }
 
-fn ensure_cross_plane_loaded(state: &AppState) {
+pub(super) fn ensure_cross_plane_loaded(state: &AppState) {
     static CROSS_PLANE_LOADED: OnceLock<()> = OnceLock::new();
     let _ = CROSS_PLANE_LOADED.get_or_init(|| {
         let _ = cross_plane_control().load_from_path(&cross_plane_state_path(state));
     });
 }
 
-fn save_cross_plane_state(state: &AppState) {
+pub(super) fn save_cross_plane_state(state: &AppState) {
     let _ = cross_plane_control().save_to_path(&cross_plane_state_path(state));
 }
 

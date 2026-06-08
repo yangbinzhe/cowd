@@ -47,6 +47,7 @@ use memory::MemoryScope;
 mod approval_routes;
 mod audit_routes;
 mod channel_routes;
+mod connector_routes;
 mod context_routes;
 mod cross_plane_routes;
 mod memory_routes;
@@ -79,6 +80,7 @@ pub struct AppState {
     pub profile_id: String,
     pub profile_manager: Arc<ProfileManager>,
     pub task_kernel: Arc<TaskKernel>,
+    pub session_lease_registry: Option<Arc<crate::daemon::SessionLeaseRegistry>>,
 }
 
 type RuntimeEntry = Arc<tokio::sync::Mutex<crate::BuiltRuntime>>;
@@ -155,6 +157,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(approval_routes::router())
         .merge(audit_routes::router())
         .merge(channel_routes::router())
+        .merge(connector_routes::router())
         .merge(context_routes::router())
         .merge(cross_plane_routes::router())
         .merge(memory_routes::router())
@@ -620,11 +623,38 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
     fn test_state_with_config(config: serde_json::Value) -> Arc<AppState> {
         test_state_with_config_and_runtime(config, None)
+    }
+
+    fn test_state_with_lease_registry(
+        registry: Arc<crate::daemon::SessionLeaseRegistry>,
+    ) -> Arc<AppState> {
+        let sessions = Arc::new(ActiveSessions::new());
+        let tools = Arc::new(GlobalToolRegistry::builtin());
+        let event_bus = SessionEventBus::new();
+        Arc::new(AppState {
+            session_kernel: test_session_kernel(sessions.clone(), None, event_bus.clone()),
+            sessions,
+            memory_manager: None,
+            unified_store: None,
+            tool_registry: tools,
+            config: None,
+            platform_runtime: None,
+            event_bus,
+            approval_gate: None,
+            auth_token: None,
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            config_home: default_config_home(),
+            profile_id: "default".to_string(),
+            profile_manager: test_profile_manager(),
+            task_kernel: test_task_kernel(),
+            session_lease_registry: Some(registry),
+        })
     }
 
     fn test_state_with_config_and_runtime(
@@ -662,6 +692,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
@@ -689,6 +720,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
@@ -720,6 +752,7 @@ mod tests {
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
@@ -760,6 +793,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
@@ -791,6 +825,7 @@ mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
@@ -814,6 +849,7 @@ mod tests {
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         })
     }
 
@@ -1912,16 +1948,20 @@ runtime:
         assert_eq!(json["components"]["context"]["durable_history"], false);
         assert_eq!(json["components"]["memory"]["status"], "unavailable");
         assert_eq!(json["components"]["permissions"]["auth_required"], false);
+        assert_eq!(
+            json["components"]["session"]["leases"]["status"],
+            "unavailable"
+        );
         assert_eq!(json["diagnostics"]["durable_session_store"], false);
         assert_eq!(json["diagnostics"]["memory_attached"], false);
         assert_eq!(
             json["diagnostics"]["stored_sessions"],
             serde_json::Value::Null
         );
-        assert_eq!(json["diagnostics"]["component_count"], 9);
+        assert_eq!(json["diagnostics"]["component_count"], 10);
         assert_eq!(json["diagnostics"]["degraded_component_count"], 2);
         assert_eq!(json["diagnostics"]["attention_component_count"], 2);
-        assert_eq!(json["diagnostics"]["capability_count"], 11);
+        assert_eq!(json["diagnostics"]["capability_count"], 24);
         assert!(json["diagnostics"]["elapsed_ms"].as_u64().is_some());
         assert!(matches!(
             json["diagnostics"]["performance_status"].as_str(),
@@ -1932,11 +1972,11 @@ runtime:
         assert_eq!(json["diagnostics"]["provider_model_count"], 0);
         assert_eq!(json["diagnostics"]["configured_model_resolved"], true);
         assert_eq!(json["diagnostics"]["production_ready"], false);
-        assert_eq!(json["diagnostics"]["required_check_count"], 10);
-        assert_eq!(json["diagnostics"]["ready_required_count"], 6);
+        assert_eq!(json["diagnostics"]["required_check_count"], 11);
+        assert_eq!(json["diagnostics"]["ready_required_count"], 7);
         assert_eq!(json["diagnostics"]["blocked_required_count"], 4);
         assert_eq!(json["readiness"]["production_ready"], false);
-        assert_eq!(json["readiness"]["score"], 60);
+        assert_eq!(json["readiness"]["score"], 63);
         assert!(json["readiness"]["blocked"]
             .as_array()
             .unwrap()
@@ -1975,6 +2015,99 @@ runtime:
             .any(|reason| reason == "session store not available"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_session_lease_routes_share_daemon_registry_projection() {
+        let registry = Arc::new(crate::daemon::SessionLeaseRegistry::default());
+        let app = api_router(test_state_with_lease_registry(registry));
+
+        let acquire = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/session-leases/acquire")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": "session-a",
+                            "owner": "tui:one",
+                            "mode": "exclusive"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(acquire.status(), StatusCode::OK);
+        let body = to_bytes(acquire.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["owner"], "tui:one");
+        assert_eq!(json["mode"], "exclusive");
+        assert!(json["acquired_at_ms"].as_u64().is_some());
+
+        let list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/session-leases")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let body = to_bytes(list.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "available");
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["leases"][0]["session_id"], "session-a");
+
+        let control = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/control-plane")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control.status(), StatusCode::OK);
+        let body = to_bytes(control.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["components"]["session"]["leases"]["attached"], true);
+        assert_eq!(json["components"]["session"]["leases"]["total"], 1);
+        assert_eq!(
+            json["components"]["session"]["leases"]["leases"][0]["owner"],
+            "tui:one"
+        );
+
+        let release = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/session-leases/release")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": "session-a",
+                            "owner": "tui:one"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(release.status(), StatusCode::OK);
+        let body = to_bytes(release.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["released"], true);
     }
 
     #[tokio::test]
@@ -2018,7 +2151,7 @@ runtime:
         assert_eq!(json["diagnostics"]["active_sessions"], 0);
         assert_eq!(json["diagnostics"]["stored_sessions"], 0);
         assert_eq!(json["diagnostics"]["open_tasks"], 1);
-        assert_eq!(json["diagnostics"]["component_count"], 9);
+        assert_eq!(json["diagnostics"]["component_count"], 10);
         assert_eq!(json["diagnostics"]["degraded_component_count"], 0);
         assert_eq!(json["diagnostics"]["attention_component_count"], 2);
         assert!(json["diagnostics"]["elapsed_ms"].as_u64().is_some());
@@ -2029,11 +2162,11 @@ runtime:
         assert_eq!(json["diagnostics"]["provider_configured"], false);
         assert_eq!(json["components"]["provider"]["status"], "unconfigured");
         assert_eq!(json["diagnostics"]["production_ready"], false);
-        assert_eq!(json["diagnostics"]["required_check_count"], 10);
-        assert_eq!(json["diagnostics"]["ready_required_count"], 8);
+        assert_eq!(json["diagnostics"]["required_check_count"], 11);
+        assert_eq!(json["diagnostics"]["ready_required_count"], 9);
         assert_eq!(json["diagnostics"]["blocked_required_count"], 2);
         assert_eq!(json["readiness"]["production_ready"], false);
-        assert_eq!(json["readiness"]["score"], 80);
+        assert_eq!(json["readiness"]["score"], 81);
         assert!(json["readiness"]["blocked"]
             .as_array()
             .unwrap()
@@ -2127,10 +2260,10 @@ runtime:
             Some("healthy" | "attention" | "degraded")
         ));
         assert_eq!(json["diagnostics"]["production_ready"], false);
-        assert_eq!(json["diagnostics"]["required_check_count"], 10);
-        assert_eq!(json["diagnostics"]["ready_required_count"], 8);
+        assert_eq!(json["diagnostics"]["required_check_count"], 11);
+        assert_eq!(json["diagnostics"]["ready_required_count"], 9);
         assert_eq!(json["diagnostics"]["blocked_required_count"], 2);
-        assert_eq!(json["readiness"]["score"], 80);
+        assert_eq!(json["readiness"]["score"], 81);
         assert!(json["readiness"]["checks"]
             .as_array()
             .unwrap()
@@ -2359,7 +2492,7 @@ providers:
         assert!(joined.contains("performance_status="));
         assert!(joined.contains("elapsed_ms="));
         assert!(joined.contains("production_ready=false"));
-        assert!(joined.contains("readiness_score=80"));
+        assert!(joined.contains("readiness_score=81"));
         assert!(joined.contains("blocked_required_count=2"));
         assert!(joined.contains("degraded=false"));
         assert!(joined.contains("durable_session_store=true"));
@@ -2370,8 +2503,8 @@ providers:
         assert!(joined.contains("configured_model_resolved=true"));
         assert!(joined.contains("stored_sessions=0"));
         assert!(joined.contains("open_tasks=1"));
-        assert!(joined.contains("component_count=9"));
-        assert!(joined.contains("capability_count=11"));
+        assert!(joined.contains("component_count=10"));
+        assert!(joined.contains("capability_count=24"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3189,6 +3322,198 @@ providers:
             .unwrap()
             .contains(&serde_json::json!("app_secret")));
         assert!(!json.to_string().contains("cli_app_id"));
+    }
+
+    #[tokio::test]
+    async fn connector_routes_expose_contract_snapshot_without_accounts() {
+        let app = api_router(test_state());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(summary["kind"], "connector_summary");
+        assert_eq!(summary["summary"]["account_count"], 0);
+        assert!(summary["summary"]["capability_count"].as_u64().unwrap() >= 8);
+        assert_eq!(summary["summary"]["resource_count"], 0);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let capabilities: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(capabilities["kind"], "connector_capabilities");
+        let list = capabilities["capabilities"].as_array().unwrap();
+        assert!(list
+            .iter()
+            .any(|item| item["capability_id"] == "channel.feishu.send_text"));
+        assert!(list
+            .iter()
+            .any(|item| item["capability_id"] == "governance.cross_plane.audit"));
+        assert!(list
+            .iter()
+            .any(|item| item["capability_id"] == "service.feishu.doc_ops"
+                && item["plane"] == "service"
+                && item["supports_commit"] == false));
+    }
+
+    #[tokio::test]
+    async fn connector_accounts_project_configured_platform_health_without_secrets() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "gateway": {
+                "platforms": [
+                    {
+                        "name": "feishu-main",
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "cli_app_id",
+                        "app_secret": ""
+                    }
+                ]
+            }
+        })));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/accounts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_accounts");
+        assert_eq!(json["total"], 1);
+        assert_eq!(json["accounts"][0]["provider"], "feishu");
+        assert_eq!(json["accounts"][0]["account_id"], "feishu-main");
+        assert_eq!(json["accounts"][0]["auth_mode"], "app_secret");
+        assert_eq!(json["accounts"][0]["health"]["status"], "degraded");
+        assert!(json["accounts"][0]["enabled_bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "channel.feishu.send_file"));
+        assert!(!json.to_string().contains("cli_app_id"));
+    }
+
+    #[tokio::test]
+    async fn mock_docs_service_connector_executes_through_cross_plane_receipt() {
+        let app = api_router(test_state());
+        let tools = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/services/mock.docs/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tools.status(), StatusCode::OK);
+        let body = to_bytes(tools.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_service_tools");
+        assert_eq!(json["service"]["id"], "mock.docs");
+        assert!(json["tools"].as_array().unwrap().iter().any(|tool| {
+            tool["capability_id"] == "service.mock.docs.read" && tool["plane"] == "service"
+        }));
+
+        let key = format!("mock-docs-{}", uuid::Uuid::new_v4());
+        let request = serde_json::json!({
+            "actor_principal": format!("user:{key}"),
+            "tool_id": "service.mock.docs.read",
+            "resource_id": "doc-1",
+            "title": "Architecture",
+            "mode": "dry_run",
+            "idempotency_key": key
+        });
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first_json["kind"], "connector_service_execution");
+        assert_eq!(first_json["service"], "mock.docs");
+        assert_eq!(first_json["replayed"], false);
+        assert_eq!(
+            first_json["result"]["resource"]["reference"],
+            "service://mock.docs/document/doc-1"
+        );
+        assert_eq!(
+            first_json["receipt"]["action"]["requested_capability"],
+            "service.mock.docs.read"
+        );
+        assert_eq!(
+            first_json["receipt"]["action"]["resource_ref"],
+            "service://mock.docs/document/doc-1"
+        );
+        let receipt_id = first_json["receipt"]["id"].as_str().unwrap().to_string();
+
+        let resources = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/resources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resources.status(), StatusCode::OK);
+        let body = to_bytes(resources.into_body(), usize::MAX).await.unwrap();
+        let resources_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resources_json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |resource| resource["reference"] == "service://mock.docs/document/doc-1"
+                    && resource["title"] == "Architecture"
+            ));
+
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let body = to_bytes(replay.into_body(), usize::MAX).await.unwrap();
+        let replay_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(replay_json["replayed"], true);
+        assert_eq!(replay_json["receipt"]["id"], receipt_id);
     }
 
     #[tokio::test]
@@ -6185,6 +6510,7 @@ providers:
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         });
         let app = api_router(state);
 
@@ -6221,6 +6547,7 @@ providers:
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         });
         let app = api_router(state);
 
@@ -6257,6 +6584,7 @@ providers:
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         });
         let app = api_router(state);
 
@@ -6302,6 +6630,7 @@ providers:
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             task_kernel: test_task_kernel(),
+            session_lease_registry: None,
         });
         let app = api_router(state);
 
