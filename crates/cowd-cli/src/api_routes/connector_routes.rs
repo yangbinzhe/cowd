@@ -85,7 +85,10 @@ pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot 
         .collect::<Vec<_>>();
     let mcp_servers = configured_mcp_servers(state.config.as_ref());
     accounts.extend(mcp_servers.iter().map(account_from_mcp_server));
+    let mock_docs = MockDocsServiceConnector::new();
+    accounts.push(account_from_service_connector(&mock_docs));
     let mut capabilities = runtime::default_capabilities();
+    capabilities.extend(mock_docs.capabilities());
     for platform in platforms {
         for operation in platform.capabilities {
             let capability = manifest_from_platform_capability(&platform.platform_type, operation);
@@ -123,6 +126,26 @@ pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot 
     snapshot
 }
 
+fn account_from_service_connector(connector: &impl ServiceConnector) -> ProviderAccount {
+    let metadata = connector.metadata();
+    let mut account = ProviderAccount::new(
+        metadata.provider.clone(),
+        metadata.id.clone(),
+        if metadata.read_only {
+            "local_readonly"
+        } else {
+            "service"
+        },
+    );
+    account.enabled_bindings = connector
+        .capabilities()
+        .into_iter()
+        .map(|capability| capability.capability_id)
+        .collect();
+    account.health = ConnectorHealth::ready();
+    account
+}
+
 fn account_from_platform(platform: &channel_routes::PlatformReadiness) -> ProviderAccount {
     let mut account = ProviderAccount::new(
         platform.platform_type.clone(),
@@ -130,6 +153,7 @@ fn account_from_platform(platform: &channel_routes::PlatformReadiness) -> Provid
         auth_mode_for_platform(&platform.platform_type),
     );
     account.secret_refs = vec![format!("config://gateway/platforms/{}", platform.name)];
+    account.scopes = platform.scopes.clone();
     account.enabled_bindings = platform
         .capabilities
         .iter()
@@ -388,8 +412,12 @@ async fn mock_docs_execute_handler(
     action.provider_account = Some("mock.docs".to_string());
     action.resource_ref = Some(preview_resource.reference.clone());
 
-    let (action, decision) = cross_plane_routes::cross_plane_control()
-        .decide_and_audit_with_action(action, chrono::Utc::now());
+    let (action, decision, _evidence) = cross_plane_routes::decide_connector_action_and_audit(
+        &state,
+        action,
+        mode,
+        chrono::Utc::now(),
+    );
     cross_plane_routes::save_cross_plane_state(&state);
 
     let allowed = decision.decision == PolicyDecisionKind::Allow;
@@ -518,8 +546,12 @@ async fn feishu_readonly_execute_handler(
         .as_ref()
         .map(|resource| resource.reference.clone());
 
-    let (action, decision) = cross_plane_routes::cross_plane_control()
-        .decide_and_audit_with_action(action, chrono::Utc::now());
+    let (action, decision, _evidence) = cross_plane_routes::decide_connector_action_and_audit(
+        &state,
+        action,
+        mode,
+        chrono::Utc::now(),
+    );
     cross_plane_routes::save_cross_plane_state(&state);
 
     let policy_allowed = decision.decision == PolicyDecisionKind::Allow;

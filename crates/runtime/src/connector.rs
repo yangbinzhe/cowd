@@ -213,9 +213,9 @@ impl CapabilityManifest {
         Self {
             capability_id: format!("service.{provider}.{operation}"),
             family: format!("service.{provider}"),
+            required_scopes: readonly_required_scopes(&provider, &operation),
             provider,
             plane: ConnectorPlane::Service,
-            required_scopes: Vec::new(),
             risk: CrossPlaneRisk::Low,
             data_classification: DataClassification::Internal,
             supports_dry_run: true,
@@ -1000,6 +1000,17 @@ fn risk_for_channel_operation(operation: &str) -> CrossPlaneRisk {
     }
 }
 
+fn readonly_required_scopes(provider: &str, operation: &str) -> Vec<String> {
+    match (provider, operation) {
+        ("feishu", "docx.read") => vec!["docx:read".to_string()],
+        ("feishu", "drive.metadata" | "drive.download_readonly") => {
+            vec!["drive:read".to_string()]
+        }
+        ("feishu", "wiki.node_readonly") => vec!["wiki:read".to_string()],
+        _ => Vec::new(),
+    }
+}
+
 fn stable_hex_hash(value: &str) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in value.as_bytes() {
@@ -1131,6 +1142,7 @@ mod tests {
                 && capability.supports_commit
                 && !capability.requires_approval
                 && capability.risk == CrossPlaneRisk::Low
+                && capability.required_scopes == vec!["docx:read".to_string()]
         }));
         assert!(matches!(
             connector.probe(&[]).status,

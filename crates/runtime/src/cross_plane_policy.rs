@@ -404,10 +404,84 @@ pub struct CrossPlaneDecisionEvidence {
     pub policy_version: String,
     pub evaluated_at: Option<DateTime<Utc>>,
     pub resolved_identity: Option<CrossPlaneResolvedIdentity>,
+    #[serde(default)]
+    pub connector_context: Option<ConnectorDecisionEvidence>,
     pub active_grants_before: usize,
     pub matched_grant_id: Option<String>,
     pub consumed_grant_id: Option<String>,
     pub remaining_uses_after: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorDecisionEvidence {
+    pub provider: String,
+    pub plane: String,
+    pub capability_id: String,
+    #[serde(default)]
+    pub provider_account: Option<String>,
+    #[serde(default)]
+    pub account_status: Option<String>,
+    #[serde(default)]
+    pub account_reason: Option<String>,
+    #[serde(default)]
+    pub resource_ref: Option<String>,
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
+    #[serde(default)]
+    pub missing_scopes: Vec<String>,
+    pub supports_commit: bool,
+    pub requires_approval: bool,
+    pub risk: CrossPlaneRisk,
+    pub data_classification: DataClassification,
+    pub requested_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorActionContext {
+    pub provider: String,
+    pub plane: String,
+    pub capability_id: String,
+    pub provider_account: Option<String>,
+    pub account_status: Option<String>,
+    pub account_reason: Option<String>,
+    pub resource_ref: Option<String>,
+    pub required_scopes: Vec<String>,
+    pub missing_scopes: Vec<String>,
+    pub supports_commit: bool,
+    pub requires_approval: bool,
+    pub risk: CrossPlaneRisk,
+    pub data_classification: DataClassification,
+    pub requested_mode: String,
+}
+
+impl ConnectorActionContext {
+    #[must_use]
+    pub fn evidence(&self) -> ConnectorDecisionEvidence {
+        ConnectorDecisionEvidence {
+            provider: self.provider.clone(),
+            plane: self.plane.clone(),
+            capability_id: self.capability_id.clone(),
+            provider_account: self.provider_account.clone(),
+            account_status: self.account_status.clone(),
+            account_reason: self.account_reason.clone(),
+            resource_ref: self.resource_ref.clone(),
+            required_scopes: self.required_scopes.clone(),
+            missing_scopes: self.missing_scopes.clone(),
+            supports_commit: self.supports_commit,
+            requires_approval: self.requires_approval,
+            risk: self.risk,
+            data_classification: self.data_classification,
+            requested_mode: self.requested_mode.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn requests_commit(&self) -> bool {
+        matches!(
+            self.requested_mode.trim().to_ascii_lowercase().as_str(),
+            "commit" | "live" | "execute"
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,6 +889,39 @@ impl CrossPlaneControlPlane {
     }
 
     #[must_use]
+    pub fn decide_with_connector_context(
+        &self,
+        mut action: CrossPlaneAction,
+        context: Option<ConnectorActionContext>,
+        now: DateTime<Utc>,
+    ) -> (
+        CrossPlaneAction,
+        CrossPlanePolicyDecision,
+        CrossPlaneDecisionEvidence,
+    ) {
+        apply_connector_context_to_action(&mut action, context.as_ref());
+        let resolved_identity = self.resolve_action_identity(&mut action, now);
+        let active_grants = self.active_grants(now);
+        let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default())
+            .with_grants(active_grants.clone());
+        let decision = engine.decide_with_connector_context(&action, context.as_ref(), now);
+        let evidence = CrossPlaneDecisionEvidence {
+            policy_version: "cross-plane.v2.connector".to_string(),
+            evaluated_at: Some(now),
+            resolved_identity,
+            connector_context: context.as_ref().map(ConnectorActionContext::evidence),
+            active_grants_before: active_grants.len(),
+            matched_grant_id: decision
+                .matched_grant
+                .as_ref()
+                .map(|grant| grant.id.clone()),
+            consumed_grant_id: None,
+            remaining_uses_after: None,
+        };
+        (action, decision, evidence)
+    }
+
+    #[must_use]
     pub fn decide_and_audit_with_action(
         &self,
         mut action: CrossPlaneAction,
@@ -830,6 +937,7 @@ impl CrossPlaneControlPlane {
             policy_version: "cross-plane.v1".to_string(),
             evaluated_at: Some(now),
             resolved_identity,
+            connector_context: None,
             active_grants_before: active_grants.len(),
             matched_grant_id: decision
                 .matched_grant
@@ -850,6 +958,36 @@ impl CrossPlaneControlPlane {
             .with_evidence(evidence),
         );
         (action, decision)
+    }
+
+    #[must_use]
+    pub fn decide_and_audit_with_connector_context(
+        &self,
+        action: CrossPlaneAction,
+        context: Option<ConnectorActionContext>,
+        now: DateTime<Utc>,
+    ) -> (
+        CrossPlaneAction,
+        CrossPlanePolicyDecision,
+        CrossPlaneDecisionEvidence,
+    ) {
+        let (action, decision, mut evidence) =
+            self.decide_with_connector_context(action, context, now);
+        let consumed = self.consume_matched_grant_if_needed(&decision);
+        evidence.consumed_grant_id = consumed
+            .as_ref()
+            .map(|(grant_id, _remaining)| grant_id.clone());
+        evidence.remaining_uses_after = consumed.as_ref().map(|(_grant_id, remaining)| *remaining);
+        self.record_audit(
+            CrossPlaneAuditRecord::new(
+                action.clone(),
+                decision.clone(),
+                format!("{:?}", decision.decision).to_lowercase(),
+                decision.reason.clone(),
+            )
+            .with_evidence(evidence.clone()),
+        );
+        (action, decision, evidence)
     }
 
     fn resolve_action_identity(
@@ -980,6 +1118,20 @@ impl CrossPlanePolicyEngine {
         action: &CrossPlaneAction,
         now: DateTime<Utc>,
     ) -> CrossPlanePolicyDecision {
+        self.decide_with_connector_context(action, None, now)
+    }
+
+    #[must_use]
+    pub fn decide_with_connector_context(
+        &self,
+        action: &CrossPlaneAction,
+        context: Option<&ConnectorActionContext>,
+        now: DateTime<Utc>,
+    ) -> CrossPlanePolicyDecision {
+        if let Some(decision) = self.connector_preflight_decision(action, context) {
+            return decision;
+        }
+
         if let Some(grant) = self
             .grants
             .iter()
@@ -1030,6 +1182,16 @@ impl CrossPlanePolicyEngine {
             DataClassification::Public | DataClassification::Internal => {}
         }
 
+        if context.is_some_and(|context| context.requires_approval) {
+            return CrossPlanePolicyDecision {
+                decision: PolicyDecisionKind::RequireSingleApproval,
+                reason: "connector_capability_requires_approval".to_string(),
+                matched_grant: None,
+                required_approval: Some(GrantType::SingleUse),
+                degrade_to: None,
+            };
+        }
+
         match action.risk {
             CrossPlaneRisk::Critical => self.decision(
                 self.config.critical_risk,
@@ -1053,6 +1215,66 @@ impl CrossPlanePolicyEngine {
                 degrade_to: None,
             },
         }
+    }
+
+    fn connector_preflight_decision(
+        &self,
+        action: &CrossPlaneAction,
+        context: Option<&ConnectorActionContext>,
+    ) -> Option<CrossPlanePolicyDecision> {
+        let context = context?;
+        if context.capability_id != action.requested_capability {
+            return Some(CrossPlanePolicyDecision {
+                decision: PolicyDecisionKind::Deny,
+                reason: "connector_capability_mismatch".to_string(),
+                matched_grant: None,
+                required_approval: None,
+                degrade_to: None,
+            });
+        }
+        if !context.missing_scopes.is_empty() {
+            return Some(CrossPlanePolicyDecision {
+                decision: PolicyDecisionKind::Deny,
+                reason: format!(
+                    "connector_missing_account_scope:{}",
+                    context.missing_scopes.join(",")
+                ),
+                matched_grant: None,
+                required_approval: None,
+                degrade_to: None,
+            });
+        }
+        match context.account_status.as_deref() {
+            Some("disabled") => {
+                return Some(CrossPlanePolicyDecision {
+                    decision: PolicyDecisionKind::Deny,
+                    reason: "connector_account_disabled".to_string(),
+                    matched_grant: None,
+                    required_approval: None,
+                    degrade_to: None,
+                });
+            }
+            Some("degraded" | "unknown") if context.requests_commit() => {
+                return Some(CrossPlanePolicyDecision {
+                    decision: PolicyDecisionKind::Deny,
+                    reason: "connector_account_not_ready_for_commit".to_string(),
+                    matched_grant: None,
+                    required_approval: None,
+                    degrade_to: None,
+                });
+            }
+            _ => {}
+        }
+        if context.requests_commit() && !context.supports_commit {
+            return Some(CrossPlanePolicyDecision {
+                decision: PolicyDecisionKind::Deny,
+                reason: "connector_capability_does_not_support_commit".to_string(),
+                matched_grant: None,
+                required_approval: None,
+                degrade_to: None,
+            });
+        }
+        None
     }
 
     fn decision(
@@ -1082,6 +1304,23 @@ fn optional_matches(expected: &Option<String>, actual: &Option<String>) -> bool 
     expected
         .as_ref()
         .is_none_or(|expected| actual.as_ref().is_some_and(|actual| actual == expected))
+}
+
+fn apply_connector_context_to_action(
+    action: &mut CrossPlaneAction,
+    context: Option<&ConnectorActionContext>,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    action.risk = context.risk;
+    action.data_classification = context.data_classification;
+    if action.provider_account.is_none() {
+        action.provider_account = context.provider_account.clone();
+    }
+    if action.resource_ref.is_none() {
+        action.resource_ref = context.resource_ref.clone();
+    }
 }
 
 fn normalize_identity_ref(identity_ref: &str) -> String {
@@ -1342,6 +1581,95 @@ mod tests {
     }
 
     #[test]
+    fn connector_context_missing_scope_denies_before_grant() {
+        let grant = CrossPlaneGrant::persistent("user:yi", "service.feishu.docx.read");
+        let engine =
+            CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default()).with_grants(vec![grant]);
+        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.docx.read");
+        action.identity_trust = IdentityTrust::Verified;
+        let context = ConnectorActionContext {
+            provider: "feishu".to_string(),
+            plane: "service".to_string(),
+            capability_id: "service.feishu.docx.read".to_string(),
+            provider_account: Some("feishu-main".to_string()),
+            account_status: Some("ready".to_string()),
+            account_reason: None,
+            resource_ref: Some("service://feishu/docx/doc-1".to_string()),
+            required_scopes: vec!["docx:read".to_string()],
+            missing_scopes: vec!["docx:read".to_string()],
+            supports_commit: true,
+            requires_approval: false,
+            risk: CrossPlaneRisk::Low,
+            data_classification: DataClassification::Internal,
+            requested_mode: "commit".to_string(),
+        };
+
+        let decision = engine.decide_with_connector_context(&action, Some(&context), now());
+
+        assert_eq!(decision.decision, PolicyDecisionKind::Deny);
+        assert_eq!(decision.reason, "connector_missing_account_scope:docx:read");
+        assert!(decision.matched_grant.is_none());
+    }
+
+    #[test]
+    fn connector_context_disabled_account_denies_commit() {
+        let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default());
+        let mut action = CrossPlaneAction::new("user:yi", "channel.feishu.send_text");
+        action.identity_trust = IdentityTrust::Verified;
+        let context = ConnectorActionContext {
+            provider: "feishu".to_string(),
+            plane: "channel".to_string(),
+            capability_id: "channel.feishu.send_text".to_string(),
+            provider_account: Some("feishu-main".to_string()),
+            account_status: Some("disabled".to_string()),
+            account_reason: Some("platform is disabled".to_string()),
+            resource_ref: Some("text://hello".to_string()),
+            required_scopes: Vec::new(),
+            missing_scopes: Vec::new(),
+            supports_commit: true,
+            requires_approval: false,
+            risk: CrossPlaneRisk::Low,
+            data_classification: DataClassification::Internal,
+            requested_mode: "commit".to_string(),
+        };
+
+        let decision = engine.decide_with_connector_context(&action, Some(&context), now());
+
+        assert_eq!(decision.decision, PolicyDecisionKind::Deny);
+        assert_eq!(decision.reason, "connector_account_disabled");
+    }
+
+    #[test]
+    fn connector_requires_approval_can_be_allowed_by_matching_grant() {
+        let grant = CrossPlaneGrant::persistent("user:yi", "mcp.github_com.tool.create_issue");
+        let engine =
+            CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default()).with_grants(vec![grant]);
+        let mut action = CrossPlaneAction::new("user:yi", "mcp.github_com.tool.create_issue");
+        action.identity_trust = IdentityTrust::Verified;
+        let context = ConnectorActionContext {
+            provider: "mcp".to_string(),
+            plane: "mcp".to_string(),
+            capability_id: "mcp.github_com.tool.create_issue".to_string(),
+            provider_account: Some("github.com".to_string()),
+            account_status: Some("ready".to_string()),
+            account_reason: None,
+            resource_ref: None,
+            required_scopes: Vec::new(),
+            missing_scopes: Vec::new(),
+            supports_commit: true,
+            requires_approval: true,
+            risk: CrossPlaneRisk::Medium,
+            data_classification: DataClassification::Internal,
+            requested_mode: "commit".to_string(),
+        };
+
+        let decision = engine.decide_with_connector_context(&action, Some(&context), now());
+
+        assert_eq!(decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(decision.reason, "matched_grant");
+    }
+
+    #[test]
     fn high_risk_requires_approval_without_matching_grant() {
         let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default());
         let mut action = CrossPlaneAction::new("user:yi", "service.feishu.drive.download");
@@ -1514,6 +1842,50 @@ mod tests {
         assert_eq!(decision.decision, PolicyDecisionKind::Allow);
         assert_eq!(control.summary(now()).active_grants, 1);
         assert!(control.list_audit(10, 0).is_empty());
+    }
+
+    #[test]
+    fn control_plane_audits_connector_evidence_fields() {
+        let control = CrossPlaneControlPlane::new();
+        let mut action = CrossPlaneAction::new("user:yi", "service.feishu.docx.read");
+        action.identity_trust = IdentityTrust::Verified;
+        let context = ConnectorActionContext {
+            provider: "feishu".to_string(),
+            plane: "service".to_string(),
+            capability_id: "service.feishu.docx.read".to_string(),
+            provider_account: Some("feishu-main".to_string()),
+            account_status: Some("ready".to_string()),
+            account_reason: None,
+            resource_ref: Some("service://feishu/docx/doc-1".to_string()),
+            required_scopes: vec!["docx:read".to_string()],
+            missing_scopes: Vec::new(),
+            supports_commit: true,
+            requires_approval: false,
+            risk: CrossPlaneRisk::Low,
+            data_classification: DataClassification::Internal,
+            requested_mode: "commit".to_string(),
+        };
+
+        let (_action, decision, evidence) =
+            control.decide_and_audit_with_connector_context(action, Some(context), now());
+
+        assert_eq!(decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(
+            evidence
+                .connector_context
+                .as_ref()
+                .map(|context| context.capability_id.as_str()),
+            Some("service.feishu.docx.read")
+        );
+        let audit = control.list_audit(10, 0);
+        let connector = audit[0].evidence.connector_context.as_ref().unwrap();
+        assert_eq!(connector.provider_account.as_deref(), Some("feishu-main"));
+        assert_eq!(
+            connector.resource_ref.as_deref(),
+            Some("service://feishu/docx/doc-1")
+        );
+        assert_eq!(connector.required_scopes, vec!["docx:read".to_string()]);
+        assert!(connector.missing_scopes.is_empty());
     }
 
     #[test]

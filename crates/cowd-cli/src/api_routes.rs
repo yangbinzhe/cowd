@@ -3331,7 +3331,7 @@ providers:
     }
 
     #[tokio::test]
-    async fn connector_routes_expose_contract_snapshot_without_accounts() {
+    async fn connector_routes_expose_contract_snapshot_with_local_service_account() {
         let workspace = unique_test_workspace("connector-empty");
         let app = api_router(test_state_with_config_runtime_and_workspace(
             serde_json::json!({}),
@@ -3352,7 +3352,7 @@ providers:
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(summary["kind"], "connector_summary");
-        assert_eq!(summary["summary"]["account_count"], 0);
+        assert_eq!(summary["summary"]["account_count"], 1);
         assert!(summary["summary"]["capability_count"].as_u64().unwrap() >= 8);
         assert_eq!(summary["summary"]["resource_count"], 0);
 
@@ -3376,6 +3376,10 @@ providers:
         assert!(list
             .iter()
             .any(|item| item["capability_id"] == "governance.cross_plane.audit"));
+        assert!(list
+            .iter()
+            .any(|item| item["capability_id"] == "service.mock.docs.read"
+                && item["plane"] == "service"));
         assert!(list
             .iter()
             .any(|item| item["capability_id"] == "service.feishu.doc_ops"
@@ -3411,7 +3415,7 @@ providers:
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["kind"], "connector_accounts");
-        assert_eq!(json["total"], 1);
+        assert_eq!(json["total"], 2);
         assert_eq!(json["accounts"][0]["provider"], "feishu");
         assert_eq!(json["accounts"][0]["account_id"], "feishu-main");
         assert_eq!(json["accounts"][0]["auth_mode"], "app_secret");
@@ -3456,7 +3460,7 @@ providers:
         let body = to_bytes(accounts.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["kind"], "connector_accounts");
-        assert_eq!(json["total"], 2);
+        assert_eq!(json["total"], 3);
         assert!(json["accounts"].as_array().unwrap().iter().any(|account| {
             account["provider"] == "mcp"
                 && account["account_id"] == "github.com"
@@ -3741,7 +3745,8 @@ providers:
                         "platformType": "feishu",
                         "enabled": true,
                         "app_id": "cli_xxx",
-                        "app_secret": "secret_xxx"
+                        "app_secret": "secret_xxx",
+                        "scopes": ["docx:read"]
                     }]
                 }
             }),
@@ -3810,6 +3815,39 @@ providers:
         assert_eq!(json["result"]["output"]["body_included"], false);
         assert_eq!(json["resource_persisted"], true);
         assert!(!json.to_string().contains("secret_xxx"));
+
+        let audit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/audit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audit.status(), StatusCode::OK);
+        let audit_body = to_bytes(audit.into_body(), usize::MAX).await.unwrap();
+        let audit_json: serde_json::Value = serde_json::from_slice(&audit_body).unwrap();
+        let connector_evidence = audit_json["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["action"]["requested_capability"] == "service.feishu.docx.read")
+            .and_then(|record| record["evidence"]["connector_context"].as_object())
+            .expect("feishu connector action should audit connector evidence");
+        assert_eq!(
+            connector_evidence["provider_account"].as_str(),
+            Some("feishu-main")
+        );
+        assert_eq!(
+            connector_evidence["resource_ref"].as_str(),
+            Some("service://feishu/docx/doccn-ready")
+        );
+        assert_eq!(
+            connector_evidence["required_scopes"],
+            serde_json::json!(["docx:read"])
+        );
 
         let resources = app
             .oneshot(
@@ -3935,7 +3973,10 @@ providers:
                 record["evidence"]["consumed_grant_id"].as_str() == Some(grant_id.as_str())
             })
             .expect("audit should include single-use grant consumption evidence");
-        assert_eq!(consumed["evidence"]["policy_version"], "cross-plane.v1");
+        assert_eq!(
+            consumed["evidence"]["policy_version"],
+            "cross-plane.v2.connector"
+        );
         assert_eq!(consumed["evidence"]["remaining_uses_after"], 0);
     }
 

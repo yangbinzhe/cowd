@@ -51,6 +51,8 @@ pub(super) struct PlatformReadiness {
     pub(super) configured: bool,
     pub(super) credential_present: bool,
     pub(super) missing_required: Vec<String>,
+    #[serde(default)]
+    pub(super) scopes: Vec<String>,
     pub(super) capabilities: Vec<&'static str>,
     pub(super) diagnostics: Vec<String>,
 }
@@ -166,6 +168,7 @@ fn platform_readiness_from_value(value: &serde_json::Value) -> Option<PlatformRe
         configured,
         credential_present,
         missing_required,
+        scopes: platform_scopes_from_value(value),
         capabilities: platform_capabilities(&platform_type),
         diagnostics,
     })
@@ -183,9 +186,30 @@ fn disabled_platform(platform_type: &str) -> PlatformReadiness {
             .iter()
             .map(|field| (*field).to_string())
             .collect(),
+        scopes: Vec::new(),
         capabilities: platform_capabilities(platform_type),
         diagnostics: vec!["platform is not configured".to_string()],
     }
+}
+
+fn platform_scopes_from_value(value: &serde_json::Value) -> Vec<String> {
+    let mut scopes = value
+        .get("scopes")
+        .or_else(|| value.get("scope"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    scopes.sort();
+    scopes.dedup();
+    scopes
 }
 
 fn required_fields(platform_type: &str) -> Vec<&'static str> {

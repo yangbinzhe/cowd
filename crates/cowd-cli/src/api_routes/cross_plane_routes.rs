@@ -12,9 +12,10 @@ use axum::{
 };
 use runtime::platform::{OutboundDispatch, OutboundPayloadKind, SessionKey};
 use runtime::{
-    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneDispatchOutcome,
+    ConnectorActionContext, ConnectorRegistrySnapshot, CrossPlaneAction, CrossPlaneAuditRecord,
+    CrossPlaneControlPlane, CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome,
     CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt, CrossPlaneGrant,
-    CrossPlaneIdentityBinding, CrossPlanePolicyDecision, PolicyDecisionKind,
+    CrossPlaneIdentityBinding, CrossPlanePolicyDecision, PolicyDecisionKind, ProviderAccount,
 };
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +89,7 @@ struct CrossPlaneActionReadiness {
     platform_readiness: Option<channel_routes::PlatformReadiness>,
     adapter_capability: Option<CrossPlaneAdapterCapability>,
     dispatch_target: Option<CrossPlaneDispatchTarget>,
+    evidence: CrossPlaneDecisionEvidence,
     executable: bool,
     blockers: Vec<String>,
 }
@@ -284,13 +286,14 @@ async fn cross_plane_policy_simulate_handler(
     Json(action): Json<CrossPlaneAction>,
 ) -> impl IntoResponse {
     ensure_cross_plane_loaded(&state);
-    let (action, decision) =
-        cross_plane_control().decide_and_audit_with_action(action, chrono::Utc::now());
+    let (action, decision, evidence) =
+        decide_connector_action_and_audit(&state, action, "dry_run", chrono::Utc::now());
     save_cross_plane_state(&state);
     Json(serde_json::json!({
         "kind": "cross_plane_policy_simulation",
         "action": action,
         "decision": decision,
+        "evidence": evidence,
     }))
 }
 
@@ -299,7 +302,7 @@ async fn cross_plane_action_preflight_handler(
     Json(action): Json<CrossPlaneAction>,
 ) -> impl IntoResponse {
     ensure_cross_plane_loaded(&state);
-    let readiness = evaluate_action_readiness(&state, action, chrono::Utc::now()).await;
+    let readiness = evaluate_action_readiness(&state, action, "dry_run", chrono::Utc::now()).await;
     Json(serde_json::json!({
         "kind": "cross_plane_action_preflight",
         "action": readiness.action,
@@ -308,6 +311,7 @@ async fn cross_plane_action_preflight_handler(
         "platform_readiness": readiness.platform_readiness,
         "adapter_capability": readiness.adapter_capability,
         "dispatch_target": readiness.dispatch_target,
+        "evidence": readiness.evidence,
         "executable": readiness.executable,
         "blockers": readiness.blockers,
     }))
@@ -350,7 +354,7 @@ async fn cross_plane_action_execute_handler(
             }));
         }
     }
-    let mut readiness = evaluate_action_readiness(&state, request.action, now).await;
+    let mut readiness = evaluate_action_readiness(&state, request.action, &mode, now).await;
     let mut status = "blocked";
     let mut dispatch_status = "not_started";
     let mut audit_result = "blocked";
@@ -442,7 +446,8 @@ async fn cross_plane_action_execute_handler(
         readiness.decision.clone(),
         audit_result,
         audit_summary,
-    );
+    )
+    .with_evidence(readiness.evidence.clone());
     let audit_record_id = audit_record.id.clone();
     cross_plane_control().record_audit(audit_record);
     let receipt = CrossPlaneExecutionReceipt::new(
@@ -513,9 +518,12 @@ fn target_platform_from_action(action: &CrossPlaneAction) -> Option<String> {
 async fn evaluate_action_readiness(
     state: &AppState,
     action: CrossPlaneAction,
+    mode: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> CrossPlaneActionReadiness {
-    let (action, decision) = cross_plane_control().decide_with_action(action, now);
+    let connector_context = connector_context_for_action(state, &action, mode);
+    let (action, decision, evidence) =
+        cross_plane_control().decide_with_connector_context(action, connector_context, now);
     let target_platform = target_platform_from_action(&action);
     let platforms = channel_routes::configured_platforms(state.config.as_ref());
     let platform_readiness = target_platform.as_ref().and_then(|target| {
@@ -551,9 +559,109 @@ async fn evaluate_action_readiness(
         platform_readiness,
         adapter_capability,
         dispatch_target,
+        evidence,
         executable,
         blockers,
     }
+}
+
+pub(super) fn decide_connector_action_and_audit(
+    state: &AppState,
+    action: CrossPlaneAction,
+    mode: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (
+    CrossPlaneAction,
+    CrossPlanePolicyDecision,
+    CrossPlaneDecisionEvidence,
+) {
+    let connector_context = connector_context_for_action(state, &action, mode);
+    cross_plane_control().decide_and_audit_with_connector_context(action, connector_context, now)
+}
+
+fn connector_context_for_action(
+    state: &AppState,
+    action: &CrossPlaneAction,
+    mode: &str,
+) -> Option<ConnectorActionContext> {
+    let snapshot = super::connector_routes::connector_snapshot(state);
+    connector_context_from_snapshot(&snapshot, action, mode)
+}
+
+fn connector_context_from_snapshot(
+    snapshot: &ConnectorRegistrySnapshot,
+    action: &CrossPlaneAction,
+    mode: &str,
+) -> Option<ConnectorActionContext> {
+    let capability = snapshot
+        .capabilities
+        .iter()
+        .find(|capability| capability.capability_id == action.requested_capability)?;
+    let account = connector_account_for_action(snapshot, action, &capability.provider);
+    let missing_scopes = account
+        .as_ref()
+        .map(|account| {
+            capability
+                .missing_scopes(account)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| capability.required_scopes.clone());
+    Some(ConnectorActionContext {
+        provider: capability.provider.clone(),
+        plane: format!("{:?}", capability.plane).to_ascii_lowercase(),
+        capability_id: capability.capability_id.clone(),
+        provider_account: account
+            .as_ref()
+            .map(|account| account.account_id.clone())
+            .or_else(|| action.provider_account.clone()),
+        account_status: account
+            .as_ref()
+            .map(|account| format!("{:?}", account.health.status).to_ascii_lowercase()),
+        account_reason: account
+            .as_ref()
+            .and_then(|account| account.health.reason.clone()),
+        resource_ref: action.resource_ref.clone(),
+        required_scopes: capability.required_scopes.clone(),
+        missing_scopes,
+        supports_commit: capability.supports_commit,
+        requires_approval: capability.requires_approval,
+        risk: capability.risk,
+        data_classification: capability.data_classification,
+        requested_mode: normalize_execute_mode(mode),
+    })
+}
+
+fn connector_account_for_action<'a>(
+    snapshot: &'a ConnectorRegistrySnapshot,
+    action: &CrossPlaneAction,
+    provider: &str,
+) -> Option<&'a ProviderAccount> {
+    if let Some(requested) = action
+        .provider_account
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(account) = snapshot.accounts.iter().find(|account| {
+            account.account_id == requested
+                || account.provider == requested
+                || account
+                    .enabled_bindings
+                    .iter()
+                    .any(|binding| binding == requested)
+        }) {
+            return Some(account);
+        }
+    }
+    snapshot.accounts.iter().find(|account| {
+        account.provider == provider
+            && account
+                .enabled_bindings
+                .iter()
+                .any(|binding| binding == &action.requested_capability)
+    })
 }
 
 fn normalize_execute_mode(mode: &str) -> String {
