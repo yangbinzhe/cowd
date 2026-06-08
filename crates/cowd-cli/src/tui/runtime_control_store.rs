@@ -532,9 +532,17 @@ pub async fn refresh_runtime_control_snapshot(
             Err(err) => snapshot.degrade(format!("approval projection unavailable: {err}")),
         },
     }
-    match projection.memory_status().await {
+    match control_client.memory_status().await {
         Ok(value) => snapshot.ingest_memory_status(&value),
-        Err(err) => snapshot.degrade(format!("memory projection unavailable: {err}")),
+        Err(socket_err) => match projection.memory_status().await {
+            Ok(value) => {
+                snapshot.degrade(format!("memory socket unavailable: {socket_err}"));
+                snapshot.ingest_memory_status(&value);
+            }
+            Err(err) => snapshot.degrade(format!(
+                "memory projection unavailable: {err}; socket unavailable: {socket_err}"
+            )),
+        },
     }
     match projection.cross_plane_summary().await {
         Ok(value) => snapshot.ingest_cross_plane_summary(&value),
@@ -554,8 +562,27 @@ pub async fn refresh_runtime_control_snapshot(
     }
 
     if let Some(session_id) = session_id {
-        if let Err(err) = projection.current_context(Some(session_id)).await {
-            snapshot.degrade(format!("context projection unavailable: {err}"));
+        match control_client.context_snapshot(Some(session_id)).await {
+            Ok(value) => {
+                if value
+                    .get("degraded")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    let reason = value
+                        .get("degraded_reason")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("context socket degraded");
+                    snapshot.degrade(format!("context socket degraded: {reason}"));
+                }
+            }
+            Err(socket_err) => {
+                if let Err(err) = projection.current_context(Some(session_id)).await {
+                    snapshot.degrade(format!(
+                        "context projection unavailable: {err}; socket unavailable: {socket_err}"
+                    ));
+                }
+            }
         }
     }
 

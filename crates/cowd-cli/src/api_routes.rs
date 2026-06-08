@@ -50,7 +50,7 @@ mod channel_routes;
 pub(crate) mod connector_routes;
 mod context_routes;
 mod cross_plane_routes;
-mod memory_routes;
+pub(crate) mod memory_routes;
 mod message_routes;
 mod profile_routes;
 mod public_routes;

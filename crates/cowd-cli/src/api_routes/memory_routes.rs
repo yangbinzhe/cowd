@@ -93,7 +93,7 @@ fn memory_kernel_health_json(health: memory::MemoryHealth) -> serde_json::Value 
     })
 }
 
-async fn memory_status_value(state: &AppState) -> serde_json::Value {
+pub(crate) async fn memory_status_value(state: &AppState) -> serde_json::Value {
     if let Some(ref mgr) = state.memory_manager {
         let layers = mgr.list_layers().await;
         let kernel = MemoryKernel::new(Arc::clone(mgr));

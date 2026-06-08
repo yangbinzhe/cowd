@@ -728,6 +728,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
 /// Supported commands:
 ///   {"cmd":"status"}
 ///   {"cmd":"runtime_snapshot"}
+///   {"cmd":"memory_status"}
+///   {"cmd":"context_snapshot","session_id":"..."}
 ///   {"cmd":"task_list"}
 ///   {"cmd":"task_start","objective":"...","yolo_mode":true}
 ///   {"cmd":"task_cancel","id":"..."}
@@ -793,6 +795,24 @@ async fn handle_unix_client(
                             Some("runtime_snapshot") => {
                                 daemon_runtime_snapshot(&sessions, &lease_registry, started_at)
                                     .await
+                            }
+                            Some("memory_status") => {
+                                let mut value =
+                                    api_routes::memory_routes::memory_status_value(&app_state)
+                                        .await;
+                                if let Some(object) = value.as_object_mut() {
+                                    object.insert("ok".to_string(), serde_json::json!(true));
+                                    object.insert(
+                                        "kind".to_string(),
+                                        serde_json::json!("daemon_memory_status"),
+                                    );
+                                }
+                                value
+                            }
+                            Some("context_snapshot") => {
+                                let session_id =
+                                    cmd.get("session_id").and_then(|value| value.as_str());
+                                daemon_context_snapshot(&app_state, session_id).await
                             }
                             Some("task_list") => serde_json::json!({
                                 "ok": true,
@@ -1346,6 +1366,56 @@ async fn daemon_runtime_snapshot(
             "control": "unix_socket",
             "projection": "http_optional",
         },
+    })
+}
+
+async fn daemon_context_snapshot(
+    app_state: &api_routes::AppState,
+    requested_session_id: Option<&str>,
+) -> serde_json::Value {
+    let session_id = requested_session_id
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            app_state
+                .session_kernel
+                .list_active_session_ids()
+                .into_iter()
+                .next()
+        })
+        .unwrap_or_else(|| "daemon-context".to_string());
+
+    let Some(runtime_entry) = app_state.session_kernel.active_runtime(&session_id) else {
+        return serde_json::json!({
+            "ok": true,
+            "kind": "daemon_context_snapshot",
+            "enabled": false,
+            "source": "session_kernel",
+            "session_id": session_id,
+            "has_envelope": false,
+            "degraded": true,
+            "degraded_reason": "runtime not active",
+        });
+    };
+
+    let runtime = runtime_entry.lock().await;
+    let envelope = runtime.last_context_envelope();
+    serde_json::json!({
+        "ok": true,
+        "kind": "daemon_context_snapshot",
+        "enabled": true,
+        "source": "runtime",
+        "session_id": session_id,
+        "has_envelope": envelope.is_some(),
+        "envelope_id": envelope.as_ref().map(|value| value.id.as_str()),
+        "intent": envelope.as_ref().map(|value| value.intent.as_str()),
+        "selected_items": envelope.as_ref().map(|value| value.selected.len()).unwrap_or(0),
+        "omitted_items": envelope.as_ref().map(|value| value.omitted.len()).unwrap_or(0),
+        "stable_head_items": envelope
+            .as_ref()
+            .map(|value| value.assembled.stable_head.len())
+            .unwrap_or(0),
+        "degraded": false,
     })
 }
 

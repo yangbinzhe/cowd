@@ -316,6 +316,32 @@ impl DaemonControlClient {
         )
     }
 
+    pub async fn memory_status(&self) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "memory_status",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+            }))
+            .await?,
+            "daemon rejected memory_status request",
+        )
+    }
+
+    pub async fn context_snapshot(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "context_snapshot",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "session_id": session_id,
+            }))
+            .await?,
+            "daemon rejected context_snapshot request",
+        )
+    }
+
     pub async fn respond_approval(
         &self,
         id: &str,
@@ -838,6 +864,57 @@ mod tests {
             .await
             .expect_err("status should reject");
         assert!(matches!(err, DaemonControlError::Rejected(_)));
+
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn memory_context_control_client_sends_socket_commands() {
+        let socket = temp_socket("memory-context-control");
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let server = tokio::spawn(async move {
+            for expected in ["memory_status", "context_snapshot"] {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("read command");
+                let command: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("command json");
+                assert_eq!(command.get("cmd").and_then(|v| v.as_str()), Some(expected));
+                match expected {
+                    "memory_status" => {
+                        writer
+                            .write_all(
+                                br#"{"ok":true,"kind":"daemon_memory_status","enabled":true}"#,
+                            )
+                            .await
+                            .expect("write response");
+                    }
+                    _ => {
+                        assert_eq!(
+                            command.get("session_id").and_then(|v| v.as_str()),
+                            Some("session-1")
+                        );
+                        writer
+                            .write_all(br#"{"ok":true,"kind":"daemon_context_snapshot","enabled":true,"session_id":"session-1","has_envelope":false}"#)
+                            .await
+                            .expect("write response");
+                    }
+                }
+                writer.write_all(b"\n").await.expect("write newline");
+            }
+        });
+
+        let client = DaemonControlClient::new(&socket).with_timeout(Duration::from_secs(1));
+        let memory = client.memory_status().await.expect("memory status");
+        assert_eq!(memory["kind"], "daemon_memory_status");
+        let context = client
+            .context_snapshot(Some("session-1"))
+            .await
+            .expect("context snapshot");
+        assert_eq!(context["session_id"], "session-1");
 
         server.await.expect("server task");
         let _ = std::fs::remove_file(socket);
