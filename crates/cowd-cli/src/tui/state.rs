@@ -3354,6 +3354,58 @@ providers:
         }
     }
 
+    #[test]
+    fn render_bridge_projects_runtime_command_center_to_gateway_tab() {
+        let mut state = TuiState::new("m", "scenario-session");
+        state.sidebar_active_tab = 11;
+        state.app.server_running = true;
+        state.app.server_uptime_secs = Some(61);
+        state.app.active_api_sessions = 2;
+        state.app.daemon_runtime_readiness = Some("94%".to_string());
+        state.app.daemon_runtime_components = Some(12);
+        state.app.daemon_task_count = Some(3);
+        state.app.daemon_pending_approvals = Some(1);
+        state.app.memory_status = Some("available".to_string());
+        state.app.daemon_action_receipts = vec![
+            crate::tui::runtime_control_store::RuntimeActionReceiptSummary {
+                status: "ok".to_string(),
+                dispatch_status: "completed".to_string(),
+                mode: "daemon-control".to_string(),
+                capability: "daemon.task.complete".to_string(),
+                idempotency_key: Some("task-1".to_string()),
+            },
+        ];
+        state.app.daemon_connector_resources = vec![
+            crate::tui::runtime_control_store::ConnectorResourceSummary {
+                reference: "service://mock.docs/document/1".to_string(),
+                provider: "mock.docs".to_string(),
+                resource_type: "document".to_string(),
+                title: "Bridge Doc".to_string(),
+                indexed_state: "indexed".to_string(),
+            },
+        ];
+
+        let mut terminal = MockTerminal::new(132, 38);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+
+        for expected in [
+            "Core Runtime",
+            "AI Context",
+            "Work Control",
+            "Connector Plane",
+            "available",
+            "completed",
+            "mock.docs",
+            "indexed",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "gateway bridge render should contain {expected}, got: {joined}"
+            );
+        }
+    }
+
     // ── startup_loading ─────────────────────────────────────────
 
     #[test]
