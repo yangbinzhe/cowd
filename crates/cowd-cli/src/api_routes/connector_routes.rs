@@ -458,7 +458,9 @@ fn list_durable_resources(
     }
 }
 
-fn durable_resource_directory(state: &AppState) -> rusqlite::Result<SqliteResourceDirectory> {
+pub(super) fn durable_resource_directory(
+    state: &AppState,
+) -> rusqlite::Result<SqliteResourceDirectory> {
     let path = resource_directory_path(&state.workspace_root);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
@@ -471,7 +473,7 @@ fn durable_resource_directory(state: &AppState) -> rusqlite::Result<SqliteResour
     SqliteResourceDirectory::open(path)
 }
 
-fn resource_directory_path(workspace_root: &Path) -> PathBuf {
+pub(super) fn resource_directory_path(workspace_root: &Path) -> PathBuf {
     workspace_root
         .join(".cowd")
         .join("resource-directory.sqlite")

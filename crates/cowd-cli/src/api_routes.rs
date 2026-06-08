@@ -5268,6 +5268,117 @@ providers:
     }
 
     #[tokio::test]
+    async fn context_current_injects_connector_resource_refs_without_resource_body() {
+        let workspace = unique_test_workspace("context-resource");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
+        let request = serde_json::json!({
+            "actor_principal": "user:context-resource",
+            "tool_id": "service.mock.docs.read",
+            "resource_id": "context-doc",
+            "title": "Context Resource Plan",
+            "mode": "dry_run",
+            "idempotency_key": format!("context-resource-{}", uuid::Uuid::new_v4())
+        });
+        let execute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execute.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/current?q=Context&session_id=session-resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let selected = json["envelope"]["selected"].as_array().unwrap();
+        let resource_item = selected
+            .iter()
+            .find(|item| item["id"] == "service://mock.docs/document/context-doc")
+            .expect("resource context item should be selected");
+        assert_eq!(resource_item["source"], "Workspace");
+        assert_eq!(resource_item["role"], "Evidence");
+        assert!(resource_item["content"]
+            .as_str()
+            .unwrap()
+            .contains("indexed_state: unknown"));
+        assert!(!resource_item["content"]
+            .as_str()
+            .unwrap()
+            .contains("Mock document"));
+        assert_eq!(
+            resource_item["evidence"][0],
+            "service://mock.docs/document/context-doc"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_resolver_returns_connector_resource_metadata_only() {
+        let workspace = unique_test_workspace("resource-evidence");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
+        let request = serde_json::json!({
+            "actor_principal": "user:resource-evidence",
+            "tool_id": "service.mock.docs.read",
+            "resource_id": "evidence-doc",
+            "title": "Evidence Resource",
+            "mode": "dry_run",
+            "idempotency_key": format!("resource-evidence-{}", uuid::Uuid::new_v4())
+        });
+        let execute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execute.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/evidence/resolve?ref=service%3A%2F%2Fmock.docs%2Fdocument%2Fevidence-doc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "resource");
+        assert_eq!(json["available"], true);
+        assert_eq!(json["resource"]["title"], "Evidence Resource");
+        assert_eq!(json["body"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
     async fn session_runs_route_reads_runtime_run_events_only() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let session_id = "runtime-runs-session";
