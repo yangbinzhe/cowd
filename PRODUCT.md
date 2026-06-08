@@ -12,6 +12,23 @@ Cowd is used by developers and operators who want an AI runtime that can work ac
 
 Cowd provides a durable AI agent runtime with session storage, memory infrastructure, context assembly, tool execution, multi-agent coordination, permission control, TUI, WebUI, and channel adapters. Success means users can understand what the agent knows, what it is doing, what it is allowed to do, and how to resume or audit the work without guessing from logs.
 
+As of v0.9.42, the connector runtime is a first-class product surface. Provider accounts, service/channel/MCP capabilities, durable external resource refs, policy decisions, execution receipts, and audit evidence must be visible through the same daemon contract and projected consistently to API, TUI, and WebUI.
+
+## Runtime Contract
+
+- `GET /api/runtime/control-plane` is the operator summary for readiness, blocked/degraded reasons, session leases, provider routing, connector status, task state, and diagnostics.
+- `GET /api/connectors/*` is the connector management surface for account readiness, declared capabilities, durable resource refs, service tools, and service execution.
+- `POST /api/cross-plane/*` is the governance surface for identity bindings, grants, policy simulation, execution, and audit.
+- TUI and WebUI should not invent separate state. They project these contracts and add controls, filters, commands, and operator affordances.
+
+## Connector Product Model
+
+- Channel capabilities move messages or media between Cowd and external conversations.
+- Service capabilities read or operate on external workspaces such as documents, drives, wikis, or future office suites.
+- MCP capabilities describe tool/resource servers without requiring control-plane inspection to start external MCP processes.
+- Resource refs store durable pointers and metadata, not full external document bodies by default.
+- Permissions apply across channels and services through identity bindings and grants, so cross-channel actions remain auditable and controllable.
+
 ## Brand Personality
 
 Precise, capable, calm.

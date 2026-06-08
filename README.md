@@ -1,24 +1,47 @@
-# COWD — AI 编程智能体框架
+# COWD — AI Agent Runtime
 
-> **Rust 原生多智能体编程框架** | 当前版本 v0.8.22
-> 统一网关 · 全功能 TUI · API 完全对等 · Session SQLite 存储
-> 内存系统 · 代码智能 · 权限管控 · MCP 协议 · 多平台接入
+> **Rust 原生 AI 运行时框架** | 当前版本 v0.9.42
+> 统一 daemon · SQLite session source of truth · Runtime Control Plane
+> TUI/WebUI 管控 · Connector Runtime · Cross-plane 权限治理 · MCP/飞书/本地服务接入
 
 ---
 
-## 当前重构主线：Runtime Control Plane
+## 当前主线：v0.9 Connector Runtime Release
 
-v0.8.22 的核心目标是在 v0.8.21 Runtime Event Spine 与 Agent Value Loop 之上建立 Runtime Health Projection：Task、Agent、Context、Memory 和 Policy 事件被统一投影为可解释的健康状态、闭环质量和降级信号。
+v0.9.42 的目标是把 runtime control-plane、session lease、connector account/capability/resource、cross-plane governance、TUI/WebUI 控制台和统一场景门禁收束为可交付版本。
+
+这一阶段不再只做局部 API 或 UI，而是让系统能回答四个生产问题：
+
+- 当前 daemon 是否具备运行条件，哪些模块 blocked/degraded？
+- 当前有哪些外部账号、服务能力、MCP 能力和资源引用可被 AI 使用？
+- 跨渠道、跨服务动作是否有 identity、grant、policy、audit 和 receipt？
+- TUI/WebUI/API 是否展示同一事实源，且可被脚本自动验收？
 
 ```
 RuntimeCommand -> RuntimeEventLog -> RuntimeProjection
               -> AgentWorkGraph
               -> MemoryPulseConsumer
               -> ContextPolicyEngine
+              -> ConnectorRegistrySnapshot
               -> TUI/WebUI Runtime Cockpit
 ```
 
 这条主线要求 Session、Agent、Task、Tool、Memory、Context、Policy、UI 全部围绕同一事实源协作。SQLite/DB 是运行态事实源；JSONL 只保留为显式导入、导出和 debug bundle 格式。
+
+### v0.9.42 关键入口
+
+```bash
+cowd gateway run
+curl http://127.0.0.1:8642/api/runtime/control-plane
+curl http://127.0.0.1:8642/api/connectors/summary
+curl http://127.0.0.1:8642/api/connectors/accounts
+curl http://127.0.0.1:8642/api/connectors/capabilities
+curl http://127.0.0.1:8642/api/connectors/resources
+scripts/v0941_unified_scenario.sh
+scripts/release_gate.sh
+```
+
+Operator 文档见 [docs/operator/v0.9.42-connector-runtime-operator-checklist.md](docs/operator/v0.9.42-connector-runtime-operator-checklist.md)。
 
 ## 项目规模
 
