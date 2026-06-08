@@ -72,6 +72,32 @@ pub enum ProcessedKey {
     Nothing,
 }
 
+const SIDEBAR_TAB_COUNT: usize = 12;
+
+fn sidebar_tab_labels(width: u16) -> Vec<&'static str> {
+    if width < 96 {
+        vec![
+            "Run", "Ctx", "Chg", "Goal", "Appr", "Todo", "Diff", "File", "Sess", "Mem", "Skill",
+            "Gate",
+        ]
+    } else {
+        vec![
+            "Runtime",
+            "Context",
+            "Changes",
+            "Goals",
+            "Approvals",
+            "Todo",
+            "Diff",
+            "Files",
+            "Sessions",
+            "Memory",
+            "Skills",
+            "Gateway",
+        ]
+    }
+}
+
 // ── TuiState ────────────────────────────────────────────────────
 
 /// Unified TUI application state.
@@ -575,20 +601,7 @@ impl TuiState {
 
             // Render sidebar: tab bar + active panel
             let tab_height = 1u16;
-            let tab_labels = [
-                "Runtime",
-                "Context",
-                "Changes",
-                "Goals",
-                "Approvals",
-                "Todo",
-                "Diff",
-                "Files",
-                "Sessions",
-                "Memory",
-                "Skills",
-                "Gateway",
-            ];
+            let tab_labels = sidebar_tab_labels(sidebar_area.width);
             let tab_area = ratatui::layout::Rect::new(
                 sidebar_area.x,
                 sidebar_area.y,
@@ -1089,12 +1102,10 @@ impl TuiState {
         // 1.75. Tab/BackTab sidebar cycling (before keybind engine which maps Tab to no-op NextPanel)
         match event.code {
             KeyCode::Tab => {
-                const SIDEBAR_TAB_COUNT: usize = 12;
                 self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
                 return true;
             }
             KeyCode::BackTab => {
-                const SIDEBAR_TAB_COUNT: usize = 12;
                 self.sidebar_active_tab = if self.sidebar_active_tab == 0 {
                     SIDEBAR_TAB_COUNT - 1
                 } else {
@@ -1292,7 +1303,6 @@ impl TuiState {
 
         // ── Sidebar tab switching ──
         // Tab / Shift+Tab: cycle through sidebar tabs.
-        const SIDEBAR_TAB_COUNT: usize = 12;
         if key.code == KeyCode::Tab {
             self.sidebar_active_tab = (self.sidebar_active_tab + 1) % SIDEBAR_TAB_COUNT;
             return ProcessedKey::Nothing;
@@ -2661,6 +2671,19 @@ providers:
 
         // ThemeEngine starts with dark builtin (no file), so hot_reload is a no-op
         assert!(!state.hot_reload_theme());
+    }
+
+    #[test]
+    fn sidebar_tab_labels_use_compact_mode_for_narrow_sidebars() {
+        let compact = sidebar_tab_labels(72);
+        let full = sidebar_tab_labels(120);
+
+        assert_eq!(compact.len(), SIDEBAR_TAB_COUNT);
+        assert_eq!(full.len(), SIDEBAR_TAB_COUNT);
+        assert_eq!(compact[0], "Run");
+        assert_eq!(compact[4], "Appr");
+        assert_eq!(full[0], "Runtime");
+        assert_eq!(full[4], "Approvals");
     }
 
     // ── startup_loading ─────────────────────────────────────────
