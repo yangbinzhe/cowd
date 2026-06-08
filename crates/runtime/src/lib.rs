@@ -126,7 +126,7 @@ pub use connector::{
     default_capabilities, CapabilityManifest, ConnectorHealth, ConnectorHealthStatus,
     ConnectorPlane, ConnectorRegistrySnapshot, ConnectorSummary, ExternalResourceRef,
     MockDocsServiceConnector, ProviderAccount, ResourceDirectory, ServiceConnector,
-    ServiceConnectorMetadata, ServiceToolRequest, ServiceToolResult,
+    ServiceConnectorMetadata, ServiceToolRequest, ServiceToolResult, SqliteResourceDirectory,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, build_cc_memory_config, ApiClient, ApiRequest,

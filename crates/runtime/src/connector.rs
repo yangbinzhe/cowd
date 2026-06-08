@@ -5,9 +5,11 @@
 //! cross-plane policy engine remains the execution governance layer.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::path::Path;
+use std::sync::{Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -532,6 +534,231 @@ impl ResourceDirectory {
     }
 }
 
+#[derive(Debug)]
+pub struct SqliteResourceDirectory {
+    connection: Mutex<Connection>,
+}
+
+impl SqliteResourceDirectory {
+    pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        let connection = Connection::open(path)?;
+        Self::from_connection(connection)
+    }
+
+    pub fn in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(connection: Connection) -> rusqlite::Result<Self> {
+        initialize_resource_directory_schema(&connection)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
+
+    pub fn upsert(&self, resource: &ExternalResourceRef) -> rusqlite::Result<ExternalResourceRef> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connection.execute(
+            r"INSERT INTO connector_resources (
+                reference, provider, account_id, resource_type, title, source,
+                permissions_summary, digest, indexed_state, created_at, updated_at, last_seen_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)
+            ON CONFLICT(reference) DO UPDATE SET
+                provider = excluded.provider,
+                account_id = excluded.account_id,
+                resource_type = excluded.resource_type,
+                title = excluded.title,
+                source = excluded.source,
+                permissions_summary = excluded.permissions_summary,
+                digest = excluded.digest,
+                indexed_state = excluded.indexed_state,
+                updated_at = excluded.updated_at,
+                last_seen_at = excluded.last_seen_at",
+            params![
+                resource.reference,
+                resource.provider,
+                resource.account_id,
+                resource.resource_type,
+                resource.title,
+                resource.source,
+                resource.permissions_summary,
+                resource.digest,
+                resource.indexed_state,
+                now,
+            ],
+        )?;
+        Ok(resource.clone())
+    }
+
+    pub fn get(&self, reference: &str) -> rusqlite::Result<Option<ExternalResourceRef>> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connection
+            .query_row(
+                r"SELECT reference, provider, account_id, resource_type, title, source,
+                    permissions_summary, digest, indexed_state
+                  FROM connector_resources
+                  WHERE reference = ?1",
+                params![reference],
+                row_to_resource_ref,
+            )
+            .optional()
+    }
+
+    pub fn list_recent(&self, limit: usize) -> rusqlite::Result<Vec<ExternalResourceRef>> {
+        self.list_page(limit, 0)
+    }
+
+    pub fn list_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> rusqlite::Result<Vec<ExternalResourceRef>> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut statement = connection.prepare(
+            r"SELECT reference, provider, account_id, resource_type, title, source,
+                permissions_summary, digest, indexed_state
+              FROM connector_resources
+              ORDER BY last_seen_at DESC, reference ASC
+              LIMIT ?1 OFFSET ?2",
+        )?;
+        let resources = statement
+            .query_map(params![limit as i64, offset as i64], row_to_resource_ref)?
+            .collect();
+        resources
+    }
+
+    pub fn search(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<ExternalResourceRef>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return self.list_recent(limit);
+        }
+        let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut statement = connection.prepare(
+            r"SELECT reference, provider, account_id, resource_type, title, source,
+                permissions_summary, digest, indexed_state
+              FROM connector_resources
+              WHERE reference LIKE ?1 ESCAPE '\'
+                 OR title LIKE ?1 ESCAPE '\'
+                 OR resource_type LIKE ?1 ESCAPE '\'
+                 OR provider LIKE ?1 ESCAPE '\'
+              ORDER BY last_seen_at DESC, reference ASC
+              LIMIT ?2",
+        )?;
+        let resources = statement
+            .query_map(params![pattern, limit as i64], row_to_resource_ref)?
+            .collect();
+        resources
+    }
+
+    pub fn mark_indexed(&self, reference: &str) -> rusqlite::Result<bool> {
+        self.update_indexed_state(reference, "indexed")
+    }
+
+    pub fn mark_stale(&self, reference: &str) -> rusqlite::Result<bool> {
+        self.update_indexed_state(reference, "stale")
+    }
+
+    fn update_indexed_state(&self, reference: &str, indexed_state: &str) -> rusqlite::Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = connection.execute(
+            "UPDATE connector_resources SET indexed_state = ?1, updated_at = ?2 WHERE reference = ?3",
+            params![indexed_state, now, reference],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn attach_source(
+        &self,
+        reference: &str,
+        source_kind: &str,
+        source_id: &str,
+    ) -> rusqlite::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connection.execute(
+            r"INSERT OR REPLACE INTO connector_resource_sources
+                (reference, source_kind, source_id, attached_at)
+              VALUES (?1, ?2, ?3, ?4)",
+            params![reference, source_kind, source_id, now],
+        )?;
+        Ok(())
+    }
+}
+
+fn initialize_resource_directory_schema(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute(
+        r"CREATE TABLE IF NOT EXISTS connector_resources (
+            reference TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            account_id TEXT,
+            resource_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            source TEXT,
+            permissions_summary TEXT,
+            digest TEXT,
+            indexed_state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_connector_resources_provider ON connector_resources(provider)",
+        [],
+    )?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_connector_resources_last_seen ON connector_resources(last_seen_at)",
+        [],
+    )?;
+    connection.execute(
+        r"CREATE TABLE IF NOT EXISTS connector_resource_sources (
+            reference TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            attached_at TEXT NOT NULL,
+            PRIMARY KEY(reference, source_kind, source_id)
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn row_to_resource_ref(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExternalResourceRef> {
+    Ok(ExternalResourceRef {
+        reference: row.get(0)?,
+        provider: row.get(1)?,
+        account_id: row.get(2)?,
+        resource_type: row.get(3)?,
+        title: row.get(4)?,
+        source: row.get(5)?,
+        permissions_summary: row.get(6)?,
+        digest: row.get(7)?,
+        indexed_state: row.get(8)?,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceConnectorMetadata {
     pub id: String,
@@ -785,5 +1012,56 @@ mod tests {
         assert_eq!(directory.get(&resource.reference), Some(resource.clone()));
         assert_eq!(directory.search("runtime", 10), vec![resource.clone()]);
         assert_eq!(directory.list_recent(1), vec![resource]);
+    }
+
+    #[test]
+    fn sqlite_resource_directory_persists_and_pages_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("resources.sqlite");
+        let first = ExternalResourceRef::new("mock.docs", "document", "doc-1", "Runtime Plan");
+        let second = ExternalResourceRef::new("mcp", "resource", "res-2", "MCP Manual");
+
+        {
+            let directory = SqliteResourceDirectory::open(&db_path).unwrap();
+            directory.upsert(&first).unwrap();
+            directory.upsert(&second).unwrap();
+            directory
+                .attach_source(&first.reference, "session", "session-1")
+                .unwrap();
+
+            assert_eq!(
+                directory.get(&first.reference).unwrap(),
+                Some(first.clone())
+            );
+            assert_eq!(
+                directory.search("manual", 10).unwrap(),
+                vec![second.clone()]
+            );
+            assert_eq!(directory.list_page(1, 0).unwrap().len(), 1);
+            assert!(directory.mark_indexed(&first.reference).unwrap());
+            assert_eq!(
+                directory
+                    .get(&first.reference)
+                    .unwrap()
+                    .unwrap()
+                    .indexed_state,
+                "indexed"
+            );
+        }
+
+        let reopened = SqliteResourceDirectory::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.get(&first.reference).unwrap().unwrap().title,
+            "Runtime Plan"
+        );
+        assert!(reopened.mark_stale(&first.reference).unwrap());
+        assert_eq!(
+            reopened
+                .get(&first.reference)
+                .unwrap()
+                .unwrap()
+                .indexed_state,
+            "stale"
+        );
     }
 }

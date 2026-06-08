@@ -696,6 +696,12 @@ mod tests {
         })
     }
 
+    fn unique_test_workspace(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("cowd-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
     fn test_state_with_store(store: Arc<UnifiedSessionStore>) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
@@ -3326,7 +3332,12 @@ providers:
 
     #[tokio::test]
     async fn connector_routes_expose_contract_snapshot_without_accounts() {
-        let app = api_router(test_state());
+        let workspace = unique_test_workspace("connector-empty");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
         let response = app
             .clone()
             .oneshot(
@@ -3491,7 +3502,12 @@ providers:
 
     #[tokio::test]
     async fn mock_docs_service_connector_executes_through_cross_plane_receipt() {
-        let app = api_router(test_state());
+        let workspace = unique_test_workspace("connector-mock-docs");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
         let tools = app
             .clone()
             .oneshot(
@@ -3538,6 +3554,7 @@ providers:
         assert_eq!(first_json["kind"], "connector_service_execution");
         assert_eq!(first_json["service"], "mock.docs");
         assert_eq!(first_json["replayed"], false);
+        assert_eq!(first_json["resource_persisted"], true);
         assert_eq!(
             first_json["result"]["resource"]["reference"],
             "service://mock.docs/document/doc-1"
@@ -3590,6 +3607,63 @@ providers:
         let replay_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(replay_json["replayed"], true);
         assert_eq!(replay_json["receipt"]["id"], receipt_id);
+    }
+
+    #[tokio::test]
+    async fn connector_resources_survive_new_app_state_for_same_workspace() {
+        let workspace = unique_test_workspace("connector-resources");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace.clone(),
+        ));
+        let request = serde_json::json!({
+            "actor_principal": "user:resource-persistence",
+            "tool_id": "service.mock.docs.read",
+            "resource_id": "persisted-doc",
+            "title": "Persisted Runtime Resource",
+            "mode": "dry_run",
+            "idempotency_key": format!("persisted-doc-{}", uuid::Uuid::new_v4())
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let reopened = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
+        let resources = reopened
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/resources?q=Persisted")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resources.status(), StatusCode::OK);
+        let body = to_bytes(resources.into_body(), usize::MAX).await.unwrap();
+        let resources_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resources_json["status"], "available");
+        assert!(resources_json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |resource| resource["reference"] == "service://mock.docs/document/persisted-doc"
+                    && resource["title"] == "Persisted Runtime Resource"
+            ));
     }
 
     #[tokio::test]

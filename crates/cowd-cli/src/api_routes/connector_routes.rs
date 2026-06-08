@@ -1,10 +1,18 @@
-use std::sync::{Arc, OnceLock};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use axum::{extract::State as AxumState, response::IntoResponse, routing::get, Json, Router};
+use axum::{
+    extract::{Query, State as AxumState},
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
 use runtime::{
     CapabilityManifest, ConnectorHealth, ConnectorRegistrySnapshot, CrossPlaneAction,
     CrossPlaneExecutionReceipt, ExternalResourceRef, MockDocsServiceConnector, PolicyDecisionKind,
-    ProviderAccount, ResourceDirectory, ServiceConnector, ServiceToolRequest, ServiceToolResult,
+    ProviderAccount, ServiceConnector, ServiceToolRequest, ServiceToolResult,
+    SqliteResourceDirectory,
 };
 use serde::{Deserialize, Serialize};
 
@@ -44,10 +52,14 @@ struct MockDocsExecuteRequest {
     idempotency_key: Option<String>,
 }
 
-static RESOURCE_DIRECTORY: OnceLock<ResourceDirectory> = OnceLock::new();
-
-fn resource_directory() -> &'static ResourceDirectory {
-    RESOURCE_DIRECTORY.get_or_init(ResourceDirectory::new)
+#[derive(Debug, Default, Deserialize)]
+struct ConnectorResourceQuery {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot {
@@ -86,11 +98,15 @@ pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot 
             .then_with(|| left.account_id.cmp(&right.account_id))
     });
     capabilities.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
-    ConnectorRegistrySnapshot::new(
-        accounts,
-        capabilities,
-        resource_directory().list_recent(100),
-    )
+    let (resources, resource_error) = list_durable_resources(state, 100, 0, None);
+    let mut snapshot = ConnectorRegistrySnapshot::new(accounts, capabilities, resources);
+    if let Some(error) = resource_error {
+        snapshot.degraded = true;
+        snapshot
+            .degraded_reasons
+            .push(format!("resource_directory:{error}"));
+    }
+    snapshot
 }
 
 fn account_from_platform(platform: &channel_routes::PlatformReadiness) -> ProviderAccount {
@@ -288,12 +304,19 @@ async fn connector_capabilities_handler(
 
 async fn connector_resources_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Query(query): Query<ConnectorResourceQuery>,
 ) -> impl IntoResponse {
-    let snapshot = connector_snapshot(&state);
-    let total = snapshot.resources.len();
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0);
+    let (resources, error) = list_durable_resources(&state, limit, offset, query.q.as_deref());
+    let total = resources.len();
     Json(serde_json::json!({
         "kind": "connector_resources",
-        "resources": snapshot.resources,
+        "status": if error.is_some() { "degraded" } else { "available" },
+        "degraded_reason": error,
+        "limit": limit,
+        "offset": offset,
+        "resources": resources,
         "total": total,
     }))
 }
@@ -395,8 +418,17 @@ async fn mock_docs_execute_handler(
             }),
         }
     };
+    let mut resource_persisted = false;
+    let mut resource_degraded_reason = None;
     if let Some(resource) = service_result.resource.clone() {
-        resource_directory().upsert(resource);
+        match durable_resource_directory(&state).and_then(|directory| directory.upsert(&resource)) {
+            Ok(_) => {
+                resource_persisted = true;
+            }
+            Err(error) => {
+                resource_degraded_reason = Some(format!("resource directory unavailable: {error}"));
+            }
+        }
     }
 
     Json(serde_json::json!({
@@ -404,6 +436,43 @@ async fn mock_docs_execute_handler(
         "service": "mock.docs",
         "replayed": false,
         "result": service_result,
+        "resource_persisted": resource_persisted,
+        "resource_degraded_reason": resource_degraded_reason,
         "receipt": receipt,
     }))
+}
+
+fn list_durable_resources(
+    state: &AppState,
+    limit: usize,
+    offset: usize,
+    query: Option<&str>,
+) -> (Vec<ExternalResourceRef>, Option<String>) {
+    match durable_resource_directory(state).and_then(|directory| {
+        query
+            .map(|value| directory.search(value, limit))
+            .unwrap_or_else(|| directory.list_page(limit, offset))
+    }) {
+        Ok(resources) => (resources, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    }
+}
+
+fn durable_resource_directory(state: &AppState) -> rusqlite::Result<SqliteResourceDirectory> {
+    let path = resource_directory_path(&state.workspace_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                error.kind(),
+                format!("failed to create resource directory parent: {error}"),
+            )))
+        })?;
+    }
+    SqliteResourceDirectory::open(path)
+}
+
+fn resource_directory_path(workspace_root: &Path) -> PathBuf {
+    workspace_root
+        .join(".cowd")
+        .join("resource-directory.sqlite")
 }
