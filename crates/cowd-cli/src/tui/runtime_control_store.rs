@@ -30,6 +30,21 @@ impl RuntimeControlSnapshot {
         }
     }
 
+    pub fn from_app(app: &App) -> Self {
+        Self {
+            daemon_running: app.server_running,
+            active_sessions: app.active_api_sessions,
+            uptime_secs: app.server_uptime_secs,
+            runtime_readiness: app.daemon_runtime_readiness.clone(),
+            runtime_components: app.daemon_runtime_components,
+            task_count: app.daemon_task_count,
+            pending_approvals: app.daemon_pending_approvals,
+            lease_owner: app.daemon_lease_owner.clone(),
+            lease_mode: app.daemon_lease_mode.clone(),
+            ..Self::default()
+        }
+    }
+
     pub fn apply_lease(&mut self, lease: &DaemonSessionLease) {
         self.lease_owner = Some(lease.owner.clone());
         self.lease_mode = Some(lease.mode.clone());

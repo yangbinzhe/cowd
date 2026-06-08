@@ -1540,6 +1540,11 @@ impl TuiState {
                 if self.command_palette.is_open() {
                     self.command_palette.close();
                 } else {
+                    let snapshot =
+                        crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(
+                            &self.app,
+                        );
+                    self.command_palette.sync_runtime_actions(&snapshot);
                     self.command_palette.open();
                 }
             }
@@ -1674,7 +1679,19 @@ impl TuiState {
             Action::FocusSessions => {
                 self.sidebar_active_tab = 6;
             }
-            Action::Execute(ref _cmd) => {}
+            Action::Execute(ref cmd) => {
+                let mut input = tui_textarea::TextArea::default();
+                input.set_block(
+                    ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .title(" Input (Enter=send, Esc=quit, Shift+Enter=newline) "),
+                );
+                input.set_style(ratatui::style::Style::default().fg(ratatui::style::Color::White));
+                input.insert_str(cmd);
+                self.app.input = input;
+                self.app
+                    .show_notification("Command prepared. Press Enter to run.");
+            }
             Action::TogglePanel(ref _name) => {}
             Action::ApplyPreset(preset) => {
                 self.layout_tree.apply_preset(preset);
