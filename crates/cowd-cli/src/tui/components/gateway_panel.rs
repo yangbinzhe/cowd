@@ -290,7 +290,7 @@ impl Component for GatewayPanel {
             status,
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: r refresh  h health  s start/stop",
+            "Keys: r refresh  h health  s start/stop  / connector actions",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -575,6 +575,10 @@ impl Component for GatewayPanel {
                         Span::styled(resource.title.clone(), Style::default().fg(Color::DarkGray)),
                     ]));
                 }
+                lines.push(Line::from(Span::styled(
+                    "Use command palette: Mark indexed · Mark stale · Remember resource",
+                    Style::default().fg(Color::DarkGray),
+                )));
             }
 
             if !self.connector_degraded_reasons.is_empty() {
@@ -701,7 +705,7 @@ impl Component for GatewayPanel {
         // ── Keyboard hint bar ──────────────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Keys: r refresh  h health  s start/stop",
+            "Keys: r refresh  h health  s start/stop  / connector actions",
             Style::default().fg(Color::DarkGray),
         )));
 

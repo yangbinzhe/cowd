@@ -210,6 +210,36 @@ impl DaemonProjectionClient {
         .await
     }
 
+    pub async fn revalidate_connector_resource(
+        &self,
+        reference: &str,
+        state: &str,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            "/api/connectors/resources/revalidate",
+            serde_json::json!({
+                "reference": reference,
+                "state": state,
+            }),
+        )
+        .await
+    }
+
+    pub async fn promote_connector_resource_to_memory(
+        &self,
+        reference: &str,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        self.post_json(
+            "/api/connectors/resources/promote-memory",
+            serde_json::json!({
+                "reference": reference,
+                "session_id": session_id,
+            }),
+        )
+        .await
+    }
+
     pub async fn preflight_cross_plane_action(
         &self,
         action: serde_json::Value,
@@ -577,6 +607,57 @@ mod tests {
             .await
             .expect("execute");
         assert_eq!(result["ok"], true);
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn connector_resource_lifecycle_routes_use_management_contract() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept revalidate");
+            let mut buf = vec![0; 4096];
+            let n = socket.read(&mut buf).await.expect("read revalidate");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("POST /api/connectors/resources/revalidate HTTP/1.1"));
+            assert!(req.contains("\"reference\":\"service://mock.docs/document/tui-doc\""));
+            assert!(req.contains("\"state\":\"stale\""));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}",
+                )
+                .await
+                .expect("write revalidate");
+
+            let (mut socket, _) = listener.accept().await.expect("accept promote");
+            let mut buf = vec![0; 4096];
+            let n = socket.read(&mut buf).await.expect("read promote");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("POST /api/connectors/resources/promote-memory HTTP/1.1"));
+            assert!(req.contains("\"reference\":\"service://mock.docs/document/tui-doc\""));
+            assert!(req.contains("\"session_id\":\"session-tui\""));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}",
+                )
+                .await
+                .expect("write promote");
+        });
+
+        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let revalidated = client
+            .revalidate_connector_resource("service://mock.docs/document/tui-doc", "stale")
+            .await
+            .expect("revalidate");
+        assert_eq!(revalidated["ok"], true);
+        let promoted = client
+            .promote_connector_resource_to_memory(
+                "service://mock.docs/document/tui-doc",
+                Some("session-tui"),
+            )
+            .await
+            .expect("promote");
+        assert_eq!(promoted["ok"], true);
         server.await.expect("server task");
     }
 }

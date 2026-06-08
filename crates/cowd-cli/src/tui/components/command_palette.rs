@@ -496,6 +496,32 @@ impl CommandPalette {
                 ),
                 Action::Execute("/context".into()),
             ));
+            if let Some(resource) = snapshot.connector_resources.first() {
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Mark Connector Resource Indexed",
+                    format!("{} -> indexed", resource.title),
+                    Action::RevalidateConnectorResource {
+                        reference: resource.reference.clone(),
+                        state: "indexed".to_string(),
+                    },
+                ));
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Mark Connector Resource Stale",
+                    format!("{} -> stale", resource.title),
+                    Action::RevalidateConnectorResource {
+                        reference: resource.reference.clone(),
+                        state: "stale".to_string(),
+                    },
+                ));
+                self.all_commands.push(CommandEntry::dynamic(
+                    "Remember Connector Resource",
+                    format!("Promote metadata for {}", resource.title),
+                    Action::PromoteConnectorResourceToMemory {
+                        reference: resource.reference.clone(),
+                        session_id: None,
+                    },
+                ));
+            }
         }
 
         if !snapshot.connector_accounts.is_empty() || !snapshot.connector_capabilities.is_empty() {
@@ -1267,6 +1293,9 @@ mod tests {
 
         for name in [
             "Search Connector Resources",
+            "Mark Connector Resource Indexed",
+            "Mark Connector Resource Stale",
+            "Remember Connector Resource",
             "Probe Connectors",
             "Mock Docs Dry Run",
             "Mock Docs Commit",
@@ -1283,6 +1312,22 @@ mod tests {
             entry.dynamic
                 && entry.name == "Inspect Degraded Connector"
                 && entry.description.contains("resource_directory")
+        }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic
+                && entry.action
+                    == Action::RevalidateConnectorResource {
+                        reference: "service://feishu/docx/doccn-ready".to_string(),
+                        state: "stale".to_string(),
+                    }
+        }));
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.dynamic
+                && entry.action
+                    == Action::PromoteConnectorResourceToMemory {
+                        reference: "service://feishu/docx/doccn-ready".to_string(),
+                        session_id: None,
+                    }
         }));
     }
 

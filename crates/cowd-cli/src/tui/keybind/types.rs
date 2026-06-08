@@ -51,6 +51,13 @@ pub enum Action {
     CancelDaemonTask(String),
     /// Complete a daemon task through the projection API.
     CompleteDaemonTask(String),
+    /// Update a connector resource lifecycle state through the daemon API.
+    RevalidateConnectorResource { reference: String, state: String },
+    /// Promote connector resource metadata into memory through the daemon API.
+    PromoteConnectorResourceToMemory {
+        reference: String,
+        session_id: Option<String>,
+    },
     /// Toggle visibility of a named panel.
     TogglePanel(String),
     /// Open a dialog by name (picker, approval, file chooser, etc.).

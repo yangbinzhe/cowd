@@ -1863,6 +1863,85 @@ impl TuiState {
                     ),
                 }
             }
+            Action::RevalidateConnectorResource { reference, state } => {
+                let resource_ref = reference.clone();
+                let desired_state = state.clone();
+                let result = run_daemon_projection_blocking(move |client| async move {
+                    client
+                        .revalidate_connector_resource(&reference, &state)
+                        .await
+                });
+                match result {
+                    Ok(value)
+                        if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) =>
+                    {
+                        self.apply_local_connector_resource_state(&resource_ref, &desired_state);
+                        self.toast_manager.push(
+                            ToastVariant::Success,
+                            Some("Connector".into()),
+                            format!("Resource marked {desired_state}"),
+                            2000,
+                        );
+                    }
+                    Ok(value) => self.toast_manager.push(
+                        ToastVariant::Warning,
+                        Some("Connector".into()),
+                        value
+                            .get("reason")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("resource state unchanged")
+                            .to_string(),
+                        3000,
+                    ),
+                    Err(err) => self.toast_manager.push(
+                        ToastVariant::Warning,
+                        Some("Connector".into()),
+                        err,
+                        3000,
+                    ),
+                }
+            }
+            Action::PromoteConnectorResourceToMemory {
+                reference,
+                session_id,
+            } => {
+                let session_id = session_id
+                    .clone()
+                    .or_else(|| Some(self.app.session_id.clone()));
+                let result = run_daemon_projection_blocking(move |client| async move {
+                    client
+                        .promote_connector_resource_to_memory(&reference, session_id.as_deref())
+                        .await
+                });
+                match result {
+                    Ok(value)
+                        if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) =>
+                    {
+                        self.toast_manager.push(
+                            ToastVariant::Success,
+                            Some("Memory".into()),
+                            "Connector resource remembered".into(),
+                            2000,
+                        );
+                    }
+                    Ok(value) => self.toast_manager.push(
+                        ToastVariant::Warning,
+                        Some("Memory".into()),
+                        value
+                            .get("reason")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("memory promotion skipped")
+                            .to_string(),
+                        3000,
+                    ),
+                    Err(err) => self.toast_manager.push(
+                        ToastVariant::Warning,
+                        Some("Memory".into()),
+                        err,
+                        3000,
+                    ),
+                }
+            }
             Action::TogglePanel(ref _name) => {}
             Action::ApplyPreset(preset) => {
                 self.layout_tree.apply_preset(preset);
@@ -1904,6 +1983,18 @@ impl TuiState {
         }
         self.app.daemon_task_count = Some(self.app.daemon_tasks.len() as u64);
         self.goal_workbench_panel.sync_from_app(&self.app);
+        let snapshot =
+            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
+        self.command_palette.sync_runtime_actions(&snapshot);
+    }
+
+    fn apply_local_connector_resource_state(&mut self, reference: &str, state: &str) {
+        for resource in &mut self.app.daemon_connector_resources {
+            if resource.reference == reference {
+                resource.indexed_state = state.to_string();
+            }
+        }
+        self.gateway_panel.sync_from_app(&self.app);
         let snapshot =
             crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
@@ -2498,6 +2589,27 @@ mod tests {
         assert_eq!(state.app.daemon_tasks[0].status, "completed");
         assert_eq!(state.app.daemon_tasks[0].blocker_reason, None);
         assert_eq!(state.app.daemon_tasks[1].status, "running");
+    }
+
+    #[test]
+    fn local_connector_resource_state_updates_projection_state() {
+        let mut state = TuiState::new("test-model", "test-session");
+        state.app.daemon_connector_resources = vec![
+            crate::tui::runtime_control_store::ConnectorResourceSummary {
+                reference: "service://mock.docs/document/tui-doc".to_string(),
+                provider: "mock.docs".to_string(),
+                resource_type: "document".to_string(),
+                title: "TUI Doc".to_string(),
+                indexed_state: "indexed".to_string(),
+            },
+        ];
+
+        state.apply_local_connector_resource_state("service://mock.docs/document/tui-doc", "stale");
+
+        assert_eq!(
+            state.app.daemon_connector_resources[0].indexed_state,
+            "stale"
+        );
     }
 
     #[test]
