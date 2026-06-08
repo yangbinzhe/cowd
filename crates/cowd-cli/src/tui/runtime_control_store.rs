@@ -25,6 +25,35 @@ pub struct DaemonApprovalSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectorAccountSummary {
+    pub provider: String,
+    pub account_id: String,
+    pub auth_mode: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub binding_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectorCapabilitySummary {
+    pub capability_id: String,
+    pub provider: String,
+    pub plane: String,
+    pub risk: String,
+    pub supports_commit: bool,
+    pub requires_approval: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectorResourceSummary {
+    pub reference: String,
+    pub provider: String,
+    pub resource_type: String,
+    pub title: String,
+    pub indexed_state: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeControlSnapshot {
     pub daemon_running: bool,
     pub active_sessions: usize,
@@ -41,6 +70,10 @@ pub struct RuntimeControlSnapshot {
     pub memory_status: Option<String>,
     pub cross_plane_grants_active: Option<u64>,
     pub cross_plane_actions_24h: Option<u64>,
+    pub connector_accounts: Vec<ConnectorAccountSummary>,
+    pub connector_capabilities: Vec<ConnectorCapabilitySummary>,
+    pub connector_resources: Vec<ConnectorResourceSummary>,
+    pub connector_degraded_reasons: Vec<String>,
     pub degraded_reasons: Vec<String>,
 }
 
@@ -69,6 +102,10 @@ impl RuntimeControlSnapshot {
             lease_mode: app.daemon_lease_mode.clone(),
             cross_plane_grants_active: app.daemon_cross_plane_grants_active,
             cross_plane_actions_24h: app.daemon_cross_plane_actions_24h,
+            connector_accounts: app.daemon_connector_accounts.clone(),
+            connector_capabilities: app.daemon_connector_capabilities.clone(),
+            connector_resources: app.daemon_connector_resources.clone(),
+            connector_degraded_reasons: app.daemon_connector_degraded_reasons.clone(),
             degraded_reasons: app.daemon_degraded_reasons.clone(),
             ..Self::default()
         }
@@ -91,6 +128,10 @@ impl RuntimeControlSnapshot {
         app.daemon_approval_items = self.approval_items.clone();
         app.daemon_cross_plane_grants_active = self.cross_plane_grants_active;
         app.daemon_cross_plane_actions_24h = self.cross_plane_actions_24h;
+        app.daemon_connector_accounts = self.connector_accounts.clone();
+        app.daemon_connector_capabilities = self.connector_capabilities.clone();
+        app.daemon_connector_resources = self.connector_resources.clone();
+        app.daemon_connector_degraded_reasons = self.connector_degraded_reasons.clone();
         app.daemon_degraded_reasons = self.degraded_reasons.clone();
         app.daemon_lease_owner = self.lease_owner.clone();
         app.daemon_lease_mode = self.lease_mode.clone();
@@ -157,6 +198,52 @@ impl RuntimeControlSnapshot {
         self.cross_plane_actions_24h = value
             .pointer("/interop/actions_24h")
             .and_then(serde_json::Value::as_u64);
+    }
+
+    pub fn ingest_connector_accounts(&mut self, value: &serde_json::Value) {
+        self.connector_accounts = value
+            .get("accounts")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(connector_account_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+
+    pub fn ingest_connector_capabilities(&mut self, value: &serde_json::Value) {
+        self.connector_capabilities = value
+            .get("capabilities")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(connector_capability_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+
+    pub fn ingest_connector_resources(&mut self, value: &serde_json::Value) {
+        self.connector_resources = value
+            .get("resources")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(connector_resource_from_json)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(reason) = value
+            .get("degraded_reason")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+        {
+            self.connector_degraded_reasons.push(reason.to_string());
+        }
     }
 
     pub fn degrade(&mut self, reason: impl Into<String>) {
@@ -273,6 +360,105 @@ fn approval_summary_from_json(value: &serde_json::Value) -> Option<DaemonApprova
     })
 }
 
+fn connector_account_from_json(value: &serde_json::Value) -> Option<ConnectorAccountSummary> {
+    let provider = value.get("provider").and_then(serde_json::Value::as_str)?;
+    let account_id = value
+        .get("account_id")
+        .or_else(|| value.get("accountId"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(provider);
+    let health = value.get("health").unwrap_or(value);
+    Some(ConnectorAccountSummary {
+        provider: provider.to_string(),
+        account_id: account_id.to_string(),
+        auth_mode: value
+            .get("auth_mode")
+            .or_else(|| value.get("authMode"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        status: health
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        reason: health
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        binding_count: value
+            .get("enabled_bindings")
+            .or_else(|| value.get("enabledBindings"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.len() as u64)
+            .unwrap_or_default(),
+    })
+}
+
+fn connector_capability_from_json(value: &serde_json::Value) -> Option<ConnectorCapabilitySummary> {
+    let capability_id = value
+        .get("capability_id")
+        .or_else(|| value.get("capabilityId"))
+        .and_then(serde_json::Value::as_str)?;
+    Some(ConnectorCapabilitySummary {
+        capability_id: capability_id.to_string(),
+        provider: value
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        plane: value
+            .get("plane")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        risk: value
+            .get("risk")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        supports_commit: value
+            .get("supports_commit")
+            .or_else(|| value.get("supportsCommit"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        requires_approval: value
+            .get("requires_approval")
+            .or_else(|| value.get("requiresApproval"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn connector_resource_from_json(value: &serde_json::Value) -> Option<ConnectorResourceSummary> {
+    let reference = value.get("reference").and_then(serde_json::Value::as_str)?;
+    Some(ConnectorResourceSummary {
+        reference: reference.to_string(),
+        provider: value
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        resource_type: value
+            .get("resource_type")
+            .or_else(|| value.get("resourceType"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("resource")
+            .to_string(),
+        title: value
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(reference)
+            .to_string(),
+        indexed_state: value
+            .get("indexed_state")
+            .or_else(|| value.get("indexedState"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+    })
+}
+
 pub async fn refresh_runtime_control_snapshot(
     control_client: &DaemonControlClient,
     projection_client: Option<&DaemonProjectionClient>,
@@ -316,6 +502,18 @@ pub async fn refresh_runtime_control_snapshot(
     match projection.cross_plane_summary().await {
         Ok(value) => snapshot.ingest_cross_plane_summary(&value),
         Err(err) => snapshot.degrade(format!("cross-plane projection unavailable: {err}")),
+    }
+    match projection.connector_accounts().await {
+        Ok(value) => snapshot.ingest_connector_accounts(&value),
+        Err(err) => snapshot.degrade(format!("connector accounts unavailable: {err}")),
+    }
+    match projection.connector_capabilities().await {
+        Ok(value) => snapshot.ingest_connector_capabilities(&value),
+        Err(err) => snapshot.degrade(format!("connector capabilities unavailable: {err}")),
+    }
+    match projection.connector_resources(None, 20, 0).await {
+        Ok(value) => snapshot.ingest_connector_resources(&value),
+        Err(err) => snapshot.degrade(format!("connector resources unavailable: {err}")),
     }
 
     if let Some(session_id) = session_id {
@@ -372,6 +570,35 @@ mod tests {
             "grants": {"active": 4},
             "interop": {"actions_24h": 7}
         }));
+        snapshot.ingest_connector_accounts(&serde_json::json!({
+            "accounts": [{
+                "provider": "feishu",
+                "account_id": "feishu-main",
+                "auth_mode": "app_secret",
+                "enabled_bindings": ["service.feishu.docx.read"],
+                "health": {"status": "degraded", "reason": "missing app_secret"}
+            }]
+        }));
+        snapshot.ingest_connector_capabilities(&serde_json::json!({
+            "capabilities": [{
+                "capability_id": "service.feishu.docx.read",
+                "provider": "feishu",
+                "plane": "service",
+                "risk": "low",
+                "supports_commit": true,
+                "requires_approval": false
+            }]
+        }));
+        snapshot.ingest_connector_resources(&serde_json::json!({
+            "degraded_reason": "resource directory unavailable",
+            "resources": [{
+                "reference": "service://feishu/docx/doccn-ready",
+                "provider": "feishu",
+                "resource_type": "docx",
+                "title": "Ready Feishu Doc",
+                "indexed_state": "indexed"
+            }]
+        }));
 
         assert!(snapshot.daemon_running);
         assert_eq!(snapshot.active_sessions, 3);
@@ -389,6 +616,20 @@ mod tests {
         assert_eq!(snapshot.memory_status.as_deref(), Some("available"));
         assert_eq!(snapshot.cross_plane_grants_active, Some(4));
         assert_eq!(snapshot.cross_plane_actions_24h, Some(7));
+        assert_eq!(snapshot.connector_accounts.len(), 1);
+        assert_eq!(snapshot.connector_accounts[0].status, "degraded");
+        assert_eq!(
+            snapshot.connector_accounts[0].reason.as_deref(),
+            Some("missing app_secret")
+        );
+        assert_eq!(snapshot.connector_capabilities.len(), 1);
+        assert!(snapshot.connector_capabilities[0].supports_commit);
+        assert_eq!(snapshot.connector_resources.len(), 1);
+        assert_eq!(snapshot.connector_resources[0].title, "Ready Feishu Doc");
+        assert_eq!(
+            snapshot.connector_degraded_reasons[0],
+            "resource directory unavailable"
+        );
     }
 
     #[test]

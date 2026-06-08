@@ -696,6 +696,12 @@ mod tests {
         })
     }
 
+    fn unique_test_workspace(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("cowd-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
     fn test_state_with_store(store: Arc<UnifiedSessionStore>) -> Arc<AppState> {
         let sessions = Arc::new(ActiveSessions::new());
         let tools = Arc::new(GlobalToolRegistry::builtin());
@@ -1961,7 +1967,14 @@ runtime:
         assert_eq!(json["diagnostics"]["component_count"], 10);
         assert_eq!(json["diagnostics"]["degraded_component_count"], 2);
         assert_eq!(json["diagnostics"]["attention_component_count"], 2);
-        assert_eq!(json["diagnostics"]["capability_count"], 24);
+        assert_eq!(
+            json["diagnostics"]["capability_count"],
+            serde_json::json!(
+                11 + json["diagnostics"]["connector_capability_count"]
+                    .as_u64()
+                    .unwrap()
+            )
+        );
         assert!(json["diagnostics"]["elapsed_ms"].as_u64().is_some());
         assert!(matches!(
             json["diagnostics"]["performance_status"].as_str(),
@@ -2504,7 +2517,7 @@ providers:
         assert!(joined.contains("stored_sessions=0"));
         assert!(joined.contains("open_tasks=1"));
         assert!(joined.contains("component_count=10"));
-        assert!(joined.contains("capability_count=24"));
+        assert!(joined.contains("capability_count=31"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3325,8 +3338,13 @@ providers:
     }
 
     #[tokio::test]
-    async fn connector_routes_expose_contract_snapshot_without_accounts() {
-        let app = api_router(test_state());
+    async fn connector_routes_expose_contract_snapshot_with_local_service_account() {
+        let workspace = unique_test_workspace("connector-empty");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
         let response = app
             .clone()
             .oneshot(
@@ -3341,7 +3359,7 @@ providers:
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(summary["kind"], "connector_summary");
-        assert_eq!(summary["summary"]["account_count"], 0);
+        assert_eq!(summary["summary"]["account_count"], 1);
         assert!(summary["summary"]["capability_count"].as_u64().unwrap() >= 8);
         assert_eq!(summary["summary"]["resource_count"], 0);
 
@@ -3365,6 +3383,10 @@ providers:
         assert!(list
             .iter()
             .any(|item| item["capability_id"] == "governance.cross_plane.audit"));
+        assert!(list
+            .iter()
+            .any(|item| item["capability_id"] == "service.mock.docs.read"
+                && item["plane"] == "service"));
         assert!(list
             .iter()
             .any(|item| item["capability_id"] == "service.feishu.doc_ops"
@@ -3400,7 +3422,7 @@ providers:
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["kind"], "connector_accounts");
-        assert_eq!(json["total"], 1);
+        assert_eq!(json["total"], 2);
         assert_eq!(json["accounts"][0]["provider"], "feishu");
         assert_eq!(json["accounts"][0]["account_id"], "feishu-main");
         assert_eq!(json["accounts"][0]["auth_mode"], "app_secret");
@@ -3414,8 +3436,89 @@ providers:
     }
 
     #[tokio::test]
+    async fn connector_routes_project_configured_mcp_servers_into_runtime_contract() {
+        let app = api_router(test_state_with_config(serde_json::json!({
+            "mcpServers": {
+                "github.com": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-github"],
+                    "env": {
+                        "GITHUB_TOKEN": "secret-token"
+                    }
+                },
+                "broken": {
+                    "type": "stdio"
+                }
+            }
+        })));
+
+        let accounts = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/accounts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accounts.status(), StatusCode::OK);
+        let body = to_bytes(accounts.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_accounts");
+        assert_eq!(json["total"], 3);
+        assert!(json["accounts"].as_array().unwrap().iter().any(|account| {
+            account["provider"] == "mcp"
+                && account["account_id"] == "github.com"
+                && account["auth_mode"] == "stdio"
+                && account["health"]["status"] == "ready"
+                && account["enabled_bindings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item == "mcp.github_com.server")
+        }));
+        assert!(json["accounts"].as_array().unwrap().iter().any(|account| {
+            account["provider"] == "mcp"
+                && account["account_id"] == "broken"
+                && account["health"]["status"] == "degraded"
+        }));
+        assert!(!json.to_string().contains("secret-token"));
+
+        let capabilities = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capabilities.status(), StatusCode::OK);
+        let body = to_bytes(capabilities.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |capability| capability["capability_id"] == "mcp.github_com.server"
+                    && capability["plane"] == "mcp"
+                    && capability["supports_commit"] == false
+            ));
+    }
+
+    #[tokio::test]
     async fn mock_docs_service_connector_executes_through_cross_plane_receipt() {
-        let app = api_router(test_state());
+        let workspace = unique_test_workspace("connector-mock-docs");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
         let tools = app
             .clone()
             .oneshot(
@@ -3462,6 +3565,7 @@ providers:
         assert_eq!(first_json["kind"], "connector_service_execution");
         assert_eq!(first_json["service"], "mock.docs");
         assert_eq!(first_json["replayed"], false);
+        assert_eq!(first_json["resource_persisted"], true);
         assert_eq!(
             first_json["result"]["resource"]["reference"],
             "service://mock.docs/document/doc-1"
@@ -3514,6 +3618,287 @@ providers:
         let replay_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(replay_json["replayed"], true);
         assert_eq!(replay_json["receipt"]["id"], receipt_id);
+    }
+
+    #[tokio::test]
+    async fn connector_resources_survive_new_app_state_for_same_workspace() {
+        let workspace = unique_test_workspace("connector-resources");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace.clone(),
+        ));
+        let request = serde_json::json!({
+            "actor_principal": "user:resource-persistence",
+            "tool_id": "service.mock.docs.read",
+            "resource_id": "persisted-doc",
+            "title": "Persisted Runtime Resource",
+            "mode": "dry_run",
+            "idempotency_key": format!("persisted-doc-{}", uuid::Uuid::new_v4())
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let reopened = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
+        let resources = reopened
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/resources?q=Persisted")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resources.status(), StatusCode::OK);
+        let body = to_bytes(resources.into_body(), usize::MAX).await.unwrap();
+        let resources_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resources_json["status"], "available");
+        assert!(resources_json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |resource| resource["reference"] == "service://mock.docs/document/persisted-doc"
+                    && resource["title"] == "Persisted Runtime Resource"
+            ));
+    }
+
+    #[tokio::test]
+    async fn connector_resources_clamp_large_page_requests() {
+        let workspace = unique_test_workspace("connector-resource-page-limit");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/resources?limit=999&offset=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "connector_resources");
+        assert_eq!(json["limit"], 200);
+    }
+
+    #[tokio::test]
+    async fn feishu_readonly_service_blocks_without_ready_account() {
+        let workspace = unique_test_workspace("feishu-readonly-blocked");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
+        let tools = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/services/feishu.readonly/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tools.status(), StatusCode::OK);
+        let body = to_bytes(tools.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["service"]["id"], "feishu.readonly");
+        assert_eq!(json["health"]["status"], "degraded");
+        assert!(json["tools"].as_array().unwrap().iter().any(|tool| {
+            tool["capability_id"] == "service.feishu.docx.read"
+                && tool["supports_commit"] == true
+                && tool["requires_approval"] == false
+        }));
+
+        let request = serde_json::json!({
+            "actor_principal": "user:feishu-readonly-blocked",
+            "tool_id": "service.feishu.docx.read",
+            "resource_id": "doccn-blocked",
+            "title": "Blocked Feishu Doc",
+            "mode": "commit",
+            "idempotency_key": format!("feishu-blocked-{}", uuid::Uuid::new_v4())
+        });
+        let execute = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/feishu.readonly/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execute.status(), StatusCode::OK);
+        let body = to_bytes(execute.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["result"]["status"], "blocked");
+        assert_eq!(json["receipt"]["status"], "blocked");
+        assert!(json["receipt"]["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|blocker| blocker
+                .as_str()
+                .unwrap_or_default()
+                .contains("no ready provider account")));
+        assert_eq!(json["resource_persisted"], false);
+    }
+
+    #[tokio::test]
+    async fn feishu_readonly_service_executes_with_ready_account_and_persists_resource() {
+        let workspace = unique_test_workspace("feishu-readonly-ready");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({
+                "gateway": {
+                    "platforms": [{
+                        "name": "feishu-main",
+                        "platformType": "feishu",
+                        "enabled": true,
+                        "app_id": "cli_xxx",
+                        "app_secret": "secret_xxx",
+                        "scopes": ["docx:read"]
+                    }]
+                }
+            }),
+            None,
+            workspace,
+        ));
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let actor_principal = format!("user:feishu-readonly-ready-{suffix}");
+        let actor_identity_ref =
+            format!("channel://feishu/user/ready?email=ready-{suffix}@example.com");
+        let identity = serde_json::json!({
+            "id": format!("idb-feishu-readonly-ready-{suffix}"),
+            "principal_id": actor_principal,
+            "identity_ref": actor_identity_ref,
+            "trust": "verified",
+            "source": "test",
+            "created_at": "2026-06-08T00:00:00Z",
+            "expires_at": null
+        });
+        let identity_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/identities")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(identity.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity_response.status(), StatusCode::OK);
+
+        let request = serde_json::json!({
+            "actor_principal": actor_principal,
+            "actor_identity_ref": actor_identity_ref,
+            "source_channel": "channel://feishu/chat/ready",
+            "session_id": "feishu-readonly-ready-session",
+            "tool_id": "service.feishu.docx.read",
+            "resource_id": "doccn-ready",
+            "title": "Ready Feishu Doc",
+            "mode": "commit",
+            "idempotency_key": format!("feishu-ready-{}", uuid::Uuid::new_v4())
+        });
+        let execute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/feishu.readonly/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execute.status(), StatusCode::OK);
+        let body = to_bytes(execute.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["health"]["status"], "ready");
+        assert_eq!(json["result"]["status"], "ok");
+        assert_eq!(
+            json["result"]["resource"]["reference"],
+            "service://feishu/docx/doccn-ready"
+        );
+        assert_eq!(json["result"]["output"]["body_included"], false);
+        assert_eq!(json["resource_persisted"], true);
+        assert!(!json.to_string().contains("secret_xxx"));
+
+        let audit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/audit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audit.status(), StatusCode::OK);
+        let audit_body = to_bytes(audit.into_body(), usize::MAX).await.unwrap();
+        let audit_json: serde_json::Value = serde_json::from_slice(&audit_body).unwrap();
+        let connector_evidence = audit_json["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["action"]["requested_capability"] == "service.feishu.docx.read")
+            .and_then(|record| record["evidence"]["connector_context"].as_object())
+            .expect("feishu connector action should audit connector evidence");
+        assert_eq!(
+            connector_evidence["provider_account"].as_str(),
+            Some("feishu-main")
+        );
+        assert_eq!(
+            connector_evidence["resource_ref"].as_str(),
+            Some("service://feishu/docx/doccn-ready")
+        );
+        assert_eq!(
+            connector_evidence["required_scopes"],
+            serde_json::json!(["docx:read"])
+        );
+
+        let resources = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/resources?q=Ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resources.status(), StatusCode::OK);
+        let body = to_bytes(resources.into_body(), usize::MAX).await.unwrap();
+        let resources_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(resources_json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resource| resource["reference"] == "service://feishu/docx/doccn-ready"));
     }
 
     #[tokio::test]
@@ -3621,7 +4006,10 @@ providers:
                 record["evidence"]["consumed_grant_id"].as_str() == Some(grant_id.as_str())
             })
             .expect("audit should include single-use grant consumption evidence");
-        assert_eq!(consumed["evidence"]["policy_version"], "cross-plane.v1");
+        assert_eq!(
+            consumed["evidence"]["policy_version"],
+            "cross-plane.v2.connector"
+        );
         assert_eq!(consumed["evidence"]["remaining_uses_after"], 0);
     }
 
@@ -5115,6 +5503,117 @@ providers:
             .unwrap()
             .iter()
             .any(|entry| entry["profile"] == "SubAgent" && entry["mode"] == "SubAgent"));
+    }
+
+    #[tokio::test]
+    async fn context_current_injects_connector_resource_refs_without_resource_body() {
+        let workspace = unique_test_workspace("context-resource");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
+        let request = serde_json::json!({
+            "actor_principal": "user:context-resource",
+            "tool_id": "service.mock.docs.read",
+            "resource_id": "context-doc",
+            "title": "Context Resource Plan",
+            "mode": "dry_run",
+            "idempotency_key": format!("context-resource-{}", uuid::Uuid::new_v4())
+        });
+        let execute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execute.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/current?q=Context&session_id=session-resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let selected = json["envelope"]["selected"].as_array().unwrap();
+        let resource_item = selected
+            .iter()
+            .find(|item| item["id"] == "service://mock.docs/document/context-doc")
+            .expect("resource context item should be selected");
+        assert_eq!(resource_item["source"], "Workspace");
+        assert_eq!(resource_item["role"], "Evidence");
+        assert!(resource_item["content"]
+            .as_str()
+            .unwrap()
+            .contains("indexed_state: unknown"));
+        assert!(!resource_item["content"]
+            .as_str()
+            .unwrap()
+            .contains("Mock document"));
+        assert_eq!(
+            resource_item["evidence"][0],
+            "service://mock.docs/document/context-doc"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_resolver_returns_connector_resource_metadata_only() {
+        let workspace = unique_test_workspace("resource-evidence");
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
+        let request = serde_json::json!({
+            "actor_principal": "user:resource-evidence",
+            "tool_id": "service.mock.docs.read",
+            "resource_id": "evidence-doc",
+            "title": "Evidence Resource",
+            "mode": "dry_run",
+            "idempotency_key": format!("resource-evidence-{}", uuid::Uuid::new_v4())
+        });
+        let execute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execute.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/evidence/resolve?ref=service%3A%2F%2Fmock.docs%2Fdocument%2Fevidence-doc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "resource");
+        assert_eq!(json["available"], true);
+        assert_eq!(json["resource"]["title"], "Evidence Resource");
+        assert_eq!(json["body"], serde_json::Value::Null);
     }
 
     #[tokio::test]

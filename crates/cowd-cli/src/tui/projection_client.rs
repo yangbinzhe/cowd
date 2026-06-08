@@ -129,6 +129,28 @@ impl DaemonProjectionClient {
         self.get_json("/api/cross-plane/summary").await
     }
 
+    pub async fn connector_accounts(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/connectors/accounts").await
+    }
+
+    pub async fn connector_capabilities(&self) -> Result<serde_json::Value, ProjectionError> {
+        self.get_json("/api/connectors/capabilities").await
+    }
+
+    pub async fn connector_resources(
+        &self,
+        query: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<serde_json::Value, ProjectionError> {
+        let mut path = format!("/api/connectors/resources?limit={limit}&offset={offset}");
+        if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
+            path.push_str("&q=");
+            path.push_str(&url_encode(query));
+        }
+        self.get_json(&path).await
+    }
+
     pub async fn preflight_cross_plane_action(
         &self,
         action: serde_json::Value,
@@ -363,6 +385,35 @@ mod tests {
         let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
         let json = client.start_task("ship tui", true).await.expect("json");
         assert_eq!(json["id"], "task-1");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn connector_resources_gets_search_page() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0; 2048];
+            let n = socket.read(&mut buf).await.expect("read");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with(
+                "GET /api/connectors/resources?limit=20&offset=40&q=Ready%20Doc HTTP/1.1"
+            ));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 16\r\n\r\n{\"resources\":[]}",
+                )
+                .await
+                .expect("write");
+        });
+
+        let client = DaemonProjectionClient::new(format!("http://{addr}"), None).expect("client");
+        let json = client
+            .connector_resources(Some("Ready Doc"), 20, 40)
+            .await
+            .expect("json");
+        assert!(json["resources"].as_array().unwrap().is_empty());
         server.await.expect("server task");
     }
 }

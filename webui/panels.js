@@ -2010,6 +2010,234 @@ window.Panels = (()=>{
     }catch(e){c.appendChild(UI.el('div','panel-empty','Tools info unavailable'))}
   }
 
+  function connectorStatusClass(status){
+    const value=String(status||'unknown').toLowerCase();
+    if(value==='ready'||value==='available'||value==='ok'||value==='executed')return 'ready';
+    if(value==='disabled'||value==='blocked')return 'blocked';
+    if(value==='degraded'||value==='stale')return 'degraded';
+    return 'unknown';
+  }
+
+  function connectorRow(source,title,meta,status){
+    const row=UI.el('div','panel-item audit-record connector-row '+connectorStatusClass(status));
+    const badge=UI.el('span','audit-source');
+    badge.textContent=String(source||status||'item').slice(0,18);
+    const body=UI.el('span','pi-name audit-body');
+    const name=UI.el('span','audit-title');
+    name.textContent=title||'connector item';
+    const detail=UI.el('span','audit-meta');
+    detail.textContent=meta||'';
+    body.appendChild(name);
+    body.appendChild(detail);
+    row.appendChild(badge);
+    row.appendChild(body);
+    return row;
+  }
+
+  function renderConnectorServiceTools(serviceData,title){
+    const tools=(serviceData&&serviceData.tools)||[];
+    const sec=UI.el('div','panel-section connector-service-tools');
+    const health=serviceData&&serviceData.health;
+    sec.innerHTML='<h3>'+UI.esc(title)+'</h3>';
+    if(health){
+      sec.appendChild(connectorRow(health.status||'health',(serviceData.service&&serviceData.service.display_name)||title,health.reason||'ready',health.status));
+    }
+    if(!tools.length){
+      sec.appendChild(UI.el('div','panel-empty','No service tools exposed'));
+      return sec;
+    }
+    tools.slice(0,6).forEach(function(tool){
+      const meta=[tool.plane,tool.risk,tool.supports_commit?'commit':'dry-run',tool.requires_approval?'approval':'no approval'].filter(Boolean).join(' · ');
+      sec.appendChild(connectorRow(tool.provider||'service',tool.capability_id,meta,tool.risk==='low'?'ready':'degraded'));
+    });
+    return sec;
+  }
+
+  function renderConnectorServiceExecutor(service,defaultTool,defaultResource,defaultTitle,onDone){
+    const box=UI.el('div','cross-plane-composer connector-service-executor');
+    box.innerHTML='<h3>'+UI.esc(service)+' Execute</h3>';
+    const form=UI.el('div','panel-form cross-plane-form');
+    const tool=UI.el('input');
+    tool.value=defaultTool;
+    tool.setAttribute('aria-label',service+' tool id');
+    const resource=UI.el('input');
+    resource.value=defaultResource;
+    resource.setAttribute('aria-label',service+' resource id');
+    const title=UI.el('input');
+    title.value=defaultTitle;
+    title.setAttribute('aria-label',service+' title');
+    const principal=UI.el('input');
+    principal.value='user:webui';
+    principal.setAttribute('aria-label',service+' actor principal');
+    const identity=UI.el('input');
+    identity.placeholder='optional channel://... identity ref';
+    identity.setAttribute('aria-label',service+' actor identity ref');
+    const mode=UI.el('select');
+    mode.setAttribute('aria-label',service+' execution mode');
+    [['dry_run','Dry run'],['commit','Commit']].forEach(function(pair){
+      const opt=UI.el('option');
+      opt.value=pair[0];
+      opt.textContent=pair[1];
+      mode.appendChild(opt);
+    });
+    form.appendChild(tool);
+    form.appendChild(resource);
+    form.appendChild(title);
+    form.appendChild(principal);
+    form.appendChild(identity);
+    form.appendChild(mode);
+    const actions=UI.el('div','cross-plane-actions');
+    const run=UI.el('button','btn-secondary');
+    run.textContent='Run service';
+    actions.appendChild(run);
+    form.appendChild(actions);
+    const result=UI.el('div','dispatch-target-preview connector-service-result');
+    run.onclick=async function(){
+      run.disabled=true;
+      result.innerHTML='<div class="panel-empty">Running service action...</div>';
+      try{
+        const body={
+          actor_principal:principal.value.trim()||'user:webui',
+          actor_identity_ref:identity.value.trim()||undefined,
+          source_channel:'local:webui',
+          session_id:'webui-connector-console',
+          tool_id:tool.value.trim(),
+          resource_id:resource.value.trim(),
+          title:title.value.trim()||resource.value.trim(),
+          mode:mode.value,
+          idempotency_key:'webui-'+service+'-'+Date.now()
+        };
+        const response=await Api.executeConnectorService(service,body);
+        result.innerHTML='<h3>Service Result</h3>';
+        const receipt=response.receipt||{};
+        result.appendChild(connectorRow((response.result&&response.result.status)||receipt.status,body.tool_id,(response.result&&response.result.resource&&response.result.resource.reference)||receipt.dispatch_status||'',(response.result&&response.result.status)||receipt.status));
+        if((receipt.blockers||[]).length){
+          result.appendChild(UI.el('div','panel-empty','Blocked '+receipt.blockers.slice(0,3).join(' · ')));
+        }
+        if(response.resource_persisted)UI.showToast('Connector resource persisted');
+        if(onDone)onDone(response);
+      }catch(e){
+        result.innerHTML='';
+        result.appendChild(UI.el('div','panel-empty','Service failed: '+e.message));
+      }finally{
+        run.disabled=false;
+      }
+    };
+    box.appendChild(form);
+    box.appendChild(result);
+    return box;
+  }
+
+  async function renderConnectorConsole(){
+    const sec=UI.el('div','panel-section connector-console');
+    sec.innerHTML='<h3>Connector Console</h3>';
+    try{
+      const [summaryData,accountsData,capabilitiesData,resourcesData,executionsData,mockTools,feishuTools]=await Promise.all([
+        Api.connectorSummary().catch(function(e){return {error:e.message,summary:{}}}),
+        Api.connectorAccounts().catch(function(e){return {error:e.message,accounts:[]}}),
+        Api.connectorCapabilities().catch(function(e){return {error:e.message,capabilities:[]}}),
+        Api.connectorResources({limit:20,offset:0}).catch(function(e){return {error:e.message,resources:[],status:'degraded'}}),
+        Api.crossPlaneActionExecutions().catch(function(){return {executions:[]}}),
+        Api.connectorServiceTools('mock.docs').catch(function(e){return {error:e.message,tools:[]}}),
+        Api.connectorServiceTools('feishu.readonly').catch(function(e){return {error:e.message,tools:[]}}),
+      ]);
+      const summary=summaryData.summary||{};
+      const accounts=accountsData.accounts||[];
+      const capabilities=capabilitiesData.capabilities||[];
+      const resources=resourcesData.resources||[];
+      const executions=executionsData.executions||[];
+      sec.innerHTML+='<div class="audit-metrics">'
+        +'<span><b>'+UI.esc(summary.accounts??accounts.length)+'</b><small>accounts</small></span>'
+        +'<span><b>'+UI.esc(summary.capabilities??capabilities.length)+'</b><small>capabilities</small></span>'
+        +'<span><b>'+UI.esc(summary.resources??resources.length)+'</b><small>resources</small></span>'
+        +'<span><b>'+UI.esc(summary.degraded?'yes':'no')+'</b><small>degraded</small></span>'
+        +'</div>';
+      const degraded=[summaryData.error,accountsData.error,capabilitiesData.error,resourcesData.error,resourcesData.degraded_reason].filter(Boolean);
+      if(degraded.length)sec.appendChild(UI.el('div','panel-empty','Degraded '+degraded.slice(0,3).join(' · ')));
+
+      const accountSec=UI.el('div','panel-section');
+      accountSec.innerHTML='<h3>Accounts</h3>';
+      if(!accounts.length)accountSec.appendChild(UI.el('div','panel-empty','No provider accounts projected'));
+      accounts.slice(0,8).forEach(function(account){
+        const health=account.health||{};
+        const meta=[account.auth_mode,health.reason,(account.enabled_bindings||[]).length+' bindings'].filter(Boolean).join(' · ');
+        accountSec.appendChild(connectorRow(health.status||'unknown',account.provider+' · '+account.account_id,meta,health.status));
+      });
+      sec.appendChild(accountSec);
+
+      const capSec=UI.el('div','panel-section');
+      capSec.innerHTML='<h3>Capabilities</h3>';
+      if(!capabilities.length)capSec.appendChild(UI.el('div','panel-empty','No connector capabilities exposed'));
+      capabilities.slice(0,12).forEach(function(cap){
+        const meta=[cap.family,cap.plane,cap.risk,cap.supports_commit?'commit':'dry-run',cap.requires_approval?'approval':'open'].filter(Boolean).join(' · ');
+        capSec.appendChild(connectorRow(cap.provider||cap.plane,cap.capability_id,meta,cap.risk==='low'?'ready':'degraded'));
+      });
+      sec.appendChild(capSec);
+
+      sec.appendChild(renderConnectorServiceTools(mockTools,'Services · Mock Docs'));
+      sec.appendChild(renderConnectorServiceTools(feishuTools,'Services · Feishu Read-only'));
+
+      const resourceSec=UI.el('div','panel-section connector-resources');
+      resourceSec.innerHTML='<h3>Resources</h3>';
+      const controls=UI.el('div','cross-plane-form-grid connector-resource-controls');
+      const search=UI.el('input');
+      search.placeholder='Search resources';
+      search.setAttribute('aria-label','Search connector resources');
+      const page=UI.el('select');
+      page.setAttribute('aria-label','Connector resource page');
+      [['0','Page 1'],['20','Page 2'],['40','Page 3']].forEach(function(pair){
+        const opt=UI.el('option');
+        opt.value=pair[0];
+        opt.textContent=pair[1];
+        page.appendChild(opt);
+      });
+      controls.appendChild(search);
+      controls.appendChild(page);
+      const list=UI.el('div','connector-resource-list');
+      async function loadResources(){
+        list.innerHTML='<div class="panel-empty">Loading resources...</div>';
+        try{
+          const data=await Api.connectorResources({q:search.value.trim(),limit:20,offset:Number(page.value||0)});
+          list.innerHTML='';
+          const rows=data.resources||[];
+          if(!rows.length)list.appendChild(UI.el('div','panel-empty','No connector resources'));
+          rows.forEach(function(resource){
+            const meta=[resource.resource_type,resource.indexed_state,resource.source].filter(Boolean).join(' · ');
+            list.appendChild(connectorRow(resource.provider||'resource',resource.title||resource.reference,meta||resource.reference,resource.indexed_state));
+          });
+          if(data.degraded_reason)list.appendChild(UI.el('div','panel-empty','Resource directory degraded: '+data.degraded_reason));
+        }catch(e){
+          list.innerHTML='';
+          list.appendChild(UI.el('div','panel-empty','Resource search failed: '+e.message));
+        }
+      }
+      search.oninput=function(){clearTimeout(search._timer);search._timer=setTimeout(loadResources,180)};
+      page.onchange=loadResources;
+      resourceSec.appendChild(controls);
+      resourceSec.appendChild(list);
+      sec.appendChild(resourceSec);
+      loadResources();
+
+      const receiptSec=UI.el('div','panel-section');
+      receiptSec.innerHTML='<h3>Receipts / Audit</h3>';
+      const connectorReceipts=executions.filter(function(receipt){
+        const cap=receipt.action&&receipt.action.requested_capability;
+        return String(cap||'').startsWith('service.')||String(cap||'').startsWith('mcp.');
+      }).slice(0,5);
+      if(!connectorReceipts.length)receiptSec.appendChild(UI.el('div','panel-empty','No connector execution receipts'));
+      connectorReceipts.forEach(function(receipt){
+        receiptSec.appendChild(connectorRow(receipt.status||'receipt',(receipt.action&&receipt.action.requested_capability)||receipt.id,[receipt.dispatch_status,receipt.mode,receipt.idempotency_key&&('idem '+receipt.idempotency_key)].filter(Boolean).join(' · '),receipt.status));
+      });
+      sec.appendChild(receiptSec);
+
+      sec.appendChild(renderConnectorServiceExecutor('mock.docs','service.mock.docs.read','webui-doc','WebUI Mock Doc',loadResources));
+      sec.appendChild(renderConnectorServiceExecutor('feishu.readonly','service.feishu.docx.read','doccn-webui','WebUI Feishu Doc',loadResources));
+    }catch(e){
+      sec.appendChild(UI.el('div','panel-empty','Connector console unavailable: '+e.message));
+    }
+    return sec;
+  }
+
   async function renderGateway(){
     const c=cont();c.innerHTML='<h3>Connectivity & Policy</h3>';
     try{
@@ -2137,6 +2365,8 @@ window.Panels = (()=>{
     }catch(e){
       c.appendChild(UI.el('div','panel-empty','Cross-plane policy unavailable'));
     }
+
+    c.appendChild(await renderConnectorConsole());
 
     const wechatSec=UI.el('div','panel-section');
     wechatSec.innerHTML='<h3>WeChat iLink</h3>';

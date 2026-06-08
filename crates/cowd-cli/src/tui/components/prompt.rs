@@ -564,7 +564,8 @@ impl Prompt {
 
         // Generate inline preview
         self.inline_preview = if self.show_suggestions {
-            let top = self.highlighted_suggestion()
+            let top = self
+                .highlighted_suggestion()
                 .map(|s| &s.text)
                 .unwrap_or(&self.current_prefix);
             // The complement is the part of the suggestion after the prefix
@@ -717,7 +718,8 @@ impl Prompt {
     /// Update the inline preview based on the currently highlighted suggestion.
     fn update_inline_preview(&mut self) {
         self.inline_preview = if self.show_suggestions && !self.suggestions.is_empty() {
-            let top = self.highlighted_suggestion()
+            let top = self
+                .highlighted_suggestion()
                 .map(|s| &s.text)
                 .unwrap_or(&self.current_prefix);
             if top.starts_with(&self.current_prefix) {
@@ -756,7 +758,8 @@ impl Prompt {
         self.show_suggestions = !self.suggestions.is_empty();
 
         self.inline_preview = if self.show_suggestions {
-            let top = self.highlighted_suggestion()
+            let top = self
+                .highlighted_suggestion()
                 .map(|s| &s.text)
                 .unwrap_or(&self.current_prefix);
             if top.starts_with(&self.current_prefix) {

@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 use crate::tui::layout::{build_default_layout, LayoutState, LayoutTree};
-use crate::tui::runtime_control_store::{DaemonApprovalSummary, DaemonTaskSummary};
+use crate::tui::runtime_control_store::{
+    ConnectorAccountSummary, ConnectorCapabilitySummary, ConnectorResourceSummary,
+    DaemonApprovalSummary, DaemonTaskSummary,
+};
 use ratatui::widgets::{Block, Borders};
 use runtime::CowdEvent;
 use std::collections::VecDeque;
@@ -205,6 +208,14 @@ pub struct App {
     pub daemon_cross_plane_grants_active: Option<u64>,
     /// Number of cross-plane interop actions observed over the last 24h.
     pub daemon_cross_plane_actions_24h: Option<u64>,
+    /// Connector provider accounts observed through the daemon projection API.
+    pub daemon_connector_accounts: Vec<ConnectorAccountSummary>,
+    /// Connector capabilities observed through the daemon projection API.
+    pub daemon_connector_capabilities: Vec<ConnectorCapabilitySummary>,
+    /// Connector resources observed through the daemon projection API.
+    pub daemon_connector_resources: Vec<ConnectorResourceSummary>,
+    /// Connector-specific degraded reasons observed through the daemon projection API.
+    pub daemon_connector_degraded_reasons: Vec<String>,
     /// Degraded daemon projection/control reasons collected during snapshot refresh.
     pub daemon_degraded_reasons: Vec<String>,
     /// Current daemon session lease owner for the attached TUI session.
@@ -417,6 +428,10 @@ impl App {
             daemon_approval_items: Vec::new(),
             daemon_cross_plane_grants_active: None,
             daemon_cross_plane_actions_24h: None,
+            daemon_connector_accounts: Vec::new(),
+            daemon_connector_capabilities: Vec::new(),
+            daemon_connector_resources: Vec::new(),
+            daemon_connector_degraded_reasons: Vec::new(),
             daemon_degraded_reasons: Vec::new(),
             daemon_lease_owner: None,
             daemon_lease_mode: None,

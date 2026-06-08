@@ -5,9 +5,12 @@
 //! cross-plane policy engine remains the execution governance layer.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::path::Path;
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -125,6 +128,20 @@ impl ProviderAccount {
             .map(String::as_str)
             .collect()
     }
+
+    #[must_use]
+    pub fn mcp_server(
+        server_name: impl Into<String>,
+        transport: impl Into<String>,
+        health: ConnectorHealth,
+    ) -> Self {
+        let server_name = server_name.into();
+        let mut account = Self::new("mcp", server_name.clone(), transport);
+        account.secret_refs = vec![format!("config://mcpServers/{server_name}")];
+        account.enabled_bindings = vec![CapabilityManifest::mcp_server(&server_name).capability_id];
+        account.health = health;
+        account
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +208,28 @@ impl CapabilityManifest {
     }
 
     #[must_use]
+    pub fn service_readonly(provider: impl Into<String>, operation: impl Into<String>) -> Self {
+        let provider = provider.into();
+        let operation = operation.into();
+        Self {
+            capability_id: format!("service.{provider}.{operation}"),
+            family: format!("service.{provider}"),
+            required_scopes: readonly_required_scopes(&provider, &operation),
+            provider,
+            plane: ConnectorPlane::Service,
+            risk: CrossPlaneRisk::Low,
+            data_classification: DataClassification::Internal,
+            supports_dry_run: true,
+            supports_commit: true,
+            requires_approval: false,
+            input_schema_ref: Some(format!(
+                "schema://connector/service/{operation}/readonly/input"
+            )),
+            output_schema_ref: Some("schema://connector/service/resource/output".to_string()),
+        }
+    }
+
+    #[must_use]
     pub fn governance(capability_id: impl Into<String>) -> Self {
         let capability_id = capability_id.into();
         Self {
@@ -206,6 +245,67 @@ impl CapabilityManifest {
             input_schema_ref: Some("schema://connector/governance/action/input".to_string()),
             output_schema_ref: Some("schema://connector/governance/receipt/output".to_string()),
             capability_id,
+        }
+    }
+
+    #[must_use]
+    pub fn mcp_server(server_name: impl AsRef<str>) -> Self {
+        let normalized_server = crate::mcp::normalize_name_for_mcp(server_name.as_ref());
+        Self {
+            capability_id: format!("mcp.{normalized_server}.server"),
+            family: format!("mcp.{normalized_server}"),
+            provider: "mcp".to_string(),
+            plane: ConnectorPlane::Mcp,
+            required_scopes: Vec::new(),
+            risk: CrossPlaneRisk::Low,
+            data_classification: DataClassification::Internal,
+            supports_dry_run: true,
+            supports_commit: false,
+            requires_approval: false,
+            input_schema_ref: Some("schema://connector/mcp/server/input".to_string()),
+            output_schema_ref: Some("schema://connector/mcp/server/output".to_string()),
+        }
+    }
+
+    #[must_use]
+    pub fn mcp_tool(server_name: impl AsRef<str>, tool_name: impl AsRef<str>) -> Self {
+        let normalized_server = crate::mcp::normalize_name_for_mcp(server_name.as_ref());
+        let normalized_tool = crate::mcp::normalize_name_for_mcp(tool_name.as_ref());
+        Self {
+            capability_id: format!("mcp.{normalized_server}.tool.{normalized_tool}"),
+            family: format!("mcp.{normalized_server}"),
+            provider: "mcp".to_string(),
+            plane: ConnectorPlane::Mcp,
+            required_scopes: Vec::new(),
+            risk: CrossPlaneRisk::Medium,
+            data_classification: DataClassification::Internal,
+            supports_dry_run: false,
+            supports_commit: true,
+            requires_approval: true,
+            input_schema_ref: Some(format!(
+                "schema://connector/mcp/{normalized_server}/tool/{normalized_tool}/input"
+            )),
+            output_schema_ref: Some("schema://connector/mcp/tool/output".to_string()),
+        }
+    }
+
+    #[must_use]
+    pub fn mcp_resource(server_name: impl AsRef<str>, resource_kind: impl AsRef<str>) -> Self {
+        let normalized_server = crate::mcp::normalize_name_for_mcp(server_name.as_ref());
+        let normalized_kind = crate::mcp::normalize_name_for_mcp(resource_kind.as_ref());
+        Self {
+            capability_id: format!("mcp.{normalized_server}.resource.{normalized_kind}"),
+            family: format!("mcp.{normalized_server}"),
+            provider: "mcp".to_string(),
+            plane: ConnectorPlane::Mcp,
+            required_scopes: Vec::new(),
+            risk: CrossPlaneRisk::Low,
+            data_classification: DataClassification::Internal,
+            supports_dry_run: true,
+            supports_commit: false,
+            requires_approval: false,
+            input_schema_ref: Some("schema://connector/mcp/resource/input".to_string()),
+            output_schema_ref: Some("schema://connector/mcp/resource/output".to_string()),
         }
     }
 
@@ -258,7 +358,34 @@ impl ExternalResourceRef {
 
     #[must_use]
     pub fn is_canonical(&self) -> bool {
-        self.reference.starts_with("service://") || self.reference.starts_with("channel://")
+        self.reference.starts_with("service://")
+            || self.reference.starts_with("channel://")
+            || self.reference.starts_with("mcp://")
+    }
+
+    #[must_use]
+    pub fn mcp_resource(
+        server_name: impl AsRef<str>,
+        uri: impl AsRef<str>,
+        title: impl Into<String>,
+    ) -> Self {
+        let server_name = server_name.as_ref();
+        let normalized_server = crate::mcp::normalize_name_for_mcp(server_name);
+        let uri = uri.as_ref();
+        let digest = stable_hex_hash(uri);
+        Self {
+            reference: format!("mcp://{normalized_server}/{digest}"),
+            provider: "mcp".to_string(),
+            account_id: Some(server_name.to_string()),
+            resource_type: "resource".to_string(),
+            title: title.into(),
+            source: Some(uri.to_string()),
+            permissions_summary: Some(
+                "MCP resource access is governed by server configuration".to_string(),
+            ),
+            digest: Some(digest),
+            indexed_state: "unknown".to_string(),
+        }
     }
 }
 
@@ -332,6 +459,11 @@ impl ConnectorRegistrySnapshot {
             .iter()
             .filter(|capability| capability.plane == ConnectorPlane::Governance)
             .count();
+        let mcp_capabilities = self
+            .capabilities
+            .iter()
+            .filter(|capability| capability.plane == ConnectorPlane::Mcp)
+            .count();
         ConnectorSummary {
             account_count: self.accounts.len(),
             capability_count: self.capabilities.len(),
@@ -339,6 +471,7 @@ impl ConnectorRegistrySnapshot {
             channel_capabilities,
             service_capabilities,
             governance_capabilities,
+            mcp_capabilities,
             degraded: self.degraded,
             degraded_reasons: self.degraded_reasons.clone(),
         }
@@ -353,6 +486,7 @@ pub struct ConnectorSummary {
     pub channel_capabilities: usize,
     pub service_capabilities: usize,
     pub governance_capabilities: usize,
+    pub mcp_capabilities: usize,
     pub degraded: bool,
     pub degraded_reasons: Vec<String>,
 }
@@ -423,6 +557,231 @@ impl ResourceDirectory {
     }
 }
 
+#[derive(Debug)]
+pub struct SqliteResourceDirectory {
+    connection: Mutex<Connection>,
+}
+
+impl SqliteResourceDirectory {
+    pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        let connection = Connection::open(path)?;
+        Self::from_connection(connection)
+    }
+
+    pub fn in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(connection: Connection) -> rusqlite::Result<Self> {
+        initialize_resource_directory_schema(&connection)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
+
+    pub fn upsert(&self, resource: &ExternalResourceRef) -> rusqlite::Result<ExternalResourceRef> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connection.execute(
+            r"INSERT INTO connector_resources (
+                reference, provider, account_id, resource_type, title, source,
+                permissions_summary, digest, indexed_state, created_at, updated_at, last_seen_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)
+            ON CONFLICT(reference) DO UPDATE SET
+                provider = excluded.provider,
+                account_id = excluded.account_id,
+                resource_type = excluded.resource_type,
+                title = excluded.title,
+                source = excluded.source,
+                permissions_summary = excluded.permissions_summary,
+                digest = excluded.digest,
+                indexed_state = excluded.indexed_state,
+                updated_at = excluded.updated_at,
+                last_seen_at = excluded.last_seen_at",
+            params![
+                resource.reference,
+                resource.provider,
+                resource.account_id,
+                resource.resource_type,
+                resource.title,
+                resource.source,
+                resource.permissions_summary,
+                resource.digest,
+                resource.indexed_state,
+                now,
+            ],
+        )?;
+        Ok(resource.clone())
+    }
+
+    pub fn get(&self, reference: &str) -> rusqlite::Result<Option<ExternalResourceRef>> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connection
+            .query_row(
+                r"SELECT reference, provider, account_id, resource_type, title, source,
+                    permissions_summary, digest, indexed_state
+                  FROM connector_resources
+                  WHERE reference = ?1",
+                params![reference],
+                row_to_resource_ref,
+            )
+            .optional()
+    }
+
+    pub fn list_recent(&self, limit: usize) -> rusqlite::Result<Vec<ExternalResourceRef>> {
+        self.list_page(limit, 0)
+    }
+
+    pub fn list_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> rusqlite::Result<Vec<ExternalResourceRef>> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut statement = connection.prepare(
+            r"SELECT reference, provider, account_id, resource_type, title, source,
+                permissions_summary, digest, indexed_state
+              FROM connector_resources
+              ORDER BY last_seen_at DESC, reference ASC
+              LIMIT ?1 OFFSET ?2",
+        )?;
+        let resources = statement
+            .query_map(params![limit as i64, offset as i64], row_to_resource_ref)?
+            .collect();
+        resources
+    }
+
+    pub fn search(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<ExternalResourceRef>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return self.list_recent(limit);
+        }
+        let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut statement = connection.prepare(
+            r"SELECT reference, provider, account_id, resource_type, title, source,
+                permissions_summary, digest, indexed_state
+              FROM connector_resources
+              WHERE reference LIKE ?1 ESCAPE '\'
+                 OR title LIKE ?1 ESCAPE '\'
+                 OR resource_type LIKE ?1 ESCAPE '\'
+                 OR provider LIKE ?1 ESCAPE '\'
+              ORDER BY last_seen_at DESC, reference ASC
+              LIMIT ?2",
+        )?;
+        let resources = statement
+            .query_map(params![pattern, limit as i64], row_to_resource_ref)?
+            .collect();
+        resources
+    }
+
+    pub fn mark_indexed(&self, reference: &str) -> rusqlite::Result<bool> {
+        self.update_indexed_state(reference, "indexed")
+    }
+
+    pub fn mark_stale(&self, reference: &str) -> rusqlite::Result<bool> {
+        self.update_indexed_state(reference, "stale")
+    }
+
+    fn update_indexed_state(&self, reference: &str, indexed_state: &str) -> rusqlite::Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = connection.execute(
+            "UPDATE connector_resources SET indexed_state = ?1, updated_at = ?2 WHERE reference = ?3",
+            params![indexed_state, now, reference],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn attach_source(
+        &self,
+        reference: &str,
+        source_kind: &str,
+        source_id: &str,
+    ) -> rusqlite::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connection.execute(
+            r"INSERT OR REPLACE INTO connector_resource_sources
+                (reference, source_kind, source_id, attached_at)
+              VALUES (?1, ?2, ?3, ?4)",
+            params![reference, source_kind, source_id, now],
+        )?;
+        Ok(())
+    }
+}
+
+fn initialize_resource_directory_schema(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute(
+        r"CREATE TABLE IF NOT EXISTS connector_resources (
+            reference TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            account_id TEXT,
+            resource_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            source TEXT,
+            permissions_summary TEXT,
+            digest TEXT,
+            indexed_state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_connector_resources_provider ON connector_resources(provider)",
+        [],
+    )?;
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_connector_resources_last_seen ON connector_resources(last_seen_at)",
+        [],
+    )?;
+    connection.execute(
+        r"CREATE TABLE IF NOT EXISTS connector_resource_sources (
+            reference TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            attached_at TEXT NOT NULL,
+            PRIMARY KEY(reference, source_kind, source_id)
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn row_to_resource_ref(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExternalResourceRef> {
+    Ok(ExternalResourceRef {
+        reference: row.get(0)?,
+        provider: row.get(1)?,
+        account_id: row.get(2)?,
+        resource_type: row.get(3)?,
+        title: row.get(4)?,
+        source: row.get(5)?,
+        permissions_summary: row.get(6)?,
+        digest: row.get(7)?,
+        indexed_state: row.get(8)?,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceConnectorMetadata {
     pub id: String,
@@ -454,7 +813,172 @@ pub struct ServiceToolResult {
 pub trait ServiceConnector {
     fn metadata(&self) -> ServiceConnectorMetadata;
     fn capabilities(&self) -> Vec<CapabilityManifest>;
+    fn probe(&self, accounts: &[ProviderAccount]) -> ConnectorHealth {
+        if accounts.iter().any(|account| {
+            account.provider == self.metadata().provider
+                && matches!(account.health.status, ConnectorHealthStatus::Ready)
+        }) {
+            ConnectorHealth::ready()
+        } else {
+            ConnectorHealth::degraded(format!(
+                "no ready provider account for {}",
+                self.metadata().provider
+            ))
+        }
+    }
     fn execute_tool(&self, request: ServiceToolRequest) -> ServiceToolResult;
+}
+
+#[derive(Debug)]
+pub struct ConnectorBulkhead {
+    max_in_flight_per_provider: usize,
+    failure_threshold: u32,
+    cooldown: Duration,
+    providers: Mutex<HashMap<String, ConnectorProviderBulkheadState>>,
+}
+
+#[derive(Debug, Clone)]
+struct ConnectorProviderBulkheadState {
+    in_flight: usize,
+    consecutive_failures: u32,
+    cooldown_until: Option<Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectorBulkheadRejection {
+    Busy {
+        provider: String,
+        in_flight: usize,
+        max_in_flight: usize,
+    },
+    CoolingDown {
+        provider: String,
+    },
+}
+
+#[derive(Debug)]
+pub struct ConnectorBulkheadGuard<'a> {
+    provider: String,
+    bulkhead: &'a ConnectorBulkhead,
+}
+
+impl ConnectorBulkhead {
+    #[must_use]
+    pub fn new(
+        max_in_flight_per_provider: usize,
+        failure_threshold: u32,
+        cooldown: Duration,
+    ) -> Self {
+        Self {
+            max_in_flight_per_provider: max_in_flight_per_provider.max(1),
+            failure_threshold: failure_threshold.max(1),
+            cooldown,
+            providers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn default_service_gate() -> Self {
+        Self::new(4, 3, Duration::from_secs(30))
+    }
+
+    pub fn try_acquire(
+        &self,
+        provider: impl Into<String>,
+    ) -> Result<ConnectorBulkheadGuard<'_>, ConnectorBulkheadRejection> {
+        let provider = provider.into();
+        let now = Instant::now();
+        let mut providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = providers
+            .entry(provider.clone())
+            .or_insert_with(ConnectorProviderBulkheadState::default);
+        if state.cooldown_until.is_some_and(|until| until > now) {
+            return Err(ConnectorBulkheadRejection::CoolingDown { provider });
+        }
+        if state.in_flight >= self.max_in_flight_per_provider {
+            return Err(ConnectorBulkheadRejection::Busy {
+                provider,
+                in_flight: state.in_flight,
+                max_in_flight: self.max_in_flight_per_provider,
+            });
+        }
+        state.in_flight += 1;
+        Ok(ConnectorBulkheadGuard {
+            provider,
+            bulkhead: self,
+        })
+    }
+
+    pub fn record_success(&self, provider: &str) {
+        let mut providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = providers
+            .entry(provider.to_string())
+            .or_insert_with(ConnectorProviderBulkheadState::default);
+        state.consecutive_failures = 0;
+        state.cooldown_until = None;
+    }
+
+    pub fn record_failure(&self, provider: &str) {
+        let mut providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = providers
+            .entry(provider.to_string())
+            .or_insert_with(ConnectorProviderBulkheadState::default);
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= self.failure_threshold {
+            state.cooldown_until = Some(Instant::now() + self.cooldown);
+        }
+    }
+
+    #[must_use]
+    pub fn in_flight(&self, provider: &str) -> usize {
+        self.providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(provider)
+            .map(|state| state.in_flight)
+            .unwrap_or(0)
+    }
+
+    fn release(&self, provider: &str) {
+        let mut providers = self
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = providers.get_mut(provider) {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+    }
+}
+
+impl Default for ConnectorBulkhead {
+    fn default() -> Self {
+        Self::default_service_gate()
+    }
+}
+
+impl Default for ConnectorProviderBulkheadState {
+    fn default() -> Self {
+        Self {
+            in_flight: 0,
+            consecutive_failures: 0,
+            cooldown_until: None,
+        }
+    }
+}
+
+impl Drop for ConnectorBulkheadGuard<'_> {
+    fn drop(&mut self) {
+        self.bulkhead.release(&self.provider);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -481,7 +1005,7 @@ impl ServiceConnector for MockDocsServiceConnector {
     fn capabilities(&self) -> Vec<CapabilityManifest> {
         ["read", "export", "summarize_ref"]
             .into_iter()
-            .map(|operation| CapabilityManifest::service("mock.docs", operation))
+            .map(|operation| CapabilityManifest::service_readonly("mock.docs", operation))
             .collect()
     }
 
@@ -512,6 +1036,79 @@ impl ServiceConnector for MockDocsServiceConnector {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct FeishuReadOnlyServiceConnector;
+
+impl FeishuReadOnlyServiceConnector {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn resource_type_for_tool(tool_id: &str) -> &'static str {
+        if tool_id.contains(".drive.") {
+            "drive"
+        } else if tool_id.contains(".wiki.") {
+            "wiki"
+        } else {
+            "docx"
+        }
+    }
+}
+
+impl ServiceConnector for FeishuReadOnlyServiceConnector {
+    fn metadata(&self) -> ServiceConnectorMetadata {
+        ServiceConnectorMetadata {
+            id: "feishu.readonly".to_string(),
+            provider: "feishu".to_string(),
+            family: "service.feishu".to_string(),
+            display_name: "Feishu Read-only".to_string(),
+            read_only: true,
+        }
+    }
+
+    fn capabilities(&self) -> Vec<CapabilityManifest> {
+        [
+            "docx.read",
+            "drive.metadata",
+            "drive.download_readonly",
+            "wiki.node_readonly",
+        ]
+        .into_iter()
+        .map(|operation| CapabilityManifest::service_readonly("feishu", operation))
+        .collect()
+    }
+
+    fn execute_tool(&self, request: ServiceToolRequest) -> ServiceToolResult {
+        let ServiceToolRequest {
+            tool_id,
+            resource_id,
+            title,
+            input,
+        } = request;
+        let resource_type = Self::resource_type_for_tool(&tool_id);
+        let mut resource = ExternalResourceRef::new("feishu", resource_type, &resource_id, &title);
+        resource.permissions_summary = Some(
+            "Feishu read-only connector; body fetch requires configured app scope".to_string(),
+        );
+        resource.source = input
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some(format!("feishu://{resource_type}/{resource_id}")));
+        ServiceToolResult {
+            status: "ok".to_string(),
+            tool_id,
+            resource: Some(resource.clone()),
+            output: serde_json::json!({
+                "summary": format!("Feishu {resource_type} resource resolved as {}", resource.reference),
+                "read_only": true,
+                "body_included": false,
+            }),
+        }
+    }
+}
+
 #[must_use]
 pub fn default_capabilities() -> Vec<CapabilityManifest> {
     let mut capabilities = vec![
@@ -534,6 +1131,16 @@ pub fn default_capabilities() -> Vec<CapabilityManifest> {
         .into_iter()
         .map(|(provider, operation)| CapabilityManifest::channel(provider, operation)),
     );
+    capabilities.extend(
+        [
+            "docx.read",
+            "drive.metadata",
+            "drive.download_readonly",
+            "wiki.node_readonly",
+        ]
+        .into_iter()
+        .map(|operation| CapabilityManifest::service_readonly("feishu", operation)),
+    );
     capabilities.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
     capabilities
 }
@@ -544,6 +1151,26 @@ fn risk_for_channel_operation(operation: &str) -> CrossPlaneRisk {
         "callback" => CrossPlaneRisk::High,
         _ => CrossPlaneRisk::Low,
     }
+}
+
+fn readonly_required_scopes(provider: &str, operation: &str) -> Vec<String> {
+    match (provider, operation) {
+        ("feishu", "docx.read") => vec!["docx:read".to_string()],
+        ("feishu", "drive.metadata" | "drive.download_readonly") => {
+            vec!["drive:read".to_string()]
+        }
+        ("feishu", "wiki.node_readonly") => vec!["wiki:read".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+fn stable_hex_hash(value: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[cfg(test)]
@@ -580,6 +1207,43 @@ mod tests {
     }
 
     #[test]
+    fn mcp_capability_contracts_are_stable() {
+        let server = CapabilityManifest::mcp_server("github.com");
+        assert_eq!(server.capability_id, "mcp.github_com.server");
+        assert_eq!(server.plane, ConnectorPlane::Mcp);
+        assert!(!server.requires_approval);
+
+        let tool = CapabilityManifest::mcp_tool("github.com", "create issue");
+        assert_eq!(tool.capability_id, "mcp.github_com.tool.create_issue");
+        assert_eq!(tool.family, "mcp.github_com");
+        assert!(tool.supports_commit);
+        assert!(tool.requires_approval);
+
+        let account = ProviderAccount::mcp_server("github.com", "stdio", ConnectorHealth::ready());
+        assert_eq!(account.provider, "mcp");
+        assert_eq!(account.account_id, "github.com");
+        assert_eq!(account.enabled_bindings, vec!["mcp.github_com.server"]);
+    }
+
+    #[test]
+    fn mcp_resource_ref_uses_canonical_scheme_without_exposing_uri_as_id() {
+        let resource = ExternalResourceRef::mcp_resource(
+            "github.com",
+            "repo://owner/project/issues/1",
+            "Issue 1",
+        );
+
+        assert!(resource.reference.starts_with("mcp://github_com/"));
+        assert_eq!(resource.provider, "mcp");
+        assert_eq!(resource.account_id.as_deref(), Some("github.com"));
+        assert_eq!(
+            resource.source.as_deref(),
+            Some("repo://owner/project/issues/1")
+        );
+        assert!(resource.is_canonical());
+    }
+
+    #[test]
     fn default_snapshot_exposes_connector_capabilities_without_accounts() {
         let snapshot = ConnectorRegistrySnapshot::empty_with_default_capabilities();
         let summary = snapshot.summary();
@@ -605,6 +1269,8 @@ mod tests {
             .any(
                 |capability| capability.capability_id == "service.mock.docs.read"
                     && capability.plane == ConnectorPlane::Service
+                    && capability.supports_commit
+                    && !capability.requires_approval
             ));
 
         let result = connector.execute_tool(ServiceToolRequest {
@@ -622,6 +1288,82 @@ mod tests {
     }
 
     #[test]
+    fn connector_bulkhead_rejects_when_provider_is_at_capacity() {
+        let bulkhead = ConnectorBulkhead::new(1, 3, Duration::from_secs(30));
+        let guard = bulkhead.try_acquire("feishu").unwrap();
+
+        let rejected = bulkhead.try_acquire("feishu").unwrap_err();
+
+        assert_eq!(
+            rejected,
+            ConnectorBulkheadRejection::Busy {
+                provider: "feishu".to_string(),
+                in_flight: 1,
+                max_in_flight: 1,
+            }
+        );
+        assert_eq!(bulkhead.in_flight("feishu"), 1);
+        drop(guard);
+        assert_eq!(bulkhead.in_flight("feishu"), 0);
+        assert!(bulkhead.try_acquire("feishu").is_ok());
+    }
+
+    #[test]
+    fn connector_bulkhead_enters_cooldown_after_repeated_failures() {
+        let bulkhead = ConnectorBulkhead::new(2, 2, Duration::from_secs(30));
+
+        bulkhead.record_failure("feishu");
+        assert!(bulkhead.try_acquire("feishu").is_ok());
+        bulkhead.record_failure("feishu");
+
+        let rejected = bulkhead.try_acquire("feishu").unwrap_err();
+
+        assert_eq!(
+            rejected,
+            ConnectorBulkheadRejection::CoolingDown {
+                provider: "feishu".to_string(),
+            }
+        );
+        bulkhead.record_success("feishu");
+        assert!(bulkhead.try_acquire("feishu").is_ok());
+    }
+
+    #[test]
+    fn feishu_readonly_connector_declares_low_risk_read_capabilities() {
+        let connector = FeishuReadOnlyServiceConnector::new();
+        let capabilities = connector.capabilities();
+
+        assert!(capabilities.iter().any(|capability| {
+            capability.capability_id == "service.feishu.docx.read"
+                && capability.supports_commit
+                && !capability.requires_approval
+                && capability.risk == CrossPlaneRisk::Low
+                && capability.required_scopes == vec!["docx:read".to_string()]
+        }));
+        assert!(matches!(
+            connector.probe(&[]).status,
+            ConnectorHealthStatus::Degraded
+        ));
+    }
+
+    #[test]
+    fn feishu_readonly_connector_returns_canonical_resource_ref_without_body() {
+        let result = FeishuReadOnlyServiceConnector::new().execute_tool(ServiceToolRequest {
+            tool_id: "service.feishu.docx.read".to_string(),
+            resource_id: "doccn123".to_string(),
+            title: "Feishu Plan".to_string(),
+            input: serde_json::json!({}),
+        });
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(
+            result.resource.unwrap().reference,
+            "service://feishu/docx/doccn123"
+        );
+        assert_eq!(result.output["body_included"], false);
+    }
+
+    #[test]
     fn resource_directory_upserts_and_searches_refs() {
         let directory = ResourceDirectory::new();
         let resource = ExternalResourceRef::new("mock.docs", "document", "doc-2", "Runtime Plan");
@@ -630,5 +1372,56 @@ mod tests {
         assert_eq!(directory.get(&resource.reference), Some(resource.clone()));
         assert_eq!(directory.search("runtime", 10), vec![resource.clone()]);
         assert_eq!(directory.list_recent(1), vec![resource]);
+    }
+
+    #[test]
+    fn sqlite_resource_directory_persists_and_pages_refs() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("resources.sqlite");
+        let first = ExternalResourceRef::new("mock.docs", "document", "doc-1", "Runtime Plan");
+        let second = ExternalResourceRef::new("mcp", "resource", "res-2", "MCP Manual");
+
+        {
+            let directory = SqliteResourceDirectory::open(&db_path).unwrap();
+            directory.upsert(&first).unwrap();
+            directory.upsert(&second).unwrap();
+            directory
+                .attach_source(&first.reference, "session", "session-1")
+                .unwrap();
+
+            assert_eq!(
+                directory.get(&first.reference).unwrap(),
+                Some(first.clone())
+            );
+            assert_eq!(
+                directory.search("manual", 10).unwrap(),
+                vec![second.clone()]
+            );
+            assert_eq!(directory.list_page(1, 0).unwrap().len(), 1);
+            assert!(directory.mark_indexed(&first.reference).unwrap());
+            assert_eq!(
+                directory
+                    .get(&first.reference)
+                    .unwrap()
+                    .unwrap()
+                    .indexed_state,
+                "indexed"
+            );
+        }
+
+        let reopened = SqliteResourceDirectory::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.get(&first.reference).unwrap().unwrap().title,
+            "Runtime Plan"
+        );
+        assert!(reopened.mark_stale(&first.reference).unwrap());
+        assert_eq!(
+            reopened
+                .get(&first.reference)
+                .unwrap()
+                .unwrap()
+                .indexed_state,
+            "stale"
+        );
     }
 }

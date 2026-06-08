@@ -360,6 +360,22 @@ window.Api = (()=>{
     async startWechatIlinkQr(body){return req('POST','/api/channels/wechat-ilink/qr',body||{})},
     async pollWechatIlinkQr(body){return req('POST','/api/channels/wechat-ilink/qr/poll',body)},
 
+    // ── Connector runtime ──
+    async connectorSummary(){return req('GET','/api/connectors/summary')},
+    async connectorAccounts(){return req('GET','/api/connectors/accounts')},
+    async connectorCapabilities(){return req('GET','/api/connectors/capabilities')},
+    async connectorResources(opts){
+      const o=opts||{};
+      const params=new URLSearchParams();
+      if(o.q)params.set('q',o.q);
+      if(o.limit!==undefined)params.set('limit',o.limit);
+      if(o.offset!==undefined)params.set('offset',o.offset);
+      const query=params.toString();
+      return req('GET','/api/connectors/resources'+(query?'?'+query:''));
+    },
+    async connectorServiceTools(service){return req('GET','/api/connectors/services/'+encodeURIComponent(service)+'/tools')},
+    async executeConnectorService(service,body){return req('POST','/api/connectors/services/'+encodeURIComponent(service)+'/execute',body||{})},
+
     // ── Usage ──
     async getUsage(){return req('GET','/api/usage')},
 

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WEBUI="$ROOT/webui"
 CHROMIUM="${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-/snap/bin/chromium}"
-PORT_PATTERN=':(18642|18643|18652|18662|18663|18664|18665|18666|18667|18668|18669|9237|9238|9239|9240|9241|8642)\b'
+PORT_PATTERN=':(18642|18643|18652|18662|18663|18664|18665|18666|18667|18668|18669|18670|9237|9238|9239|9240|9241|8642)\b'
 TMUX_PATTERN='cowd-|webui-|phase5|message100k|prepare|audit|workspace|profile'
 
 run() {
@@ -52,6 +52,7 @@ main() {
   run cargo test -p cowd-cli task -- --nocapture
   run scripts/task_phase_scenario.sh
   run scripts/memory_degraded_scenario.sh
+  run scripts/v0941_unified_scenario.sh
   run cargo test -p cowd-cli --test resume_slash_commands resume_latest_restores_the_most_recent_managed_session -- --nocapture
   run cargo test -p cowd-cli yolo -- --nocapture
   run cargo test -p cowd-cli cli_session_sync_replaces_store_messages_and_events -- --nocapture
@@ -62,6 +63,10 @@ main() {
   run_in_webui npm test
   run_in_webui env PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$CHROMIUM" npm run test:e2e
   run scripts/webui_live_workbench_scenario.sh
+
+  run cargo test -p runtime --lib connector
+  run cargo test -p cowd-cli connector --no-default-features
+  run cargo test -p cowd-cli runtime_control --no-default-features -- --test-threads=1
 
   check_no_test_ports
   check_no_test_tmux

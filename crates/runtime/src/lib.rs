@@ -123,10 +123,12 @@ pub use config_validate::{
     DiagnosticKind, ValidationResult,
 };
 pub use connector::{
-    default_capabilities, CapabilityManifest, ConnectorHealth, ConnectorHealthStatus,
-    ConnectorPlane, ConnectorRegistrySnapshot, ConnectorSummary, ExternalResourceRef,
-    MockDocsServiceConnector, ProviderAccount, ResourceDirectory, ServiceConnector,
-    ServiceConnectorMetadata, ServiceToolRequest, ServiceToolResult,
+    default_capabilities, CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadGuard,
+    ConnectorBulkheadRejection, ConnectorHealth, ConnectorHealthStatus, ConnectorPlane,
+    ConnectorRegistrySnapshot, ConnectorSummary, ExternalResourceRef,
+    FeishuReadOnlyServiceConnector, MockDocsServiceConnector, ProviderAccount, ResourceDirectory,
+    ServiceConnector, ServiceConnectorMetadata, ServiceToolRequest, ServiceToolResult,
+    SqliteResourceDirectory,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, build_cc_memory_config, ApiClient, ApiRequest,
@@ -137,12 +139,12 @@ pub use cowd_event::{
     CowdEvent, CowdEventBus, RuntimePolicyDecisionSummary, RuntimeWorkGraphSummary,
 };
 pub use cross_plane_policy::{
-    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane, CrossPlaneDecisionEvidence,
-    CrossPlaneDispatchOutcome, CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt,
-    CrossPlaneGrant, CrossPlaneIdentityBinding, CrossPlaneOutboundMessagePlan,
-    CrossPlanePolicyConfig, CrossPlanePolicyDecision, CrossPlanePolicyEngine,
-    CrossPlaneResolvedIdentity, CrossPlaneRisk, CrossPlaneSummary, DataClassification, GrantType,
-    IdentityTrust, PolicyDecisionKind,
+    ConnectorActionContext, ConnectorDecisionEvidence, CrossPlaneAction, CrossPlaneAuditRecord,
+    CrossPlaneControlPlane, CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome,
+    CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt, CrossPlaneGrant,
+    CrossPlaneIdentityBinding, CrossPlaneOutboundMessagePlan, CrossPlanePolicyConfig,
+    CrossPlanePolicyDecision, CrossPlanePolicyEngine, CrossPlaneResolvedIdentity, CrossPlaneRisk,
+    CrossPlaneSummary, DataClassification, GrantType, IdentityTrust, PolicyDecisionKind,
 };
 pub use doc_ingestion::{
     ClassificationResult, ConflictStrategy, DocumentCategory, DocumentClassifier, DocumentIngestor,

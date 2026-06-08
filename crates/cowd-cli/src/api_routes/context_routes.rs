@@ -12,6 +12,7 @@ use memory::{MemoryKernel, MemoryTurnContext};
 use runtime::{
     ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextOmission,
     ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind, ContextVisibility,
+    ExternalResourceRef, SqliteResourceDirectory,
 };
 use serde::Deserialize;
 
@@ -173,6 +174,8 @@ async fn context_current_handler(
     } else {
         degraded.push(ContextSourceKind::Memory);
     }
+
+    dynamic_items.extend(resource_context_items(&state, &query));
 
     let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
         profile,
@@ -548,6 +551,8 @@ async fn resolve_evidence_ref_handler(
         resolve_session_evidence(&state, reference, session_ref).await
     } else if reference.starts_with("tool://") {
         resolve_tool_evidence(&state, reference, session_id.as_deref()).await
+    } else if reference.starts_with("service://") || reference.starts_with("mcp://") {
+        resolve_resource_evidence(&state, reference)
     } else if reference.starts_with("agent://") {
         serde_json::json!({
             "ref": reference,
@@ -565,6 +570,87 @@ async fn resolve_evidence_ref_handler(
     };
 
     Ok(Json(resolved))
+}
+
+fn resource_context_items(state: &AppState, query: &str) -> Vec<ContextItem> {
+    let path = super::connector_routes::resource_directory_path(&state.workspace_root);
+    if !path.exists() {
+        return Vec::new();
+    }
+    let Ok(directory) = SqliteResourceDirectory::open(path) else {
+        return Vec::new();
+    };
+    let resources = if query.trim().is_empty() {
+        directory.list_recent(5)
+    } else {
+        directory.search(query, 5)
+    }
+    .unwrap_or_default();
+
+    resources.into_iter().map(resource_context_item).collect()
+}
+
+fn resource_context_item(resource: ExternalResourceRef) -> ContextItem {
+    let mut content = format!(
+        "resource: {}\nref: {}\nprovider: {}\ntype: {}\nindexed_state: {}",
+        resource.title,
+        resource.reference,
+        resource.provider,
+        resource.resource_type,
+        resource.indexed_state
+    );
+    if matches!(resource.indexed_state.as_str(), "stale" | "degraded") {
+        content.push_str("\nwarning: resource metadata may be stale or degraded; resolve evidence before relying on details");
+    }
+    let mut item = ContextItem::new(
+        resource.reference.clone(),
+        ContextSourceKind::Workspace,
+        ContextRole::Evidence,
+        content,
+    );
+    item.authority = ContextAuthority::Derived;
+    item.visibility = ContextVisibility::Shared;
+    item.score = if resource.indexed_state == "stale" {
+        0.45
+    } else {
+        0.7
+    };
+    item.evidence = vec![resource.reference];
+    item
+}
+
+fn resolve_resource_evidence(state: &AppState, reference: &str) -> serde_json::Value {
+    let path = super::connector_routes::resource_directory_path(&state.workspace_root);
+    if !path.exists() {
+        return serde_json::json!({
+            "ref": reference,
+            "kind": "resource",
+            "available": false,
+            "reason": "resource directory is not initialized",
+        });
+    }
+    match SqliteResourceDirectory::open(path).and_then(|directory| directory.get(reference)) {
+        Ok(Some(resource)) => serde_json::json!({
+            "ref": reference,
+            "kind": "resource",
+            "available": true,
+            "resource": resource,
+            "body": null,
+            "reason": "resource evidence resolves metadata only; fetch/read must go through connector capability",
+        }),
+        Ok(None) => serde_json::json!({
+            "ref": reference,
+            "kind": "resource",
+            "available": false,
+            "reason": "resource ref not found",
+        }),
+        Err(error) => serde_json::json!({
+            "ref": reference,
+            "kind": "resource",
+            "available": false,
+            "reason": format!("resource lookup failed: {error}"),
+        }),
+    }
 }
 
 fn resolve_workspace_evidence(root: &FsPath, reference: &str, relative: &str) -> serde_json::Value {
