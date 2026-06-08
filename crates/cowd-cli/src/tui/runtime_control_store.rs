@@ -281,6 +281,85 @@ impl RuntimeControlSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeControlLocalStore {
+    snapshot: RuntimeControlSnapshot,
+}
+
+impl RuntimeControlLocalStore {
+    pub fn from_app(app: &App) -> Self {
+        Self {
+            snapshot: RuntimeControlSnapshot::from_app(app),
+        }
+    }
+
+    pub fn snapshot(&self) -> &RuntimeControlSnapshot {
+        &self.snapshot
+    }
+
+    pub fn apply_to_app(&self, app: &mut App) {
+        self.snapshot.apply_to_app(app);
+    }
+
+    pub fn apply_approval_response(&mut self, approval_id: &str) {
+        self.snapshot
+            .approval_items
+            .retain(|approval| approval.id != approval_id);
+        self.snapshot.pending_approvals = Some(self.snapshot.approval_items.len() as u64);
+    }
+
+    pub fn apply_task_status(&mut self, task_id: &str, status: &str) {
+        for task in &mut self.snapshot.tasks {
+            if task.id == task_id {
+                task.status = status.to_string();
+                if matches!(status, "completed" | "cancelled" | "canceled") {
+                    task.blocker_reason = None;
+                }
+            }
+        }
+        self.snapshot.task_count = Some(self.snapshot.tasks.len() as u64);
+    }
+
+    pub fn apply_connector_resource_state(&mut self, reference: &str, state: &str) {
+        for resource in &mut self.snapshot.connector_resources {
+            if resource.reference == reference {
+                resource.indexed_state = state.to_string();
+            }
+        }
+    }
+
+    pub fn push_action_receipt(
+        &mut self,
+        status: &str,
+        dispatch_status: &str,
+        mode: &str,
+        capability: &str,
+        idempotency_key: Option<String>,
+    ) {
+        self.snapshot.action_receipts.insert(
+            0,
+            RuntimeActionReceiptSummary {
+                status: status.to_string(),
+                dispatch_status: truncate_receipt_field(dispatch_status, 80),
+                mode: mode.to_string(),
+                capability: capability.to_string(),
+                idempotency_key,
+            },
+        );
+        self.snapshot.action_receipts.truncate(8);
+    }
+}
+
+fn truncate_receipt_field(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 fn task_summary_from_json(value: &serde_json::Value) -> Option<DaemonTaskSummary> {
     let id = value.get("id").and_then(serde_json::Value::as_str)?;
     let objective = value
@@ -791,5 +870,67 @@ mod tests {
             restored.action_receipts[0].capability,
             "daemon.task.complete"
         );
+    }
+
+    #[test]
+    fn local_store_applies_runtime_mutations_and_receipt_limits() {
+        let mut app = App::new("claude-sonnet-4-6", "session-local-store");
+        app.daemon_approval_items = vec![DaemonApprovalSummary {
+            id: "approval-1".to_string(),
+            tool_name: "bash".to_string(),
+            risk: Some("high".to_string()),
+            requester: Some("session".to_string()),
+            input_preview: "run command".to_string(),
+        }];
+        app.daemon_pending_approvals = Some(1);
+        app.daemon_tasks = vec![DaemonTaskSummary {
+            id: "task-1".to_string(),
+            objective: "finish task".to_string(),
+            status: "blocked".to_string(),
+            current_phase: None,
+            yolo_mode: false,
+            failure_count: 0,
+            review_result: None,
+            artifact_count: 0,
+            blocker_reason: Some("waiting".to_string()),
+        }];
+        app.daemon_task_count = Some(1);
+        app.daemon_connector_resources = vec![ConnectorResourceSummary {
+            reference: "service://mock.docs/document/1".to_string(),
+            provider: "mock.docs".to_string(),
+            resource_type: "document".to_string(),
+            title: "Doc".to_string(),
+            indexed_state: "indexed".to_string(),
+        }];
+
+        let mut store = RuntimeControlLocalStore::from_app(&app);
+        store.apply_approval_response("approval-1");
+        store.apply_task_status("task-1", "completed");
+        store.apply_connector_resource_state("service://mock.docs/document/1", "stale");
+        store.push_action_receipt(
+            "failed",
+            &"x".repeat(100),
+            "daemon-control",
+            "connector.resource.revalidate",
+            Some("service://mock.docs/document/1".to_string()),
+        );
+        store.apply_to_app(&mut app);
+
+        assert_eq!(app.daemon_pending_approvals, Some(0));
+        assert!(app.daemon_approval_items.is_empty());
+        assert_eq!(app.daemon_tasks[0].status, "completed");
+        assert_eq!(app.daemon_tasks[0].blocker_reason, None);
+        assert_eq!(app.daemon_connector_resources[0].indexed_state, "stale");
+        assert_eq!(app.daemon_action_receipts.len(), 1);
+        assert_eq!(
+            app.daemon_action_receipts[0]
+                .dispatch_status
+                .chars()
+                .count(),
+            83
+        );
+        assert!(app.daemon_action_receipts[0]
+            .dispatch_status
+            .ends_with("..."));
     }
 }

@@ -2108,42 +2108,17 @@ impl TuiState {
     }
 
     fn apply_local_daemon_approval_response(&mut self, approval_id: &str) {
-        self.app
-            .daemon_approval_items
-            .retain(|approval| approval.id != approval_id);
-        self.app.daemon_pending_approvals = Some(self.app.daemon_approval_items.len() as u64);
-        self.approval_cockpit_panel.sync_from_app(&self.app);
-        let snapshot =
-            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
-        self.command_palette.sync_runtime_actions(&snapshot);
+        self.mutate_runtime_control_store(|store| store.apply_approval_response(approval_id));
     }
 
     fn apply_local_daemon_task_status(&mut self, task_id: &str, status: &str) {
-        for task in &mut self.app.daemon_tasks {
-            if task.id == task_id {
-                task.status = status.to_string();
-                if matches!(status, "completed" | "cancelled" | "canceled") {
-                    task.blocker_reason = None;
-                }
-            }
-        }
-        self.app.daemon_task_count = Some(self.app.daemon_tasks.len() as u64);
-        self.goal_workbench_panel.sync_from_app(&self.app);
-        let snapshot =
-            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
-        self.command_palette.sync_runtime_actions(&snapshot);
+        self.mutate_runtime_control_store(|store| store.apply_task_status(task_id, status));
     }
 
     fn apply_local_connector_resource_state(&mut self, reference: &str, state: &str) {
-        for resource in &mut self.app.daemon_connector_resources {
-            if resource.reference == reference {
-                resource.indexed_state = state.to_string();
-            }
-        }
-        self.gateway_panel.sync_from_app(&self.app);
-        let snapshot =
-            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
-        self.command_palette.sync_runtime_actions(&snapshot);
+        self.mutate_runtime_control_store(|store| {
+            store.apply_connector_resource_state(reference, state);
+        });
     }
 
     fn push_runtime_action_receipt(
@@ -2154,20 +2129,29 @@ impl TuiState {
         capability: &str,
         idempotency_key: Option<String>,
     ) {
-        self.app.daemon_action_receipts.insert(
-            0,
-            crate::tui::runtime_control_store::RuntimeActionReceiptSummary {
-                status: status.to_string(),
-                dispatch_status: truncate_receipt_field(dispatch_status, 80),
-                mode: mode.to_string(),
-                capability: capability.to_string(),
-                idempotency_key,
-            },
-        );
-        self.app.daemon_action_receipts.truncate(8);
+        self.mutate_runtime_control_store(|store| {
+            store.push_action_receipt(status, dispatch_status, mode, capability, idempotency_key);
+        });
+    }
+
+    fn mutate_runtime_control_store(
+        &mut self,
+        mutate: impl FnOnce(&mut crate::tui::runtime_control_store::RuntimeControlLocalStore),
+    ) {
+        let mut store =
+            crate::tui::runtime_control_store::RuntimeControlLocalStore::from_app(&self.app);
+        mutate(&mut store);
+        store.apply_to_app(&mut self.app);
+        self.sync_runtime_control_surfaces(store.snapshot());
+    }
+
+    fn sync_runtime_control_surfaces(
+        &mut self,
+        snapshot: &crate::tui::runtime_control_store::RuntimeControlSnapshot,
+    ) {
+        self.approval_cockpit_panel.sync_from_app(&self.app);
+        self.goal_workbench_panel.sync_from_app(&self.app);
         self.gateway_panel.sync_from_app(&self.app);
-        let snapshot =
-            crate::tui::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
     }
 
@@ -2646,16 +2630,6 @@ where
     }
 }
 
-fn truncate_receipt_field(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let truncated = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
-}
-
 fn search_l4_entries_blocking(
     orchestrator: std::sync::Arc<memory::MemoryOrchestrator>,
 ) -> Result<Vec<memory::MemoryEntry>, String> {
@@ -2916,15 +2890,6 @@ mod tests {
         );
         assert_eq!(state.gateway_panel.execution_receipts.len(), 2);
         std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn runtime_action_receipt_truncates_long_status() {
-        let long = "x".repeat(100);
-        let truncated = truncate_receipt_field(&long, 16);
-
-        assert_eq!(truncated.chars().count(), 19);
-        assert!(truncated.ends_with("..."));
     }
 
     #[test]
