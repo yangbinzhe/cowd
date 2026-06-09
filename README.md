@@ -1,14 +1,14 @@
 # COWD — AI Agent Runtime
 
-> **Rust 原生 AI 运行时框架** | 当前版本 v0.9.42
+> **Rust 原生 AI 运行时框架** | 当前版本 v0.9.82
 > 统一 daemon · SQLite session source of truth · Runtime Control Plane
 > TUI/WebUI 管控 · Connector Runtime · Cross-plane 权限治理 · MCP/飞书/本地服务接入
 
 ---
 
-## 当前主线：v0.9 Connector Runtime Release
+## 当前主线：v0.9 AI Runtime Release
 
-v0.9.42 的目标是把 runtime control-plane、session lease、connector account/capability/resource、cross-plane governance、TUI/WebUI 控制台和统一场景门禁收束为可交付版本。
+v0.9 的目标是把 runtime control-plane、session lease、connector account/capability/resource、cross-plane governance、TUI/WebUI 控制台和统一场景门禁收束为可交付版本。
 
 这一阶段不再只做局部 API 或 UI，而是让系统能回答四个生产问题：
 
@@ -28,7 +28,7 @@ RuntimeCommand -> RuntimeEventLog -> RuntimeProjection
 
 这条主线要求 Session、Agent、Task、Tool、Memory、Context、Policy、UI 全部围绕同一事实源协作。SQLite/DB 是运行态事实源；JSONL 只保留为显式导入、导出和 debug bundle 格式。
 
-### v0.9.42 关键入口
+### 关键入口
 
 ```bash
 cowd gateway run
@@ -37,8 +37,8 @@ curl http://127.0.0.1:8642/api/connectors/summary
 curl http://127.0.0.1:8642/api/connectors/accounts
 curl http://127.0.0.1:8642/api/connectors/capabilities
 curl http://127.0.0.1:8642/api/connectors/resources
-scripts/v0941_unified_scenario.sh
-scripts/release_gate.sh
+scripts/validate.sh scenario
+scripts/validate.sh release
 ```
 
 Operator 文档见 [docs/operator/v0.9.42-connector-runtime-operator-checklist.md](docs/operator/v0.9.42-connector-runtime-operator-checklist.md)。

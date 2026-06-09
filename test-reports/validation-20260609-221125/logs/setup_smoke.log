@@ -1,0 +1,32 @@
+[2026-06-09T22:12:13+08:00] START setup_smoke
+Cowd
+  Version          0.9.82
+  Git SHA          7e20614
+  Target           x86_64-unknown-linux-gnu
+  Build date       2026-06-09
+Setup Center
+  Status           action
+  Working dir      /media/yi/Datas/workspace/cowd-develop
+  Config home      /home/yi/.cowd
+  Loaded configs   1
+  Gateway          not running
+  Next             cowd gateway wechat-qr
+
+Checks
+  Config           ready   1 config file(s) loaded
+  Provider         ready   Model deepseek-v4-pro routes through provider deepseek
+  Gateway          warn    Configured at http://127.0.0.1:8642, not currently running
+                           next: cowd gateway run
+  Feishu           ready   Enabled with required credentials; secrets are not displayed
+  WeChat           action  No personal WeChat QR account authorized
+                           next: cowd gateway wechat-qr
+  Memory           ready   Enabled with default organic memory runtime
+  Session          ready   SQLite session store exists at /home/yi/.cowd/sessions.db
+  Permission       ready   Permission mode is default; --solo/--yolo remain explicit overrides
+
+Safe commands
+  /setup                         Re-run this setup check in TUI
+  cowd gateway wechat-qr          Authorize personal WeChat by QR
+  cowd gateway run                Start gateway/WebUI in foreground
+  cowd gateway restart            Reload gateway after channel auth
+[2026-06-09T22:12:13+08:00] END setup_smoke status=0 elapsed=0s target_before=2218405245 target_after=2218405245

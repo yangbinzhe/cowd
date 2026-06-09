@@ -1,0 +1,45 @@
+[2026-06-09T22:06:31+08:00] START cargo_test_cowd_cli_setup
+   Compiling mock-anthropic-service v0.9.78 (/media/yi/Datas/workspace/cowd-develop/crates/mock-anthropic-service)
+   Compiling serial_test v3.5.0
+   Compiling cowd-cli v0.9.78 (/media/yi/Datas/workspace/cowd-develop/crates/cowd-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.86s
+     Running unittests src/main.rs (/tmp/cowd-target-v0978-validation/debug/deps/cowd-692f69fa499d5f79)
+
+running 3 tests
+test tests::setup_next_action_prioritizes_action_items_over_warnings ... ok
+test tests::setup_report_and_json_are_redacted_and_actionable ... ok
+test tui::components::command_palette::tests::default_entries_include_setup_center_action ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1210 filtered out; finished in 0.00s
+
+     Running tests/cli_flags_and_config_defaults.rs (/tmp/cowd-target-v0978-validation/debug/deps/cli_flags_and_config_defaults-e613667a5c8cee96)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/compact_output.rs (/tmp/cowd-target-v0978-validation/debug/deps/compact_output-9bfe2578c6b72ba3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/mock_parity_harness.rs (/tmp/cowd-target-v0978-validation/debug/deps/mock_parity_harness-72b31a0c13c61bfb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/output_format_contract.rs (/tmp/cowd-target-v0978-validation/debug/deps/output_format_contract-4ce653962cb73fda)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/resume_slash_commands.rs (/tmp/cowd-target-v0978-validation/debug/deps/resume_slash_commands-f7302df5826d7e3f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+[2026-06-09T22:06:49+08:00] END cargo_test_cowd_cli_setup status=0 elapsed=18s target_before=9507646253 target_after=10772677061

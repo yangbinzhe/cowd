@@ -1,0 +1,152 @@
+[2026-06-09T22:03:50+08:00] START cargo_test_memory_tuner
+   Compiling slab v0.4.12
+   Compiling getrandom v0.2.17
+   Compiling rustls v0.23.40
+   Compiling futures-channel v0.3.32
+   Compiling serde_json v1.0.150
+   Compiling aho-corasick v1.1.4
+   Compiling csv-core v0.1.13
+   Compiling idna v1.1.0
+   Compiling serial_test_derive v3.5.0
+   Compiling futures-util v0.3.32
+   Compiling ring v0.17.14
+   Compiling csv v1.4.0
+   Compiling hyper v1.10.0
+   Compiling url v2.5.8
+   Compiling rusqlite v0.31.0
+   Compiling regex-automata v0.4.14
+   Compiling rustls-webpki v0.103.13
+   Compiling tower v0.5.3
+   Compiling hyper-util v0.1.20
+   Compiling futures-executor v0.3.32
+   Compiling serial_test v3.5.0
+   Compiling r2d2_sqlite v0.24.0
+   Compiling tower-http v0.6.11
+   Compiling regex v1.12.3
+   Compiling tree-sitter v0.24.7
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling cowd-memory v0.9.78 (/media/yi/Datas/workspace/cowd-develop/crates/memory)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.84s
+     Running unittests src/lib.rs (/tmp/cowd-target-v0978-validation/debug/deps/cowd_memory-435e9485901691c5)
+
+running 6 tests
+test performance_monitor::tests::test_tuner_min_samples_guard ... ok
+test performance_monitor::tests::test_tuner_adjusts_cache_ttl ... ok
+test performance_monitor::tests::test_tuner_rate_limit ... ok
+test performance_monitor::tests::test_tuner_noop_on_good_performance ... ok
+test performance_monitor::tests::test_tuner_adjusts_prefetch_on_high_latency ... ok
+test performance_monitor::tests::test_tuner_adjusts_compression ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 528 filtered out; finished in 0.00s
+
+     Running tests/agent_scope_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/agent_scope_test-834ff0abeddf4117)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/conflict_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/conflict_test-b04b2fd46d81b5b8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/e2e_lifecycle_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/e2e_lifecycle_test-ea37157d31a0aeb7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/embedding_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/embedding_test-23ec3d1ccd780ae0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/fact_check_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/fact_check_test-f94dd8b44951169d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/integration_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/integration_test-f6abdc9b3fd5f424)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/longmem_eval_harness.rs (/tmp/cowd-target-v0978-validation/debug/deps/longmem_eval_harness-e27d7e815c0675be)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/memory_kernel_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/memory_kernel_test-adccaac898ffbc6c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 27 filtered out; finished in 0.00s
+
+     Running tests/message_persistence_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/message_persistence_test-1581b07196ab7145)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/performance_bench.rs (/tmp/cowd-target-v0978-validation/debug/deps/performance_bench-70a0ab1fb918fb07)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/persistence_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/persistence_test-a99e54f311fb1438)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/prepare_context_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/prepare_context_test-5a2561dc081d6dee)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/project_kg_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/project_kg_test-ef5697c841dbc066)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.00s
+
+     Running tests/project_scope_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/project_scope_test-cb0fcf8ee5463756)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/swarm_concurrent_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/swarm_concurrent_test-33a5f8299fc3ead8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/swarm_e2e_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/swarm_e2e_test-1ea8af8638c9073c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/token_benchmark_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/token_benchmark_test-992e688edef6c2b2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/verbatim_sink_test.rs (/tmp/cowd-target-v0978-validation/debug/deps/verbatim_sink_test-eddb3e2f7374927a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[2026-06-09T22:04:04+08:00] END cargo_test_memory_tuner status=0 elapsed=14s target_before=1542113041 target_after=4123073271
