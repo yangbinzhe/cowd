@@ -80,7 +80,9 @@ window.Sessions = (()=>{
 
   async function createSession(model){
     try{
-      const d=await Api.createSession(model||UI.$('model-selector').value||'claude-sonnet-4-6');
+      const selector=UI.$('model-selector');
+      const selectedModel=selector&&selector.value?selector.value:'';
+      const d=await Api.createSession(model||selectedModel);
       activeId=d.id||d.session_id;
       Api.sid=activeId;
       UI.$('chat-messages').innerHTML='';

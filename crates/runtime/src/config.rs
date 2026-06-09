@@ -1965,12 +1965,18 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         let defaults = VectorConfig::default();
         // Static config values.
         let enabled = optional_bool(v, "enabled", "merged settings.memory.vector")?;
-        let model_name = optional_string_dual(v, "model", "merged settings.memory.vector")?;
+        let model_name = optional_string_dual(v, "model", "merged settings.memory.vector")?.or(
+            optional_string_dual(v, "embedding_model", "merged settings.memory.vector")?,
+        );
         let dimension = optional_usize(v, "dimension", "merged settings.memory.vector")?;
-        let api_url = optional_string_dual(v, "apiUrl", "merged settings.memory.vector")?;
-        let api_key = optional_string_dual(v, "apiKey", "merged settings.memory.vector")?;
-        let timeout_secs = optional_u64(v, "timeoutSecs", "merged settings.memory.vector")?;
-        let batch_size = optional_usize(v, "batchSize", "merged settings.memory.vector")?;
+        let api_url = optional_string_dual(v, "api_url", "merged settings.memory.vector")?;
+        let api_key = optional_string_dual(v, "api_key", "merged settings.memory.vector")?;
+        let timeout_secs = optional_u64(v, "timeout_secs", "merged settings.memory.vector")?.or(
+            optional_u64(v, "timeoutSecs", "merged settings.memory.vector")?,
+        );
+        let batch_size = optional_usize(v, "batch_size", "merged settings.memory.vector")?.or(
+            optional_usize(v, "batchSize", "merged settings.memory.vector")?,
+        );
 
         // Environment variable overrides.
         let resolved_model = std::env::var("COWD_MEMORY_VECTOR_MODEL")
@@ -3900,6 +3906,47 @@ mod tests {
             loaded.get("modle").is_some(),
             "unknown key should be present in merged config"
         );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn memory_vector_accepts_embedding_model_alias() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            r#"
+memory:
+  enabled: true
+  vector:
+    enabled: true
+    embedding_model: text-embedding-v4
+    api_url: https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
+    api_key: test-key
+    dimension: 0
+    timeout_secs: 30
+    batch_size: 32
+"#,
+        )
+        .expect("write memory config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.memory().vector.enabled);
+        assert_eq!(loaded.memory().vector.model, "text-embedding-v4");
+        assert_eq!(
+            loaded.memory().vector.api_url,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
+        );
+        assert_eq!(loaded.memory().vector.api_key, "test-key");
+        assert_eq!(loaded.memory().vector.dimension, 0);
+        assert_eq!(loaded.memory().vector.batch_size, 32);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

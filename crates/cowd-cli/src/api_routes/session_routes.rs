@@ -78,6 +78,15 @@ fn default_order() -> String {
     "desc".to_string()
 }
 
+fn default_session_model(state: &AppState) -> String {
+    runtime::ConfigLoader::new(&state.workspace_root, &state.config_home)
+        .load()
+        .ok()
+        .and_then(|config| config.model().map(str::to_string))
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
+}
+
 #[derive(Deserialize)]
 struct GetEventsParams {
     #[serde(default)]
@@ -261,7 +270,8 @@ async fn create_session(
     let session = runtime::Session::new();
     let model = body
         .model
-        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| default_session_model(&state));
     let runtime = if let Some(store) = state.unified_store() {
         crate::build_runtime_with_session_store(
             store.clone(),

@@ -29,6 +29,8 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::FromRawFd;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Child, Command};
@@ -133,6 +135,54 @@ fn reap_daemon_children() {
             }
         });
     }
+}
+
+fn gateway_daemon_log_file() -> Result<std::fs::File, Box<dyn std::error::Error>> {
+    let log_dir = runtime::cowd_dirs::config_home_dir().join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("gateway-daemon.log"))?)
+}
+
+fn spawn_gateway_daemon(exe: &Path) -> Result<Child, Box<dyn std::error::Error>> {
+    let stdout = gateway_daemon_log_file()?;
+    let stderr = stdout.try_clone()?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("gateway")
+        .arg("run")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr));
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    command
+        .spawn()
+        .map_err(|e| format!("failed to start gateway daemon: {e}").into())
+}
+
+fn wait_for_gateway_start(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!("gateway daemon exited during startup: {status}").into());
+        }
+        if server::get_server_status()
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err("gateway daemon did not become ready before timeout".into())
 }
 
 static SHARED_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -500,14 +550,8 @@ fn run_gateway_action(
             let exe =
                 std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
             tracing::info!(binary = %exe.display(), "gateway start: spawning daemon");
-            let child = std::process::Command::new(&exe)
-                .arg("gateway")
-                .arg("run")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| format!("failed to start gateway daemon: {e}"))?;
+            let mut child = spawn_gateway_daemon(&exe)?;
+            wait_for_gateway_start(&mut child, Duration::from_secs(5))?;
             let pid = adopt_daemon_child(child);
             println!("Gateway started (pid: {pid})");
             tracing::info!(pid, "gateway daemon spawned");
@@ -616,14 +660,8 @@ fn run_gateway_action(
             tracing::info!("gateway restart: stopped, re-spawning");
             let exe =
                 std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
-            let child = std::process::Command::new(&exe)
-                .arg("gateway")
-                .arg("run")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| format!("failed to start gateway daemon: {e}"))?;
+            let mut child = spawn_gateway_daemon(&exe)?;
+            wait_for_gateway_start(&mut child, Duration::from_secs(5))?;
             let pid = adopt_daemon_child(child);
             println!("Gateway restarted (pid: {pid})");
             tracing::info!(pid, "gateway restarted");

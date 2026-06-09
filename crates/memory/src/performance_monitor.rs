@@ -111,22 +111,30 @@ impl PerformanceMonitor {
         let ms = duration.as_secs_f64() * 1000.0;
         let buf = self.extract_durations.lock();
         Self::push_rolling(buf, ms, self.window_size);
+        self.total_calls.fetch_add(1, Ordering::Relaxed);
+        *self.last_updated.lock() = Utc::now();
     }
 
     /// Record a compression ratio (output tokens ÷ input tokens).
     pub fn record_compression_ratio(&self, ratio: f64) {
         let buf = self.compression_ratios.lock();
         Self::push_rolling(buf, ratio, self.window_size);
+        self.total_calls.fetch_add(1, Ordering::Relaxed);
+        *self.last_updated.lock() = Utc::now();
     }
 
     /// Record a cache hit.
     pub fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.total_calls.fetch_add(1, Ordering::Relaxed);
+        *self.last_updated.lock() = Utc::now();
     }
 
     /// Record a cache miss.
     pub fn record_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        self.total_calls.fetch_add(1, Ordering::Relaxed);
+        *self.last_updated.lock() = Utc::now();
     }
 
     // ── Queries ─────────────────────────────────────────────────────────
@@ -346,13 +354,6 @@ impl AutoTuner {
             }
             if cfg.l2_cache_ttl_secs < 604_800 {
                 cfg.l2_cache_ttl_secs = (cfg.l2_cache_ttl_secs * 12 / 10).min(604_800);
-                adjusted = true;
-            }
-        } else if avg_prepare > 0.0 && avg_prepare < self.target_prepare_latency_ms * 0.3 {
-            // Headroom: increase prefetch (up to 20)
-            let mut cfg = self.tuning_config.lock();
-            if cfg.prefetch_hot_topics < 20 {
-                cfg.prefetch_hot_topics = (cfg.prefetch_hot_topics + 1).min(20);
                 adjusted = true;
             }
         }

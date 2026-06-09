@@ -100,7 +100,13 @@ window.Api = (()=>{
         limit: d.limit || rows.length
       };
     },
-    async createSession(model){const d=await req('POST','/api/sessions',{model:model||'claude-sonnet-4-6'});sid=d.id||d.session_id;return d},
+    async createSession(model){
+      const body = {};
+      if(model && String(model).trim())body.model = String(model).trim();
+      const d=await req('POST','/api/sessions',body);
+      sid=d.id||d.session_id;
+      return d;
+    },
     async getSession(id){return req('GET','/api/sessions/'+(id||sid))},
     async deleteSession(id){return req('DELETE','/api/sessions/'+(id||sid))},
     async compactSession(id){return req('POST','/api/sessions/'+(id||sid)+'/compact')},

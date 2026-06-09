@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::types::Value;
@@ -133,7 +133,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             input_tokens  INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
             estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
-            status TEXT NOT NULL DEFAULT 'active'
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at_ms INTEGER NOT NULL DEFAULT 0,
+            updated_at_ms INTEGER NOT NULL DEFAULT 0
         )",
         r"CREATE TABLE IF NOT EXISTS session_memories (
             session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
@@ -283,6 +285,20 @@ fn init_schema(conn: &Connection) -> Result<()> {
     if !existing_session_columns.contains("status") {
         conn.execute(
             "ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    if !existing_session_columns.contains("created_at_ms") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(sql_err)?;
+    }
+    if !existing_session_columns.contains("updated_at_ms") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0",
             [],
         )
         .map_err(sql_err)?;
@@ -474,6 +490,12 @@ fn session_sort_order(order: &str) -> &'static str {
     }
 }
 
+fn iso_to_ms(value: &str) -> i64 {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or_else(|_| Utc::now().timestamp_millis())
+}
+
 fn session_list_where_clause(opts: &SessionListOptions<'_>) -> (String, Vec<Value>) {
     let mut where_parts: Vec<&'static str> = Vec::new();
     let mut values = Vec::new();
@@ -589,8 +611,9 @@ impl SqliteSessionStore {
             r"INSERT OR IGNORE INTO sessions
                (session_id, platform, chat_id, user_id, model,
                 created_at, last_activity, message_count, reset_policy, metadata_json,
-                input_tokens, output_tokens, estimated_cost_usd, status)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                input_tokens, output_tokens, estimated_cost_usd, status,
+                created_at_ms, updated_at_ms)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 session.session_id,
                 session.platform,
@@ -606,6 +629,8 @@ impl SqliteSessionStore {
                 session.output_tokens,
                 session.estimated_cost_usd,
                 session.status,
+                iso_to_ms(&session.created_at),
+                iso_to_ms(&session.last_activity),
             ],
         )
         .map_err(sql_err)?;
@@ -646,7 +671,8 @@ impl SqliteSessionStore {
                input_tokens  = ?10,
                output_tokens = ?11,
                estimated_cost_usd = ?12,
-               status = ?13
+               status = ?13,
+               updated_at_ms = ?14
                WHERE session_id = ?1",
             params![
                 session.session_id,
@@ -662,6 +688,7 @@ impl SqliteSessionStore {
                 session.output_tokens,
                 session.estimated_cost_usd,
                 session.status,
+                iso_to_ms(&session.last_activity),
             ],
         )
         .map_err(sql_err)?;
@@ -678,8 +705,9 @@ impl SqliteSessionStore {
             r"INSERT OR REPLACE INTO sessions
                (session_id, platform, chat_id, user_id, model,
                 created_at, last_activity, message_count, reset_policy, metadata_json,
-                input_tokens, output_tokens, estimated_cost_usd, status)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                input_tokens, output_tokens, estimated_cost_usd, status,
+                created_at_ms, updated_at_ms)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 session.session_id,
                 session.platform,
@@ -695,6 +723,8 @@ impl SqliteSessionStore {
                 session.output_tokens,
                 session.estimated_cost_usd,
                 session.status,
+                iso_to_ms(&session.created_at),
+                iso_to_ms(&session.last_activity),
             ],
         )
         .map_err(sql_err)?;
@@ -1623,6 +1653,23 @@ mod tests {
         assert_eq!(loaded.session_id, "session-001");
         assert_eq!(loaded.platform, "test");
         assert_eq!(loaded.message_count, 1);
+    }
+
+    #[test]
+    fn create_session_populates_millisecond_timestamps() {
+        let (store, _dir) = make_store();
+        let rec = make_record("session-ms");
+        store.create_session(&rec).unwrap();
+        let conn = store.conn().unwrap();
+        let (created_at_ms, updated_at_ms): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at_ms, updated_at_ms FROM sessions WHERE session_id = ?1",
+                params!["session-ms"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(created_at_ms, 1_704_067_200_000);
+        assert_eq!(updated_at_ms, 1_704_067_260_000);
     }
 
     #[test]

@@ -778,14 +778,14 @@ describe('API module', () => {
     expect(data.total).toBe(0);
   });
 
-  it('createSession uses default model', async () => {
+  it('createSession lets the backend choose the default model', async () => {
     const mockF = vi.fn(() =>
       Promise.resolve({ ok: true, json: () => Promise.resolve({ id: 'new-s' }) })
     );
     vi.stubGlobal('fetch', mockF);
     await window.Api.createSession();
     const body = JSON.parse(mockF.mock.calls[0][1].body);
-    expect(body.model).toBe('claude-sonnet-4-6');
+    expect(body.model).toBeUndefined();
   });
 
   it('getEvents normalizes event responses and query params', async () => {

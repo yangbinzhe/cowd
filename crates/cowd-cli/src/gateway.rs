@@ -176,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(provider_registry)]
     fn register_and_get() {
         let sessions = ActiveSessions::new();
         let rt = dummy_runtime();
@@ -185,6 +186,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(provider_registry)]
     fn list_returns_sorted_ids() {
         let sessions = ActiveSessions::new();
         sessions.register("b".into(), dummy_runtime()).unwrap();
@@ -195,6 +197,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(provider_registry)]
     fn remove_drops_session() {
         let sessions = ActiveSessions::new();
         sessions.register("sess-1".into(), dummy_runtime()).unwrap();
@@ -219,6 +222,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(provider_registry)]
     fn register_overwrite() {
         let sessions = ActiveSessions::new();
         sessions.register("sess-1".into(), dummy_runtime()).unwrap();
