@@ -22,7 +22,11 @@ cleanup() {
     tmux kill-session -t "$TUI_SESSION" >/dev/null 2>&1 || true
     tmux kill-session -t "$GATEWAY_SESSION" >/dev/null 2>&1 || true
   fi
-  rm -rf "$TMP_DIR"
+  for _ in {1..5}; do
+    rm -rf "$TMP_DIR" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  rm -rf "$TMP_DIR" 2>/dev/null || true
 }
 
 print_logs() {
