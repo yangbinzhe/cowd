@@ -134,6 +134,18 @@ impl IaccStore {
         find_cockpit_profile(&connection, profile_id)
     }
 
+    pub fn list_cockpit_profiles(
+        &self,
+        cadence: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<IaccCockpitProfile>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_cockpit_profiles(&connection, cadence, limit)
+    }
+
     pub fn cockpit_projection(
         &self,
         profile_id: &str,
@@ -1146,6 +1158,40 @@ fn find_cockpit_profile(
         .optional()?
         .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
         .transpose()
+}
+
+fn list_cockpit_profiles(
+    connection: &Connection,
+    cadence: Option<&str>,
+    limit: usize,
+) -> Result<Vec<IaccCockpitProfile>, IaccStoreError> {
+    let cadence = cadence
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let mut statement = connection.prepare(
+        "SELECT profile_json FROM iacc_cockpit_profile ORDER BY updated_at DESC, profile_id ASC",
+    )?;
+    let profiles = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .map(|row| {
+            let json = row?;
+            serde_json::from_str::<IaccCockpitProfile>(&json).map_err(IaccStoreError::from)
+        })
+        .filter_map(|result| match result {
+            Ok(profile)
+                if cadence
+                    .as_ref()
+                    .is_none_or(|cadence| profile.cadence == *cadence) =>
+            {
+                Some(Ok(profile))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .take(limit.max(1))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(profiles)
 }
 
 fn insert_cockpit_report(
@@ -2965,6 +3011,11 @@ mod tests {
             .upsert_cockpit_profile(&profile)
             .expect("profile saves");
         assert_eq!(store.health().unwrap().cockpit_profile_count, 1);
+        let daily_profiles = store
+            .list_cockpit_profiles(Some("daily"), 10)
+            .expect("profiles list");
+        assert_eq!(daily_profiles.len(), 1);
+        assert_eq!(daily_profiles[0].profile_id, profile.profile_id);
 
         let projection = store
             .cockpit_projection(&profile.profile_id)

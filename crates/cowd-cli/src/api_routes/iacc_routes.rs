@@ -21,7 +21,7 @@ use runtime::{
     IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccRelation, IaccRelationInput,
     IaccStore, IaccStoreError, IdentityTrust, PolicyDecisionKind, IACC_SCHEMA_VERSION,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::task_kernel::TaskRecord;
 
@@ -45,6 +45,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/iacc/cockpit/profiles/:id/reports/generate",
             post(iacc_cockpit_report_generate_handler),
+        )
+        .route(
+            "/api/iacc/cockpit/reports/schedules/run",
+            post(iacc_cockpit_report_schedule_run_handler),
         )
         .route(
             "/api/iacc/cockpit/reports/:id",
@@ -186,6 +190,40 @@ struct IaccCockpitReportGenerateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct IaccCockpitReportScheduleRunRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    cadence: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    report_id_prefix: Option<String>,
+    #[serde(default)]
+    delivery_ref: Option<String>,
+    #[serde(default)]
+    deliver: bool,
+    #[serde(default = "default_iacc_bridge_mode")]
+    mode: String,
+    #[serde(default)]
+    actor_principal: Option<String>,
+    #[serde(default)]
+    actor_identity_ref: Option<String>,
+    #[serde(default)]
+    source_channel: Option<String>,
+    #[serde(default)]
+    requested_capability: Option<String>,
+    #[serde(default)]
+    provider_account: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    template_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct IaccEntityUpsertRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -322,6 +360,17 @@ struct IaccCockpitReportDeliveryRequest {
     template_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct IaccCockpitReportDeliveryOutcome {
+    mode: String,
+    status: String,
+    dispatch_status: String,
+    report: IaccCockpitReportSnapshot,
+    delivery_payload: IaccCockpitReportDeliveryPayload,
+    cross_plane_execution_receipt: CrossPlaneExecutionReceipt,
+    idempotent_replay: bool,
+}
+
 fn default_iacc_bridge_mode() -> String {
     "dry_run".to_string()
 }
@@ -361,6 +410,7 @@ async fn iacc_health_handler(
             "scheduled_report_foundation",
             "cockpit_report_delivery_bridge",
             "cockpit_report_payload_templates",
+            "cockpit_report_schedule_runner",
             "personal_cockpit_projection",
             "cockpit_profile_thresholds",
             "evidence_quality_gate",
@@ -483,85 +533,99 @@ async fn iacc_cockpit_report_deliver_handler(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<IaccCockpitReportDeliveryRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    super::cross_plane_routes::ensure_cross_plane_loaded(&state);
     let store = open_iacc_store(&state)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let report = store
         .get_cockpit_report(&id)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC cockpit report not found"))?;
-    let mode = normalize_iacc_bridge_mode(&request.mode);
-    let idempotency_key = request
-        .idempotency_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(str::to_string);
-    let delivery_payload = iacc_report_delivery_payload(&report, &request);
+    let outcome = deliver_iacc_cockpit_report(&state, &store, report, request)?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.cockpit.report_delivery",
+        "mode": outcome.mode,
+        "status": outcome.status,
+        "dispatch_status": outcome.dispatch_status,
+        "report": outcome.report,
+        "delivery_payload": outcome.delivery_payload,
+        "cross_plane_execution_receipt": outcome.cross_plane_execution_receipt,
+        "idempotent_replay": outcome.idempotent_replay,
+    })))
+}
 
-    if let Some(key) = &idempotency_key {
-        if let Some(receipt) =
-            super::cross_plane_routes::cross_plane_control().find_execution_by_idempotency_key(key)
-        {
-            if !iacc_report_delivery_receipt_matches(&receipt, &report) {
-                return Err(api_error(
-                    StatusCode::CONFLICT,
-                    "IACC cockpit report delivery idempotency key belongs to another cross-plane action",
-                ));
-            }
-            let report = attach_iacc_report_delivery_receipt(&store, &report, &receipt)
-                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-            return Ok(Json(serde_json::json!({
-                "kind": "iacc.cockpit.report_delivery",
-                "mode": receipt.mode,
-                "status": receipt.status,
-                "dispatch_status": receipt.dispatch_status,
+async fn iacc_cockpit_report_schedule_run_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccCockpitReportScheduleRunRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let limit = request.limit.unwrap_or(50).clamp(1, 100);
+    let profiles = store
+        .list_cockpit_profiles(request.cadence.as_deref(), limit)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let mut items = Vec::new();
+    let mut delivery_count = 0usize;
+
+    for profile in profiles {
+        let report_id = request.report_id_prefix.as_ref().map(|prefix| {
+            format!(
+                "{}-{}",
+                prefix.trim().trim_end_matches('-'),
+                profile.profile_id
+            )
+        });
+        let report = store
+            .generate_cockpit_report(
+                &profile.profile_id,
+                IaccCockpitReportRequest {
+                    report_id,
+                    cadence: request
+                        .cadence
+                        .clone()
+                        .or_else(|| Some(profile.cadence.clone())),
+                    delivery_ref: request
+                        .delivery_ref
+                        .clone()
+                        .or_else(|| default_iacc_schedule_delivery_ref(&profile, &request)),
+                    note: Some("scheduled cockpit report".to_string()),
+                },
+            )
+            .map_err(|error| match error {
+                IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+                other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            })?;
+
+        if request.deliver {
+            let delivery_request =
+                iacc_schedule_delivery_request(&profile, &report, &request, delivery_count);
+            let outcome = deliver_iacc_cockpit_report(&state, &store, report, delivery_request)?;
+            delivery_count += 1;
+            items.push(serde_json::json!({
+                "profile_id": profile.profile_id,
+                "owner_ref": profile.owner_ref,
+                "cadence": profile.cadence,
+                "report": outcome.report,
+                "delivery": outcome,
+            }));
+        } else {
+            items.push(serde_json::json!({
+                "profile_id": profile.profile_id,
+                "owner_ref": profile.owner_ref,
+                "cadence": profile.cadence,
                 "report": report,
-                "delivery_payload": delivery_payload,
-                "cross_plane_execution_receipt": receipt,
-                "idempotent_replay": true,
-            })));
+                "delivery": null,
+            }));
         }
     }
 
-    let action = iacc_report_delivery_action(&report, &request, &delivery_payload);
-    let now = chrono::Utc::now();
-    let (action, decision, evidence) =
-        super::cross_plane_routes::decide_connector_action(&state, action, &mode, now);
-    let (status, dispatch_status, blockers, audit_result, audit_summary) =
-        iacc_cross_plane_bridge_outcome(&mode, &decision);
-    let audit_record = CrossPlaneAuditRecord::new(
-        action.clone(),
-        decision.clone(),
-        audit_result,
-        audit_summary,
-    )
-    .with_evidence(evidence);
-    let audit_record_id = audit_record.id.clone();
-    super::cross_plane_routes::cross_plane_control().record_audit(audit_record);
-    let receipt = CrossPlaneExecutionReceipt::new(
-        idempotency_key,
-        mode.clone(),
-        status.clone(),
-        dispatch_status.clone(),
-        action,
-        decision,
-        blockers,
-        Some(audit_record_id),
-    );
-    super::cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
-    super::cross_plane_routes::save_cross_plane_state(&state);
-    let report = attach_iacc_report_delivery_receipt(&store, &report, &receipt)
-        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
-        "kind": "iacc.cockpit.report_delivery",
-        "mode": mode,
-        "status": status,
-        "dispatch_status": dispatch_status,
-        "report": report,
-        "delivery_payload": delivery_payload,
-        "cross_plane_execution_receipt": receipt,
-        "idempotent_replay": false,
+        "kind": "iacc.cockpit.report_schedule_run",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "cadence": request.cadence,
+        "matched_profile_count": items.len(),
+        "generated_report_count": items.len(),
+        "delivery_count": delivery_count,
+        "items": items,
     })))
 }
 
@@ -1266,6 +1330,86 @@ fn attach_iacc_cross_plane_receipt(
     )
 }
 
+fn deliver_iacc_cockpit_report(
+    state: &AppState,
+    store: &IaccStore,
+    report: IaccCockpitReportSnapshot,
+    request: IaccCockpitReportDeliveryRequest,
+) -> Result<IaccCockpitReportDeliveryOutcome, (StatusCode, Json<ErrorResponse>)> {
+    super::cross_plane_routes::ensure_cross_plane_loaded(state);
+    let mode = normalize_iacc_bridge_mode(&request.mode);
+    let idempotency_key = request
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string);
+    let delivery_payload = iacc_report_delivery_payload(&report, &request);
+
+    if let Some(key) = &idempotency_key {
+        if let Some(receipt) =
+            super::cross_plane_routes::cross_plane_control().find_execution_by_idempotency_key(key)
+        {
+            if !iacc_report_delivery_receipt_matches(&receipt, &report) {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    "IACC cockpit report delivery idempotency key belongs to another cross-plane action",
+                ));
+            }
+            let report = attach_iacc_report_delivery_receipt(store, &report, &receipt)
+                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            return Ok(IaccCockpitReportDeliveryOutcome {
+                mode: receipt.mode.clone(),
+                status: receipt.status.clone(),
+                dispatch_status: receipt.dispatch_status.clone(),
+                report,
+                delivery_payload,
+                cross_plane_execution_receipt: receipt,
+                idempotent_replay: true,
+            });
+        }
+    }
+
+    let action = iacc_report_delivery_action(&report, &request, &delivery_payload);
+    let now = chrono::Utc::now();
+    let (action, decision, evidence) =
+        super::cross_plane_routes::decide_connector_action(state, action, &mode, now);
+    let (status, dispatch_status, blockers, audit_result, audit_summary) =
+        iacc_cross_plane_bridge_outcome(&mode, &decision);
+    let audit_record = CrossPlaneAuditRecord::new(
+        action.clone(),
+        decision.clone(),
+        audit_result,
+        audit_summary,
+    )
+    .with_evidence(evidence);
+    let audit_record_id = audit_record.id.clone();
+    super::cross_plane_routes::cross_plane_control().record_audit(audit_record);
+    let receipt = CrossPlaneExecutionReceipt::new(
+        idempotency_key,
+        mode.clone(),
+        status.clone(),
+        dispatch_status.clone(),
+        action,
+        decision,
+        blockers,
+        Some(audit_record_id),
+    );
+    super::cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
+    super::cross_plane_routes::save_cross_plane_state(state);
+    let report = attach_iacc_report_delivery_receipt(store, &report, &receipt)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(IaccCockpitReportDeliveryOutcome {
+        mode,
+        status,
+        dispatch_status,
+        report,
+        delivery_payload,
+        cross_plane_execution_receipt: receipt,
+        idempotent_replay: false,
+    })
+}
+
 fn attach_iacc_report_delivery_receipt(
     store: &IaccStore,
     report: &IaccCockpitReportSnapshot,
@@ -1281,6 +1425,60 @@ fn attach_iacc_report_delivery_receipt(
             receipt.audit_record_id.clone(),
         ),
     )
+}
+
+fn default_iacc_schedule_delivery_ref(
+    profile: &IaccCockpitProfile,
+    request: &IaccCockpitReportScheduleRunRequest,
+) -> Option<String> {
+    let channel = request
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("feishu");
+    profile
+        .owner_ref
+        .strip_prefix("user:")
+        .filter(|user| !user.trim().is_empty())
+        .map(|user| format!("channel://{channel}/user/{}", user.trim()))
+}
+
+fn iacc_schedule_delivery_request(
+    profile: &IaccCockpitProfile,
+    report: &IaccCockpitReportSnapshot,
+    request: &IaccCockpitReportScheduleRunRequest,
+    delivery_index: usize,
+) -> IaccCockpitReportDeliveryRequest {
+    IaccCockpitReportDeliveryRequest {
+        mode: request.mode.clone(),
+        idempotency_key: Some(format!(
+            "iacc-schedule:{}:{}:{}",
+            request
+                .request_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("report-run"),
+            report.report_id,
+            delivery_index
+        )),
+        actor_principal: request
+            .actor_principal
+            .clone()
+            .or_else(|| Some(profile.owner_ref.clone())),
+        actor_identity_ref: request.actor_identity_ref.clone(),
+        source_channel: request
+            .source_channel
+            .clone()
+            .or_else(|| Some("iacc.report.schedule".to_string())),
+        requested_capability: request.requested_capability.clone(),
+        provider_account: request.provider_account.clone(),
+        target_ref: report.delivery_ref.clone(),
+        resource_ref: None,
+        channel: request.channel.clone(),
+        template_id: request.template_id.clone(),
+    }
 }
 
 fn iacc_report_delivery_receipt_matches(
