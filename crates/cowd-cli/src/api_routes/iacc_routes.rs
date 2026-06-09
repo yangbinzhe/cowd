@@ -14,10 +14,10 @@ use runtime::{
     server_manufacturing_domain_pack, AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode,
     CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneExecutionReceipt, CrossPlaneRisk,
     DataClassification, IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback,
-    IaccComputeJobInput, IaccCrossPlaneBridgeReceipt, IaccEntity, IaccEntityInput, IaccFact,
-    IaccFactInput, IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccRelation,
-    IaccRelationInput, IaccStore, IaccStoreError, IdentityTrust, PolicyDecisionKind,
-    IACC_SCHEMA_VERSION,
+    IaccCockpitProfile, IaccCockpitProfileInput, IaccComputeJobInput, IaccCrossPlaneBridgeReceipt,
+    IaccEntity, IaccEntityInput, IaccFact, IaccFactInput, IaccIncident, IaccMetricDependency,
+    IaccMetricDependencyInput, IaccRelation, IaccRelationInput, IaccStore, IaccStoreError,
+    IdentityTrust, PolicyDecisionKind, IACC_SCHEMA_VERSION,
 };
 use serde::Deserialize;
 
@@ -28,6 +28,18 @@ use super::{api_error, AppState, ErrorResponse};
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/iacc/health", get(iacc_health_handler))
+        .route(
+            "/api/iacc/cockpit/profiles/upsert",
+            post(iacc_cockpit_profile_upsert_handler),
+        )
+        .route(
+            "/api/iacc/cockpit/profiles/:id",
+            get(iacc_cockpit_profile_get_handler),
+        )
+        .route(
+            "/api/iacc/cockpit/profiles/:id/projection",
+            get(iacc_cockpit_projection_handler),
+        )
         .route(
             "/api/iacc/domain/server-manufacturing",
             get(iacc_server_manufacturing_domain_handler),
@@ -138,6 +150,15 @@ struct IaccFactIngestRequest {
     session_id: Option<String>,
     #[serde(default)]
     facts: Vec<IaccFactInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccCockpitProfileUpsertRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    profile: IaccCockpitProfileInput,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,8 +303,11 @@ async fn iacc_health_handler(
         "metric_dependency_count": health.metric_dependency_count,
         "compute_job_count": health.compute_job_count,
         "quality_gate_count": health.quality_gate_count,
+        "cockpit_profile_count": health.cockpit_profile_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": [
+            "personal_cockpit_projection",
+            "cockpit_profile_thresholds",
             "evidence_quality_gate",
             "insight_quality_gate",
             "cross_plane_action_bridge",
@@ -309,6 +333,55 @@ async fn iacc_health_handler(
             "incident_operational_analysis",
             "action_execution_feedback"
         ],
+    })))
+}
+
+async fn iacc_cockpit_profile_upsert_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccCockpitProfileUpsertRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let profile = store
+        .upsert_cockpit_profile(&IaccCockpitProfile::from_input(request.profile))
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.cockpit.profile",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "profile": profile,
+    })))
+}
+
+async fn iacc_cockpit_profile_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let profile = store
+        .get_cockpit_profile(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC cockpit profile not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.cockpit.profile",
+        "profile": profile,
+    })))
+}
+
+async fn iacc_cockpit_projection_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let projection = store.cockpit_projection(&id).map_err(|error| match error {
+        IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.cockpit.projection",
+        "projection": projection,
     })))
 }
 

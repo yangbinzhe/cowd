@@ -8,6 +8,7 @@
 mod analysis;
 mod attention;
 mod change;
+mod cockpit;
 mod compute;
 mod domain;
 mod entity;
@@ -27,6 +28,9 @@ pub use analysis::{
 };
 pub use attention::{IaccAttentionItem, IaccSeverity};
 pub use change::IaccChangeEvent;
+pub use cockpit::{
+    IaccCockpitProfile, IaccCockpitProfileInput, IaccCockpitProjection, IaccCockpitWidget,
+};
 pub use compute::{IaccComputeJob, IaccComputeJobInput, IaccComputePlan};
 pub use domain::{
     server_manufacturing_domain_pack, server_manufacturing_seed_plan, IaccDomainPack,

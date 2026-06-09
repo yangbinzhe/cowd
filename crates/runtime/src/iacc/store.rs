@@ -10,14 +10,14 @@ use thiserror::Error;
 
 use super::{
     IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
-    IaccChangeEvent, IaccComputeJob, IaccComputeJobInput, IaccComputePlan,
-    IaccCrossPlaneBridgeReceipt, IaccDomainSeedResult, IaccEntity, IaccEvidencePacket,
-    IaccEvidenceSourceRef, IaccFact, IaccImpactHop, IaccImpactTrace, IaccIncident,
-    IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage, IaccMetricState,
-    IaccOperationalAnalysis, IaccQualityGateDecision, IaccRelation, IaccSeverity,
+    IaccChangeEvent, IaccCockpitProfile, IaccCockpitProjection, IaccCockpitWidget, IaccComputeJob,
+    IaccComputeJobInput, IaccComputePlan, IaccCrossPlaneBridgeReceipt, IaccDomainSeedResult,
+    IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccImpactHop,
+    IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage,
+    IaccMetricState, IaccOperationalAnalysis, IaccQualityGateDecision, IaccRelation, IaccSeverity,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 9;
+pub const IACC_SCHEMA_VERSION: i64 = 10;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -46,6 +46,7 @@ pub struct IaccHealth {
     pub metric_dependency_count: u64,
     pub compute_job_count: u64,
     pub quality_gate_count: u64,
+    pub cockpit_profile_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,7 +105,43 @@ impl IaccStore {
             metric_dependency_count: count_table(&connection, "iacc_metric_dependency")?,
             compute_job_count: count_table(&connection, "iacc_compute_job")?,
             quality_gate_count: count_table(&connection, "iacc_quality_gate")?,
+            cockpit_profile_count: count_table(&connection, "iacc_cockpit_profile")?,
         })
+    }
+
+    pub fn upsert_cockpit_profile(
+        &self,
+        profile: &IaccCockpitProfile,
+    ) -> Result<IaccCockpitProfile, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_cockpit_profile(&connection, profile)
+    }
+
+    pub fn get_cockpit_profile(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<IaccCockpitProfile>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_cockpit_profile(&connection, profile_id)
+    }
+
+    pub fn cockpit_projection(
+        &self,
+        profile_id: &str,
+    ) -> Result<IaccCockpitProjection, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let profile = find_cockpit_profile(&connection, profile_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(profile_id.to_string()))?;
+        build_cockpit_projection(&connection, profile)
     }
 
     pub fn upsert_entity(&self, entity: &IaccEntity) -> Result<IaccEntity, IaccStoreError> {
@@ -771,7 +808,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 9, datetime('now'))
+        VALUES (1, 10, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -779,6 +816,16 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
                 ELSE iacc_schema.schema_version
             END,
             updated_at = excluded.updated_at;
+
+        CREATE TABLE IF NOT EXISTS iacc_cockpit_profile (
+            profile_id TEXT PRIMARY KEY,
+            owner_ref TEXT NOT NULL,
+            profile_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_cockpit_profile_owner
+            ON iacc_cockpit_profile(owner_ref, updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS iacc_entity (
             entity_id TEXT PRIMARY KEY,
@@ -998,6 +1045,208 @@ fn count_table(connection: &Connection, table: &str) -> rusqlite::Result<u64> {
     connection
         .query_row(&sql, [], |row| row.get::<_, i64>(0))
         .map(|value| value as u64)
+}
+
+fn upsert_cockpit_profile(
+    connection: &Connection,
+    profile: &IaccCockpitProfile,
+) -> Result<IaccCockpitProfile, IaccStoreError> {
+    let mut profile = profile.clone();
+    if let Some(existing) = find_cockpit_profile(connection, &profile.profile_id)? {
+        profile.created_at = existing.created_at;
+    }
+    profile.updated_at = Utc::now();
+    connection.execute(
+        r"INSERT INTO iacc_cockpit_profile (
+            profile_id, owner_ref, profile_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(profile_id) DO UPDATE SET
+            owner_ref = excluded.owner_ref,
+            profile_json = excluded.profile_json,
+            updated_at = excluded.updated_at",
+        params![
+            profile.profile_id,
+            profile.owner_ref,
+            serde_json::to_string(&profile)?,
+            profile.created_at.to_rfc3339(),
+            profile.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(profile)
+}
+
+fn find_cockpit_profile(
+    connection: &Connection,
+    profile_id: &str,
+) -> Result<Option<IaccCockpitProfile>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT profile_json FROM iacc_cockpit_profile WHERE profile_id = ?1",
+            params![profile_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn build_cockpit_projection(
+    connection: &Connection,
+    profile: IaccCockpitProfile,
+) -> Result<IaccCockpitProjection, IaccStoreError> {
+    let attention = list_attention(connection, 50)?
+        .into_iter()
+        .filter(|item| attention_matches_profile(item, &profile))
+        .take(8)
+        .collect::<Vec<_>>();
+    let quality_gates = list_recent_quality_gates(connection, 20)?;
+    let executions = list_recent_executions(connection, 20)?;
+    let mut widgets = Vec::new();
+
+    let attention_status = if attention
+        .iter()
+        .any(|item| matches!(item.severity, IaccSeverity::Critical))
+    {
+        "critical"
+    } else if attention.is_empty() {
+        "clear"
+    } else {
+        "watch"
+    };
+    let attention_sources = attention
+        .iter()
+        .map(|item| format!("iacc:attention:{}", item.attention_id))
+        .collect::<Vec<_>>();
+    widgets.push(IaccCockpitWidget::new(
+        "attention_queue",
+        "Focused operational attention",
+        attention_status,
+        attention
+            .iter()
+            .map(|item| item.priority_score)
+            .fold(0.0_f32, f32::max),
+        serde_json::json!({
+            "count": attention.len(),
+            "items": attention,
+        }),
+        attention_sources,
+    ));
+
+    let pass_count = quality_gates
+        .iter()
+        .filter(|gate| gate.decision == "pass")
+        .count();
+    let review_count = quality_gates
+        .iter()
+        .filter(|gate| gate.decision == "review")
+        .count();
+    let fail_count = quality_gates
+        .iter()
+        .filter(|gate| gate.decision == "fail")
+        .count();
+    let gate_status = if fail_count > 0 {
+        "fail"
+    } else if review_count > 0 {
+        "review"
+    } else if pass_count > 0 {
+        "pass"
+    } else {
+        "empty"
+    };
+    widgets.push(IaccCockpitWidget::new(
+        "quality_gate_status",
+        "Evidence and insight quality",
+        gate_status,
+        (fail_count as f32 * 1.0 + review_count as f32 * 0.65 + pass_count as f32 * 0.25).min(1.0),
+        serde_json::json!({
+            "pass_count": pass_count,
+            "review_count": review_count,
+            "fail_count": fail_count,
+            "recent": quality_gates,
+        }),
+        Vec::new(),
+    ));
+
+    let active_executions = executions
+        .iter()
+        .filter(|execution| {
+            !matches!(
+                execution.status.as_str(),
+                "feedback_resolved" | "feedback_rejected"
+            )
+        })
+        .count();
+    widgets.push(IaccCockpitWidget::new(
+        "action_execution_status",
+        "Governed action execution",
+        if active_executions > 0 {
+            "active"
+        } else {
+            "clear"
+        },
+        (active_executions as f32 / 5.0).min(1.0),
+        serde_json::json!({
+            "active_count": active_executions,
+            "recent": executions,
+        }),
+        Vec::new(),
+    ));
+
+    widgets.push(IaccCockpitWidget::new(
+        "focus_thresholds",
+        "Personal focus and thresholds",
+        if profile.thresholds.is_null() {
+            "empty"
+        } else {
+            "configured"
+        },
+        0.2,
+        serde_json::json!({
+            "focus_refs": profile.focus_refs,
+            "focus_metric_ids": profile.focus_metric_ids,
+            "thresholds": profile.thresholds,
+            "cadence": profile.cadence,
+        }),
+        Vec::new(),
+    ));
+
+    let summary = format!(
+        "profile={} attention={} quality_gates={} active_executions={}",
+        profile.profile_id,
+        widgets
+            .iter()
+            .find(|widget| widget.widget_type == "attention_queue")
+            .and_then(|widget| widget.data.get("count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        pass_count + review_count + fail_count,
+        active_executions
+    );
+    Ok(IaccCockpitProjection {
+        projection_id: format!("cockpit-projection-{}", uuid::Uuid::new_v4()),
+        profile,
+        widgets,
+        summary,
+        generated_at: Utc::now(),
+    })
+}
+
+fn attention_matches_profile(item: &IaccAttentionItem, profile: &IaccCockpitProfile) -> bool {
+    if profile.focus_refs.is_empty() && profile.focus_metric_ids.is_empty() {
+        return true;
+    }
+    if item.entity_ref.as_ref().is_some_and(|entity_ref| {
+        profile
+            .focus_refs
+            .iter()
+            .any(|focus_ref| focus_ref == entity_ref)
+    }) {
+        return true;
+    }
+    profile
+        .focus_metric_ids
+        .iter()
+        .any(|metric_id| item.title.contains(metric_id))
 }
 
 fn upsert_entity(
@@ -1312,6 +1561,20 @@ fn upsert_attention(
     Ok(())
 }
 
+fn list_attention(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<IaccAttentionItem>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT attention_json
+          FROM iacc_attention_item
+          ORDER BY priority_score DESC, updated_at DESC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
 fn find_attention(
     connection: &Connection,
     attention_id: &str,
@@ -1409,6 +1672,20 @@ fn find_quality_gate(
         .optional()?
         .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
         .transpose()
+}
+
+fn list_recent_quality_gates(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<IaccQualityGateDecision>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT gate_json
+          FROM iacc_quality_gate
+          ORDER BY created_at DESC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1992,6 +2269,20 @@ fn find_execution(
         .transpose()
 }
 
+fn list_recent_executions(
+    connection: &Connection,
+    limit: usize,
+) -> Result<Vec<IaccActionExecution>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT execution_json
+          FROM iacc_action_execution
+          ORDER BY updated_at DESC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
 fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> IaccAttentionItem {
     let now = Utc::now();
     let severity = match change.severity_hint.as_str() {
@@ -2053,7 +2344,8 @@ fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> I
 mod tests {
     use super::*;
     use crate::iacc::{
-        IaccComputeJobInput, IaccEntityInput, IaccFactInput, IaccRelationInput, IaccSourceKey,
+        IaccCockpitProfileInput, IaccComputeJobInput, IaccEntityInput, IaccFactInput,
+        IaccRelationInput, IaccSourceKey,
     };
 
     #[test]
@@ -2511,6 +2803,103 @@ mod tests {
         assert_eq!(pass_gate.decision, "pass");
         assert!(pass_gate.score >= 0.75);
         assert_eq!(store.health().unwrap().quality_gate_count, 2);
+    }
+
+    #[test]
+    fn cockpit_projection_aggregates_focus_quality_and_actions() {
+        let store = IaccStore::in_memory().expect("store opens");
+        let fact = IaccFact::from_input(IaccFactInput {
+            fact_id: Some("fact-cockpit-shortage".to_string()),
+            snapshot_id: Some("snapshot-cockpit-shortage".to_string()),
+            fact_type: "supply.material_shortage".to_string(),
+            entity_refs: vec!["component:gpu-cockpit".to_string()],
+            metric_key: Some("material_shortage_risk".to_string()),
+            dimensions: serde_json::json!({"week": "2026-W32"}),
+            measures: serde_json::json!({"short_qty": 260}),
+            event_time: None,
+            valid_from: None,
+            valid_to: None,
+            source_ref: Some("connector:erp:shortage".to_string()),
+            confidence: Some(0.94),
+            raw_hash: None,
+        });
+        store.ingest_fact(&fact).expect("fact ingests");
+        let recompute = store.recompute_metrics().expect("recompute");
+        let packet = store
+            .build_evidence_packet(
+                Some(&recompute.attention[0].attention_id),
+                Some("GPU shortage cockpit incident"),
+            )
+            .expect("packet builds");
+        store
+            .evaluate_evidence_quality(&packet.packet_id)
+            .expect("review gate evaluates");
+        let mut incident = IaccIncident::new("GPU shortage cockpit");
+        incident.attention_id = packet.attention_id.clone();
+        incident.evidence_packet_id = Some(packet.packet_id.clone());
+        store.create_incident(&incident).expect("incident saves");
+        let analysis = store
+            .analyze_incident(&incident.incident_id)
+            .expect("analysis");
+        store
+            .evaluate_evidence_quality(&packet.packet_id)
+            .expect("pass gate evaluates");
+        store
+            .execute_recommended_action(
+                &analysis.analysis_id,
+                &analysis.recommended_actions[0].action_id,
+                &IaccActionExecutionRequest {
+                    mode: "commit".to_string(),
+                    operator_id: Some("user:ops-planner".to_string()),
+                    note: Some("cockpit action".to_string()),
+                },
+            )
+            .expect("execution saves");
+
+        let profile = IaccCockpitProfile::from_input(IaccCockpitProfileInput {
+            profile_id: Some("cockpit-profile-ops".to_string()),
+            owner_ref: "user:ops-planner".to_string(),
+            display_name: Some("Ops planner".to_string()),
+            focus_refs: vec!["component:gpu-cockpit".to_string()],
+            focus_metric_ids: vec!["material_shortage_risk".to_string()],
+            thresholds: serde_json::json!({"material_shortage_risk": {"critical": 100}}),
+            template_id: Some("ops.default".to_string()),
+            cadence: Some("daily".to_string()),
+        });
+        let profile = store
+            .upsert_cockpit_profile(&profile)
+            .expect("profile saves");
+        assert_eq!(store.health().unwrap().cockpit_profile_count, 1);
+
+        let projection = store
+            .cockpit_projection(&profile.profile_id)
+            .expect("projection builds");
+        assert_eq!(projection.profile.owner_ref, "user:ops-planner");
+        let attention_widget = projection
+            .widgets
+            .iter()
+            .find(|widget| widget.widget_type == "attention_queue")
+            .expect("attention widget exists");
+        assert!(attention_widget.data["count"].as_u64().unwrap_or(0) >= 1);
+        assert!(!attention_widget.source_refs.is_empty());
+        let quality_widget = projection
+            .widgets
+            .iter()
+            .find(|widget| widget.widget_type == "quality_gate_status")
+            .expect("quality widget exists");
+        assert_eq!(quality_widget.data["pass_count"], 1);
+        let action_widget = projection
+            .widgets
+            .iter()
+            .find(|widget| widget.widget_type == "action_execution_status")
+            .expect("action widget exists");
+        assert_eq!(action_widget.data["active_count"], 1);
+        let threshold_widget = projection
+            .widgets
+            .iter()
+            .find(|widget| widget.widget_type == "focus_thresholds")
+            .expect("threshold widget exists");
+        assert_eq!(threshold_widget.status, "configured");
     }
 
     #[test]
