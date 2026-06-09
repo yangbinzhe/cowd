@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    IaccEntity, IaccEntityInput, IaccFact, IaccFactInput, IaccMetricDefinition, IaccRelation,
-    IaccRelationInput, IaccSourceKey,
+    IaccEntity, IaccEntityInput, IaccFact, IaccFactInput, IaccMetricDefinition,
+    IaccMetricDependency, IaccMetricDependencyInput, IaccRelation, IaccRelationInput,
+    IaccSourceKey,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -46,6 +47,8 @@ pub struct IaccDomainSeedPlan {
     #[serde(default)]
     pub metric_definitions: Vec<IaccMetricDefinition>,
     #[serde(default)]
+    pub metric_dependencies: Vec<IaccMetricDependency>,
+    #[serde(default)]
     pub facts: Vec<IaccFact>,
 }
 
@@ -56,6 +59,7 @@ pub struct IaccDomainSeedResult {
     pub entity_count: usize,
     pub relation_count: usize,
     pub metric_definition_count: usize,
+    pub metric_dependency_count: usize,
     pub fact_count: usize,
     pub scenario_count: usize,
     pub seeded_at: DateTime<Utc>,
@@ -138,12 +142,14 @@ pub fn server_manufacturing_seed_plan() -> IaccDomainSeedPlan {
     let entities = server_manufacturing_entities();
     let relations = server_manufacturing_relations();
     let metric_definitions = server_manufacturing_metric_definitions();
+    let metric_dependencies = server_manufacturing_metric_dependencies();
     let facts = server_manufacturing_facts();
     IaccDomainSeedPlan {
         pack,
         entities,
         relations,
         metric_definitions,
+        metric_dependencies,
         facts,
     }
 }
@@ -477,6 +483,52 @@ fn server_manufacturing_metric_definitions() -> Vec<IaccMetricDefinition> {
     ]
 }
 
+fn server_manufacturing_metric_dependencies() -> Vec<IaccMetricDependency> {
+    vec![
+        metric_dependency(
+            "supplier_commit_variance",
+            "material_shortage_risk",
+            "supplier_commit_to_material_availability",
+            Some("supplied_by"),
+            vec!["supply.commit_variance", "supply.material_shortage"],
+        ),
+        metric_dependency(
+            "material_shortage_risk",
+            "order_delivery_risk",
+            "material_availability_to_delivery",
+            Some("requires,reserved_for"),
+            vec![
+                "supply.material_shortage",
+                "fulfillment.order_delivery_risk",
+            ],
+        ),
+        metric_dependency(
+            "work_center_load",
+            "order_delivery_risk",
+            "capacity_to_delivery",
+            Some("processed_at,produced_by,reserved_for"),
+            vec![
+                "manufacturing.work_center_load",
+                "fulfillment.order_delivery_risk",
+            ],
+        ),
+        metric_dependency(
+            "first_pass_yield",
+            "quality_escape_risk",
+            "yield_to_quality_escape",
+            Some("quality_checked_by"),
+            vec!["quality.first_pass_yield", "quality.escape_risk"],
+        ),
+        metric_dependency(
+            "quality_escape_risk",
+            "order_delivery_risk",
+            "quality_to_delivery",
+            Some("affected_by,reserved_for"),
+            vec!["quality.escape_risk", "fulfillment.order_delivery_risk"],
+        ),
+    ]
+}
+
 fn server_manufacturing_facts() -> Vec<IaccFact> {
     vec![
         fact(
@@ -644,6 +696,33 @@ fn fact(
         source_ref: Some(source_ref.to_string()),
         confidence: Some(confidence),
         raw_hash: None,
+    })
+}
+
+fn metric_dependency(
+    upstream_metric_id: &str,
+    downstream_metric_id: &str,
+    dependency_type: &str,
+    entity_relation_type: Option<&str>,
+    required_fact_types: Vec<&str>,
+) -> IaccMetricDependency {
+    IaccMetricDependency::from_input(IaccMetricDependencyInput {
+        dependency_id: Some(format!(
+            "metric-dependency-{upstream_metric_id}-{downstream_metric_id}-{dependency_type}"
+        )),
+        upstream_metric_id: upstream_metric_id.to_string(),
+        downstream_metric_id: downstream_metric_id.to_string(),
+        dependency_type: dependency_type.to_string(),
+        entity_relation_type: entity_relation_type.map(str::to_string),
+        required_fact_types: required_fact_types
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        transformation_ref: Some(format!(
+            "iacc://domain/server_manufacturing/dependencies/{dependency_type}/v0.9.86"
+        )),
+        confidence: Some(0.82),
+        notes: None,
     })
 }
 

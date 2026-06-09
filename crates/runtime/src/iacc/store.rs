@@ -11,11 +11,12 @@ use thiserror::Error;
 use super::{
     IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
     IaccChangeEvent, IaccDomainSeedResult, IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef,
-    IaccFact, IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricState,
-    IaccOperationalAnalysis, IaccRelation, IaccSeverity,
+    IaccFact, IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMetricDefinition,
+    IaccMetricDependency, IaccMetricLineage, IaccMetricState, IaccOperationalAnalysis,
+    IaccRelation, IaccSeverity,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 6;
+pub const IACC_SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -41,6 +42,7 @@ pub struct IaccHealth {
     pub execution_count: u64,
     pub entity_count: u64,
     pub relation_count: u64,
+    pub metric_dependency_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,6 +98,7 @@ impl IaccStore {
             execution_count: count_table(&connection, "iacc_action_execution")?,
             entity_count: count_table(&connection, "iacc_entity")?,
             relation_count: count_table(&connection, "iacc_relation")?,
+            metric_dependency_count: count_table(&connection, "iacc_metric_dependency")?,
         })
     }
 
@@ -184,6 +187,40 @@ impl IaccStore {
         upsert_metric_definition(&connection, definition)
     }
 
+    pub fn upsert_metric_dependency(
+        &self,
+        dependency: &IaccMetricDependency,
+    ) -> Result<IaccMetricDependency, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_metric_dependency(&connection, dependency)
+    }
+
+    pub fn metric_lineage(
+        &self,
+        metric_id: &str,
+        max_depth: usize,
+    ) -> Result<IaccMetricLineage, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        build_metric_lineage(&connection, metric_id, max_depth)
+    }
+
+    pub fn metrics_affected_by_fact_type(
+        &self,
+        fact_type: &str,
+    ) -> Result<Vec<String>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        metrics_affected_by_fact_type(&connection, fact_type)
+    }
+
     pub fn seed_server_manufacturing_domain(&self) -> Result<IaccDomainSeedResult, IaccStoreError> {
         let plan = super::server_manufacturing_seed_plan();
         for entity in &plan.entities {
@@ -195,6 +232,9 @@ impl IaccStore {
         for definition in &plan.metric_definitions {
             self.register_metric_definition(definition)?;
         }
+        for dependency in &plan.metric_dependencies {
+            self.upsert_metric_dependency(dependency)?;
+        }
         for fact in &plan.facts {
             self.ingest_fact(fact)?;
         }
@@ -204,6 +244,7 @@ impl IaccStore {
             entity_count: plan.entities.len(),
             relation_count: plan.relations.len(),
             metric_definition_count: plan.metric_definitions.len(),
+            metric_dependency_count: plan.metric_dependencies.len(),
             fact_count: plan.facts.len(),
             scenario_count: plan.pack.scenarios.len(),
             seeded_at: Utc::now(),
@@ -595,7 +636,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 6, datetime('now'))
+        VALUES (1, 7, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -709,6 +750,22 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_iacc_metric_state_lookup
             ON iacc_metric_state(metric_id, entity_scope, period, computed_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_metric_dependency (
+            dependency_id TEXT PRIMARY KEY,
+            upstream_metric_id TEXT NOT NULL,
+            downstream_metric_id TEXT NOT NULL,
+            dependency_type TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            dependency_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(upstream_metric_id, downstream_metric_id, dependency_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_metric_dependency_upstream
+            ON iacc_metric_dependency(upstream_metric_id, downstream_metric_id);
+        CREATE INDEX IF NOT EXISTS idx_iacc_metric_dependency_downstream
+            ON iacc_metric_dependency(downstream_metric_id, upstream_metric_id);
 
         CREATE TABLE IF NOT EXISTS iacc_change_event (
             change_id TEXT PRIMARY KEY,
@@ -1299,6 +1356,155 @@ fn upsert_metric_definition(
     Ok(())
 }
 
+fn upsert_metric_dependency(
+    connection: &Connection,
+    dependency: &IaccMetricDependency,
+) -> Result<IaccMetricDependency, IaccStoreError> {
+    let mut dependency = dependency.clone();
+    if let Some(existing) = find_metric_dependency_by_key(
+        connection,
+        &dependency.upstream_metric_id,
+        &dependency.downstream_metric_id,
+        &dependency.dependency_type,
+    )? {
+        dependency.dependency_id = existing.dependency_id;
+        dependency.created_at = existing.created_at;
+    }
+    dependency.updated_at = Utc::now();
+    connection.execute(
+        r"INSERT INTO iacc_metric_dependency (
+            dependency_id, upstream_metric_id, downstream_metric_id, dependency_type,
+            confidence, dependency_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(dependency_id) DO UPDATE SET
+            upstream_metric_id = excluded.upstream_metric_id,
+            downstream_metric_id = excluded.downstream_metric_id,
+            dependency_type = excluded.dependency_type,
+            confidence = excluded.confidence,
+            dependency_json = excluded.dependency_json,
+            updated_at = excluded.updated_at",
+        params![
+            dependency.dependency_id,
+            dependency.upstream_metric_id,
+            dependency.downstream_metric_id,
+            dependency.dependency_type,
+            dependency.confidence,
+            serde_json::to_string(&dependency)?,
+            dependency.created_at.to_rfc3339(),
+            dependency.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(dependency)
+}
+
+fn find_metric_dependency_by_key(
+    connection: &Connection,
+    upstream_metric_id: &str,
+    downstream_metric_id: &str,
+    dependency_type: &str,
+) -> Result<Option<IaccMetricDependency>, IaccStoreError> {
+    connection
+        .query_row(
+            r"SELECT dependency_json
+              FROM iacc_metric_dependency
+              WHERE upstream_metric_id = ?1
+                AND downstream_metric_id = ?2
+                AND dependency_type = ?3",
+            params![upstream_metric_id, downstream_metric_id, dependency_type],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn list_upstream_metric_dependencies(
+    connection: &Connection,
+    metric_id: &str,
+) -> Result<Vec<IaccMetricDependency>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT dependency_json
+          FROM iacc_metric_dependency
+          WHERE downstream_metric_id = ?1
+          ORDER BY updated_at DESC",
+    )?;
+    let rows = statement.query_map(params![metric_id], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn list_downstream_metric_dependencies(
+    connection: &Connection,
+    metric_id: &str,
+) -> Result<Vec<IaccMetricDependency>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT dependency_json
+          FROM iacc_metric_dependency
+          WHERE upstream_metric_id = ?1
+          ORDER BY updated_at DESC",
+    )?;
+    let rows = statement.query_map(params![metric_id], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn build_metric_lineage(
+    connection: &Connection,
+    metric_id: &str,
+    max_depth: usize,
+) -> Result<IaccMetricLineage, IaccStoreError> {
+    let max_depth = max_depth.clamp(1, 6);
+    let upstream_dependencies = list_upstream_metric_dependencies(connection, metric_id)?;
+    let downstream_dependencies = list_downstream_metric_dependencies(connection, metric_id)?;
+    let mut impacted = BTreeSet::new();
+    let mut queue = VecDeque::from([(metric_id.to_string(), 0usize)]);
+    while let Some((current_metric_id, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        for dependency in list_downstream_metric_dependencies(connection, &current_metric_id)? {
+            if impacted.insert(dependency.downstream_metric_id.clone()) {
+                queue.push_back((dependency.downstream_metric_id, depth + 1));
+            }
+        }
+    }
+    Ok(IaccMetricLineage {
+        metric_id: metric_id.to_string(),
+        upstream_dependencies,
+        downstream_dependencies,
+        impacted_metric_ids: impacted.into_iter().collect(),
+        generated_at: Utc::now(),
+    })
+}
+
+fn metrics_affected_by_fact_type(
+    connection: &Connection,
+    fact_type: &str,
+) -> Result<Vec<String>, IaccStoreError> {
+    let mut impacted = BTreeSet::new();
+    let mut statement = connection.prepare(
+        r"SELECT dependency_json
+          FROM iacc_metric_dependency
+          ORDER BY updated_at DESC",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let dependency: IaccMetricDependency = serde_json::from_str(&row?)?;
+        if dependency
+            .required_fact_types
+            .iter()
+            .any(|candidate| candidate == fact_type)
+        {
+            impacted.insert(dependency.upstream_metric_id.clone());
+            impacted.insert(dependency.downstream_metric_id.clone());
+            for metric_id in build_metric_lineage(connection, &dependency.downstream_metric_id, 6)?
+                .impacted_metric_ids
+            {
+                impacted.insert(metric_id);
+            }
+        }
+    }
+    Ok(impacted.into_iter().collect())
+}
+
 fn latest_metric_state(
     connection: &Connection,
     metric_id: &str,
@@ -1737,6 +1943,38 @@ mod tests {
             .iter()
             .any(|state| state.metric_id == "material_shortage_risk"));
         assert!(!recompute.attention.is_empty());
+    }
+
+    #[test]
+    fn metric_dependency_graph_projects_lineage_and_fact_impact() {
+        let store = IaccStore::in_memory().expect("store opens");
+        let result = store
+            .seed_server_manufacturing_domain()
+            .expect("domain seed runs");
+        assert_eq!(result.metric_dependency_count, 5);
+
+        let lineage = store
+            .metric_lineage("supplier_commit_variance", 6)
+            .expect("lineage builds");
+        assert!(lineage
+            .downstream_dependencies
+            .iter()
+            .any(|dependency| dependency.downstream_metric_id == "material_shortage_risk"));
+        assert!(lineage
+            .impacted_metric_ids
+            .iter()
+            .any(|metric_id| metric_id == "order_delivery_risk"));
+
+        let affected = store
+            .metrics_affected_by_fact_type("supply.commit_variance")
+            .expect("affected metrics resolve");
+        assert!(affected
+            .iter()
+            .any(|metric_id| metric_id == "supplier_commit_variance"));
+        assert!(affected
+            .iter()
+            .any(|metric_id| metric_id == "order_delivery_risk"));
+        assert_eq!(store.health().unwrap().metric_dependency_count, 5);
     }
 
     #[test]

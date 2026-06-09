@@ -15,6 +15,7 @@ mod execution;
 mod fact;
 mod incident;
 mod metric;
+mod metric_graph;
 mod relation;
 mod source;
 mod store;
@@ -34,6 +35,7 @@ pub use execution::{IaccActionExecution, IaccActionExecutionRequest, IaccActionF
 pub use fact::{IaccFact, IaccFactInput};
 pub use incident::IaccIncident;
 pub use metric::{IaccMetricDefinition, IaccMetricState, IaccMetricStatus};
+pub use metric_graph::{IaccMetricDependency, IaccMetricDependencyInput, IaccMetricLineage};
 pub use relation::{IaccImpactHop, IaccImpactTrace, IaccRelation, IaccRelationInput};
 pub use source::{IaccSourceKind, IaccSourceSnapshot};
 pub use store::{

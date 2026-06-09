@@ -13,8 +13,8 @@ use memory::store::session::SessionRecord;
 use runtime::{
     server_manufacturing_domain_pack, AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode,
     IaccActionExecutionRequest, IaccActionFeedback, IaccEntity, IaccEntityInput, IaccFact,
-    IaccFactInput, IaccIncident, IaccRelation, IaccRelationInput, IaccStore, IaccStoreError,
-    IACC_SCHEMA_VERSION,
+    IaccFactInput, IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccRelation,
+    IaccRelationInput, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
 };
 use serde::Deserialize;
 
@@ -59,8 +59,20 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/iacc/metrics", get(iacc_metrics_handler))
         .route("/api/iacc/metrics/:id", get(iacc_metric_detail_handler))
         .route(
+            "/api/iacc/metrics/:id/lineage",
+            get(iacc_metric_lineage_handler),
+        )
+        .route(
             "/api/iacc/metrics/recompute",
             post(iacc_metric_recompute_handler),
+        )
+        .route(
+            "/api/iacc/metric-dependencies/upsert",
+            post(iacc_metric_dependency_upsert_handler),
+        )
+        .route(
+            "/api/iacc/metric-dependencies/affected-by-fact-type",
+            post(iacc_metric_affected_by_fact_type_handler),
         )
         .route("/api/iacc/changes", get(iacc_changes_handler))
         .route("/api/iacc/attention/hot", get(iacc_attention_hot_handler))
@@ -130,6 +142,24 @@ struct IaccRelationUpsertRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct IaccMetricDependencyUpsertRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    dependency: IaccMetricDependencyInput,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccAffectedByFactTypeRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    fact_type: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct IaccEvidenceBuildRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -187,8 +217,12 @@ async fn iacc_health_handler(
         "execution_count": health.execution_count,
         "entity_count": health.entity_count,
         "relation_count": health.relation_count,
+        "metric_dependency_count": health.metric_dependency_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": [
+            "metric_dependency_graph",
+            "metric_lineage",
+            "fact_type_metric_impact",
             "server_manufacturing_domain_pack",
             "server_manufacturing_seed",
             "entity_relation_network",
@@ -418,6 +452,56 @@ async fn iacc_metric_detail_handler(
         "kind": "iacc.metric",
         "metric_id": id,
         "states": states,
+    })))
+}
+
+async fn iacc_metric_lineage_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let lineage = store
+        .metric_lineage(&id, 6)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.metric.lineage",
+        "lineage": lineage,
+    })))
+}
+
+async fn iacc_metric_dependency_upsert_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccMetricDependencyUpsertRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let dependency = store
+        .upsert_metric_dependency(&IaccMetricDependency::from_input(request.dependency))
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.metric_dependency",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "dependency": dependency,
+    })))
+}
+
+async fn iacc_metric_affected_by_fact_type_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccAffectedByFactTypeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let metric_ids = store
+        .metrics_affected_by_fact_type(&request.fact_type)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.metric_dependency.affected_by_fact_type",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "fact_type": request.fact_type,
+        "metric_ids": metric_ids,
     })))
 }
 
