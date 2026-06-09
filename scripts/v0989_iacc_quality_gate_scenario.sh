@@ -4,11 +4,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
-PORT="${COWD_V0981_PORT:-18701}"
+PORT="${COWD_V0989_PORT:-18709}"
 BASE_URL="http://127.0.0.1:$PORT"
-SESSION="cowd-v0981-iacc-$$"
+SESSION="cowd-v0989-iacc-$$"
 TMP_ROOT="${TMPDIR:-/tmp}"
-TMP_DIR="$(mktemp -d "$TMP_ROOT/cowd-v0981-iacc.XXXXXX")"
+TMP_DIR="$(mktemp -d "$TMP_ROOT/cowd-v0989-iacc.XXXXXX")"
 WORKDIR="$TMP_DIR/workspace"
 CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
@@ -29,7 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 if ! command -v tmux >/dev/null 2>&1; then
-  echo "tmux is required for v0.9.81 IACC action feedback scenario" >&2
+  echo "tmux is required for v0.9.89 IACC quality gate scenario" >&2
   exit 1
 fi
 
@@ -81,11 +81,12 @@ done
 
 curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"daemon-http-gateway"'
 curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"expected_schema_version":9'
-curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"action_execution_feedback"'
+curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"evidence_quality_gate"'
+curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"insight_quality_gate"'
 
 curl -fsS "$BASE_URL/api/iacc/facts/ingest" \
   -H 'content-type: application/json' \
-  -d '{"request_id":"v0981","session_id":"session-v0981","facts":[{"fact_id":"fact-v0981-shortage-a","snapshot_id":"snapshot-v0981-shortage-a","fact_type":"supply.material_shortage","entity_refs":["component:gpu-v0981","product:server-v0981"],"metric_key":"material_shortage_risk","dimensions":{"week":"2026-W29"},"measures":{"short_qty":260},"source_ref":"connector:erp:material-shortage","confidence":0.93}]}' \
+  -d '{"request_id":"v0989","session_id":"session-v0989","facts":[{"fact_id":"fact-v0989-shortage-a","snapshot_id":"snapshot-v0989-shortage-a","fact_type":"supply.material_shortage","entity_refs":["component:gpu-v0989","product:server-v0989"],"metric_key":"material_shortage_risk","dimensions":{"week":"2026-W30"},"measures":{"short_qty":280},"source_ref":"connector:erp:material-shortage","confidence":0.94}]}' \
   | rg -q '"ingested":1'
 
 curl -fsS "$BASE_URL/api/iacc/metrics/recompute" -X POST | rg -q '"change_count":1'
@@ -93,33 +94,28 @@ curl -fsS "$BASE_URL/api/iacc/metrics/recompute" -X POST | rg -q '"change_count"
 attention_id="$(curl -fsS "$BASE_URL/api/iacc/attention/hot" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["items"][0]["attention_id"])')"
 packet_id="$(curl -fsS "$BASE_URL/api/iacc/evidence/build" \
   -H 'content-type: application/json' \
-  -d "{\"request_id\":\"v0981\",\"session_id\":\"session-v0981\",\"attention_id\":\"$attention_id\",\"problem_statement\":\"v0.9.81 GPU shortage closed-loop incident\"}" \
+  -d "{\"request_id\":\"v0989\",\"session_id\":\"session-v0989\",\"attention_id\":\"$attention_id\",\"problem_statement\":\"v0.9.89 GPU shortage quality gated incident\"}" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["packet"]["packet_id"])')"
+
+review_gate_json="$(curl -fsS "$BASE_URL/api/iacc/evidence/$packet_id/quality-gate" -X POST)"
+printf '%s' "$review_gate_json" | rg -q '"kind":"iacc.quality_gate"'
+printf '%s' "$review_gate_json" | rg -q '"decision":"review"'
+printf '%s' "$review_gate_json" | rg -q '"run_incident_analysis"'
+review_gate_id="$(printf '%s' "$review_gate_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["gate"]["gate_id"])')"
+curl -fsS "$BASE_URL/api/iacc/quality-gates/$review_gate_id" | rg -q "$review_gate_id"
 
 incident_json="$(curl -fsS "$BASE_URL/api/iacc/incidents" \
   -H 'content-type: application/json' \
-  -d "{\"request_id\":\"v0981\",\"session_id\":\"session-v0981\",\"title\":\"GPU shortage closed-loop incident\",\"evidence_packet_id\":\"$packet_id\"}")"
+  -d "{\"request_id\":\"v0989\",\"session_id\":\"session-v0989\",\"title\":\"GPU shortage quality gated incident\",\"evidence_packet_id\":\"$packet_id\"}")"
 incident_id="$(printf '%s' "$incident_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["incident"]["incident_id"])')"
 
-analysis_json="$(curl -fsS "$BASE_URL/api/iacc/incidents/$incident_id/analyze" -X POST)"
-analysis_id="$(printf '%s' "$analysis_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["analysis"]["analysis_id"])')"
-action_id="$(printf '%s' "$analysis_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["analysis"]["recommended_actions"][0]["action_id"])')"
+curl -fsS "$BASE_URL/api/iacc/incidents/$incident_id/analyze" -X POST | rg -q '"status":"ready_for_review"'
 
-execution_json="$(curl -fsS "$BASE_URL/api/iacc/analyses/$analysis_id/actions/$action_id/execute" \
-  -H 'content-type: application/json' \
-  -d '{"mode":"commit","operator_id":"user:ops-planner","note":"queue supplier recovery action"}')"
-execution_id="$(printf '%s' "$execution_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["execution"]["execution_id"])')"
-printf '%s' "$execution_json" | rg -q '"status":"queued_for_human_review"'
-printf '%s' "$execution_json" | rg -q '"receipt_kind":"iacc.action.execution"'
-
-feedback_json="$(curl -fsS "$BASE_URL/api/iacc/executions/$execution_id/feedback" \
-  -H 'content-type: application/json' \
-  -d '{"outcome":"resolved","note":"supplier commit secured and shortage cleared","metric_delta":-260}')"
-printf '%s' "$feedback_json" | rg -q '"status":"feedback_resolved"'
-printf '%s' "$feedback_json" | rg -q '"outcome":"resolved"'
-
-curl -fsS "$BASE_URL/api/iacc/executions/$execution_id" | rg -q "$execution_id"
-curl -fsS "$BASE_URL/api/iacc/incidents/$incident_id" | rg -q '"status":"closed"'
-curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"execution_count":1'
+pass_gate_json="$(curl -fsS "$BASE_URL/api/iacc/evidence/$packet_id/quality-gate" -X POST)"
+printf '%s' "$pass_gate_json" | rg -q '"decision":"pass"'
+printf '%s' "$pass_gate_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["gate"]["score"] >= 0.75'
+pass_gate_id="$(printf '%s' "$pass_gate_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["gate"]["gate_id"])')"
+curl -fsS "$BASE_URL/api/iacc/quality-gates/$pass_gate_id" | rg -q "$pass_gate_id"
+curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"quality_gate_count":2'
 
 test -f "$WORKDIR/.cowd/iacc.sqlite"

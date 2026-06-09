@@ -182,8 +182,9 @@ pub use iacc::{
     IaccFactInput, IaccHealth, IaccImpactHop, IaccImpactPath, IaccImpactTrace, IaccIncident,
     IaccMetricDefinition, IaccMetricDependency, IaccMetricDependencyInput, IaccMetricLineage,
     IaccMetricRecomputeResult, IaccMetricState, IaccMetricStatus, IaccOperationalAnalysis,
-    IaccRecommendedAction, IaccRelation, IaccRelationInput, IaccSeverity, IaccSourceKey,
-    IaccSourceKind, IaccSourceSnapshot, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
+    IaccQualityGateDecision, IaccRecommendedAction, IaccRelation, IaccRelationInput, IaccSeverity,
+    IaccSourceKey, IaccSourceKind, IaccSourceSnapshot, IaccStore, IaccStoreError,
+    IACC_SCHEMA_VERSION,
 };
 pub use joint_problem_solving::{
     AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult, ProblemSolvingConfig,

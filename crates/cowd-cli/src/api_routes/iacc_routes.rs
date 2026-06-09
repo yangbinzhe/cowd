@@ -95,8 +95,16 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/iacc/evidence/:id", get(iacc_evidence_get_handler))
         .route(
+            "/api/iacc/evidence/:id/quality-gate",
+            post(iacc_evidence_quality_gate_handler),
+        )
+        .route(
             "/api/iacc/evidence/:id/context",
             get(iacc_evidence_context_handler),
+        )
+        .route(
+            "/api/iacc/quality-gates/:id",
+            get(iacc_quality_gate_get_handler),
         )
         .route("/api/iacc/incidents", post(iacc_incident_create_handler))
         .route("/api/iacc/incidents/:id", get(iacc_incident_get_handler))
@@ -241,8 +249,11 @@ async fn iacc_health_handler(
         "relation_count": health.relation_count,
         "metric_dependency_count": health.metric_dependency_count,
         "compute_job_count": health.compute_job_count,
+        "quality_gate_count": health.quality_gate_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": [
+            "evidence_quality_gate",
+            "insight_quality_gate",
             "incremental_compute_job",
             "scoped_metric_recompute",
             "metric_dependency_graph",
@@ -657,6 +668,40 @@ async fn iacc_evidence_get_handler(
     Ok(Json(serde_json::json!({
         "kind": "iacc.evidence.packet",
         "packet": packet,
+    })))
+}
+
+async fn iacc_evidence_quality_gate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let gate = store
+        .evaluate_evidence_quality(&id)
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.quality_gate",
+        "gate": gate,
+    })))
+}
+
+async fn iacc_quality_gate_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let gate = store
+        .get_quality_gate(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC quality gate not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.quality_gate",
+        "gate": gate,
     })))
 }
 

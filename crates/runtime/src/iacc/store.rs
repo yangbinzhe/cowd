@@ -13,10 +13,10 @@ use super::{
     IaccChangeEvent, IaccComputeJob, IaccComputeJobInput, IaccComputePlan, IaccDomainSeedResult,
     IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccImpactHop,
     IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage,
-    IaccMetricState, IaccOperationalAnalysis, IaccRelation, IaccSeverity,
+    IaccMetricState, IaccOperationalAnalysis, IaccQualityGateDecision, IaccRelation, IaccSeverity,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 8;
+pub const IACC_SCHEMA_VERSION: i64 = 9;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -44,6 +44,7 @@ pub struct IaccHealth {
     pub relation_count: u64,
     pub metric_dependency_count: u64,
     pub compute_job_count: u64,
+    pub quality_gate_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,6 +102,7 @@ impl IaccStore {
             relation_count: count_table(&connection, "iacc_relation")?,
             metric_dependency_count: count_table(&connection, "iacc_metric_dependency")?,
             compute_job_count: count_table(&connection, "iacc_compute_job")?,
+            quality_gate_count: count_table(&connection, "iacc_quality_gate")?,
         })
     }
 
@@ -590,6 +592,32 @@ impl IaccStore {
         find_evidence_packet(&connection, packet_id)
     }
 
+    pub fn evaluate_evidence_quality(
+        &self,
+        packet_id: &str,
+    ) -> Result<IaccQualityGateDecision, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let packet = find_evidence_packet(&connection, packet_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(packet_id.to_string()))?;
+        let decision = IaccQualityGateDecision::for_evidence_packet(&packet);
+        insert_quality_gate(&connection, &decision)?;
+        Ok(decision)
+    }
+
+    pub fn get_quality_gate(
+        &self,
+        gate_id: &str,
+    ) -> Result<Option<IaccQualityGateDecision>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_quality_gate(&connection, gate_id)
+    }
+
     pub fn create_incident(&self, incident: &IaccIncident) -> Result<IaccIncident, IaccStoreError> {
         let connection = self
             .connection
@@ -726,7 +754,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 8, datetime('now'))
+        VALUES (1, 9, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -818,6 +846,18 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             packet_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS iacc_quality_gate (
+            gate_id TEXT PRIMARY KEY,
+            target_ref TEXT NOT NULL,
+            gate_type TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            score REAL NOT NULL,
+            gate_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_quality_gate_target
+            ON iacc_quality_gate(target_ref, created_at DESC);
 
         CREATE TABLE IF NOT EXISTS iacc_metric_definition (
             metric_id TEXT PRIMARY KEY,
@@ -1311,6 +1351,42 @@ fn find_evidence_packet(
         .query_row(
             "SELECT packet_json FROM iacc_evidence_packet WHERE packet_id = ?1",
             params![packet_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn insert_quality_gate(
+    connection: &Connection,
+    gate: &IaccQualityGateDecision,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_quality_gate (
+            gate_id, target_ref, gate_type, decision, score, gate_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            gate.gate_id,
+            gate.target_ref,
+            gate.gate_type,
+            gate.decision,
+            gate.score,
+            serde_json::to_string(gate)?,
+            gate.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_quality_gate(
+    connection: &Connection,
+    gate_id: &str,
+) -> Result<Option<IaccQualityGateDecision>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT gate_json FROM iacc_quality_gate WHERE gate_id = ?1",
+            params![gate_id],
             |row| row.get::<_, String>(0),
         )
         .optional()?
@@ -2358,6 +2434,66 @@ mod tests {
             .expect("incident exists");
         assert_eq!(loaded.title, "material risk");
         assert_eq!(store.health().unwrap().incident_count, 1);
+    }
+
+    #[test]
+    fn quality_gate_reviews_evidence_then_passes_after_analysis() {
+        let store = IaccStore::in_memory().expect("store opens");
+        let fact = IaccFact::from_input(IaccFactInput {
+            fact_id: Some("fact-quality-shortage".to_string()),
+            snapshot_id: Some("snapshot-quality-shortage".to_string()),
+            fact_type: "supply.material_shortage".to_string(),
+            entity_refs: vec!["component:gpu-quality".to_string()],
+            metric_key: Some("material_shortage_risk".to_string()),
+            dimensions: serde_json::json!({"week": "2026-W28"}),
+            measures: serde_json::json!({"short_qty": 220}),
+            event_time: None,
+            valid_from: None,
+            valid_to: None,
+            source_ref: Some("connector:erp:shortage".to_string()),
+            confidence: Some(0.92),
+            raw_hash: None,
+        });
+        store.ingest_fact(&fact).expect("fact ingests");
+        let recompute = store.recompute_metrics().expect("recompute");
+        let packet = store
+            .build_evidence_packet(
+                Some(&recompute.attention[0].attention_id),
+                Some("GPU shortage quality gated incident"),
+            )
+            .expect("packet builds");
+
+        let review_gate = store
+            .evaluate_evidence_quality(&packet.packet_id)
+            .expect("quality gate evaluates");
+        assert_eq!(review_gate.decision, "review");
+        assert!(review_gate
+            .required_actions
+            .iter()
+            .any(|action| action == "run_incident_analysis"));
+        assert_eq!(
+            store
+                .get_quality_gate(&review_gate.gate_id)
+                .expect("gate loads")
+                .expect("gate exists")
+                .target_ref,
+            format!("iacc:evidence:{}", packet.packet_id)
+        );
+
+        let mut incident = IaccIncident::new("GPU shortage quality gate");
+        incident.attention_id = packet.attention_id.clone();
+        incident.evidence_packet_id = Some(packet.packet_id.clone());
+        store.create_incident(&incident).expect("incident saves");
+        store
+            .analyze_incident(&incident.incident_id)
+            .expect("incident analyzes");
+
+        let pass_gate = store
+            .evaluate_evidence_quality(&packet.packet_id)
+            .expect("quality gate re-evaluates");
+        assert_eq!(pass_gate.decision, "pass");
+        assert!(pass_gate.score >= 0.75);
+        assert_eq!(store.health().unwrap().quality_gate_count, 2);
     }
 
     #[test]
