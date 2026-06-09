@@ -29,8 +29,9 @@ pub use analysis::{
 pub use attention::{IaccAttentionItem, IaccSeverity};
 pub use change::IaccChangeEvent;
 pub use cockpit::{
-    IaccCockpitProfile, IaccCockpitProfileInput, IaccCockpitProjection, IaccCockpitReportRequest,
-    IaccCockpitReportSnapshot, IaccCockpitWidget,
+    IaccCockpitProfile, IaccCockpitProfileInput, IaccCockpitProjection,
+    IaccCockpitReportDeliveryReceipt, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
+    IaccCockpitWidget,
 };
 pub use compute::{IaccComputeJob, IaccComputeJobInput, IaccComputePlan};
 pub use domain::{

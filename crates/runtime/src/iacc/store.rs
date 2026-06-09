@@ -10,12 +10,12 @@ use thiserror::Error;
 
 use super::{
     IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
-    IaccChangeEvent, IaccCockpitProfile, IaccCockpitProjection, IaccCockpitReportRequest,
-    IaccCockpitReportSnapshot, IaccCockpitWidget, IaccComputeJob, IaccComputeJobInput,
-    IaccComputePlan, IaccCrossPlaneBridgeReceipt, IaccDomainSeedResult, IaccEntity,
-    IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccImpactHop, IaccImpactTrace,
-    IaccIncident, IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage, IaccMetricState,
-    IaccOperationalAnalysis, IaccQualityGateDecision, IaccRelation, IaccSeverity,
+    IaccChangeEvent, IaccCockpitProfile, IaccCockpitProjection, IaccCockpitReportDeliveryReceipt,
+    IaccCockpitReportRequest, IaccCockpitReportSnapshot, IaccCockpitWidget, IaccComputeJob,
+    IaccComputeJobInput, IaccComputePlan, IaccCrossPlaneBridgeReceipt, IaccDomainSeedResult,
+    IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccImpactHop,
+    IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage,
+    IaccMetricState, IaccOperationalAnalysis, IaccQualityGateDecision, IaccRelation, IaccSeverity,
 };
 
 pub const IACC_SCHEMA_VERSION: i64 = 11;
@@ -173,6 +173,22 @@ impl IaccStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         find_cockpit_report(&connection, report_id)
+    }
+
+    pub fn attach_cockpit_report_delivery(
+        &self,
+        report_id: &str,
+        receipt: IaccCockpitReportDeliveryReceipt,
+    ) -> Result<IaccCockpitReportSnapshot, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut report = find_cockpit_report(&connection, report_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(report_id.to_string()))?;
+        report.attach_delivery_receipt(receipt);
+        insert_cockpit_report(&connection, &report)?;
+        Ok(report)
     }
 
     pub fn upsert_entity(&self, entity: &IaccEntity) -> Result<IaccEntity, IaccStoreError> {
@@ -2421,8 +2437,8 @@ fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> I
 mod tests {
     use super::*;
     use crate::iacc::{
-        IaccCockpitProfileInput, IaccCockpitReportRequest, IaccComputeJobInput, IaccEntityInput,
-        IaccFactInput, IaccRelationInput, IaccSourceKey,
+        IaccCockpitProfileInput, IaccCockpitReportDeliveryReceipt, IaccCockpitReportRequest,
+        IaccComputeJobInput, IaccEntityInput, IaccFactInput, IaccRelationInput, IaccSourceKey,
     };
 
     #[test]
@@ -2998,6 +3014,34 @@ mod tests {
             .expect("report exists");
         assert_eq!(loaded_report.delivery_ref, report.delivery_ref);
         assert_eq!(store.health().unwrap().cockpit_report_count, 1);
+
+        let delivered = store
+            .attach_cockpit_report_delivery(
+                &report.report_id,
+                IaccCockpitReportDeliveryReceipt::new(
+                    report.report_id.clone(),
+                    "cpx-report-test",
+                    "planned",
+                    "dry_run",
+                    Some("cpa-report-test".to_string()),
+                ),
+            )
+            .expect("report delivery attaches");
+        assert_eq!(delivered.status, "delivery_planned");
+        assert_eq!(delivered.delivery_receipts.len(), 1);
+        let delivered = store
+            .attach_cockpit_report_delivery(
+                &report.report_id,
+                IaccCockpitReportDeliveryReceipt::new(
+                    report.report_id.clone(),
+                    "cpx-report-test",
+                    "planned",
+                    "dry_run",
+                    Some("cpa-report-test".to_string()),
+                ),
+            )
+            .expect("report delivery deduplicates");
+        assert_eq!(delivered.delivery_receipts.len(), 1);
     }
 
     #[test]

@@ -86,8 +86,22 @@ pub struct IaccCockpitReportSnapshot {
     pub delivery_ref: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+    #[serde(default)]
+    pub delivery_receipts: Vec<IaccCockpitReportDeliveryReceipt>,
     pub projection: IaccCockpitProjection,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IaccCockpitReportDeliveryReceipt {
+    pub delivery_id: String,
+    pub report_id: String,
+    pub cross_plane_receipt_id: String,
+    pub cross_plane_status: String,
+    pub cross_plane_dispatch_status: String,
+    #[serde(default)]
+    pub audit_record_id: Option<String>,
+    pub delivered_at: DateTime<Utc>,
 }
 
 impl IaccCockpitProfile {
@@ -173,8 +187,42 @@ impl IaccCockpitReportSnapshot {
             status: "generated".to_string(),
             delivery_ref: request.delivery_ref,
             note: request.note,
+            delivery_receipts: Vec::new(),
             projection,
             created_at: Utc::now(),
+        }
+    }
+
+    pub fn attach_delivery_receipt(&mut self, receipt: IaccCockpitReportDeliveryReceipt) {
+        self.delivery_receipts
+            .retain(|existing| existing.cross_plane_receipt_id != receipt.cross_plane_receipt_id);
+        self.status = match receipt.cross_plane_status.as_str() {
+            "planned" => "delivery_planned".to_string(),
+            "dispatched" => "delivery_dispatched".to_string(),
+            "blocked" => "delivery_blocked".to_string(),
+            other => format!("delivery_{other}"),
+        };
+        self.delivery_receipts.push(receipt);
+    }
+}
+
+impl IaccCockpitReportDeliveryReceipt {
+    #[must_use]
+    pub fn new(
+        report_id: impl Into<String>,
+        cross_plane_receipt_id: impl Into<String>,
+        cross_plane_status: impl Into<String>,
+        cross_plane_dispatch_status: impl Into<String>,
+        audit_record_id: Option<String>,
+    ) -> Self {
+        Self {
+            delivery_id: format!("cockpit-delivery-{}", uuid::Uuid::new_v4()),
+            report_id: report_id.into(),
+            cross_plane_receipt_id: cross_plane_receipt_id.into(),
+            cross_plane_status: cross_plane_status.into(),
+            cross_plane_dispatch_status: cross_plane_dispatch_status.into(),
+            audit_record_id,
+            delivered_at: Utc::now(),
         }
     }
 }
