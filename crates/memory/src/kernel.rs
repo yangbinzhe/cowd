@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cognitive::CognitiveContextManager,
     error::MemoryError,
+    memory_authority::{
+        authority_decision, same_memory_key, MemoryAuthorityAction, MemoryAuthorityDecision,
+    },
+    memory_cluster::{cluster_entries, MemoryCluster},
+    memory_usage::{summarize_usage, MemoryUsageSignal, MemoryUsageSummary},
     project_scope::MemoryScope,
     types::{
         AgentVisibility, MemoryEntry, MemoryId, MemoryLayer, Message, PreparedContext, TokenBudget,
@@ -68,7 +73,9 @@ pub enum MemoryInformationState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MemoryState {
     Candidate,
+    Observed,
     Active,
+    Validated,
     Conflicted,
     Superseded,
     Stale,
@@ -127,7 +134,7 @@ impl MemoryAtomView {
     #[must_use]
     pub fn is_explainable_orientation(&self) -> bool {
         self.information_state == MemoryInformationState::Orientation
-            && matches!(self.state, MemoryState::Active)
+            && matches!(self.state, MemoryState::Active | MemoryState::Validated)
             && (self.evidence_pointer.is_some() || self.explicit_authority)
     }
 }
@@ -396,6 +403,11 @@ impl MemoryKernel {
         }
 
         let memory_id = entry.id;
+        let authority_match = self.authority_match(&entry).await?;
+        let authority_action = authority_match
+            .as_ref()
+            .map(|(_, decision)| decision.action)
+            .unwrap_or(MemoryAuthorityAction::SupersedeExisting);
         if let Err(error) = self.manager.remember(entry).await {
             tracing::warn!(
                 session_id = %ctx.session_id,
@@ -404,11 +416,40 @@ impl MemoryKernel {
                 "memory kernel remember degraded"
             );
         } else {
+            if let Some((existing_id, decision)) = authority_match {
+                match decision.action {
+                    MemoryAuthorityAction::SupersedeExisting => {
+                        self.record_lifecycle_event(
+                            ctx,
+                            existing_id,
+                            self.latest_state(existing_id).await.unwrap_or(None),
+                            MemoryState::Superseded,
+                            format!("superseded by {memory_id}: {}", decision.reason),
+                        )
+                        .await;
+                    }
+                    MemoryAuthorityAction::MarkConflict => {
+                        self.record_lifecycle_event(
+                            ctx,
+                            existing_id,
+                            self.latest_state(existing_id).await.unwrap_or(None),
+                            MemoryState::Conflicted,
+                            format!("conflicts with {memory_id}: {}", decision.reason),
+                        )
+                        .await;
+                    }
+                    MemoryAuthorityAction::KeepExisting | MemoryAuthorityAction::Duplicate => {}
+                }
+            }
             self.record_lifecycle_event(
                 ctx,
                 memory_id,
                 None,
-                MemoryState::Active,
+                match authority_action {
+                    MemoryAuthorityAction::MarkConflict => MemoryState::Conflicted,
+                    MemoryAuthorityAction::Duplicate => MemoryState::Observed,
+                    _ => MemoryState::Active,
+                },
                 "remembered through memory kernel",
             )
             .await;
@@ -470,8 +511,11 @@ impl MemoryKernel {
         max_tokens: u64,
     ) -> MemoryKernelResult<MemoryContextPacket> {
         let prepared = self.prepare(ctx, query, messages).await?;
-        self.context_packet_from_entries(prepared.entries, max_items, max_tokens)
-            .await
+        let packet = self
+            .context_packet_from_entries(prepared.entries, max_items, max_tokens)
+            .await?;
+        self.record_context_usage(ctx, &packet).await?;
+        Ok(packet)
     }
 
     pub async fn context_packet_from_entries(
@@ -518,6 +562,44 @@ impl MemoryKernel {
     pub async fn links(&self) -> MemoryKernelResult<Vec<MemoryLink>> {
         let entries = self.manager.list_all_entries().await?;
         Ok(build_links(&entries))
+    }
+
+    pub async fn clusters(&self, limit: usize) -> MemoryKernelResult<Vec<MemoryCluster>> {
+        let entries = self
+            .filter_active_entries(self.manager.list_all_entries().await?)
+            .await;
+        let mut clusters = cluster_entries(&entries, 960);
+        clusters.truncate(limit.max(1));
+        Ok(clusters)
+    }
+
+    pub async fn usage_summary(&self) -> MemoryKernelResult<MemoryUsageSummary> {
+        let raw = self
+            .manager
+            .kernel_kv_get(MEMORY_USAGE_KEY)
+            .await?
+            .unwrap_or_else(|| "[]".to_string());
+        let signals: Vec<MemoryUsageSignal> = serde_json::from_str(&raw).unwrap_or_default();
+        Ok(summarize_usage(&signals, 3))
+    }
+
+    pub async fn runtime_snapshot(&self) -> MemoryKernelResult<MemoryRuntimeSnapshot> {
+        let entries = self.manager.list_all_entries().await?;
+        let active_entries = self.filter_active_entries(entries.clone()).await;
+        let health = health_from_entries(&entries, None);
+        let clusters = cluster_entries(&active_entries, 960);
+        let usage = self.usage_summary().await.unwrap_or_default();
+        Ok(MemoryRuntimeSnapshot {
+            total_entries: entries.len(),
+            active_entries: active_entries.len(),
+            cluster_count: clusters.len(),
+            hot_memory_count: usage.hot_memory_ids.len(),
+            conflict_pressure: health.conflict_pressure,
+            stale_pressure: health.stale_pressure,
+            authority_ready: true,
+            clusters: clusters.into_iter().take(8).collect(),
+            usage,
+        })
     }
 
     pub async fn path_recall(
@@ -757,11 +839,102 @@ impl MemoryKernel {
             )))
         })
     }
+
+    async fn authority_match(
+        &self,
+        incoming: &MemoryEntry,
+    ) -> MemoryKernelResult<Option<(MemoryId, MemoryAuthorityDecision)>> {
+        let incoming_key = same_memory_key(incoming);
+        let entries = self.manager.list_all_entries().await?;
+        let mut best: Option<(MemoryId, MemoryAuthorityDecision)> = None;
+        for existing in entries {
+            if existing.id == incoming.id || same_memory_key(&existing) != incoming_key {
+                continue;
+            }
+            if matches!(
+                self.latest_state(existing.id).await.ok().flatten(),
+                Some(MemoryState::Superseded | MemoryState::Archived)
+            ) {
+                continue;
+            }
+            let decision = authority_decision(&existing, incoming);
+            if matches!(
+                decision.action,
+                MemoryAuthorityAction::SupersedeExisting
+                    | MemoryAuthorityAction::MarkConflict
+                    | MemoryAuthorityAction::Duplicate
+            ) {
+                best = Some((existing.id, decision));
+                break;
+            }
+        }
+        Ok(best)
+    }
+
+    async fn record_context_usage(
+        &self,
+        ctx: &MemoryTurnContext,
+        packet: &MemoryContextPacket,
+    ) -> MemoryKernelResult<()> {
+        if packet.selected.is_empty() {
+            return Ok(());
+        }
+        let raw = self
+            .manager
+            .kernel_kv_get(MEMORY_USAGE_KEY)
+            .await?
+            .unwrap_or_else(|| "[]".to_string());
+        let mut signals: Vec<MemoryUsageSignal> = serde_json::from_str(&raw).unwrap_or_default();
+        for item in &packet.selected {
+            signals.push(MemoryUsageSignal {
+                memory_id: item.atom.id,
+                session_id: ctx.session_id.clone(),
+                agent_id: ctx.agent_id.clone(),
+                selected_count: 1,
+                last_reason: item.reason.clone(),
+            });
+            if matches!(item.atom.state, MemoryState::Active | MemoryState::Observed) {
+                self.record_lifecycle_event(
+                    ctx,
+                    item.atom.id,
+                    Some(item.atom.state),
+                    MemoryState::Validated,
+                    "validated by context selection",
+                )
+                .await;
+            }
+        }
+        if signals.len() > 2_000 {
+            let start = signals.len() - 2_000;
+            signals.drain(0..start);
+        }
+        if let Ok(raw) = serde_json::to_string(&signals) {
+            if let Err(error) = self.manager.kernel_kv_put(MEMORY_USAGE_KEY, &raw).await {
+                tracing::warn!(%error, "memory usage persist degraded");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryRuntimeSnapshot {
+    pub total_entries: usize,
+    pub active_entries: usize,
+    pub cluster_count: usize,
+    pub hot_memory_count: usize,
+    pub conflict_pressure: f32,
+    pub stale_pressure: f32,
+    pub authority_ready: bool,
+    pub clusters: Vec<MemoryCluster>,
+    pub usage: MemoryUsageSummary,
 }
 
 fn lifecycle_key(memory_id: MemoryId) -> String {
     format!("memory_lifecycle:{memory_id}")
 }
+
+const MEMORY_USAGE_KEY: &str = "memory_usage:context_selection";
 
 fn build_links(entries: &[MemoryEntry]) -> Vec<MemoryLink> {
     let mut links = Vec::new();
@@ -841,11 +1014,15 @@ fn packet_role_and_reason(atom: &MemoryAtomView) -> (MemoryPacketRole, String) {
             MemoryPacketRole::Supporting,
             "candidate memory can support reasoning but is not authoritative".to_string(),
         ),
-        MemoryState::Active if atom.is_explainable_orientation() => (
+        MemoryState::Observed => (
+            MemoryPacketRole::Supporting,
+            "observed memory can support reasoning but is not yet validated".to_string(),
+        ),
+        MemoryState::Active | MemoryState::Validated if atom.is_explainable_orientation() => (
             MemoryPacketRole::Orientation,
             "active explainable orientation memory".to_string(),
         ),
-        MemoryState::Active => (
+        MemoryState::Active | MemoryState::Validated => (
             MemoryPacketRole::Supporting,
             "active memory lacks explicit orientation evidence".to_string(),
         ),

@@ -187,6 +187,7 @@ case "$SCOPE" in
     run_step gateway_webui_contract keep bash scripts/v0970_gateway_webui_contract_scenario.sh
     run_step agent_graph_contract keep bash scripts/v0971_agent_graph_scenario.sh
     run_step context_runtime_contract keep bash scripts/v0972_context_runtime_scenario.sh
+    run_step memory_runtime_contract keep bash scripts/v0973_memory_runtime_scenario.sh
     run_step tui_interaction_quality keep bash scripts/v0963_tui_interaction_quality_gate.sh
     ;;
 esac

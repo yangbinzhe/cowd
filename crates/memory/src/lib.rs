@@ -54,8 +54,11 @@ pub mod kernel;
 pub mod layers;
 pub(crate) mod legacy_jsonl;
 pub mod maintenance;
+pub mod memory_authority;
+pub mod memory_cluster;
 pub mod memory_pulse;
 pub mod memory_sync;
+pub mod memory_usage;
 pub mod miner;
 pub mod orchestrator;
 pub mod performance_monitor;
@@ -114,17 +117,23 @@ pub use kernel::{
     MemoryAtomView, MemoryContextPacket, MemoryDegradation, MemoryHealth, MemoryInformationState,
     MemoryKernel, MemoryKernelError, MemoryKernelResult, MemoryLayerView, MemoryLifecycleEvent,
     MemoryLink, MemoryLinkKind, MemoryPacketItem, MemoryPacketRole, MemoryPath, MemoryPrimitive,
-    MemoryState, MemoryTurnContext, OmittedMemory,
+    MemoryRuntimeSnapshot, MemoryState, MemoryTurnContext, OmittedMemory,
 };
 pub use layers::shared::{L4Event, L4EventBus, L4Operation};
 pub use maintenance::{
     scan_maintenance_candidates, MaintenanceCandidate, MaintenanceCandidateFilter,
     MaintenanceCandidateKind, MaintenanceCandidateStatus, MaintenanceQueue, MaintenanceScanConfig,
 };
+pub use memory_authority::{
+    authority_decision, authority_level, MemoryAuthorityAction, MemoryAuthorityDecision,
+    MemoryAuthorityLevel,
+};
+pub use memory_cluster::{cluster_entries, MemoryCluster};
 pub use memory_pulse::{
     MemoryPulseBatch, MemoryPulseConfig, MemoryPulseConsumer, MemoryPulseReport,
     MemoryPulseTransition,
 };
+pub use memory_usage::{summarize_usage, MemoryUsageSignal, MemoryUsageSummary};
 pub use orchestrator::MemoryOrchestrator;
 pub use runtime_event::{
     RuntimeEvent, RuntimeEventPage, RuntimeEventScope, RuntimeRef, RUNTIME_EVENT_TYPE,

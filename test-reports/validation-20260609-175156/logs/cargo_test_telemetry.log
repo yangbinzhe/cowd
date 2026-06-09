@@ -1,0 +1,19 @@
+[2026-06-09T17:52:00+08:00] START cargo_test_telemetry
+   Compiling telemetry v0.9.73 (/media/yi/Datas/workspace/cowd/crates/telemetry)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+     Running unittests src/lib.rs (/tmp/cowd-target-v0973-speed/debug/deps/telemetry-74b1d885e8f9851e)
+
+running 3 tests
+test tests::session_tracer_records_structured_events_and_trace_sequence ... ok
+test tests::request_profile_emits_headers_and_merges_body ... ok
+test tests::jsonl_sink_persists_events ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests telemetry
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[2026-06-09T17:52:01+08:00] END cargo_test_telemetry status=0 elapsed=1s target_before=7082653465 target_after=7093110910

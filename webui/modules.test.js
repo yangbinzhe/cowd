@@ -59,6 +59,9 @@ describe('API module', () => {
     expect(typeof window.Api.recallExplain).toBe('function');
     expect(typeof window.Api.memoryPacket).toBe('function');
     expect(typeof window.Api.memoryLinks).toBe('function');
+    expect(typeof window.Api.memoryRuntime).toBe('function');
+    expect(typeof window.Api.memoryClusters).toBe('function');
+    expect(typeof window.Api.memoryLifecycle).toBe('function');
     expect(typeof window.Api.memoryMaintenance).toBe('function');
     expect(typeof window.Api.scanMemoryMaintenance).toBe('function');
     expect(typeof window.Api.updateMemoryMaintenance).toBe('function');
@@ -1494,6 +1497,19 @@ describe('API module', () => {
       if (path.includes('/api/memory/links')) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ links: [] }) });
       }
+      if (path.includes('/api/memory/runtime')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          runtime: {
+            active_entries: 2,
+            cluster_count: 1,
+            hot_memory_count: 1,
+            conflict_pressure: 0,
+            stale_pressure: 0,
+            usage: { total_selected: 3 },
+            clusters: [{ id: 'cluster:runtime', title: 'Runtime', summary: 'Memory runtime cluster', entry_ids: ['m1'], token_estimate: 12 }],
+          }
+        }) });
+      }
       return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
     }));
 
@@ -1501,6 +1517,8 @@ describe('API module', () => {
 
     const text = document.getElementById('panel-content').textContent;
     expect(text).toContain('L4');
+    expect(text).toContain('Living Memory Runtime');
+    expect(text).toContain('Runtime');
     expect(text).not.toContain('[object Object]');
   });
 
