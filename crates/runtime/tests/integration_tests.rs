@@ -623,7 +623,7 @@ async fn test_reputation_flows_to_agent_directory() {
 /// DiscussionEngine + L4 memory integration:
 /// Verifies that the engine can be created, connected to a CognitiveContextManager
 /// backed by temp storage, and that conflict detection runs without panic.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_discussion_engine_detects_conflicts() {
     use memory::cognitive::CognitiveContextManager;
     use memory::config::MemoryConfig;

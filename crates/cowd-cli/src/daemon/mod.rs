@@ -394,10 +394,13 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
     let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
         Some(mem_cfg) => {
             tracing::info!("initialising memory manager...");
-            CognitiveContextManager::new(mem_cfg.clone())
-                .await
-                .ok()
-                .map(Arc::new)
+            match CognitiveContextManager::new(mem_cfg.clone()).await {
+                Ok(manager) => Some(Arc::new(manager)),
+                Err(err) => {
+                    tracing::error!(error = %err, "memory manager initialisation failed");
+                    None
+                }
+            }
         }
         None => None,
     };

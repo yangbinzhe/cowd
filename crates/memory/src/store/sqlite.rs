@@ -42,6 +42,7 @@ use crate::{
 const IN_MEMORY_PATH: &str = ":memory:";
 
 fn new_pool(db_path: &str, max_size: u32) -> Result<Pool<SqliteConnectionManager>> {
+    preflight_repair_sqlite_schema(db_path)?;
     let manager = SqliteConnectionManager::file(db_path);
     let pool = Pool::builder()
         .max_size(max_size)
@@ -52,6 +53,15 @@ fn new_pool(db_path: &str, max_size: u32) -> Result<Pool<SqliteConnectionManager
     exec_pragma(&conn, "PRAGMA foreign_keys=ON")?;
     exec_pragma(&conn, "PRAGMA busy_timeout=5000")?;
     Ok(pool)
+}
+
+fn preflight_repair_sqlite_schema(db_path: &str) -> Result<()> {
+    if db_path == IN_MEMORY_PATH || !Path::new(db_path).exists() {
+        return Ok(());
+    }
+
+    let conn = Connection::open(db_path).map_err(|e| sql_ctx("open sqlite preflight", e))?;
+    drop_legacy_memories_fts_schema(&conn)
 }
 
 /// Execute a pragma that may return rows (rusqlite 0.31+ treats this as an error).
@@ -70,6 +80,13 @@ fn sql_err(e: rusqlite::Error) -> MemoryError {
         }
     } else {
         MemoryError::Store(e.to_string())
+    }
+}
+
+fn sql_ctx(context: &str, e: rusqlite::Error) -> MemoryError {
+    match sql_err(e) {
+        MemoryError::Store(details) => MemoryError::Store(format!("{context}: {details}")),
+        other => other,
     }
 }
 
@@ -343,7 +360,9 @@ fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryMeta> {
 // ---------------------------------------------------------------------------
 
 fn init_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch("BEGIN IMMEDIATE;").map_err(sql_err)?;
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|e| sql_ctx("begin schema migration", e))?;
+    drop_legacy_memories_fts_schema(conn)?;
 
     // Execute each DDL statement individually to avoid rusqlite's execute_batch
     // returning "Execute returned results" errors when FTS5 virtual tables or
@@ -519,15 +538,308 @@ END",
 )",
     ];
 
-    for stmt in statements {
-        conn.execute_batch(stmt).map_err(sql_err)?;
+    for (index, stmt) in statements.iter().enumerate() {
+        conn.execute_batch(stmt).map_err(|e| {
+            sql_ctx(
+                &format!(
+                    "schema statement {index}: {}",
+                    stmt.lines().next().unwrap_or(stmt)
+                ),
+                e,
+            )
+        })?;
     }
 
     // Phase 1 migration: add source_agent and visibility columns.
     let _ = conn.execute_batch("ALTER TABLE memories ADD COLUMN source_agent TEXT");
     let _ = conn.execute_batch("ALTER TABLE memories ADD COLUMN visibility TEXT");
+    ensure_memories_fts_schema(conn)?;
+    migrate_legacy_memory_enums(conn)
+        .map_err(|e| MemoryError::Store(format!("migrate legacy memory enums: {e}")))?;
+    migrate_legacy_memory_ids(conn)
+        .map_err(|e| MemoryError::Store(format!("migrate legacy memory ids: {e}")))?;
 
-    conn.execute_batch("COMMIT;").map_err(sql_err)?;
+    conn.execute_batch("COMMIT;")
+        .map_err(|e| sql_ctx("commit schema migration", e))?;
+    Ok(())
+}
+
+fn legacy_memory_uuid(id: &str) -> Uuid {
+    const NAMESPACE: Uuid = uuid::uuid!("4d7d1b5e-7257-5df2-9a53-7de6b5fb4f20");
+    Uuid::new_v5(&NAMESPACE, id.as_bytes())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1)",
+        params![table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .map_err(sql_err)
+}
+
+fn memories_fts_has_current_schema(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "memories_fts")? {
+        return Ok(false);
+    }
+
+    let sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memories_fts'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(sql_err)?;
+    let Some(sql) = sql.flatten() else {
+        return Ok(false);
+    };
+    Ok(sql.contains("tags_json") && !sql.contains("\n    tags,") && !sql.contains(",tags,"))
+}
+
+fn drop_legacy_memories_fts_schema(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "memories_fts")? || memories_fts_has_current_schema(conn)? {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r"
+DROP TRIGGER IF EXISTS memories_ai;
+DROP TRIGGER IF EXISTS memories_ad;
+DROP TRIGGER IF EXISTS memories_au;
+DROP TABLE IF EXISTS memories_fts;
+",
+    )
+    .map_err(|e| sql_ctx("drop legacy memories_fts", e))
+}
+
+fn drop_memories_fts_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r"
+DROP TRIGGER IF EXISTS memories_ai;
+DROP TRIGGER IF EXISTS memories_ad;
+DROP TRIGGER IF EXISTS memories_au;
+",
+    )
+    .map_err(|e| sql_ctx("drop memories_fts triggers", e))
+}
+
+fn create_memories_fts_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r"
+CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, id, title, content, tags_json)
+        VALUES (new.rowid, new.id, new.title, new.content, new.tags_json);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, content, tags_json)
+        VALUES ('delete', old.rowid, old.id, old.title, old.content, old.tags_json);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, id, title, content, tags_json)
+        VALUES ('delete', old.rowid, old.id, old.title, old.content, old.tags_json);
+    INSERT INTO memories_fts(rowid, id, title, content, tags_json)
+        VALUES (new.rowid, new.id, new.title, new.content, new.tags_json);
+END;
+",
+    )
+    .map_err(|e| sql_ctx("create memories_fts triggers", e))
+}
+
+fn ensure_memories_fts_schema(conn: &Connection) -> Result<()> {
+    if memories_fts_has_current_schema(conn)? {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r"
+DROP TRIGGER IF EXISTS memories_ai;
+DROP TRIGGER IF EXISTS memories_ad;
+DROP TRIGGER IF EXISTS memories_au;
+DROP TABLE IF EXISTS memories_fts;
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+    id      UNINDEXED,
+    title,
+    content,
+    tags_json,
+    content=memories,
+    content_rowid=rowid
+);
+",
+    )
+    .map_err(|e| sql_ctx("create memories_fts schema", e))?;
+    create_memories_fts_triggers(conn)
+}
+
+fn migrate_legacy_memory_ids(conn: &Connection) -> Result<()> {
+    let ids = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM memories ORDER BY id")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql_err)?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let id = row.map_err(sql_err)?;
+            if Uuid::parse_str(&id).is_err() {
+                ids.push(id);
+            }
+        }
+        ids
+    };
+
+    let fts_exists = table_exists(conn, "memories_fts")?;
+    if fts_exists {
+        drop_memories_fts_triggers(conn)?;
+    }
+
+    for old_id in ids {
+        let new_id = legacy_memory_uuid(&old_id).to_string();
+        conn.execute(
+            "UPDATE memories SET id = ?1 WHERE id = ?2",
+            params![new_id, old_id],
+        )
+        .map_err(sql_err)?;
+        if table_exists(conn, "memory_meta")? {
+            conn.execute(
+                "UPDATE memory_meta SET memory_id = ?1 WHERE memory_id = ?2",
+                params![new_id, old_id],
+            )
+            .map_err(sql_err)?;
+        }
+        if table_exists(conn, "vector_embeddings")? {
+            conn.execute(
+                "UPDATE vector_embeddings SET memory_id = ?1 WHERE memory_id = ?2",
+                params![new_id, old_id],
+            )
+            .map_err(sql_err)?;
+        }
+        if table_exists(conn, "symbol_references")? {
+            conn.execute(
+                "UPDATE symbol_references SET memory_id = ?1 WHERE memory_id = ?2",
+                params![new_id, old_id],
+            )
+            .map_err(sql_err)?;
+        }
+        if table_exists(conn, "relations")? {
+            conn.execute(
+                "UPDATE relations SET subject_id = ?1 WHERE subject_id = ?2",
+                params![new_id, old_id],
+            )
+            .map_err(sql_err)?;
+            conn.execute(
+                "UPDATE relations SET object_id = ?1 WHERE object_id = ?2",
+                params![new_id, old_id],
+            )
+            .map_err(sql_err)?;
+        }
+    }
+
+    if fts_exists {
+        create_memories_fts_triggers(conn)?;
+        conn.execute(
+            "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')",
+            [],
+        )
+        .map_err(|e| sql_ctx("rebuild memories_fts", e))?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy_memory_enums(conn: &Connection) -> Result<()> {
+    let fts_exists = table_exists(conn, "memories_fts")?;
+    if fts_exists {
+        drop_memories_fts_triggers(conn)?;
+    }
+
+    let valid_categories = [
+        category_to_str(MemoryCategory::UserPreference),
+        category_to_str(MemoryCategory::ProjectConvention),
+        category_to_str(MemoryCategory::Decision),
+        category_to_str(MemoryCategory::Reference),
+        category_to_str(MemoryCategory::Shared),
+        category_to_str(MemoryCategory::CompressedSummary),
+        category_to_str(MemoryCategory::ProjectKnowledge),
+    ];
+    for category in valid_categories {
+        conn.execute(
+            "UPDATE memories SET category = ?1 WHERE lower(category) = lower(?1) AND category != ?1",
+            params![category],
+        )
+        .map_err(sql_err)?;
+    }
+    conn.execute(
+        "UPDATE memories SET category = ?1
+         WHERE category NOT IN (?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            category_to_str(MemoryCategory::ProjectKnowledge),
+            category_to_str(MemoryCategory::UserPreference),
+            category_to_str(MemoryCategory::ProjectConvention),
+            category_to_str(MemoryCategory::Decision),
+            category_to_str(MemoryCategory::Reference),
+            category_to_str(MemoryCategory::Shared),
+            category_to_str(MemoryCategory::CompressedSummary),
+            category_to_str(MemoryCategory::ProjectKnowledge),
+        ],
+    )
+    .map_err(sql_err)?;
+
+    let valid_sources = [
+        source_to_str(MemorySource::UserExplicit),
+        source_to_str(MemorySource::AutoExtracted),
+        source_to_str(MemorySource::Compression),
+        source_to_str(MemorySource::Import),
+        source_to_str(MemorySource::Prefetch),
+    ];
+    for source in valid_sources {
+        conn.execute(
+            "UPDATE memories SET source = ?1 WHERE lower(source) = lower(?1) AND source != ?1",
+            params![source],
+        )
+        .map_err(sql_err)?;
+    }
+    conn.execute(
+        "UPDATE memories SET source = ?1
+         WHERE source NOT IN (?2, ?3, ?4, ?5, ?6)",
+        params![
+            source_to_str(MemorySource::AutoExtracted),
+            source_to_str(MemorySource::UserExplicit),
+            source_to_str(MemorySource::AutoExtracted),
+            source_to_str(MemorySource::Compression),
+            source_to_str(MemorySource::Import),
+            source_to_str(MemorySource::Prefetch),
+        ],
+    )
+    .map_err(sql_err)?;
+
+    conn.execute(
+        "UPDATE memories SET priority = CASE
+            WHEN priority BETWEEN 0 AND 3 THEN priority
+            WHEN priority >= 85 THEN ?1
+            WHEN priority >= 65 THEN ?2
+            WHEN priority >= 40 THEN ?3
+            ELSE ?4
+         END",
+        params![
+            priority_to_int(Priority::Critical),
+            priority_to_int(Priority::High),
+            priority_to_int(Priority::Normal),
+            priority_to_int(Priority::Low),
+        ],
+    )
+    .map_err(sql_err)?;
+
+    if fts_exists {
+        create_memories_fts_triggers(conn)?;
+        conn.execute(
+            "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')",
+            [],
+        )
+        .map_err(|e| sql_ctx("rebuild memories_fts after enum migration", e))?;
+    }
+
     Ok(())
 }
 
@@ -553,11 +865,14 @@ impl SqliteStore {
             .to_str()
             .ok_or_else(|| MemoryError::Store("non-UTF-8 sqlite path".to_string()))?
             .to_owned();
-        let pool = new_pool(&db_path, 10)?;
+        let pool = new_pool(&db_path, 10)
+            .map_err(|e| MemoryError::Store(format!("open sqlite pool: {e}")))?;
         let store = Self { pool };
         let conn = store.conn()?;
-        init_schema(&conn)?;
-        store.ensure_kv_table(&conn)?;
+        init_schema(&conn).map_err(|e| MemoryError::Store(format!("init sqlite schema: {e}")))?;
+        store
+            .ensure_kv_table(&conn)
+            .map_err(|e| MemoryError::Store(format!("ensure sqlite kv table: {e}")))?;
         Ok(store)
     }
 
@@ -567,21 +882,27 @@ impl SqliteStore {
             .to_str()
             .ok_or_else(|| MemoryError::Store("non-UTF-8 sqlite path".to_string()))?
             .to_owned();
-        let pool = new_pool(&db_path, 10)?;
+        let pool = new_pool(&db_path, 10)
+            .map_err(|e| MemoryError::Store(format!("open sqlite pool: {e}")))?;
         let store = Self { pool };
         let conn = store.conn()?;
-        init_schema(&conn)?;
-        store.ensure_kv_table(&conn)?;
+        init_schema(&conn).map_err(|e| MemoryError::Store(format!("init sqlite schema: {e}")))?;
+        store
+            .ensure_kv_table(&conn)
+            .map_err(|e| MemoryError::Store(format!("ensure sqlite kv table: {e}")))?;
         Ok(store)
     }
 
     /// Create an in-memory database (useful for testing).
     pub fn open_in_memory() -> Result<Self> {
-        let pool = new_pool(IN_MEMORY_PATH, 1)?;
+        let pool = new_pool(IN_MEMORY_PATH, 1)
+            .map_err(|e| MemoryError::Store(format!("open sqlite pool: {e}")))?;
         let store = Self { pool };
         let conn = store.conn()?;
-        init_schema(&conn)?;
-        store.ensure_kv_table(&conn)?;
+        init_schema(&conn).map_err(|e| MemoryError::Store(format!("init sqlite schema: {e}")))?;
+        store
+            .ensure_kv_table(&conn)
+            .map_err(|e| MemoryError::Store(format!("ensure sqlite kv table: {e}")))?;
         Ok(store)
     }
 
@@ -2427,6 +2748,149 @@ mod tests {
     fn open_store() -> SqliteStore {
         let tmp = Box::leak(Box::new(tempfile::TempDir::new().unwrap()));
         SqliteStore::open_path(&tmp.path().join("test.db")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn init_schema_migrates_legacy_string_memory_ids() {
+        let store = open_store();
+        let conn = store.conn().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            r"INSERT INTO memories
+               (id, layer, category, priority, source, title, content,
+                embedding_json, tags_json, relations_json, confidence,
+                access_count, staleness, created_at, updated_at,
+                last_accessed_at, scope, session_id, source_agent, visibility)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,?9,1.0,0,0.0,?10,?10,NULL,?11,NULL,NULL,NULL)",
+            rusqlite::params![
+                "mem-legacy-project-identity",
+                layer_to_int(MemoryLayer::L2),
+                category_to_str(MemoryCategory::ProjectKnowledge),
+                priority_to_int(Priority::High),
+                source_to_str(MemorySource::Import),
+                "legacy title",
+                "legacy content",
+                "[]",
+                "[]",
+                now,
+                MemoryScope::default().to_string(),
+            ],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let migrated_id: String = conn
+            .query_row("SELECT id FROM memories LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert!(Uuid::parse_str(&migrated_id).is_ok());
+
+        let entries = store.search_by_layer(MemoryLayer::L2).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "legacy title");
+    }
+
+    #[tokio::test]
+    async fn init_schema_repairs_legacy_fts_tags_column() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("legacy-fts.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r"
+CREATE TABLE memories (
+    id               TEXT    PRIMARY KEY,
+    layer            INTEGER NOT NULL,
+    category         TEXT    NOT NULL,
+    priority         INTEGER NOT NULL,
+    source           TEXT    NOT NULL,
+    title            TEXT    NOT NULL DEFAULT '',
+    content          TEXT    NOT NULL,
+    embedding_json   TEXT,
+    tags_json        TEXT    NOT NULL DEFAULT '[]',
+    relations_json   TEXT    NOT NULL DEFAULT '[]',
+    confidence       REAL    NOT NULL DEFAULT 1.0,
+    access_count     INTEGER NOT NULL DEFAULT 0,
+    staleness        REAL    NOT NULL DEFAULT 0.0,
+    created_at       TEXT    NOT NULL,
+    updated_at       TEXT    NOT NULL,
+    last_accessed_at TEXT,
+    scope            TEXT,
+    session_id       TEXT,
+    source_agent     TEXT,
+    visibility       TEXT
+);
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+    id      UNINDEXED,
+    title,
+    content,
+    tags,
+    content=memories,
+    content_rowid=rowid
+);
+",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            r"INSERT INTO memories
+               (id, layer, category, priority, source, title, content,
+                embedding_json, tags_json, relations_json, confidence,
+                access_count, staleness, created_at, updated_at,
+                last_accessed_at, scope, session_id, source_agent, visibility)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,?9,1.0,0,0.0,?10,?10,NULL,?11,NULL,NULL,NULL)",
+            rusqlite::params![
+                "mem-legacy-fts",
+                layer_to_int(MemoryLayer::L2),
+                "key_services",
+                90,
+                "analysis",
+                "legacy fts",
+                "legacy fts content",
+                "[]",
+                "[]",
+                now,
+                MemoryScope::default().to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        preflight_repair_sqlite_schema(db_path.to_str().unwrap()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        let fts_sql_after_preflight: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'memories_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(fts_sql_after_preflight.is_none());
+        drop(conn);
+
+        let store = SqliteStore::open_path(&db_path).unwrap();
+        let conn = store.conn().unwrap();
+        let fts_columns = {
+            let mut stmt = conn.prepare("PRAGMA table_info(memories_fts)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(fts_columns.iter().any(|column| column == "tags_json"));
+        assert!(!fts_columns.iter().any(|column| column == "tags"));
+
+        let migrated_id: String = conn
+            .query_row("SELECT id FROM memories LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert!(Uuid::parse_str(&migrated_id).is_ok());
+
+        let entries = store.search_by_layer(MemoryLayer::L2).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "legacy fts");
+        assert_eq!(entries[0].category, MemoryCategory::ProjectKnowledge);
+        assert_eq!(entries[0].source, MemorySource::AutoExtracted);
+        assert_eq!(entries[0].priority, Priority::Critical);
     }
 
     #[tokio::test]

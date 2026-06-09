@@ -242,6 +242,8 @@ pub struct Worker {
     pub created_at: u64,
     pub updated_at: u64,
     pub events: Vec<WorkerEvent>,
+    #[serde(skip)]
+    state_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -275,6 +277,7 @@ impl WorkerRegistry {
         inner.counter += 1;
         let ts = now_secs();
         let worker_id = format!("worker_{:08x}_{}", ts, inner.counter);
+        let state_path = crate::cowd_dirs::worker_state_path();
         let trust_auto_resolve = trusted_roots
             .iter()
             .any(|root| path_matches_allowlist(cwd, root));
@@ -294,6 +297,7 @@ impl WorkerRegistry {
             created_at: ts,
             updated_at: ts,
             events: Vec::new(),
+            state_path,
         };
         push_event(
             &mut worker,
@@ -779,7 +783,7 @@ struct StateSnapshot<'a> {
 }
 
 fn emit_state_file(worker: &Worker) {
-    let state_path = crate::cowd_dirs::worker_state_path();
+    let state_path = &worker.state_path;
     let state_dir = state_path.parent().unwrap_or_else(|| {
         tracing::error!(
             "state path has no parent directory: {}",

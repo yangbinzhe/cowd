@@ -41,7 +41,8 @@ test('live connector console preserves the active session across runtime and con
       return response.json();
     };
 
-    const session = await json('/api/sessions', { model: 'claude-sonnet-4-6' });
+    const config = await getJson('/api/config');
+    const session = await json('/api/sessions', config.model ? { model: config.model } : {});
     const sessionId = session.id || session.session_id;
     window.Api.sid = sessionId;
 

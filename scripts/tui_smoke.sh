@@ -10,6 +10,7 @@ CAPTURE="$TMP_DIR/pane.txt"
 CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
 WORKSPACE="$TMP_DIR/workspace"
+SOCKET="$TMP_DIR/cowd.sock"
 SMOKE_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-tui-smoke}"
 
 cleanup() {
@@ -50,6 +51,7 @@ cp "$CONFIG_HOME/config.yaml" "$HOME_DIR/.cowd/config.yaml"
 tmux new-session -d -s "$SESSION" -x 120 -y 36 \
   "bash -lc \"cd '$WORKSPACE' && \
     export COWD_CONFIG_HOME='$CONFIG_HOME' && \
+    export COWD_DAEMON_SOCKET='$SOCKET' && \
     export HOME='$HOME_DIR' && \
     export ANTHROPIC_API_KEY='$SMOKE_API_KEY' && \
     export COWD_DISABLE_DAEMON_AUTOSTART=1 && \
