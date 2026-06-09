@@ -66,6 +66,7 @@ pub mod approval_gate;
 pub mod connector;
 pub mod cowd_event;
 pub mod cross_plane_policy;
+pub mod iacc;
 pub mod joint_problem_solving;
 pub mod mirror;
 pub mod model_registry;
@@ -171,6 +172,11 @@ pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
     format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
     HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
+};
+pub use iacc::{
+    iacc_reference, IaccAttentionItem, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
+    IaccFactInput, IaccHealth, IaccSeverity, IaccSourceKind, IaccSourceSnapshot, IaccStore,
+    IaccStoreError, IACC_SCHEMA_VERSION,
 };
 pub use joint_problem_solving::{
     AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult, ProblemSolvingConfig,

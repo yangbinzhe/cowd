@@ -51,6 +51,7 @@ mod channel_routes;
 pub(crate) mod connector_routes;
 mod context_routes;
 mod cross_plane_routes;
+mod iacc_routes;
 pub(crate) mod memory_routes;
 mod message_routes;
 mod profile_routes;
@@ -162,6 +163,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(connector_routes::router())
         .merge(context_routes::router())
         .merge(cross_plane_routes::router())
+        .merge(iacc_routes::router())
         .merge(memory_routes::router())
         .merge(message_routes::router())
         .merge(profile_routes::router())
@@ -1017,6 +1019,117 @@ mod tests {
             json["socket_control"],
             "local low-latency daemon control plane"
         );
+    }
+
+    #[tokio::test]
+    async fn iacc_foundation_ingests_fact_and_builds_evidence_packet() {
+        let workspace = test_temp_dir("iacc-foundation");
+        let config_home = test_temp_dir("iacc-config");
+        let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/iacc/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let ingest = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/facts/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "iacc-test-1",
+                            "session_id": "session-iacc",
+                            "facts": [{
+                                "fact_id": "fact-gpu-shortage",
+                                "snapshot_id": "snapshot-week-24",
+                                "fact_type": "supply.material_shortage",
+                                "entity_refs": ["component:gpu-a"],
+                                "metric_key": "material_shortage_risk",
+                                "dimensions": {"week": "2026-W24"},
+                                "measures": {"short_qty": 42},
+                                "source_ref": "connector:mock.docs:gpu-shortage",
+                                "confidence": 0.91
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ingest.status(), StatusCode::OK);
+        let body = to_bytes(ingest.into_body(), usize::MAX).await.unwrap();
+        let ingest_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ingest_json["ingested"], 1);
+        let attention_id = ingest_json["attention"][0]["attention_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let hot = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/iacc/attention/hot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hot.status(), StatusCode::OK);
+        let body = to_bytes(hot.into_body(), usize::MAX).await.unwrap();
+        let hot_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(hot_json["items"].as_array().unwrap().len(), 1);
+
+        let evidence = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/evidence/build")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "attention_id": attention_id,
+                            "problem_statement": "GPU shortage may affect server shipments"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.status(), StatusCode::OK);
+        let body = to_bytes(evidence.into_body(), usize::MAX).await.unwrap();
+        let evidence_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let packet_id = evidence_json["packet"]["packet_id"].as_str().unwrap();
+        assert!(evidence_json["packet"]["missing_evidence"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+
+        let fetched = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/iacc/evidence/{packet_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        assert!(workspace.join(".cowd").join("iacc.sqlite").exists());
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
