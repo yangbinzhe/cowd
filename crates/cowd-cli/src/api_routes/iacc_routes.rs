@@ -11,9 +11,10 @@ use axum::{
 };
 use memory::store::session::SessionRecord;
 use runtime::{
-    AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode, IaccActionExecutionRequest,
-    IaccActionFeedback, IaccEntity, IaccEntityInput, IaccFact, IaccFactInput, IaccIncident,
-    IaccRelation, IaccRelationInput, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
+    server_manufacturing_domain_pack, AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode,
+    IaccActionExecutionRequest, IaccActionFeedback, IaccEntity, IaccEntityInput, IaccFact,
+    IaccFactInput, IaccIncident, IaccRelation, IaccRelationInput, IaccStore, IaccStoreError,
+    IACC_SCHEMA_VERSION,
 };
 use serde::Deserialize;
 
@@ -24,6 +25,14 @@ use super::{api_error, AppState, ErrorResponse};
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/iacc/health", get(iacc_health_handler))
+        .route(
+            "/api/iacc/domain/server-manufacturing",
+            get(iacc_server_manufacturing_domain_handler),
+        )
+        .route(
+            "/api/iacc/domain/server-manufacturing/seed",
+            post(iacc_server_manufacturing_seed_handler),
+        )
         .route("/api/iacc/entities", get(iacc_entities_handler))
         .route(
             "/api/iacc/entities/upsert",
@@ -180,6 +189,8 @@ async fn iacc_health_handler(
         "relation_count": health.relation_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": [
+            "server_manufacturing_domain_pack",
+            "server_manufacturing_seed",
             "entity_relation_network",
             "entity_source_key_resolution",
             "entity_impact_trace",
@@ -195,6 +206,28 @@ async fn iacc_health_handler(
             "incident_operational_analysis",
             "action_execution_feedback"
         ],
+    })))
+}
+
+async fn iacc_server_manufacturing_domain_handler(
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.domain_pack",
+        "pack": server_manufacturing_domain_pack(),
+    })))
+}
+
+async fn iacc_server_manufacturing_seed_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let result = store
+        .seed_server_manufacturing_domain()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.domain_seed",
+        "result": result,
     })))
 }
 

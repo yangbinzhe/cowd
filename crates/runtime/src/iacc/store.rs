@@ -10,8 +10,8 @@ use thiserror::Error;
 
 use super::{
     IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
-    IaccChangeEvent, IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
-    IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricState,
+    IaccChangeEvent, IaccDomainSeedResult, IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef,
+    IaccFact, IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricState,
     IaccOperationalAnalysis, IaccRelation, IaccSeverity,
 };
 
@@ -171,6 +171,43 @@ impl IaccStore {
             return Err(IaccStoreError::NotFound(entity_id.to_string()));
         }
         build_impact_trace(&connection, entity_id, max_depth)
+    }
+
+    pub fn register_metric_definition(
+        &self,
+        definition: &IaccMetricDefinition,
+    ) -> Result<(), IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_metric_definition(&connection, definition)
+    }
+
+    pub fn seed_server_manufacturing_domain(&self) -> Result<IaccDomainSeedResult, IaccStoreError> {
+        let plan = super::server_manufacturing_seed_plan();
+        for entity in &plan.entities {
+            self.upsert_entity(entity)?;
+        }
+        for relation in &plan.relations {
+            self.upsert_relation(relation)?;
+        }
+        for definition in &plan.metric_definitions {
+            self.register_metric_definition(definition)?;
+        }
+        for fact in &plan.facts {
+            self.ingest_fact(fact)?;
+        }
+        Ok(IaccDomainSeedResult {
+            domain_id: plan.pack.domain_id,
+            version: plan.pack.version,
+            entity_count: plan.entities.len(),
+            relation_count: plan.relations.len(),
+            metric_definition_count: plan.metric_definitions.len(),
+            fact_count: plan.facts.len(),
+            scenario_count: plan.pack.scenarios.len(),
+            seeded_at: Utc::now(),
+        })
     }
 
     pub fn ingest_fact(&self, fact: &IaccFact) -> Result<IaccAttentionItem, IaccStoreError> {
@@ -1656,6 +1693,50 @@ mod tests {
             .iter()
             .any(|entity| entity.entity_id == order.entity_id));
         assert_eq!(store.health().unwrap().relation_count, 2);
+    }
+
+    #[test]
+    fn server_manufacturing_seed_creates_domain_network_and_metric_facts() {
+        let store = IaccStore::in_memory().expect("store opens");
+        let result = store
+            .seed_server_manufacturing_domain()
+            .expect("domain seed runs");
+
+        assert_eq!(result.domain_id, "server_manufacturing");
+        assert_eq!(result.scenario_count, 3);
+        assert!(result.entity_count >= 10);
+        assert!(result.relation_count >= 10);
+        assert!(result.fact_count >= 5);
+
+        let health = store.health().expect("health loads");
+        assert_eq!(health.entity_count, result.entity_count as u64);
+        assert_eq!(health.relation_count, result.relation_count as u64);
+        assert_eq!(
+            health.metric_definition_count,
+            result.metric_definition_count as u64
+        );
+        assert_eq!(health.fact_count, result.fact_count as u64);
+
+        let resolved = store
+            .resolve_entity_by_source_key("plm", "GPU_H100_80GB")
+            .expect("source resolves")
+            .expect("entity exists");
+        assert_eq!(resolved.entity_id, "entity-component-gpu-h100");
+
+        let trace = store
+            .impact_trace("entity-component-gpu-h100", 3)
+            .expect("impact trace builds");
+        assert!(trace
+            .entities
+            .iter()
+            .any(|entity| entity.entity_id == "entity-order-co-2026-0001"));
+
+        let recompute = store.recompute_metrics().expect("metrics recompute");
+        assert!(recompute
+            .metric_states
+            .iter()
+            .any(|state| state.metric_id == "material_shortage_risk"));
+        assert!(!recompute.attention.is_empty());
     }
 
     #[test]

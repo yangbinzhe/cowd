@@ -1,6 +1,6 @@
 # COWD — AI Agent Runtime
 
-> **Rust 原生 AI 运行时框架** | 当前版本 v0.9.84
+> **Rust 原生 AI 运行时框架** | 当前版本 v0.9.85
 > 统一 daemon · SQLite session source of truth · Runtime Control Plane
 > TUI/WebUI 管控 · Connector Runtime · Cross-plane 权限治理 · MCP/飞书/本地服务接入
 

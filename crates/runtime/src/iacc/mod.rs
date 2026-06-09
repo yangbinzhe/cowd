@@ -8,6 +8,7 @@
 mod analysis;
 mod attention;
 mod change;
+mod domain;
 mod entity;
 mod evidence;
 mod execution;
@@ -23,6 +24,10 @@ pub use analysis::{
 };
 pub use attention::{IaccAttentionItem, IaccSeverity};
 pub use change::IaccChangeEvent;
+pub use domain::{
+    server_manufacturing_domain_pack, server_manufacturing_seed_plan, IaccDomainPack,
+    IaccDomainScenario, IaccDomainSeedPlan, IaccDomainSeedResult,
+};
 pub use entity::{IaccEntity, IaccEntityInput, IaccSourceKey};
 pub use evidence::{IaccEvidencePacket, IaccEvidenceSourceRef};
 pub use execution::{IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback};

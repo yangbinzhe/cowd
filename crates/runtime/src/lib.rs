@@ -174,10 +174,12 @@ pub use hooks::{
     HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
 };
 pub use iacc::{
-    iacc_reference, IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback,
-    IaccAttentionItem, IaccAttributionCandidate, IaccChangeEvent, IaccEntity, IaccEntityInput,
-    IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccFactInput, IaccHealth, IaccImpactHop,
-    IaccImpactPath, IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricRecomputeResult,
+    iacc_reference, server_manufacturing_domain_pack, server_manufacturing_seed_plan,
+    IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
+    IaccAttributionCandidate, IaccChangeEvent, IaccDomainPack, IaccDomainScenario,
+    IaccDomainSeedPlan, IaccDomainSeedResult, IaccEntity, IaccEntityInput, IaccEvidencePacket,
+    IaccEvidenceSourceRef, IaccFact, IaccFactInput, IaccHealth, IaccImpactHop, IaccImpactPath,
+    IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricRecomputeResult,
     IaccMetricState, IaccMetricStatus, IaccOperationalAnalysis, IaccRecommendedAction,
     IaccRelation, IaccRelationInput, IaccSeverity, IaccSourceKey, IaccSourceKind,
     IaccSourceSnapshot, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
