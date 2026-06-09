@@ -2485,8 +2485,8 @@ mod tests {
     use crate::iacc::{
         IaccCockpitProfileInput, IaccCockpitReportDeliveryPayload,
         IaccCockpitReportDeliveryPayloadRequest, IaccCockpitReportDeliveryReceipt,
-        IaccCockpitReportRequest, IaccComputeJobInput, IaccEntityInput, IaccFactInput,
-        IaccRelationInput, IaccSourceKey,
+        IaccCockpitReportDeliveryState, IaccCockpitReportRequest, IaccComputeJobInput,
+        IaccEntityInput, IaccFactInput, IaccRelationInput, IaccSourceKey,
     };
 
     #[test]
@@ -3102,6 +3102,10 @@ mod tests {
             .expect("report delivery attaches");
         assert_eq!(delivered.status, "delivery_planned");
         assert_eq!(delivered.delivery_receipts.len(), 1);
+        let delivery_state = IaccCockpitReportDeliveryState::from_report(&delivered);
+        assert_eq!(delivery_state.classification, "dry_run_planned");
+        assert!(!delivery_state.retryable);
+        assert_eq!(delivery_state.attempt_count, 1);
         let delivered = store
             .attach_cockpit_report_delivery(
                 &report.report_id,

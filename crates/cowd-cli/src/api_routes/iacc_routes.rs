@@ -16,10 +16,11 @@ use runtime::{
     DataClassification, IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback,
     IaccCockpitProfile, IaccCockpitProfileInput, IaccCockpitReportDeliveryPayload,
     IaccCockpitReportDeliveryPayloadRequest, IaccCockpitReportDeliveryReceipt,
-    IaccCockpitReportRequest, IaccCockpitReportSnapshot, IaccComputeJobInput,
-    IaccCrossPlaneBridgeReceipt, IaccEntity, IaccEntityInput, IaccFact, IaccFactInput,
-    IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccRelation, IaccRelationInput,
-    IaccStore, IaccStoreError, IdentityTrust, PolicyDecisionKind, IACC_SCHEMA_VERSION,
+    IaccCockpitReportDeliveryState, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
+    IaccComputeJobInput, IaccCrossPlaneBridgeReceipt, IaccEntity, IaccEntityInput, IaccFact,
+    IaccFactInput, IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccRelation,
+    IaccRelationInput, IaccStore, IaccStoreError, IdentityTrust, PolicyDecisionKind,
+    IACC_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,14 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/iacc/cockpit/reports/:id/deliver",
             post(iacc_cockpit_report_deliver_handler),
+        )
+        .route(
+            "/api/iacc/cockpit/reports/:id/delivery-state",
+            get(iacc_cockpit_report_delivery_state_handler),
+        )
+        .route(
+            "/api/iacc/cockpit/reports/:id/delivery/retry",
+            post(iacc_cockpit_report_delivery_retry_handler),
         )
         .route(
             "/api/iacc/domain/server-manufacturing",
@@ -360,6 +369,34 @@ struct IaccCockpitReportDeliveryRequest {
     template_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct IaccCockpitReportDeliveryRetryRequest {
+    #[serde(default = "default_iacc_bridge_mode")]
+    mode: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    actor_principal: Option<String>,
+    #[serde(default)]
+    actor_identity_ref: Option<String>,
+    #[serde(default)]
+    source_channel: Option<String>,
+    #[serde(default)]
+    requested_capability: Option<String>,
+    #[serde(default)]
+    provider_account: Option<String>,
+    #[serde(default)]
+    target_ref: Option<String>,
+    #[serde(default)]
+    resource_ref: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    template_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct IaccCockpitReportDeliveryOutcome {
     mode: String,
@@ -411,6 +448,7 @@ async fn iacc_health_handler(
             "cockpit_report_delivery_bridge",
             "cockpit_report_payload_templates",
             "cockpit_report_schedule_runner",
+            "cockpit_report_delivery_retry_state",
             "personal_cockpit_projection",
             "cockpit_profile_thresholds",
             "evidence_quality_gate",
@@ -549,6 +587,56 @@ async fn iacc_cockpit_report_deliver_handler(
         "delivery_payload": outcome.delivery_payload,
         "cross_plane_execution_receipt": outcome.cross_plane_execution_receipt,
         "idempotent_replay": outcome.idempotent_replay,
+    })))
+}
+
+async fn iacc_cockpit_report_delivery_state_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let report = store
+        .get_cockpit_report(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC cockpit report not found"))?;
+    let delivery_state = IaccCockpitReportDeliveryState::from_report(&report);
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.cockpit.report_delivery_state",
+        "report_id": report.report_id,
+        "delivery_state": delivery_state,
+    })))
+}
+
+async fn iacc_cockpit_report_delivery_retry_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<IaccCockpitReportDeliveryRetryRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let report = store
+        .get_cockpit_report(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC cockpit report not found"))?;
+    let before_state = IaccCockpitReportDeliveryState::from_report(&report);
+    if !before_state.retryable && !request.force {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "IACC cockpit report delivery is not retryable: {}",
+                before_state.classification
+            ),
+        ));
+    }
+    let delivery_request = iacc_retry_delivery_request(&report, &before_state, request);
+    let outcome = deliver_iacc_cockpit_report(&state, &store, report, delivery_request)?;
+    let after_state = IaccCockpitReportDeliveryState::from_report(&outcome.report);
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.cockpit.report_delivery_retry",
+        "before_state": before_state,
+        "after_state": after_state,
+        "delivery": outcome,
     })))
 }
 
@@ -1478,6 +1566,42 @@ fn iacc_schedule_delivery_request(
         resource_ref: None,
         channel: request.channel.clone(),
         template_id: request.template_id.clone(),
+    }
+}
+
+fn iacc_retry_delivery_request(
+    report: &IaccCockpitReportSnapshot,
+    state: &IaccCockpitReportDeliveryState,
+    request: IaccCockpitReportDeliveryRetryRequest,
+) -> IaccCockpitReportDeliveryRequest {
+    let latest_receipt_id = state
+        .latest_receipt
+        .as_ref()
+        .map(|receipt| receipt.cross_plane_receipt_id.as_str())
+        .unwrap_or("no-receipt");
+    IaccCockpitReportDeliveryRequest {
+        mode: request.mode,
+        idempotency_key: request.idempotency_key.or_else(|| {
+            Some(format!(
+                "iacc-retry:{}:{}:{}",
+                report.report_id,
+                latest_receipt_id,
+                state.attempt_count + 1
+            ))
+        }),
+        actor_principal: request
+            .actor_principal
+            .or_else(|| Some(report.owner_ref.clone())),
+        actor_identity_ref: request.actor_identity_ref,
+        source_channel: request
+            .source_channel
+            .or_else(|| Some("iacc.report.retry".to_string())),
+        requested_capability: request.requested_capability,
+        provider_account: request.provider_account,
+        target_ref: request.target_ref.or_else(|| report.delivery_ref.clone()),
+        resource_ref: request.resource_ref,
+        channel: request.channel,
+        template_id: request.template_id,
     }
 }
 

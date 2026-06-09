@@ -136,6 +136,20 @@ pub struct IaccCockpitReportDeliveryReceipt {
     pub delivered_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IaccCockpitReportDeliveryState {
+    pub report_id: String,
+    pub report_status: String,
+    pub attempt_count: usize,
+    #[serde(default)]
+    pub latest_receipt: Option<IaccCockpitReportDeliveryReceipt>,
+    pub classification: String,
+    pub retryable: bool,
+    pub recommended_mode: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
 impl IaccCockpitProfile {
     #[must_use]
     pub fn from_input(input: IaccCockpitProfileInput) -> Self {
@@ -314,6 +328,107 @@ impl IaccCockpitReportDeliveryReceipt {
             delivered_at: Utc::now(),
         }
     }
+}
+
+impl IaccCockpitReportDeliveryState {
+    #[must_use]
+    pub fn from_report(report: &IaccCockpitReportSnapshot) -> Self {
+        let latest_receipt = report
+            .delivery_receipts
+            .iter()
+            .max_by_key(|receipt| receipt.delivered_at)
+            .cloned();
+        let (classification, retryable, recommended_mode, reasons) =
+            classify_report_delivery(report, latest_receipt.as_ref());
+        Self {
+            report_id: report.report_id.clone(),
+            report_status: report.status.clone(),
+            attempt_count: report.delivery_receipts.len(),
+            latest_receipt,
+            classification,
+            retryable,
+            recommended_mode,
+            reasons,
+        }
+    }
+}
+
+fn classify_report_delivery(
+    report: &IaccCockpitReportSnapshot,
+    latest_receipt: Option<&IaccCockpitReportDeliveryReceipt>,
+) -> (String, bool, String, Vec<String>) {
+    let Some(receipt) = latest_receipt else {
+        return (
+            "not_delivered".to_string(),
+            true,
+            "dry_run".to_string(),
+            vec!["delivery:not_attempted".to_string()],
+        );
+    };
+    match (
+        receipt.cross_plane_status.as_str(),
+        receipt.cross_plane_dispatch_status.as_str(),
+    ) {
+        ("blocked", "policy_blocked") => (
+            "policy_blocked".to_string(),
+            false,
+            "dry_run".to_string(),
+            vec!["policy:grant_or_identity_required".to_string()],
+        ),
+        ("blocked", dispatch_status) => (
+            "delivery_blocked".to_string(),
+            is_retryable_delivery_dispatch(dispatch_status),
+            "dry_run".to_string(),
+            vec![format!("dispatch:{dispatch_status}")],
+        ),
+        ("planned", "dry_run") => (
+            "dry_run_planned".to_string(),
+            false,
+            "commit".to_string(),
+            vec!["delivery:dry_run_only".to_string()],
+        ),
+        ("planned", "human_review_required") => (
+            "awaiting_human_review".to_string(),
+            false,
+            "commit".to_string(),
+            vec!["governance:human_review_required".to_string()],
+        ),
+        ("dispatched", dispatch_status) => (
+            "sent".to_string(),
+            false,
+            "commit".to_string(),
+            vec![format!("dispatch:{dispatch_status}")],
+        ),
+        (_, dispatch_status) if is_retryable_delivery_dispatch(dispatch_status) => (
+            "delivery_retryable_failure".to_string(),
+            true,
+            "dry_run".to_string(),
+            vec![format!("dispatch:{dispatch_status}")],
+        ),
+        _ => (
+            report.status.clone(),
+            false,
+            "dry_run".to_string(),
+            vec![format!(
+                "delivery:{}:{}",
+                receipt.cross_plane_status, receipt.cross_plane_dispatch_status
+            )],
+        ),
+    }
+}
+
+fn is_retryable_delivery_dispatch(dispatch_status: &str) -> bool {
+    matches!(
+        dispatch_status,
+        "adapter_not_bound"
+            | "target_not_ready"
+            | "runtime_unavailable"
+            | "dispatch_failed"
+            | "send_failed"
+            | "retryable_failure"
+    ) || dispatch_status.contains("failed")
+        || dispatch_status.contains("unavailable")
+        || dispatch_status.contains("not_ready")
 }
 
 fn infer_report_delivery_channel(

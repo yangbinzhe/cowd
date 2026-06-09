@@ -31,8 +31,8 @@ pub use change::IaccChangeEvent;
 pub use cockpit::{
     IaccCockpitProfile, IaccCockpitProfileInput, IaccCockpitProjection,
     IaccCockpitReportDeliveryPayload, IaccCockpitReportDeliveryPayloadRequest,
-    IaccCockpitReportDeliveryReceipt, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
-    IaccCockpitWidget,
+    IaccCockpitReportDeliveryReceipt, IaccCockpitReportDeliveryState, IaccCockpitReportRequest,
+    IaccCockpitReportSnapshot, IaccCockpitWidget,
 };
 pub use compute::{IaccComputeJob, IaccComputeJobInput, IaccComputePlan};
 pub use domain::{
