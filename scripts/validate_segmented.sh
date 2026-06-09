@@ -183,6 +183,7 @@ case "$SCOPE" in
     run_step unified_runtime_surface keep bash scripts/v0964_unified_runtime_surface_scenario.sh
     run_step tui_daemon_attach keep bash scripts/v0952_tui_daemon_attach_scenario.sh
     run_step same_session_multi_surface keep bash scripts/v0956_same_session_multi_surface_sync.sh
+    run_step session_lifecycle keep bash scripts/v0968_session_lifecycle_scenario.sh
     run_step tui_interaction_quality keep bash scripts/v0963_tui_interaction_quality_gate.sh
     ;;
 esac

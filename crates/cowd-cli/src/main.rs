@@ -22,6 +22,7 @@ mod runtime_protocol;
 mod runtime_service;
 mod server;
 mod session_kernel;
+mod session_lifecycle_kernel;
 mod suggestions;
 mod task_kernel;
 mod tui;
