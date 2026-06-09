@@ -1248,6 +1248,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn iacc_evidence_context_and_incident_create_agent_graph() {
+        let workspace = test_temp_dir("iacc-agent");
+        let config_home = test_temp_dir("iacc-agent-config");
+        let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
+
+        let ingest = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/facts/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "facts": [{
+                                "fact_id": "fact-agent-risk",
+                                "snapshot_id": "snapshot-agent-risk",
+                                "fact_type": "supply.material_shortage",
+                                "entity_refs": ["component:gpu-agent"],
+                                "metric_key": "material_shortage_risk",
+                                "dimensions": {"week": "2026-W26"},
+                                "measures": {"short_qty": 180},
+                                "confidence": 0.92
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ingest.status(), StatusCode::OK);
+
+        let recompute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/metrics/recompute")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recompute.status(), StatusCode::OK);
+        let body = to_bytes(recompute.into_body(), usize::MAX).await.unwrap();
+        let recompute_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let attention_id = recompute_json["result"]["attention"][0]["attention_id"]
+            .as_str()
+            .unwrap();
+
+        let evidence = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/evidence/build")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "attention_id": attention_id,
+                            "problem_statement": "GPU shortage threatens server shipment"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.status(), StatusCode::OK);
+        let body = to_bytes(evidence.into_body(), usize::MAX).await.unwrap();
+        let evidence_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(evidence_json["packet"]["metric_evidence"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        assert!(evidence_json["packet"]["change_evidence"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        let packet_id = evidence_json["packet"]["packet_id"].as_str().unwrap();
+
+        let context = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/iacc/evidence/{packet_id}/context"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(context.status(), StatusCode::OK);
+        let body = to_bytes(context.into_body(), usize::MAX).await.unwrap();
+        let context_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            context_json["context_item"]["id"],
+            format!("iacc:evidence:{packet_id}")
+        );
+
+        let incident = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/incidents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": "GPU material shortage incident",
+                            "evidence_packet_id": packet_id
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(incident.status(), StatusCode::OK);
+        let body = to_bytes(incident.into_body(), usize::MAX).await.unwrap();
+        let incident_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(incident_json["incident"]["evidence_packet_id"], packet_id);
+        assert!(incident_json["agent_graph"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["id"] == "iacc_researcher"));
+        assert!(incident_json["agent_graph"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|evidence| evidence["reference"] == format!("iacc:evidence:{packet_id}")));
+        let incident_id = incident_json["incident"]["incident_id"].as_str().unwrap();
+
+        let fetched = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/iacc/incidents/{incident_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn agent_run_persists_evidence_to_session_event() {
         let app = api_router(test_state());
         let started = app

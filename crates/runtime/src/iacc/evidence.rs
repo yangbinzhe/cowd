@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IaccEvidenceSourceRef {
     pub kind: String,
@@ -51,13 +53,45 @@ impl IaccEvidencePacket {
             impact_paths: Vec::new(),
             source_refs: Vec::new(),
             missing_evidence: vec![
-                "metric_network_not_computed_in_v0.9.77".to_string(),
-                "attribution_not_computed_in_v0.9.77".to_string(),
-                "impact_paths_not_computed_in_v0.9.77".to_string(),
+                "attribution_not_computed_in_v0.9.79".to_string(),
+                "impact_paths_not_computed_in_v0.9.79".to_string(),
             ],
             confidence: 0.3,
             token_budget: 4_000,
             created_at: Utc::now(),
         }
+    }
+
+    #[must_use]
+    pub fn to_context_item(&self) -> ContextItem {
+        let mut item = ContextItem::new(
+            format!("iacc:evidence:{}", self.packet_id),
+            ContextSourceKind::Task,
+            ContextRole::Evidence,
+            self.context_summary(),
+        );
+        item.authority = ContextAuthority::Derived;
+        item.visibility = ContextVisibility::Shared;
+        item.score = self.confidence;
+        item.evidence = self
+            .source_refs
+            .iter()
+            .map(|source| source.reference.clone())
+            .collect();
+        item
+    }
+
+    fn context_summary(&self) -> String {
+        let metric_count = self.metric_evidence.len();
+        let change_count = self.change_evidence.len();
+        let missing = if self.missing_evidence.is_empty() {
+            "none".to_string()
+        } else {
+            self.missing_evidence.join(", ")
+        };
+        format!(
+            "IACC EvidencePacket {}: {}. metric_evidence={}, change_evidence={}, confidence={:.2}, missing_evidence={}",
+            self.packet_id, self.problem_statement, metric_count, change_count, self.confidence, missing
+        )
     }
 }

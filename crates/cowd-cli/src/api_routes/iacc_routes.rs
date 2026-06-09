@@ -9,8 +9,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use runtime::{IaccFact, IaccFactInput, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION};
+use memory::store::session::SessionRecord;
+use runtime::{
+    AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode, IaccFact, IaccFactInput,
+    IaccIncident, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
+};
 use serde::Deserialize;
+
+use crate::task_kernel::TaskRecord;
 
 use super::{api_error, AppState, ErrorResponse};
 
@@ -31,6 +37,12 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(iacc_evidence_build_handler),
         )
         .route("/api/iacc/evidence/:id", get(iacc_evidence_get_handler))
+        .route(
+            "/api/iacc/evidence/:id/context",
+            get(iacc_evidence_context_handler),
+        )
+        .route("/api/iacc/incidents", post(iacc_incident_create_handler))
+        .route("/api/iacc/incidents/:id", get(iacc_incident_get_handler))
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +67,20 @@ struct IaccEvidenceBuildRequest {
     problem_statement: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct IaccIncidentCreateRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    attention_id: Option<String>,
+    #[serde(default)]
+    evidence_packet_id: Option<String>,
+}
+
 async fn iacc_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -74,6 +100,7 @@ async fn iacc_health_handler(
         "change_count": health.change_count,
         "attention_count": health.attention_count,
         "evidence_count": health.evidence_count,
+        "incident_count": health.incident_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": [
             "fact_ingest",
@@ -82,7 +109,9 @@ async fn iacc_health_handler(
             "change_event",
             "attention_hot",
             "evidence_packet_build",
-            "evidence_packet_get"
+            "evidence_packet_get",
+            "evidence_context_item",
+            "incident_agent_graph"
         ],
     })))
 }
@@ -234,6 +263,260 @@ async fn iacc_evidence_get_handler(
         "kind": "iacc.evidence.packet",
         "packet": packet,
     })))
+}
+
+async fn iacc_evidence_context_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let packet = store
+        .get_evidence_packet(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC evidence packet not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.evidence.context_item",
+        "context_item": packet.to_context_item(),
+    })))
+}
+
+async fn iacc_incident_create_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccIncidentCreateRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let packet = match request.evidence_packet_id.as_deref() {
+        Some(packet_id) => store
+            .get_evidence_packet(packet_id)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC evidence packet not found"))?,
+        None => store
+            .build_evidence_packet(request.attention_id.as_deref(), request.title.as_deref())
+            .map_err(|error| match error {
+                IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+                other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            })?,
+    };
+    let title = request
+        .title
+        .clone()
+        .unwrap_or_else(|| packet.problem_statement.clone());
+    let task = state
+        .task_kernel
+        .start_goal(format!("IACC incident analysis: {title}"), false)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let mut graph = task
+        .agent_graph
+        .clone()
+        .unwrap_or_else(|| AgentRunGraph::from_objective(task.id.clone(), task.objective.clone()));
+    enrich_iacc_agent_graph(&mut graph, &packet)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let task = state
+        .task_kernel
+        .upsert_agent_graph(&task.id, graph.clone())
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    append_iacc_agent_runtime_event(&state, &task, &graph)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    let mut incident = IaccIncident::new(title);
+    incident.attention_id = packet.attention_id.clone();
+    incident.evidence_packet_id = Some(packet.packet_id.clone());
+    incident.task_id = Some(task.id.clone());
+    incident.agent_graph_id = Some(graph.graph_id.clone());
+    let incident = store
+        .create_incident(&incident)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.incident",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "incident": incident,
+        "task": task,
+        "agent_graph": graph,
+        "context_item": packet.to_context_item(),
+    })))
+}
+
+async fn iacc_incident_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let incident = store
+        .get_incident(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC incident not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.incident",
+        "incident": incident,
+    })))
+}
+
+fn enrich_iacc_agent_graph(
+    graph: &mut AgentRunGraph,
+    packet: &runtime::IaccEvidencePacket,
+) -> Result<(), runtime::AgentGraphError> {
+    let now = now_ms();
+    ensure_agent_node(
+        graph,
+        AgentTaskNode {
+            id: "iacc_researcher".to_string(),
+            role: AgentRole::Researcher,
+            title: "IACC Evidence Research".to_string(),
+            objective: "Validate IACC evidence packet and identify missing evidence".to_string(),
+            depends_on: vec!["planner".to_string()],
+            status: AgentNodeStatus::Pending,
+            assigned_agent: Some("iacc_researcher".to_string()),
+            result: None,
+            error: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        },
+    )?;
+    ensure_agent_node(
+        graph,
+        AgentTaskNode {
+            id: "iacc_reviewer".to_string(),
+            role: AgentRole::Reviewer,
+            title: "IACC Insight Review".to_string(),
+            objective: "Review confidence, conflicts, and governance readiness".to_string(),
+            depends_on: vec!["iacc_researcher".to_string()],
+            status: AgentNodeStatus::Pending,
+            assigned_agent: Some("iacc_reviewer".to_string()),
+            result: None,
+            error: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        },
+    )?;
+    ensure_agent_node(
+        graph,
+        AgentTaskNode {
+            id: "iacc_merger".to_string(),
+            role: AgentRole::Merger,
+            title: "IACC Decision Merge".to_string(),
+            objective: "Merge agent findings into one governed operating decision".to_string(),
+            depends_on: vec!["iacc_reviewer".to_string()],
+            status: AgentNodeStatus::Pending,
+            assigned_agent: Some("iacc_merger".to_string()),
+            result: None,
+            error: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        },
+    )?;
+    let reference = format!("iacc:evidence:{}", packet.packet_id);
+    graph.add_evidence(
+        "planner",
+        "iacc_evidence_packet",
+        reference.clone(),
+        packet.problem_statement.clone(),
+    )?;
+    graph.add_evidence(
+        "iacc_researcher",
+        "iacc_evidence_packet",
+        reference,
+        format!(
+            "metric_evidence={}, change_evidence={}, missing_evidence={}",
+            packet.metric_evidence.len(),
+            packet.change_evidence.len(),
+            packet.missing_evidence.len()
+        ),
+    )?;
+    Ok(())
+}
+
+fn ensure_agent_node(
+    graph: &mut AgentRunGraph,
+    node: AgentTaskNode,
+) -> Result<(), runtime::AgentGraphError> {
+    if graph.nodes.iter().any(|existing| existing.id == node.id) {
+        return Ok(());
+    }
+    graph.add_node(node)
+}
+
+async fn append_iacc_agent_runtime_event(
+    state: &AppState,
+    task: &TaskRecord,
+    graph: &AgentRunGraph,
+) -> Result<(), String> {
+    ensure_iacc_task_session_record(state, task)
+        .await
+        .map_err(|error| format!("failed to prepare IACC task runtime session: {error}"))?;
+    state
+        .session_kernel
+        .append_runtime_event(
+            &task.id,
+            memory::RuntimeEventScope::Workgraph,
+            "iacc.agent_graph.updated",
+            serde_json::json!({ "graph": graph }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+async fn ensure_iacc_task_session_record(
+    state: &AppState,
+    task: &TaskRecord,
+) -> Result<(), String> {
+    let Some(store) = state.unified_store() else {
+        return Ok(());
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let metadata_json = serde_json::json!({
+        "kind": "iacc.incident.task",
+        "task_id": task.id,
+        "objective": task.objective,
+        "yolo_mode": task.yolo_mode,
+        "current_phase": task.current_phase,
+    })
+    .to_string();
+    let mut record = SessionRecord {
+        session_id: task.id.clone(),
+        platform: "iacc".to_string(),
+        chat_id: task.id.clone(),
+        user_id: None,
+        model: None,
+        created_at: now.clone(),
+        last_activity: now,
+        message_count: task.audit.len() as i64,
+        reset_policy: "none".to_string(),
+        metadata_json: Some(metadata_json),
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: 0.0,
+        status: task.status.as_str().to_string(),
+    };
+    if let Some(existing) = store
+        .get_session(&task.id)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        record.created_at = existing.created_at;
+        store
+            .update_session(&record)
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        store
+            .create_session(&record)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn open_iacc_store(state: &AppState) -> Result<IaccStore, IaccStoreError> {

@@ -9,6 +9,7 @@ mod attention;
 mod change;
 mod evidence;
 mod fact;
+mod incident;
 mod metric;
 mod source;
 mod store;
@@ -17,6 +18,7 @@ pub use attention::{IaccAttentionItem, IaccSeverity};
 pub use change::IaccChangeEvent;
 pub use evidence::{IaccEvidencePacket, IaccEvidenceSourceRef};
 pub use fact::{IaccFact, IaccFactInput};
+pub use incident::IaccIncident;
 pub use metric::{IaccMetricDefinition, IaccMetricState, IaccMetricStatus};
 pub use source::{IaccSourceKind, IaccSourceSnapshot};
 pub use store::{

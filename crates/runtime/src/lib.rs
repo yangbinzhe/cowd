@@ -175,9 +175,9 @@ pub use hooks::{
 };
 pub use iacc::{
     iacc_reference, IaccAttentionItem, IaccChangeEvent, IaccEvidencePacket, IaccEvidenceSourceRef,
-    IaccFact, IaccFactInput, IaccHealth, IaccMetricDefinition, IaccMetricRecomputeResult,
-    IaccMetricState, IaccMetricStatus, IaccSeverity, IaccSourceKind, IaccSourceSnapshot, IaccStore,
-    IaccStoreError, IACC_SCHEMA_VERSION,
+    IaccFact, IaccFactInput, IaccHealth, IaccIncident, IaccMetricDefinition,
+    IaccMetricRecomputeResult, IaccMetricState, IaccMetricStatus, IaccSeverity, IaccSourceKind,
+    IaccSourceSnapshot, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
 };
 pub use joint_problem_solving::{
     AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult, ProblemSolvingConfig,

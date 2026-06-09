@@ -10,10 +10,10 @@ use thiserror::Error;
 
 use super::{
     IaccAttentionItem, IaccChangeEvent, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
-    IaccMetricDefinition, IaccMetricState, IaccSeverity,
+    IaccIncident, IaccMetricDefinition, IaccMetricState, IaccSeverity,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 2;
+pub const IACC_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -34,6 +34,7 @@ pub struct IaccHealth {
     pub change_count: u64,
     pub attention_count: u64,
     pub evidence_count: u64,
+    pub incident_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,6 +85,7 @@ impl IaccStore {
             change_count: count_table(&connection, "iacc_change_event")?,
             attention_count: count_table(&connection, "iacc_attention_item")?,
             evidence_count: count_table(&connection, "iacc_evidence_packet")?,
+            incident_count: count_table(&connection, "iacc_incident")?,
         })
     }
 
@@ -296,11 +298,29 @@ impl IaccStore {
                 "owner_roles": item.owner_roles,
             });
             for reference in item.linked_changes {
+                if let Some(change_id) = reference.strip_prefix("iacc:change:") {
+                    if let Some(change) = find_change(&connection, change_id)? {
+                        packet.change_evidence.push(serde_json::to_value(&change)?);
+                        if let Some(metric_id) = change.metric_id.as_deref() {
+                            if let Some(state) =
+                                latest_metric_state_for_metric(&connection, metric_id)?
+                            {
+                                packet.metric_evidence.push(serde_json::to_value(&state)?);
+                            }
+                        }
+                    }
+                }
                 packet.source_refs.push(IaccEvidenceSourceRef {
                     kind: "change_or_fact".to_string(),
                     reference,
-                    summary: "V0.9.77 foundation attention source".to_string(),
+                    summary: "IACC attention evidence source".to_string(),
                 });
+            }
+            if !packet.metric_evidence.is_empty() {
+                packet
+                    .missing_evidence
+                    .retain(|item| !item.contains("metric_network"));
+                packet.confidence = packet.confidence.max(0.65);
             }
         }
         insert_evidence_packet(&connection, &packet)?;
@@ -325,6 +345,31 @@ impl IaccStore {
             .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
             .transpose()
     }
+
+    pub fn create_incident(&self, incident: &IaccIncident) -> Result<IaccIncident, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_incident(&connection, incident)?;
+        Ok(incident.clone())
+    }
+
+    pub fn get_incident(&self, incident_id: &str) -> Result<Option<IaccIncident>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        connection
+            .query_row(
+                "SELECT incident_json FROM iacc_incident WHERE incident_id = ?1",
+                params![incident_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+            .transpose()
+    }
 }
 
 fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
@@ -335,7 +380,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 2, datetime('now'))
+        VALUES (1, 3, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -414,7 +459,21 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             detected_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_iacc_change_detected
-            ON iacc_change_event(detected_at DESC);",
+            ON iacc_change_event(detected_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_incident (
+            incident_id TEXT PRIMARY KEY,
+            attention_id TEXT,
+            evidence_packet_id TEXT,
+            task_id TEXT,
+            agent_graph_id TEXT,
+            status TEXT NOT NULL,
+            incident_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_incident_updated
+            ON iacc_incident(updated_at DESC);",
     )
 }
 
@@ -712,6 +771,61 @@ fn insert_change_event(
     Ok(())
 }
 
+fn find_change(
+    connection: &Connection,
+    change_id: &str,
+) -> Result<Option<IaccChangeEvent>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT change_json FROM iacc_change_event WHERE change_id = ?1",
+            params![change_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn latest_metric_state_for_metric(
+    connection: &Connection,
+    metric_id: &str,
+) -> Result<Option<IaccMetricState>, IaccStoreError> {
+    connection
+        .query_row(
+            r"SELECT state_json
+              FROM iacc_metric_state
+              WHERE metric_id = ?1
+              ORDER BY computed_at DESC
+              LIMIT 1",
+            params![metric_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn upsert_incident(connection: &Connection, incident: &IaccIncident) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_incident (
+            incident_id, attention_id, evidence_packet_id, task_id, agent_graph_id,
+            status, incident_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            incident.incident_id,
+            incident.attention_id,
+            incident.evidence_packet_id,
+            incident.task_id,
+            incident.agent_graph_id,
+            incident.status,
+            serde_json::to_string(incident)?,
+            incident.created_at.to_rfc3339(),
+            incident.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
 fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> IaccAttentionItem {
     let now = Utc::now();
     let severity = match change.severity_hint.as_str() {
@@ -873,5 +987,59 @@ mod tests {
         assert_eq!(states.len(), 2);
         let changes = store.list_changes(10).expect("changes list");
         assert_eq!(changes.len(), 2);
+    }
+
+    #[test]
+    fn evidence_packet_includes_metric_change_and_context_item() {
+        let store = IaccStore::in_memory().expect("store opens");
+        let fact = IaccFact::from_input(IaccFactInput {
+            fact_id: Some("fact-plan-context".to_string()),
+            snapshot_id: Some("snapshot-plan-context".to_string()),
+            fact_type: "plan.weekly_demand".to_string(),
+            entity_refs: vec!["product:server-context".to_string()],
+            metric_key: Some("plan_bom_delta".to_string()),
+            dimensions: serde_json::json!({"week": "2026-W25"}),
+            measures: serde_json::json!({"demand_qty": 160}),
+            event_time: None,
+            valid_from: None,
+            valid_to: None,
+            source_ref: None,
+            confidence: Some(0.9),
+            raw_hash: None,
+        });
+        store.ingest_fact(&fact).expect("fact ingests");
+        let recompute = store.recompute_metrics().expect("recompute");
+        let attention_id = recompute.attention[0].attention_id.clone();
+
+        let packet = store
+            .build_evidence_packet(Some(&attention_id), Some("plan changed"))
+            .expect("packet builds");
+
+        assert!(!packet.metric_evidence.is_empty());
+        assert!(!packet.change_evidence.is_empty());
+        let context_item = packet.to_context_item();
+        assert_eq!(
+            context_item.id,
+            format!("iacc:evidence:{}", packet.packet_id)
+        );
+        assert!(!context_item.evidence.is_empty());
+    }
+
+    #[test]
+    fn store_persists_incident() {
+        let store = IaccStore::in_memory().expect("store opens");
+        let mut incident = IaccIncident::new("material risk");
+        incident.attention_id = Some("attention-1".to_string());
+        incident.evidence_packet_id = Some("packet-1".to_string());
+        incident.task_id = Some("task-1".to_string());
+        incident.agent_graph_id = Some("agent-graph-task-1".to_string());
+        store.create_incident(&incident).expect("incident saves");
+
+        let loaded = store
+            .get_incident(&incident.incident_id)
+            .expect("incident loads")
+            .expect("incident exists");
+        assert_eq!(loaded.title, "material risk");
+        assert_eq!(store.health().unwrap().incident_count, 1);
     }
 }
