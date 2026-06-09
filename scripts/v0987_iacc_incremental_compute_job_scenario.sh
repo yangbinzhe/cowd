@@ -4,11 +4,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
-PORT="${COWD_V0986_PORT:-18706}"
+PORT="${COWD_V0987_PORT:-18707}"
 BASE_URL="http://127.0.0.1:$PORT"
-SESSION="cowd-v0986-iacc-$$"
+SESSION="cowd-v0987-iacc-$$"
 TMP_ROOT="${TMPDIR:-/tmp}"
-TMP_DIR="$(mktemp -d "$TMP_ROOT/cowd-v0986-iacc.XXXXXX")"
+TMP_DIR="$(mktemp -d "$TMP_ROOT/cowd-v0987-iacc.XXXXXX")"
 WORKDIR="$TMP_DIR/workspace"
 CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
@@ -29,7 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 if ! command -v tmux >/dev/null 2>&1; then
-  echo "tmux is required for v0.9.86 IACC metric dependency scenario" >&2
+  echo "tmux is required for v0.9.87 IACC incremental compute scenario" >&2
   exit 1
 fi
 
@@ -81,29 +81,33 @@ done
 
 curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"daemon-http-gateway"'
 curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"expected_schema_version":8'
-curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"metric_dependency_graph"'
+curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"incremental_compute_job"'
 
 curl -fsS "$BASE_URL/api/iacc/domain/server-manufacturing/seed" -X POST | rg -q '"metric_dependency_count":5'
-curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"metric_dependency_count":5'
 
-lineage_json="$(curl -fsS "$BASE_URL/api/iacc/metrics/supplier_commit_variance/lineage")"
-printf '%s' "$lineage_json" | rg -q '"metric_id":"supplier_commit_variance"'
-printf '%s' "$lineage_json" | rg -q '"downstream_metric_id":"material_shortage_risk"'
-printf '%s' "$lineage_json" | rg -q 'order_delivery_risk'
-
-affected_json="$(curl -fsS "$BASE_URL/api/iacc/metric-dependencies/affected-by-fact-type" \
+plan_json="$(curl -fsS "$BASE_URL/api/iacc/compute/jobs/plan" \
   -H 'content-type: application/json' \
-  -d '{"request_id":"v0986-fact-impact","session_id":"session-v0986","fact_type":"supply.commit_variance"}')"
-printf '%s' "$affected_json" | rg -q '"supplier_commit_variance"'
-printf '%s' "$affected_json" | rg -q '"material_shortage_risk"'
-printf '%s' "$affected_json" | rg -q '"order_delivery_risk"'
+  -d '{"request_id":"v0987-plan","session_id":"session-v0987","job":{"job_id":"compute-job-v0987-supply-commit","trigger_fact_type":"supply.commit_variance","trigger_fact_refs":["iacc:fact:fact-smfg-commit-gpu-alpha-w30"],"entity_scope":"supplier:supplier-gpu-alpha","period":"2026-W30"}}')"
+printf '%s' "$plan_json" | rg -q '"status":"planned"'
+printf '%s' "$plan_json" | rg -q '"supplier_commit_variance"'
+printf '%s' "$plan_json" | rg -q '"material_shortage_risk"'
+printf '%s' "$plan_json" | rg -q '"order_delivery_risk"'
 
-curl -fsS "$BASE_URL/api/iacc/metric-dependencies/upsert" \
-  -H 'content-type: application/json' \
-  -d '{"request_id":"v0986-manual","session_id":"session-v0986","dependency":{"upstream_metric_id":"material_shortage_risk","downstream_metric_id":"revenue_at_risk","dependency_type":"material_availability_to_revenue","entity_relation_type":"reserved_for","required_fact_types":["supply.material_shortage","finance.revenue_at_risk"],"confidence":0.78,"notes":"manual dependency added by v0.9.86 scenario"}}' \
-  | rg -q '"downstream_metric_id":"revenue_at_risk"'
+job_id="$(printf '%s' "$plan_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["plan"]["job"]["job_id"])')"
 
-curl -fsS "$BASE_URL/api/iacc/metrics/material_shortage_risk/lineage" | rg -q '"revenue_at_risk"'
-curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"metric_dependency_count":6'
+run_json="$(curl -fsS "$BASE_URL/api/iacc/compute/jobs/$job_id/run" -X POST)"
+printf '%s' "$run_json" | rg -q '"status":"completed"'
+printf '%s' "$run_json" | rg -q '"attempts":1'
+printf '%s' "$run_json" | rg -q '"metric_state_count":3'
+printf '%s' "$run_json" | rg -q '"change_count":3'
+
+curl -fsS "$BASE_URL/api/iacc/compute/jobs/$job_id" | rg -q '"status":"completed"'
+curl -fsS "$BASE_URL/api/iacc/metrics/supplier_commit_variance" | rg -q '"supplier_commit_variance"'
+if curl -fsS "$BASE_URL/api/iacc/metrics/work_center_load" >/dev/null 2>&1; then
+  echo "work_center_load should not be recomputed by supply.commit_variance job" >&2
+  exit 1
+fi
+
+curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"compute_job_count":1'
 
 test -f "$WORKDIR/.cowd/iacc.sqlite"

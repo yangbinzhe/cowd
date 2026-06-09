@@ -8,6 +8,7 @@
 mod analysis;
 mod attention;
 mod change;
+mod compute;
 mod domain;
 mod entity;
 mod evidence;
@@ -25,6 +26,7 @@ pub use analysis::{
 };
 pub use attention::{IaccAttentionItem, IaccSeverity};
 pub use change::IaccChangeEvent;
+pub use compute::{IaccComputeJob, IaccComputeJobInput, IaccComputePlan};
 pub use domain::{
     server_manufacturing_domain_pack, server_manufacturing_seed_plan, IaccDomainPack,
     IaccDomainScenario, IaccDomainSeedPlan, IaccDomainSeedResult,

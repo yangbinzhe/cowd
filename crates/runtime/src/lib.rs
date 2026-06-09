@@ -176,14 +176,14 @@ pub use hooks::{
 pub use iacc::{
     iacc_reference, server_manufacturing_domain_pack, server_manufacturing_seed_plan,
     IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
-    IaccAttributionCandidate, IaccChangeEvent, IaccDomainPack, IaccDomainScenario,
-    IaccDomainSeedPlan, IaccDomainSeedResult, IaccEntity, IaccEntityInput, IaccEvidencePacket,
-    IaccEvidenceSourceRef, IaccFact, IaccFactInput, IaccHealth, IaccImpactHop, IaccImpactPath,
-    IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricDependency,
-    IaccMetricDependencyInput, IaccMetricLineage, IaccMetricRecomputeResult, IaccMetricState,
-    IaccMetricStatus, IaccOperationalAnalysis, IaccRecommendedAction, IaccRelation,
-    IaccRelationInput, IaccSeverity, IaccSourceKey, IaccSourceKind, IaccSourceSnapshot, IaccStore,
-    IaccStoreError, IACC_SCHEMA_VERSION,
+    IaccAttributionCandidate, IaccChangeEvent, IaccComputeJob, IaccComputeJobInput,
+    IaccComputePlan, IaccDomainPack, IaccDomainScenario, IaccDomainSeedPlan, IaccDomainSeedResult,
+    IaccEntity, IaccEntityInput, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
+    IaccFactInput, IaccHealth, IaccImpactHop, IaccImpactPath, IaccImpactTrace, IaccIncident,
+    IaccMetricDefinition, IaccMetricDependency, IaccMetricDependencyInput, IaccMetricLineage,
+    IaccMetricRecomputeResult, IaccMetricState, IaccMetricStatus, IaccOperationalAnalysis,
+    IaccRecommendedAction, IaccRelation, IaccRelationInput, IaccSeverity, IaccSourceKey,
+    IaccSourceKind, IaccSourceSnapshot, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
 };
 pub use joint_problem_solving::{
     AgentDiscussion, DiscussionTurn, JpsOps, PhaseStatus, PipelineResult, ProblemSolvingConfig,

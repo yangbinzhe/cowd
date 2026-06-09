@@ -10,13 +10,13 @@ use thiserror::Error;
 
 use super::{
     IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
-    IaccChangeEvent, IaccDomainSeedResult, IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef,
-    IaccFact, IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMetricDefinition,
-    IaccMetricDependency, IaccMetricLineage, IaccMetricState, IaccOperationalAnalysis,
-    IaccRelation, IaccSeverity,
+    IaccChangeEvent, IaccComputeJob, IaccComputeJobInput, IaccComputePlan, IaccDomainSeedResult,
+    IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccImpactHop,
+    IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage,
+    IaccMetricState, IaccOperationalAnalysis, IaccRelation, IaccSeverity,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 7;
+pub const IACC_SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -43,6 +43,7 @@ pub struct IaccHealth {
     pub entity_count: u64,
     pub relation_count: u64,
     pub metric_dependency_count: u64,
+    pub compute_job_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,6 +100,7 @@ impl IaccStore {
             entity_count: count_table(&connection, "iacc_entity")?,
             relation_count: count_table(&connection, "iacc_relation")?,
             metric_dependency_count: count_table(&connection, "iacc_metric_dependency")?,
+            compute_job_count: count_table(&connection, "iacc_compute_job")?,
         })
     }
 
@@ -221,6 +223,76 @@ impl IaccStore {
         metrics_affected_by_fact_type(&connection, fact_type)
     }
 
+    pub fn plan_compute_job_for_fact_type(
+        &self,
+        input: IaccComputeJobInput,
+    ) -> Result<IaccComputePlan, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut affected_metric_ids = if input.metric_ids.is_empty() {
+            metrics_affected_by_fact_type(&connection, &input.trigger_fact_type)?
+        } else {
+            input.metric_ids.clone()
+        };
+        if affected_metric_ids.is_empty() {
+            affected_metric_ids = metric_ids_for_fact_type(&connection, &input.trigger_fact_type)?;
+        }
+        affected_metric_ids.sort();
+        affected_metric_ids.dedup();
+        let mut job = IaccComputeJob::from_input(IaccComputeJobInput {
+            metric_ids: affected_metric_ids.clone(),
+            ..input
+        });
+        job.priority = priority_for_compute_job(&job);
+        upsert_compute_job(&connection, &job)?;
+        Ok(IaccComputePlan {
+            job,
+            affected_metric_ids,
+            planned_at: Utc::now(),
+        })
+    }
+
+    pub fn get_compute_job(&self, job_id: &str) -> Result<Option<IaccComputeJob>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_compute_job(&connection, job_id)
+    }
+
+    pub fn run_compute_job(&self, job_id: &str) -> Result<IaccComputeJob, IaccStoreError> {
+        let mut job = {
+            let connection = self
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut job = find_compute_job(&connection, job_id)?
+                .ok_or_else(|| IaccStoreError::NotFound(job_id.to_string()))?;
+            job.status = "running".to_string();
+            job.attempts += 1;
+            job.updated_at = Utc::now();
+            upsert_compute_job(&connection, &job)?;
+            job
+        };
+
+        let recompute = self.recompute_metrics_for_metric_ids(&job.metric_ids)?;
+        job.status = "completed".to_string();
+        job.result_summary = serde_json::json!({
+            "metric_ids": job.metric_ids.clone(),
+            "metric_state_count": recompute.metric_state_count,
+            "change_count": recompute.change_count,
+            "attention_count": recompute.attention_count,
+        });
+        job.updated_at = Utc::now();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_compute_job(&connection, &job)
+    }
+
     pub fn seed_server_manufacturing_domain(&self) -> Result<IaccDomainSeedResult, IaccStoreError> {
         let plan = super::server_manufacturing_seed_plan();
         for entity in &plan.entities {
@@ -305,6 +377,21 @@ impl IaccStore {
     }
 
     pub fn recompute_metrics(&self) -> Result<IaccMetricRecomputeResult, IaccStoreError> {
+        self.recompute_metrics_with_filter(None)
+    }
+
+    pub fn recompute_metrics_for_metric_ids(
+        &self,
+        metric_ids: &[String],
+    ) -> Result<IaccMetricRecomputeResult, IaccStoreError> {
+        let filter = metric_ids.iter().cloned().collect::<BTreeSet<_>>();
+        self.recompute_metrics_with_filter(Some(&filter))
+    }
+
+    fn recompute_metrics_with_filter(
+        &self,
+        metric_filter: Option<&BTreeSet<String>>,
+    ) -> Result<IaccMetricRecomputeResult, IaccStoreError> {
         let connection = self
             .connection
             .lock()
@@ -312,6 +399,9 @@ impl IaccStore {
         let facts = metric_facts(&connection)?;
         let mut groups = BTreeMap::<MetricGroupKey, MetricAccumulator>::new();
         for fact in facts {
+            if metric_filter.is_some_and(|filter| !filter.contains(&fact.metric_id)) {
+                continue;
+            }
             groups.entry(fact.key()).or_default().push(fact);
         }
 
@@ -636,7 +726,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 7, datetime('now'))
+        VALUES (1, 8, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -766,6 +856,20 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             ON iacc_metric_dependency(upstream_metric_id, downstream_metric_id);
         CREATE INDEX IF NOT EXISTS idx_iacc_metric_dependency_downstream
             ON iacc_metric_dependency(downstream_metric_id, upstream_metric_id);
+
+        CREATE TABLE IF NOT EXISTS iacc_compute_job (
+            job_id TEXT PRIMARY KEY,
+            trigger_fact_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            priority REAL NOT NULL,
+            job_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_compute_job_status
+            ON iacc_compute_job(status, priority DESC, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_iacc_compute_job_fact_type
+            ON iacc_compute_job(trigger_fact_type, updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS iacc_change_event (
             change_id TEXT PRIMARY KEY,
@@ -1505,6 +1609,81 @@ fn metrics_affected_by_fact_type(
     Ok(impacted.into_iter().collect())
 }
 
+fn metric_ids_for_fact_type(
+    connection: &Connection,
+    fact_type: &str,
+) -> Result<Vec<String>, IaccStoreError> {
+    let mut impacted = BTreeSet::new();
+    let mut statement = connection.prepare(
+        r"SELECT definition_json
+          FROM iacc_metric_definition
+          ORDER BY metric_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let definition: IaccMetricDefinition = serde_json::from_str(&row?)?;
+        if definition.inputs.iter().any(|input| input == fact_type) {
+            impacted.insert(definition.metric_id);
+        }
+    }
+    Ok(impacted.into_iter().collect())
+}
+
+fn priority_for_compute_job(job: &IaccComputeJob) -> f32 {
+    let metric_score = (job.metric_ids.len() as f32 / 8.0).min(1.0);
+    let trigger_score = if job.trigger_fact_type.contains("shortage")
+        || job.trigger_fact_type.contains("delivery")
+        || job.trigger_fact_type.contains("quality")
+    {
+        0.9
+    } else {
+        0.55
+    };
+    (metric_score * 0.45 + trigger_score * 0.55).min(1.0)
+}
+
+fn upsert_compute_job(
+    connection: &Connection,
+    job: &IaccComputeJob,
+) -> Result<IaccComputeJob, IaccStoreError> {
+    connection.execute(
+        r"INSERT INTO iacc_compute_job (
+            job_id, trigger_fact_type, status, priority, job_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(job_id) DO UPDATE SET
+            trigger_fact_type = excluded.trigger_fact_type,
+            status = excluded.status,
+            priority = excluded.priority,
+            job_json = excluded.job_json,
+            updated_at = excluded.updated_at",
+        params![
+            job.job_id,
+            job.trigger_fact_type,
+            job.status,
+            job.priority,
+            serde_json::to_string(job)?,
+            job.created_at.to_rfc3339(),
+            job.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(job.clone())
+}
+
+fn find_compute_job(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Option<IaccComputeJob>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT job_json FROM iacc_compute_job WHERE job_id = ?1",
+            params![job_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
 fn latest_metric_state(
     connection: &Connection,
     metric_id: &str,
@@ -1780,7 +1959,9 @@ fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> I
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iacc::{IaccEntityInput, IaccFactInput, IaccRelationInput, IaccSourceKey};
+    use crate::iacc::{
+        IaccComputeJobInput, IaccEntityInput, IaccFactInput, IaccRelationInput, IaccSourceKey,
+    };
 
     #[test]
     fn entity_source_keys_resolve_to_one_canonical_entity() {
@@ -1975,6 +2156,53 @@ mod tests {
             .iter()
             .any(|metric_id| metric_id == "order_delivery_risk"));
         assert_eq!(store.health().unwrap().metric_dependency_count, 5);
+    }
+
+    #[test]
+    fn compute_job_plans_and_runs_scoped_metric_recompute() {
+        let store = IaccStore::in_memory().expect("store opens");
+        store
+            .seed_server_manufacturing_domain()
+            .expect("domain seed runs");
+
+        let plan = store
+            .plan_compute_job_for_fact_type(IaccComputeJobInput {
+                job_id: Some("compute-job-supply-commit".to_string()),
+                trigger_fact_type: "supply.commit_variance".to_string(),
+                trigger_fact_refs: vec!["iacc:fact:fact-smfg-commit-gpu-alpha-w30".to_string()],
+                entity_scope: Some("supplier:supplier-gpu-alpha".to_string()),
+                period: Some("2026-W30".to_string()),
+                metric_ids: Vec::new(),
+                priority: None,
+            })
+            .expect("job plans");
+
+        assert_eq!(plan.job.status, "planned");
+        assert!(plan
+            .affected_metric_ids
+            .iter()
+            .any(|metric_id| metric_id == "supplier_commit_variance"));
+        assert!(plan
+            .affected_metric_ids
+            .iter()
+            .any(|metric_id| metric_id == "order_delivery_risk"));
+        assert_eq!(store.health().unwrap().compute_job_count, 1);
+
+        let job = store.run_compute_job(&plan.job.job_id).expect("job runs");
+        assert_eq!(job.status, "completed");
+        assert_eq!(job.attempts, 1);
+        assert_eq!(job.result_summary["metric_state_count"], 3);
+        assert!(
+            store
+                .metric_states("supplier_commit_variance")
+                .expect("states load")
+                .len()
+                == 1
+        );
+        assert!(store
+            .metric_states("work_center_load")
+            .expect("states load")
+            .is_empty());
     }
 
     #[test]
