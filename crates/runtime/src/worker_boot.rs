@@ -1431,6 +1431,7 @@ mod tests {
 
     #[test]
     fn emit_state_file_writes_worker_status_on_transition() {
+        let _guard = crate::test_env_lock();
         let cwd_path = std::env::temp_dir().join(format!(
             "cowd-state-test-{}",
             std::time::SystemTime::now()
