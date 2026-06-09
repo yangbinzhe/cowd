@@ -44,6 +44,7 @@ use memory::types::{
 #[cfg(test)]
 use memory::MemoryScope;
 
+mod agent_routes;
 mod approval_routes;
 mod audit_routes;
 mod channel_routes;
@@ -155,6 +156,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
 
     let protected_routes = Router::new()
         .merge(approval_routes::router())
+        .merge(agent_routes::router())
         .merge(audit_routes::router())
         .merge(channel_routes::router())
         .merge(connector_routes::router())
@@ -1015,6 +1017,107 @@ mod tests {
             json["socket_control"],
             "local low-latency daemon control plane"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_run_persists_evidence_to_session_event() {
+        let app = api_router(test_state());
+        let started = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "objective": "coordinate multi agent",
+                            "yolo_mode": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::CREATED);
+        let body = to_bytes(started.into_body(), usize::MAX).await.unwrap();
+        let task: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let task_id = task["id"].as_str().unwrap();
+
+        let runs = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runs.status(), StatusCode::OK);
+        let body = to_bytes(runs.into_body(), usize::MAX).await.unwrap();
+        let runs_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(runs_json["kind"], "agent_run_graphs");
+        assert_eq!(runs_json["runs"][0]["session_id"], task_id);
+
+        let upsert = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/agent-graph"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "objective": "coordinate multi agent",
+                            "nodes": [
+                                {
+                                    "id": "planner",
+                                    "role": "planner",
+                                    "title": "Plan",
+                                    "objective": "split work",
+                                    "depends_on": [],
+                                    "status": "ready",
+                                    "created_at_ms": 1,
+                                    "updated_at_ms": 1
+                                },
+                                {
+                                    "id": "review",
+                                    "role": "reviewer",
+                                    "title": "Review",
+                                    "objective": "challenge result",
+                                    "depends_on": ["planner"],
+                                    "status": "pending",
+                                    "created_at_ms": 1,
+                                    "updated_at_ms": 1
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upsert.status(), StatusCode::OK);
+        let body = to_bytes(upsert.into_body(), usize::MAX).await.unwrap();
+        let graph: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(graph["nodes"].as_array().unwrap().len(), 2);
+
+        let fetched = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/tasks/{task_id}/agent-graph"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let body = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
+        let fetched_graph: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fetched_graph["nodes"][1]["id"], "review");
     }
 
     #[tokio::test]

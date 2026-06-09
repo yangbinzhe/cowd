@@ -59,6 +59,8 @@ pub use session::workspace_sessions_dir;
 pub mod agent;
 pub mod agent_collaboration;
 pub mod agent_discussion;
+pub mod agent_kernel;
+pub mod agent_protocol;
 pub mod agent_workgraph;
 pub mod approval_gate;
 pub mod connector;
@@ -96,6 +98,11 @@ pub use agent_collaboration::{
 };
 pub use agent_discussion::{
     ConsensusMethod, ConsensusResult, Contribution, Discussion, DiscussionEngine, DiscussionPhase,
+};
+pub use agent_kernel::{AgentGraphError, AgentRunGraph};
+pub use agent_protocol::{
+    AgentEvidence, AgentMergeDecision, AgentMessage, AgentNodeStatus, AgentReview, AgentRole,
+    AgentTaskNode, ReviewVerdict,
 };
 pub use agent_workgraph::{
     AgentWorkGraph, WorkGraphEdge, WorkGraphEdgeKind, WorkGraphNode, WorkGraphNodeKind,

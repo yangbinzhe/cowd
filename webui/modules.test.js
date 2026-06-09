@@ -386,6 +386,9 @@ describe('API module', () => {
     expect(typeof window.Api.cancelTask).toBe('function');
     expect(typeof window.Api.completeTask).toBe('function');
     expect(typeof window.Api.recordTaskFailure).toBe('function');
+    expect(typeof window.Api.agentRuns).toBe('function');
+    expect(typeof window.Api.taskAgentGraph).toBe('function');
+    expect(typeof window.Api.upsertTaskAgentGraph).toBe('function');
   });
 
   it('task endpoints use stable route contracts', async () => {
@@ -405,6 +408,9 @@ describe('API module', () => {
     await window.Api.cancelTask('task-1');
     await window.Api.completeTask('task-1');
     await window.Api.recordTaskFailure('task-1', 'blocked');
+    await window.Api.agentRuns();
+    await window.Api.taskAgentGraph('task-1');
+    await window.Api.upsertTaskAgentGraph('task-1', { objective: 'ship', nodes: [] });
 
     expect(String(mockF.mock.calls[0][0])).toBe('/api/tasks');
     expect(String(mockF.mock.calls[1][0])).toBe('/api/tasks/start');
@@ -415,6 +421,9 @@ describe('API module', () => {
     expect(String(mockF.mock.calls[5][0])).toBe('/api/tasks/task-1/cancel');
     expect(String(mockF.mock.calls[6][0])).toBe('/api/tasks/task-1/complete');
     expect(String(mockF.mock.calls[7][0])).toBe('/api/tasks/task-1/failure');
+    expect(String(mockF.mock.calls[8][0])).toBe('/api/agents/runs');
+    expect(String(mockF.mock.calls[9][0])).toBe('/api/tasks/task-1/agent-graph');
+    expect(String(mockF.mock.calls[10][0])).toBe('/api/tasks/task-1/agent-graph');
   });
 
   it('has all cron endpoints', () => {
@@ -2442,6 +2451,47 @@ describe('API module', () => {
     expect(text).toContain('playwright');
     expect(text).toContain('accepted');
     expect(text).toContain('external input required');
+  });
+
+  it('renders agent run graph structure in the agents panel', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    vi.stubGlobal('fetch', vi.fn((url) => {
+      const path = String(url);
+      if (path.includes('/api/agents/runs')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            runs: [{
+              graph_id: 'agent-graph-task-1',
+              session_id: 'task-1',
+              objective: 'Coordinate agents',
+              status: 'running',
+              nodes: [
+                { id: 'planner', role: 'planner', title: 'Plan', status: 'completed' },
+                { id: 'exec', role: 'executor', title: 'Implement', status: 'reviewing' }
+              ],
+              evidence: [{ kind: 'test', summary: 'unit passed' }],
+              reviews: [{ verdict: 'challenge', comment: 'missing e2e' }],
+              merge_decisions: [{ decision: 'prefer executor', conflicts: ['coverage gap'] }]
+            }]
+          })
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ current: null, tasks: [] })
+      });
+    }));
+
+    await window.Panels.renderAgents();
+
+    const text = document.getElementById('panel-content').textContent;
+    expect(text).toContain('Agent Run Graph');
+    expect(text).toContain('Coordinate agents');
+    expect(text).toContain('executor');
+    expect(text).toContain('unit passed');
+    expect(text).toContain('missing e2e');
+    expect(text).toContain('prefer executor');
   });
 
   it('renders approval queue and posts approval decisions', async () => {

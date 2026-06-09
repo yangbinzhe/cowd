@@ -309,6 +309,9 @@ window.Api = (()=>{
     async cancelTask(id){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/cancel')},
     async completeTask(id){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/complete')},
     async recordTaskFailure(id,reason){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/failure',{reason})},
+    async agentRuns(){return req('GET','/api/agents/runs')},
+    async taskAgentGraph(id){return req('GET','/api/tasks/'+encodeURIComponent(id)+'/agent-graph')},
+    async upsertTaskAgentGraph(id,graph){return req('POST','/api/tasks/'+encodeURIComponent(id)+'/agent-graph',graph||{})},
 
     // ── Skills ──
     async listSkills(){return req('GET','/v1/skills')},
