@@ -1,0 +1,16 @@
+[2026-06-09T13:14:55+08:00] START webui_npm_test
+
+> test
+> vitest run
+
+
+ RUN  v2.1.9 /media/yi/Datas/workspace/cowd/webui
+
+ ✓ modules.test.js (71 tests) 441ms
+
+ Test Files  1 passed (1)
+      Tests  71 passed (71)
+   Start at  13:14:56
+   Duration  1.29s (transform 91ms, setup 13ms, collect 109ms, tests 441ms, environment 347ms, prepare 47ms)
+
+[2026-06-09T13:14:57+08:00] END webui_npm_test status=0 elapsed=2s target_before=0 target_after=0

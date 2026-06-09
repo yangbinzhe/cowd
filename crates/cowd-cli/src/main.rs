@@ -17,6 +17,9 @@ mod init;
 mod logging;
 mod mcp_serve;
 mod render;
+mod runtime_boundary;
+mod runtime_protocol;
+mod runtime_service;
 mod server;
 mod session_kernel;
 mod suggestions;
@@ -4897,6 +4900,8 @@ impl LiveCli {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt_for_mode(yolo_mode)?;
         let (session, session_state) = load_or_create_live_session(session_id)?;
+        let cwd = std::env::current_dir()?;
+        init_runtime_providers_for_cwd(&cwd);
         let runtime = build_runtime(
             session_state,
             &session.id,
@@ -8086,15 +8091,10 @@ fn summarize_tool_payload_for_markdown(payload: &str) -> String {
     truncate_for_summary(&compact, SESSION_MARKDOWN_TOOL_SUMMARY_LIMIT)
 }
 
-/// Fallback: load providers directly from ~/.cowd/config.yaml
+/// Fallback: load providers directly from the active Cowd config home.
 /// when ConfigLoader merge loses them.
 fn fallback_init_providers_from_user_config() {
-    let user_cfg = match std::env::var("HOME") {
-        Ok(home) => std::path::PathBuf::from(home)
-            .join(".cowd")
-            .join("config.yaml"),
-        Err(_) => return,
-    };
+    let user_cfg = runtime::cowd_dirs::config_home_dir().join("config.yaml");
     if !user_cfg.exists() {
         return;
     }
@@ -8163,9 +8163,32 @@ fn fallback_init_providers_from_user_config() {
 
     runtime::init_global_providers(runtime::ProvidersConfig { providers });
     tracing::warn!(
-        "[init] fallback: loaded {} providers from ~/.cowd/config.yaml",
+        path = %user_cfg.display(),
+        "[init] fallback: loaded {} providers from Cowd config home",
         runtime::list_all_providers().len()
     );
+}
+
+fn init_runtime_providers_for_cwd(cwd: &Path) {
+    let loader = runtime::ConfigLoader::default_for(cwd);
+    match loader.load() {
+        Ok(cfg) => {
+            let providers = cfg.providers().clone();
+            tracing::debug!(
+                "[init] merged providers count: {}",
+                providers.providers.len()
+            );
+            if !providers.is_empty() {
+                runtime::init_global_providers(providers);
+            } else {
+                fallback_init_providers_from_user_config();
+            }
+        }
+        Err(e) => {
+            tracing::warn!("failed to load config for provider registry: {e}");
+            fallback_init_providers_from_user_config();
+        }
+    }
 }
 
 fn run_prompt(
@@ -8186,28 +8209,8 @@ fn run_prompt(
     let system_prompt = build_system_prompt_for_mode(yolo_mode)?;
     let session_state = new_cli_session()?;
     let session = create_managed_session_handle(&session_state.session_id)?;
-    // Initialize global provider registry so resolve_global_provider works
     let cwd = std::env::current_dir()?;
-    let loader = runtime::ConfigLoader::default_for(&cwd);
-    match loader.load() {
-        Ok(cfg) => {
-            let providers = cfg.providers().clone();
-            tracing::debug!(
-                "[init] merged providers count: {}",
-                providers.providers.len()
-            );
-            if !providers.is_empty() {
-                runtime::init_global_providers(providers);
-            } else {
-                // Fallback: ConfigLoader merge may lose providers. Load user config directly.
-                fallback_init_providers_from_user_config();
-            }
-        }
-        Err(e) => {
-            tracing::warn!("failed to load config for provider registry: {e}");
-            fallback_init_providers_from_user_config();
-        }
-    }
+    init_runtime_providers_for_cwd(&cwd);
     let mut runtime = build_runtime(
         session_state,
         &session.id,
@@ -13949,6 +13952,7 @@ UU conflicted.rs",
     }
 
     #[test]
+    #[serial_test::serial(provider_registry)]
     fn tui_sidebar_switch_replaces_live_runtime_session() {
         let _cwd_guard = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env_guard = env_lock();
@@ -13962,6 +13966,20 @@ UU conflicted.rs",
         std::env::set_current_dir(&workspace).expect("switch cwd");
         std::env::set_var("COWD_CONFIG_HOME", &config_home);
         std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-tui-switch");
+        std::fs::write(
+            config_home.join("config.yaml"),
+            r#"
+model: claude-sonnet-4-6
+providers:
+  test-anthropic:
+    base_url: http://127.0.0.1:9
+    api_key: test-dummy-key-for-tui-switch
+    protocol: anthropic
+    models:
+      - claude-sonnet-4-6
+"#,
+        )
+        .expect("test provider config should write");
         runtime::init_global_providers(runtime::ProvidersConfig {
             providers: std::collections::HashMap::from([(
                 "test-anthropic".to_string(),

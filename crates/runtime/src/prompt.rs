@@ -629,7 +629,7 @@ mod tests {
         } else {
             std::env::remove_var("COWD_CONFIG_HOME");
         }
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -1,0 +1,15 @@
+[2026-06-09T13:10:14+08:00] START unified_runtime_surface
+   Compiling cowd-cli v0.9.67 (/media/yi/Datas/workspace/cowd/crates/cowd-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.46s
+
+Running 1 test using 1 worker
+
+(node:2091488) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:2091488) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓  1 [chromium] › unified-runtime.live.e2e.spec.js:11:1 › live unified runtime keeps TUI WebUI and daemon state coherent (777ms)
+
+  1 passed (1.4s)
+v0.9.64 unified runtime surface scenario passed
+[2026-06-09T13:10:33+08:00] END unified_runtime_surface status=0 elapsed=19s target_before=2203966333 target_after=2203966333

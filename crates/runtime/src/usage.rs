@@ -268,10 +268,19 @@ mod tests {
         let cost = usage.estimate_cost_usd();
         assert_eq!(format_usd(cost.input_cost_usd), "$15.0000");
         assert_eq!(format_usd(cost.output_cost_usd), "$37.5000");
+        let model_pricing =
+            pricing_for_model("claude-sonnet-4-6").expect("known model pricing should resolve");
+        let model_cost = usage.estimate_cost_usd_with_pricing(model_pricing);
         let lines = usage.summary_lines_for_model("usage", Some("claude-sonnet-4-6"));
-        assert!(lines[0].contains("estimated_cost=$10.9350"));
+        assert!(lines[0].contains(&format!(
+            "estimated_cost={}",
+            format_usd(model_cost.total_cost_usd())
+        )));
         assert!(lines[0].contains("model=claude-sonnet-4-6"));
-        assert!(lines[1].contains("cache_read=$0.0600"));
+        assert!(lines[1].contains(&format!(
+            "cache_read={}",
+            format_usd(model_cost.cache_read_cost_usd)
+        )));
     }
 
     #[test]

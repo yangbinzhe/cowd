@@ -1,0 +1,3 @@
+[2026-06-09T13:09:56+08:00] START tui_smoke
+TUI smoke test passed
+[2026-06-09T13:09:57+08:00] END tui_smoke status=0 elapsed=1s target_before=2203966333 target_after=2203966333
