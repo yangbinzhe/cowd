@@ -10,10 +10,11 @@ use thiserror::Error;
 
 use super::{
     IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
-    IaccChangeEvent, IaccComputeJob, IaccComputeJobInput, IaccComputePlan, IaccDomainSeedResult,
-    IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccImpactHop,
-    IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage,
-    IaccMetricState, IaccOperationalAnalysis, IaccQualityGateDecision, IaccRelation, IaccSeverity,
+    IaccChangeEvent, IaccComputeJob, IaccComputeJobInput, IaccComputePlan,
+    IaccCrossPlaneBridgeReceipt, IaccDomainSeedResult, IaccEntity, IaccEvidencePacket,
+    IaccEvidenceSourceRef, IaccFact, IaccImpactHop, IaccImpactTrace, IaccIncident,
+    IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage, IaccMetricState,
+    IaccOperationalAnalysis, IaccQualityGateDecision, IaccRelation, IaccSeverity,
 };
 
 pub const IACC_SCHEMA_VERSION: i64 = 9;
@@ -720,6 +721,22 @@ impl IaccStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         find_execution(&connection, execution_id)
+    }
+
+    pub fn attach_cross_plane_receipt(
+        &self,
+        execution_id: &str,
+        receipt: IaccCrossPlaneBridgeReceipt,
+    ) -> Result<IaccActionExecution, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut execution = find_execution(&connection, execution_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(execution_id.to_string()))?;
+        execution.attach_cross_plane_receipt(receipt);
+        insert_execution(&connection, &execution)?;
+        Ok(execution)
     }
 
     pub fn record_execution_feedback(
@@ -2611,6 +2628,38 @@ mod tests {
         assert_eq!(execution.status, "queued_for_human_review");
         assert_eq!(execution.action_type, "supplier_recovery");
         assert_eq!(store.health().unwrap().execution_count, 1);
+
+        let execution = store
+            .attach_cross_plane_receipt(
+                &execution.execution_id,
+                IaccCrossPlaneBridgeReceipt::new(
+                    execution.execution_id.clone(),
+                    "cpx-iacc-test",
+                    "planned",
+                    "dry_run",
+                    Some("cpa-iacc-test".to_string()),
+                ),
+            )
+            .expect("bridge receipt attaches");
+        assert_eq!(execution.status, "cross_plane_planned");
+        assert_eq!(execution.cross_plane_receipts.len(), 1);
+        assert_eq!(
+            execution.receipt["cross_plane_receipts"][0]["cross_plane_receipt_id"],
+            "cpx-iacc-test"
+        );
+        let execution = store
+            .attach_cross_plane_receipt(
+                &execution.execution_id,
+                IaccCrossPlaneBridgeReceipt::new(
+                    execution.execution_id.clone(),
+                    "cpx-iacc-test",
+                    "planned",
+                    "dry_run",
+                    Some("cpa-iacc-test".to_string()),
+                ),
+            )
+            .expect("bridge receipt deduplicates");
+        assert_eq!(execution.cross_plane_receipts.len(), 1);
 
         let execution = store
             .record_execution_feedback(

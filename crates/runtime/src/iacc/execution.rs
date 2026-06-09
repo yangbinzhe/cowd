@@ -33,9 +33,23 @@ pub struct IaccActionExecution {
     #[serde(default)]
     pub receipt: Value,
     #[serde(default)]
+    pub cross_plane_receipts: Vec<IaccCrossPlaneBridgeReceipt>,
+    #[serde(default)]
     pub feedback: Option<IaccActionFeedback>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IaccCrossPlaneBridgeReceipt {
+    pub bridge_id: String,
+    pub execution_id: String,
+    pub cross_plane_receipt_id: String,
+    pub cross_plane_status: String,
+    pub cross_plane_dispatch_status: String,
+    #[serde(default)]
+    pub audit_record_id: Option<String>,
+    pub bridged_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -88,10 +102,28 @@ impl IaccActionExecution {
                 "note": request.note,
                 "created_at": now,
             }),
+            cross_plane_receipts: Vec::new(),
             feedback: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    pub fn attach_cross_plane_receipt(&mut self, receipt: IaccCrossPlaneBridgeReceipt) {
+        self.cross_plane_receipts
+            .retain(|existing| existing.cross_plane_receipt_id != receipt.cross_plane_receipt_id);
+        let status = receipt.cross_plane_status.clone();
+        let dispatch_status = receipt.cross_plane_dispatch_status.clone();
+        self.cross_plane_receipts.push(receipt);
+        self.status = match status.as_str() {
+            "planned" => "cross_plane_planned".to_string(),
+            "dispatched" => "cross_plane_dispatched".to_string(),
+            "blocked" => "cross_plane_blocked".to_string(),
+            _ => format!("cross_plane_{status}"),
+        };
+        self.updated_at = Utc::now();
+        self.receipt =
+            merge_cross_plane_receipt(&self.receipt, &self.cross_plane_receipts, &dispatch_status);
     }
 
     pub fn apply_feedback(&mut self, feedback: IaccActionFeedback) {
@@ -104,6 +136,27 @@ impl IaccActionExecution {
         self.updated_at = feedback.recorded_at;
         self.receipt = merge_feedback_receipt(&self.receipt, &feedback, &self.status);
         self.feedback = Some(feedback);
+    }
+}
+
+impl IaccCrossPlaneBridgeReceipt {
+    #[must_use]
+    pub fn new(
+        execution_id: impl Into<String>,
+        cross_plane_receipt_id: impl Into<String>,
+        cross_plane_status: impl Into<String>,
+        cross_plane_dispatch_status: impl Into<String>,
+        audit_record_id: Option<String>,
+    ) -> Self {
+        Self {
+            bridge_id: format!("iacc-bridge-{}", uuid::Uuid::new_v4()),
+            execution_id: execution_id.into(),
+            cross_plane_receipt_id: cross_plane_receipt_id.into(),
+            cross_plane_status: cross_plane_status.into(),
+            cross_plane_dispatch_status: cross_plane_dispatch_status.into(),
+            audit_record_id,
+            bridged_at: Utc::now(),
+        }
     }
 }
 
@@ -142,6 +195,25 @@ fn merge_feedback_receipt(receipt: &Value, feedback: &IaccActionFeedback, status
         map.insert(
             "feedback".to_string(),
             serde_json::to_value(feedback).unwrap_or(Value::Null),
+        );
+    }
+    receipt
+}
+
+fn merge_cross_plane_receipt(
+    receipt: &Value,
+    bridge_receipts: &[IaccCrossPlaneBridgeReceipt],
+    dispatch_status: &str,
+) -> Value {
+    let mut receipt = receipt.clone();
+    if let Some(map) = receipt.as_object_mut() {
+        map.insert(
+            "cross_plane_dispatch_status".to_string(),
+            Value::String(dispatch_status.to_string()),
+        );
+        map.insert(
+            "cross_plane_receipts".to_string(),
+            serde_json::to_value(bridge_receipts).unwrap_or(Value::Null),
         );
     }
     receipt

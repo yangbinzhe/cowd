@@ -12,9 +12,11 @@ use axum::{
 use memory::store::session::SessionRecord;
 use runtime::{
     server_manufacturing_domain_pack, AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode,
-    IaccActionExecutionRequest, IaccActionFeedback, IaccComputeJobInput, IaccEntity,
-    IaccEntityInput, IaccFact, IaccFactInput, IaccIncident, IaccMetricDependency,
-    IaccMetricDependencyInput, IaccRelation, IaccRelationInput, IaccStore, IaccStoreError,
+    CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneExecutionReceipt, CrossPlaneRisk,
+    DataClassification, IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback,
+    IaccComputeJobInput, IaccCrossPlaneBridgeReceipt, IaccEntity, IaccEntityInput, IaccFact,
+    IaccFactInput, IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccRelation,
+    IaccRelationInput, IaccStore, IaccStoreError, IdentityTrust, PolicyDecisionKind,
     IACC_SCHEMA_VERSION,
 };
 use serde::Deserialize;
@@ -118,6 +120,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(iacc_action_execute_handler),
         )
         .route("/api/iacc/executions/:id", get(iacc_execution_get_handler))
+        .route(
+            "/api/iacc/executions/:id/cross-plane/execute",
+            post(iacc_execution_cross_plane_bridge_handler),
+        )
         .route(
             "/api/iacc/executions/:id/feedback",
             post(iacc_execution_feedback_handler),
@@ -223,6 +229,32 @@ struct IaccExecutionFeedbackRequest {
     metric_delta: Option<f64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct IaccCrossPlaneBridgeRequest {
+    #[serde(default = "default_iacc_bridge_mode")]
+    mode: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    actor_principal: Option<String>,
+    #[serde(default)]
+    actor_identity_ref: Option<String>,
+    #[serde(default)]
+    source_channel: Option<String>,
+    #[serde(default)]
+    requested_capability: Option<String>,
+    #[serde(default)]
+    provider_account: Option<String>,
+    #[serde(default)]
+    target_ref: Option<String>,
+    #[serde(default)]
+    resource_ref: Option<String>,
+}
+
+fn default_iacc_bridge_mode() -> String {
+    "dry_run".to_string()
+}
+
 async fn iacc_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -254,6 +286,7 @@ async fn iacc_health_handler(
         "capabilities": [
             "evidence_quality_gate",
             "insight_quality_gate",
+            "cross_plane_action_bridge",
             "incremental_compute_job",
             "scoped_metric_recompute",
             "metric_dependency_graph",
@@ -863,6 +896,84 @@ async fn iacc_execution_get_handler(
     })))
 }
 
+async fn iacc_execution_cross_plane_bridge_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<IaccCrossPlaneBridgeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    super::cross_plane_routes::ensure_cross_plane_loaded(&state);
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let execution = store
+        .get_execution(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC action execution not found"))?;
+    let mode = normalize_iacc_bridge_mode(&request.mode);
+    let idempotency_key = request
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string);
+
+    if let Some(key) = &idempotency_key {
+        if let Some(receipt) =
+            super::cross_plane_routes::cross_plane_control().find_execution_by_idempotency_key(key)
+        {
+            let execution = attach_iacc_cross_plane_receipt(&store, &execution, &receipt)
+                .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            return Ok(Json(serde_json::json!({
+                "kind": "iacc.cross_plane_action_bridge",
+                "mode": receipt.mode,
+                "status": receipt.status,
+                "dispatch_status": receipt.dispatch_status,
+                "execution": execution,
+                "cross_plane_execution_receipt": receipt,
+                "idempotent_replay": true,
+            })));
+        }
+    }
+
+    let action = iacc_cross_plane_action_from_execution(&execution, &request);
+    let now = chrono::Utc::now();
+    let (action, decision, evidence) =
+        super::cross_plane_routes::decide_connector_action(&state, action, &mode, now);
+    let (status, dispatch_status, blockers, audit_result, audit_summary) =
+        iacc_cross_plane_bridge_outcome(&mode, &decision);
+    let audit_record = CrossPlaneAuditRecord::new(
+        action.clone(),
+        decision.clone(),
+        audit_result,
+        audit_summary,
+    )
+    .with_evidence(evidence);
+    let audit_record_id = audit_record.id.clone();
+    super::cross_plane_routes::cross_plane_control().record_audit(audit_record);
+    let receipt = CrossPlaneExecutionReceipt::new(
+        idempotency_key,
+        mode.clone(),
+        status.clone(),
+        dispatch_status.clone(),
+        action,
+        decision,
+        blockers,
+        Some(audit_record_id),
+    );
+    super::cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
+    super::cross_plane_routes::save_cross_plane_state(&state);
+    let execution = attach_iacc_cross_plane_receipt(&store, &execution, &receipt)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.cross_plane_action_bridge",
+        "mode": mode,
+        "status": status,
+        "dispatch_status": dispatch_status,
+        "execution": execution,
+        "cross_plane_execution_receipt": receipt,
+        "idempotent_replay": false,
+    })))
+}
+
 async fn iacc_execution_feedback_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -883,6 +994,127 @@ async fn iacc_execution_feedback_handler(
         "kind": "iacc.action_execution",
         "execution": execution,
     })))
+}
+
+fn attach_iacc_cross_plane_receipt(
+    store: &IaccStore,
+    execution: &IaccActionExecution,
+    receipt: &CrossPlaneExecutionReceipt,
+) -> Result<IaccActionExecution, IaccStoreError> {
+    store.attach_cross_plane_receipt(
+        &execution.execution_id,
+        IaccCrossPlaneBridgeReceipt::new(
+            execution.execution_id.clone(),
+            receipt.id.clone(),
+            receipt.status.clone(),
+            receipt.dispatch_status.clone(),
+            receipt.audit_record_id.clone(),
+        ),
+    )
+}
+
+fn iacc_cross_plane_action_from_execution(
+    execution: &IaccActionExecution,
+    request: &IaccCrossPlaneBridgeRequest,
+) -> CrossPlaneAction {
+    let actor_principal = request
+        .actor_principal
+        .as_deref()
+        .or(execution.operator_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("iacc:operator");
+    let requested_capability = request
+        .requested_capability
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_iacc_cross_plane_capability(execution));
+    let mut action = CrossPlaneAction::new(actor_principal, requested_capability);
+    action.actor_identity_ref = request.actor_identity_ref.clone();
+    action.source_channel = Some(
+        request
+            .source_channel
+            .clone()
+            .unwrap_or_else(|| "iacc".to_string()),
+    );
+    action.session_id = Some(execution.incident_id.clone());
+    action.provider_account = request.provider_account.clone();
+    action.target_ref = request.target_ref.clone();
+    action.resource_ref = request
+        .resource_ref
+        .clone()
+        .or_else(|| Some(format!("text://{}", default_iacc_bridge_message(execution))));
+    action.risk = iacc_cross_plane_risk(execution);
+    action.data_classification = DataClassification::Internal;
+    action.identity_trust = IdentityTrust::Unknown;
+    action
+}
+
+fn default_iacc_cross_plane_capability(execution: &IaccActionExecution) -> &'static str {
+    match execution.action_type.as_str() {
+        "supplier_recovery" | "plan_bom_reconciliation" | "evidence_review" => {
+            "channel.feishu.send_text"
+        }
+        _ => "channel.feishu.send_text",
+    }
+}
+
+fn default_iacc_bridge_message(execution: &IaccActionExecution) -> String {
+    format!(
+        "IACC action {} [{}]: {}; incident={}; execution={}",
+        execution.action_type,
+        execution.owner_role,
+        execution.title,
+        execution.incident_id,
+        execution.execution_id
+    )
+}
+
+fn iacc_cross_plane_risk(execution: &IaccActionExecution) -> CrossPlaneRisk {
+    if execution.governance.contains("human_review") || execution.mode == "commit" {
+        CrossPlaneRisk::Medium
+    } else {
+        CrossPlaneRisk::Low
+    }
+}
+
+fn normalize_iacc_bridge_mode(mode: &str) -> String {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "commit" | "live" | "execute" => "commit".to_string(),
+        _ => "dry_run".to_string(),
+    }
+}
+
+fn iacc_cross_plane_bridge_outcome(
+    mode: &str,
+    decision: &runtime::CrossPlanePolicyDecision,
+) -> (String, String, Vec<String>, String, String) {
+    if decision.decision == PolicyDecisionKind::Allow {
+        if mode == "dry_run" {
+            return (
+                "planned".to_string(),
+                "dry_run".to_string(),
+                Vec::new(),
+                "dry_run".to_string(),
+                "iacc_cross_plane_bridge_dry_run_plan".to_string(),
+            );
+        }
+        return (
+            "planned".to_string(),
+            "human_review_required".to_string(),
+            vec!["iacc:human_review_required".to_string()],
+            "planned".to_string(),
+            "iacc_cross_plane_bridge_queued_for_human_review".to_string(),
+        );
+    }
+    (
+        "blocked".to_string(),
+        "policy_blocked".to_string(),
+        vec![format!("policy:{}", decision.reason)],
+        "blocked".to_string(),
+        "iacc_cross_plane_bridge_policy_blocked".to_string(),
+    )
 }
 
 fn enrich_iacc_agent_graph(

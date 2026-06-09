@@ -34,7 +34,10 @@ pub use domain::{
 };
 pub use entity::{IaccEntity, IaccEntityInput, IaccSourceKey};
 pub use evidence::{IaccEvidencePacket, IaccEvidenceSourceRef};
-pub use execution::{IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback};
+pub use execution::{
+    IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback,
+    IaccCrossPlaneBridgeReceipt,
+};
 pub use fact::{IaccFact, IaccFactInput};
 pub use incident::IaccIncident;
 pub use metric::{IaccMetricDefinition, IaccMetricState, IaccMetricStatus};
