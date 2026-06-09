@@ -11,8 +11,9 @@ use axum::{
 };
 use memory::store::session::SessionRecord;
 use runtime::{
-    AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode, IaccFact, IaccFactInput,
-    IaccIncident, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
+    AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode, IaccActionExecutionRequest,
+    IaccActionFeedback, IaccFact, IaccFactInput, IaccIncident, IaccStore, IaccStoreError,
+    IACC_SCHEMA_VERSION,
 };
 use serde::Deserialize;
 
@@ -48,6 +49,15 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(iacc_incident_analyze_handler),
         )
         .route("/api/iacc/analyses/:id", get(iacc_analysis_get_handler))
+        .route(
+            "/api/iacc/analyses/:analysis_id/actions/:action_id/execute",
+            post(iacc_action_execute_handler),
+        )
+        .route("/api/iacc/executions/:id", get(iacc_execution_get_handler))
+        .route(
+            "/api/iacc/executions/:id/feedback",
+            post(iacc_execution_feedback_handler),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +96,14 @@ struct IaccIncidentCreateRequest {
     evidence_packet_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct IaccExecutionFeedbackRequest {
+    outcome: String,
+    note: String,
+    #[serde(default)]
+    metric_delta: Option<f64>,
+}
+
 async fn iacc_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -107,6 +125,7 @@ async fn iacc_health_handler(
         "evidence_count": health.evidence_count,
         "incident_count": health.incident_count,
         "analysis_count": health.analysis_count,
+        "execution_count": health.execution_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": [
             "fact_ingest",
@@ -118,7 +137,8 @@ async fn iacc_health_handler(
             "evidence_packet_get",
             "evidence_context_item",
             "incident_agent_graph",
-            "incident_operational_analysis"
+            "incident_operational_analysis",
+            "action_execution_feedback"
         ],
     })))
 }
@@ -392,6 +412,63 @@ async fn iacc_analysis_get_handler(
     Ok(Json(serde_json::json!({
         "kind": "iacc.operational_analysis",
         "analysis": analysis,
+    })))
+}
+
+async fn iacc_action_execute_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath((analysis_id, action_id)): AxumPath<(String, String)>,
+    Json(request): Json<IaccActionExecutionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let execution = store
+        .execute_recommended_action(&analysis_id, &action_id, &request)
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.action_execution",
+        "execution": execution,
+    })))
+}
+
+async fn iacc_execution_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let execution = store
+        .get_execution(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC action execution not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.action_execution",
+        "execution": execution,
+    })))
+}
+
+async fn iacc_execution_feedback_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<IaccExecutionFeedbackRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let execution = store
+        .record_execution_feedback(
+            &id,
+            IaccActionFeedback::new(request.outcome, request.note, request.metric_delta),
+        )
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.action_execution",
+        "execution": execution,
     })))
 }
 

@@ -1405,6 +1405,9 @@ mod tests {
             .as_array()
             .is_some_and(|items| !items.is_empty()));
         let analysis_id = analysis_json["analysis"]["analysis_id"].as_str().unwrap();
+        let action_id = analysis_json["analysis"]["recommended_actions"][0]["action_id"]
+            .as_str()
+            .unwrap();
 
         let fetched_analysis = app
             .clone()
@@ -1418,6 +1421,75 @@ mod tests {
             .unwrap();
         assert_eq!(fetched_analysis.status(), StatusCode::OK);
 
+        let execution = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/iacc/analyses/{analysis_id}/actions/{action_id}/execute"
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "mode": "commit",
+                            "operator_id": "user:ops-planner",
+                            "note": "queue reviewed recovery action"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(execution.status(), StatusCode::OK);
+        let body = to_bytes(execution.into_body(), usize::MAX).await.unwrap();
+        let execution_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(execution_json["execution"]["mode"], "commit");
+        assert_eq!(
+            execution_json["execution"]["status"],
+            "queued_for_human_review"
+        );
+        let execution_id = execution_json["execution"]["execution_id"]
+            .as_str()
+            .unwrap();
+
+        let feedback = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/iacc/executions/{execution_id}/feedback"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "outcome": "resolved",
+                            "note": "supplier recovery completed",
+                            "metric_delta": -180
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(feedback.status(), StatusCode::OK);
+        let body = to_bytes(feedback.into_body(), usize::MAX).await.unwrap();
+        let feedback_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(feedback_json["execution"]["status"], "feedback_resolved");
+
+        let fetched_execution = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/iacc/executions/{execution_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched_execution.status(), StatusCode::OK);
+
         let fetched = app
             .oneshot(
                 Request::builder()
@@ -1428,6 +1500,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetched.status(), StatusCode::OK);
+        let body = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
+        let fetched_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fetched_json["incident"]["status"], "closed");
         let _ = std::fs::remove_dir_all(workspace);
     }
 

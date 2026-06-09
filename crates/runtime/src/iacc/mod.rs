@@ -9,6 +9,7 @@ mod analysis;
 mod attention;
 mod change;
 mod evidence;
+mod execution;
 mod fact;
 mod incident;
 mod metric;
@@ -21,6 +22,7 @@ pub use analysis::{
 pub use attention::{IaccAttentionItem, IaccSeverity};
 pub use change::IaccChangeEvent;
 pub use evidence::{IaccEvidencePacket, IaccEvidenceSourceRef};
+pub use execution::{IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback};
 pub use fact::{IaccFact, IaccFactInput};
 pub use incident::IaccIncident;
 pub use metric::{IaccMetricDefinition, IaccMetricState, IaccMetricStatus};

@@ -9,11 +9,12 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::{
-    IaccAttentionItem, IaccChangeEvent, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
-    IaccIncident, IaccMetricDefinition, IaccMetricState, IaccOperationalAnalysis, IaccSeverity,
+    IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
+    IaccChangeEvent, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccIncident,
+    IaccMetricDefinition, IaccMetricState, IaccOperationalAnalysis, IaccSeverity,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 4;
+pub const IACC_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -36,6 +37,7 @@ pub struct IaccHealth {
     pub evidence_count: u64,
     pub incident_count: u64,
     pub analysis_count: u64,
+    pub execution_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -88,6 +90,7 @@ impl IaccStore {
             evidence_count: count_table(&connection, "iacc_evidence_packet")?,
             incident_count: count_table(&connection, "iacc_incident")?,
             analysis_count: count_table(&connection, "iacc_operational_analysis")?,
+            execution_count: count_table(&connection, "iacc_action_execution")?,
         })
     }
 
@@ -407,15 +410,64 @@ impl IaccStore {
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        connection
-            .query_row(
-                "SELECT analysis_json FROM iacc_operational_analysis WHERE analysis_id = ?1",
-                params![analysis_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
-            .transpose()
+        find_analysis(&connection, analysis_id)
+    }
+
+    pub fn execute_recommended_action(
+        &self,
+        analysis_id: &str,
+        action_id: &str,
+        request: &IaccActionExecutionRequest,
+    ) -> Result<IaccActionExecution, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let analysis = find_analysis(&connection, analysis_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(analysis_id.to_string()))?;
+        let action = analysis
+            .recommended_actions
+            .iter()
+            .find(|action| action.action_id == action_id)
+            .cloned()
+            .ok_or_else(|| IaccStoreError::NotFound(action_id.to_string()))?;
+        let execution = IaccActionExecution::from_action(&analysis, &action, request);
+        insert_execution(&connection, &execution)?;
+        Ok(execution)
+    }
+
+    pub fn get_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<IaccActionExecution>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_execution(&connection, execution_id)
+    }
+
+    pub fn record_execution_feedback(
+        &self,
+        execution_id: &str,
+        feedback: IaccActionFeedback,
+    ) -> Result<IaccActionExecution, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut execution = find_execution(&connection, execution_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(execution_id.to_string()))?;
+        execution.apply_feedback(feedback);
+        insert_execution(&connection, &execution)?;
+        if execution.status == "feedback_resolved" {
+            if let Some(mut incident) = find_incident(&connection, &execution.incident_id)? {
+                incident.status = "closed".to_string();
+                incident.updated_at = Utc::now();
+                upsert_incident(&connection, &incident)?;
+            }
+        }
+        Ok(execution)
     }
 }
 
@@ -427,7 +479,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 4, datetime('now'))
+        VALUES (1, 5, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -532,7 +584,23 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_iacc_analysis_incident
-            ON iacc_operational_analysis(incident_id, created_at DESC);",
+            ON iacc_operational_analysis(incident_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_action_execution (
+            execution_id TEXT PRIMARY KEY,
+            analysis_id TEXT NOT NULL,
+            incident_id TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            execution_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_action_execution_analysis
+            ON iacc_action_execution(analysis_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_iacc_action_execution_incident
+            ON iacc_action_execution(incident_id, updated_at DESC);",
     )
 }
 
@@ -937,6 +1005,60 @@ fn insert_analysis(
     Ok(())
 }
 
+fn find_analysis(
+    connection: &Connection,
+    analysis_id: &str,
+) -> Result<Option<IaccOperationalAnalysis>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT analysis_json FROM iacc_operational_analysis WHERE analysis_id = ?1",
+            params![analysis_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn insert_execution(
+    connection: &Connection,
+    execution: &IaccActionExecution,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_action_execution (
+            execution_id, analysis_id, incident_id, action_id, status, mode,
+            execution_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            execution.execution_id,
+            execution.analysis_id,
+            execution.incident_id,
+            execution.action_id,
+            execution.status,
+            execution.mode,
+            serde_json::to_string(execution)?,
+            execution.created_at.to_rfc3339(),
+            execution.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_execution(
+    connection: &Connection,
+    execution_id: &str,
+) -> Result<Option<IaccActionExecution>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT execution_json FROM iacc_action_execution WHERE execution_id = ?1",
+            params![execution_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
 fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> IaccAttentionItem {
     let now = Utc::now();
     let severity = match change.severity_hint.as_str() {
@@ -1216,5 +1338,80 @@ mod tests {
             .expect("incident exists");
         assert_eq!(updated_incident.status, "analyzed");
         assert_eq!(store.health().unwrap().analysis_count, 1);
+    }
+
+    #[test]
+    fn execute_action_and_feedback_closes_incident() {
+        let store = IaccStore::in_memory().expect("store opens");
+        let fact = IaccFact::from_input(IaccFactInput {
+            fact_id: Some("fact-execution-shortage".to_string()),
+            snapshot_id: Some("snapshot-execution-shortage".to_string()),
+            fact_type: "supply.material_shortage".to_string(),
+            entity_refs: vec!["component:gpu-execution".to_string()],
+            metric_key: Some("material_shortage_risk".to_string()),
+            dimensions: serde_json::json!({"week": "2026-W29"}),
+            measures: serde_json::json!({"short_qty": 260}),
+            event_time: None,
+            valid_from: None,
+            valid_to: None,
+            source_ref: None,
+            confidence: Some(0.93),
+            raw_hash: None,
+        });
+        store.ingest_fact(&fact).expect("fact ingests");
+        let recompute = store.recompute_metrics().expect("recompute");
+        let packet = store
+            .build_evidence_packet(
+                Some(&recompute.attention[0].attention_id),
+                Some("GPU shortage execution incident"),
+            )
+            .expect("packet builds");
+        let mut incident = IaccIncident::new("GPU shortage execution");
+        incident.attention_id = packet.attention_id.clone();
+        incident.evidence_packet_id = Some(packet.packet_id.clone());
+        store.create_incident(&incident).expect("incident saves");
+        let analysis = store
+            .analyze_incident(&incident.incident_id)
+            .expect("analysis");
+        let action_id = analysis.recommended_actions[0].action_id.clone();
+
+        let execution = store
+            .execute_recommended_action(
+                &analysis.analysis_id,
+                &action_id,
+                &IaccActionExecutionRequest {
+                    mode: "commit".to_string(),
+                    operator_id: Some("user:planner".to_string()),
+                    note: Some("review and queue recovery".to_string()),
+                },
+            )
+            .expect("execution saves");
+
+        assert_eq!(execution.mode, "commit");
+        assert_eq!(execution.status, "queued_for_human_review");
+        assert_eq!(execution.action_type, "supplier_recovery");
+        assert_eq!(store.health().unwrap().execution_count, 1);
+
+        let execution = store
+            .record_execution_feedback(
+                &execution.execution_id,
+                IaccActionFeedback::new("resolved", "supplier commit secured", Some(-260.0)),
+            )
+            .expect("feedback saves");
+        assert_eq!(execution.status, "feedback_resolved");
+        assert_eq!(execution.feedback.as_ref().unwrap().outcome, "resolved");
+        assert_eq!(
+            store
+                .get_execution(&execution.execution_id)
+                .unwrap()
+                .unwrap()
+                .receipt["feedback"]["note"],
+            "supplier commit secured"
+        );
+        let incident = store
+            .get_incident(&incident.incident_id)
+            .unwrap()
+            .expect("incident exists");
+        assert_eq!(incident.status, "closed");
     }
 }
