@@ -1380,6 +1380,44 @@ mod tests {
             .any(|evidence| evidence["reference"] == format!("iacc:evidence:{packet_id}")));
         let incident_id = incident_json["incident"]["incident_id"].as_str().unwrap();
 
+        let analysis = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/iacc/incidents/{incident_id}/analyze"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(analysis.status(), StatusCode::OK);
+        let body = to_bytes(analysis.into_body(), usize::MAX).await.unwrap();
+        let analysis_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(analysis_json["analysis"]["incident_id"], incident_id);
+        assert!(analysis_json["analysis"]["attribution_candidates"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        assert!(analysis_json["analysis"]["impact_paths"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        assert!(analysis_json["analysis"]["recommended_actions"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        let analysis_id = analysis_json["analysis"]["analysis_id"].as_str().unwrap();
+
+        let fetched_analysis = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/iacc/analyses/{analysis_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched_analysis.status(), StatusCode::OK);
+
         let fetched = app
             .oneshot(
                 Request::builder()

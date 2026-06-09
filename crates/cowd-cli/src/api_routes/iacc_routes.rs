@@ -43,6 +43,11 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/iacc/incidents", post(iacc_incident_create_handler))
         .route("/api/iacc/incidents/:id", get(iacc_incident_get_handler))
+        .route(
+            "/api/iacc/incidents/:id/analyze",
+            post(iacc_incident_analyze_handler),
+        )
+        .route("/api/iacc/analyses/:id", get(iacc_analysis_get_handler))
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +106,7 @@ async fn iacc_health_handler(
         "attention_count": health.attention_count,
         "evidence_count": health.evidence_count,
         "incident_count": health.incident_count,
+        "analysis_count": health.analysis_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": [
             "fact_ingest",
@@ -111,7 +117,8 @@ async fn iacc_health_handler(
             "evidence_packet_build",
             "evidence_packet_get",
             "evidence_context_item",
-            "incident_agent_graph"
+            "incident_agent_graph",
+            "incident_operational_analysis"
         ],
     })))
 }
@@ -353,6 +360,38 @@ async fn iacc_incident_get_handler(
     Ok(Json(serde_json::json!({
         "kind": "iacc.incident",
         "incident": incident,
+    })))
+}
+
+async fn iacc_incident_analyze_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let analysis = store.analyze_incident(&id).map_err(|error| match error {
+        IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.operational_analysis",
+        "analysis": analysis,
+    })))
+}
+
+async fn iacc_analysis_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let analysis = store
+        .get_analysis(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC operational analysis not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.operational_analysis",
+        "analysis": analysis,
     })))
 }
 

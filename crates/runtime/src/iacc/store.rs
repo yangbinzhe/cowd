@@ -10,10 +10,10 @@ use thiserror::Error;
 
 use super::{
     IaccAttentionItem, IaccChangeEvent, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
-    IaccIncident, IaccMetricDefinition, IaccMetricState, IaccSeverity,
+    IaccIncident, IaccMetricDefinition, IaccMetricState, IaccOperationalAnalysis, IaccSeverity,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 3;
+pub const IACC_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -35,6 +35,7 @@ pub struct IaccHealth {
     pub attention_count: u64,
     pub evidence_count: u64,
     pub incident_count: u64,
+    pub analysis_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,6 +87,7 @@ impl IaccStore {
             attention_count: count_table(&connection, "iacc_attention_item")?,
             evidence_count: count_table(&connection, "iacc_evidence_packet")?,
             incident_count: count_table(&connection, "iacc_incident")?,
+            analysis_count: count_table(&connection, "iacc_operational_analysis")?,
         })
     }
 
@@ -335,15 +337,7 @@ impl IaccStore {
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        connection
-            .query_row(
-                "SELECT packet_json FROM iacc_evidence_packet WHERE packet_id = ?1",
-                params![packet_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
-            .transpose()
+        find_evidence_packet(&connection, packet_id)
     }
 
     pub fn create_incident(&self, incident: &IaccIncident) -> Result<IaccIncident, IaccStoreError> {
@@ -360,10 +354,63 @@ impl IaccStore {
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_incident(&connection, incident_id)
+    }
+
+    pub fn analyze_incident(
+        &self,
+        incident_id: &str,
+    ) -> Result<IaccOperationalAnalysis, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut incident = find_incident(&connection, incident_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(incident_id.to_string()))?;
+        let packet_id = incident
+            .evidence_packet_id
+            .clone()
+            .ok_or_else(|| IaccStoreError::NotFound("incident evidence packet".to_string()))?;
+        let mut packet = find_evidence_packet(&connection, &packet_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(packet_id.clone()))?;
+        let analysis = IaccOperationalAnalysis::from_evidence(incident_id, &packet);
+
+        packet.attribution_candidates = analysis
+            .attribution_candidates
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        packet.impact_paths = analysis
+            .impact_paths
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        packet.missing_evidence.retain(|item| {
+            !item.contains("attribution_not_computed")
+                && !item.contains("impact_paths_not_computed")
+        });
+        packet.confidence = packet.confidence.max(analysis.confidence);
+        insert_evidence_packet(&connection, &packet)?;
+        insert_analysis(&connection, &analysis)?;
+
+        incident.status = "analyzed".to_string();
+        incident.updated_at = Utc::now();
+        upsert_incident(&connection, &incident)?;
+        Ok(analysis)
+    }
+
+    pub fn get_analysis(
+        &self,
+        analysis_id: &str,
+    ) -> Result<Option<IaccOperationalAnalysis>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         connection
             .query_row(
-                "SELECT incident_json FROM iacc_incident WHERE incident_id = ?1",
-                params![incident_id],
+                "SELECT analysis_json FROM iacc_operational_analysis WHERE analysis_id = ?1",
+                params![analysis_id],
                 |row| row.get::<_, String>(0),
             )
             .optional()?
@@ -380,7 +427,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 3, datetime('now'))
+        VALUES (1, 4, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -473,7 +520,19 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_iacc_incident_updated
-            ON iacc_incident(updated_at DESC);",
+            ON iacc_incident(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_operational_analysis (
+            analysis_id TEXT PRIMARY KEY,
+            incident_id TEXT NOT NULL,
+            evidence_packet_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            analysis_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_analysis_incident
+            ON iacc_operational_analysis(incident_id, created_at DESC);",
     )
 }
 
@@ -558,6 +617,21 @@ fn insert_evidence_packet(
         ],
     )?;
     Ok(())
+}
+
+fn find_evidence_packet(
+    connection: &Connection,
+    packet_id: &str,
+) -> Result<Option<IaccEvidencePacket>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT packet_json FROM iacc_evidence_packet WHERE packet_id = ?1",
+            params![packet_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -826,6 +900,43 @@ fn upsert_incident(connection: &Connection, incident: &IaccIncident) -> Result<(
     Ok(())
 }
 
+fn find_incident(
+    connection: &Connection,
+    incident_id: &str,
+) -> Result<Option<IaccIncident>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT incident_json FROM iacc_incident WHERE incident_id = ?1",
+            params![incident_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn insert_analysis(
+    connection: &Connection,
+    analysis: &IaccOperationalAnalysis,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_operational_analysis (
+            analysis_id, incident_id, evidence_packet_id, status, confidence,
+            analysis_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            analysis.analysis_id,
+            analysis.incident_id,
+            analysis.evidence_packet_id,
+            analysis.status,
+            analysis.confidence,
+            serde_json::to_string(analysis)?,
+            analysis.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
 fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> IaccAttentionItem {
     let now = Utc::now();
     let severity = match change.severity_hint.as_str() {
@@ -1041,5 +1152,69 @@ mod tests {
             .expect("incident exists");
         assert_eq!(loaded.title, "material risk");
         assert_eq!(store.health().unwrap().incident_count, 1);
+    }
+
+    #[test]
+    fn analyze_incident_projects_attribution_impact_and_actions() {
+        let store = IaccStore::in_memory().expect("store opens");
+        let fact = IaccFact::from_input(IaccFactInput {
+            fact_id: Some("fact-analysis-shortage".to_string()),
+            snapshot_id: Some("snapshot-analysis-shortage".to_string()),
+            fact_type: "supply.material_shortage".to_string(),
+            entity_refs: vec!["component:gpu-analysis".to_string()],
+            metric_key: Some("material_shortage_risk".to_string()),
+            dimensions: serde_json::json!({"week": "2026-W27"}),
+            measures: serde_json::json!({"short_qty": 240}),
+            event_time: None,
+            valid_from: None,
+            valid_to: None,
+            source_ref: None,
+            confidence: Some(0.91),
+            raw_hash: None,
+        });
+        store.ingest_fact(&fact).expect("fact ingests");
+        let recompute = store.recompute_metrics().expect("recompute");
+        let packet = store
+            .build_evidence_packet(
+                Some(&recompute.attention[0].attention_id),
+                Some("GPU shortage threatens build plan"),
+            )
+            .expect("packet builds");
+        let mut incident = IaccIncident::new("GPU shortage");
+        incident.attention_id = packet.attention_id.clone();
+        incident.evidence_packet_id = Some(packet.packet_id.clone());
+        store.create_incident(&incident).expect("incident saves");
+
+        let analysis = store
+            .analyze_incident(&incident.incident_id)
+            .expect("incident analyzes");
+
+        assert_eq!(analysis.incident_id, incident.incident_id);
+        assert_eq!(analysis.evidence_packet_id, packet.packet_id);
+        assert_eq!(
+            analysis.attribution_candidates[0].cause_type,
+            "supply_constraint"
+        );
+        assert_eq!(
+            analysis.impact_paths[0].impact_type,
+            "material_availability_risk"
+        );
+        assert_eq!(
+            analysis.recommended_actions[0].action_type,
+            "supplier_recovery"
+        );
+        let updated_packet = store
+            .get_evidence_packet(&packet.packet_id)
+            .expect("packet loads")
+            .expect("packet exists");
+        assert!(!updated_packet.attribution_candidates.is_empty());
+        assert!(!updated_packet.impact_paths.is_empty());
+        assert!(updated_packet.missing_evidence.is_empty());
+        let updated_incident = store
+            .get_incident(&incident.incident_id)
+            .expect("incident loads")
+            .expect("incident exists");
+        assert_eq!(updated_incident.status, "analyzed");
+        assert_eq!(store.health().unwrap().analysis_count, 1);
     }
 }

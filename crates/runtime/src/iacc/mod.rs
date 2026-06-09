@@ -5,6 +5,7 @@
 //! evidence packets without replacing source systems, connector resources, or
 //! memory runtime.
 
+mod analysis;
 mod attention;
 mod change;
 mod evidence;
@@ -14,6 +15,9 @@ mod metric;
 mod source;
 mod store;
 
+pub use analysis::{
+    IaccAttributionCandidate, IaccImpactPath, IaccOperationalAnalysis, IaccRecommendedAction,
+};
 pub use attention::{IaccAttentionItem, IaccSeverity};
 pub use change::IaccChangeEvent;
 pub use evidence::{IaccEvidencePacket, IaccEvidenceSourceRef};
