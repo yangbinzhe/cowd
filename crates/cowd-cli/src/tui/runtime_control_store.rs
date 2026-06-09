@@ -808,6 +808,7 @@ mod tests {
                     mode: "collaborative".to_string(),
                 }],
             },
+            lifecycle: Vec::new(),
         });
 
         assert!(snapshot.daemon_running);

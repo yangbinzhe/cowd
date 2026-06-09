@@ -1,0 +1,15 @@
+[2026-06-09T14:16:05+08:00] START webui_live_workbench
+   Compiling cowd-cli v0.9.69 (/media/yi/Datas/workspace/cowd/crates/cowd-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.78s
+
+Running 1 test using 1 worker
+
+(node:2849099) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:2849099) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓  1 [chromium] › tasks-workbench.live.e2e.spec.js:11:1 › live gateway workbench renders persisted task phase state (386ms)
+
+  1 passed (1.0s)
+live WebUI workbench scenario passed
+[2026-06-09T14:16:23+08:00] END webui_live_workbench status=0 elapsed=18s target_before=2206646099 target_after=2206646099

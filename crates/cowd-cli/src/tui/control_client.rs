@@ -59,6 +59,8 @@ pub struct DaemonRuntimeSnapshot {
     pub sessions: Vec<String>,
     #[serde(default)]
     pub leases: DaemonLeaseSnapshot,
+    #[serde(default)]
+    pub lifecycle: Vec<DaemonSessionLifecycleSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -67,6 +69,67 @@ pub struct DaemonLeaseSnapshot {
     pub total: usize,
     #[serde(default)]
     pub items: Vec<DaemonSessionLease>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DaemonSessionLifecycleSnapshot {
+    pub session_id: String,
+    pub state: String,
+    #[serde(default)]
+    pub attachments: Vec<DaemonSessionAttachment>,
+    #[serde(default)]
+    pub next_sequence: usize,
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DaemonSessionAttachment {
+    pub session_id: String,
+    pub actor: DaemonSessionActor,
+    #[serde(default)]
+    pub attached_at_ms: u64,
+    #[serde(default)]
+    pub last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DaemonSessionActor {
+    pub id: String,
+    pub surface: String,
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DaemonSessionLifecycleEvent {
+    pub session_id: String,
+    pub sequence: usize,
+    pub event_type: String,
+    #[serde(default)]
+    pub actor: Option<DaemonSessionActor>,
+    pub state: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DaemonSessionAttachResponse {
+    pub ok: bool,
+    pub event: DaemonSessionLifecycleEvent,
+    #[serde(default)]
+    pub snapshot: Option<DaemonSessionLifecycleSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DaemonSessionReplayResponse {
+    pub ok: bool,
+    pub session_id: String,
+    pub from_sequence: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub next_sequence: usize,
+    #[serde(default)]
+    pub events: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -256,6 +319,82 @@ impl DaemonControlClient {
         }
 
         Ok(value)
+    }
+
+    pub async fn attach_session(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+        surface: &str,
+        role: Option<&str>,
+    ) -> Result<DaemonSessionAttachResponse, DaemonControlError> {
+        let value = self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "session.attach",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "session_id": session_id,
+                "actor_id": actor_id,
+                "surface": surface,
+                "role": role,
+            }))
+            .await?,
+            "daemon rejected session.attach request",
+        )?;
+
+        serde_json::from_value(value).map_err(DaemonControlError::Json)
+    }
+
+    pub async fn detach_session(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+    ) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "session.detach",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "session_id": session_id,
+                "actor_id": actor_id,
+            }))
+            .await?,
+            "daemon rejected session.detach request",
+        )
+    }
+
+    pub async fn lifecycle_snapshot(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, DaemonControlError> {
+        self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "session.lifecycle",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "session_id": session_id,
+            }))
+            .await?,
+            "daemon rejected session.lifecycle request",
+        )
+    }
+
+    pub async fn replay_session(
+        &self,
+        session_id: &str,
+        from_sequence: usize,
+        limit: usize,
+    ) -> Result<DaemonSessionReplayResponse, DaemonControlError> {
+        let value = self.expect_ok(
+            self.send_json(serde_json::json!({
+                "cmd": "session.replay",
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "session_id": session_id,
+                "from_sequence": from_sequence,
+                "limit": limit,
+            }))
+            .await?,
+            "daemon rejected session.replay request",
+        )?;
+
+        serde_json::from_value(value).map_err(DaemonControlError::Json)
     }
 
     pub async fn task_status(&self) -> Result<serde_json::Value, DaemonControlError> {
@@ -1048,6 +1187,106 @@ mod tests {
         assert_eq!(ensured.session_id, "session-1");
         assert!(ensured.created);
         assert_eq!(ensured.active_sessions, 1);
+
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_control_client_sends_attach_detach_replay_commands() {
+        let socket = temp_socket("session-lifecycle");
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let server = tokio::spawn(async move {
+            for expected in ["session.attach", "session.replay", "session.detach"] {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("read command");
+                let command: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("command json");
+                assert_eq!(command.get("cmd").and_then(|v| v.as_str()), Some(expected));
+                assert_eq!(
+                    command.get("session_id").and_then(|v| v.as_str()),
+                    Some("session-1")
+                );
+                match expected {
+                    "session.attach" => {
+                        assert_eq!(
+                            command.get("actor_id").and_then(|v| v.as_str()),
+                            Some("tui:1")
+                        );
+                        writer
+                            .write_all(br#"{"ok":true,"event":{"session_id":"session-1","sequence":0,"event_type":"session.attach","actor":{"id":"tui:1","surface":"tui","role":"writer"},"state":"attached","created_at_ms":1},"snapshot":{"session_id":"session-1","state":"attached","attachments":[],"next_sequence":1,"updated_at_ms":1}}"#)
+                            .await
+                            .expect("write attach");
+                    }
+                    "session.replay" => {
+                        assert_eq!(
+                            command.get("from_sequence").and_then(|v| v.as_u64()),
+                            Some(0)
+                        );
+                        writer
+                            .write_all(br#"{"ok":true,"session_id":"session-1","from_sequence":0,"limit":100,"total":0,"next_sequence":0,"events":[]}"#)
+                            .await
+                            .expect("write replay");
+                    }
+                    _ => {
+                        writer
+                            .write_all(br#"{"ok":true,"event":{"session_id":"session-1","sequence":1,"event_type":"session.detach","state":"detached","created_at_ms":2},"snapshot":{"session_id":"session-1","state":"detached","attachments":[],"next_sequence":2,"updated_at_ms":2}}"#)
+                            .await
+                            .expect("write detach");
+                    }
+                }
+                writer.write_all(b"\n").await.expect("write newline");
+            }
+        });
+
+        let client = DaemonControlClient::new(&socket).with_timeout(Duration::from_secs(1));
+        let attached = client
+            .attach_session("session-1", "tui:1", "tui", Some("writer"))
+            .await
+            .expect("attach");
+        assert_eq!(attached.event.sequence, 0);
+        let replay = client
+            .replay_session("session-1", 0, 100)
+            .await
+            .expect("replay");
+        assert_eq!(replay.next_sequence, 0);
+        let detached = client
+            .detach_session("session-1", "tui:1")
+            .await
+            .expect("detach");
+        assert_eq!(detached["snapshot"]["state"], "detached");
+
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_reads_lifecycle_projection() {
+        let socket = temp_socket("runtime-lifecycle");
+        let listener = UnixListener::bind(&socket).expect("bind test socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read command");
+            writer
+                .write_all(br#"{"ok":true,"kind":"daemon_runtime_snapshot","protocol_version":1,"daemon":"cowd","active_sessions":1,"uptime_secs":9,"sessions":["s1"],"leases":{"total":0,"items":[]},"lifecycle":[{"session_id":"s1","state":"attached","attachments":[{"session_id":"s1","actor":{"id":"tui:1","surface":"tui","role":"writer"},"attached_at_ms":1,"last_seen_ms":1}],"next_sequence":1,"updated_at_ms":1}]}"#)
+                .await
+                .expect("write response");
+            writer.write_all(b"\n").await.expect("write newline");
+        });
+
+        let snapshot = DaemonControlClient::new(&socket)
+            .with_timeout(Duration::from_secs(1))
+            .runtime_snapshot()
+            .await
+            .expect("snapshot");
+        assert_eq!(snapshot.lifecycle[0].state, "attached");
+        assert_eq!(snapshot.lifecycle[0].attachments[0].actor.surface, "tui");
 
         server.await.expect("server task");
         let _ = std::fs::remove_file(socket);

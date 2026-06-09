@@ -3219,6 +3219,7 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
     let daemon_client = tui::control_client::DaemonControlClient::default_local();
     let mut daemon_session_ids: Vec<String> = Vec::new();
     let mut daemon_session_attached = false;
+    let daemon_actor_id = format!("tui:{}", std::process::id());
     let mut daemon_lease_owner: Option<String> = None;
     let mut daemon_session_lease: Option<tui::control_client::DaemonSessionLease> = None;
     match SHARED_RT.block_on(daemon_client.status()) {
@@ -3246,7 +3247,44 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
                         "system",
                         &format!("Daemon session {action}: {}", ensured.session_id),
                     );
-                    let lease_owner = format!("tui:{}", std::process::id());
+                    match SHARED_RT.block_on(daemon_client.attach_session(
+                        &ensured.session_id,
+                        &daemon_actor_id,
+                        "tui",
+                        Some("writer"),
+                    )) {
+                        Ok(attached) => {
+                            state.add_message(
+                                "system",
+                                &format!(
+                                    "Daemon lifecycle attached: state={}, seq={}",
+                                    attached.event.state, attached.event.sequence
+                                ),
+                            );
+                            match SHARED_RT.block_on(daemon_client.replay_session(
+                                &ensured.session_id,
+                                0,
+                                100,
+                            )) {
+                                Ok(replay) => state.add_message(
+                                    "system",
+                                    &format!(
+                                        "Daemon replay ready: total={}, next_seq={}",
+                                        replay.total, replay.next_sequence
+                                    ),
+                                ),
+                                Err(err) => state.add_message(
+                                    "system",
+                                    &format!("Daemon replay unavailable: {err}"),
+                                ),
+                            }
+                        }
+                        Err(err) => state.add_message(
+                            "system",
+                            &format!("Daemon lifecycle attach unavailable: {err}"),
+                        ),
+                    }
+                    let lease_owner = daemon_actor_id.clone();
                     match SHARED_RT.block_on(daemon_client.acquire_session_lease(
                         &ensured.session_id,
                         &lease_owner,
@@ -3616,6 +3654,13 @@ fn run_tui_repl(mut cli: LiveCli, workspace: PathBuf) -> Result<(), Box<dyn std:
             SHARED_RT.block_on(daemon_client.release_session_lease(&session_id, owner))
         {
             tracing::warn!(error = %err, session_id = %session_id, owner, "failed to release daemon session lease");
+        }
+    }
+    if daemon_session_attached {
+        if let Err(err) =
+            SHARED_RT.block_on(daemon_client.detach_session(&session_id, &daemon_actor_id))
+        {
+            tracing::warn!(error = %err, session_id = %session_id, actor = %daemon_actor_id, "failed to detach daemon session lifecycle");
         }
     }
     cli.persist_session()?;

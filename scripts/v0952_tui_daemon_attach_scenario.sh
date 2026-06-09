@@ -133,6 +133,8 @@ tmux capture-pane -pt "$TUI_SESSION" -S -260 >"$TUI_CAPTURE"
 
 rg -q "Daemon control connected" "$TUI_CAPTURE"
 rg -q "Daemon session (created|attached)" "$TUI_CAPTURE"
+rg -q "Daemon lifecycle attached" "$TUI_CAPTURE"
+rg -q "Daemon replay ready" "$TUI_CAPTURE"
 rg -q "Daemon session lease acquired" "$TUI_CAPTURE"
 rg -q "Daemon runtime projection connected|Daemon projection degraded" "$TUI_CAPTURE"
 if rg -q "__COWD_TUI_EXIT__[1-9]|panic|backtrace|thread .* panicked|failed to initialize terminal|Run cowd --help" "$TUI_CAPTURE"; then
