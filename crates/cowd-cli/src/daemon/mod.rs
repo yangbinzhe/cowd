@@ -27,6 +27,7 @@ use crate::gateway::ActiveSessions;
 use crate::runtime_protocol::RuntimeRequest;
 use crate::runtime_service::RuntimeService;
 use crate::session_kernel::SessionKernel;
+use crate::session_lifecycle_kernel::SessionLifecycleKernel;
 use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use memory::UnifiedSessionStore;
@@ -409,6 +410,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
 
     let event_bus = SessionEventBus::new();
     let lease_registry = Arc::new(SessionLeaseRegistry::default());
+    let lifecycle_kernel = Arc::new(SessionLifecycleKernel::new());
 
     let unified_store = crate::get_unified_store().ok().map(|s| Arc::new(s.clone()));
     let session_kernel = Arc::new(SessionKernel::new(
@@ -642,6 +644,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
         let event_bus = event_bus.clone();
         let unified_store = unified_store.clone();
         let lease_registry = lease_registry.clone();
+        let lifecycle_kernel = lifecycle_kernel.clone();
+        let session_kernel_for_socket = session_kernel.clone();
         let task_kernel = app_state.task_kernel.clone();
         let approval_gate = app_state.approval_gate.clone();
         let app_state_for_socket = app_state.clone();
@@ -656,6 +660,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
                             let event_bus = event_bus.clone();
                             let unified_store = unified_store.clone();
                             let lease_registry = lease_registry.clone();
+                            let lifecycle_kernel = lifecycle_kernel.clone();
+                            let session_kernel = session_kernel_for_socket.clone();
                             let task_kernel = task_kernel.clone();
                             let approval_gate = approval_gate.clone();
                             let app_state = app_state_for_socket.clone();
@@ -665,6 +671,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
                                 event_bus,
                                 unified_store,
                                 lease_registry,
+                                session_kernel,
+                                lifecycle_kernel,
                                 task_kernel,
                                 approval_gate,
                                 app_state,
@@ -757,6 +765,8 @@ async fn handle_unix_client(
     event_bus: Arc<SessionEventBus>,
     unified_store: Option<Arc<UnifiedSessionStore>>,
     lease_registry: Arc<SessionLeaseRegistry>,
+    session_kernel: Arc<SessionKernel>,
+    lifecycle_kernel: Arc<SessionLifecycleKernel>,
     task_kernel: Arc<crate::task_kernel::TaskKernel>,
     approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
     app_state: Arc<api_routes::AppState>,
@@ -765,7 +775,13 @@ async fn handle_unix_client(
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
-    let runtime_service = RuntimeService::new(sessions.clone(), lease_registry.clone(), started_at);
+    let runtime_service = RuntimeService::new(
+        sessions.clone(),
+        lease_registry.clone(),
+        session_kernel,
+        lifecycle_kernel,
+        started_at,
+    );
 
     loop {
         line.clear();
@@ -1018,6 +1034,63 @@ async fn handle_unix_client(
                                         .unwrap_or_default();
                                     runtime_service
                                         .release_session_lease_value(session_id, owner)
+                                        .await
+                                }
+                                Some("session.attach") | Some("attach_session") => {
+                                    let session_id = cmd
+                                        .get("session_id")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or_default();
+                                    let actor_id = cmd
+                                        .get("actor_id")
+                                        .or_else(|| cmd.get("owner"))
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("anonymous");
+                                    let surface = cmd
+                                        .get("surface")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("socket");
+                                    let role = cmd.get("role").and_then(|s| s.as_str());
+                                    runtime_service
+                                        .attach_session_value(session_id, actor_id, surface, role)
+                                        .await
+                                }
+                                Some("session.detach") | Some("detach_session") => {
+                                    let session_id = cmd
+                                        .get("session_id")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or_default();
+                                    let actor_id = cmd
+                                        .get("actor_id")
+                                        .or_else(|| cmd.get("owner"))
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or_default();
+                                    runtime_service
+                                        .detach_session_value(session_id, actor_id)
+                                        .await
+                                }
+                                Some("session.lifecycle") | Some("session.lifecycle.snapshot") => {
+                                    let session_id = cmd.get("session_id").and_then(|s| s.as_str());
+                                    runtime_service.lifecycle_snapshot_value(session_id).await
+                                }
+                                Some("session.replay") | Some("replay_session") => {
+                                    let session_id = cmd
+                                        .get("session_id")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or_default();
+                                    let from_sequence = cmd
+                                        .get("from_sequence")
+                                        .or_else(|| cmd.get("from_seq"))
+                                        .and_then(|value| value.as_u64())
+                                        .unwrap_or(0)
+                                        as usize;
+                                    let limit = cmd
+                                        .get("limit")
+                                        .and_then(|value| value.as_u64())
+                                        .unwrap_or(100)
+                                        as usize;
+                                    runtime_service
+                                        .replay_session_value(session_id, from_sequence, limit)
                                         .await
                                 }
                                 Some("ensure_session") => {

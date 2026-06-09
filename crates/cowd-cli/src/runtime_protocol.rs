@@ -11,6 +11,10 @@ pub(crate) enum RuntimeCommandKind {
     SessionList,
     SessionLeaseAcquire,
     SessionLeaseRelease,
+    SessionAttach,
+    SessionDetach,
+    SessionLifecycle,
+    SessionReplay,
     SessionChat,
     Unknown,
 }
@@ -25,6 +29,10 @@ impl RuntimeCommandKind {
             "list_sessions" | "session.list" => Self::SessionList,
             "acquire_session_lease" | "session.lease.acquire" => Self::SessionLeaseAcquire,
             "release_session_lease" | "session.lease.release" => Self::SessionLeaseRelease,
+            "attach_session" | "session.attach" => Self::SessionAttach,
+            "detach_session" | "session.detach" => Self::SessionDetach,
+            "session.lifecycle" | "session.lifecycle.snapshot" => Self::SessionLifecycle,
+            "replay_session" | "session.replay" => Self::SessionReplay,
             "chat" | "chat_stream" | "session.chat" => Self::SessionChat,
             _ => Self::Unknown,
         }
@@ -39,6 +47,10 @@ impl RuntimeCommandKind {
             Self::SessionList => "session.list",
             Self::SessionLeaseAcquire => "session.lease.acquire",
             Self::SessionLeaseRelease => "session.lease.release",
+            Self::SessionAttach => "session.attach",
+            Self::SessionDetach => "session.detach",
+            Self::SessionLifecycle => "session.lifecycle",
+            Self::SessionReplay => "session.replay",
             Self::SessionChat => "session.chat",
             Self::Unknown => "unknown",
         }
@@ -251,5 +263,21 @@ mod tests {
 
         assert_eq!(request.kind(), RuntimeCommandKind::SessionEnsure);
         assert_eq!(request.session_id_str(), Some("session-a"));
+    }
+
+    #[test]
+    fn session_lifecycle_commands_have_stable_wire_aliases() {
+        assert_eq!(
+            RuntimeCommandKind::from_wire("attach_session"),
+            RuntimeCommandKind::SessionAttach
+        );
+        assert_eq!(
+            RuntimeCommandKind::from_wire("session.detach").as_wire(),
+            "session.detach"
+        );
+        assert_eq!(
+            RuntimeCommandKind::from_wire("session.replay"),
+            RuntimeCommandKind::SessionReplay
+        );
     }
 }
