@@ -5950,6 +5950,14 @@ providers:
             json["lean_probe"]["stable_head_hash"]
         );
         assert_eq!(json["cache_stability"]["stable_head_reusable"], true);
+        assert_eq!(
+            json["snapshot"]["stable_head_hash"],
+            json["lean_probe"]["stable_head_hash"]
+        );
+        assert_eq!(
+            json["budget_explanation"]["total_tokens"],
+            json["envelope"]["budget"]["total_tokens"]
+        );
         assert_eq!(json["mode_coverage"]["all_profiles_covered"], true);
         assert_eq!(json["mode_coverage"]["all_stable_heads_reusable"], true);
         assert_eq!(
@@ -5990,6 +5998,31 @@ providers:
             .unwrap()
             .iter()
             .any(|entry| entry["profile"] == "SubAgent" && entry["mode"] == "SubAgent"));
+    }
+
+    #[tokio::test]
+    async fn context_current_can_project_agent_view() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/context/current?q=review&session_id=session-1&agent_id=reviewer&agent_task=review%20the%20plan")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["agent_view"]["child_agent_id"], "reviewer");
+        assert_eq!(json["agent_view"]["parent_agent_id"], "primary");
+        assert_eq!(json["agent_view"]["envelope"]["profile"], "SubAgent");
+        assert_eq!(
+            json["agent_view"]["envelope"]["diagnostics"]["stable_head_hash"],
+            json["envelope"]["diagnostics"]["stable_head_hash"]
+        );
     }
 
     #[tokio::test]

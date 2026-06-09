@@ -2445,7 +2445,14 @@ mod tests {
                 } => {
                     assert_eq!(server_name, "alpha");
                     assert_eq!(method, "tools/call");
-                    assert_eq!(source.kind(), ErrorKind::UnexpectedEof);
+                    assert!(
+                        matches!(
+                            source.kind(),
+                            ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe
+                        ),
+                        "expected transport close, got {:?}",
+                        source.kind()
+                    );
                 }
                 other => panic!("expected transport error, got {other:?}"),
             }

@@ -190,6 +190,10 @@ window.Api = (()=>{
       if(o.q)params.set('q',o.q);
       if(o.session_id)params.set('session_id',o.session_id);
       if(o.profile)params.set('profile',o.profile);
+      if(o.agent_id)params.set('agent_id',o.agent_id);
+      if(o.agent_task)params.set('agent_task',o.agent_task);
+      if(o.agent_budget)params.set('agent_budget',o.agent_budget);
+      if(o.agent_sources)params.set('agent_sources',o.agent_sources);
       const query=params.toString();
       return req('GET','/api/context/current'+(query?'?'+query:''));
     },

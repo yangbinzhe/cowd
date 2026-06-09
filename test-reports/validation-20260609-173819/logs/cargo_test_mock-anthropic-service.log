@@ -1,0 +1,22 @@
+[2026-06-09T17:38:59+08:00] START cargo_test_mock-anthropic-service
+   Compiling mock-anthropic-service v0.9.72 (/media/yi/Datas/workspace/cowd/crates/mock-anthropic-service)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.47s
+     Running unittests src/lib.rs (/tmp/cowd-target-v0972-speed/debug/deps/mock_anthropic_service-75743673118e3dc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/tmp/cowd-target-v0972-speed/debug/deps/mock_anthropic_service-8fc6e25aba437de4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mock_anthropic_service
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[2026-06-09T17:39:00+08:00] END cargo_test_mock-anthropic-service status=0 elapsed=1s target_before=15344685030 target_after=15344685030

@@ -210,7 +210,7 @@ fn prepare_command(
         return prepared;
     }
 
-    let mut prepared = Command::new("sh");
+    let mut prepared = Command::new(shell_program());
     prepared.arg("-lc").arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", crate::cowd_dirs::sandbox_home_dir());
@@ -237,7 +237,7 @@ fn prepare_tokio_command(
         return prepared;
     }
 
-    let mut prepared = TokioCommand::new("sh");
+    let mut prepared = TokioCommand::new(shell_program());
     prepared.arg("-lc").arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", crate::cowd_dirs::sandbox_home_dir());
@@ -250,6 +250,14 @@ fn prepare_sandbox_dirs() {
     use std::fs;
     let _ = fs::create_dir_all(crate::cowd_dirs::sandbox_home_dir());
     let _ = fs::create_dir_all(crate::cowd_dirs::sandbox_tmp_dir());
+}
+
+fn shell_program() -> &'static str {
+    if std::path::Path::new("/bin/sh").exists() {
+        "/bin/sh"
+    } else {
+        "sh"
+    }
 }
 
 #[cfg(test)]
