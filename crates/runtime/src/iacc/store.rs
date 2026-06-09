@@ -2437,8 +2437,10 @@ fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> I
 mod tests {
     use super::*;
     use crate::iacc::{
-        IaccCockpitProfileInput, IaccCockpitReportDeliveryReceipt, IaccCockpitReportRequest,
-        IaccComputeJobInput, IaccEntityInput, IaccFactInput, IaccRelationInput, IaccSourceKey,
+        IaccCockpitProfileInput, IaccCockpitReportDeliveryPayload,
+        IaccCockpitReportDeliveryPayloadRequest, IaccCockpitReportDeliveryReceipt,
+        IaccCockpitReportRequest, IaccComputeJobInput, IaccEntityInput, IaccFactInput,
+        IaccRelationInput, IaccSourceKey,
     };
 
     #[test]
@@ -3014,6 +3016,26 @@ mod tests {
             .expect("report exists");
         assert_eq!(loaded_report.delivery_ref, report.delivery_ref);
         assert_eq!(store.health().unwrap().cockpit_report_count, 1);
+
+        let payload = IaccCockpitReportDeliveryPayload::from_report(
+            &report,
+            IaccCockpitReportDeliveryPayloadRequest {
+                channel: Some("feishu".to_string()),
+                template_id: Some("ops.alert.compact".to_string()),
+                target_ref: report.delivery_ref.clone(),
+                requested_capability: None,
+            },
+        );
+        assert_eq!(payload.channel, "feishu");
+        assert_eq!(payload.template_id, "ops.alert.compact");
+        assert_eq!(payload.requested_capability, "channel.feishu.send_text");
+        assert!(payload.resource_ref.starts_with("text://"));
+        assert!(payload
+            .constraints
+            .contains(&"payload_kind:text".to_string()));
+        assert!(payload
+            .constraints
+            .contains(&"target_ref_present".to_string()));
 
         let delivered = store
             .attach_cockpit_report_delivery(

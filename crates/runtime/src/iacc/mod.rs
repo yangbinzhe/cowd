@@ -30,6 +30,7 @@ pub use attention::{IaccAttentionItem, IaccSeverity};
 pub use change::IaccChangeEvent;
 pub use cockpit::{
     IaccCockpitProfile, IaccCockpitProfileInput, IaccCockpitProjection,
+    IaccCockpitReportDeliveryPayload, IaccCockpitReportDeliveryPayloadRequest,
     IaccCockpitReportDeliveryReceipt, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
     IaccCockpitWidget,
 };

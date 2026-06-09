@@ -14,7 +14,8 @@ use runtime::{
     server_manufacturing_domain_pack, AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode,
     CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneExecutionReceipt, CrossPlaneRisk,
     DataClassification, IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback,
-    IaccCockpitProfile, IaccCockpitProfileInput, IaccCockpitReportDeliveryReceipt,
+    IaccCockpitProfile, IaccCockpitProfileInput, IaccCockpitReportDeliveryPayload,
+    IaccCockpitReportDeliveryPayloadRequest, IaccCockpitReportDeliveryReceipt,
     IaccCockpitReportRequest, IaccCockpitReportSnapshot, IaccComputeJobInput,
     IaccCrossPlaneBridgeReceipt, IaccEntity, IaccEntityInput, IaccFact, IaccFactInput,
     IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccRelation, IaccRelationInput,
@@ -315,6 +316,10 @@ struct IaccCockpitReportDeliveryRequest {
     target_ref: Option<String>,
     #[serde(default)]
     resource_ref: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    template_id: Option<String>,
 }
 
 fn default_iacc_bridge_mode() -> String {
@@ -355,6 +360,7 @@ async fn iacc_health_handler(
             "cockpit_report_snapshot",
             "scheduled_report_foundation",
             "cockpit_report_delivery_bridge",
+            "cockpit_report_payload_templates",
             "personal_cockpit_projection",
             "cockpit_profile_thresholds",
             "evidence_quality_gate",
@@ -491,6 +497,7 @@ async fn iacc_cockpit_report_deliver_handler(
         .map(str::trim)
         .filter(|key| !key.is_empty())
         .map(str::to_string);
+    let delivery_payload = iacc_report_delivery_payload(&report, &request);
 
     if let Some(key) = &idempotency_key {
         if let Some(receipt) =
@@ -510,13 +517,14 @@ async fn iacc_cockpit_report_deliver_handler(
                 "status": receipt.status,
                 "dispatch_status": receipt.dispatch_status,
                 "report": report,
+                "delivery_payload": delivery_payload,
                 "cross_plane_execution_receipt": receipt,
                 "idempotent_replay": true,
             })));
         }
     }
 
-    let action = iacc_report_delivery_action(&report, &request);
+    let action = iacc_report_delivery_action(&report, &request, &delivery_payload);
     let now = chrono::Utc::now();
     let (action, decision, evidence) =
         super::cross_plane_routes::decide_connector_action(&state, action, &mode, now);
@@ -551,6 +559,7 @@ async fn iacc_cockpit_report_deliver_handler(
         "status": status,
         "dispatch_status": dispatch_status,
         "report": report,
+        "delivery_payload": delivery_payload,
         "cross_plane_execution_receipt": receipt,
         "idempotent_replay": false,
     })))
@@ -1281,9 +1290,28 @@ fn iacc_report_delivery_receipt_matches(
     receipt.action.session_id.as_deref() == Some(report.report_id.as_str())
 }
 
+fn iacc_report_delivery_payload(
+    report: &IaccCockpitReportSnapshot,
+    request: &IaccCockpitReportDeliveryRequest,
+) -> IaccCockpitReportDeliveryPayload {
+    IaccCockpitReportDeliveryPayload::from_report(
+        report,
+        IaccCockpitReportDeliveryPayloadRequest {
+            channel: request.channel.clone(),
+            template_id: request.template_id.clone(),
+            target_ref: request
+                .target_ref
+                .clone()
+                .or_else(|| report.delivery_ref.clone()),
+            requested_capability: request.requested_capability.clone(),
+        },
+    )
+}
+
 fn iacc_report_delivery_action(
     report: &IaccCockpitReportSnapshot,
     request: &IaccCockpitReportDeliveryRequest,
+    delivery_payload: &IaccCockpitReportDeliveryPayload,
 ) -> CrossPlaneAction {
     let actor_principal = request
         .actor_principal
@@ -1296,7 +1324,7 @@ fn iacc_report_delivery_action(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("channel.feishu.send_text");
+        .unwrap_or(delivery_payload.requested_capability.as_str());
     let mut action = CrossPlaneAction::new(actor_principal, requested_capability);
     action.actor_identity_ref = request.actor_identity_ref.clone();
     action.source_channel = Some(
@@ -1310,21 +1338,16 @@ fn iacc_report_delivery_action(
     action.target_ref = request
         .target_ref
         .clone()
+        .or_else(|| delivery_payload.target_ref.clone())
         .or_else(|| report.delivery_ref.clone());
-    action.resource_ref = request.resource_ref.clone().or_else(|| {
-        Some(format!(
-            "text://{}",
-            default_iacc_report_delivery_message(report)
-        ))
-    });
+    action.resource_ref = request
+        .resource_ref
+        .clone()
+        .or_else(|| Some(delivery_payload.resource_ref.clone()));
     action.risk = CrossPlaneRisk::Low;
     action.data_classification = DataClassification::Internal;
     action.identity_trust = IdentityTrust::Unknown;
     action
-}
-
-fn default_iacc_report_delivery_message(report: &IaccCockpitReportSnapshot) -> String {
-    format!("{}: {}", report.title, report.summary)
 }
 
 fn iacc_cross_plane_action_from_execution(

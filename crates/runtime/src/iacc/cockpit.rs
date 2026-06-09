@@ -73,6 +73,38 @@ pub struct IaccCockpitReportRequest {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IaccCockpitReportDeliveryPayloadRequest {
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub template_id: Option<String>,
+    #[serde(default)]
+    pub target_ref: Option<String>,
+    #[serde(default)]
+    pub requested_capability: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IaccCockpitReportDeliveryPayload {
+    pub payload_id: String,
+    pub report_id: String,
+    pub channel: String,
+    pub template_id: String,
+    #[serde(default)]
+    pub target_ref: Option<String>,
+    pub requested_capability: String,
+    pub resource_ref: String,
+    pub subject: String,
+    pub text: String,
+    pub markdown: String,
+    #[serde(default)]
+    pub body: Value,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    pub rendered_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IaccCockpitReportSnapshot {
     pub report_id: String,
@@ -206,6 +238,63 @@ impl IaccCockpitReportSnapshot {
     }
 }
 
+impl IaccCockpitReportDeliveryPayload {
+    #[must_use]
+    pub fn from_report(
+        report: &IaccCockpitReportSnapshot,
+        request: IaccCockpitReportDeliveryPayloadRequest,
+    ) -> Self {
+        let target_ref = request
+            .target_ref
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| report.delivery_ref.clone());
+        let channel = infer_report_delivery_channel(
+            request.channel.as_deref(),
+            request.requested_capability.as_deref(),
+            target_ref.as_deref(),
+        );
+        let template_id = request
+            .template_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| default_report_delivery_template(&channel).to_string());
+        let requested_capability = request
+            .requested_capability
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| default_report_delivery_capability(&channel).to_string());
+        let subject = format!("IACC {} cockpit report", report.cadence);
+        let text = render_report_delivery_text(report, &template_id);
+        let markdown = render_report_delivery_markdown(report, &template_id);
+        let resource_ref = format!("text://{text}");
+        let constraints = report_delivery_constraints(&channel, &requested_capability, &target_ref);
+        Self {
+            payload_id: format!("cockpit-payload-{}", uuid::Uuid::new_v4()),
+            report_id: report.report_id.clone(),
+            channel,
+            template_id,
+            target_ref,
+            requested_capability,
+            resource_ref,
+            subject,
+            text,
+            markdown: markdown.clone(),
+            body: serde_json::json!({
+                "kind": "iacc.cockpit.report_delivery_payload",
+                "report_id": report.report_id,
+                "profile_id": report.profile_id,
+                "owner_ref": report.owner_ref,
+                "cadence": report.cadence,
+                "title": report.title,
+                "summary": report.summary,
+                "markdown": markdown,
+                "widget_count": report.projection.widgets.len(),
+                "generated_at": report.created_at,
+            }),
+            constraints,
+            rendered_at: Utc::now(),
+        }
+    }
+}
+
 impl IaccCockpitReportDeliveryReceipt {
     #[must_use]
     pub fn new(
@@ -225,4 +314,132 @@ impl IaccCockpitReportDeliveryReceipt {
             delivered_at: Utc::now(),
         }
     }
+}
+
+fn infer_report_delivery_channel(
+    channel: Option<&str>,
+    requested_capability: Option<&str>,
+    target_ref: Option<&str>,
+) -> String {
+    if let Some(channel) = normalized_non_empty(channel) {
+        return channel;
+    }
+    if let Some(capability) = normalized_non_empty(requested_capability) {
+        if capability.contains(".feishu.") {
+            return "feishu".to_string();
+        }
+        if capability.contains(".email.") {
+            return "email".to_string();
+        }
+        if capability.contains(".webhook.") {
+            return "webhook".to_string();
+        }
+    }
+    if let Some(target_ref) = normalized_non_empty(target_ref) {
+        if let Some(rest) = target_ref.strip_prefix("channel://") {
+            if let Some(channel) = rest.split('/').next().filter(|value| !value.is_empty()) {
+                return channel.to_string();
+            }
+        }
+        if target_ref.starts_with("mailto:") {
+            return "email".to_string();
+        }
+        if target_ref.starts_with("webhook://") {
+            return "webhook".to_string();
+        }
+    }
+    "feishu".to_string()
+}
+
+fn default_report_delivery_template(channel: &str) -> &'static str {
+    match channel {
+        "email" => "ops.email.standard",
+        "webhook" => "ops.webhook.compact",
+        _ => "ops.feishu.compact",
+    }
+}
+
+fn default_report_delivery_capability(channel: &str) -> &'static str {
+    match channel {
+        "email" => "channel.email.send_text",
+        "webhook" => "channel.webhook.send_text",
+        _ => "channel.feishu.send_text",
+    }
+}
+
+fn render_report_delivery_text(report: &IaccCockpitReportSnapshot, template_id: &str) -> String {
+    let top_widgets = report
+        .projection
+        .widgets
+        .iter()
+        .take(3)
+        .map(|widget| format!("{}={}", widget.title, widget.status))
+        .collect::<Vec<_>>()
+        .join("; ");
+    match template_id {
+        "ops.alert.compact" | "ops.feishu.compact" | "ops.webhook.compact" => format!(
+            "{}: {}; widgets={}; top=[{}]; report={}",
+            report.title,
+            report.summary,
+            report.projection.widgets.len(),
+            top_widgets,
+            report.report_id
+        ),
+        _ => format!(
+            "{}: {}; cadence={}; widgets={}; report={}",
+            report.title,
+            report.summary,
+            report.cadence,
+            report.projection.widgets.len(),
+            report.report_id
+        ),
+    }
+}
+
+fn render_report_delivery_markdown(
+    report: &IaccCockpitReportSnapshot,
+    template_id: &str,
+) -> String {
+    let widget_lines = report
+        .projection
+        .widgets
+        .iter()
+        .take(5)
+        .map(|widget| format!("- {}: {}", widget.title, widget.status))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "# {}\n\n{}\n\nTemplate: {}\nReport: {}\n\n{}",
+        report.title, report.summary, template_id, report.report_id, widget_lines
+    )
+}
+
+fn report_delivery_constraints(
+    channel: &str,
+    requested_capability: &str,
+    target_ref: &Option<String>,
+) -> Vec<String> {
+    let mut constraints = vec![
+        "payload_kind:text".to_string(),
+        "cross_plane_policy_required".to_string(),
+        "report_snapshot_required".to_string(),
+        format!("channel:{channel}"),
+        format!("capability:{requested_capability}"),
+    ];
+    if target_ref
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        constraints.push("target_ref_present".to_string());
+    } else {
+        constraints.push("target_ref_required".to_string());
+    }
+    constraints
+}
+
+fn normalized_non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
 }
