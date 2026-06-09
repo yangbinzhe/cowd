@@ -449,6 +449,7 @@ async fn iacc_health_handler(
             "cockpit_report_payload_templates",
             "cockpit_report_schedule_runner",
             "cockpit_report_delivery_retry_state",
+            "cockpit_report_webui_visibility",
             "personal_cockpit_projection",
             "cockpit_profile_thresholds",
             "evidence_quality_gate",

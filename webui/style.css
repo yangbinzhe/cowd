@@ -293,6 +293,11 @@ pre,code{font-family:var(--font-mono);font-size:13px}
 .connector-console .audit-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}
 .connector-resource-controls{margin-bottom:8px}
 .connector-resource-list{min-height:42px}
+.iacc-report-controls{display:grid;grid-template-columns:minmax(0,1fr) 88px 88px;gap:6px}
+.iacc-report-controls input{min-width:0;padding:6px 8px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:12px}
+.iacc-report-controls input:focus{outline:none;border-color:var(--accent)}
+.iacc-report-state .runtime-workgraph-detail{margin-top:8px}
+.iacc-delivery-receipts{margin-top:8px}
 .dispatch-target-preview{margin-top:8px}
 .dispatch-target-preview:empty{display:none}
 .cross-plane-composer{border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);padding:9px;margin-top:10px}

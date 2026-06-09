@@ -2178,6 +2178,150 @@ window.Panels = (()=>{
     }catch(e){c.appendChild(UI.el('div','panel-empty','Tools info unavailable'))}
   }
 
+  function iaccDeliveryStatusClass(status){
+    const value=String(status||'').toLowerCase();
+    if(value.includes('blocked')||value.includes('failed'))return 'blocked';
+    if(value.includes('review')||value.includes('planned'))return 'degraded';
+    if(value.includes('sent')||value.includes('dispatched'))return 'ready';
+    return 'unknown';
+  }
+
+  function renderIaccReportState(reportData,stateData,target){
+    target.innerHTML='';
+    const report=(reportData&&reportData.report)||reportData||{};
+    const state=(stateData&&stateData.delivery_state)||{};
+    const sec=UI.el('div','panel-section iacc-report-state');
+    sec.innerHTML='<h3>IACC Report State</h3>';
+    if(!report.report_id){
+      sec.appendChild(UI.el('div','panel-empty','No report loaded'));
+      target.appendChild(sec);
+      return;
+    }
+    const metrics=UI.el('div','memory-metrics');
+    metrics.appendChild(renderMemoryMetric('status',report.status||'unknown','report'));
+    metrics.appendChild(renderMemoryMetric('cadence',report.cadence||'n/a','report'));
+    metrics.appendChild(renderMemoryMetric('attempts',state.attempt_count??(report.delivery_receipts||[]).length,'delivery'));
+    metrics.appendChild(renderMemoryMetric('class',state.classification||'n/a','delivery'));
+    metrics.appendChild(renderMemoryMetric('retry',state.retryable?'yes':'no',state.recommended_mode||'mode'));
+    metrics.appendChild(renderMemoryMetric('widgets',((report.projection||{}).widgets||[]).length,'projection'));
+    sec.appendChild(metrics);
+    const detail=UI.el('div','runtime-workgraph-detail');
+    detail.innerHTML='<b>'+UI.esc(report.report_id)+'</b><small>'+UI.esc([report.owner_ref,report.profile_id,report.delivery_ref].filter(Boolean).join(' · '))+'</small>';
+    sec.appendChild(detail);
+    const latest=state.latest_receipt||{};
+    if(latest.cross_plane_receipt_id){
+      const row=UI.el('div','panel-item audit-record connector-row '+iaccDeliveryStatusClass(state.classification));
+      row.innerHTML='<span class="audit-source">'+UI.esc(state.classification||'delivery')+'</span><b>'+UI.esc(latest.cross_plane_receipt_id)+'</b><small>'+UI.esc([latest.cross_plane_status,latest.cross_plane_dispatch_status,latest.audit_record_id].filter(Boolean).join(' · '))+'</small>';
+      sec.appendChild(row);
+    }
+    const receipts=report.delivery_receipts||[];
+    if(receipts.length){
+      const list=UI.el('div','iacc-delivery-receipts');
+      receipts.slice(-4).reverse().forEach(function(receipt){
+        const row=UI.el('div','panel-item audit-record connector-row '+iaccDeliveryStatusClass(receipt.cross_plane_status||receipt.cross_plane_dispatch_status));
+        row.innerHTML='<span class="audit-source">'+UI.esc(receipt.cross_plane_status||'receipt')+'</span><b>'+UI.esc(receipt.cross_plane_receipt_id||receipt.delivery_id)+'</b><small>'+UI.esc([receipt.cross_plane_dispatch_status,receipt.delivered_at].filter(Boolean).join(' · '))+'</small>';
+        list.appendChild(row);
+      });
+      sec.appendChild(list);
+    }
+    target.appendChild(sec);
+  }
+
+  async function renderIacc(){
+    const c=cont();c.innerHTML='';
+    const header=UI.el('div','panel-section iacc-console');
+    header.innerHTML='<h3>IACC Reports</h3>';
+    const controls=UI.el('div','iacc-report-controls');
+    const reportInput=UI.el('input');
+    reportInput.placeholder='Report id';
+    reportInput.value=localStorage.getItem('cowd-iacc-report-id')||'';
+    reportInput.setAttribute('aria-label','IACC report id');
+    const loadBtn=UI.el('button','btn-secondary btn-sm','Load report');
+    const retryBtn=UI.el('button','btn-secondary btn-sm','Force retry');
+    controls.appendChild(reportInput);
+    controls.appendChild(loadBtn);
+    controls.appendChild(retryBtn);
+    header.appendChild(controls);
+    c.appendChild(header);
+    const healthSec=UI.el('div','panel-section iacc-health');
+    healthSec.innerHTML='<h3>IACC Health</h3>';
+    c.appendChild(healthSec);
+    const reportMount=UI.el('div','iacc-report-mount');
+    c.appendChild(reportMount);
+    let currentReport=null;
+
+    async function loadHealth(){
+      healthSec.innerHTML='<h3>IACC Health</h3>';
+      try{
+        const health=await Api.iaccHealth();
+        const metrics=UI.el('div','memory-metrics');
+        metrics.appendChild(renderMemoryMetric('schema',health.schema_version+'/'+health.expected_schema_version,'version'));
+        metrics.appendChild(renderMemoryMetric('profiles',health.cockpit_profile_count||0,'cockpit'));
+        metrics.appendChild(renderMemoryMetric('reports',health.cockpit_report_count||0,'cockpit'));
+        metrics.appendChild(renderMemoryMetric('quality',health.quality_gate_count||0,'gates'));
+        metrics.appendChild(renderMemoryMetric('actions',health.execution_count||0,'executions'));
+        metrics.appendChild(renderMemoryMetric('attention',health.attention_count||0,'items'));
+        healthSec.appendChild(metrics);
+        const caps=UI.el('div','runtime-control-plane-caps');
+        (health.capabilities||[]).filter(function(cap){return String(cap).includes('cockpit_report')}).slice(0,8).forEach(function(cap){
+          caps.appendChild(UI.el('span','memory-chip',cap));
+        });
+        if(caps.childNodes.length)healthSec.appendChild(caps);
+      }catch(e){
+        healthSec.appendChild(UI.el('div','panel-empty','IACC health unavailable'));
+      }
+    }
+
+    async function loadReport(){
+      const reportId=reportInput.value.trim();
+      if(!reportId){
+        reportMount.innerHTML='';
+        reportMount.appendChild(UI.el('div','panel-empty','Enter a report id'));
+        return;
+      }
+      loadBtn.disabled=true;
+      try{
+        localStorage.setItem('cowd-iacc-report-id',reportId);
+        const report=await Api.iaccCockpitReport(reportId);
+        const state=await Api.iaccCockpitReportDeliveryState(reportId);
+        currentReport=(report&&report.report)||null;
+        renderIaccReportState(report,state,reportMount);
+      }catch(e){
+        reportMount.innerHTML='';
+        reportMount.appendChild(UI.el('div','panel-empty',e.message));
+      }finally{
+        loadBtn.disabled=false;
+      }
+    }
+
+    loadBtn.onclick=loadReport;
+    retryBtn.onclick=async function(){
+      const reportId=reportInput.value.trim();
+      if(!reportId)return;
+      retryBtn.disabled=true;
+      try{
+        const body={
+          force:true,
+          mode:'dry_run',
+          actor_principal:(currentReport&&currentReport.owner_ref)||undefined,
+          channel:'feishu',
+          template_id:'ops.alert.compact'
+        };
+        const result=await Api.retryIaccCockpitReportDelivery(reportId,body);
+        UI.showToast('IACC retry '+((result.after_state&&result.after_state.classification)||'queued'),'success');
+        await loadReport();
+      }catch(e){
+        UI.showToast(e.message,'error');
+      }finally{
+        retryBtn.disabled=false;
+      }
+    };
+
+    await loadHealth();
+    if(reportInput.value.trim())await loadReport();
+    else renderIaccReportState(null,null,reportMount);
+  }
+
   function connectorStatusClass(status){
     const value=String(status||'unknown').toLowerCase();
     if(value==='ready'||value==='available'||value==='ok'||value==='executed')return 'ready';
@@ -2846,5 +2990,5 @@ window.Panels = (()=>{
     }catch(e){c.appendChild(UI.el('div','panel-section','Progress unavailable'))}
   }
 
-  return{renderMemory,renderContext,renderRuntimeConsole,renderMemoryLayer,renderMemorySymbolResults,showMemoryEntryForm,renderMemorySpatial,renderMemoryNetwork,renderProgress,renderSkills,renderCrons,renderSettings,renderAgents,renderTools,renderGateway,renderAudit,renderCCConfig,renderCCProviders,renderCCApproval,renderCCHistory,renderCCUsage};
+  return{renderMemory,renderContext,renderRuntimeConsole,renderMemoryLayer,renderMemorySymbolResults,showMemoryEntryForm,renderMemorySpatial,renderMemoryNetwork,renderProgress,renderSkills,renderCrons,renderSettings,renderAgents,renderTools,renderIacc,renderGateway,renderAudit,renderCCConfig,renderCCProviders,renderCCApproval,renderCCHistory,renderCCUsage};
 })();

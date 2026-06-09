@@ -427,6 +427,13 @@ window.Api = (()=>{
     async connectorServiceTools(service){return req('GET','/api/connectors/services/'+encodeURIComponent(service)+'/tools')},
     async executeConnectorService(service,body){return req('POST','/api/connectors/services/'+encodeURIComponent(service)+'/execute',body||{})},
 
+    // ── IACC cockpit ──
+    async iaccHealth(){return req('GET','/api/iacc/health')},
+    async iaccCockpitReport(reportId){return req('GET','/api/iacc/cockpit/reports/'+encodeURIComponent(reportId))},
+    async iaccCockpitReportDeliveryState(reportId){return req('GET','/api/iacc/cockpit/reports/'+encodeURIComponent(reportId)+'/delivery-state')},
+    async retryIaccCockpitReportDelivery(reportId,body){return req('POST','/api/iacc/cockpit/reports/'+encodeURIComponent(reportId)+'/delivery/retry',body||{})},
+    async runIaccCockpitReportSchedule(body){return req('POST','/api/iacc/cockpit/reports/schedules/run',body||{})},
+
     // ── Usage ──
     async getUsage(){return req('GET','/api/usage')},
 

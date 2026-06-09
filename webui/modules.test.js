@@ -633,6 +633,41 @@ describe('API module', () => {
     expect(result.decision.decision).toBe('allow');
   });
 
+  it('IACC cockpit report endpoints use the delivery visibility route contract', async () => {
+    const mockF = vi.fn((path, opts) => {
+      if (path === '/api/iacc/health') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'iacc.health', status: 'ready' }) });
+      }
+      if (path === '/api/iacc/cockpit/reports/report-1') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'iacc.cockpit.report', report: { report_id: 'report-1' } }) });
+      }
+      if (path === '/api/iacc/cockpit/reports/report-1/delivery-state') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'iacc.cockpit.report_delivery_state', delivery_state: { classification: 'dry_run_planned' } }) });
+      }
+      if (path === '/api/iacc/cockpit/reports/report-1/delivery/retry') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'iacc.cockpit.report_delivery_retry', after_state: { classification: 'dry_run_planned' } }) });
+      }
+      if (path === '/api/iacc/cockpit/reports/schedules/run') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ kind: 'iacc.cockpit.report_schedule_run', generated_report_count: 1 }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Api.iaccHealth();
+    await window.Api.iaccCockpitReport('report-1');
+    await window.Api.iaccCockpitReportDeliveryState('report-1');
+    await window.Api.retryIaccCockpitReportDelivery('report-1', { force: true });
+    await window.Api.runIaccCockpitReportSchedule({ cadence: 'daily' });
+
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/iacc/health');
+    expect(String(mockF.mock.calls[1][0])).toBe('/api/iacc/cockpit/reports/report-1');
+    expect(String(mockF.mock.calls[2][0])).toBe('/api/iacc/cockpit/reports/report-1/delivery-state');
+    expect(String(mockF.mock.calls[3][0])).toBe('/api/iacc/cockpit/reports/report-1/delivery/retry');
+    expect(mockF.mock.calls[3][1].method).toBe('POST');
+    expect(String(mockF.mock.calls[4][0])).toBe('/api/iacc/cockpit/reports/schedules/run');
+  });
+
   it('connector runtime endpoints use the management route contract', async () => {
     const mockF = vi.fn((url, opts = {}) => {
       const path = String(url);
@@ -970,6 +1005,7 @@ describe('API module', () => {
     expect(typeof window.Panels.renderAgents).toBe('function');
     expect(typeof window.Panels.renderGateway).toBe('function');
     expect(typeof window.Panels.renderTools).toBe('function');
+    expect(typeof window.Panels.renderIacc).toBe('function');
     expect(typeof window.Panels.renderAudit).toBe('function');
     expect(typeof window.Panels.renderSettings).toBe('function');
     expect(typeof window.Panels.renderCCConfig).toBe('function');
@@ -1237,6 +1273,86 @@ describe('API module', () => {
     expect(panel.textContent).toContain('service://mock.docs/document/webui-doc');
   });
 
+  it('renders IACC report delivery state and force retry control', async () => {
+    document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
+    localStorage.setItem('cowd-iacc-report-id', 'cockpit-report-webui');
+    const mockF = vi.fn((path) => {
+      if (path === '/api/iacc/health') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'iacc.health',
+          schema_version: 11,
+          expected_schema_version: 11,
+          cockpit_profile_count: 2,
+          cockpit_report_count: 3,
+          quality_gate_count: 4,
+          execution_count: 5,
+          attention_count: 6,
+          capabilities: ['cockpit_report_delivery_retry_state', 'cockpit_report_schedule_runner']
+        }) });
+      }
+      if (path === '/api/iacc/cockpit/reports/cockpit-report-webui') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'iacc.cockpit.report',
+          report: {
+            report_id: 'cockpit-report-webui',
+            status: 'delivery_planned',
+            cadence: 'daily',
+            owner_ref: 'user:ops-planner',
+            profile_id: 'cockpit-profile-webui',
+            delivery_ref: 'channel://feishu/user/ops-planner',
+            delivery_receipts: [{
+              cross_plane_receipt_id: 'cpx-webui',
+              cross_plane_status: 'planned',
+              cross_plane_dispatch_status: 'dry_run',
+              audit_record_id: 'cpa-webui',
+              delivered_at: '2026-06-10T00:00:00Z'
+            }],
+            projection: { widgets: [{ widget_id: 'w1' }] }
+          }
+        }) });
+      }
+      if (path === '/api/iacc/cockpit/reports/cockpit-report-webui/delivery-state') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'iacc.cockpit.report_delivery_state',
+          delivery_state: {
+            classification: 'dry_run_planned',
+            retryable: false,
+            recommended_mode: 'commit',
+            attempt_count: 1,
+            latest_receipt: {
+              cross_plane_receipt_id: 'cpx-webui',
+              cross_plane_status: 'planned',
+              cross_plane_dispatch_status: 'dry_run',
+              audit_record_id: 'cpa-webui'
+            }
+          }
+        }) });
+      }
+      if (path === '/api/iacc/cockpit/reports/cockpit-report-webui/delivery/retry') {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({
+          kind: 'iacc.cockpit.report_delivery_retry',
+          after_state: { classification: 'dry_run_planned' }
+        }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal('fetch', mockF);
+
+    await window.Panels.renderIacc();
+    const panel = document.getElementById('panel-content');
+    expect(panel.textContent).toContain('IACC Reports');
+    expect(panel.textContent).toContain('cockpit-report-webui');
+    expect(panel.textContent).toContain('dry_run_planned');
+    expect(panel.textContent).toContain('cpx-webui');
+
+    document.querySelectorAll('.iacc-report-controls button')[1].click();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const retryCall = mockF.mock.calls.find(call => String(call[0]).includes('/delivery/retry'));
+    expect(JSON.parse(retryCall[1].body).force).toBe(true);
+    expect(JSON.parse(retryCall[1].body).actor_principal).toBe('user:ops-planner');
+  });
+
   it('gateway composer preflights and executes typed media actions', async () => {
     document.body.innerHTML = '<div id="toast"></div><div id="panel-content"></div>';
     const mockF = vi.fn((url, options = {}) => {
@@ -1389,6 +1505,7 @@ describe('API module', () => {
     const html = fs.readFileSync('index.html', 'utf8');
     expect(html).toContain('data-panel="context"');
     expect(html).toContain('data-panel="runtime"');
+    expect(html).toContain('data-panel="iacc"');
     expect(window.Commands.getMatches('/context')[0].cmd).toBe('/context');
     expect(window.Commands.getMatches('/runtime')[0].cmd).toBe('/runtime');
   });

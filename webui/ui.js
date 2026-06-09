@@ -116,6 +116,7 @@ window.UI = (()=>{
       else if(name==='crons')Panels.renderCrons();
       else if(name==='agents')Panels.renderAgents();
       else if(name==='tools')Panels.renderTools();
+      else if(name==='iacc')Panels.renderIacc();
       else if(name==='gateway')Panels.renderGateway();
       else if(name==='audit')Panels.renderAudit();
       else if(name==='settings')Panels.renderSettings();
