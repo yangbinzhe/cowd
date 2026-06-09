@@ -10,9 +10,10 @@ use axum::{
 use memory::store::session::SessionEvent;
 use memory::{MemoryKernel, MemoryTurnContext};
 use runtime::{
-    ContextAuthority, ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextOmission,
-    ContextProfile, ContextRole, ContextRuntimeKernel, ContextSourceKind, ContextVisibility,
-    ExternalResourceRef, SqliteResourceDirectory,
+    AgentContextLease, AgentReturnRequirement, ContextAuthority, ContextEnvelope,
+    ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextOmission, ContextProfile,
+    ContextRole, ContextRuntimeKernel, ContextSourceKind, ContextVisibility, ExternalResourceRef,
+    SqliteResourceDirectory,
 };
 use serde::Deserialize;
 
@@ -97,6 +98,9 @@ async fn context_current_handler(
             );
             let cache_stability =
                 ContextRuntimeKernel::cache_stability_report(&envelope, &envelope);
+            let snapshot = ContextRuntimeKernel::snapshot(&envelope);
+            let budget_explanation = ContextRuntimeKernel::budget_explanation(&envelope);
+            let agent_view = context_agent_view_from_params(&params, &envelope);
             return Json(serde_json::json!({
                 "enabled": true,
                 "source": "runtime",
@@ -105,6 +109,9 @@ async fn context_current_handler(
                 "policy_decision": policy_decision,
                 "cache_stability": cache_stability,
                 "mode_coverage": mode_coverage,
+                "snapshot": snapshot,
+                "budget_explanation": budget_explanation,
+                "agent_view": agent_view,
             }));
         }
     }
@@ -198,6 +205,9 @@ async fn context_current_handler(
         envelope.budget.total_tokens,
     );
     let cache_stability = ContextRuntimeKernel::cache_stability_report(&envelope, &envelope);
+    let snapshot = ContextRuntimeKernel::snapshot(&envelope);
+    let budget_explanation = ContextRuntimeKernel::budget_explanation(&envelope);
+    let agent_view = context_agent_view_from_params(&params, &envelope);
 
     Json(serde_json::json!({
         "enabled": true,
@@ -206,8 +216,74 @@ async fn context_current_handler(
         "policy_decision": policy_decision,
         "cache_stability": cache_stability,
         "mode_coverage": mode_coverage,
+        "snapshot": snapshot,
+        "budget_explanation": budget_explanation,
+        "agent_view": agent_view,
         "envelope": envelope,
     }))
+}
+
+fn context_agent_view_from_params(
+    params: &HashMap<String, String>,
+    envelope: &ContextEnvelope,
+) -> Option<runtime::AgentContextView> {
+    let child_agent_id = params.get("agent_id")?.trim();
+    if child_agent_id.is_empty() {
+        return None;
+    }
+    let allowed_sources = params
+        .get("agent_sources")
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(parse_context_source_kind)
+                .collect::<Vec<_>>()
+        })
+        .filter(|sources| !sources.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                ContextSourceKind::Task,
+                ContextSourceKind::Workspace,
+                ContextSourceKind::Memory,
+                ContextSourceKind::AgentPeer,
+            ]
+        });
+    Some(ContextRuntimeKernel::agent_context_view(
+        envelope,
+        AgentContextLease {
+            parent_session_id: envelope.identity.session_id.clone(),
+            parent_agent_id: envelope.identity.agent_id.clone(),
+            child_agent_id: child_agent_id.to_string(),
+            task_contract: params
+                .get("agent_task")
+                .cloned()
+                .unwrap_or_else(|| envelope.intent.clone()),
+            allowed_sources,
+            max_tokens: params
+                .get("agent_budget")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(4_000),
+            required_return: vec![
+                AgentReturnRequirement::ResultSummary,
+                AgentReturnRequirement::Evidence,
+                AgentReturnRequirement::Conflicts,
+            ],
+        },
+    ))
+}
+
+fn parse_context_source_kind(value: &str) -> Option<ContextSourceKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "stablehead" | "stable_head" => Some(ContextSourceKind::StableHead),
+        "runtimeheader" | "runtime_header" => Some(ContextSourceKind::RuntimeHeader),
+        "conversation" => Some(ContextSourceKind::Conversation),
+        "memory" => Some(ContextSourceKind::Memory),
+        "task" => Some(ContextSourceKind::Task),
+        "tooltrace" | "tool_trace" => Some(ContextSourceKind::ToolTrace),
+        "workspace" => Some(ContextSourceKind::Workspace),
+        "agentpeer" | "agent_peer" => Some(ContextSourceKind::AgentPeer),
+        "handoff" => Some(ContextSourceKind::Handoff),
+        _ => None,
+    }
 }
 
 fn parse_context_profile(value: &str) -> Option<ContextProfile> {

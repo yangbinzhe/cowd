@@ -169,6 +169,46 @@ window.Panels = (()=>{
     return sec;
   }
 
+  function renderContextSnapshot(snapshot,budgetExplanation,agentView){
+    const sec=UI.el('div','context-runtime-snapshot');
+    sec.innerHTML='<h4>Runtime Snapshot</h4>';
+    const metrics=UI.el('div','memory-metrics');
+    if(snapshot){
+      metrics.appendChild(renderMemoryMetric('agent',snapshot.agent_id||'primary','view'));
+      metrics.appendChild(renderMemoryMetric('used',snapshot.used_tokens||0,'tokens'));
+      metrics.appendChild(renderMemoryMetric('stable',shortHash(snapshot.stable_head_hash),'hash'));
+      metrics.appendChild(renderMemoryMetric('tail',shortHash(snapshot.dynamic_tail_hash),'hash'));
+    }
+    if(agentView&&agentView.child_agent_id){
+      metrics.appendChild(renderMemoryMetric('child',agentView.child_agent_id,'agent'));
+      metrics.appendChild(renderMemoryMetric('inherited',(agentView.inherited_item_ids||[]).length,'items'));
+    }
+    sec.appendChild(metrics);
+    const segments=UI.el('div','context-mode-list');
+    ((snapshot&&snapshot.segments)||[]).forEach(function(segment){
+      const row=UI.el('div','context-mode-row');
+      row.innerHTML='<b>'+UI.esc(segment.kind||'segment')+'</b><small>'+UI.esc([shortHash(segment.hash),String(segment.token_estimate||0)+' tk',String(segment.item_count||0)+' items'].join(' · '))+'</small>';
+      segments.appendChild(row);
+    });
+    if(segments.childNodes.length)sec.appendChild(segments);
+    const allocations=(budgetExplanation&&budgetExplanation.allocations)||[];
+    if(allocations.length){
+      const budget=UI.el('div','context-mode-list');
+      allocations.slice(0,8).forEach(function(item){
+        const row=UI.el('div','context-mode-row');
+        row.innerHTML='<b>'+UI.esc(item.source||'source')+'</b><small>'+UI.esc([String(item.used_tokens||0)+'/'+String(item.max_tokens||0)+' tk',String(item.selected_count||0)+' selected',String(item.omitted_count||0)+' omitted',item.exhausted?'exhausted':'open'].join(' · '))+'</small>';
+        budget.appendChild(row);
+      });
+      sec.appendChild(budget);
+    }
+    if(agentView&&agentView.envelope){
+      const note=UI.el('small','runtime-policy-reason');
+      note.textContent='agent view '+agentView.child_agent_id+' · stable '+shortHash((agentView.envelope.diagnostics||{}).stable_head_hash);
+      sec.appendChild(note);
+    }
+    return sec;
+  }
+
   function renderContextHistoryItem(item,onSelect){
     const row=UI.el('button','context-history-item');
     const envelope=item.envelope||{};
@@ -866,11 +906,14 @@ window.Panels = (()=>{
     const controls=UI.el('div','context-controls');
     const input=UI.el('input');
     input.placeholder='Inspect intent...';
+    const agent=UI.el('input');
+    agent.placeholder='Agent view...';
     const profile=UI.el('select');
     profile.innerHTML='<option value="MainTurn">Main</option><option value="SoloGoal">Solo</option><option value="YoloGoal">Yolo</option><option value="Review">Review</option><option value="Resume">Resume</option><option value="SubAgent">SubAgent</option><option value="Collaboration">Collab</option><option value="Cron">Cron</option>';
     const refresh=UI.el('button','btn-secondary btn-sm');
     refresh.textContent='Refresh';
     controls.appendChild(input);
+    controls.appendChild(agent);
     controls.appendChild(profile);
     controls.appendChild(refresh);
     hdr.appendChild(controls);
@@ -881,6 +924,8 @@ window.Panels = (()=>{
     async function load(){
       mount.innerHTML='';
       const opts={q:input.value||'',profile:profile.value};
+      if(agent.value)opts.agent_id=agent.value;
+      if(agent.value)opts.agent_task=input.value||'inspect current context';
       if(Api.sid)opts.session_id=Api.sid;
       try{
         const response=await Api.currentContext(opts);
@@ -889,6 +934,9 @@ window.Panels = (()=>{
         const policyDecision=(response&&response.policy_decision)||null;
         const modeCoverage=(response&&response.mode_coverage)||null;
         const cacheStability=(response&&response.cache_stability)||null;
+        const snapshot=(response&&response.snapshot)||null;
+        const budgetExplanation=(response&&response.budget_explanation)||null;
+        const agentView=(response&&response.agent_view)||null;
         const diagnostics=envelope.diagnostics||{};
         const budget=envelope.budget||{};
         const assembled=envelope.assembled||{};
@@ -915,6 +963,7 @@ window.Panels = (()=>{
         overview.appendChild(metrics);
         overview.appendChild(renderLeanProbe(leanProbe,policyDecision));
         overview.appendChild(renderModeCoverage(modeCoverage,cacheStability));
+        overview.appendChild(renderContextSnapshot(snapshot,budgetExplanation,agentView));
         if((diagnostics.degraded_sources||[]).length){
           const degraded=UI.el('div','context-degraded');
           degraded.textContent='degraded: '+diagnostics.degraded_sources.join(', ');
@@ -1079,6 +1128,7 @@ window.Panels = (()=>{
     }
     refresh.onclick=load;
     input.onkeydown=function(e){if(e.key==='Enter')load()};
+    agent.onkeydown=function(e){if(e.key==='Enter')load()};
     profile.onchange=load;
     load();
   }

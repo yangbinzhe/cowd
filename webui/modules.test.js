@@ -153,9 +153,17 @@ describe('API module', () => {
     );
     vi.stubGlobal('fetch', mockF);
 
-    const context = await window.Api.currentContext({ q: 'ship', session_id: 's1', profile: 'Review' });
+    const context = await window.Api.currentContext({
+      q: 'ship',
+      session_id: 's1',
+      profile: 'Review',
+      agent_id: 'reviewer',
+      agent_task: 'review plan',
+      agent_budget: 4000,
+      agent_sources: 'workspace,task',
+    });
 
-    expect(String(mockF.mock.calls[0][0])).toBe('/api/context/current?q=ship&session_id=s1&profile=Review');
+    expect(String(mockF.mock.calls[0][0])).toBe('/api/context/current?q=ship&session_id=s1&profile=Review&agent_id=reviewer&agent_task=review+plan&agent_budget=4000&agent_sources=workspace%2Ctask');
     expect(context.envelope.id).toBe('ctx-1');
   });
 
@@ -1648,6 +1656,40 @@ describe('API module', () => {
               { profile: 'SubAgent', mode: 'SubAgent', stable_head_reusable: true, pressure_bp: 90 },
             ],
           },
+          snapshot: {
+            envelope_id: 'ctx-1',
+            session_id: 's1',
+            agent_id: 'primary',
+            profile: 'MainTurn',
+            stable_head_hash: 'stablehashabcdef',
+            runtime_header_hash: 'runtimehashabcdef',
+            dynamic_tail_hash: 'dynamichashabcdef',
+            total_tokens: 8000,
+            used_tokens: 120,
+            segments: [
+              { kind: 'StableHead', hash: 'stablehashabcdef', token_estimate: 3, item_count: 1 },
+              { kind: 'RuntimeHeader', hash: 'runtimehashabcdef', token_estimate: 4, item_count: 1 },
+              { kind: 'DynamicTail', hash: 'dynamichashabcdef', token_estimate: 12, item_count: 1 },
+            ],
+          },
+          budget_explanation: {
+            total_tokens: 8000,
+            used_tokens: 120,
+            pressure_bp: 150,
+            allocations: [
+              { source: 'Memory', used_tokens: 12, max_tokens: 2400, selected_count: 1, omitted_count: 1, exhausted: true },
+              { source: 'Task', used_tokens: 0, max_tokens: 2000, selected_count: 0, omitted_count: 0, exhausted: false },
+            ],
+          },
+          agent_view: {
+            child_agent_id: 'reviewer',
+            parent_agent_id: 'primary',
+            inherited_item_ids: ['workspace-fact'],
+            isolated_omissions: [],
+            envelope: {
+              diagnostics: { stable_head_hash: 'stablehashabcdef' },
+            },
+          },
         })
       });
     }));
@@ -1660,9 +1702,12 @@ describe('API module', () => {
     expect(text).toContain('Context Runtime');
     expect(text).toContain('Runtime Probe');
     expect(text).toContain('Mode Coverage');
+    expect(text).toContain('Runtime Snapshot');
     expect(text).toContain('SourceFallback');
     expect(text).toContain('PreferOrientationPacket');
     expect(text).toContain('friendly');
+    expect(text).toContain('reviewer');
+    expect(text).toContain('Memory');
     expect(text).toContain('SubAgent');
     expect(text).toContain('runtime');
     expect(text).toContain('SessionKernel owns durable sessions');

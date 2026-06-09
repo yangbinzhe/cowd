@@ -393,6 +393,82 @@ pub struct ContextModeCoverageReport {
     pub entries: Vec<ContextModeCoverageEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextSegmentKind {
+    StableHead,
+    RuntimeHeader,
+    DynamicTail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSegmentSnapshot {
+    pub kind: ContextSegmentKind,
+    pub hash: String,
+    pub token_estimate: u64,
+    pub item_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSnapshot {
+    pub envelope_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub profile: ContextProfile,
+    pub stable_head_hash: String,
+    pub runtime_header_hash: String,
+    pub dynamic_tail_hash: String,
+    pub total_tokens: u64,
+    pub used_tokens: u64,
+    pub segments: Vec<ContextSegmentSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSegmentChange {
+    pub kind: ContextSegmentKind,
+    pub previous_hash: String,
+    pub next_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSnapshotDiff {
+    pub previous_envelope_id: String,
+    pub next_envelope_id: String,
+    pub stable_head_reusable: bool,
+    pub runtime_header_changed: bool,
+    pub dynamic_tail_changed: bool,
+    pub changed_segments: Vec<ContextSegmentChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBudgetAllocation {
+    pub source: ContextSourceKind,
+    pub min_tokens: u64,
+    pub target_tokens: u64,
+    pub max_tokens: u64,
+    pub used_tokens: u64,
+    pub selected_count: usize,
+    pub omitted_count: usize,
+    pub exhausted: bool,
+    pub priority: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextBudgetExplanation {
+    pub total_tokens: u64,
+    pub used_tokens: u64,
+    pub pressure_bp: u16,
+    pub allocations: Vec<ContextBudgetAllocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentContextView {
+    pub child_agent_id: String,
+    pub parent_agent_id: String,
+    pub envelope: ContextEnvelope,
+    pub inherited_item_ids: Vec<String>,
+    pub isolated_omissions: Vec<ContextOmission>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssembledContext {
     pub stable_head: Vec<String>,
@@ -641,6 +717,200 @@ impl ContextRuntimeKernel {
             dynamic_tail_changed: comparison.dynamic_tail_changed,
             prompt_cache_friendly,
             reason,
+        }
+    }
+
+    pub fn snapshot(envelope: &ContextEnvelope) -> ContextSnapshot {
+        let stable_tokens = envelope
+            .assembled
+            .stable_head
+            .iter()
+            .map(|text| estimate_tokens(text))
+            .sum();
+        let runtime_tokens = envelope
+            .assembled
+            .runtime_header
+            .iter()
+            .map(|text| estimate_tokens(text))
+            .sum();
+        let dynamic_tokens = envelope
+            .selected
+            .iter()
+            .map(|item| item.token_estimate)
+            .sum();
+        ContextSnapshot {
+            envelope_id: envelope.id.clone(),
+            session_id: envelope.identity.session_id.clone(),
+            agent_id: envelope.identity.agent_id.clone(),
+            profile: envelope.profile,
+            stable_head_hash: envelope.diagnostics.stable_head_hash.clone(),
+            runtime_header_hash: envelope.diagnostics.runtime_header_hash.clone(),
+            dynamic_tail_hash: envelope.diagnostics.dynamic_tail_hash.clone(),
+            total_tokens: envelope.budget.total_tokens,
+            used_tokens: envelope.budget.used_tokens,
+            segments: vec![
+                ContextSegmentSnapshot {
+                    kind: ContextSegmentKind::StableHead,
+                    hash: envelope.diagnostics.stable_head_hash.clone(),
+                    token_estimate: stable_tokens,
+                    item_count: envelope.assembled.stable_head.len(),
+                },
+                ContextSegmentSnapshot {
+                    kind: ContextSegmentKind::RuntimeHeader,
+                    hash: envelope.diagnostics.runtime_header_hash.clone(),
+                    token_estimate: runtime_tokens,
+                    item_count: envelope.assembled.runtime_header.len(),
+                },
+                ContextSegmentSnapshot {
+                    kind: ContextSegmentKind::DynamicTail,
+                    hash: envelope.diagnostics.dynamic_tail_hash.clone(),
+                    token_estimate: dynamic_tokens,
+                    item_count: envelope.selected.len(),
+                },
+            ],
+        }
+    }
+
+    pub fn snapshot_diff(
+        previous: &ContextEnvelope,
+        next: &ContextEnvelope,
+    ) -> ContextSnapshotDiff {
+        let previous_snapshot = Self::snapshot(previous);
+        let next_snapshot = Self::snapshot(next);
+        let mut changed_segments = Vec::new();
+        for previous_segment in &previous_snapshot.segments {
+            if let Some(next_segment) = next_snapshot
+                .segments
+                .iter()
+                .find(|segment| segment.kind == previous_segment.kind)
+            {
+                if previous_segment.hash != next_segment.hash {
+                    changed_segments.push(ContextSegmentChange {
+                        kind: previous_segment.kind,
+                        previous_hash: previous_segment.hash.clone(),
+                        next_hash: next_segment.hash.clone(),
+                    });
+                }
+            }
+        }
+        ContextSnapshotDiff {
+            previous_envelope_id: previous.id.clone(),
+            next_envelope_id: next.id.clone(),
+            stable_head_reusable: previous_snapshot.stable_head_hash
+                == next_snapshot.stable_head_hash,
+            runtime_header_changed: previous_snapshot.runtime_header_hash
+                != next_snapshot.runtime_header_hash,
+            dynamic_tail_changed: previous_snapshot.dynamic_tail_hash
+                != next_snapshot.dynamic_tail_hash,
+            changed_segments,
+        }
+    }
+
+    pub fn budget_explanation(envelope: &ContextEnvelope) -> ContextBudgetExplanation {
+        let mut allocations = Vec::new();
+        for lease in &envelope.budget.leases {
+            let used_tokens = envelope
+                .selected
+                .iter()
+                .filter(|item| item.source == lease.source)
+                .map(|item| item.token_estimate)
+                .sum::<u64>();
+            let selected_count = envelope
+                .selected
+                .iter()
+                .filter(|item| item.source == lease.source)
+                .count();
+            let omitted_count = envelope
+                .omitted
+                .iter()
+                .filter(|item| item.source == lease.source)
+                .count();
+            allocations.push(ContextBudgetAllocation {
+                source: lease.source,
+                min_tokens: lease.min_tokens,
+                target_tokens: lease.target_tokens,
+                max_tokens: lease.max_tokens,
+                used_tokens,
+                selected_count,
+                omitted_count,
+                exhausted: omitted_count > 0 || used_tokens >= lease.max_tokens,
+                priority: lease.priority,
+            });
+        }
+        ContextBudgetExplanation {
+            total_tokens: envelope.budget.total_tokens,
+            used_tokens: envelope.budget.used_tokens,
+            pressure_bp: envelope.diagnostics.pressure_bp,
+            allocations,
+        }
+    }
+
+    pub fn agent_context_view(
+        parent: &ContextEnvelope,
+        lease: AgentContextLease,
+    ) -> AgentContextView {
+        let mut inherited = Vec::new();
+        let mut isolated_omissions = Vec::new();
+        for item in &parent.selected {
+            if !lease.allowed_sources.contains(&item.source) {
+                continue;
+            }
+            if item.visibility == ContextVisibility::Private
+                && item.authority == ContextAuthority::Agent
+                && item.id != lease.child_agent_id
+            {
+                isolated_omissions.push(ContextOmission {
+                    source: item.source,
+                    reason: format!(
+                        "private agent context isolated from {}",
+                        lease.child_agent_id
+                    ),
+                    token_estimate: item.token_estimate,
+                });
+                continue;
+            }
+            if item.visibility != ContextVisibility::Private
+                || matches!(
+                    item.source,
+                    ContextSourceKind::Task | ContextSourceKind::Workspace
+                )
+            {
+                inherited.push(item.clone());
+            }
+        }
+
+        let mut contract_item = ContextItem::new(
+            format!("agent-contract:{}", lease.child_agent_id),
+            ContextSourceKind::Task,
+            ContextRole::TaskState,
+            lease.task_contract.clone(),
+        );
+        contract_item.authority = ContextAuthority::System;
+        contract_item.visibility = ContextVisibility::Private;
+        let mut dynamic_items = vec![contract_item];
+        dynamic_items.extend(inherited.clone());
+
+        let mut identity = Self::child_identity_from_lease(&lease);
+        identity.project_id = parent.identity.project_id.clone();
+        identity.task_id = parent.identity.task_id.clone();
+        identity.team_id = parent.identity.team_id.clone();
+        let runtime_header = Self::runtime_header(&identity, ContextProfile::SubAgent);
+        let envelope = Self::build_envelope(ContextEnvelopeRequest {
+            identity,
+            profile: ContextProfile::SubAgent,
+            intent: parent.intent.clone(),
+            stable_head: parent.assembled.stable_head.clone(),
+            runtime_header,
+            dynamic_items,
+            omitted: isolated_omissions.clone(),
+            total_budget_tokens: lease.max_tokens.max(1),
+        });
+        AgentContextView {
+            child_agent_id: lease.child_agent_id,
+            parent_agent_id: lease.parent_agent_id,
+            inherited_item_ids: inherited.into_iter().map(|item| item.id).collect(),
+            envelope,
+            isolated_omissions,
         }
     }
 
@@ -1436,6 +1706,142 @@ mod tests {
             a.diagnostics.dynamic_tail_hash,
             b.diagnostics.dynamic_tail_hash
         );
+    }
+
+    #[test]
+    fn stable_header_hash_unchanged_for_dialogue_only_change() {
+        let previous = ContextRuntimeKernel::build_envelope(request_with_dynamic("turn one"));
+        let next = ContextRuntimeKernel::build_envelope(request_with_dynamic("turn two"));
+        let diff = ContextRuntimeKernel::snapshot_diff(&previous, &next);
+
+        assert!(diff.stable_head_reusable);
+        assert!(!diff.runtime_header_changed);
+        assert!(diff.dynamic_tail_changed);
+        assert_eq!(diff.changed_segments.len(), 1);
+        assert_eq!(
+            diff.changed_segments[0].kind,
+            ContextSegmentKind::DynamicTail
+        );
+    }
+
+    #[test]
+    fn context_budget_drops_lowest_priority_dynamic_segment() {
+        let mut high = item_with_tokens(
+            "task-high",
+            ContextSourceKind::Task,
+            ContextRole::TaskState,
+            300,
+        );
+        high.score = 0.9;
+        let mut low = item_with_tokens(
+            "memory-low",
+            ContextSourceKind::Memory,
+            ContextRole::Orientation,
+            400,
+        );
+        low.score = 0.1;
+        let envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            identity: ContextIdentity::main("session-budget"),
+            profile: ContextProfile::YoloGoal,
+            intent: "budget".to_string(),
+            stable_head: vec!["stable".to_string()],
+            runtime_header: vec!["runtime".to_string()],
+            dynamic_items: vec![low, high],
+            omitted: Vec::new(),
+            total_budget_tokens: 1_000,
+        });
+        let budget = ContextRuntimeKernel::budget_explanation(&envelope);
+
+        assert!(envelope.selected.iter().any(|item| item.id == "task-high"));
+        assert!(envelope
+            .omitted
+            .iter()
+            .any(|item| item.source == ContextSourceKind::Memory));
+        assert!(budget
+            .allocations
+            .iter()
+            .any(|item| item.source == ContextSourceKind::Memory && item.omitted_count == 1));
+    }
+
+    #[test]
+    fn agent_context_view_isolated_but_shares_project_facts() {
+        let mut project_fact = ContextItem::new(
+            "workspace-fact",
+            ContextSourceKind::Workspace,
+            ContextRole::Evidence,
+            "workspace project fact",
+        );
+        project_fact.visibility = ContextVisibility::Shared;
+        project_fact.authority = ContextAuthority::Project;
+        let mut private_peer = ContextItem::new(
+            "peer-private",
+            ContextSourceKind::AgentPeer,
+            ContextRole::Evidence,
+            "private peer note",
+        );
+        private_peer.visibility = ContextVisibility::Private;
+        private_peer.authority = ContextAuthority::Agent;
+        let parent = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
+            identity: ContextIdentity::main("session-agent"),
+            profile: ContextProfile::Collaboration,
+            intent: "delegate".to_string(),
+            stable_head: vec!["stable".to_string()],
+            runtime_header: vec!["runtime".to_string()],
+            dynamic_items: vec![project_fact, private_peer],
+            omitted: Vec::new(),
+            total_budget_tokens: 10_000,
+        });
+
+        let view = ContextRuntimeKernel::agent_context_view(
+            &parent,
+            AgentContextLease {
+                parent_session_id: "session-agent".to_string(),
+                parent_agent_id: "primary".to_string(),
+                child_agent_id: "reviewer".to_string(),
+                task_contract: "review safely".to_string(),
+                allowed_sources: vec![ContextSourceKind::Workspace, ContextSourceKind::AgentPeer],
+                max_tokens: 4_000,
+                required_return: vec![AgentReturnRequirement::Evidence],
+            },
+        );
+
+        assert_eq!(view.envelope.identity.agent_id, "reviewer");
+        assert!(view
+            .inherited_item_ids
+            .contains(&"workspace-fact".to_string()));
+        assert!(!view
+            .inherited_item_ids
+            .contains(&"peer-private".to_string()));
+        assert!(view
+            .isolated_omissions
+            .iter()
+            .any(|item| item.reason.contains("private agent context")));
+        assert_eq!(
+            view.envelope.diagnostics.stable_head_hash,
+            parent.diagnostics.stable_head_hash
+        );
+    }
+
+    #[test]
+    fn context_snapshot_diff_reports_changed_segments() {
+        let first = ContextRuntimeKernel::build_envelope(request_with_dynamic("alpha"));
+        let mut changed_request = request_with_dynamic("alpha");
+        changed_request.runtime_header = vec!["runtime: changed".to_string()];
+        changed_request.dynamic_items = vec![ContextItem::new(
+            "memory-2",
+            ContextSourceKind::Memory,
+            ContextRole::Orientation,
+            "beta",
+        )];
+        let second = ContextRuntimeKernel::build_envelope(changed_request);
+        let snapshot = ContextRuntimeKernel::snapshot(&second);
+        let diff = ContextRuntimeKernel::snapshot_diff(&first, &second);
+
+        assert_eq!(snapshot.segments.len(), 3);
+        assert!(diff.stable_head_reusable);
+        assert!(diff.runtime_header_changed);
+        assert!(diff.dynamic_tail_changed);
+        assert_eq!(diff.changed_segments.len(), 2);
     }
 
     #[test]
