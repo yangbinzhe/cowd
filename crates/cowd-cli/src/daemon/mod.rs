@@ -24,6 +24,8 @@ use tower_http::services::ServeDir;
 use crate::api_routes;
 use crate::event_bus::SessionEventBus;
 use crate::gateway::ActiveSessions;
+use crate::runtime_protocol::RuntimeRequest;
+use crate::runtime_service::RuntimeService;
 use crate::session_kernel::SessionKernel;
 use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
@@ -763,6 +765,7 @@ async fn handle_unix_client(
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
+    let runtime_service = RuntimeService::new(sessions.clone(), lease_registry.clone(), started_at);
 
     loop {
         line.clear();
@@ -793,384 +796,402 @@ async fn handle_unix_client(
                             break;
                         }
 
-                        match cmd.get("cmd").and_then(|c| c.as_str()) {
-                            Some("status") => daemon_control_status(&sessions, started_at),
-                            Some("runtime_snapshot") => {
-                                daemon_runtime_snapshot(&sessions, &lease_registry, started_at)
-                                    .await
-                            }
-                            Some("memory_status") => {
-                                let mut value =
-                                    api_routes::memory_routes::memory_status_value(&app_state)
-                                        .await;
-                                if let Some(object) = value.as_object_mut() {
-                                    object.insert("ok".to_string(), serde_json::json!(true));
-                                    object.insert(
-                                        "kind".to_string(),
-                                        serde_json::json!("daemon_memory_status"),
-                                    );
+                        let protocol_request =
+                            serde_json::from_value::<RuntimeRequest>(cmd.clone()).ok();
+                        if let Some(request) = protocol_request
+                            .as_ref()
+                            .filter(|request| !request.is_supported_version())
+                        {
+                            RuntimeService::unsupported_protocol_value(request)
+                        } else {
+                            match cmd.get("cmd").and_then(|c| c.as_str()) {
+                                Some("status") | Some("runtime.status") => {
+                                    runtime_service.status_value()
                                 }
-                                value
-                            }
-                            Some("context_snapshot") => {
-                                let session_id =
-                                    cmd.get("session_id").and_then(|value| value.as_str());
-                                daemon_context_snapshot(&app_state, session_id).await
-                            }
-                            Some("task_list") => serde_json::json!({
-                                "ok": true,
-                                "tasks": task_kernel.list(),
-                                "current": task_kernel.current(),
-                            }),
-                            Some("task_start") => {
-                                let objective = cmd
-                                    .get("objective")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or_default();
-                                let yolo_mode = cmd
-                                    .get("yolo_mode")
-                                    .and_then(|value| value.as_bool())
-                                    .unwrap_or(false);
-                                match task_kernel.start_goal(objective, yolo_mode) {
-                                    Ok(task) => serde_json::json!({
-                                        "ok": true,
-                                        "task": task,
-                                    }),
-                                    Err(error) => serde_json::json!({
-                                        "ok": false,
-                                        "error": error,
-                                    }),
+                                Some("runtime_snapshot") | Some("runtime.snapshot") => {
+                                    runtime_service.snapshot_value().await
                                 }
-                            }
-                            Some("task_cancel") => {
-                                let id = cmd
-                                    .get("id")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or_default();
-                                match task_kernel.transition(
-                                    id,
-                                    crate::task_kernel::TaskStatus::Cancelled,
-                                    None,
-                                    "cancelled by TUI socket",
-                                ) {
-                                    Ok(task) => serde_json::json!({
-                                        "ok": true,
-                                        "task": task,
-                                    }),
-                                    Err(error) => serde_json::json!({
-                                        "ok": false,
-                                        "error": error,
-                                    }),
+                                Some("memory_status") => {
+                                    let mut value =
+                                        api_routes::memory_routes::memory_status_value(&app_state)
+                                            .await;
+                                    if let Some(object) = value.as_object_mut() {
+                                        object.insert("ok".to_string(), serde_json::json!(true));
+                                        object.insert(
+                                            "kind".to_string(),
+                                            serde_json::json!("daemon_memory_status"),
+                                        );
+                                    }
+                                    value
                                 }
-                            }
-                            Some("task_complete") => {
-                                let id = cmd
-                                    .get("id")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or_default();
-                                match task_kernel.transition(
-                                    id,
-                                    crate::task_kernel::TaskStatus::Completed,
-                                    None,
-                                    "accepted by TUI socket",
-                                ) {
-                                    Ok(task) => serde_json::json!({
-                                        "ok": true,
-                                        "task": task,
-                                    }),
-                                    Err(error) => serde_json::json!({
-                                        "ok": false,
-                                        "error": error,
-                                    }),
+                                Some("context_snapshot") => {
+                                    let session_id =
+                                        cmd.get("session_id").and_then(|value| value.as_str());
+                                    daemon_context_snapshot(&app_state, session_id).await
                                 }
-                            }
-                            Some("approval_pending") => {
-                                let pending = match approval_gate.as_ref() {
-                                    Some(gate) => gate.get_pending_requests().await,
-                                    None => Vec::new(),
-                                };
-                                serde_json::json!({
+                                Some("task_list") => serde_json::json!({
                                     "ok": true,
-                                    "approvals": pending,
-                                })
-                            }
-                            Some("approval_respond") => match approval_gate.as_ref() {
-                                Some(gate) => {
+                                    "tasks": task_kernel.list(),
+                                    "current": task_kernel.current(),
+                                }),
+                                Some("task_start") => {
+                                    let objective = cmd
+                                        .get("objective")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default();
+                                    let yolo_mode = cmd
+                                        .get("yolo_mode")
+                                        .and_then(|value| value.as_bool())
+                                        .unwrap_or(false);
+                                    match task_kernel.start_goal(objective, yolo_mode) {
+                                        Ok(task) => serde_json::json!({
+                                            "ok": true,
+                                            "task": task,
+                                        }),
+                                        Err(error) => serde_json::json!({
+                                            "ok": false,
+                                            "error": error,
+                                        }),
+                                    }
+                                }
+                                Some("task_cancel") => {
                                     let id = cmd
                                         .get("id")
                                         .and_then(|value| value.as_str())
                                         .unwrap_or_default();
-                                    let approved = cmd
-                                        .get("approved")
-                                        .and_then(|value| value.as_bool())
-                                        .unwrap_or(false);
-                                    let persistence = parse_socket_approval_persistence(
-                                        cmd.get("persistence")
-                                            .and_then(|value| value.as_str())
-                                            .unwrap_or("once"),
-                                    );
-                                    let verdict = if approved {
-                                        ApprovalVerdict::Approved
-                                    } else {
-                                        ApprovalVerdict::Denied {
-                                            reason: cmd
-                                                .get("reason")
-                                                .and_then(|value| value.as_str())
-                                                .unwrap_or("denied by TUI socket")
-                                                .to_string(),
-                                        }
-                                    };
-                                    match gate.resolve_approval(id, verdict, persistence).await {
-                                        Some(request) => serde_json::json!({
+                                    match task_kernel.transition(
+                                        id,
+                                        crate::task_kernel::TaskStatus::Cancelled,
+                                        None,
+                                        "cancelled by TUI socket",
+                                    ) {
+                                        Ok(task) => serde_json::json!({
                                             "ok": true,
-                                            "id": id,
-                                            "resolved": true,
-                                            "approved": approved,
-                                            "tool": "bash",
-                                            "action": request.command,
+                                            "task": task,
                                         }),
-                                        None => serde_json::json!({
+                                        Err(error) => serde_json::json!({
                                             "ok": false,
-                                            "error": "approval request not found",
+                                            "error": error,
                                         }),
                                     }
                                 }
-                                None => return_json_error("approval gate not configured"),
-                            },
-                            Some("connector_resource_list") => {
-                                let limit = cmd
-                                    .get("limit")
-                                    .and_then(|value| value.as_u64())
-                                    .map(|value| value as usize);
-                                let offset = cmd
-                                    .get("offset")
-                                    .and_then(|value| value.as_u64())
-                                    .map(|value| value as usize);
-                                let query = cmd.get("q").and_then(|value| value.as_str());
-                                api_routes::connector_routes::connector_resources_snapshot(
-                                    &app_state, limit, offset, query,
-                                )
-                            }
-                            Some("connector_resource_revalidate") => {
-                                let reference = cmd
-                                    .get("reference")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or_default();
-                                let state = cmd.get("state").and_then(|value| value.as_str());
-                                api_routes::connector_routes::connector_resource_revalidate_snapshot(
+                                Some("task_complete") => {
+                                    let id = cmd
+                                        .get("id")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default();
+                                    match task_kernel.transition(
+                                        id,
+                                        crate::task_kernel::TaskStatus::Completed,
+                                        None,
+                                        "accepted by TUI socket",
+                                    ) {
+                                        Ok(task) => serde_json::json!({
+                                            "ok": true,
+                                            "task": task,
+                                        }),
+                                        Err(error) => serde_json::json!({
+                                            "ok": false,
+                                            "error": error,
+                                        }),
+                                    }
+                                }
+                                Some("approval_pending") => {
+                                    let pending = match approval_gate.as_ref() {
+                                        Some(gate) => gate.get_pending_requests().await,
+                                        None => Vec::new(),
+                                    };
+                                    serde_json::json!({
+                                        "ok": true,
+                                        "approvals": pending,
+                                    })
+                                }
+                                Some("approval_respond") => match approval_gate.as_ref() {
+                                    Some(gate) => {
+                                        let id = cmd
+                                            .get("id")
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or_default();
+                                        let approved = cmd
+                                            .get("approved")
+                                            .and_then(|value| value.as_bool())
+                                            .unwrap_or(false);
+                                        let persistence = parse_socket_approval_persistence(
+                                            cmd.get("persistence")
+                                                .and_then(|value| value.as_str())
+                                                .unwrap_or("once"),
+                                        );
+                                        let verdict = if approved {
+                                            ApprovalVerdict::Approved
+                                        } else {
+                                            ApprovalVerdict::Denied {
+                                                reason: cmd
+                                                    .get("reason")
+                                                    .and_then(|value| value.as_str())
+                                                    .unwrap_or("denied by TUI socket")
+                                                    .to_string(),
+                                            }
+                                        };
+                                        match gate.resolve_approval(id, verdict, persistence).await
+                                        {
+                                            Some(request) => serde_json::json!({
+                                                "ok": true,
+                                                "id": id,
+                                                "resolved": true,
+                                                "approved": approved,
+                                                "tool": "bash",
+                                                "action": request.command,
+                                            }),
+                                            None => serde_json::json!({
+                                                "ok": false,
+                                                "error": "approval request not found",
+                                            }),
+                                        }
+                                    }
+                                    None => return_json_error("approval gate not configured"),
+                                },
+                                Some("connector_resource_list") => {
+                                    let limit = cmd
+                                        .get("limit")
+                                        .and_then(|value| value.as_u64())
+                                        .map(|value| value as usize);
+                                    let offset = cmd
+                                        .get("offset")
+                                        .and_then(|value| value.as_u64())
+                                        .map(|value| value as usize);
+                                    let query = cmd.get("q").and_then(|value| value.as_str());
+                                    api_routes::connector_routes::connector_resources_snapshot(
+                                        &app_state, limit, offset, query,
+                                    )
+                                }
+                                Some("connector_resource_revalidate") => {
+                                    let reference = cmd
+                                        .get("reference")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default();
+                                    let state = cmd.get("state").and_then(|value| value.as_str());
+                                    api_routes::connector_routes::connector_resource_revalidate_snapshot(
                                     &app_state, reference, state,
                                 )
-                            }
-                            Some("connector_resource_promote_memory") => {
-                                let reference = cmd
-                                    .get("reference")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or_default();
-                                let session_id = cmd
-                                    .get("session_id")
-                                    .and_then(|value| value.as_str())
-                                    .map(ToOwned::to_owned);
-                                api_routes::connector_routes::connector_resource_promote_memory_snapshot(
+                                }
+                                Some("connector_resource_promote_memory") => {
+                                    let reference = cmd
+                                        .get("reference")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default();
+                                    let session_id = cmd
+                                        .get("session_id")
+                                        .and_then(|value| value.as_str())
+                                        .map(ToOwned::to_owned);
+                                    api_routes::connector_routes::connector_resource_promote_memory_snapshot(
                                     &app_state,
                                     reference,
                                     session_id,
                                 )
                                 .await
-                            }
-                            Some("acquire_session_lease") => {
-                                let session_id = cmd
-                                    .get("session_id")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or_default();
-                                let owner = cmd
-                                    .get("owner")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or_default();
-                                let mode = cmd
-                                    .get("mode")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or("collaborative");
-                                lease_registry.acquire(session_id, owner, mode).await
-                            }
-                            Some("release_session_lease") => {
-                                let session_id = cmd
-                                    .get("session_id")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or_default();
-                                let owner = cmd
-                                    .get("owner")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or_default();
-                                lease_registry.release(session_id, owner).await
-                            }
-                            Some("ensure_session") => {
-                                let session_id = cmd
-                                    .get("session_id")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or_default();
-                                let model = cmd
-                                    .get("model")
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("claude-sonnet-4-6");
-                                ensure_daemon_session(
-                                    &sessions,
-                                    unified_store.as_ref(),
-                                    session_id,
-                                    model,
-                                )
-                                .await
-                            }
-                            Some("create_session") => {
-                                let model = cmd
-                                    .get("model")
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("claude-sonnet-4-6");
-                                let session_id = uuid::Uuid::new_v4().to_string();
-                                ensure_daemon_session(
-                                    &sessions,
-                                    unified_store.as_ref(),
-                                    &session_id,
-                                    model,
-                                )
-                                .await
-                            }
-                            Some("chat") => {
-                                let session_id = cmd
-                                    .get("session_id")
-                                    .and_then(|s| s.as_str())
-                                    .unwrap_or_default();
-                                let content = cmd
-                                    .get("content")
-                                    .and_then(|c| c.as_str())
-                                    .unwrap_or_default();
+                                }
+                                Some("acquire_session_lease") | Some("session.lease.acquire") => {
+                                    let session_id = cmd
+                                        .get("session_id")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or_default();
+                                    let owner = cmd
+                                        .get("owner")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or_default();
+                                    let mode = cmd
+                                        .get("mode")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("collaborative");
+                                    runtime_service
+                                        .acquire_session_lease_value(session_id, owner, mode)
+                                        .await
+                                }
+                                Some("release_session_lease") | Some("session.lease.release") => {
+                                    let session_id = cmd
+                                        .get("session_id")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or_default();
+                                    let owner = cmd
+                                        .get("owner")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or_default();
+                                    runtime_service
+                                        .release_session_lease_value(session_id, owner)
+                                        .await
+                                }
+                                Some("ensure_session") => {
+                                    let session_id = cmd
+                                        .get("session_id")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or_default();
+                                    let model = cmd
+                                        .get("model")
+                                        .and_then(|m| m.as_str())
+                                        .unwrap_or("claude-sonnet-4-6");
+                                    ensure_daemon_session(
+                                        &sessions,
+                                        unified_store.as_ref(),
+                                        session_id,
+                                        model,
+                                    )
+                                    .await
+                                }
+                                Some("create_session") => {
+                                    let model = cmd
+                                        .get("model")
+                                        .and_then(|m| m.as_str())
+                                        .unwrap_or("claude-sonnet-4-6");
+                                    let session_id = uuid::Uuid::new_v4().to_string();
+                                    ensure_daemon_session(
+                                        &sessions,
+                                        unified_store.as_ref(),
+                                        &session_id,
+                                        model,
+                                    )
+                                    .await
+                                }
+                                Some("chat") => {
+                                    let session_id = cmd
+                                        .get("session_id")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or_default();
+                                    let content = cmd
+                                        .get("content")
+                                        .and_then(|c| c.as_str())
+                                        .unwrap_or_default();
 
-                                if session_id.is_empty() || content.is_empty() {
-                                    serde_json::json!({
-                                        "ok": false,
-                                        "error": "session_id and content are required",
-                                    })
-                                } else {
-                                    match sessions.get(session_id) {
-                                        Some(entry) => {
-                                            let started_data = serde_json::json!({
-                                                "type": "TurnStarted",
-                                                "session_id": session_id,
-                                            });
-                                            event_bus
-                                                .broadcast(session_id, &started_data.to_string())
-                                                .await;
-                                            let mut guard = entry.lock().await;
-                                            match guard
-                                                .run_turn_async(
-                                                    content,
-                                                    &runtime::permissions::SharedPrompter::none(),
-                                                )
-                                                .await
-                                            {
-                                                Ok(summary) => {
-                                                    if let Some(ref store) = unified_store {
-                                                        let session_snapshot =
-                                                            guard.session().clone();
-                                                        if let Err(e) = crate::api_routes::sync_runtime_session_metadata_to_store(
+                                    if session_id.is_empty() || content.is_empty() {
+                                        serde_json::json!({
+                                            "ok": false,
+                                            "error": "session_id and content are required",
+                                        })
+                                    } else {
+                                        match sessions.get(session_id) {
+                                            Some(entry) => {
+                                                let started_data = serde_json::json!({
+                                                    "type": "TurnStarted",
+                                                    "session_id": session_id,
+                                                });
+                                                event_bus
+                                                    .broadcast(
+                                                        session_id,
+                                                        &started_data.to_string(),
+                                                    )
+                                                    .await;
+                                                let mut guard = entry.lock().await;
+                                                match guard
+                                                    .run_turn_async(
+                                                        content,
+                                                        &runtime::permissions::SharedPrompter::none(
+                                                        ),
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(summary) => {
+                                                        if let Some(ref store) = unified_store {
+                                                            let session_snapshot =
+                                                                guard.session().clone();
+                                                            if let Err(e) = crate::api_routes::sync_runtime_session_metadata_to_store(
                                                             store,
                                                             session_id,
                                                             &session_snapshot,
                                                         ).await {
                                                             tracing::warn!(session_id = %session_id, error = %e, "failed to sync daemon session metadata");
                                                         }
-                                                    }
-                                                    let final_text = summary
-                                                        .assistant_messages
-                                                        .last()
-                                                        .map(|msg| {
-                                                            msg.blocks
-                                                                .iter()
-                                                                .filter_map(|block| {
-                                                                    match block {
+                                                        }
+                                                        let final_text = summary
+                                                            .assistant_messages
+                                                            .last()
+                                                            .map(|msg| {
+                                                                msg.blocks
+                                                                    .iter()
+                                                                    .filter_map(|block| {
+                                                                        match block {
                                                                 runtime::ContentBlock::Text {
                                                                     text,
                                                                 } => Some(text.as_str()),
                                                                 _ => None,
                                                             }
-                                                                })
-                                                                .collect::<Vec<_>>()
-                                                                .join("")
+                                                                    })
+                                                                    .collect::<Vec<_>>()
+                                                                    .join("")
+                                                            })
+                                                            .unwrap_or_default();
+
+                                                        let sse_data = serde_json::json!({
+                                                            "type": "TurnComplete",
+                                                            "session_id": session_id,
+                                                            "response": final_text,
+                                                            "iterations": summary.iterations,
+                                                        });
+                                                        let thinking_done = serde_json::json!({
+                                                            "type": "ThinkingComplete",
+                                                            "session_id": session_id,
+                                                        });
+                                                        event_bus
+                                                            .broadcast(
+                                                                session_id,
+                                                                &thinking_done.to_string(),
+                                                            )
+                                                            .await;
+                                                        event_bus
+                                                            .broadcast(
+                                                                session_id,
+                                                                &sse_data.to_string(),
+                                                            )
+                                                            .await;
+
+                                                        serde_json::json!({
+                                                            "ok": true,
+                                                            "response": final_text,
+                                                            "iterations": summary.iterations,
                                                         })
-                                                        .unwrap_or_default();
-
-                                                    let sse_data = serde_json::json!({
-                                                        "type": "TurnComplete",
-                                                        "session_id": session_id,
-                                                        "response": final_text,
-                                                        "iterations": summary.iterations,
-                                                    });
-                                                    let thinking_done = serde_json::json!({
-                                                        "type": "ThinkingComplete",
-                                                        "session_id": session_id,
-                                                    });
-                                                    event_bus
-                                                        .broadcast(
-                                                            session_id,
-                                                            &thinking_done.to_string(),
-                                                        )
-                                                        .await;
-                                                    event_bus
-                                                        .broadcast(
-                                                            session_id,
-                                                            &sse_data.to_string(),
-                                                        )
-                                                        .await;
-
-                                                    serde_json::json!({
-                                                        "ok": true,
-                                                        "response": final_text,
-                                                        "iterations": summary.iterations,
-                                                    })
-                                                }
-                                                Err(e) => {
-                                                    let err_msg = e.to_string();
-                                                    let sse_data = serde_json::json!({
-                                                        "type": "TurnError",
-                                                        "session_id": session_id,
-                                                        "error": err_msg,
-                                                    });
-                                                    event_bus
-                                                        .broadcast(
-                                                            session_id,
-                                                            &sse_data.to_string(),
-                                                        )
-                                                        .await;
-                                                    serde_json::json!({
-                                                        "ok": false,
-                                                        "error": err_msg,
-                                                    })
+                                                    }
+                                                    Err(e) => {
+                                                        let err_msg = e.to_string();
+                                                        let sse_data = serde_json::json!({
+                                                            "type": "TurnError",
+                                                            "session_id": session_id,
+                                                            "error": err_msg,
+                                                        });
+                                                        event_bus
+                                                            .broadcast(
+                                                                session_id,
+                                                                &sse_data.to_string(),
+                                                            )
+                                                            .await;
+                                                        serde_json::json!({
+                                                            "ok": false,
+                                                            "error": err_msg,
+                                                        })
+                                                    }
                                                 }
                                             }
-                                        }
-                                        None => {
-                                            serde_json::json!({
-                                                "ok": false,
-                                                "error": format!("session {session_id} not found"),
-                                            })
+                                            None => {
+                                                serde_json::json!({
+                                                    "ok": false,
+                                                    "error": format!("session {session_id} not found"),
+                                                })
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Some("list_sessions") => {
-                                let ids = sessions.list();
-                                serde_json::json!({ "ok": true, "sessions": ids })
-                            }
-                            Some(other) => {
-                                serde_json::json!({
-                                    "ok": false,
-                                    "error": format!("unknown command: {other}"),
-                                })
-                            }
-                            None => {
-                                serde_json::json!({
-                                    "ok": false,
-                                    "error": "missing 'cmd' field",
-                                })
+                                Some("list_sessions") | Some("session.list") => {
+                                    runtime_service.list_sessions_value()
+                                }
+                                Some(other) => {
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "error": format!("unknown command: {other}"),
+                                    })
+                                }
+                                None => {
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "error": "missing 'cmd' field",
+                                    })
+                                }
                             }
                         }
                     }

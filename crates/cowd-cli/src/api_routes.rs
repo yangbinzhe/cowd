@@ -2389,6 +2389,7 @@ providers:
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider_registry)]
     async fn runtime_provider_reload_replaces_global_registry_from_config() {
         runtime::init_global_providers(runtime::ProvidersConfig::default());
         let root = test_temp_dir("runtime-provider-reload");

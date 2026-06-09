@@ -177,7 +177,7 @@ case "$SCOPE" in
     run_step webui_e2e keep bash -lc 'cd webui && PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-/snap/bin/chromium}" npm run test:e2e'
     ;;
   live)
-    run_step cargo_build_cli clean cargo build -p cowd-cli --no-default-features
+    run_step cargo_build_cli keep cargo build -p cowd-cli --no-default-features
     run_step tui_smoke keep bash scripts/tui_smoke.sh
     run_step webui_live_workbench keep bash scripts/webui_live_workbench_scenario.sh
     run_step unified_runtime_surface keep bash scripts/v0964_unified_runtime_surface_scenario.sh

@@ -270,6 +270,22 @@ impl WorkerRegistry {
         trusted_roots: &[String],
         auto_recover_prompt_misdelivery: bool,
     ) -> Worker {
+        self.create_with_state_path(
+            cwd,
+            trusted_roots,
+            auto_recover_prompt_misdelivery,
+            crate::cowd_dirs::worker_state_path(),
+        )
+    }
+
+    #[must_use]
+    fn create_with_state_path(
+        &self,
+        cwd: &str,
+        trusted_roots: &[String],
+        auto_recover_prompt_misdelivery: bool,
+        state_path: PathBuf,
+    ) -> Worker {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("worker registry lock poisoned; recovering");
             poisoned.into_inner()
@@ -277,7 +293,6 @@ impl WorkerRegistry {
         inner.counter += 1;
         let ts = now_secs();
         let worker_id = format!("worker_{:08x}_{}", ts, inner.counter);
-        let state_path = crate::cowd_dirs::worker_state_path();
         let trust_auto_resolve = trusted_roots
             .iter()
             .any(|root| path_matches_allowlist(cwd, root));
@@ -1431,7 +1446,6 @@ mod tests {
 
     #[test]
     fn emit_state_file_writes_worker_status_on_transition() {
-        let _guard = crate::test_env_lock();
         let cwd_path = std::env::temp_dir().join(format!(
             "cowd-state-test-{}",
             std::time::SystemTime::now()
@@ -1440,18 +1454,13 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&cwd_path).expect("test dir should create");
-        let config_home = cwd_path.join(".cowd");
-        std::fs::create_dir_all(&config_home).expect("config dir should create");
-        // Temporarily override COWD_CONFIG_HOME so the state file lands in our temp dir
-        let prev = std::env::var_os("COWD_CONFIG_HOME");
-        std::env::set_var("COWD_CONFIG_HOME", &config_home);
+        let state_path = cwd_path.join(".cowd").join("worker-state.json");
 
         let cwd = cwd_path.to_str().expect("test path should be utf8");
         let registry = WorkerRegistry::new();
-        let worker = registry.create(cwd, &[], true);
+        let worker = registry.create_with_state_path(cwd, &[], true, state_path.clone());
 
         // After create the worker is Spawning — state file should exist
-        let state_path = crate::cowd_dirs::worker_state_path();
         assert!(
             state_path.exists(),
             "state file should exist after worker creation"
@@ -1487,11 +1496,6 @@ mod tests {
             "is_ready should be true when ReadyForPrompt"
         );
 
-        // Restore previous env value
-        match prev {
-            Some(v) => std::env::set_var("COWD_CONFIG_HOME", v),
-            None => std::env::remove_var("COWD_CONFIG_HOME"),
-        }
         let _ = std::fs::remove_dir_all(&cwd_path);
     }
 

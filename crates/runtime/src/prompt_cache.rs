@@ -703,8 +703,8 @@ mod tests {
         assert_eq!(stats.completion_cache_misses, 1);
         assert_eq!(stats.completion_cache_writes, 1);
 
-        std::fs::remove_dir_all(temp_root).expect("cleanup temp root");
         std::env::remove_var("COWD_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[test]

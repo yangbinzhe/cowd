@@ -397,6 +397,8 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
     use memory::agent_directory::{AgentDirectory, AgentInfo, AgentStatus};
     use runtime::team_discovery::TeamDiscoveryProtocol;
 
+    let rust_skill = "rust-td-rank-unique";
+    let testing_skill = "testing-td-rank-unique";
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -407,7 +409,11 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
         AgentInfo {
             agent_id: "rust-expert".into(),
             role: "Executor".into(),
-            capabilities: vec!["rust".into(), "testing".into(), "refactoring".into()],
+            capabilities: vec![
+                rust_skill.into(),
+                testing_skill.into(),
+                "refactoring".into(),
+            ],
             status: AgentStatus::Active,
             registered_at_ms: now,
             last_heartbeat_ms: now,
@@ -425,7 +431,7 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
         AgentInfo {
             agent_id: "tester".into(),
             role: "Reviewer".into(),
-            capabilities: vec!["testing".into()],
+            capabilities: vec![testing_skill.into()],
             status: AgentStatus::Active,
             registered_at_ms: now,
             last_heartbeat_ms: now,
@@ -440,7 +446,7 @@ fn team_discovery_ranks_by_skill_overlap_from_directory() {
     let discovery = TeamDiscoveryProtocol::new();
     let ranked = discovery.discover_team(
         "Build a Rust microservice with tests",
-        &["rust".into(), "testing".into()],
+        &[rust_skill.into(), testing_skill.into()],
     );
 
     assert_eq!(ranked.len(), 2);
@@ -465,6 +471,7 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
     use runtime::agent::{SubAgentConfig, SubAgentError, SubAgentExecutor, SubAgentResult};
     use runtime::agent_collaboration::{CollaborationOrchestrator, CollaborationTask};
 
+    let rust_skill = "rust-orchestrator-unique";
     struct NoopExecutor;
     impl SubAgentExecutor for NoopExecutor {
         fn execute(
@@ -486,7 +493,7 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
         AgentInfo {
             agent_id: "high-rep".into(),
             role: "Executor".into(),
-            capabilities: vec!["rust".into()],
+            capabilities: vec![rust_skill.into()],
             status: AgentStatus::Active,
             registered_at_ms: now,
             last_heartbeat_ms: now,
@@ -501,7 +508,7 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
         AgentInfo {
             agent_id: "low-rep".into(),
             role: "Executor".into(),
-            capabilities: vec!["rust".into(), "testing".into()],
+            capabilities: vec![rust_skill.into(), "testing-orchestrator-unique".into()],
             status: AgentStatus::Active,
             registered_at_ms: now,
             last_heartbeat_ms: now,
@@ -523,7 +530,7 @@ fn orchestrator_assemble_team_uses_discovery_protocol() {
 
     let task = CollaborationTask {
         description: "Rust refactoring".into(),
-        required_skills: vec!["rust".into()],
+        required_skills: vec![rust_skill.into()],
         subtasks: vec![],
         review_criteria: None,
     };
@@ -688,10 +695,11 @@ async fn test_collaboration_orchestrator_synthesis() {
         .as_millis() as u64;
 
     // Register a dummy agent so assemble_team doesn't return None.
+    let dummy_skill = "rust-run-boxed-unique";
     AgentDirectory::global().register(AgentInfo {
         agent_id: "dummy-1".to_string(),
         role: "Executor".to_string(),
-        capabilities: vec!["rust".to_string()],
+        capabilities: vec![dummy_skill.to_string()],
         status: AgentStatus::Active,
         registered_at_ms: now,
         last_heartbeat_ms: now,
@@ -699,7 +707,9 @@ async fn test_collaboration_orchestrator_synthesis() {
     });
 
     let orch = CollaborationOrchestrator::<DummyExec>::new(Arc::new(DummyExec));
-    let result: Option<String> = orch.run_boxed("test task", &["rust".to_string()]).await;
+    let result: Option<String> = orch
+        .run_boxed("test task", &[dummy_skill.to_string()])
+        .await;
     assert!(
         result.is_some(),
         "run_boxed should return Some for valid task"

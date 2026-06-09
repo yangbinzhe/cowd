@@ -1,0 +1,66 @@
+[2026-06-09T13:12:44+08:00] START cargo_test_plugins
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling serde_core v1.0.228
+   Compiling zmij v1.0.21
+   Compiling syn v2.0.117
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.150
+   Compiling memchr v2.8.1
+   Compiling serde_derive v1.0.228
+   Compiling itoa v1.0.18
+   Compiling plugins v0.9.67 (/media/yi/Datas/workspace/cowd/crates/plugins)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.87s
+     Running unittests src/lib.rs (/tmp/cowd-target-20260609-131242-2109468/debug/deps/plugins-5c1d8b8551736465)
+
+running 39 tests
+test hooks::tests::generated_hook_scripts_are_executable ... ok
+test test_isolation::tests::test_env_lock_creates_plugin_directories ... ok
+test test_isolation::tests::test_env_lock_creates_isolated_home ... ok
+test tests::load_plugin_from_directory_accumulates_multiple_validation_errors ... ok
+test tests::load_plugin_from_directory_rejects_claude_code_manifest_contracts_with_guidance ... ok
+test tests::auto_installs_bundled_plugins_into_the_registry ... ok
+test tests::load_plugin_from_directory_rejects_invalid_permissions ... ok
+test tests::load_plugin_from_directory_rejects_invalid_tool_required_permission ... ok
+test tests::load_plugin_from_directory_rejects_directory_command_paths ... ok
+test tests::load_plugin_from_directory_rejects_missing_lifecycle_paths ... ok
+test tests::load_plugin_from_directory_rejects_missing_tool_or_command_paths ... ok
+test tests::aggregates_and_executes_plugin_tools ... ok
+test tests::bundled_sync_prunes_removed_bundled_registry_entries ... ok
+test tests::cowd_config_home_isolation_prevents_host_plugin_leakage ... ok
+test tests::default_bundled_root_loads_repo_bundles_as_installed_plugins ... ok
+test tests::installed_plugin_discovery_prunes_stale_registry_entries ... ok
+test tests::installed_plugin_discovery_keeps_registry_entries_outside_install_root ... ok
+test hooks::tests::collects_and_runs_hooks_from_enabled_plugins ... ok
+test tests::discovers_builtin_and_bundled_plugins ... ok
+test tests::installed_plugin_registry_report_collects_load_failures_from_install_root ... ok
+test tests::list_installed_plugins_scans_packaged_manifests_in_install_root ... ok
+test tests::list_installed_plugins_scans_install_root_without_registry_entries ... ok
+test tests::load_plugin_from_directory_rejects_duplicate_permissions_and_commands ... ok
+test tests::installs_enables_updates_and_uninstalls_external_plugins ... ok
+test tests::load_plugin_from_directory_defaults_optional_fields ... ok
+test tests::load_plugin_from_directory_reads_root_manifest_and_validates_entries ... ok
+test tests::load_plugin_from_directory_supports_packaged_manifest_path ... ok
+test tests::load_plugin_from_directory_validates_required_fields ... ok
+test tests::persists_bundled_plugin_disable_state_across_reloads ... ok
+test tests::persists_bundled_plugin_enable_state_across_reloads ... ok
+test tests::plugin_registry_report_collects_load_failures_without_dropping_valid_plugins ... ok
+test tests::plugin_lifecycle_handles_parallel_execution ... ok
+test tests::plugin_registry_runs_initialize_and_shutdown_for_enabled_plugins ... ok
+test tests::plugin_registry_tracks_enabled_state_and_lookup ... ok
+test tests::rejects_plugin_sources_with_missing_failure_hook_paths ... ok
+test tests::rejects_plugin_sources_with_missing_hook_paths ... ok
+test tests::validates_plugin_source_before_install ... ok
+test hooks::tests::propagates_plugin_hook_failures ... ok
+test hooks::tests::pre_tool_use_denies_when_plugin_hook_exits_two ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+   Doc-tests plugins
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[2026-06-09T13:12:48+08:00] END cargo_test_plugins status=0 elapsed=4s target_before=0 target_after=92563890
