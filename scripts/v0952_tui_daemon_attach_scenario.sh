@@ -56,7 +56,13 @@ if ss -ltnp | rg -q ":$PORT\\b"; then
 fi
 
 cd "$ROOT"
-cargo build -p cowd-cli
+if [[ "${COWD_SCENARIO_SKIP_BUILD:-0}" != "1" ]]; then
+  cargo build -p cowd-cli
+fi
+if [[ ! -x "$BIN" ]]; then
+  echo "missing cowd binary at $BIN; run cargo build -p cowd-cli first" >&2
+  exit 1
+fi
 
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
 cat >"$CONFIG_HOME/config.yaml" <<EOF

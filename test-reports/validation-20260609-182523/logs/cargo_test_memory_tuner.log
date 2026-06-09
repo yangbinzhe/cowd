@@ -1,0 +1,179 @@
+[2026-06-09T18:25:28+08:00] START cargo_test_memory_tuner
+   Compiling libc v0.2.186
+   Compiling serde_core v1.0.228
+   Compiling slab v0.4.12
+   Compiling log v0.4.30
+   Compiling num-traits v0.2.19
+   Compiling rustls v0.23.40
+   Compiling futures-channel v0.3.32
+   Compiling tracing-core v0.1.36
+   Compiling idna v1.1.0
+   Compiling csv-core v0.1.13
+   Compiling aho-corasick v1.1.4
+   Compiling serial_test_derive v3.5.0
+   Compiling futures-util v0.3.32
+   Compiling tracing v0.1.44
+   Compiling url v2.5.8
+   Compiling regex-automata v0.4.14
+   Compiling parking_lot_core v0.9.12
+   Compiling errno v0.3.14
+   Compiling socket2 v0.6.4
+   Compiling mio v1.2.1
+   Compiling getrandom v0.2.17
+   Compiling getrandom v0.4.2
+   Compiling inotify-sys v0.1.5
+   Compiling mio v0.8.11
+   Compiling filetime v0.2.29
+   Compiling inotify v0.9.6
+   Compiling signal-hook-registry v1.4.8
+   Compiling ring v0.17.14
+   Compiling rand v0.10.1
+   Compiling parking_lot v0.12.5
+   Compiling tempfile v3.27.0
+   Compiling futures-executor v0.3.32
+   Compiling notify v6.1.1
+   Compiling tokio v1.52.3
+   Compiling scheduled-thread-pool v0.2.7
+   Compiling serial_test v3.5.0
+   Compiling r2d2 v0.8.10
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.150
+   Compiling csv v1.4.0
+   Compiling uuid v1.23.1
+   Compiling regex v1.12.3
+   Compiling rustls-webpki v0.103.13
+   Compiling tree-sitter v0.24.7
+   Compiling chrono v0.4.44
+   Compiling serde_urlencoded v0.7.1
+   Compiling rusqlite v0.31.0
+   Compiling r2d2_sqlite v0.24.0
+   Compiling hyper v1.10.0
+   Compiling tower v0.5.3
+   Compiling tower-http v0.6.11
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-util v0.1.20
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling cowd-memory v0.9.75 (/media/yi/Datas/workspace/cowd-develop/crates/memory)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.07s
+     Running unittests src/lib.rs (/tmp/cowd-target-v0975-speed/debug/deps/cowd_memory-6dbdce1e7c4d5a1d)
+
+running 6 tests
+test performance_monitor::tests::test_tuner_min_samples_guard ... ok
+test performance_monitor::tests::test_tuner_adjusts_compression ... ok
+test performance_monitor::tests::test_tuner_adjusts_prefetch_on_high_latency ... ok
+test performance_monitor::tests::test_tuner_adjusts_cache_ttl ... ok
+test performance_monitor::tests::test_tuner_noop_on_good_performance ... ok
+test performance_monitor::tests::test_tuner_rate_limit ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 528 filtered out; finished in 0.00s
+
+     Running tests/agent_scope_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/agent_scope_test-e7e3e69543145311)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/conflict_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/conflict_test-8e571373b2bbd6e6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/e2e_lifecycle_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/e2e_lifecycle_test-e8305b0670c3773f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/embedding_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/embedding_test-cc9b0dd4ce23ed5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/fact_check_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/fact_check_test-838cccd4ec70e3e8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/integration_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/integration_test-eb40f4473a611b50)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/longmem_eval_harness.rs (/tmp/cowd-target-v0975-speed/debug/deps/longmem_eval_harness-541ea2bd6843d905)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/memory_kernel_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/memory_kernel_test-9fc8a4dfee99384a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 27 filtered out; finished in 0.00s
+
+     Running tests/message_persistence_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/message_persistence_test-49013948565cd43e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/performance_bench.rs (/tmp/cowd-target-v0975-speed/debug/deps/performance_bench-9ea4947b961b463a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/persistence_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/persistence_test-c6d2f395de8243c6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/prepare_context_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/prepare_context_test-4c10c9b6c3747c40)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/project_kg_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/project_kg_test-2f705bf8abe04079)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.00s
+
+     Running tests/project_scope_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/project_scope_test-5e5bcad9bcafeaac)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/swarm_concurrent_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/swarm_concurrent_test-85a85981e978b26a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/swarm_e2e_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/swarm_e2e_test-8349bada90ef371f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/token_benchmark_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/token_benchmark_test-56e6d3f3fec76829)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/verbatim_sink_test.rs (/tmp/cowd-target-v0975-speed/debug/deps/verbatim_sink_test-ba29d0b0d88aa459)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[2026-06-09T18:25:43+08:00] END cargo_test_memory_tuner status=0 elapsed=15s target_before=2310813775 target_after=5007771407

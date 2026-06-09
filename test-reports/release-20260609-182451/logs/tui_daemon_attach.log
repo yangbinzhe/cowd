@@ -1,0 +1,3 @@
+[2026-06-09T18:25:07+08:00] START tui_daemon_attach
+v0.9.52 TUI daemon attach scenario passed
+[2026-06-09T18:25:09+08:00] END tui_daemon_attach status=0 elapsed=2s target_before=2217321414 target_after=2217321414

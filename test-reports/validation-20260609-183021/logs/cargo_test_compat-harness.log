@@ -1,0 +1,19 @@
+[2026-06-09T18:30:24+08:00] START cargo_test_compat-harness
+   Compiling compat-harness v0.9.75 (/media/yi/Datas/workspace/cowd-develop/crates/compat-harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s
+     Running unittests src/lib.rs (/tmp/cowd-target-v0975-speed/debug/deps/compat_harness-4eb065f15c893a3c)
+
+running 3 tests
+test tests::detects_known_upstream_command_symbols ... ok
+test tests::detects_known_upstream_tool_symbols ... ok
+test tests::extracts_non_empty_manifests_from_upstream_repo ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests compat_harness
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[2026-06-09T18:30:24+08:00] END cargo_test_compat-harness status=0 elapsed=0s target_before=10569475360 target_after=10757197581
