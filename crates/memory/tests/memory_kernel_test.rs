@@ -630,6 +630,163 @@ async fn archive_hides_memory_without_deleting_evidence() {
 }
 
 #[tokio::test]
+async fn authoritative_memory_supersedes_old_fact() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("authority.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-authority", "agent-authority");
+    let mut old = entry(MemoryLayer::L3, MemorySource::AutoExtracted, "runtime rule");
+    old.content = "runtime rule is old".to_string();
+    old.source_agent = Some("agent-authority".to_string());
+    let old_id = old.id;
+    let mut new = entry(MemoryLayer::L3, MemorySource::UserExplicit, "runtime rule");
+    new.content = "runtime rule is new".to_string();
+    let new_id = new.id;
+
+    kernel.remember(&ctx, old).await.unwrap();
+    kernel.remember(&ctx, new).await.unwrap();
+
+    assert_eq!(
+        kernel
+            .lifecycle_events(old_id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        MemoryState::Superseded
+    );
+    assert_eq!(
+        kernel
+            .lifecycle_events(new_id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        MemoryState::Active
+    );
+}
+
+#[tokio::test]
+async fn equal_authority_conflict_is_visible_for_review() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("conflict.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-conflict", "agent-conflict");
+    let mut first = entry(MemoryLayer::L3, MemorySource::UserExplicit, "conflict rule");
+    first.content = "value A".to_string();
+    let first_id = first.id;
+    let mut second = entry(MemoryLayer::L3, MemorySource::UserExplicit, "conflict rule");
+    second.content = "value B".to_string();
+    let second_id = second.id;
+
+    kernel.remember(&ctx, first).await.unwrap();
+    kernel.remember(&ctx, second).await.unwrap();
+
+    assert_eq!(
+        kernel
+            .lifecycle_events(first_id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        MemoryState::Conflicted
+    );
+    assert_eq!(
+        kernel
+            .lifecycle_events(second_id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        MemoryState::Conflicted
+    );
+}
+
+#[tokio::test]
+async fn memory_runtime_clusters_large_documents_without_loading_full_body() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("clusters.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-cluster", "agent-cluster");
+    for idx in 0..5 {
+        let mut doc = entry(
+            MemoryLayer::L3,
+            MemorySource::Import,
+            &format!("large doc {idx}"),
+        );
+        doc.content = "large document body ".repeat(600);
+        doc.tags = vec!["large-docs".to_string()];
+        kernel.remember(&ctx, doc).await.unwrap();
+    }
+
+    let clusters = kernel.clusters(4).await.unwrap();
+
+    assert_eq!(clusters.len(), 1);
+    assert_eq!(clusters[0].entry_ids.len(), 5);
+    assert!(clusters[0].summary.len() <= 960);
+    assert!(clusters[0].truncated);
+}
+
+#[tokio::test]
+async fn context_usage_feedback_promotes_hot_memory_summary() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manager = Arc::new(
+        CognitiveContextManager::new(test_config(&tmp.path().join("usage.db")))
+            .await
+            .unwrap(),
+    );
+    let kernel = MemoryKernel::new(Arc::clone(&manager));
+    let ctx = MemoryTurnContext::new("session-usage", "agent-usage");
+    let mut hot = entry(
+        MemoryLayer::L2,
+        MemorySource::UserExplicit,
+        "HOT_MEMORY_ALPHA",
+    );
+    hot.content = "HOT_MEMORY_ALPHA should be selected repeatedly".to_string();
+    hot.scope = MemoryScope::Session(ctx.session_id.clone());
+    hot.session_id = Some(ctx.session_id.clone());
+    let hot_id = hot.id;
+    manager.remember(hot).await.unwrap();
+
+    for _ in 0..3 {
+        kernel
+            .context_packet(&ctx, "HOT_MEMORY_ALPHA", &[], 4, 1_000)
+            .await
+            .unwrap();
+    }
+
+    let runtime = kernel.runtime_snapshot().await.unwrap();
+
+    assert!(runtime.usage.hot_memory_ids.contains(&hot_id));
+    assert_eq!(
+        kernel
+            .lifecycle_events(hot_id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .to,
+        MemoryState::Validated
+    );
+}
+
+#[tokio::test]
 async fn large_memory_context_packet_stays_bounded() {
     let tmp = tempfile::TempDir::new().unwrap();
     let manager = Arc::new(

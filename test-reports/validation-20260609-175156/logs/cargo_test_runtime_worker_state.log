@@ -1,0 +1,164 @@
+[2026-06-09T17:52:11+08:00] START cargo_test_runtime_worker_state
+   Compiling value-bag v1.12.0
+   Compiling crossbeam-utils v0.8.21
+   Compiling tokio v1.52.3
+   Compiling futures-util v0.3.32
+   Compiling getrandom v0.2.17
+   Compiling parking v2.2.1
+   Compiling rustix v1.1.4
+   Compiling linux-raw-sys v0.12.1
+   Compiling openssl-sys v0.9.116
+   Compiling either v1.16.0
+   Compiling serde_json v1.0.150
+   Compiling memchr v2.8.1
+   Compiling futures-lite v2.6.1
+   Compiling ring v0.17.14
+   Compiling log v0.4.30
+   Compiling regex-automata v0.4.14
+   Compiling async-io v2.6.0
+   Compiling dirs-sys-next v0.1.2
+   Compiling concurrent-queue v2.5.0
+   Compiling aho-corasick v1.1.4
+   Compiling openssl v0.10.80
+   Compiling smallvec v1.15.1
+   Compiling regex-syntax v0.8.10
+   Compiling event-listener v5.4.1
+   Compiling crunchy v0.2.4
+   Compiling event-listener-strategy v0.5.4
+   Compiling parking_lot_core v0.9.12
+   Compiling dirs-next v2.0.0
+   Compiling tiny-keccak v2.0.2
+   Compiling siphasher v1.0.3
+   Compiling async-task v4.7.1
+   Compiling phf_shared v0.11.3
+   Compiling parking_lot v0.12.5
+   Compiling rustls-webpki v0.103.13
+   Compiling term v0.7.0
+   Compiling async-channel v2.5.0
+   Compiling new_debug_unreachable v1.0.6
+   Compiling syn v1.0.109
+   Compiling fixedbitset v0.4.2
+   Compiling rustls v0.23.40
+   Compiling precomputed-hash v0.1.1
+   Compiling bit-vec v0.6.3
+   Compiling petgraph v0.6.5
+   Compiling bit-set v0.5.3
+   Compiling regex v1.12.3
+   Compiling string_cache v0.8.9
+   Compiling ena v0.14.4
+   Compiling ascii-canvas v3.0.0
+   Compiling async-lock v3.4.2
+   Compiling native-tls v0.2.18
+   Compiling itertools v0.11.0
+   Compiling rand_core v0.6.4
+   Compiling piper v0.2.5
+   Compiling pico-args v0.5.0
+   Compiling unicode-xid v0.2.6
+   Compiling csv v1.4.0
+   Compiling blocking v1.6.2
+   Compiling rand_chacha v0.3.1
+   Compiling async-executor v1.14.0
+   Compiling tokio-util v0.7.18
+   Compiling tokio-native-tls v0.3.1
+   Compiling tower v0.5.3
+   Compiling event-listener v2.5.3
+   Compiling rusqlite v0.31.0
+   Compiling r2d2 v0.8.10
+   Compiling async-channel v1.9.0
+   Compiling rand v0.8.6
+   Compiling crossbeam-channel v0.5.15
+   Compiling mio v0.8.11
+   Compiling h2 v0.4.14
+   Compiling lalrpop-util v0.20.2
+   Compiling polling v3.11.0
+   Compiling tower-http v0.6.11
+   Compiling kv-log-macro v1.0.7
+   Compiling itertools v0.14.0
+   Compiling http v0.2.12
+   Compiling lalrpop v0.20.2
+   Compiling pin-utils v0.1.0
+   Compiling tungstenite v0.24.0
+   Compiling async-signal v0.2.14
+   Compiling async-global-executor v2.4.1
+   Compiling async-process v2.5.0
+   Compiling http-body v0.4.6
+   Compiling prost-derive v0.13.5
+   Compiling r2d2_sqlite v0.24.0
+   Compiling tree-sitter v0.24.7
+   Compiling notify v6.1.1
+   Compiling tempfile v3.27.0
+   Compiling futures-executor v0.3.32
+   Compiling socket2 v0.5.10
+   Compiling hyper v1.10.0
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling imap v3.0.0-alpha.15
+   Compiling hyper v0.14.32
+   Compiling tokio-rustls v0.26.4
+   Compiling async-attributes v1.1.2
+   Compiling futures v0.3.32
+   Compiling tokio-tungstenite v0.24.0
+   Compiling lettre v0.11.22
+   Compiling async-std v1.13.2
+   Compiling serde_regex v1.1.0
+   Compiling plugins v0.9.73 (/media/yi/Datas/workspace/cowd/crates/plugins)
+   Compiling telemetry v0.9.73 (/media/yi/Datas/workspace/cowd/crates/telemetry)
+   Compiling prost v0.13.5
+   Compiling assert-json-diff v2.0.2
+   Compiling fs2 v0.4.3
+   Compiling hyper-util v0.1.20
+   Compiling similar v2.7.0
+   Compiling levenshtein v1.0.5
+   Compiling base64 v0.21.7
+   Compiling async-object-pool v0.1.5
+   Compiling hyper-tls v0.6.0
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling basic-cookies v0.1.5
+   Compiling cowd-memory v0.9.73 (/media/yi/Datas/workspace/cowd/crates/memory)
+   Compiling httpmock v0.7.0
+   Compiling runtime v0.9.73 (/media/yi/Datas/workspace/cowd/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.98s
+     Running unittests src/lib.rs (/tmp/cowd-target-v0973-speed/debug/deps/runtime-3e320b789789a1ff)
+
+running 1 test
+test worker_boot::tests::emit_state_file_writes_worker_status_on_transition ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1094 filtered out; finished in 0.00s
+
+     Running tests/concurrency_lock_test.rs (/tmp/cowd-target-v0973-speed/debug/deps/concurrency_lock_test-99517a6a15a24e84)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/feishu_e2e_test.rs (/tmp/cowd-target-v0973-speed/debug/deps/feishu_e2e_test-b66b55ae1bb07c11)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/feishu_gateway.rs (/tmp/cowd-target-v0973-speed/debug/deps/feishu_gateway-1219865f54d1086c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/feishu_live_test.rs (/tmp/cowd-target-v0973-speed/debug/deps/feishu_live_test-b670bc83738900ca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/feishu_ws_debug.rs (/tmp/cowd-target-v0973-speed/debug/deps/feishu_ws_debug-3ba8b48095942de0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/integration_tests.rs (/tmp/cowd-target-v0973-speed/debug/deps/integration_tests-c204400ac447554a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.00s
+
+[2026-06-09T17:52:43+08:00] END cargo_test_runtime_worker_state status=0 elapsed=32s target_before=9493545695 target_after=11639662218

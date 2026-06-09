@@ -1206,6 +1206,34 @@ window.Panels = (()=>{
     }
   }
 
+  async function renderMemoryRuntime(target){
+    target.innerHTML='<h3>Living Memory Runtime</h3>';
+    try{
+      const response=await Api.memoryRuntime();
+      const runtime=response.runtime||{};
+      const usage=runtime.usage||{};
+      const clusters=runtime.clusters||[];
+      const metrics=UI.el('div','memory-metrics');
+      metrics.appendChild(renderMemoryMetric('active',fmtNumber(runtime.active_entries),'entries'));
+      metrics.appendChild(renderMemoryMetric('clusters',fmtNumber(runtime.cluster_count),'groups'));
+      metrics.appendChild(renderMemoryMetric('hot',fmtNumber(runtime.hot_memory_count),'memories'));
+      metrics.appendChild(renderMemoryMetric('conflict',fmtPct(runtime.conflict_pressure),'pressure'));
+      metrics.appendChild(renderMemoryMetric('stale',fmtPct(runtime.stale_pressure),'pressure'));
+      metrics.appendChild(renderMemoryMetric('selected',fmtNumber(usage.total_selected),'context'));
+      target.appendChild(metrics);
+      const list=UI.el('div','panel-list');
+      clusters.slice(0,6).forEach(function(cluster){
+        const item=UI.el('div','panel-item');
+        item.innerHTML='<strong>'+UI.esc(cluster.title||cluster.id)+'</strong><small>'+fmtNumber((cluster.entry_ids||[]).length)+' memories · '+fmtNumber(cluster.token_estimate)+' tokens'+(cluster.truncated?' · summarized':'')+'</small><p>'+UI.esc(cluster.summary||'')+'</p>';
+        list.appendChild(item);
+      });
+      if(!clusters.length)list.appendChild(UI.el('div','panel-empty','No active clusters'));
+      target.appendChild(list);
+    }catch(e){
+      target.appendChild(UI.el('div','panel-empty','Runtime unavailable: '+e.message));
+    }
+  }
+
   function addNetworkNode(nodes,id,label,type){
     const key=String(id||label||'node');
     if(!nodes.has(key))nodes.set(key,{id:key,label:String(label||key),type:type||'memory'});
@@ -1418,6 +1446,10 @@ window.Panels = (()=>{
     const maintenanceSec=UI.el('div','panel-section memory-maintenance');
     c.appendChild(maintenanceSec);
     await renderMemoryMaintenance(maintenanceSec);
+
+    const runtimeSec=UI.el('div','panel-section memory-runtime');
+    c.appendChild(runtimeSec);
+    await renderMemoryRuntime(runtimeSec);
 
     const kernelSec=UI.el('div','memory-grid');
     const packetSec=UI.el('div');

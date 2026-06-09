@@ -30,6 +30,9 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/memory/packet", get(memory_packet_handler))
         .route("/api/memory/links", get(memory_links_handler))
+        .route("/api/memory/runtime", get(memory_runtime_handler))
+        .route("/api/memory/clusters", get(memory_clusters_handler))
+        .route("/api/memory/lifecycle/:id", get(memory_lifecycle_handler))
         .route("/api/memory/stats", get(memory_stats_handler))
         .route("/api/memory/layers", get(memory_layers_handler))
         .route(
@@ -131,6 +134,7 @@ pub(crate) async fn memory_status_value(state: &AppState) -> serde_json::Value {
             "session_store": true,
             "context_health": context_health_json(mgr.ctx_health()),
             "kernel_health": kernel_health,
+            "runtime": kernel.runtime_snapshot().await.ok(),
             "performance": mgr.performance_report(),
         })
     } else {
@@ -909,6 +913,95 @@ async fn memory_links_handler(
             "degraded_reason": error.to_string(),
         })),
     }
+}
+
+async fn memory_runtime_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let Some(ref mgr) = state.memory_manager else {
+        return Json(serde_json::json!({
+            "enabled": false,
+            "runtime": null,
+            "degraded": true,
+            "degraded_reason": "memory not configured",
+        }));
+    };
+    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    match kernel.runtime_snapshot().await {
+        Ok(runtime) => Json(serde_json::json!({
+            "enabled": true,
+            "runtime": runtime,
+            "degraded": false,
+            "degraded_reason": null,
+        })),
+        Err(error) => Json(serde_json::json!({
+            "enabled": true,
+            "runtime": null,
+            "degraded": true,
+            "degraded_reason": error.to_string(),
+        })),
+    }
+}
+
+#[derive(Deserialize)]
+struct MemoryClusterQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn memory_clusters_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Query(query): Query<MemoryClusterQuery>,
+) -> Json<serde_json::Value> {
+    let Some(ref mgr) = state.memory_manager else {
+        return Json(serde_json::json!({
+            "enabled": false,
+            "clusters": [],
+            "degraded": true,
+            "degraded_reason": "memory not configured",
+        }));
+    };
+    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    match kernel.clusters(query.limit.unwrap_or(24).min(200)).await {
+        Ok(clusters) => Json(serde_json::json!({
+            "enabled": true,
+            "clusters": clusters,
+            "total": clusters.len(),
+            "degraded": false,
+            "degraded_reason": null,
+        })),
+        Err(error) => Json(serde_json::json!({
+            "enabled": true,
+            "clusters": [],
+            "total": 0,
+            "degraded": true,
+            "degraded_reason": error.to_string(),
+        })),
+    }
+}
+
+async fn memory_lifecycle_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let Some(ref mgr) = state.memory_manager else {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "memory not configured",
+        ));
+    };
+    let memory_id = MemoryId::try_parse(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid memory id"))?;
+    let kernel = MemoryKernel::new(Arc::clone(mgr));
+    let events = kernel
+        .lifecycle_events(memory_id)
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "id": id,
+        "events": events,
+    })))
 }
 
 fn parse_memory_layer(layer: &str) -> Option<MemoryLayer> {

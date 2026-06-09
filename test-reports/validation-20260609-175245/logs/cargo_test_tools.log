@@ -1,0 +1,140 @@
+[2026-06-09T17:53:25+08:00] START cargo_test_tools
+   Compiling reqwest v0.12.28
+   Compiling cowd-memory v0.9.73 (/media/yi/Datas/workspace/cowd/crates/memory)
+   Compiling runtime v0.9.73 (/media/yi/Datas/workspace/cowd/crates/runtime)
+   Compiling api v0.9.73 (/media/yi/Datas/workspace/cowd/crates/api)
+   Compiling commands v0.9.73 (/media/yi/Datas/workspace/cowd/crates/commands)
+   Compiling tools v0.9.73 (/media/yi/Datas/workspace/cowd/crates/tools)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.37s
+     Running unittests src/lib.rs (/tmp/cowd-target-v0973-speed/debug/deps/tools-b28ea9df51b1558c)
+
+running 113 tests
+test executor::tests::agent_rejects_blank_required_fields ... ok
+test executor::tests::ask_user_question_reports_pending_in_noninteractive_mode ... ok
+test executor::tests::agent_tool_subset_mapping_is_expected ... ok
+test executor::tests::agent_state_classification_covers_finished_and_specific_blockers ... ok
+test executor::tests::ask_user_question_supports_noninteractive_env_answer ... ok
+test executor::tests::given_empty_code_when_repl_then_rejects_with_error ... ok
+test executor::tests::given_empty_payload_when_structured_output_then_rejects_with_error ... ok
+test executor::tests::given_excessive_duration_when_sleep_then_rejects_with_error ... ok
+test executor::tests::exposes_mvp_tools ... ok
+test executor::tests::given_unsupported_language_when_repl_then_rejects_with_error ... ok
+test executor::tests::given_read_only_enforcer_when_bash_then_denied ... ok
+test executor::tests::given_read_only_enforcer_when_edit_file_then_denied ... ok
+test executor::tests::given_zero_duration_when_sleep_then_succeeds ... ok
+test executor::tests::given_read_only_enforcer_when_write_file_then_denied ... ok
+test executor::tests::given_read_only_enforcer_when_glob_search_then_not_permission_denied ... ok
+test executor::tests::lane_event_schema_serializes_to_canonical_names ... ok
+test executor::tests::lane_failure_taxonomy_normalizes_common_blockers ... ok
+test executor::tests::mcp_auth_returns_stable_disconnected_contract ... ok
+test executor::tests::notebook_edit_rejects_invalid_inputs ... ok
+test executor::tests::global_tool_registry_denies_blocked_tool_before_dispatch ... ok
+test executor::tests::pending_tools_preserve_multiple_streaming_tool_calls_by_index ... ok
+test executor::tests::permission_mode_from_plugin_rejects_invalid_inputs ... ok
+test executor::tests::notebook_edit_replaces_inserts_and_deletes_cells ... ok
+test executor::tests::rejects_unknown_tool_names ... ok
+test executor::tests::brief_returns_sent_message_and_attachment_metadata ... ok
+test executor::tests::run_task_packet_creates_packet_backed_task ... ok
+test executor::tests::runtime_tools_extend_registry_definitions_permissions_and_search ... ok
+test executor::tests::commit_provenance_is_extracted_from_agent_results ... ok
+test executor::tests::given_timeout_ms_when_repl_blocks_then_returns_timeout_error ... ok
+test executor::tests::recovery_loop_state_file_reflects_transitions ... ok
+test executor::tests::repl_executes_python_code ... ok
+test executor::tests::remote_trigger_posts_with_timeout_contract ... ok
+test executor::tests::bash_tool_reports_success_exit_failure_timeout_and_background ... ok
+test executor::tests::agent_fake_runner_can_persist_completion_and_failure ... ok
+test executor::tests::sleep_waits_and_reports_duration ... ok
+test executor::tests::stall_detect_and_resolve_trust_end_to_end ... ok
+test executor::tests::stall_detect_and_restart_recovery_end_to_end ... ok
+test executor::tests::structured_output_echoes_input_payload ... ok
+test executor::tests::agent_persists_handoff_metadata ... ok
+test executor::tests::subagent_tool_executor_denies_blocked_tool_before_dispatch ... ok
+Switched to a new branch 'feature/targeted-tests'
+Switched to branch 'main'
+Switched to branch 'feature/targeted-tests'
+test executor::tests::bash_targeted_tests_skip_branch_preflight ... ok
+Switched to a new branch 'feature/stale-tests'
+Switched to branch 'main'
+Switched to branch 'feature/stale-tests'
+test executor::tests::bash_workspace_tests_are_blocked_when_branch_is_behind_main ... ok
+test executor::tests::config_reads_and_writes_supported_values ... ok
+test executor::tests::enter_and_exit_plan_mode_round_trip_existing_local_override ... ok
+test executor::tests::exit_plan_mode_clears_override_when_enter_created_it_from_empty_local_state ... ok
+test executor::tests::file_tools_cover_read_write_and_edit_behaviors ... ok
+test executor::tests::tool_search_supports_keyword_and_select_queries ... ok
+test executor::tests::worker_await_ready_on_spawning_worker_returns_not_ready ... ok
+test executor::tests::web_fetch_supports_plain_text_and_rejects_invalid_url ... ok
+test executor::tests::worker_get_on_unknown_id_returns_error ... ok
+test executor::tests::worker_get_returns_worker_state ... ok
+test executor::tests::worker_observe_completion_degraded_provider_sets_failed_status ... ok
+test executor::tests::worker_observe_completion_success_finish_sets_finished_status ... ok
+test executor::tests::worker_restart_on_unknown_id_returns_error ... ok
+test executor::tests::worker_restart_resets_to_spawning ... ok
+test executor::tests::worker_send_prompt_on_non_ready_worker_returns_error ... ok
+test executor::tests::worker_terminate_on_unknown_id_returns_error ... ok
+test executor::tests::worker_terminate_sets_finished_status ... ok
+test executor::tests::web_fetch_returns_prompt_aware_summary ... ok
+test executor::tests::worker_tools_detect_misdelivery_and_arm_prompt_replay ... ok
+test lane_completion::tests::detects_completion_when_all_conditions_met ... ok
+test executor::tests::worker_tools_gate_prompt_delivery_until_ready_and_support_auto_trust ... ok
+test lane_completion::tests::no_completion_when_error_present ... ok
+test lane_completion::tests::no_completion_when_not_finished ... ok
+test lane_completion::tests::no_completion_when_not_pushed ... ok
+test lane_completion::tests::no_completion_when_tests_not_green ... ok
+test pdf_extract::tests::extracts_text_from_file_on_disk ... ok
+test pdf_extract::tests::extracts_text_from_flate_compressed_stream ... ok
+test pdf_extract::tests::extracts_uncompressed_text_from_minimal_pdf ... ok
+test pdf_extract::tests::handles_escaped_parentheses ... ok
+test pdf_extract::tests::handles_tj_array_operator ... ok
+test pdf_extract::tests::looks_like_pdf_path_detects_pdf_references ... ok
+test pdf_extract::tests::maybe_extract_pdf_from_prompt_extracts_existing_file ... ok
+test pdf_extract::tests::maybe_extract_pdf_from_prompt_returns_none_for_missing_file ... ok
+test pdf_extract::tests::returns_empty_for_non_pdf_data ... ok
+test lane_completion::tests::evaluate_triggers_closeout_for_completed_lane ... ok
+test executor::tests::given_no_enforcer_when_bash_then_executes_normally ... ok
+test executor::tests::given_read_only_enforcer_when_read_file_then_not_permission_denied ... ok
+test executor::tests::glob_and_grep_tools_cover_success_and_errors ... ok
+test executor::tests::powershell_errors_when_shell_is_missing ... ok
+test sandbox_exec::tests::a12_ruby_executes ... ok
+test executor::tests::powershell_runs_via_stub_shell ... ok
+test sandbox_exec::tests::a12_unsupported_language ... ok
+test web_tools::tests::fetch_config_defaults ... ok
+test web_tools::tests::format_empty_results ... ok
+test web_tools::tests::format_results_with_items ... ok
+test web_tools::tests::search_config_defaults ... ok
+test web_tools::tests::strip_html_basic ... ok
+test web_tools::tests::strip_html_collapse_whitespace ... ok
+test web_tools::tests::strip_html_removes_script ... ok
+test executor::tests::provider_runtime_client_chain_appends_configured_fallbacks_in_order ... ok
+test sandbox_exec::tests::a12_error_exit_code ... ok
+test executor::tests::provider_runtime_client_chain_matches_entry_by_constructor_model ... ok
+test executor::tests::provider_runtime_client_chain_skips_fallbacks_missing_credentials ... ok
+test sandbox_exec::tests::a12_node_executes ... ok
+test sandbox_exec::tests::a12_python_executes ... ok
+test sandbox_exec::tests::a12_shell_executes ... ok
+test executor::tests::provider_runtime_client_chain_uses_only_primary_when_no_fallbacks_configured ... ok
+test executor::tests::skill_loads_direct_skill_and_legacy_command_from_claude_config_dir ... ok
+test executor::tests::skill_loads_learned_skill_from_claude_config_dir ... ok
+test executor::tests::skill_loads_local_skill_prompt ... ok
+test executor::tests::skill_loads_project_local_claude_skill_prompt ... ok
+test executor::tests::skill_loads_project_local_legacy_command_markdown ... ok
+test executor::tests::skill_loads_project_local_omc_and_agents_skill_prompts ... ok
+test executor::tests::skill_resolves_project_local_skills_and_legacy_commands ... ok
+test executor::tests::subagent_runtime_executes_tool_loop_with_isolated_session ... ok
+test executor::tests::todo_write_persists_and_returns_previous_state ... ok
+test executor::tests::todo_write_rejects_invalid_payloads_and_sets_verification_nudge ... ok
+test executor::tests::web_search_extracts_and_filters_results ... ok
+test executor::tests::web_search_handles_generic_links_and_invalid_base_url ... ok
+test executor::tests::worker_create_merges_config_trusted_roots_without_per_call_override ... ok
+test sandbox_exec::tests::a12_language_count ... ok
+test sandbox_exec::tests::a12_timeout_kills_long_process ... ok
+
+test result: ok. 113 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.79s
+
+   Doc-tests tools
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[2026-06-09T17:53:52+08:00] END cargo_test_tools status=0 elapsed=27s target_before=13132331256 target_after=13789615067

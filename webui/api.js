@@ -172,6 +172,12 @@ window.Api = (()=>{
       return req('GET','/api/memory/packet?'+params.toString());
     },
     async memoryLinks(){return req('GET','/api/memory/links')},
+    async memoryRuntime(){return req('GET','/api/memory/runtime')},
+    async memoryClusters(limit){
+      const q=limit?('?limit='+encodeURIComponent(limit)):'';
+      return req('GET','/api/memory/clusters'+q);
+    },
+    async memoryLifecycle(id){return req('GET','/api/memory/lifecycle/'+encodeURIComponent(id))},
     async memoryMaintenance(opts){
       const o=opts||{};
       const params=new URLSearchParams();
