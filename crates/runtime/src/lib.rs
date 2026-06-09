@@ -174,8 +174,9 @@ pub use hooks::{
     HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
 };
 pub use iacc::{
-    iacc_reference, IaccAttentionItem, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
-    IaccFactInput, IaccHealth, IaccSeverity, IaccSourceKind, IaccSourceSnapshot, IaccStore,
+    iacc_reference, IaccAttentionItem, IaccChangeEvent, IaccEvidencePacket, IaccEvidenceSourceRef,
+    IaccFact, IaccFactInput, IaccHealth, IaccMetricDefinition, IaccMetricRecomputeResult,
+    IaccMetricState, IaccMetricStatus, IaccSeverity, IaccSourceKind, IaccSourceSnapshot, IaccStore,
     IaccStoreError, IACC_SCHEMA_VERSION,
 };
 pub use joint_problem_solving::{

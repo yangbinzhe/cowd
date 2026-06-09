@@ -1,14 +1,19 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
-use super::{IaccAttentionItem, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact};
+use super::{
+    IaccAttentionItem, IaccChangeEvent, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
+    IaccMetricDefinition, IaccMetricState, IaccSeverity,
+};
 
-pub const IACC_SCHEMA_VERSION: i64 = 1;
+pub const IACC_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -24,8 +29,21 @@ pub enum IaccStoreError {
 pub struct IaccHealth {
     pub schema_version: i64,
     pub fact_count: u64,
+    pub metric_definition_count: u64,
+    pub metric_state_count: u64,
+    pub change_count: u64,
     pub attention_count: u64,
     pub evidence_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IaccMetricRecomputeResult {
+    pub metric_state_count: usize,
+    pub change_count: usize,
+    pub attention_count: usize,
+    pub metric_states: Vec<IaccMetricState>,
+    pub changes: Vec<IaccChangeEvent>,
+    pub attention: Vec<IaccAttentionItem>,
 }
 
 #[derive(Debug)]
@@ -61,6 +79,9 @@ impl IaccStore {
         Ok(IaccHealth {
             schema_version: schema_version(&connection)?,
             fact_count: count_table(&connection, "iacc_fact")?,
+            metric_definition_count: count_table(&connection, "iacc_metric_definition")?,
+            metric_state_count: count_table(&connection, "iacc_metric_state")?,
+            change_count: count_table(&connection, "iacc_change_event")?,
             attention_count: count_table(&connection, "iacc_attention_item")?,
             evidence_count: count_table(&connection, "iacc_evidence_packet")?,
         })
@@ -113,6 +134,128 @@ impl IaccStore {
             r"SELECT attention_json
               FROM iacc_attention_item
               ORDER BY priority_score DESC, updated_at DESC
+              LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn recompute_metrics(&self) -> Result<IaccMetricRecomputeResult, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let facts = metric_facts(&connection)?;
+        let mut groups = BTreeMap::<MetricGroupKey, MetricAccumulator>::new();
+        for fact in facts {
+            groups.entry(fact.key()).or_default().push(fact);
+        }
+
+        let mut states = Vec::new();
+        let mut changes = Vec::new();
+        let mut attention = Vec::new();
+        for (key, accumulator) in groups {
+            let definition =
+                IaccMetricDefinition::inferred(key.metric_id.clone(), &accumulator.fact_type);
+            upsert_metric_definition(&connection, &definition)?;
+            let previous =
+                latest_metric_state(&connection, &key.metric_id, &key.entity_scope, &key.period)?;
+            let previous_value = previous.as_ref().map(|state| state.value);
+            let value = accumulator.value;
+            let delta = previous_value.map_or(value, |previous| value - previous);
+            let delta_ratio = previous_value.and_then(|previous| {
+                if previous.abs() > f64::EPSILON {
+                    Some(delta / previous)
+                } else {
+                    None
+                }
+            });
+            let state = IaccMetricState {
+                state_id: format!("metric-state-{}", uuid::Uuid::new_v4()),
+                metric_id: key.metric_id.clone(),
+                entity_scope: key.entity_scope.clone(),
+                period: key.period.clone(),
+                value,
+                previous_value,
+                delta,
+                delta_ratio,
+                status: IaccMetricState::status_for_delta(delta),
+                computed_at: Utc::now(),
+                input_fact_refs: accumulator.fact_ids.clone(),
+                confidence: accumulator.confidence(),
+            };
+            insert_metric_state(&connection, &state)?;
+            states.push(state.clone());
+
+            if delta.abs() > f64::EPSILON {
+                let change = IaccChangeEvent {
+                    change_id: format!("change-{}", uuid::Uuid::new_v4()),
+                    change_type: "metric_delta".to_string(),
+                    entity_ref: key.entity_scope.clone(),
+                    metric_id: Some(key.metric_id.clone()),
+                    from_value: previous_value.map(Value::from),
+                    to_value: Some(Value::from(value)),
+                    delta,
+                    period: key.period.clone(),
+                    detected_at: Utc::now(),
+                    source_fact_refs: accumulator.fact_ids.clone(),
+                    severity_hint: IaccChangeEvent::severity_for_delta(delta),
+                };
+                insert_change_event(&connection, &change)?;
+                let item = attention_from_change(&change, &state);
+                upsert_attention(&connection, &item)?;
+                changes.push(change);
+                attention.push(item);
+            }
+        }
+        Ok(IaccMetricRecomputeResult {
+            metric_state_count: states.len(),
+            change_count: changes.len(),
+            attention_count: attention.len(),
+            metric_states: states,
+            changes,
+            attention,
+        })
+    }
+
+    pub fn list_metric_definitions(&self) -> Result<Vec<IaccMetricDefinition>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut statement = connection.prepare(
+            r"SELECT definition_json
+              FROM iacc_metric_definition
+              ORDER BY metric_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn metric_states(&self, metric_id: &str) -> Result<Vec<IaccMetricState>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut statement = connection.prepare(
+            r"SELECT state_json
+              FROM iacc_metric_state
+              WHERE metric_id = ?1
+              ORDER BY computed_at DESC",
+        )?;
+        let rows = statement.query_map(params![metric_id], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn list_changes(&self, limit: usize) -> Result<Vec<IaccChangeEvent>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut statement = connection.prepare(
+            r"SELECT change_json
+              FROM iacc_change_event
+              ORDER BY detected_at DESC
               LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
@@ -192,8 +335,14 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 1, datetime('now'))
-        ON CONFLICT(id) DO UPDATE SET schema_version = excluded.schema_version;
+        VALUES (1, 2, datetime('now'))
+        ON CONFLICT(id) DO UPDATE SET
+            schema_version = CASE
+                WHEN iacc_schema.schema_version < excluded.schema_version
+                THEN excluded.schema_version
+                ELSE iacc_schema.schema_version
+            END,
+            updated_at = excluded.updated_at;
 
         CREATE TABLE IF NOT EXISTS iacc_fact (
             fact_id TEXT PRIMARY KEY,
@@ -230,7 +379,42 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             attention_id TEXT,
             packet_json TEXT NOT NULL,
             created_at TEXT NOT NULL
-        );",
+        );
+
+        CREATE TABLE IF NOT EXISTS iacc_metric_definition (
+            metric_id TEXT PRIMARY KEY,
+            definition_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS iacc_metric_state (
+            state_id TEXT PRIMARY KEY,
+            metric_id TEXT NOT NULL,
+            entity_scope TEXT NOT NULL,
+            period TEXT NOT NULL,
+            value REAL NOT NULL,
+            previous_value REAL,
+            delta REAL NOT NULL,
+            status TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            computed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_metric_state_lookup
+            ON iacc_metric_state(metric_id, entity_scope, period, computed_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_change_event (
+            change_id TEXT PRIMARY KEY,
+            metric_id TEXT,
+            entity_ref TEXT NOT NULL,
+            period TEXT NOT NULL,
+            delta REAL NOT NULL,
+            severity_hint TEXT NOT NULL,
+            change_json TEXT NOT NULL,
+            detected_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_change_detected
+            ON iacc_change_event(detected_at DESC);",
     )
 }
 
@@ -317,6 +501,274 @@ fn insert_evidence_packet(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MetricGroupKey {
+    metric_id: String,
+    entity_scope: String,
+    period: String,
+}
+
+#[derive(Debug, Clone)]
+struct MetricFactRow {
+    fact_id: String,
+    fact_type: String,
+    metric_id: String,
+    entity_scope: String,
+    period: String,
+    value: f64,
+    confidence: f32,
+}
+
+impl MetricFactRow {
+    fn key(&self) -> MetricGroupKey {
+        MetricGroupKey {
+            metric_id: self.metric_id.clone(),
+            entity_scope: self.entity_scope.clone(),
+            period: self.period.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct MetricAccumulator {
+    fact_type: String,
+    value: f64,
+    fact_ids: Vec<String>,
+    confidence_sum: f32,
+}
+
+impl MetricAccumulator {
+    fn push(&mut self, fact: MetricFactRow) {
+        if self.fact_type.is_empty() {
+            self.fact_type = fact.fact_type;
+        }
+        self.value += fact.value;
+        self.fact_ids.push(format!("iacc:fact:{}", fact.fact_id));
+        self.confidence_sum += fact.confidence;
+    }
+
+    fn confidence(&self) -> f32 {
+        if self.fact_ids.is_empty() {
+            0.0
+        } else {
+            self.confidence_sum / self.fact_ids.len() as f32
+        }
+    }
+}
+
+fn metric_facts(connection: &Connection) -> Result<Vec<MetricFactRow>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT fact_id, fact_type, entity_refs_json, metric_key, dimensions_json,
+            measures_json, confidence
+          FROM iacc_fact
+          WHERE metric_key IS NOT NULL
+          ORDER BY event_time ASC, fact_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, f32>(6)?,
+        ))
+    })?;
+    let mut facts = Vec::new();
+    for row in rows {
+        let (
+            fact_id,
+            fact_type,
+            entity_refs_json,
+            metric_id,
+            dimensions_json,
+            measures_json,
+            confidence,
+        ) = row?;
+        let entity_refs: Vec<String> = serde_json::from_str(&entity_refs_json)?;
+        let dimensions: Value = serde_json::from_str(&dimensions_json)?;
+        let measures: Value = serde_json::from_str(&measures_json)?;
+        let entity_scope = entity_refs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "enterprise".to_string());
+        let period = dimensions
+            .get("period")
+            .or_else(|| dimensions.get("week"))
+            .and_then(Value::as_str)
+            .unwrap_or("current")
+            .to_string();
+        let value = numeric_measure_sum(&measures);
+        facts.push(MetricFactRow {
+            fact_id,
+            fact_type,
+            metric_id,
+            entity_scope,
+            period,
+            value,
+            confidence,
+        });
+    }
+    Ok(facts)
+}
+
+fn numeric_measure_sum(value: &Value) -> f64 {
+    match value {
+        Value::Number(number) => number.as_f64().unwrap_or(0.0),
+        Value::Object(map) => map.values().map(numeric_measure_sum).sum(),
+        Value::Array(items) => items.iter().map(numeric_measure_sum).sum(),
+        _ => 0.0,
+    }
+}
+
+fn upsert_metric_definition(
+    connection: &Connection,
+    definition: &IaccMetricDefinition,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT INTO iacc_metric_definition (
+            metric_id, definition_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(metric_id) DO UPDATE SET
+            definition_json = excluded.definition_json,
+            updated_at = excluded.updated_at",
+        params![
+            definition.metric_id,
+            serde_json::to_string(definition)?,
+            definition.created_at.to_rfc3339(),
+            definition.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn latest_metric_state(
+    connection: &Connection,
+    metric_id: &str,
+    entity_scope: &str,
+    period: &str,
+) -> Result<Option<IaccMetricState>, IaccStoreError> {
+    connection
+        .query_row(
+            r"SELECT state_json
+              FROM iacc_metric_state
+              WHERE metric_id = ?1 AND entity_scope = ?2 AND period = ?3
+              ORDER BY computed_at DESC
+              LIMIT 1",
+            params![metric_id, entity_scope, period],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn insert_metric_state(
+    connection: &Connection,
+    state: &IaccMetricState,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT INTO iacc_metric_state (
+            state_id, metric_id, entity_scope, period, value, previous_value,
+            delta, status, state_json, computed_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            state.state_id,
+            state.metric_id,
+            state.entity_scope,
+            state.period,
+            state.value,
+            state.previous_value,
+            state.delta,
+            format!("{:?}", state.status).to_ascii_lowercase(),
+            serde_json::to_string(state)?,
+            state.computed_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_change_event(
+    connection: &Connection,
+    change: &IaccChangeEvent,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT INTO iacc_change_event (
+            change_id, metric_id, entity_ref, period, delta, severity_hint,
+            change_json, detected_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            change.change_id,
+            change.metric_id,
+            change.entity_ref,
+            change.period,
+            change.delta,
+            change.severity_hint,
+            serde_json::to_string(change)?,
+            change.detected_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> IaccAttentionItem {
+    let now = Utc::now();
+    let severity = match change.severity_hint.as_str() {
+        "critical" => IaccSeverity::Critical,
+        "warning" => IaccSeverity::Warning,
+        "normal" => IaccSeverity::Normal,
+        _ => IaccSeverity::Unknown,
+    };
+    let severity_score = match severity {
+        IaccSeverity::Critical => 1.0,
+        IaccSeverity::Warning => 0.65,
+        IaccSeverity::Normal => 0.2,
+        IaccSeverity::Unknown => 0.35,
+    };
+    let urgency = if change.delta.abs() > 0.0 { 0.7 } else { 0.2 };
+    let impact_scope = (change.delta.abs() / 100.0).min(1.0) as f32;
+    let strategic_weight = 0.5_f32;
+    let confidence = state.confidence;
+    let priority_score = severity_score * 0.30
+        + urgency * 0.20
+        + impact_scope * 0.20
+        + strategic_weight * 0.15
+        + confidence * 0.10
+        + 0.05;
+    IaccAttentionItem {
+        attention_id: format!("attention-{}", uuid::Uuid::new_v4()),
+        title: format!(
+            "Metric {} changed by {} for {}",
+            state.metric_id, change.delta, state.entity_scope
+        ),
+        business_domain: state
+            .metric_id
+            .split('_')
+            .next()
+            .unwrap_or("operations")
+            .to_string(),
+        entity_ref: Some(state.entity_scope.clone()),
+        period: Some(state.period.clone()),
+        priority_score,
+        severity,
+        urgency,
+        strategic_weight,
+        confidence,
+        reason_codes: vec![
+            "metric_recomputed".to_string(),
+            "metric_delta_detected".to_string(),
+        ],
+        linked_changes: vec![format!("iacc:change:{}", change.change_id)],
+        linked_anomalies: Vec::new(),
+        linked_impacts: Vec::new(),
+        owner_roles: vec!["operations_analyst".to_string()],
+        status: "open".to_string(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +813,65 @@ mod tests {
         assert_eq!(health.fact_count, 1);
         assert_eq!(health.attention_count, 1);
         assert_eq!(health.evidence_count, 1);
+    }
+
+    #[test]
+    fn iacc_store_recomputes_metrics_and_emits_changes() {
+        let store = IaccStore::in_memory().expect("store opens");
+        let first = IaccFact::from_input(IaccFactInput {
+            fact_id: Some("fact-plan-1".to_string()),
+            snapshot_id: Some("snapshot-plan-a".to_string()),
+            fact_type: "plan.weekly_demand".to_string(),
+            entity_refs: vec!["product:server-a".to_string()],
+            metric_key: Some("plan_bom_delta".to_string()),
+            dimensions: serde_json::json!({"week": "2026-W24"}),
+            measures: serde_json::json!({"demand_qty": 100}),
+            event_time: None,
+            valid_from: None,
+            valid_to: None,
+            source_ref: None,
+            confidence: Some(0.8),
+            raw_hash: None,
+        });
+        store.ingest_fact(&first).expect("first fact ingests");
+
+        let initial = store.recompute_metrics().expect("initial recompute");
+        assert_eq!(initial.metric_state_count, 1);
+        assert_eq!(initial.change_count, 1);
+        assert_eq!(initial.metric_states[0].value, 100.0);
+        assert_eq!(initial.metric_states[0].previous_value, None);
+
+        let second = IaccFact::from_input(IaccFactInput {
+            fact_id: Some("fact-plan-2".to_string()),
+            snapshot_id: Some("snapshot-plan-b".to_string()),
+            fact_type: "plan.weekly_demand".to_string(),
+            entity_refs: vec!["product:server-a".to_string()],
+            metric_key: Some("plan_bom_delta".to_string()),
+            dimensions: serde_json::json!({"week": "2026-W24"}),
+            measures: serde_json::json!({"demand_qty": 130}),
+            event_time: None,
+            valid_from: None,
+            valid_to: None,
+            source_ref: None,
+            confidence: Some(0.9),
+            raw_hash: None,
+        });
+        store.ingest_fact(&second).expect("second fact ingests");
+
+        let next = store.recompute_metrics().expect("second recompute");
+        assert_eq!(next.metric_state_count, 1);
+        assert_eq!(next.change_count, 1);
+        assert_eq!(next.metric_states[0].value, 230.0);
+        assert_eq!(next.metric_states[0].previous_value, Some(100.0));
+        assert_eq!(next.metric_states[0].delta, 130.0);
+        assert_eq!(next.changes[0].severity_hint, "critical");
+        assert!(!next.attention.is_empty());
+
+        let metrics = store.list_metric_definitions().expect("metrics list");
+        assert_eq!(metrics[0].metric_id, "plan_bom_delta");
+        let states = store.metric_states("plan_bom_delta").expect("states list");
+        assert_eq!(states.len(), 2);
+        let changes = store.list_changes(10).expect("changes list");
+        assert_eq!(changes.len(), 2);
     }
 }

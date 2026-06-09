@@ -1133,6 +1133,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn iacc_metric_recompute_projects_changes_and_attention() {
+        let workspace = test_temp_dir("iacc-metric");
+        let config_home = test_temp_dir("iacc-metric-config");
+        let app = api_router(test_state_with_workspace(workspace.clone(), config_home));
+
+        let ingest = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/facts/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "facts": [
+                                {
+                                    "fact_id": "fact-plan-api-1",
+                                    "snapshot_id": "snapshot-plan-api-1",
+                                    "fact_type": "plan.weekly_demand",
+                                    "entity_refs": ["product:server-a"],
+                                    "metric_key": "plan_bom_delta",
+                                    "dimensions": {"week": "2026-W24"},
+                                    "measures": {"demand_qty": 100},
+                                    "confidence": 0.8
+                                },
+                                {
+                                    "fact_id": "fact-plan-api-2",
+                                    "snapshot_id": "snapshot-plan-api-2",
+                                    "fact_type": "plan.weekly_demand",
+                                    "entity_refs": ["product:server-a"],
+                                    "metric_key": "plan_bom_delta",
+                                    "dimensions": {"week": "2026-W24"},
+                                    "measures": {"demand_qty": 140},
+                                    "confidence": 0.9
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ingest.status(), StatusCode::OK);
+
+        let recompute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/iacc/metrics/recompute")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recompute.status(), StatusCode::OK);
+        let body = to_bytes(recompute.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["result"]["metric_state_count"], 1);
+        assert_eq!(json["result"]["change_count"], 1);
+        assert_eq!(json["result"]["metric_states"][0]["value"], 240.0);
+
+        let metric = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/iacc/metrics/plan_bom_delta")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metric.status(), StatusCode::OK);
+
+        let changes = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/iacc/changes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(changes.status(), StatusCode::OK);
+        let body = to_bytes(changes.into_body(), usize::MAX).await.unwrap();
+        let changes_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(changes_json["changes"].as_array().unwrap().len(), 1);
+
+        let hot = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/iacc/attention/hot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hot.status(), StatusCode::OK);
+        let body = to_bytes(hot.into_body(), usize::MAX).await.unwrap();
+        let hot_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(hot_json["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["reason_codes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "metric_delta_detected")));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
     async fn agent_run_persists_evidence_to_session_event() {
         let app = api_router(test_state());
         let started = app

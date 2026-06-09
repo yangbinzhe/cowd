@@ -18,6 +18,13 @@ pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/iacc/health", get(iacc_health_handler))
         .route("/api/iacc/facts/ingest", post(iacc_fact_ingest_handler))
+        .route("/api/iacc/metrics", get(iacc_metrics_handler))
+        .route("/api/iacc/metrics/:id", get(iacc_metric_detail_handler))
+        .route(
+            "/api/iacc/metrics/recompute",
+            post(iacc_metric_recompute_handler),
+        )
+        .route("/api/iacc/changes", get(iacc_changes_handler))
         .route("/api/iacc/attention/hot", get(iacc_attention_hot_handler))
         .route(
             "/api/iacc/evidence/build",
@@ -62,11 +69,17 @@ async fn iacc_health_handler(
         "schema_version": health.schema_version,
         "expected_schema_version": IACC_SCHEMA_VERSION,
         "fact_count": health.fact_count,
+        "metric_definition_count": health.metric_definition_count,
+        "metric_state_count": health.metric_state_count,
+        "change_count": health.change_count,
         "attention_count": health.attention_count,
         "evidence_count": health.evidence_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": [
             "fact_ingest",
+            "metric_recompute",
+            "metric_state",
+            "change_event",
             "attention_hot",
             "evidence_packet_build",
             "evidence_packet_get"
@@ -103,6 +116,70 @@ async fn iacc_fact_ingest_handler(
         "ingested": facts.len(),
         "facts": facts,
         "attention": attention,
+    })))
+}
+
+async fn iacc_metrics_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let metrics = store
+        .list_metric_definitions()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.metrics",
+        "metrics": metrics,
+    })))
+}
+
+async fn iacc_metric_detail_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let states = store
+        .metric_states(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if states.is_empty() {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "IACC metric state not found",
+        ));
+    }
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.metric",
+        "metric_id": id,
+        "states": states,
+    })))
+}
+
+async fn iacc_metric_recompute_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let result = store
+        .recompute_metrics()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.metrics.recompute",
+        "result": result,
+    })))
+}
+
+async fn iacc_changes_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let changes = store
+        .list_changes(100)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.changes",
+        "changes": changes,
     })))
 }
 
