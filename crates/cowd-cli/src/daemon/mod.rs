@@ -6,12 +6,9 @@
 // Shared state: ActiveSessions, CognitiveContextManager, GlobalToolRegistry, SessionEventBus
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
 
 use axum::http::{header, HeaderValue};
 use serde::Serialize;
@@ -19,7 +16,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::api_routes;
 use crate::event_bus::SessionEventBus;
@@ -281,7 +278,7 @@ fn build_startup_diagnostics(
         workspace_root: workspace_root.display().to_string(),
         config_home: config_home.display().to_string(),
         webui_dir: webui_dir.display().to_string(),
-        webui_available: has_webui_index(webui_dir),
+        webui_available: crate::gateway_static::has_webui_index(webui_dir),
         memory_enabled: config.memory_config.is_some(),
         memory_available,
         unified_store_available,
@@ -331,45 +328,8 @@ impl PidFileGuard {
     }
 }
 
-fn has_webui_index(path: &Path) -> bool {
-    path.join("index.html").is_file()
-}
-
 fn resolve_webui_dir() -> PathBuf {
-    if let Some(path) = env::var_os("COWD_WEBUI_DIR").map(PathBuf::from) {
-        if has_webui_index(&path) {
-            return path;
-        }
-        tracing::warn!(
-            path = %path.display(),
-            "COWD_WEBUI_DIR does not contain index.html; trying fallback paths"
-        );
-    }
-
-    if let Ok(cwd) = env::current_dir() {
-        let source_tree_path = cwd.join("webui");
-        if has_webui_index(&source_tree_path) {
-            return source_tree_path;
-        }
-    }
-
-    if let Ok(exe) = env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let installed_path = exe_dir.join("webui");
-            if has_webui_index(&installed_path) {
-                return installed_path;
-            }
-        }
-    }
-
-    let fallback = env::current_dir()
-        .map(|cwd| cwd.join("webui"))
-        .unwrap_or_else(|_| PathBuf::from("webui"));
-    tracing::warn!(
-        path = %fallback.display(),
-        "WebUI index.html was not found; static file serving may return 404"
-    );
-    fallback
+    crate::gateway_static::resolve_static_webui_source().path
 }
 
 impl Drop for PidFileGuard {
@@ -532,7 +492,10 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<(), String> {
 
         tracing::info!(path = %webui_dir.display(), "serving WebUI assets");
         api_routes::api_router(app_state.clone())
-            .fallback_service(ServeDir::new(webui_dir))
+            .fallback_service(
+                ServeDir::new(webui_dir.clone())
+                    .fallback(ServeFile::new(webui_dir.join("index.html"))),
+            )
             .layer(cors)
     };
 

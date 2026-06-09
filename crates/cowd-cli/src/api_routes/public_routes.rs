@@ -14,12 +14,52 @@ use super::{AppState, ErrorResponse};
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health_handler))
+        .route("/healthz", get(gateway_health_handler))
+        .route("/readyz", get(gateway_ready_handler))
+        .route("/api/webui/manifest", get(webui_manifest_handler))
         .route("/api/auth/login", post(login_handler))
         .route("/api/auth/verify", get(verify_handler))
 }
 
 async fn health_handler() -> &'static str {
     "OK"
+}
+
+async fn gateway_health_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    Json(
+        serde_json::to_value(crate::gateway_health::gateway_health_snapshot(&state))
+            .unwrap_or_else(|_| serde_json::json!({"status":"error"})),
+    )
+}
+
+async fn gateway_ready_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let snapshot = crate::gateway_health::gateway_readiness_snapshot(&state);
+    let status = if snapshot.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(
+            serde_json::to_value(snapshot)
+                .unwrap_or_else(|_| serde_json::json!({"ready":false,"status":"error"})),
+        ),
+    )
+}
+
+async fn webui_manifest_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let health = crate::gateway_health::gateway_health_snapshot(&state);
+    Json(
+        serde_json::to_value(crate::gateway_service::webui_manifest(health))
+            .unwrap_or_else(|_| serde_json::json!({"kind":"cowd.webui.manifest","status":"error"})),
+    )
 }
 
 #[derive(Deserialize)]

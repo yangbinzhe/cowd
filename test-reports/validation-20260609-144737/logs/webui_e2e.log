@@ -1,0 +1,80 @@
+[2026-06-09T14:58:21+08:00] START webui_e2e
+
+> test:e2e
+> PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-/snap/bin/chromium} playwright test --browser=chromium
+
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:21] "GET /index.html HTTP/1.1" 200 -
+
+Running 4 tests using 4 workers
+
+(node:3279859) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3279857) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3279865) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3279858) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3279858) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3279859) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3279865) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:3279857) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /index.html HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /style.css HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /api.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /ui.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /sessions.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /messages.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /state.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /workspace.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /panels.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /boot.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /commands.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /index.html HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /index.html HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /style.css HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /api.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /ui.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /state.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /messages.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /sessions.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /workspace.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /panels.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /boot.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /commands.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /style.css HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /api.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /index.html HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /sessions.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /ui.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /messages.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /state.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /panels.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /workspace.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /commands.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /boot.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /style.css HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /api.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /state.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /ui.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /sessions.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /messages.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /workspace.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /panels.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /commands.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /boot.js HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /assets/logo.svg HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /assets/logo.svg HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /assets/logo.svg HTTP/1.1" 200 -
+[2m[WebServer] [22m127.0.0.1 - - [09/Jun/2026 14:58:22] "GET /assets/logo.svg HTTP/1.1" 200 -
+  ✓  1 [chromium] › auth-flow.e2e.spec.js:11:1 › unauthenticated login keeps main controls interactive (414ms)
+  ✓  3 [chromium] › connector-console.e2e.spec.js:11:1 › connector console renders degraded services and executes mock service (518ms)
+  ✓  2 [chromium] › tasks-workbench.e2e.spec.js:11:1 › workbench panels render durable task and memory status (654ms)
+  ✓  4 [chromium] › runtime-console.e2e.spec.js:11:1 › runtime console opens timeline context refs in browser (952ms)
+
+  4 passed (1.8s)
+[2026-06-09T14:58:23+08:00] END webui_e2e status=0 elapsed=2s target_before=0 target_after=0

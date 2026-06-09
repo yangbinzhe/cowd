@@ -905,9 +905,38 @@ describe('API module', () => {
   });
 
   it('gateway and skills endpoints are defined', () => {
+    expect(typeof window.Api.gatewayHealth).toBe('function');
+    expect(typeof window.Api.gatewayReady).toBe('function');
+    expect(typeof window.Api.webuiManifest).toBe('function');
     expect(typeof window.Api.getUsage).toBe('function');
     expect(typeof window.Api.toggleSolo).toBe('function');
     expect(typeof window.Api.compactSession).toBe('function');
+  });
+
+  it('gateway health endpoints use public daemon routes', async () => {
+    const mockF = vi.fn((path) =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(String(path).includes('manifest')
+          ? { kind: 'cowd.webui.manifest' }
+          : { status: 'healthy' })
+      })
+    );
+    global.fetch = mockF;
+
+    const health = await window.Api.gatewayHealth();
+    const ready = await window.Api.gatewayReady();
+    const manifest = await window.Api.webuiManifest();
+
+    expect(health.status).toBe('healthy');
+    expect(ready.status).toBe('healthy');
+    expect(manifest.kind).toBe('cowd.webui.manifest');
+    expect(mockF.mock.calls.map(call => call[0])).toEqual([
+      '/healthz',
+      '/readyz',
+      '/api/webui/manifest',
+    ]);
   });
 
   it('Panels module exposes all panel renderers', () => {

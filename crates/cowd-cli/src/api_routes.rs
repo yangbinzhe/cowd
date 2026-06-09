@@ -90,7 +90,7 @@ impl AppState {
         self.session_kernel.unified_store()
     }
 
-    fn has_unified_store(&self) -> bool {
+    pub(crate) fn has_unified_store(&self) -> bool {
         self.session_kernel.has_unified_store()
     }
 
@@ -931,6 +931,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn gateway_health_reports_pid_addr_static_source() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["gateway"], "daemon-http-gateway");
+        assert_eq!(json["api_router"], "embedded-router");
+        assert!(json["process"]["pid_file"]
+            .as_str()
+            .unwrap()
+            .contains("cowd"));
+        assert!(json["process"]["addr_file"]
+            .as_str()
+            .unwrap()
+            .contains("addr"));
+        assert!(!json["static_webui"]["kind"].as_str().unwrap().is_empty());
+        assert_eq!(json["runtime"]["session_kernel"], true);
+        assert_eq!(json["runtime"]["event_bus"], true);
+    }
+
+    #[tokio::test]
+    async fn gateway_ready_reports_required_runtime_services() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response.status() == StatusCode::OK
+                || response.status() == StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let required = json["required"].as_array().unwrap();
+        assert!(required.iter().any(|item| item == "daemon-http-gateway"));
+        assert!(required.iter().any(|item| item == "session-kernel"));
+        assert!(required.iter().any(|item| item == "static-webui-index"));
+    }
+
+    #[tokio::test]
+    async fn webui_manifest_explains_gateway_daemon_router_relationship() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/webui/manifest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["kind"], "cowd.webui.manifest");
+        assert_eq!(json["daemon"], "runtime owner process");
+        assert_eq!(json["api_router"], "gateway internal route table");
+        assert_eq!(
+            json["socket_control"],
+            "local low-latency daemon control plane"
+        );
     }
 
     #[tokio::test]

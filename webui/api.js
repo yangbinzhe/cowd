@@ -83,6 +83,11 @@ window.Api = (()=>{
     get token(){return authToken},
     set token(v){authToken=v;if(v)localStorage.setItem('cowd-auth-token',v);else localStorage.removeItem('cowd-auth-token')},
 
+    // ── Gateway ──
+    async gatewayHealth(){return req('GET','/healthz')},
+    async gatewayReady(){return req('GET','/readyz')},
+    async webuiManifest(){return req('GET','/api/webui/manifest')},
+
     // ── Sessions ──
     async listSessions(opts){
       const o=opts||{};
