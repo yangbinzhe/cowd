@@ -4,11 +4,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
-PORT="${COWD_V0991_PORT:-18711}"
+PORT="${COWD_V0992_PORT:-18712}"
 BASE_URL="http://127.0.0.1:$PORT"
-SESSION="cowd-v0991-iacc-$$"
+SESSION="cowd-v0992-iacc-$$"
 TMP_ROOT="${TMPDIR:-/tmp}"
-TMP_DIR="$(mktemp -d "$TMP_ROOT/cowd-v0991-iacc.XXXXXX")"
+TMP_DIR="$(mktemp -d "$TMP_ROOT/cowd-v0992-iacc.XXXXXX")"
 WORKDIR="$TMP_DIR/workspace"
 CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
@@ -29,7 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 if ! command -v tmux >/dev/null 2>&1; then
-  echo "tmux is required for v0.9.91 IACC cockpit projection scenario" >&2
+  echo "tmux is required for v0.9.92 IACC cockpit report snapshot scenario" >&2
   exit 1
 fi
 
@@ -81,12 +81,12 @@ done
 
 curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"daemon-http-gateway"'
 curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"expected_schema_version":11'
-curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"personal_cockpit_projection"'
-curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"cockpit_profile_thresholds"'
+curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"cockpit_report_snapshot"'
+curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"scheduled_report_foundation"'
 
 curl -fsS "$BASE_URL/api/iacc/facts/ingest" \
   -H 'content-type: application/json' \
-  -d '{"request_id":"v0991","session_id":"session-v0991","facts":[{"fact_id":"fact-v0991-shortage-a","snapshot_id":"snapshot-v0991-shortage-a","fact_type":"supply.material_shortage","entity_refs":["component:gpu-v0991","product:server-v0991"],"metric_key":"material_shortage_risk","dimensions":{"week":"2026-W32"},"measures":{"short_qty":320},"source_ref":"connector:erp:material-shortage","confidence":0.94}]}' \
+  -d '{"request_id":"v0992","session_id":"session-v0992","facts":[{"fact_id":"fact-v0992-shortage-a","snapshot_id":"snapshot-v0992-shortage-a","fact_type":"supply.material_shortage","entity_refs":["component:gpu-v0992","product:server-v0992"],"metric_key":"material_shortage_risk","dimensions":{"week":"2026-W33"},"measures":{"short_qty":340},"source_ref":"connector:erp:material-shortage","confidence":0.94}]}' \
   | rg -q '"ingested":1'
 
 curl -fsS "$BASE_URL/api/iacc/metrics/recompute" -X POST | rg -q '"change_count":1'
@@ -94,16 +94,14 @@ curl -fsS "$BASE_URL/api/iacc/metrics/recompute" -X POST | rg -q '"change_count"
 attention_id="$(curl -fsS "$BASE_URL/api/iacc/attention/hot" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["items"][0]["attention_id"])')"
 packet_id="$(curl -fsS "$BASE_URL/api/iacc/evidence/build" \
   -H 'content-type: application/json' \
-  -d "{\"request_id\":\"v0991\",\"session_id\":\"session-v0991\",\"attention_id\":\"$attention_id\",\"problem_statement\":\"v0.9.91 GPU shortage cockpit incident\"}" \
+  -d "{\"request_id\":\"v0992\",\"session_id\":\"session-v0992\",\"attention_id\":\"$attention_id\",\"problem_statement\":\"v0.9.92 GPU shortage report incident\"}" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["packet"]["packet_id"])')"
-
 curl -fsS "$BASE_URL/api/iacc/evidence/$packet_id/quality-gate" -X POST | rg -q '"decision":"review"'
 
 incident_json="$(curl -fsS "$BASE_URL/api/iacc/incidents" \
   -H 'content-type: application/json' \
-  -d "{\"request_id\":\"v0991\",\"session_id\":\"session-v0991\",\"title\":\"GPU shortage cockpit incident\",\"evidence_packet_id\":\"$packet_id\"}")"
+  -d "{\"request_id\":\"v0992\",\"session_id\":\"session-v0992\",\"title\":\"GPU shortage report incident\",\"evidence_packet_id\":\"$packet_id\"}")"
 incident_id="$(printf '%s' "$incident_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["incident"]["incident_id"])')"
-
 analysis_json="$(curl -fsS "$BASE_URL/api/iacc/incidents/$incident_id/analyze" -X POST)"
 analysis_id="$(printf '%s' "$analysis_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["analysis"]["analysis_id"])')"
 action_id="$(printf '%s' "$analysis_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["analysis"]["recommended_actions"][0]["action_id"])')"
@@ -111,22 +109,23 @@ curl -fsS "$BASE_URL/api/iacc/evidence/$packet_id/quality-gate" -X POST | rg -q 
 
 curl -fsS "$BASE_URL/api/iacc/analyses/$analysis_id/actions/$action_id/execute" \
   -H 'content-type: application/json' \
-  -d '{"mode":"commit","operator_id":"user:ops-planner","note":"queue cockpit-visible recovery action"}' \
+  -d '{"mode":"commit","operator_id":"user:ops-planner","note":"queue report-visible recovery action"}' \
   | rg -q '"status":"queued_for_human_review"'
 
-profile_json="$(curl -fsS "$BASE_URL/api/iacc/cockpit/profiles/upsert" \
+curl -fsS "$BASE_URL/api/iacc/cockpit/profiles/upsert" \
   -H 'content-type: application/json' \
-  -d '{"request_id":"v0991","session_id":"session-v0991","profile":{"profile_id":"cockpit-profile-v0991-ops","owner_ref":"user:ops-planner","display_name":"Ops planner cockpit","focus_refs":["component:gpu-v0991"],"focus_metric_ids":["material_shortage_risk"],"thresholds":{"material_shortage_risk":{"critical":100,"warning":40}},"template_id":"ops.default","cadence":"daily"}}')"
-printf '%s' "$profile_json" | rg -q '"profile_id":"cockpit-profile-v0991-ops"'
-curl -fsS "$BASE_URL/api/iacc/cockpit/profiles/cockpit-profile-v0991-ops" | rg -q '"owner_ref":"user:ops-planner"'
+  -d '{"request_id":"v0992","session_id":"session-v0992","profile":{"profile_id":"cockpit-profile-v0992-ops","owner_ref":"user:ops-planner","display_name":"Ops planner report cockpit","focus_refs":["component:gpu-v0992"],"focus_metric_ids":["material_shortage_risk"],"thresholds":{"material_shortage_risk":{"critical":100,"warning":40}},"template_id":"ops.default","cadence":"daily"}}' \
+  | rg -q '"profile_id":"cockpit-profile-v0992-ops"'
 
-projection_json="$(curl -fsS "$BASE_URL/api/iacc/cockpit/profiles/cockpit-profile-v0991-ops/projection")"
-printf '%s' "$projection_json" | rg -q '"kind":"iacc.cockpit.projection"'
-printf '%s' "$projection_json" | rg -q '"attention_queue"'
-printf '%s' "$projection_json" | rg -q '"quality_gate_status"'
-printf '%s' "$projection_json" | rg -q '"action_execution_status"'
-printf '%s' "$projection_json" | rg -q '"focus_thresholds"'
-printf '%s' "$projection_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); widgets={w["widget_type"]:w for w in d["projection"]["widgets"]}; assert widgets["attention_queue"]["data"]["count"] >= 1; assert widgets["quality_gate_status"]["data"]["pass_count"] >= 1; assert widgets["action_execution_status"]["data"]["active_count"] >= 1; assert widgets["focus_thresholds"]["status"] == "configured"'
+report_json="$(curl -fsS "$BASE_URL/api/iacc/cockpit/profiles/cockpit-profile-v0992-ops/reports/generate" \
+  -H 'content-type: application/json' \
+  -d '{"request_id":"v0992-report","session_id":"session-v0992","report":{"report_id":"cockpit-report-v0992-daily","cadence":"daily","delivery_ref":"channel://feishu/user/ops-planner","note":"daily report snapshot"}}')"
+printf '%s' "$report_json" | rg -q '"kind":"iacc.cockpit.report"'
+printf '%s' "$report_json" | rg -q '"report_id":"cockpit-report-v0992-daily"'
+printf '%s' "$report_json" | rg -q '"status":"generated"'
+printf '%s' "$report_json" | rg -q '"projection"'
+printf '%s' "$report_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["report"]["projection"]["profile"]["profile_id"] == "cockpit-profile-v0992-ops"; assert len(d["report"]["projection"]["widgets"]) == 4'
 
-curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"cockpit_profile_count":1'
+curl -fsS "$BASE_URL/api/iacc/cockpit/reports/cockpit-report-v0992-daily" | rg -q '"delivery_ref":"channel://feishu/user/ops-planner"'
+curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"cockpit_report_count":1'
 test -f "$WORKDIR/.cowd/iacc.sqlite"

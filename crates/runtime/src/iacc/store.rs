@@ -10,14 +10,15 @@ use thiserror::Error;
 
 use super::{
     IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
-    IaccChangeEvent, IaccCockpitProfile, IaccCockpitProjection, IaccCockpitWidget, IaccComputeJob,
-    IaccComputeJobInput, IaccComputePlan, IaccCrossPlaneBridgeReceipt, IaccDomainSeedResult,
-    IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccImpactHop,
-    IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage,
-    IaccMetricState, IaccOperationalAnalysis, IaccQualityGateDecision, IaccRelation, IaccSeverity,
+    IaccChangeEvent, IaccCockpitProfile, IaccCockpitProjection, IaccCockpitReportRequest,
+    IaccCockpitReportSnapshot, IaccCockpitWidget, IaccComputeJob, IaccComputeJobInput,
+    IaccComputePlan, IaccCrossPlaneBridgeReceipt, IaccDomainSeedResult, IaccEntity,
+    IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccImpactHop, IaccImpactTrace,
+    IaccIncident, IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage, IaccMetricState,
+    IaccOperationalAnalysis, IaccQualityGateDecision, IaccRelation, IaccSeverity,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 10;
+pub const IACC_SCHEMA_VERSION: i64 = 11;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -47,6 +48,7 @@ pub struct IaccHealth {
     pub compute_job_count: u64,
     pub quality_gate_count: u64,
     pub cockpit_profile_count: u64,
+    pub cockpit_report_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,6 +108,7 @@ impl IaccStore {
             compute_job_count: count_table(&connection, "iacc_compute_job")?,
             quality_gate_count: count_table(&connection, "iacc_quality_gate")?,
             cockpit_profile_count: count_table(&connection, "iacc_cockpit_profile")?,
+            cockpit_report_count: count_table(&connection, "iacc_cockpit_report")?,
         })
     }
 
@@ -142,6 +145,34 @@ impl IaccStore {
         let profile = find_cockpit_profile(&connection, profile_id)?
             .ok_or_else(|| IaccStoreError::NotFound(profile_id.to_string()))?;
         build_cockpit_projection(&connection, profile)
+    }
+
+    pub fn generate_cockpit_report(
+        &self,
+        profile_id: &str,
+        request: IaccCockpitReportRequest,
+    ) -> Result<IaccCockpitReportSnapshot, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let profile = find_cockpit_profile(&connection, profile_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(profile_id.to_string()))?;
+        let projection = build_cockpit_projection(&connection, profile)?;
+        let report = IaccCockpitReportSnapshot::from_projection(projection, request);
+        insert_cockpit_report(&connection, &report)?;
+        Ok(report)
+    }
+
+    pub fn get_cockpit_report(
+        &self,
+        report_id: &str,
+    ) -> Result<Option<IaccCockpitReportSnapshot>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_cockpit_report(&connection, report_id)
     }
 
     pub fn upsert_entity(&self, entity: &IaccEntity) -> Result<IaccEntity, IaccStoreError> {
@@ -808,7 +839,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 10, datetime('now'))
+        VALUES (1, 11, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -826,6 +857,17 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_iacc_cockpit_profile_owner
             ON iacc_cockpit_profile(owner_ref, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_cockpit_report (
+            report_id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            owner_ref TEXT NOT NULL,
+            status TEXT NOT NULL,
+            report_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_cockpit_report_profile
+            ON iacc_cockpit_report(profile_id, created_at DESC);
 
         CREATE TABLE IF NOT EXISTS iacc_entity (
             entity_id TEXT PRIMARY KEY,
@@ -1083,6 +1125,41 @@ fn find_cockpit_profile(
         .query_row(
             "SELECT profile_json FROM iacc_cockpit_profile WHERE profile_id = ?1",
             params![profile_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn insert_cockpit_report(
+    connection: &Connection,
+    report: &IaccCockpitReportSnapshot,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_cockpit_report (
+            report_id, profile_id, owner_ref, status, report_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            report.report_id,
+            report.profile_id,
+            report.owner_ref,
+            report.status,
+            serde_json::to_string(report)?,
+            report.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_cockpit_report(
+    connection: &Connection,
+    report_id: &str,
+) -> Result<Option<IaccCockpitReportSnapshot>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT report_json FROM iacc_cockpit_report WHERE report_id = ?1",
+            params![report_id],
             |row| row.get::<_, String>(0),
         )
         .optional()?
@@ -2344,8 +2421,8 @@ fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> I
 mod tests {
     use super::*;
     use crate::iacc::{
-        IaccCockpitProfileInput, IaccComputeJobInput, IaccEntityInput, IaccFactInput,
-        IaccRelationInput, IaccSourceKey,
+        IaccCockpitProfileInput, IaccCockpitReportRequest, IaccComputeJobInput, IaccEntityInput,
+        IaccFactInput, IaccRelationInput, IaccSourceKey,
     };
 
     #[test]
@@ -2900,6 +2977,27 @@ mod tests {
             .find(|widget| widget.widget_type == "focus_thresholds")
             .expect("threshold widget exists");
         assert_eq!(threshold_widget.status, "configured");
+
+        let report = store
+            .generate_cockpit_report(
+                &profile.profile_id,
+                IaccCockpitReportRequest {
+                    report_id: Some("cockpit-report-ops-daily".to_string()),
+                    cadence: Some("daily".to_string()),
+                    delivery_ref: Some("channel://feishu/user/ops-planner".to_string()),
+                    note: Some("daily cockpit report".to_string()),
+                },
+            )
+            .expect("report generates");
+        assert_eq!(report.status, "generated");
+        assert_eq!(report.profile_id, profile.profile_id);
+        assert_eq!(report.projection.widgets.len(), 4);
+        let loaded_report = store
+            .get_cockpit_report(&report.report_id)
+            .expect("report loads")
+            .expect("report exists");
+        assert_eq!(loaded_report.delivery_ref, report.delivery_ref);
+        assert_eq!(store.health().unwrap().cockpit_report_count, 1);
     }
 
     #[test]

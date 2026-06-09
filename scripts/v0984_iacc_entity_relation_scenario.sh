@@ -80,7 +80,7 @@ for _ in {1..100}; do
 done
 
 curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"daemon-http-gateway"'
-curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"expected_schema_version":10'
+curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"expected_schema_version":11'
 curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"entity_relation_network"'
 
 component_json="$(curl -fsS "$BASE_URL/api/iacc/entities/upsert" \

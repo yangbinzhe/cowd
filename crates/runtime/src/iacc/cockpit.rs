@@ -61,6 +61,35 @@ pub struct IaccCockpitProjection {
     pub generated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IaccCockpitReportRequest {
+    #[serde(default)]
+    pub report_id: Option<String>,
+    #[serde(default)]
+    pub cadence: Option<String>,
+    #[serde(default)]
+    pub delivery_ref: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IaccCockpitReportSnapshot {
+    pub report_id: String,
+    pub profile_id: String,
+    pub owner_ref: String,
+    pub cadence: String,
+    pub title: String,
+    pub summary: String,
+    pub status: String,
+    #[serde(default)]
+    pub delivery_ref: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    pub projection: IaccCockpitProjection,
+    pub created_at: DateTime<Utc>,
+}
+
 impl IaccCockpitProfile {
     #[must_use]
     pub fn from_input(input: IaccCockpitProfileInput) -> Self {
@@ -112,6 +141,40 @@ impl IaccCockpitWidget {
             priority_score,
             data,
             source_refs,
+        }
+    }
+}
+
+impl IaccCockpitReportSnapshot {
+    #[must_use]
+    pub fn from_projection(
+        projection: IaccCockpitProjection,
+        request: IaccCockpitReportRequest,
+    ) -> Self {
+        let report_id = request
+            .report_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("cockpit-report-{}", uuid::Uuid::new_v4()));
+        let cadence = request
+            .cadence
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| projection.profile.cadence.clone());
+        let title = format!(
+            "IACC cockpit report for {} ({})",
+            projection.profile.display_name, cadence
+        );
+        Self {
+            report_id,
+            profile_id: projection.profile.profile_id.clone(),
+            owner_ref: projection.profile.owner_ref.clone(),
+            cadence,
+            title,
+            summary: projection.summary.clone(),
+            status: "generated".to_string(),
+            delivery_ref: request.delivery_ref,
+            note: request.note,
+            projection,
+            created_at: Utc::now(),
         }
     }
 }
