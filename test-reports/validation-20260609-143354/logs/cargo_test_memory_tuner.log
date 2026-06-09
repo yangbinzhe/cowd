@@ -1,0 +1,288 @@
+[2026-06-09T14:34:03+08:00] START cargo_test_memory_tuner
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.186
+   Compiling find-msvc-tools v0.1.9
+   Compiling syn v2.0.117
+   Compiling shlex v1.3.0
+   Compiling cc v1.2.62
+   Compiling cfg-if v1.0.4
+   Compiling smallvec v1.15.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling parking_lot_core v0.9.12
+   Compiling tree-sitter-language v0.1.7
+   Compiling scopeguard v1.2.0
+   Compiling itoa v1.0.18
+   Compiling once_cell v1.21.4
+   Compiling synstructure v0.13.2
+   Compiling lock_api v0.4.14
+   Compiling pin-project-lite v0.2.17
+   Compiling parking_lot v0.12.5
+   Compiling futures-core v0.3.32
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling zerofrom v0.1.8
+   Compiling yoke v0.8.2
+   Compiling displaydoc v0.2.6
+   Compiling zerovec v0.11.6
+   Compiling bytes v1.11.1
+   Compiling tinystr v0.8.3
+   Compiling serde_core v1.0.228
+   Compiling litemap v0.8.2
+   Compiling writeable v0.6.3
+   Compiling potential_utf v0.1.5
+   Compiling icu_locale_core v2.2.0
+   Compiling zerotrie v0.2.4
+   Compiling utf8_iter v1.0.4
+   Compiling memchr v2.8.1
+   Compiling icu_properties_data v2.2.0
+   Compiling icu_normalizer_data v2.2.0
+   Compiling icu_provider v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling errno v0.3.14
+   Compiling percent-encoding v2.3.2
+   Compiling signal-hook-registry v1.4.8
+   Compiling tokio-macros v2.7.0
+   Compiling mio v1.2.1
+   Compiling socket2 v0.6.4
+   Compiling ring v0.17.14
+   Compiling slab v0.4.12
+   Compiling futures-task v0.3.32
+   Compiling futures-util v0.3.32
+   Compiling tokio v1.52.3
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling http v1.4.1
+   Compiling rand_core v0.10.1
+   Compiling getrandom v0.4.2
+   Compiling zeroize v1.8.2
+   Compiling serde v1.0.228
+   Compiling zerocopy v0.8.49
+   Compiling version_check v0.9.5
+   Compiling ahash v0.8.12
+   Compiling rustls-pki-types v1.14.1
+   Compiling http-body v1.0.1
+   Compiling idna_adapter v1.2.2
+   Compiling form_urlencoded v1.2.2
+   Compiling serde_derive v1.0.228
+   Compiling getrandom v0.2.17
+   Compiling bitflags v2.11.1
+   Compiling httparse v1.10.1
+   Compiling autocfg v1.5.1
+   Compiling untrusted v0.9.0
+   Compiling zmij v1.0.21
+   Compiling log v0.4.30
+   Compiling num-traits v0.2.19
+   Compiling idna v1.1.0
+   Compiling cpufeatures v0.3.0
+   Compiling pkg-config v0.3.33
+   Compiling vcpkg v0.2.15
+   Compiling tower-service v0.3.3
+   Compiling rustls v0.23.40
+   Compiling ryu v1.0.23
+   Compiling try-lock v0.2.5
+   Compiling serde_json v1.0.150
+   Compiling want v0.3.1
+   Compiling libsqlite3-sys v0.28.0
+   Compiling chacha20 v0.10.0
+   Compiling rustls-webpki v0.103.13
+   Compiling url v2.5.8
+   Compiling futures-channel v0.3.32
+   Compiling tracing-attributes v0.1.31
+   Compiling tracing-core v0.1.36
+   Compiling time-core v0.1.8
+   Compiling atomic-waker v1.1.2
+   Compiling powerfmt v0.2.0
+   Compiling subtle v2.6.1
+   Compiling num-conv v0.2.2
+   Compiling crossbeam-utils v0.8.21
+   Compiling time-macros v0.2.27
+   Compiling tracing v0.1.44
+   Compiling deranged v0.5.8
+   Compiling hyper v1.10.0
+   Compiling hashbrown v0.14.5
+   Compiling rand v0.10.1
+   Compiling csv-core v0.1.13
+   Compiling aho-corasick v1.1.4
+   Compiling sync_wrapper v1.0.2
+   Compiling rustix v1.1.4
+   Compiling regex-syntax v0.8.10
+   Compiling iana-time-zone v0.1.65
+   Compiling tower-layer v0.3.3
+   Compiling ipnet v2.12.0
+   Compiling base64 v0.22.1
+   Compiling sha1_smol v1.0.1
+   Compiling uuid v1.23.1
+   Compiling hyper-util v0.1.20
+   Compiling tower v0.5.3
+   Compiling chrono v0.4.44
+   Compiling regex-automata v0.4.14
+   Compiling csv v1.4.0
+   Compiling hashlink v0.9.1
+   Compiling tokio-rustls v0.26.4
+   Compiling time v0.3.47
+   Compiling webpki-roots v1.0.7
+   Compiling scheduled-thread-pool v0.2.7
+   Compiling inotify-sys v0.1.5
+   Compiling tree-sitter-go v0.23.4
+   Compiling tree-sitter-java v0.23.5
+   Compiling tree-sitter-rust v0.23.3
+   Compiling tree-sitter v0.24.7
+   Compiling tree-sitter-python v0.23.6
+   Compiling tree-sitter-typescript v0.23.2
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling same-file v1.0.6
+   Compiling thiserror v2.0.18
+   Compiling fallible-iterator v0.3.0
+   Compiling linux-raw-sys v0.12.1
+   Compiling bitflags v1.3.2
+   Compiling inotify v0.9.6
+   Compiling rusqlite v0.31.0
+   Compiling walkdir v2.5.0
+   Compiling crossbeam-channel v0.5.15
+   Compiling r2d2 v0.8.10
+   Compiling hyper-rustls v0.27.9
+   Compiling regex v1.12.3
+   Compiling tower-http v0.6.11
+   Compiling serde_urlencoded v0.7.1
+   Compiling mio v0.8.11
+   Compiling http-body-util v0.1.3
+   Compiling thiserror-impl v2.0.18
+   Compiling filetime v0.2.29
+   Compiling twox-hash v2.1.2
+   Compiling fastrand v2.4.1
+   Compiling streaming-iterator v0.1.9
+   Compiling tempfile v3.27.0
+   Compiling lz4_flex v0.11.6
+   Compiling notify v6.1.1
+   Compiling reqwest v0.12.28
+   Compiling r2d2_sqlite v0.24.0
+   Compiling futures-executor v0.3.32
+   Compiling async-trait v0.1.89
+   Compiling serial_test_derive v3.5.0
+   Compiling serial_test v3.5.0
+   Compiling cowd-memory v0.9.70 (/media/yi/Datas/workspace/cowd/crates/memory)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 45.31s
+     Running unittests src/lib.rs (/tmp/cowd-target-v0970-fast/debug/deps/cowd_memory-6892f5a71f5be6ba)
+
+running 6 tests
+test performance_monitor::tests::test_tuner_rate_limit ... ok
+test performance_monitor::tests::test_tuner_adjusts_cache_ttl ... ok
+test performance_monitor::tests::test_tuner_adjusts_prefetch_on_high_latency ... ok
+test performance_monitor::tests::test_tuner_min_samples_guard ... ok
+test performance_monitor::tests::test_tuner_adjusts_compression ... ok
+test performance_monitor::tests::test_tuner_noop_on_good_performance ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 524 filtered out; finished in 0.00s
+
+     Running tests/agent_scope_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/agent_scope_test-e4cbac8da562433d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/conflict_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/conflict_test-84ba331b12ca715b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/e2e_lifecycle_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/e2e_lifecycle_test-2cbaa1939cde15e2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/embedding_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/embedding_test-3eb8c9b2b54644ff)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/fact_check_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/fact_check_test-22e2bab1f5f53711)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/integration_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/integration_test-a4cb81ee9ed4c1f9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/longmem_eval_harness.rs (/tmp/cowd-target-v0970-fast/debug/deps/longmem_eval_harness-df4716f50b623732)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/memory_kernel_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/memory_kernel_test-9f18984b6dc33e9e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.00s
+
+     Running tests/message_persistence_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/message_persistence_test-b3595cb48a08920d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/performance_bench.rs (/tmp/cowd-target-v0970-fast/debug/deps/performance_bench-a7c2d45ba795430e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/persistence_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/persistence_test-1c0305e3ba30c9c5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/prepare_context_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/prepare_context_test-73dc92cd25278a5b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/project_kg_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/project_kg_test-eb2565bfcb200e4a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.00s
+
+     Running tests/project_scope_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/project_scope_test-a465f34b1d2cc461)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/swarm_concurrent_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/swarm_concurrent_test-e2693259530940cf)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/swarm_e2e_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/swarm_e2e_test-594cf566114c2b07)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/token_benchmark_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/token_benchmark_test-a4d3072b1d106482)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/verbatim_sink_test.rs (/tmp/cowd-target-v0970-fast/debug/deps/verbatim_sink_test-169c0d93fdb6b048)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+[2026-06-09T14:34:48+08:00] END cargo_test_memory_tuner status=0 elapsed=45s target_before=0 target_after=3092653633

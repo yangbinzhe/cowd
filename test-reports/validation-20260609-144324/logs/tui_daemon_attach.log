@@ -1,0 +1,5 @@
+[2026-06-09T14:45:31+08:00] START tui_daemon_attach
+   Compiling cowd-cli v0.9.70 (/media/yi/Datas/workspace/cowd/crates/cowd-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.76s
+v0.9.52 TUI daemon attach scenario passed
+[2026-06-09T14:45:48+08:00] END tui_daemon_attach status=0 elapsed=17s target_before=2206233992 target_after=2206233992
