@@ -639,16 +639,12 @@ const fn current_fingerprint_version() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
 
     fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::test_env_lock()
     }
 
     #[test]
