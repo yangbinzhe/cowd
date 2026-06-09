@@ -69,9 +69,16 @@ fn main() {
         });
     println!("cargo:rustc-env=BUILD_DATE={build_date}");
 
-    // Rerun if git state changes
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
+    // Rerun if git state changes. Worktrees keep HEAD outside the workspace
+    // `.git` path, so ask git for the actual files Cargo should watch.
+    watch_git_path("HEAD");
+    watch_git_path("logs/HEAD");
+    if let Some(branch) = git_output(["rev-parse", "--abbrev-ref", "HEAD"]) {
+        if branch != "HEAD" {
+            watch_git_path(&format!("refs/heads/{branch}"));
+        }
+    }
+    watch_git_path("packed-refs");
 
     // Copy only runtime WebUI assets. Test/build dependencies such as
     // node_modules must never enter the generated CLI artifacts.
@@ -97,6 +104,23 @@ fn main() {
             });
         let target_webui = Path::new(&target_dir).join(&profile).join("webui");
         copy_webui_runtime_assets(&webui_dir, &target_webui);
+    }
+}
+
+fn git_output<const N: usize>(args: [&str; N]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn watch_git_path(path: &str) {
+    if let Some(actual_path) = git_output(["rev-parse", "--git-path", path]) {
+        println!("cargo:rerun-if-changed={actual_path}");
     }
 }
 

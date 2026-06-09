@@ -34,6 +34,7 @@ impl SlashCommand {
             Self::Cost => "/cost",
             Self::Doctor => "/doctor",
             Self::Config { .. } => "/config",
+            Self::Setup => "/setup",
             Self::Memory { .. } => "/memory",
             Self::History { .. } => "/history",
             Self::Diff => "/diff",
@@ -191,6 +192,10 @@ pub fn validate_slash_command_input(
         "config" => SlashCommand::Config {
             section: parse_config_section(&args)?,
         },
+        "setup" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Setup
+        }
         "mcp" => parse_mcp_command(&args)?,
         "memory" => {
             validate_no_args(command, &args)?;

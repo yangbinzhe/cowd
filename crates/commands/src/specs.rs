@@ -117,6 +117,13 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "setup",
+        aliases: &[],
+        summary: "Check local setup and show the next required action",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "mcp",
         aliases: &[],
         summary: "Inspect configured MCP servers",
@@ -1092,6 +1099,7 @@ pub enum SlashCommand {
     Config {
         section: Option<String>,
     },
+    Setup,
     Mcp {
         action: Option<String>,
         target: Option<String>,

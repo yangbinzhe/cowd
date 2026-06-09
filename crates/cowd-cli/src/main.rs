@@ -439,6 +439,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
 
         CliAction::Doctor { output_format } => doctor::run_doctor(output_format)?,
+        CliAction::Setup { output_format } => print_setup(output_format)?,
         CliAction::State { output_format } => mcp_serve::run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Export {
@@ -847,6 +848,9 @@ pub(crate) enum CliAction {
     Doctor {
         output_format: CliOutputFormat,
     },
+    Setup {
+        output_format: CliOutputFormat,
+    },
     State {
         output_format: CliOutputFormat,
     },
@@ -904,6 +908,7 @@ pub(crate) enum LocalHelpTopic {
     Status,
     Sandbox,
     Doctor,
+    Setup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1194,6 +1199,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "setup" => {
+            if rest.len() > 1 {
+                return Err("unexpected arguments for setup. Usage: cowd setup".to_string());
+            }
+            Ok(CliAction::Setup { output_format })
+        }
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
         "import-session" => {
@@ -1265,6 +1276,7 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "status" => LocalHelpTopic::Status,
         "sandbox" => LocalHelpTopic::Sandbox,
         "doctor" => LocalHelpTopic::Doctor,
+        "setup" => LocalHelpTopic::Setup,
         _ => return None,
     };
     Some(Ok(CliAction::HelpTopic(topic)))
@@ -1294,6 +1306,7 @@ fn parse_single_word_command_alias(
         })),
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
+        "setup" => Some(Ok(CliAction::Setup { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
         other => bare_slash_command_guidance(other).map(Err),
     }
@@ -1403,6 +1416,7 @@ fn parse_direct_slash_cli_action(
                 }),
             }
         }
+        Ok(Some(SlashCommand::Setup)) => Ok(CliAction::Setup { output_format }),
         Ok(Some(SlashCommand::Unknown(name))) => {
             Err(suggestions::format_unknown_direct_slash_command(&name))
         }
@@ -2579,6 +2593,16 @@ fn run_resume_command(
         SlashCommand::Config { section } => {
             let message = render_config_report(section.as_deref())?;
             let json = render_config_json(section.as_deref())?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                session_path: None,
+                message: Some(message),
+                json: Some(json),
+            })
+        }
+        SlashCommand::Setup => {
+            let message = render_setup_report()?;
+            let json = render_setup_json()?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 session_path: None,
@@ -5330,6 +5354,10 @@ impl LiveCli {
                 Self::print_config(section.as_deref())?;
                 false
             }
+            SlashCommand::Setup => {
+                Self::print_setup()?;
+                false
+            }
             SlashCommand::Mcp { action, target } => {
                 let args = match (action.as_deref(), target.as_deref()) {
                     (None, None) => None,
@@ -5825,6 +5853,11 @@ impl LiveCli {
 
     fn print_config(section: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", render_config_report(section)?);
+        Ok(())
+    }
+
+    fn print_setup() -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", render_setup_report()?);
         Ok(())
     }
 
@@ -7326,6 +7359,372 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
     })
 }
 
+#[derive(Debug, Clone)]
+struct SetupItem {
+    id: &'static str,
+    label: &'static str,
+    status: &'static str,
+    summary: String,
+    next: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SetupSnapshot {
+    cwd: PathBuf,
+    config_home: PathBuf,
+    loaded_files: Vec<String>,
+    gateway_running: bool,
+    items: Vec<SetupItem>,
+}
+
+impl SetupSnapshot {
+    fn overall_status(&self) -> &'static str {
+        if self.items.iter().any(|item| item.status == "action") {
+            "action"
+        } else if self.items.iter().any(|item| item.status == "warn") {
+            "warn"
+        } else {
+            "ready"
+        }
+    }
+
+    fn next_action(&self) -> String {
+        self.items
+            .iter()
+            .filter(|item| item.status == "action")
+            .find_map(|item| item.next.clone())
+            .or_else(|| self.items.iter().find_map(|item| item.next.clone()))
+            .unwrap_or_else(|| "Start Cowd: cowd --yolo, or inspect runtime: /status".to_string())
+    }
+}
+
+fn print_setup(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    match output_format {
+        CliOutputFormat::Text => println!("{}", render_setup_report()?),
+        CliOutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&render_setup_json()?)?)
+        }
+    }
+    Ok(())
+}
+
+fn render_setup_report() -> Result<String, Box<dyn std::error::Error>> {
+    let snapshot = setup_snapshot()?;
+    let mut lines = vec![
+        "Setup Center".to_string(),
+        format!("  Status           {}", snapshot.overall_status()),
+        format!("  Working dir      {}", snapshot.cwd.display()),
+        format!("  Config home      {}", snapshot.config_home.display()),
+        format!("  Loaded configs   {}", snapshot.loaded_files.len()),
+        format!(
+            "  Gateway          {}",
+            if snapshot.gateway_running {
+                "running"
+            } else {
+                "not running"
+            }
+        ),
+        format!("  Next             {}", snapshot.next_action()),
+        String::new(),
+        "Checks".to_string(),
+    ];
+
+    for item in snapshot.items {
+        lines.push(format!(
+            "  {:<16} {:<7} {}",
+            item.label, item.status, item.summary
+        ));
+        if let Some(next) = item.next {
+            lines.push(format!("  {:<16}         next: {}", "", next));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Safe commands".to_string());
+    lines.push("  /setup                         Re-run this setup check in TUI".to_string());
+    lines.push("  cowd gateway wechat-qr          Authorize personal WeChat by QR".to_string());
+    lines.push("  cowd gateway run                Start gateway/WebUI in foreground".to_string());
+    lines.push("  cowd gateway restart            Reload gateway after channel auth".to_string());
+    Ok(lines.join("\n"))
+}
+
+fn render_setup_json() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let snapshot = setup_snapshot()?;
+    Ok(json!({
+        "kind": "setup",
+        "status": snapshot.overall_status(),
+        "cwd": snapshot.cwd.display().to_string(),
+        "config_home": snapshot.config_home.display().to_string(),
+        "loaded_files": snapshot.loaded_files,
+        "gateway_running": snapshot.gateway_running,
+        "next": snapshot.next_action(),
+        "items": snapshot.items.into_iter().map(|item| {
+            json!({
+                "id": item.id,
+                "label": item.label,
+                "status": item.status,
+                "summary": item.summary,
+                "next": item.next,
+            })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
+fn setup_snapshot() -> Result<SetupSnapshot, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let config_home = loader.config_home().to_path_buf();
+    let config = loader
+        .load()
+        .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
+    let loaded_files = config
+        .loaded_entries()
+        .iter()
+        .map(|entry| entry.path.display().to_string())
+        .collect::<Vec<_>>();
+    let gateway_running = server::get_server_status().ok().flatten().is_some();
+    let mut items = Vec::new();
+
+    items.push(setup_config_item(&loaded_files, &config_home));
+    items.push(setup_provider_item(&config));
+    items.push(setup_gateway_item(&config, gateway_running));
+    items.push(setup_feishu_item(&config));
+    items.push(setup_wechat_item());
+    items.push(setup_memory_item(&config));
+    items.push(setup_session_item(&config_home));
+    items.push(setup_permission_item(&config));
+
+    Ok(SetupSnapshot {
+        cwd,
+        config_home,
+        loaded_files,
+        gateway_running,
+        items,
+    })
+}
+
+fn setup_config_item(loaded_files: &[String], config_home: &Path) -> SetupItem {
+    if loaded_files.is_empty() {
+        SetupItem {
+            id: "config",
+            label: "Config",
+            status: "action",
+            summary: "No config file loaded; defaults work but channels/providers need config"
+                .to_string(),
+            next: Some(format!(
+                "Create or edit {}",
+                config_home.join("config.yaml").display()
+            )),
+        }
+    } else {
+        SetupItem {
+            id: "config",
+            label: "Config",
+            status: "ready",
+            summary: format!("{} config file(s) loaded", loaded_files.len()),
+            next: None,
+        }
+    }
+}
+
+fn setup_provider_item(config: &runtime::RuntimeConfig) -> SetupItem {
+    let model = config.model().unwrap_or(DEFAULT_MODEL);
+    if let Some(provider) = config.providers().resolve_full(model) {
+        return SetupItem {
+            id: "provider",
+            label: "Provider",
+            status: "ready",
+            summary: format!("Model {model} routes through provider {}", provider.name),
+            next: None,
+        };
+    }
+    if env::var("ANTHROPIC_API_KEY").is_ok()
+        || env::var("ANTHROPIC_AUTH_TOKEN").is_ok()
+        || env::var("OPENAI_API_KEY").is_ok()
+    {
+        return SetupItem {
+            id: "provider",
+            label: "Provider",
+            status: "ready",
+            summary: format!("Model {model} can use environment credentials"),
+            next: None,
+        };
+    }
+    SetupItem {
+        id: "provider",
+        label: "Provider",
+        status: "action",
+        summary: format!("No provider route found for model {model}"),
+        next: Some("Add a provider in ~/.cowd/config.yaml or set API key env".to_string()),
+    }
+}
+
+fn setup_gateway_item(config: &runtime::RuntimeConfig, gateway_running: bool) -> SetupItem {
+    let gateway = config.gateway();
+    let api = gateway
+        .platforms
+        .iter()
+        .find(|platform| matches!(platform.platform_type.as_str(), "api_server" | "api"));
+    let Some(api) = api else {
+        return SetupItem {
+            id: "gateway",
+            label: "Gateway",
+            status: "action",
+            summary: "API server platform is not configured".to_string(),
+            next: Some("Enable gateway api_server in ~/.cowd/config.yaml".to_string()),
+        };
+    };
+    if !gateway.enabled || !api.enabled {
+        return SetupItem {
+            id: "gateway",
+            label: "Gateway",
+            status: "action",
+            summary: "Gateway or api_server is disabled".to_string(),
+            next: Some("Set gateway.enabled and api_server.enabled to true".to_string()),
+        };
+    }
+    let host = json_str(api.extra.get("host")).unwrap_or("127.0.0.1");
+    let port = json_i64(api.extra.get("port")).unwrap_or(8642);
+    SetupItem {
+        id: "gateway",
+        label: "Gateway",
+        status: if gateway_running { "ready" } else { "warn" },
+        summary: if gateway_running {
+            format!("Running; WebUI should be at http://{host}:{port}")
+        } else {
+            format!("Configured at http://{host}:{port}, not currently running")
+        },
+        next: (!gateway_running).then(|| "cowd gateway run".to_string()),
+    }
+}
+
+fn setup_feishu_item(config: &runtime::RuntimeConfig) -> SetupItem {
+    let feishu = config
+        .gateway()
+        .platforms
+        .iter()
+        .find(|platform| matches!(platform.platform_type.as_str(), "feishu" | "lark"));
+    let Some(feishu) = feishu else {
+        return SetupItem {
+            id: "feishu",
+            label: "Feishu",
+            status: "warn",
+            summary: "No Feishu platform configured".to_string(),
+            next: Some("Add a Feishu platform only if you need Feishu".to_string()),
+        };
+    };
+    if !feishu.enabled {
+        return SetupItem {
+            id: "feishu",
+            label: "Feishu",
+            status: "warn",
+            summary: "Configured but disabled".to_string(),
+            next: Some("Set the Feishu platform enabled: true".to_string()),
+        };
+    }
+    let has_app_id = json_str(feishu.extra.get("app_id")).is_some_and(|value| !value.is_empty());
+    let has_app_secret =
+        json_str(feishu.extra.get("app_secret")).is_some_and(|value| !value.is_empty());
+    if has_app_id && has_app_secret {
+        SetupItem {
+            id: "feishu",
+            label: "Feishu",
+            status: "ready",
+            summary: "Enabled with required credentials; secrets are not displayed".to_string(),
+            next: None,
+        }
+    } else {
+        SetupItem {
+            id: "feishu",
+            label: "Feishu",
+            status: "action",
+            summary: "Missing app_id or app_secret".to_string(),
+            next: Some("Fill Feishu app_id/app_secret in ~/.cowd/config.yaml".to_string()),
+        }
+    }
+}
+
+fn setup_wechat_item() -> SetupItem {
+    match runtime::platform::wechat_ilink::list_wechat_qr_accounts(None) {
+        Ok(accounts) if !accounts.is_empty() => SetupItem {
+            id: "wechat",
+            label: "WeChat",
+            status: "ready",
+            summary: format!("{} QR-authorized account(s) available", accounts.len()),
+            next: None,
+        },
+        Ok(_) => SetupItem {
+            id: "wechat",
+            label: "WeChat",
+            status: "action",
+            summary: "No personal WeChat QR account authorized".to_string(),
+            next: Some("cowd gateway wechat-qr".to_string()),
+        },
+        Err(error) => SetupItem {
+            id: "wechat",
+            label: "WeChat",
+            status: "warn",
+            summary: format!("Could not read WeChat accounts: {error}"),
+            next: Some("cowd gateway wechat-qr".to_string()),
+        },
+    }
+}
+
+fn setup_memory_item(config: &runtime::RuntimeConfig) -> SetupItem {
+    let memory = config.memory();
+    SetupItem {
+        id: "memory",
+        label: "Memory",
+        status: if memory.enabled { "ready" } else { "warn" },
+        summary: if memory.enabled {
+            "Enabled with default organic memory runtime".to_string()
+        } else {
+            "Disabled; conversations still work but memory will not accumulate".to_string()
+        },
+        next: (!memory.enabled)
+            .then(|| "Set memory.enabled: true when you want memory".to_string()),
+    }
+}
+
+fn setup_session_item(config_home: &Path) -> SetupItem {
+    let db_path = config_home.join("sessions.db");
+    SetupItem {
+        id: "session",
+        label: "Session",
+        status: if db_path.exists() { "ready" } else { "warn" },
+        summary: if db_path.exists() {
+            format!("SQLite session store exists at {}", db_path.display())
+        } else {
+            "SQLite session store will be created on first session use".to_string()
+        },
+        next: None,
+    }
+}
+
+fn setup_permission_item(config: &runtime::RuntimeConfig) -> SetupItem {
+    let mode = match config.permission_mode() {
+        Some(ResolvedPermissionMode::ReadOnly) => "read-only",
+        Some(ResolvedPermissionMode::WorkspaceWrite) => "workspace-write",
+        Some(ResolvedPermissionMode::DangerFullAccess) => "danger-full-access",
+        None => "default",
+    };
+    SetupItem {
+        id: "permission",
+        label: "Permission",
+        status: "ready",
+        summary: format!("Permission mode is {mode}; --solo/--yolo remain explicit overrides"),
+        next: None,
+    }
+}
+
+fn json_str(value: Option<&JsonValue>) -> Option<&str> {
+    value.and_then(JsonValue::as_str)
+}
+
+fn json_i64(value: Option<&JsonValue>) -> Option<i64> {
+    value.and_then(JsonValue::as_i64)
+}
+
 fn render_help_topic(topic: LocalHelpTopic) -> String {
     match topic {
         LocalHelpTopic::Status => "Status
@@ -7345,6 +7744,12 @@ fn render_help_topic(topic: LocalHelpTopic) -> String {
   Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
   Output           local-only health report; no provider request or session resume required
   Related          /doctor · cowd --resume latest /doctor"
+            .to_string(),
+        LocalHelpTopic::Setup => "Setup
+  Usage            cowd setup
+  Purpose          check local setup, channels, gateway, memory, sessions, and permissions
+  Output           safe readiness report with no secrets
+  Related          /setup · cowd gateway wechat-qr · cowd gateway run"
             .to_string(),
     }
 }
@@ -10952,6 +11357,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
+    writeln!(out, "  cowd setup")?;
+    writeln!(
+        out,
+        "      Check local setup, channels, gateway/WebUI, and next action"
+    )?;
     writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
     writeln!(
         out,
@@ -11120,9 +11530,10 @@ mod tests {
         parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
         push_output_block, render_config_report, render_diff_report, render_diff_report_for,
         render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, session_db_path, session_db_resume_context_packet, short_tool_id,
+        render_session_markdown, render_setup_json, render_setup_report,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command, session_db_path,
+        session_db_resume_context_packet, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
         sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
@@ -12100,6 +12511,12 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&["setup".to_string()]).expect("setup should parse"),
+            CliAction::Setup {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
             parse_args(&[
                 "state".to_string(),
                 "--output-format".to_string(),
@@ -12209,6 +12626,11 @@ mod tests {
                 .expect("doctor help should parse"),
             CliAction::HelpTopic(LocalHelpTopic::Doctor)
         );
+        assert_eq!(
+            parse_args(&["setup".to_string(), "--help".to_string()])
+                .expect("setup help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Setup)
+        );
     }
 
     #[test]
@@ -12239,6 +12661,12 @@ mod tests {
         assert_eq!(
             parse_args(&["sandbox".to_string()]).expect("sandbox should parse"),
             CliAction::Sandbox {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["setup".to_string()]).expect("setup should parse"),
+            CliAction::Setup {
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -12595,6 +13023,12 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(&["/setup".to_string()]).expect("/setup should parse"),
+            CliAction::Setup {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
             parse_args(&[
                 "/skills".to_string(),
                 "help".to_string(),
@@ -12659,6 +13093,64 @@ mod tests {
         .expect_err("invalid /plugins list shape should be rejected");
         assert!(plugins_error.contains("Usage: /plugin list"));
         assert!(plugins_error.contains("Aliases          /plugins, /marketplace"));
+
+        let setup_error = parse_args(&["/setup".to_string(), "now".to_string()])
+            .expect_err("invalid /setup shape should be rejected");
+        assert!(setup_error.contains("Unexpected arguments for /setup."));
+        assert!(setup_error.contains("Usage            /setup"));
+    }
+
+    #[test]
+    fn setup_report_and_json_are_redacted_and_actionable() {
+        let _guard = env_lock();
+        let _cfg_guard = ConfigHomeGuard::new();
+
+        let report = render_setup_report().expect("setup report should render");
+        assert!(report.contains("Setup Center"));
+        assert!(report.contains("Checks"));
+        assert!(report.contains("cowd gateway wechat-qr"));
+        assert!(!report.contains("app_secret"));
+        assert!(!report.contains("auth_token"));
+
+        let json = render_setup_json().expect("setup json should render");
+        assert_eq!(json["kind"], "setup");
+        let items = json["items"]
+            .as_array()
+            .expect("setup json should include items");
+        assert!(items.iter().any(|item| item["id"] == "wechat"));
+        assert!(items.iter().any(|item| item["id"] == "permission"));
+        let encoded = serde_json::to_string(&json).expect("json should encode");
+        assert!(!encoded.contains("app_secret"));
+        assert!(!encoded.contains("auth_token"));
+    }
+
+    #[test]
+    fn setup_next_action_prioritizes_action_items_over_warnings() {
+        let snapshot = super::SetupSnapshot {
+            cwd: PathBuf::from("/workspace"),
+            config_home: PathBuf::from("/config"),
+            loaded_files: vec![],
+            gateway_running: false,
+            items: vec![
+                super::SetupItem {
+                    id: "gateway",
+                    label: "Gateway",
+                    status: "warn",
+                    summary: "configured but not running".to_string(),
+                    next: Some("cowd gateway run".to_string()),
+                },
+                super::SetupItem {
+                    id: "wechat",
+                    label: "WeChat",
+                    status: "action",
+                    summary: "not authorized".to_string(),
+                    next: Some("cowd gateway wechat-qr".to_string()),
+                },
+            ],
+        };
+
+        assert_eq!(snapshot.overall_status(), "action");
+        assert_eq!(snapshot.next_action(), "cowd gateway wechat-qr");
     }
 
     #[test]

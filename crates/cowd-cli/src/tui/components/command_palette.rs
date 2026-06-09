@@ -280,6 +280,11 @@ fn default_entries() -> Vec<CommandEntry> {
         Action::ReloadProviders,
     ));
     entries.push(CommandEntry::new(
+        "Open Setup Center",
+        "Check local setup and show the next required action",
+        Action::Execute("/setup".into()),
+    ));
+    entries.push(CommandEntry::new(
         "Cancel",
         "Cancel the current operation",
         Action::Cancel,
@@ -1154,6 +1159,14 @@ mod tests {
         let p = setup_palette();
         assert!(p.all_commands.iter().any(|entry| {
             entry.name == "Reload Providers" && entry.action == Action::ReloadProviders
+        }));
+    }
+
+    #[test]
+    fn default_entries_include_setup_center_action() {
+        let p = setup_palette();
+        assert!(p.all_commands.iter().any(|entry| {
+            entry.name == "Open Setup Center" && entry.action == Action::Execute("/setup".into())
         }));
     }
 
