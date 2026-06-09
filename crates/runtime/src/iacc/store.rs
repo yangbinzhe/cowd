@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -10,11 +10,12 @@ use thiserror::Error;
 
 use super::{
     IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
-    IaccChangeEvent, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccIncident,
-    IaccMetricDefinition, IaccMetricState, IaccOperationalAnalysis, IaccSeverity,
+    IaccChangeEvent, IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
+    IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMetricDefinition, IaccMetricState,
+    IaccOperationalAnalysis, IaccRelation, IaccSeverity,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 5;
+pub const IACC_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -38,6 +39,8 @@ pub struct IaccHealth {
     pub incident_count: u64,
     pub analysis_count: u64,
     pub execution_count: u64,
+    pub entity_count: u64,
+    pub relation_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,7 +94,83 @@ impl IaccStore {
             incident_count: count_table(&connection, "iacc_incident")?,
             analysis_count: count_table(&connection, "iacc_operational_analysis")?,
             execution_count: count_table(&connection, "iacc_action_execution")?,
+            entity_count: count_table(&connection, "iacc_entity")?,
+            relation_count: count_table(&connection, "iacc_relation")?,
         })
+    }
+
+    pub fn upsert_entity(&self, entity: &IaccEntity) -> Result<IaccEntity, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_entity(&connection, entity)
+    }
+
+    pub fn get_entity(&self, entity_id: &str) -> Result<Option<IaccEntity>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_entity(&connection, entity_id)
+    }
+
+    pub fn resolve_entity_by_source_key(
+        &self,
+        source_system: &str,
+        source_key: &str,
+    ) -> Result<Option<IaccEntity>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_entity_by_source_key(&connection, source_system, source_key)
+    }
+
+    pub fn list_entities(&self, limit: usize) -> Result<Vec<IaccEntity>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_entities(&connection, limit)
+    }
+
+    pub fn upsert_relation(&self, relation: &IaccRelation) -> Result<IaccRelation, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        upsert_relation(&connection, relation)
+    }
+
+    pub fn list_entity_relations(
+        &self,
+        entity_id: &str,
+        limit: usize,
+    ) -> Result<Vec<IaccRelation>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if find_entity(&connection, entity_id)?.is_none() {
+            return Err(IaccStoreError::NotFound(entity_id.to_string()));
+        }
+        list_entity_relations(&connection, entity_id, limit)
+    }
+
+    pub fn impact_trace(
+        &self,
+        entity_id: &str,
+        max_depth: usize,
+    ) -> Result<IaccImpactTrace, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if find_entity(&connection, entity_id)?.is_none() {
+            return Err(IaccStoreError::NotFound(entity_id.to_string()));
+        }
+        build_impact_trace(&connection, entity_id, max_depth)
     }
 
     pub fn ingest_fact(&self, fact: &IaccFact) -> Result<IaccAttentionItem, IaccStoreError> {
@@ -479,7 +558,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 5, datetime('now'))
+        VALUES (1, 6, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -487,6 +566,53 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
                 ELSE iacc_schema.schema_version
             END,
             updated_at = excluded.updated_at;
+
+        CREATE TABLE IF NOT EXISTS iacc_entity (
+            entity_id TEXT PRIMARY KEY,
+            entity_type TEXT NOT NULL,
+            canonical_key TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            source_keys_json TEXT NOT NULL,
+            attributes_json TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            entity_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(entity_type, canonical_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_entity_type
+            ON iacc_entity(entity_type, canonical_key);
+
+        CREATE TABLE IF NOT EXISTS iacc_entity_source_key (
+            source_system TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            source_ref TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(source_system, source_key),
+            FOREIGN KEY(entity_id) REFERENCES iacc_entity(entity_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_entity_source_entity
+            ON iacc_entity_source_key(entity_id);
+
+        CREATE TABLE IF NOT EXISTS iacc_relation (
+            relation_id TEXT PRIMARY KEY,
+            relation_type TEXT NOT NULL,
+            from_entity_id TEXT NOT NULL,
+            to_entity_id TEXT NOT NULL,
+            attributes_json TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            relation_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(relation_type, from_entity_id, to_entity_id),
+            FOREIGN KEY(from_entity_id) REFERENCES iacc_entity(entity_id) ON DELETE CASCADE,
+            FOREIGN KEY(to_entity_id) REFERENCES iacc_entity(entity_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_relation_from
+            ON iacc_relation(from_entity_id, relation_type);
+        CREATE INDEX IF NOT EXISTS idx_iacc_relation_to
+            ON iacc_relation(to_entity_id, relation_type);
 
         CREATE TABLE IF NOT EXISTS iacc_fact (
             fact_id TEXT PRIMARY KEY,
@@ -617,6 +743,298 @@ fn count_table(connection: &Connection, table: &str) -> rusqlite::Result<u64> {
     connection
         .query_row(&sql, [], |row| row.get::<_, i64>(0))
         .map(|value| value as u64)
+}
+
+fn upsert_entity(
+    connection: &Connection,
+    entity: &IaccEntity,
+) -> Result<IaccEntity, IaccStoreError> {
+    let mut entity = entity.clone();
+    if let Some(existing) =
+        find_entity_by_canonical(connection, &entity.entity_type, &entity.canonical_key)?
+    {
+        entity.entity_id = existing.entity_id;
+        entity.created_at = existing.created_at;
+        entity.source_keys = merged_source_keys(&existing.source_keys, &entity.source_keys);
+    }
+    entity.updated_at = Utc::now();
+    connection.execute(
+        r"INSERT INTO iacc_entity (
+            entity_id, entity_type, canonical_key, display_name, source_keys_json,
+            attributes_json, confidence, entity_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(entity_id) DO UPDATE SET
+            entity_type = excluded.entity_type,
+            canonical_key = excluded.canonical_key,
+            display_name = excluded.display_name,
+            source_keys_json = excluded.source_keys_json,
+            attributes_json = excluded.attributes_json,
+            confidence = excluded.confidence,
+            entity_json = excluded.entity_json,
+            updated_at = excluded.updated_at",
+        params![
+            entity.entity_id,
+            entity.entity_type,
+            entity.canonical_key,
+            entity.display_name,
+            serde_json::to_string(&entity.source_keys)?,
+            serde_json::to_string(&entity.attributes)?,
+            entity.confidence,
+            serde_json::to_string(&entity)?,
+            entity.created_at.to_rfc3339(),
+            entity.updated_at.to_rfc3339(),
+        ],
+    )?;
+    connection.execute(
+        "DELETE FROM iacc_entity_source_key WHERE entity_id = ?1",
+        params![entity.entity_id],
+    )?;
+    for source_key in &entity.source_keys {
+        connection.execute(
+            r"INSERT INTO iacc_entity_source_key (
+                source_system, source_key, entity_id, source_ref, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(source_system, source_key) DO UPDATE SET
+                entity_id = excluded.entity_id,
+                source_ref = excluded.source_ref",
+            params![
+                source_key.normalized_system(),
+                source_key.normalized_key(),
+                entity.entity_id,
+                source_key.source_ref,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+    }
+    Ok(entity)
+}
+
+fn merged_source_keys(
+    existing: &[super::IaccSourceKey],
+    incoming: &[super::IaccSourceKey],
+) -> Vec<super::IaccSourceKey> {
+    let mut seen = BTreeSet::new();
+    let mut keys = Vec::new();
+    for source_key in existing.iter().chain(incoming.iter()) {
+        let key = (source_key.normalized_system(), source_key.normalized_key());
+        if seen.insert(key) {
+            keys.push(source_key.clone());
+        }
+    }
+    keys
+}
+
+fn find_entity(
+    connection: &Connection,
+    entity_id: &str,
+) -> Result<Option<IaccEntity>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT entity_json FROM iacc_entity WHERE entity_id = ?1",
+            params![entity_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn find_entity_by_canonical(
+    connection: &Connection,
+    entity_type: &str,
+    canonical_key: &str,
+) -> Result<Option<IaccEntity>, IaccStoreError> {
+    connection
+        .query_row(
+            r"SELECT entity_json
+              FROM iacc_entity
+              WHERE entity_type = ?1 AND canonical_key = ?2",
+            params![entity_type, canonical_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn find_entity_by_source_key(
+    connection: &Connection,
+    source_system: &str,
+    source_key: &str,
+) -> Result<Option<IaccEntity>, IaccStoreError> {
+    connection
+        .query_row(
+            r"SELECT e.entity_json
+              FROM iacc_entity_source_key s
+              JOIN iacc_entity e ON e.entity_id = s.entity_id
+              WHERE s.source_system = ?1 AND s.source_key = ?2",
+            params![
+                super::entity::normalize_key(source_system),
+                super::entity::normalize_key(source_key),
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn list_entities(connection: &Connection, limit: usize) -> Result<Vec<IaccEntity>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT entity_json
+          FROM iacc_entity
+          ORDER BY updated_at DESC
+          LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn upsert_relation(
+    connection: &Connection,
+    relation: &IaccRelation,
+) -> Result<IaccRelation, IaccStoreError> {
+    if find_entity(connection, &relation.from_entity_id)?.is_none() {
+        return Err(IaccStoreError::NotFound(relation.from_entity_id.clone()));
+    }
+    if find_entity(connection, &relation.to_entity_id)?.is_none() {
+        return Err(IaccStoreError::NotFound(relation.to_entity_id.clone()));
+    }
+
+    let mut relation = relation.clone();
+    if let Some(existing) = find_relation_by_key(
+        connection,
+        &relation.relation_type,
+        &relation.from_entity_id,
+        &relation.to_entity_id,
+    )? {
+        relation.relation_id = existing.relation_id;
+        relation.created_at = existing.created_at;
+    }
+    relation.updated_at = Utc::now();
+    connection.execute(
+        r"INSERT INTO iacc_relation (
+            relation_id, relation_type, from_entity_id, to_entity_id, attributes_json,
+            confidence, relation_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(relation_id) DO UPDATE SET
+            relation_type = excluded.relation_type,
+            from_entity_id = excluded.from_entity_id,
+            to_entity_id = excluded.to_entity_id,
+            attributes_json = excluded.attributes_json,
+            confidence = excluded.confidence,
+            relation_json = excluded.relation_json,
+            updated_at = excluded.updated_at",
+        params![
+            relation.relation_id,
+            relation.relation_type,
+            relation.from_entity_id,
+            relation.to_entity_id,
+            serde_json::to_string(&relation.attributes)?,
+            relation.confidence,
+            serde_json::to_string(&relation)?,
+            relation.created_at.to_rfc3339(),
+            relation.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(relation)
+}
+
+fn find_relation_by_key(
+    connection: &Connection,
+    relation_type: &str,
+    from_entity_id: &str,
+    to_entity_id: &str,
+) -> Result<Option<IaccRelation>, IaccStoreError> {
+    connection
+        .query_row(
+            r"SELECT relation_json
+              FROM iacc_relation
+              WHERE relation_type = ?1 AND from_entity_id = ?2 AND to_entity_id = ?3",
+            params![relation_type, from_entity_id, to_entity_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn list_entity_relations(
+    connection: &Connection,
+    entity_id: &str,
+    limit: usize,
+) -> Result<Vec<IaccRelation>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT relation_json
+          FROM iacc_relation
+          WHERE from_entity_id = ?1 OR to_entity_id = ?1
+          ORDER BY updated_at DESC
+          LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![entity_id, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn build_impact_trace(
+    connection: &Connection,
+    root_entity_id: &str,
+    max_depth: usize,
+) -> Result<IaccImpactTrace, IaccStoreError> {
+    let max_depth = max_depth.clamp(1, 5);
+    let mut queue = VecDeque::from([(root_entity_id.to_string(), 0usize)]);
+    let mut seen_entities = BTreeSet::from([root_entity_id.to_string()]);
+    let mut seen_relations = BTreeSet::new();
+    let mut hops = Vec::new();
+
+    while let Some((entity_id, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        for relation in list_entity_relations(connection, &entity_id, 500)? {
+            if !seen_relations.insert(relation.relation_id.clone()) {
+                continue;
+            }
+            let next_entity_id = if relation.from_entity_id == entity_id {
+                relation.to_entity_id.clone()
+            } else {
+                relation.from_entity_id.clone()
+            };
+            let traversal_direction = if relation.from_entity_id == entity_id {
+                "outbound"
+            } else {
+                "inbound"
+            }
+            .to_string();
+            let from_entity = find_entity(connection, &relation.from_entity_id)?;
+            let to_entity = find_entity(connection, &relation.to_entity_id)?;
+            hops.push(IaccImpactHop {
+                depth: depth + 1,
+                traversal_direction,
+                relation,
+                from_entity,
+                to_entity,
+            });
+            if seen_entities.insert(next_entity_id.clone()) {
+                queue.push_back((next_entity_id, depth + 1));
+            }
+        }
+    }
+
+    let mut entities = Vec::new();
+    for entity_id in &seen_entities {
+        if let Some(entity) = find_entity(connection, entity_id)? {
+            entities.push(entity);
+        }
+    }
+    Ok(IaccImpactTrace {
+        root_entity_id: root_entity_id.to_string(),
+        max_depth,
+        entities,
+        hops,
+        generated_at: Utc::now(),
+    })
 }
 
 fn upsert_attention(
@@ -1119,7 +1537,126 @@ fn attention_from_change(change: &IaccChangeEvent, state: &IaccMetricState) -> I
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iacc::IaccFactInput;
+    use crate::iacc::{IaccEntityInput, IaccFactInput, IaccRelationInput, IaccSourceKey};
+
+    #[test]
+    fn entity_source_keys_resolve_to_one_canonical_entity() {
+        let store = IaccStore::in_memory().expect("store opens");
+        let first = IaccEntity::from_input(IaccEntityInput {
+            entity_id: None,
+            entity_type: "Component".to_string(),
+            canonical_key: "GPU-H100".to_string(),
+            display_name: Some("GPU H100".to_string()),
+            source_keys: vec![IaccSourceKey {
+                source_system: "ERP".to_string(),
+                source_key: "MAT-GPU-H100".to_string(),
+                source_ref: Some("connector:erp:material".to_string()),
+            }],
+            attributes: serde_json::json!({"family": "gpu"}),
+            confidence: Some(0.96),
+        });
+        let first = store.upsert_entity(&first).expect("entity saves");
+
+        let second = IaccEntity::from_input(IaccEntityInput {
+            entity_id: None,
+            entity_type: "component".to_string(),
+            canonical_key: "gpu-h100".to_string(),
+            display_name: Some("H100 accelerator".to_string()),
+            source_keys: vec![IaccSourceKey {
+                source_system: "PLM".to_string(),
+                source_key: "GPU_H100_80GB".to_string(),
+                source_ref: Some("connector:plm:item".to_string()),
+            }],
+            attributes: serde_json::json!({"thermal_design": "high"}),
+            confidence: Some(0.91),
+        });
+        let second = store.upsert_entity(&second).expect("entity merges");
+
+        assert_eq!(first.entity_id, second.entity_id);
+        assert_eq!(second.source_keys.len(), 2);
+        let resolved = store
+            .resolve_entity_by_source_key("plm", "GPU_H100_80GB")
+            .expect("source key resolves")
+            .expect("entity exists");
+        assert_eq!(resolved.entity_id, first.entity_id);
+        assert_eq!(store.health().unwrap().entity_count, 1);
+    }
+
+    #[test]
+    fn relation_network_traces_component_impact_to_orders() {
+        let store = IaccStore::in_memory().expect("store opens");
+        let component = store
+            .upsert_entity(&IaccEntity::from_input(IaccEntityInput {
+                entity_id: Some("entity-component-gpu".to_string()),
+                entity_type: "component".to_string(),
+                canonical_key: "gpu-h100".to_string(),
+                display_name: Some("GPU H100".to_string()),
+                source_keys: Vec::new(),
+                attributes: serde_json::json!({}),
+                confidence: Some(0.98),
+            }))
+            .expect("component saves");
+        let product = store
+            .upsert_entity(&IaccEntity::from_input(IaccEntityInput {
+                entity_id: Some("entity-product-server".to_string()),
+                entity_type: "product".to_string(),
+                canonical_key: "server-ai-8gpu".to_string(),
+                display_name: Some("AI Server 8GPU".to_string()),
+                source_keys: Vec::new(),
+                attributes: serde_json::json!({}),
+                confidence: Some(0.95),
+            }))
+            .expect("product saves");
+        let order = store
+            .upsert_entity(&IaccEntity::from_input(IaccEntityInput {
+                entity_id: Some("entity-order-customer-a".to_string()),
+                entity_type: "customer_order".to_string(),
+                canonical_key: "co-2026-0001".to_string(),
+                display_name: Some("Customer order CO-2026-0001".to_string()),
+                source_keys: Vec::new(),
+                attributes: serde_json::json!({"priority": "strategic"}),
+                confidence: Some(0.92),
+            }))
+            .expect("order saves");
+
+        let requires = store
+            .upsert_relation(&IaccRelation::from_input(IaccRelationInput {
+                relation_id: None,
+                relation_type: "requires".to_string(),
+                from_entity_id: product.entity_id.clone(),
+                to_entity_id: component.entity_id.clone(),
+                attributes: serde_json::json!({"qty_per": 8}),
+                confidence: Some(0.97),
+            }))
+            .expect("requires relation saves");
+        store
+            .upsert_relation(&IaccRelation::from_input(IaccRelationInput {
+                relation_id: None,
+                relation_type: "reserved_for".to_string(),
+                from_entity_id: order.entity_id.clone(),
+                to_entity_id: product.entity_id.clone(),
+                attributes: serde_json::json!({"week": "2026-W30"}),
+                confidence: Some(0.9),
+            }))
+            .expect("order relation saves");
+
+        let component_relations = store
+            .list_entity_relations(&component.entity_id, 10)
+            .expect("relations list");
+        assert_eq!(component_relations.len(), 1);
+        assert_eq!(component_relations[0].relation_id, requires.relation_id);
+
+        let trace = store
+            .impact_trace(&component.entity_id, 3)
+            .expect("impact path builds");
+        assert_eq!(trace.root_entity_id, component.entity_id);
+        assert_eq!(trace.hops.len(), 2);
+        assert!(trace
+            .entities
+            .iter()
+            .any(|entity| entity.entity_id == order.entity_id));
+        assert_eq!(store.health().unwrap().relation_count, 2);
+    }
 
     #[test]
     fn iacc_store_ingests_fact_and_builds_evidence_packet() {

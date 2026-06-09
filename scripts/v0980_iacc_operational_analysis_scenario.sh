@@ -80,7 +80,7 @@ for _ in {1..100}; do
 done
 
 curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"daemon-http-gateway"'
-curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"expected_schema_version":5'
+curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"expected_schema_version":6'
 curl -fsS "$BASE_URL/api/iacc/health" | rg -q '"incident_operational_analysis"'
 
 curl -fsS "$BASE_URL/api/iacc/facts/ingest" \

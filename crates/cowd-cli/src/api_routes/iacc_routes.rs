@@ -12,8 +12,8 @@ use axum::{
 use memory::store::session::SessionRecord;
 use runtime::{
     AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode, IaccActionExecutionRequest,
-    IaccActionFeedback, IaccFact, IaccFactInput, IaccIncident, IaccStore, IaccStoreError,
-    IACC_SCHEMA_VERSION,
+    IaccActionFeedback, IaccEntity, IaccEntityInput, IaccFact, IaccFactInput, IaccIncident,
+    IaccRelation, IaccRelationInput, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
 };
 use serde::Deserialize;
 
@@ -24,6 +24,28 @@ use super::{api_error, AppState, ErrorResponse};
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/iacc/health", get(iacc_health_handler))
+        .route("/api/iacc/entities", get(iacc_entities_handler))
+        .route(
+            "/api/iacc/entities/upsert",
+            post(iacc_entity_upsert_handler),
+        )
+        .route(
+            "/api/iacc/entities/resolve-source-key",
+            post(iacc_entity_resolve_source_key_handler),
+        )
+        .route("/api/iacc/entities/:id", get(iacc_entity_get_handler))
+        .route(
+            "/api/iacc/entities/:id/relations",
+            get(iacc_entity_relations_handler),
+        )
+        .route(
+            "/api/iacc/entities/:id/impact-path",
+            get(iacc_entity_impact_path_handler),
+        )
+        .route(
+            "/api/iacc/relations/upsert",
+            post(iacc_relation_upsert_handler),
+        )
         .route("/api/iacc/facts/ingest", post(iacc_fact_ingest_handler))
         .route("/api/iacc/metrics", get(iacc_metrics_handler))
         .route("/api/iacc/metrics/:id", get(iacc_metric_detail_handler))
@@ -68,6 +90,34 @@ struct IaccFactIngestRequest {
     session_id: Option<String>,
     #[serde(default)]
     facts: Vec<IaccFactInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccEntityUpsertRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    entity: IaccEntityInput,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccEntityResolveSourceKeyRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    source_system: String,
+    source_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccRelationUpsertRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    relation: IaccRelationInput,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,8 +176,13 @@ async fn iacc_health_handler(
         "incident_count": health.incident_count,
         "analysis_count": health.analysis_count,
         "execution_count": health.execution_count,
+        "entity_count": health.entity_count,
+        "relation_count": health.relation_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": [
+            "entity_relation_network",
+            "entity_source_key_resolution",
+            "entity_impact_trace",
             "fact_ingest",
             "metric_recompute",
             "metric_state",
@@ -140,6 +195,128 @@ async fn iacc_health_handler(
             "incident_operational_analysis",
             "action_execution_feedback"
         ],
+    })))
+}
+
+async fn iacc_entities_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let entities = store
+        .list_entities(100)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.entities",
+        "entities": entities,
+    })))
+}
+
+async fn iacc_entity_upsert_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccEntityUpsertRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let entity = store
+        .upsert_entity(&IaccEntity::from_input(request.entity))
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.entity",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "entity": entity,
+    })))
+}
+
+async fn iacc_entity_resolve_source_key_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccEntityResolveSourceKeyRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let entity = store
+        .resolve_entity_by_source_key(&request.source_system, &request.source_key)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC entity source key not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.entity.resolution",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "source_system": request.source_system,
+        "source_key": request.source_key,
+        "entity": entity,
+    })))
+}
+
+async fn iacc_entity_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let entity = store
+        .get_entity(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC entity not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.entity",
+        "entity": entity,
+    })))
+}
+
+async fn iacc_relation_upsert_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccRelationUpsertRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let relation = store
+        .upsert_relation(&IaccRelation::from_input(request.relation))
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.relation",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "relation": relation,
+    })))
+}
+
+async fn iacc_entity_relations_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let relations = store
+        .list_entity_relations(&id, 100)
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.entity.relations",
+        "entity_id": id,
+        "relations": relations,
+    })))
+}
+
+async fn iacc_entity_impact_path_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let trace = store.impact_trace(&id, 3).map_err(|error| match error {
+        IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.entity.impact_path",
+        "trace": trace,
     })))
 }
 

@@ -8,11 +8,13 @@
 mod analysis;
 mod attention;
 mod change;
+mod entity;
 mod evidence;
 mod execution;
 mod fact;
 mod incident;
 mod metric;
+mod relation;
 mod source;
 mod store;
 
@@ -21,11 +23,13 @@ pub use analysis::{
 };
 pub use attention::{IaccAttentionItem, IaccSeverity};
 pub use change::IaccChangeEvent;
+pub use entity::{IaccEntity, IaccEntityInput, IaccSourceKey};
 pub use evidence::{IaccEvidencePacket, IaccEvidenceSourceRef};
 pub use execution::{IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback};
 pub use fact::{IaccFact, IaccFactInput};
 pub use incident::IaccIncident;
 pub use metric::{IaccMetricDefinition, IaccMetricState, IaccMetricStatus};
+pub use relation::{IaccImpactHop, IaccImpactTrace, IaccRelation, IaccRelationInput};
 pub use source::{IaccSourceKind, IaccSourceSnapshot};
 pub use store::{
     IaccHealth, IaccMetricRecomputeResult, IaccStore, IaccStoreError, IACC_SCHEMA_VERSION,
