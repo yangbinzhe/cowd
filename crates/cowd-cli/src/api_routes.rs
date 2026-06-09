@@ -4389,7 +4389,7 @@ providers:
     }
 
     #[tokio::test]
-    async fn cross_plane_single_use_grant_is_consumed_and_auditable() {
+    async fn cross_plane_policy_simulation_does_not_consume_single_use_grant() {
         let app = api_router(test_state());
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = format!("user:test-{suffix}");
@@ -4469,10 +4469,7 @@ providers:
         assert_eq!(second.status(), StatusCode::OK);
         let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
         let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
-        assert_eq!(
-            second_json["decision"]["decision"],
-            "require_single_approval"
-        );
+        assert_eq!(second_json["decision"]["decision"], "allow");
 
         let audit = app
             .oneshot(
@@ -4487,17 +4484,125 @@ providers:
         let audit_body = to_bytes(audit.into_body(), usize::MAX).await.unwrap();
         let audit_json: serde_json::Value = serde_json::from_slice(&audit_body).unwrap();
         let records = audit_json["records"].as_array().unwrap();
-        let consumed = records
+        assert!(
+            records.iter().all(|record| {
+                record["evidence"]["consumed_grant_id"].as_str() != Some(grant_id.as_str())
+            }),
+            "policy simulation must not consume single-use grants"
+        );
+    }
+
+    #[tokio::test]
+    async fn connector_service_commit_consumes_single_use_grant_and_audits() {
+        let app = api_router(test_state());
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let principal = format!("user:service-commit-{suffix}");
+        let capability = "service.mock.docs.read";
+        let grant_id = format!("grant-service-commit-{suffix}");
+        let grant = serde_json::json!({
+            "id": grant_id,
+            "principal_id": principal,
+            "capability": capability,
+            "account_id": null,
+            "target_ref": null,
+            "resource_ref": null,
+            "source_channel": null,
+            "grant_type": "single_use",
+            "expires_at": null,
+            "remaining_uses": null,
+            "created_by": "test",
+            "approval_id": null
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/grants")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(grant.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let execute = serde_json::json!({
+            "actor_principal": principal,
+            "source_channel": "channel://wechat/chat/service-commit",
+            "session_id": "service-commit-session",
+            "tool_id": capability,
+            "resource_id": format!("doc-{suffix}"),
+            "title": "Service Commit",
+            "mode": "commit",
+            "idempotency_key": format!("idem-service-commit-{suffix}")
+        });
+        let executed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/connectors/services/mock.docs/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(execute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executed.status(), StatusCode::OK);
+        let body = to_bytes(executed.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["result"]["status"], "ok");
+        assert_eq!(json["receipt"]["audit_record_id"].as_str().is_some(), true);
+
+        let audit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cross-plane/audit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let audit_body = to_bytes(audit.into_body(), usize::MAX).await.unwrap();
+        let audit_json: serde_json::Value = serde_json::from_slice(&audit_body).unwrap();
+        let consumed = audit_json["records"]
+            .as_array()
+            .unwrap()
             .iter()
             .find(|record| {
                 record["evidence"]["consumed_grant_id"].as_str() == Some(grant_id.as_str())
             })
-            .expect("audit should include single-use grant consumption evidence");
-        assert_eq!(
-            consumed["evidence"]["policy_version"],
-            "cross-plane.v2.connector"
-        );
+            .expect("commit audit should include single-use grant consumption");
         assert_eq!(consumed["evidence"]["remaining_uses_after"], 0);
+
+        let action = serde_json::json!({
+            "actor_principal": principal,
+            "requested_capability": capability,
+            "provider_account": "mock.docs",
+            "source_channel": "channel://wechat/chat/service-commit",
+            "resource_ref": null,
+            "target_ref": null,
+            "session_id": "service-commit-session",
+            "risk": "medium",
+            "data_classification": "internal",
+            "identity_trust": "verified"
+        });
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cross-plane/policy/simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(action.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(second_json["decision"]["decision"], "allow");
     }
 
     #[tokio::test]
@@ -4762,10 +4867,7 @@ providers:
             .unwrap();
         let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
         let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
-        assert_eq!(
-            second_json["decision"]["decision"],
-            "require_single_approval"
-        );
+        assert_eq!(second_json["decision"]["decision"], "allow");
     }
 
     #[tokio::test]
@@ -4885,10 +4987,7 @@ providers:
             .unwrap();
         let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
         let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
-        assert_eq!(
-            second_json["decision"]["decision"],
-            "require_single_approval"
-        );
+        assert_eq!(second_json["decision"]["decision"], "allow");
     }
 
     #[tokio::test]

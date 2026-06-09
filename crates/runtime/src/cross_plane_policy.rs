@@ -932,7 +932,7 @@ impl CrossPlaneControlPlane {
         let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default())
             .with_grants(active_grants.clone());
         let decision = engine.decide(&action, now);
-        let consumed = self.consume_matched_grant_if_needed(&decision);
+        let consumed = self.consume_matched_grant_for_decision(&decision);
         let evidence = CrossPlaneDecisionEvidence {
             policy_version: "cross-plane.v1".to_string(),
             evaluated_at: Some(now),
@@ -973,7 +973,7 @@ impl CrossPlaneControlPlane {
     ) {
         let (action, decision, mut evidence) =
             self.decide_with_connector_context(action, context, now);
-        let consumed = self.consume_matched_grant_if_needed(&decision);
+        let consumed = self.consume_matched_grant_for_decision(&decision);
         evidence.consumed_grant_id = consumed
             .as_ref()
             .map(|(grant_id, _remaining)| grant_id.clone());
@@ -1018,7 +1018,7 @@ impl CrossPlaneControlPlane {
             .collect()
     }
 
-    fn consume_matched_grant_if_needed(
+    pub fn consume_matched_grant_for_decision(
         &self,
         decision: &CrossPlanePolicyDecision,
     ) -> Option<(String, u32)> {

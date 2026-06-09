@@ -14,9 +14,10 @@ use memory::types::{
 use memory::{CognitiveContextManager, MemoryKernel, MemoryScope, MemoryTurnContext};
 use runtime::{
     CapabilityManifest, ConnectorBulkhead, ConnectorBulkheadRejection, ConnectorHealth,
-    ConnectorRegistrySnapshot, CrossPlaneAction, CrossPlaneExecutionReceipt, ExternalResourceRef,
-    FeishuReadOnlyServiceConnector, MockDocsServiceConnector, PolicyDecisionKind, ProviderAccount,
-    ServiceConnector, ServiceToolRequest, ServiceToolResult, SqliteResourceDirectory,
+    ConnectorRegistrySnapshot, CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneExecutionReceipt,
+    ExternalResourceRef, FeishuReadOnlyServiceConnector, MockDocsServiceConnector,
+    PolicyDecisionKind, ProviderAccount, ServiceConnector, ServiceToolRequest, ServiceToolResult,
+    SqliteResourceDirectory,
 };
 use serde::{Deserialize, Serialize};
 
@@ -882,12 +883,8 @@ async fn mock_docs_execute_handler(
     action.provider_account = Some("mock.docs".to_string());
     action.resource_ref = Some(preview_resource.reference.clone());
 
-    let (action, decision, _evidence) = cross_plane_routes::decide_connector_action_and_audit(
-        &state,
-        action,
-        mode,
-        chrono::Utc::now(),
-    );
+    let (action, decision, mut evidence) =
+        cross_plane_routes::decide_connector_action(&state, action, mode, chrono::Utc::now());
     cross_plane_routes::save_cross_plane_state(&state);
 
     let policy_allowed = decision.decision == PolicyDecisionKind::Allow;
@@ -924,6 +921,35 @@ async fn mock_docs_execute_handler(
     if let Some(blocker) = bulkhead_blocker {
         blockers.push(blocker);
     }
+    if mode == "commit" && allowed {
+        if let Some((grant_id, remaining)) =
+            cross_plane_routes::cross_plane_control().consume_matched_grant_for_decision(&decision)
+        {
+            evidence.consumed_grant_id = Some(grant_id);
+            evidence.remaining_uses_after = Some(remaining);
+        }
+    }
+    let audit_result = if mode == "commit" && allowed {
+        "executed"
+    } else if allowed {
+        "dry_run"
+    } else {
+        "blocked"
+    };
+    let audit_summary = if blockers.is_empty() {
+        format!("mock.docs {audit_result}")
+    } else {
+        blockers.join("; ")
+    };
+    let audit_record = CrossPlaneAuditRecord::new(
+        action.clone(),
+        decision.clone(),
+        audit_result,
+        audit_summary,
+    )
+    .with_evidence(evidence);
+    let audit_record_id = audit_record.id.clone();
+    cross_plane_routes::cross_plane_control().record_audit(audit_record);
     let receipt = CrossPlaneExecutionReceipt::new(
         idempotency_key,
         mode,
@@ -932,7 +958,7 @@ async fn mock_docs_execute_handler(
         action,
         decision,
         blockers,
-        None,
+        Some(audit_record_id),
     );
     cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
     cross_plane_routes::save_cross_plane_state(&state);
@@ -1035,12 +1061,8 @@ async fn feishu_readonly_execute_handler(
         .as_ref()
         .map(|resource| resource.reference.clone());
 
-    let (action, decision, _evidence) = cross_plane_routes::decide_connector_action_and_audit(
-        &state,
-        action,
-        mode,
-        chrono::Utc::now(),
-    );
+    let (action, decision, mut evidence) =
+        cross_plane_routes::decide_connector_action(&state, action, mode, chrono::Utc::now());
     cross_plane_routes::save_cross_plane_state(&state);
 
     let policy_allowed = decision.decision == PolicyDecisionKind::Allow;
@@ -1086,6 +1108,35 @@ async fn feishu_readonly_execute_handler(
     if let Some(blocker) = bulkhead_blocker {
         blockers.push(blocker);
     }
+    if mode == "commit" && allowed {
+        if let Some((grant_id, remaining)) =
+            cross_plane_routes::cross_plane_control().consume_matched_grant_for_decision(&decision)
+        {
+            evidence.consumed_grant_id = Some(grant_id);
+            evidence.remaining_uses_after = Some(remaining);
+        }
+    }
+    let audit_result = if mode == "commit" && allowed {
+        "executed"
+    } else if allowed {
+        "dry_run"
+    } else {
+        "blocked"
+    };
+    let audit_summary = if blockers.is_empty() {
+        format!("feishu.readonly {audit_result}")
+    } else {
+        blockers.join("; ")
+    };
+    let audit_record = CrossPlaneAuditRecord::new(
+        action.clone(),
+        decision.clone(),
+        audit_result,
+        audit_summary,
+    )
+    .with_evidence(evidence);
+    let audit_record_id = audit_record.id.clone();
+    cross_plane_routes::cross_plane_control().record_audit(audit_record);
     let receipt = CrossPlaneExecutionReceipt::new(
         idempotency_key,
         mode,
@@ -1094,7 +1145,7 @@ async fn feishu_readonly_execute_handler(
         action,
         decision,
         blockers,
-        None,
+        Some(audit_record_id),
     );
     cross_plane_routes::cross_plane_control().record_execution(receipt.clone());
     cross_plane_routes::save_cross_plane_state(&state);

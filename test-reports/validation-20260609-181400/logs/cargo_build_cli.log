@@ -1,0 +1,4 @@
+[2026-06-09T18:14:02+08:00] START cargo_build_cli
+   Compiling cowd-cli v0.9.74 (/media/yi/Datas/workspace/cowd-develop/crates/cowd-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.72s
+[2026-06-09T18:14:15+08:00] END cargo_build_cli status=0 elapsed=13s target_before=14196231453 target_after=14196231453

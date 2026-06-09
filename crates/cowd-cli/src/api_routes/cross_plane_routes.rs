@@ -287,7 +287,7 @@ async fn cross_plane_policy_simulate_handler(
 ) -> impl IntoResponse {
     ensure_cross_plane_loaded(&state);
     let (action, decision, evidence) =
-        decide_connector_action_and_audit(&state, action, "dry_run", chrono::Utc::now());
+        decide_connector_action(&state, action, "dry_run", chrono::Utc::now());
     save_cross_plane_state(&state);
     Json(serde_json::json!({
         "kind": "cross_plane_policy_simulation",
@@ -355,6 +355,7 @@ async fn cross_plane_action_execute_handler(
         }
     }
     let mut readiness = evaluate_action_readiness(&state, request.action, &mode, now).await;
+    let mut evidence = readiness.evidence.clone();
     let mut status = "blocked";
     let mut dispatch_status = "not_started";
     let mut audit_result = "blocked";
@@ -404,6 +405,12 @@ async fn cross_plane_action_execute_handler(
                         audit_summary = "live_dispatch_sent".to_string();
                         dispatched = true;
                         dispatch_outcome = Some(outcome);
+                        if let Some((grant_id, remaining)) = cross_plane_control()
+                            .consume_matched_grant_for_decision(&readiness.decision)
+                        {
+                            evidence.consumed_grant_id = Some(grant_id);
+                            evidence.remaining_uses_after = Some(remaining);
+                        }
                     }
                     Err((blocker, outcome)) => {
                         readiness.blockers.push(blocker);
@@ -447,7 +454,7 @@ async fn cross_plane_action_execute_handler(
         audit_result,
         audit_summary,
     )
-    .with_evidence(readiness.evidence.clone());
+    .with_evidence(evidence.clone());
     let audit_record_id = audit_record.id.clone();
     cross_plane_control().record_audit(audit_record);
     let receipt = CrossPlaneExecutionReceipt::new(
@@ -565,7 +572,7 @@ async fn evaluate_action_readiness(
     }
 }
 
-pub(super) fn decide_connector_action_and_audit(
+pub(super) fn decide_connector_action(
     state: &AppState,
     action: CrossPlaneAction,
     mode: &str,
@@ -576,7 +583,7 @@ pub(super) fn decide_connector_action_and_audit(
     CrossPlaneDecisionEvidence,
 ) {
     let connector_context = connector_context_for_action(state, &action, mode);
-    cross_plane_control().decide_and_audit_with_connector_context(action, connector_context, now)
+    cross_plane_control().decide_with_connector_context(action, connector_context, now)
 }
 
 fn connector_context_for_action(

@@ -1,0 +1,47 @@
+[2026-06-09T18:13:38+08:00] START cargo_test_cowd-cli_core
+   Compiling cowd-cli v0.9.74 (/media/yi/Datas/workspace/cowd-develop/crates/cowd-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.36s
+     Running unittests src/main.rs (/tmp/cowd-target-v0974-speed/debug/deps/cowd-8a15ba24fb2ac4cd)
+
+running 7 tests
+test gateway::tests::get_nonexistent_returns_none ... ok
+test gateway::tests::list_returns_sorted_ids ... ok
+test gateway::tests::new_creates_empty_registry ... ok
+test gateway::tests::register_and_get ... ok
+test gateway::tests::register_overwrite ... ok
+test gateway::tests::remove_drops_session ... ok
+test gateway::tests::remove_nonexistent_returns_none ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 1203 filtered out; finished in 0.66s
+
+     Running tests/cli_flags_and_config_defaults.rs (/tmp/cowd-target-v0974-speed/debug/deps/cli_flags_and_config_defaults-c32656eea068c349)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/compact_output.rs (/tmp/cowd-target-v0974-speed/debug/deps/compact_output-0a9bad6496e4a2ba)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/mock_parity_harness.rs (/tmp/cowd-target-v0974-speed/debug/deps/mock_parity_harness-cee8e0c28e0d47e6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/output_format_contract.rs (/tmp/cowd-target-v0974-speed/debug/deps/output_format_contract-4023c061febcfbe9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/resume_slash_commands.rs (/tmp/cowd-target-v0974-speed/debug/deps/resume_slash_commands-4dda4a8dfcfe08de)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+
+[2026-06-09T18:13:58+08:00] END cargo_test_cowd-cli_core status=0 elapsed=20s target_before=14196231453 target_after=14196231453
