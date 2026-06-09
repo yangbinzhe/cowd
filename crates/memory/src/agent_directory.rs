@@ -86,11 +86,19 @@ pub struct AgentDirectory {
 }
 
 impl AgentDirectory {
+    /// Create an empty directory instance.
+    ///
+    /// Most runtime callers should use `AgentDirectory::global()`. A dedicated
+    /// instance is useful when a caller needs explicit lifecycle isolation.
+    pub fn new() -> Self {
+        Self {
+            agents: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// Obtain a reference to the global singleton directory.
     pub fn global() -> &'static Self {
-        DIRECTORY.get_or_init(|| Self {
-            agents: Mutex::new(HashMap::new()),
-        })
+        DIRECTORY.get_or_init(Self::new)
     }
 
     /// Register a new agent in the directory.
@@ -194,8 +202,7 @@ mod tests {
 
     #[test]
     fn register_and_lookup() {
-        let dir = AgentDirectory::global();
-        dir.clear_all(); // ensure clean state
+        let dir = AgentDirectory::new();
         let info = dummy_agent("test-1", vec!["rust".to_string()]);
         dir.register(info);
         let active = dir.list_active();
@@ -205,8 +212,7 @@ mod tests {
 
     #[test]
     fn discover_by_capability() {
-        let dir = AgentDirectory::global();
-        dir.clear_all(); // ensure clean state
+        let dir = AgentDirectory::new();
         dir.register(dummy_agent(
             "a1",
             vec!["rust".to_string(), "testing".to_string()],
@@ -224,8 +230,7 @@ mod tests {
 
     #[test]
     fn offline_agents_are_excluded() {
-        let dir = AgentDirectory::global();
-        dir.clear_all(); // ensure clean state
+        let dir = AgentDirectory::new();
         let mut offline = dummy_agent("off-1", vec!["rust".to_string()]);
         offline.status = AgentStatus::Offline;
         dir.register(offline);
@@ -238,8 +243,7 @@ mod tests {
 
     #[test]
     fn test_update_reputation_and_read_back() {
-        let dir = AgentDirectory::global();
-        dir.clear_all();
+        let dir = AgentDirectory::new();
         let info = dummy_agent("rep-1", vec!["rust".to_string()]);
         dir.register(info);
 
@@ -264,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_update_reputation_noop_on_missing() {
-        let dir = AgentDirectory::global();
+        let dir = AgentDirectory::new();
         dir.update_reputation("ghost", ReputationScore::default());
         let active = dir.list_active();
         assert!(active.iter().find(|a| a.agent_id == "ghost").is_none());
@@ -272,8 +276,7 @@ mod tests {
 
     #[test]
     fn update_status_preserves_other_fields() {
-        let dir = AgentDirectory::global();
-        dir.clear_all();
+        let dir = AgentDirectory::new();
         let info = dummy_agent("st-1", vec!["go".to_string()]);
         let orig_registered = info.registered_at_ms;
         dir.register(info);

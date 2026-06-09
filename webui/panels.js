@@ -1993,6 +1993,7 @@ window.Panels = (()=>{
     const c=cont();c.innerHTML='<h3>Agent Tasks</h3>';
     try{
       const tasks=await Api.taskStatus();
+      const agentRuns=await Api.agentRuns().catch(function(){return {runs:[]}});
       const sec=UI.el('div','panel-section');
       sec.innerHTML='<h3>Task Registry</h3>';
       const current=tasks.current;
@@ -2030,6 +2031,39 @@ window.Panels = (()=>{
         }
       }else{
         sec.appendChild(UI.el('div','panel-empty','No active task'));
+      }
+      const graphs=(agentRuns.runs||[]).slice(-5).reverse();
+      if(graphs.length){
+        const graphSec=UI.el('div','panel-section');
+        graphSec.innerHTML='<h3>Agent Run Graph</h3>';
+        graphs.forEach(function(graph){
+          const box=UI.el('div','panel-section');
+          box.innerHTML='<h3>'+UI.esc(graph.status||'running')+' · '+UI.esc(graph.objective||graph.graph_id||'agent graph')+'</h3>';
+          const metrics=UI.el('div','memory-metrics');
+          metrics.appendChild(renderMemoryMetric('nodes',(graph.nodes||[]).length,'graph'));
+          metrics.appendChild(renderMemoryMetric('evidence',(graph.evidence||[]).length,'refs'));
+          metrics.appendChild(renderMemoryMetric('reviews',(graph.reviews||[]).length,'quality'));
+          metrics.appendChild(renderMemoryMetric('merges',(graph.merge_decisions||[]).length,'decisions'));
+          box.appendChild(metrics);
+          (graph.nodes||[]).slice(0,6).forEach(function(node){
+            const row=UI.el('div','panel-item');
+            const name=UI.el('span','pi-name');
+            name.textContent=(node.status||'pending')+' · '+(node.role||'agent')+' · '+(node.title||node.id);
+            row.appendChild(name);
+            box.appendChild(row);
+          });
+          (graph.evidence||[]).slice(-3).forEach(function(evidence){
+            box.appendChild(UI.el('div','panel-empty','evidence: '+(evidence.kind||'ref')+' · '+(evidence.summary||evidence.reference||'')));
+          });
+          (graph.reviews||[]).slice(-3).forEach(function(review){
+            box.appendChild(UI.el('div','panel-empty','review: '+(review.verdict||'review')+' · '+(review.comment||'')));
+          });
+          (graph.merge_decisions||[]).slice(-2).forEach(function(decision){
+            box.appendChild(UI.el('div','panel-empty','merge: '+(decision.decision||'decision')+' · conflicts '+((decision.conflicts||[]).length)));
+          });
+          graphSec.appendChild(box);
+        });
+        sec.appendChild(graphSec);
       }
       (tasks.tasks||[]).slice(-8).reverse().forEach(function(task){
         if(current&&task.id===current.id)return;

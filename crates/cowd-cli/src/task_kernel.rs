@@ -4,6 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use runtime::{AgentNodeStatus, AgentRunGraph, ReviewVerdict};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +100,8 @@ pub(crate) struct TaskRecord {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub audit: Vec<TaskAuditEvent>,
+    #[serde(default)]
+    pub agent_graph: Option<AgentRunGraph>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -177,7 +180,13 @@ impl TaskKernel {
             created_at_ms: now,
             updated_at_ms: now,
             audit: Vec::new(),
+            agent_graph: None,
         };
+        task.agent_graph = Some(AgentRunGraph::from_objective(
+            task.id.clone(),
+            task.objective.clone(),
+        ));
+        sync_agent_phase_node(&mut task, "implementation")?;
         task.audit.push(TaskAuditEvent {
             event_type: "started".to_string(),
             message: "task started".to_string(),
@@ -268,6 +277,7 @@ impl TaskKernel {
         task.current_phase = Some(name.clone());
         task.updated_at_ms = now;
         task.phases.push(phase);
+        sync_agent_phase_node(task, &name)?;
         task.audit.push(TaskAuditEvent {
             event_type: "phase_started".to_string(),
             message: format!("phase started: {name}"),
@@ -318,6 +328,28 @@ impl TaskKernel {
             value,
             created_at_ms: now,
         });
+        if let Some(graph) = &mut task.agent_graph {
+            graph
+                .add_evidence(
+                    phase_id,
+                    phase
+                        .artifacts
+                        .last()
+                        .map(|artifact| artifact.kind.as_str())
+                        .unwrap_or("note"),
+                    phase
+                        .artifacts
+                        .last()
+                        .map(|artifact| artifact.label.as_str())
+                        .unwrap_or("artifact"),
+                    phase
+                        .artifacts
+                        .last()
+                        .map(|artifact| artifact.value.as_str())
+                        .unwrap_or(""),
+                )
+                .map_err(|error| error.to_string())?;
+        }
         phase.updated_at_ms = now;
         task.updated_at_ms = now;
         task.audit.push(TaskAuditEvent {
@@ -372,6 +404,18 @@ impl TaskKernel {
         };
         task.current_phase = Some(phase.name.clone());
         task.updated_at_ms = now;
+        if let Some(graph) = &mut task.agent_graph {
+            if graph.nodes.iter().any(|node| node.id == phase_id) {
+                let verdict = if completed {
+                    ReviewVerdict::Accept
+                } else {
+                    ReviewVerdict::Challenge
+                };
+                graph
+                    .add_review(phase_id, "task-reviewer", verdict, result.clone())
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         task.audit.push(TaskAuditEvent {
             event_type: "phase_reviewed".to_string(),
             message: result,
@@ -406,9 +450,70 @@ impl TaskKernel {
             task.blocker_reason = Some(reason.clone());
             task.current_phase = Some("blocked".to_string());
         }
+        if let Some(graph) = &mut task.agent_graph {
+            if let Some(current_phase) = task.current_phase.as_deref() {
+                if let Some(node_id) = task
+                    .phases
+                    .iter()
+                    .rev()
+                    .find(|phase| phase.name == current_phase)
+                    .map(|phase| phase.id.clone())
+                {
+                    if graph.nodes.iter().any(|node| node.id == node_id) {
+                        graph
+                            .record_failure(&node_id, reason.clone())
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+        }
         task.audit.push(TaskAuditEvent {
             event_type: "failure".to_string(),
             message: reason,
+            created_at_ms: now,
+        });
+        let updated = task.clone();
+        drop(store);
+        self.persist()?;
+        Ok(updated)
+    }
+
+    #[must_use]
+    pub(crate) fn list_agent_graphs(&self) -> Vec<AgentRunGraph> {
+        self.list()
+            .into_iter()
+            .filter_map(|task| task.agent_graph)
+            .collect()
+    }
+
+    #[must_use]
+    pub(crate) fn agent_graph(&self, task_id: &str) -> Option<AgentRunGraph> {
+        self.list()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .and_then(|task| task.agent_graph)
+    }
+
+    pub(crate) fn upsert_agent_graph(
+        &self,
+        task_id: &str,
+        graph: AgentRunGraph,
+    ) -> Result<TaskRecord, String> {
+        let now = now_ms();
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let task = store
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| format!("task {task_id} not found"))?;
+        task.agent_graph = Some(graph);
+        task.updated_at_ms = now;
+        task.audit.push(TaskAuditEvent {
+            event_type: "agent_graph_updated".to_string(),
+            message: "agent graph updated".to_string(),
             created_at_ms: now,
         });
         let updated = task.clone();
@@ -503,6 +608,26 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn sync_agent_phase_node(task: &mut TaskRecord, phase_name: &str) -> Result<(), String> {
+    let Some(graph) = &mut task.agent_graph else {
+        return Ok(());
+    };
+    let Some(phase) = task.phases.last() else {
+        return Ok(());
+    };
+    graph
+        .upsert_phase_node(
+            phase.id.clone(),
+            phase_name.to_string(),
+            phase.objective.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+    if let Some(planner) = graph.nodes.iter_mut().find(|node| node.id == "planner") {
+        planner.status = AgentNodeStatus::Completed;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -646,6 +771,16 @@ mod tests {
             .audit
             .iter()
             .any(|event| event.event_type == "phase_reviewed"));
+        let graph = reviewed.agent_graph.as_ref().expect("agent graph");
+        assert!(graph.nodes.iter().any(|node| node.id == phase.id));
+        assert!(graph.evidence.iter().any(|evidence| {
+            evidence.node_id == phase.id
+                && evidence.reference == "playwright"
+                && evidence.summary == "2 passed"
+        }));
+        assert!(graph.reviews.iter().any(|review| {
+            review.node_id == phase.id && review.comment == "accepted after gate"
+        }));
 
         let restored = TaskKernel::open(path.clone()).unwrap();
         let restored_task = restored
@@ -654,6 +789,7 @@ mod tests {
             .find(|t| t.id == task.id)
             .unwrap();
         assert!(restored_task.phases.iter().any(|p| p.id == phase.id));
+        assert_eq!(restored.list_agent_graphs().len(), 1);
 
         let _ = std::fs::remove_file(path);
     }
