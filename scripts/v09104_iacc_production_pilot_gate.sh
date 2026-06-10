@@ -25,6 +25,7 @@ run_script scripts/v09102_iacc_command_center_incident_room_scenario.sh
 run_script scripts/v09103_iacc_source_pack_large_data_scenario.sh
 run_script scripts/v09105_iacc_data_plane_adapter_scenario.sh
 run_script scripts/v09106_iacc_connector_runtime_scenario.sh
+run_script scripts/v09107_iacc_ontology_entity_governance_scenario.sh
 run_script scripts/v0998_iacc_production_release_gate.sh
 
-printf '\nIACC v0.9.106 connector runtime gate passed.\n'
+printf '\nIACC v0.9.107 ontology entity governance gate passed.\n'

@@ -21,6 +21,7 @@ mod incident;
 mod memory_case;
 mod metric;
 mod metric_graph;
+mod ontology;
 mod quality;
 mod relation;
 mod skill;
@@ -62,6 +63,11 @@ pub use incident::IaccIncident;
 pub use memory_case::{IaccCasePromotion, IaccMemoryCase, IaccPlaybook, IaccPlaybookStep};
 pub use metric::{IaccMetricDefinition, IaccMetricState, IaccMetricStatus};
 pub use metric_graph::{IaccMetricDependency, IaccMetricDependencyInput, IaccMetricLineage};
+pub use ontology::{
+    match_candidate, server_manufacturing_ontology_pack, IaccEntityConflictDecision,
+    IaccEntityMatchCandidate, IaccOntologyConcept, IaccOntologyMetricBinding, IaccOntologyPack,
+    IaccOntologyRelation,
+};
 pub use quality::IaccQualityGateDecision;
 pub use relation::{IaccImpactHop, IaccImpactTrace, IaccRelation, IaccRelationInput};
 pub use skill::{

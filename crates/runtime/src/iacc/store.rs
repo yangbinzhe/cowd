@@ -17,12 +17,12 @@ use super::{
     IaccDataPlaneIngestPlan, IaccDataPlaneIngestPlanInput, IaccDataPlaneWatermark,
     IaccDomainSeedResult, IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
     IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMemoryCase, IaccMetricDefinition,
-    IaccMetricDependency, IaccMetricLineage, IaccMetricState, IaccOperationalAnalysis,
-    IaccPlaybook, IaccQualityGateDecision, IaccRelation, IaccSeverity, IaccSourceDeltaPlan,
-    IaccSourcePack, IaccSourcePackValidation, IaccSqliteDataPlane,
+    IaccMetricDependency, IaccMetricLineage, IaccMetricState, IaccOntologyPack,
+    IaccOperationalAnalysis, IaccPlaybook, IaccQualityGateDecision, IaccRelation, IaccSeverity,
+    IaccSourceDeltaPlan, IaccSourcePack, IaccSourcePackValidation, IaccSqliteDataPlane,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 13;
+pub const IACC_SCHEMA_VERSION: i64 = 14;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -58,6 +58,9 @@ pub struct IaccHealth {
     pub source_pack_count: u64,
     pub data_plane_watermark_count: u64,
     pub connector_run_count: u64,
+    pub ontology_pack_count: u64,
+    pub entity_match_candidate_count: u64,
+    pub entity_conflict_decision_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,6 +126,12 @@ impl IaccStore {
             source_pack_count: count_table(&connection, "iacc_source_pack")?,
             data_plane_watermark_count: count_table(&connection, "iacc_data_plane_watermark")?,
             connector_run_count: count_table(&connection, "iacc_connector_run")?,
+            ontology_pack_count: count_table(&connection, "iacc_ontology_pack")?,
+            entity_match_candidate_count: count_table(&connection, "iacc_entity_match_candidate")?,
+            entity_conflict_decision_count: count_table(
+                &connection,
+                "iacc_entity_conflict_decision",
+            )?,
         })
     }
 
@@ -293,6 +302,85 @@ impl IaccStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         list_entities(&connection, limit)
+    }
+
+    pub fn seed_server_manufacturing_ontology(&self) -> Result<IaccOntologyPack, IaccStoreError> {
+        let pack = super::server_manufacturing_ontology_pack();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        insert_ontology_pack(&connection, &pack)?;
+        Ok(pack)
+    }
+
+    pub fn get_ontology_pack(
+        &self,
+        ontology_id: &str,
+    ) -> Result<Option<IaccOntologyPack>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_ontology_pack(&connection, ontology_id)
+    }
+
+    pub fn propose_entity_match(
+        &self,
+        left_entity_id: &str,
+        right_entity_id: &str,
+    ) -> Result<super::IaccEntityMatchCandidate, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let left = find_entity(&connection, left_entity_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(left_entity_id.to_string()))?;
+        let right = find_entity(&connection, right_entity_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(right_entity_id.to_string()))?;
+        let candidate = super::match_candidate(&left, &right).ok_or_else(|| {
+            IaccStoreError::NotFound(
+                "entity match candidate below confidence threshold".to_string(),
+            )
+        })?;
+        insert_entity_match_candidate(&connection, &candidate)?;
+        Ok(candidate)
+    }
+
+    pub fn decide_entity_conflict(
+        &self,
+        candidate_id: &str,
+        survivor_entity_id: &str,
+        retired_entity_id: &str,
+        survivorship_rule: &str,
+        notes: Option<String>,
+    ) -> Result<super::IaccEntityConflictDecision, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_entity_match_candidate(&connection, candidate_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(candidate_id.to_string()))?;
+        let survivor = find_entity(&connection, survivor_entity_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(survivor_entity_id.to_string()))?;
+        let retired = find_entity(&connection, retired_entity_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(retired_entity_id.to_string()))?;
+        let decision = super::IaccEntityConflictDecision {
+            decision_id: format!("entity-conflict-decision-{}", uuid::Uuid::new_v4()),
+            candidate_id: candidate_id.to_string(),
+            decision: "merge".to_string(),
+            survivor_entity_id: survivor.entity_id,
+            retired_entity_id: retired.entity_id,
+            survivorship_rule: survivorship_rule.to_string(),
+            notes,
+            decision_metadata: serde_json::json!({
+                "source": "iacc.entity_governance",
+                "policy": survivorship_rule,
+            }),
+            decided_at: Utc::now(),
+        };
+        insert_entity_conflict_decision(&connection, &decision)?;
+        Ok(decision)
     }
 
     pub fn upsert_relation(&self, relation: &IaccRelation) -> Result<IaccRelation, IaccStoreError> {
@@ -1118,7 +1206,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 13, datetime('now'))
+        VALUES (1, 14, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -1412,7 +1500,38 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_iacc_connector_run_source
             ON iacc_connector_run(source_pack_id, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_iacc_connector_run_status
-            ON iacc_connector_run(status, updated_at DESC);",
+            ON iacc_connector_run(status, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_ontology_pack (
+            ontology_id TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            version TEXT NOT NULL,
+            pack_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS iacc_entity_match_candidate (
+            candidate_id TEXT PRIMARY KEY,
+            left_entity_id TEXT NOT NULL,
+            right_entity_id TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            status TEXT NOT NULL,
+            candidate_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_entity_match_candidate_entities
+            ON iacc_entity_match_candidate(left_entity_id, right_entity_id);
+
+        CREATE TABLE IF NOT EXISTS iacc_entity_conflict_decision (
+            decision_id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL,
+            survivor_entity_id TEXT NOT NULL,
+            retired_entity_id TEXT NOT NULL,
+            decision_json TEXT NOT NULL,
+            decided_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_entity_conflict_candidate
+            ON iacc_entity_conflict_decision(candidate_id, decided_at DESC);",
     )
 }
 
@@ -1700,6 +1819,98 @@ fn attention_matches_profile(item: &IaccAttentionItem, profile: &IaccCockpitProf
         .focus_metric_ids
         .iter()
         .any(|metric_id| item.title.contains(metric_id))
+}
+
+fn insert_ontology_pack(
+    connection: &Connection,
+    pack: &IaccOntologyPack,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_ontology_pack (
+            ontology_id, domain, version, pack_json, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            pack.ontology_id,
+            pack.domain,
+            pack.version,
+            serde_json::to_string(pack)?,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_ontology_pack(
+    connection: &Connection,
+    ontology_id: &str,
+) -> Result<Option<IaccOntologyPack>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT pack_json FROM iacc_ontology_pack WHERE ontology_id = ?1",
+            params![ontology_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn insert_entity_match_candidate(
+    connection: &Connection,
+    candidate: &super::IaccEntityMatchCandidate,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_entity_match_candidate (
+            candidate_id, left_entity_id, right_entity_id, confidence, status,
+            candidate_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            candidate.candidate_id,
+            candidate.left_entity_id,
+            candidate.right_entity_id,
+            candidate.confidence,
+            candidate.status,
+            serde_json::to_string(candidate)?,
+            candidate.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_entity_match_candidate(
+    connection: &Connection,
+    candidate_id: &str,
+) -> Result<Option<super::IaccEntityMatchCandidate>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT candidate_json FROM iacc_entity_match_candidate WHERE candidate_id = ?1",
+            params![candidate_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn insert_entity_conflict_decision(
+    connection: &Connection,
+    decision: &super::IaccEntityConflictDecision,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_entity_conflict_decision (
+            decision_id, candidate_id, survivor_entity_id, retired_entity_id,
+            decision_json, decided_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            decision.decision_id,
+            decision.candidate_id,
+            decision.survivor_entity_id,
+            decision.retired_entity_id,
+            serde_json::to_string(decision)?,
+            decision.decided_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn upsert_entity(

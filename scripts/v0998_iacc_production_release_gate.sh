@@ -124,7 +124,7 @@ EOF
   done
 
   curl -fsS "$base_url/healthz" | rg -q '"gateway":"daemon-http-gateway"'
-  curl -fsS "$base_url/api/iacc/health" | rg -q '"expected_schema_version":13'
+  curl -fsS "$base_url/api/iacc/health" | rg -q '"expected_schema_version":14'
   curl -fsS "$base_url/api/iacc/health" | rg -q '"production_operation_package"'
 }
 

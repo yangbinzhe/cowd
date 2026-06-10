@@ -12,18 +12,19 @@ use axum::{
 use memory::store::session::SessionRecord;
 use runtime::{
     plan_server_manufacturing_skills, run_server_manufacturing_skill,
-    server_manufacturing_domain_pack, server_manufacturing_skill_pack, skill_agent_node_id,
-    AgentNodeStatus, AgentRole, AgentRunGraph, AgentTaskNode, CrossPlaneAction,
-    CrossPlaneAuditRecord, CrossPlaneExecutionReceipt, CrossPlaneRisk, DataClassification,
-    IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccCockpitProfile,
-    IaccCockpitProfileInput, IaccCockpitReportDeliveryPayload,
-    IaccCockpitReportDeliveryPayloadRequest, IaccCockpitReportDeliveryReceipt,
-    IaccCockpitReportDeliveryState, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
-    IaccComputeJobInput, IaccConnectorRunInput, IaccCrossPlaneBridgeReceipt,
-    IaccDataPlaneIngestPlanInput, IaccEntity, IaccEntityInput, IaccFact, IaccFactInput,
-    IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccPlaybook, IaccRelation,
-    IaccRelationInput, IaccSkillManifest, IaccSkillPlan, IaccSkillRun, IaccSourcePack, IaccStore,
-    IaccStoreError, IdentityTrust, PolicyDecisionKind, IACC_SCHEMA_VERSION,
+    server_manufacturing_domain_pack, server_manufacturing_ontology_pack,
+    server_manufacturing_skill_pack, skill_agent_node_id, AgentNodeStatus, AgentRole,
+    AgentRunGraph, AgentTaskNode, CrossPlaneAction, CrossPlaneAuditRecord,
+    CrossPlaneExecutionReceipt, CrossPlaneRisk, DataClassification, IaccActionExecution,
+    IaccActionExecutionRequest, IaccActionFeedback, IaccCockpitProfile, IaccCockpitProfileInput,
+    IaccCockpitReportDeliveryPayload, IaccCockpitReportDeliveryPayloadRequest,
+    IaccCockpitReportDeliveryReceipt, IaccCockpitReportDeliveryState, IaccCockpitReportRequest,
+    IaccCockpitReportSnapshot, IaccComputeJobInput, IaccConnectorRunInput,
+    IaccCrossPlaneBridgeReceipt, IaccDataPlaneIngestPlanInput, IaccEntity, IaccEntityInput,
+    IaccFact, IaccFactInput, IaccIncident, IaccMetricDependency, IaccMetricDependencyInput,
+    IaccPlaybook, IaccRelation, IaccRelationInput, IaccSkillManifest, IaccSkillPlan, IaccSkillRun,
+    IaccSourcePack, IaccStore, IaccStoreError, IdentityTrust, PolicyDecisionKind,
+    IACC_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -121,6 +122,14 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/iacc/domain/server-manufacturing/seed",
             post(iacc_server_manufacturing_seed_handler),
         )
+        .route(
+            "/api/iacc/ontology/server-manufacturing",
+            get(iacc_server_manufacturing_ontology_handler),
+        )
+        .route(
+            "/api/iacc/ontology/server-manufacturing/seed",
+            post(iacc_server_manufacturing_ontology_seed_handler),
+        )
         .route("/api/iacc/entities", get(iacc_entities_handler))
         .route(
             "/api/iacc/entities/upsert",
@@ -129,6 +138,14 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/iacc/entities/resolve-source-key",
             post(iacc_entity_resolve_source_key_handler),
+        )
+        .route(
+            "/api/iacc/entities/match-candidate",
+            post(iacc_entity_match_candidate_handler),
+        )
+        .route(
+            "/api/iacc/entities/conflict-decision",
+            post(iacc_entity_conflict_decision_handler),
         )
         .route("/api/iacc/entities/:id", get(iacc_entity_get_handler))
         .route(
@@ -325,6 +342,30 @@ struct IaccEntityResolveSourceKeyRequest {
     session_id: Option<String>,
     source_system: String,
     source_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccEntityMatchCandidateRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    left_entity_id: String,
+    right_entity_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IaccEntityConflictDecisionRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    candidate_id: String,
+    survivor_entity_id: String,
+    retired_entity_id: String,
+    survivorship_rule: String,
+    #[serde(default)]
+    notes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -606,6 +647,9 @@ async fn iacc_health_handler(
         "source_pack_count": health.source_pack_count,
         "data_plane_watermark_count": health.data_plane_watermark_count,
         "connector_run_count": health.connector_run_count,
+        "ontology_pack_count": health.ontology_pack_count,
+        "entity_match_candidate_count": health.entity_match_candidate_count,
+        "entity_conflict_decision_count": health.entity_conflict_decision_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": capabilities,
     })))
@@ -620,6 +664,10 @@ fn iacc_health_capabilities() -> Vec<&'static str> {
         "connector_runtime",
         "connector_run_receipt",
         "connector_quality_report",
+        "server_manufacturing_ontology",
+        "entity_match_candidate",
+        "entity_conflict_decision",
+        "entity_survivorship_rule",
         "cockpit_report_snapshot",
         "scheduled_report_foundation",
         "cockpit_report_delivery_bridge",
@@ -1187,6 +1235,28 @@ async fn iacc_server_manufacturing_seed_handler(
     })))
 }
 
+async fn iacc_server_manufacturing_ontology_handler(
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.ontology_pack",
+        "pack": server_manufacturing_ontology_pack(),
+    })))
+}
+
+async fn iacc_server_manufacturing_ontology_seed_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let pack = store
+        .seed_server_manufacturing_ontology()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.ontology_seed",
+        "pack": pack,
+    })))
+}
+
 async fn iacc_entities_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -1198,6 +1268,52 @@ async fn iacc_entities_handler(
     Ok(Json(serde_json::json!({
         "kind": "iacc.entities",
         "entities": entities,
+    })))
+}
+
+async fn iacc_entity_match_candidate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccEntityMatchCandidateRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let candidate = store
+        .propose_entity_match(&request.left_entity_id, &request.right_entity_id)
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.entity.match_candidate",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "candidate": candidate,
+    })))
+}
+
+async fn iacc_entity_conflict_decision_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Json(request): Json<IaccEntityConflictDecisionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let decision = store
+        .decide_entity_conflict(
+            &request.candidate_id,
+            &request.survivor_entity_id,
+            &request.retired_entity_id,
+            &request.survivorship_rule,
+            request.notes,
+        )
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.entity.conflict_decision",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "decision": decision,
     })))
 }
 
