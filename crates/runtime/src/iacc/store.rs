@@ -790,6 +790,17 @@ impl IaccStore {
         find_analysis(&connection, analysis_id)
     }
 
+    pub fn latest_analysis_for_incident(
+        &self,
+        incident_id: &str,
+    ) -> Result<Option<IaccOperationalAnalysis>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        latest_analysis_for_incident(&connection, incident_id)
+    }
+
     pub fn execute_recommended_action(
         &self,
         analysis_id: &str,
@@ -822,6 +833,18 @@ impl IaccStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         find_execution(&connection, execution_id)
+    }
+
+    pub fn list_executions_for_incident(
+        &self,
+        incident_id: &str,
+        limit: usize,
+    ) -> Result<Vec<IaccActionExecution>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_executions_for_incident(&connection, incident_id, limit)
     }
 
     pub fn attach_cross_plane_receipt(

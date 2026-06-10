@@ -35,6 +35,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/iacc/health", get(iacc_health_handler))
         .route("/api/iacc/skills", get(iacc_skills_handler))
         .route("/api/iacc/skills/:id", get(iacc_skill_get_handler))
+        .route("/api/iacc/command-center", get(iacc_command_center_handler))
         .route(
             "/api/iacc/cockpit/profiles/upsert",
             post(iacc_cockpit_profile_upsert_handler),
@@ -153,6 +154,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/iacc/incidents", post(iacc_incident_create_handler))
         .route("/api/iacc/incidents/:id", get(iacc_incident_get_handler))
+        .route(
+            "/api/iacc/incidents/:id/room",
+            get(iacc_incident_room_handler),
+        )
         .route(
             "/api/iacc/incidents/:id/analyze",
             post(iacc_incident_analyze_handler),
@@ -532,6 +537,8 @@ async fn iacc_health_handler(
             "playbook_recommendation",
             "server_manufacturing_skill_pack",
             "incident_skill_agent_graph",
+            "command_center_projection",
+            "incident_room_projection",
             "personal_cockpit_projection",
             "cockpit_profile_thresholds",
             "evidence_quality_gate",
@@ -578,6 +585,39 @@ async fn iacc_skill_get_handler(
     Ok(Json(serde_json::json!({
         "kind": "iacc.skill",
         "skill": skill,
+    })))
+}
+
+async fn iacc_command_center_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let health = store
+        .health()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let attention = store
+        .list_attention(10)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let changes = store
+        .list_changes(10)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let skills = server_manufacturing_skill_pack();
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.command_center",
+        "health": health,
+        "risk_queue": attention,
+        "recent_changes": changes,
+        "skill_count": skills.len(),
+        "operating_lanes": [
+            "supply_risk",
+            "clear_to_build",
+            "capacity",
+            "quality",
+            "delivery",
+            "procurement",
+            "plan_change"
+        ],
     })))
 }
 
@@ -1333,6 +1373,50 @@ async fn iacc_incident_get_handler(
     Ok(Json(serde_json::json!({
         "kind": "iacc.incident",
         "incident": incident,
+    })))
+}
+
+async fn iacc_incident_room_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let incident = store
+        .get_incident(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC incident not found"))?;
+    let evidence_packet = incident
+        .evidence_packet_id
+        .as_deref()
+        .and_then(|packet_id| store.get_evidence_packet(packet_id).ok().flatten());
+    let quality_gate = evidence_packet
+        .as_ref()
+        .and_then(|packet| store.evaluate_evidence_quality(&packet.packet_id).ok());
+    let analysis = store
+        .latest_analysis_for_incident(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let executions = store
+        .list_executions_for_incident(&id, 20)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let memory_cases = store.search_memory_cases(Some(&id), 10).unwrap_or_default();
+    let playbooks = store
+        .recommend_playbooks_for_incident(&id, 5)
+        .unwrap_or_default();
+    let agent_graph = incident
+        .task_id
+        .as_deref()
+        .and_then(|task_id| state.task_kernel.agent_graph(task_id));
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.incident_room",
+        "incident": incident,
+        "evidence_packet": evidence_packet,
+        "quality_gate": quality_gate,
+        "analysis": analysis,
+        "executions": executions,
+        "memory_cases": memory_cases,
+        "playbooks": playbooks,
+        "agent_graph": agent_graph,
     })))
 }
 
