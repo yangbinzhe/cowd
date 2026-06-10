@@ -20,11 +20,11 @@ use super::{
     IaccMetricAttentionPlan, IaccMetricAttentionScore, IaccMetricDefinition, IaccMetricDependency,
     IaccMetricLineage, IaccMetricSnapshot, IaccMetricSnapshotItem, IaccMetricState,
     IaccOntologyPack, IaccOperationalAnalysis, IaccPlaybook, IaccQualityGateDecision, IaccRelation,
-    IaccSeverity, IaccSourceDeltaPlan, IaccSourcePack, IaccSourcePackValidation,
+    IaccSeverity, IaccSkillRun, IaccSourceDeltaPlan, IaccSourcePack, IaccSourcePackValidation,
     IaccSqliteDataPlane,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 15;
+pub const IACC_SCHEMA_VERSION: i64 = 17;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -64,6 +64,7 @@ pub struct IaccHealth {
     pub entity_match_candidate_count: u64,
     pub entity_conflict_decision_count: u64,
     pub metric_snapshot_count: u64,
+    pub skill_execution_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,6 +137,7 @@ impl IaccStore {
                 "iacc_entity_conflict_decision",
             )?,
             metric_snapshot_count: count_table(&connection, "iacc_metric_snapshot")?,
+            skill_execution_count: count_table(&connection, "iacc_skill_execution")?,
         })
     }
 
@@ -1096,6 +1098,37 @@ impl IaccStore {
         find_execution(&connection, execution_id)
     }
 
+    pub fn record_skill_run(&self, run: &IaccSkillRun) -> Result<IaccSkillRun, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        insert_skill_execution(&connection, run)
+    }
+
+    pub fn get_skill_run(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<IaccSkillRun>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_skill_execution(&connection, execution_id)
+    }
+
+    pub fn list_skill_runs_for_incident(
+        &self,
+        incident_id: &str,
+        limit: usize,
+    ) -> Result<Vec<IaccSkillRun>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list_skill_executions_for_incident(&connection, incident_id, limit)
+    }
+
     pub fn list_executions_for_incident(
         &self,
         incident_id: &str,
@@ -1250,7 +1283,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 15, datetime('now'))
+        VALUES (1, 17, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -1585,7 +1618,21 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_iacc_metric_snapshot_scope
-            ON iacc_metric_snapshot(scope_ref, created_at DESC);",
+            ON iacc_metric_snapshot(scope_ref, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_skill_execution (
+            execution_id TEXT PRIMARY KEY,
+            incident_id TEXT NOT NULL,
+            skill_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            execution_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_skill_execution_incident
+            ON iacc_skill_execution(incident_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_iacc_skill_execution_skill
+            ON iacc_skill_execution(skill_id, updated_at DESC);",
     )
 }
 
@@ -2841,6 +2888,82 @@ fn insert_metric_snapshot(
         ],
     )?;
     Ok(())
+}
+
+fn insert_skill_execution(
+    connection: &Connection,
+    run: &IaccSkillRun,
+) -> Result<IaccSkillRun, IaccStoreError> {
+    let mut run = run.clone();
+    let execution_id = run.execution_id.clone().unwrap_or_else(|| {
+        let generated = format!("skill-execution-{}", uuid::Uuid::new_v4());
+        run.execution_id = Some(generated.clone());
+        generated
+    });
+    let created_at = run
+        .telemetry
+        .as_ref()
+        .map(|telemetry| telemetry.completed_at)
+        .unwrap_or_else(Utc::now);
+    let updated_at = run
+        .telemetry
+        .as_ref()
+        .map(|telemetry| telemetry.completed_at)
+        .unwrap_or(created_at);
+    connection.execute(
+        r"INSERT INTO iacc_skill_execution (
+            execution_id, incident_id, skill_id, status, execution_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(execution_id) DO UPDATE SET
+            incident_id = excluded.incident_id,
+            skill_id = excluded.skill_id,
+            status = excluded.status,
+            execution_json = excluded.execution_json,
+            updated_at = excluded.updated_at",
+        params![
+            execution_id,
+            run.incident_id,
+            run.skill_id,
+            run.status,
+            serde_json::to_string(&run)?,
+            created_at.to_rfc3339(),
+            updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(run)
+}
+
+fn find_skill_execution(
+    connection: &Connection,
+    execution_id: &str,
+) -> Result<Option<IaccSkillRun>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT execution_json FROM iacc_skill_execution WHERE execution_id = ?1",
+            params![execution_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn list_skill_executions_for_incident(
+    connection: &Connection,
+    incident_id: &str,
+    limit: usize,
+) -> Result<Vec<IaccSkillRun>, IaccStoreError> {
+    let mut statement = connection.prepare(
+        r"SELECT execution_json
+          FROM iacc_skill_execution
+          WHERE incident_id = ?1
+          ORDER BY updated_at DESC
+          LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![incident_id, limit.max(1) as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
 }
 
 fn priority_for_compute_job(job: &IaccComputeJob) -> f32 {

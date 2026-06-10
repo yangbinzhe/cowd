@@ -244,6 +244,11 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/iacc/incidents/:id/skills/:skill_id/run",
             post(iacc_incident_skill_run_handler),
         )
+        .route(
+            "/api/iacc/incidents/:id/skills",
+            get(iacc_incident_skill_runs_handler),
+        )
+        .route("/api/iacc/skill-runs/:id", get(iacc_skill_run_get_handler))
         .route("/api/iacc/cases/:id", get(iacc_memory_case_get_handler))
         .route(
             "/api/iacc/cases/search",
@@ -685,6 +690,7 @@ async fn iacc_health_handler(
         "entity_match_candidate_count": health.entity_match_candidate_count,
         "entity_conflict_decision_count": health.entity_conflict_decision_count,
         "metric_snapshot_count": health.metric_snapshot_count,
+        "skill_execution_count": health.skill_execution_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": capabilities,
     })))
@@ -750,6 +756,8 @@ fn iacc_health_capabilities() -> Vec<&'static str> {
         "incident_agent_graph",
         "incident_operational_analysis",
         "action_execution_feedback",
+        "skill_execution_record",
+        "skill_execution_query",
     ]
 }
 
@@ -2093,9 +2101,17 @@ async fn iacc_incident_skill_run_handler(
         .get_incident(&id)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC incident not found"))?;
+    let analysis = store.analyze_incident(&id).ok();
+    let packet = incident
+        .evidence_packet_id
+        .as_deref()
+        .and_then(|packet_id| store.get_evidence_packet(packet_id).ok().flatten());
     let skill = find_iacc_skill(&skill_id)
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC skill not found"))?;
-    let run = run_server_manufacturing_skill(&incident, &skill);
+    let run = run_server_manufacturing_skill(&incident, &skill, analysis.as_ref(), packet.as_ref());
+    let run = store
+        .record_skill_run(&run)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let graph = complete_iacc_skill_agent_node(&state, &incident, &run)
         .await
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
@@ -2106,6 +2122,42 @@ async fn iacc_incident_skill_run_handler(
         "incident_id": id,
         "skill_run": run,
         "agent_graph": graph,
+    })))
+}
+
+async fn iacc_incident_skill_runs_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let incident = store
+        .get_incident(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC incident not found"))?;
+    let runs = store
+        .list_skill_runs_for_incident(&incident.incident_id, 24)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.skill.run_list",
+        "incident_id": incident.incident_id,
+        "items": runs,
+    })))
+}
+
+async fn iacc_skill_run_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let run = store
+        .get_skill_run(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC skill run not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.skill.run",
+        "skill_run": run,
     })))
 }
 

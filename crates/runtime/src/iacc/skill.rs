@@ -1,6 +1,43 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::{IaccEvidencePacket, IaccIncident, IaccOperationalAnalysis};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IaccSkillExecutionContext {
+    pub incident_id: String,
+    pub skill_id: String,
+    #[serde(default)]
+    pub attention_id: Option<String>,
+    #[serde(default)]
+    pub evidence_packet_id: Option<String>,
+    #[serde(default)]
+    pub analysis_id: Option<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub metric_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IaccSkillToolCall {
+    pub tool_name: String,
+    pub purpose: String,
+    #[serde(default)]
+    pub input_refs: Vec<String>,
+    pub expected_output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IaccSkillTelemetry {
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub elapsed_ms: u64,
+    pub tool_call_count: usize,
+    pub evidence_ref_count: usize,
+    pub confidence: f32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IaccSkillManifest {
@@ -33,8 +70,10 @@ pub struct IaccSkillPlan {
     pub planned_agent_nodes: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IaccSkillRun {
+    #[serde(default)]
+    pub execution_id: Option<String>,
     pub incident_id: String,
     pub skill_id: String,
     pub status: String,
@@ -45,6 +84,14 @@ pub struct IaccSkillRun {
     pub required_evidence: Vec<String>,
     #[serde(default)]
     pub agent_node_id: Option<String>,
+    #[serde(default)]
+    pub execution_context: Option<IaccSkillExecutionContext>,
+    #[serde(default)]
+    pub tool_plan: Vec<IaccSkillToolCall>,
+    #[serde(default)]
+    pub telemetry: Option<IaccSkillTelemetry>,
+    #[serde(default)]
+    pub structured_report: Value,
 }
 
 #[must_use]
@@ -195,18 +242,87 @@ pub fn plan_server_manufacturing_skills(
 pub fn run_server_manufacturing_skill(
     incident: &IaccIncident,
     skill: &IaccSkillManifest,
+    analysis: Option<&IaccOperationalAnalysis>,
+    packet: Option<&IaccEvidencePacket>,
 ) -> IaccSkillRun {
+    let context = IaccSkillExecutionContext {
+        incident_id: incident.incident_id.clone(),
+        skill_id: skill.skill_id.clone(),
+        attention_id: incident.attention_id.clone(),
+        evidence_packet_id: incident.evidence_packet_id.clone(),
+        analysis_id: analysis.map(|item| item.analysis_id.clone()),
+        evidence_refs: packet
+            .map(|item| {
+                item.source_refs
+                    .iter()
+                    .map(|source| source.reference.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        metric_keys: skill.input_metric_keys.clone(),
+    };
+    let started_at = Utc::now();
+    let tool_plan = skill
+        .tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool_name)| IaccSkillToolCall {
+            tool_name: tool_name.clone(),
+            purpose: format!("step_{}_{}", index + 1, skill.analysis_method),
+            input_refs: context.evidence_refs.clone(),
+            expected_output: skill.success_criteria.clone(),
+        })
+        .collect::<Vec<_>>();
+    let structured_report = serde_json::json!({
+        "incident_id": incident.incident_id,
+        "skill_id": skill.skill_id,
+        "analysis_method": skill.analysis_method,
+        "success_criteria": skill.success_criteria,
+        "evidence_refs": context.evidence_refs,
+        "metric_keys": context.metric_keys,
+        "recommended_actions": skill.output_actions,
+        "quality_gate": skill.quality_gate,
+        "quality_gate_status": if packet
+            .map(|item| item.confidence >= 0.75 && item.missing_evidence.is_empty())
+            .unwrap_or(false)
+        {
+            "pass"
+        } else {
+            "review"
+        },
+        "evidence_packet_confidence": packet.map(|item| item.confidence),
+    });
+    let completed_at = Utc::now();
     IaccSkillRun {
+        execution_id: Some(format!("skill-execution-{}", uuid::Uuid::new_v4())),
         incident_id: incident.incident_id.clone(),
         skill_id: skill.skill_id.clone(),
         status: "completed".to_string(),
         summary: format!(
-            "{} prepared governed analysis for {}",
-            skill.role, incident.title
+            "{} prepared governed analysis for {} with {} tool calls",
+            skill.role,
+            incident.title,
+            tool_plan.len()
         ),
         recommended_actions: skill.output_actions.clone(),
         required_evidence: skill.required_evidence.clone(),
         agent_node_id: Some(skill_agent_node_id(&skill.skill_id)),
+        execution_context: Some(context),
+        tool_plan,
+        telemetry: Some(IaccSkillTelemetry {
+            started_at,
+            completed_at,
+            elapsed_ms: completed_at
+                .signed_duration_since(started_at)
+                .num_milliseconds()
+                .max(0) as u64,
+            tool_call_count: skill.tools.len(),
+            evidence_ref_count: packet
+                .map(|item| item.source_refs.len())
+                .unwrap_or_default(),
+            confidence: packet.map(|item| item.confidence).unwrap_or(0.5),
+        }),
+        structured_report,
     }
 }
 

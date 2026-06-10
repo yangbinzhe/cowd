@@ -27,6 +27,7 @@ run_script scripts/v09105_iacc_data_plane_adapter_scenario.sh
 run_script scripts/v09106_iacc_connector_runtime_scenario.sh
 run_script scripts/v09107_iacc_ontology_entity_governance_scenario.sh
 run_script scripts/v09108_iacc_metric_attention_snapshot_scenario.sh
+run_script scripts/v09109_iacc_skill_runtime_scenario.sh
 run_script scripts/v0998_iacc_production_release_gate.sh
 
-printf '\nIACC v0.9.108 metric attention snapshot gate passed.\n'
+printf '\nIACC v0.9.109 skill runtime gate passed.\n'
