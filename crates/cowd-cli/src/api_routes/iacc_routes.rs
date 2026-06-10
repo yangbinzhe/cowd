@@ -19,11 +19,11 @@ use runtime::{
     IaccCockpitProfileInput, IaccCockpitReportDeliveryPayload,
     IaccCockpitReportDeliveryPayloadRequest, IaccCockpitReportDeliveryReceipt,
     IaccCockpitReportDeliveryState, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
-    IaccComputeJobInput, IaccCrossPlaneBridgeReceipt, IaccDataPlaneIngestPlanInput, IaccEntity,
-    IaccEntityInput, IaccFact, IaccFactInput, IaccIncident, IaccMetricDependency,
-    IaccMetricDependencyInput, IaccPlaybook, IaccRelation, IaccRelationInput, IaccSkillManifest,
-    IaccSkillPlan, IaccSkillRun, IaccSourcePack, IaccStore, IaccStoreError, IdentityTrust,
-    PolicyDecisionKind, IACC_SCHEMA_VERSION,
+    IaccComputeJobInput, IaccConnectorRunInput, IaccCrossPlaneBridgeReceipt,
+    IaccDataPlaneIngestPlanInput, IaccEntity, IaccEntityInput, IaccFact, IaccFactInput,
+    IaccIncident, IaccMetricDependency, IaccMetricDependencyInput, IaccPlaybook, IaccRelation,
+    IaccRelationInput, IaccSkillManifest, IaccSkillPlan, IaccSkillRun, IaccSourcePack, IaccStore,
+    IaccStoreError, IdentityTrust, PolicyDecisionKind, IACC_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +64,18 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/iacc/source-packs/:id/delta-plan",
             post(iacc_source_pack_delta_plan_handler),
+        )
+        .route(
+            "/api/iacc/source-packs/:id/connector-runs/plan",
+            post(iacc_source_pack_connector_run_plan_handler),
+        )
+        .route(
+            "/api/iacc/source-packs/:id/connector-runs/run",
+            post(iacc_source_pack_connector_run_execute_handler),
+        )
+        .route(
+            "/api/iacc/connector-runs/:id",
+            get(iacc_connector_run_get_handler),
         )
         .route(
             "/api/iacc/cockpit/profiles/upsert",
@@ -459,6 +471,16 @@ struct IaccSourcePackIngestFileRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct IaccConnectorRunRequest {
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    run: Option<IaccConnectorRunInput>,
+}
+
+#[derive(Debug, Deserialize)]
 struct IaccCrossPlaneBridgeRequest {
     #[serde(default = "default_iacc_bridge_mode")]
     mode: String,
@@ -583,6 +605,7 @@ async fn iacc_health_handler(
         "playbook_count": health.playbook_count,
         "source_pack_count": health.source_pack_count,
         "data_plane_watermark_count": health.data_plane_watermark_count,
+        "connector_run_count": health.connector_run_count,
         "store": iacc_store_path(&state.workspace_root),
         "capabilities": capabilities,
     })))
@@ -594,6 +617,9 @@ fn iacc_health_capabilities() -> Vec<&'static str> {
         "data_plane_ingest_plan",
         "data_plane_watermark",
         "data_plane_replay_policy",
+        "connector_runtime",
+        "connector_run_receipt",
+        "connector_quality_report",
         "cockpit_report_snapshot",
         "scheduled_report_foundation",
         "cockpit_report_delivery_bridge",
@@ -820,6 +846,84 @@ async fn iacc_source_pack_ingest_file_handler(
         "source_pack_id": id,
         "ingested": attention.len(),
         "attention": attention,
+    })))
+}
+
+async fn iacc_source_pack_connector_run_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<IaccConnectorRunRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let mut input = request.run.unwrap_or(IaccConnectorRunInput {
+        run_id: None,
+        mode: Some("plan".to_string()),
+        resource_ref: None,
+        partition_ref: None,
+        credential_ref: None,
+        expected_rows: None,
+        checksum: None,
+    });
+    input.mode = Some("plan".to_string());
+    let run = store
+        .plan_connector_run(&id, input)
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.connector_run.plan",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "run": run,
+    })))
+}
+
+async fn iacc_source_pack_connector_run_execute_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<IaccConnectorRunRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let mut input = request.run.unwrap_or(IaccConnectorRunInput {
+        run_id: None,
+        mode: Some("run".to_string()),
+        resource_ref: None,
+        partition_ref: None,
+        credential_ref: None,
+        expected_rows: None,
+        checksum: None,
+    });
+    input.mode = Some("run".to_string());
+    let run = store
+        .plan_connector_run(&id, input)
+        .map_err(|error| match error {
+            IaccStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
+            other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.connector_run",
+        "request_id": request.request_id,
+        "session_id": request.session_id,
+        "run": run,
+    })))
+}
+
+async fn iacc_connector_run_get_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let store = open_iacc_store(&state)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let run = store
+        .get_connector_run(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "IACC connector run not found"))?;
+    Ok(Json(serde_json::json!({
+        "kind": "iacc.connector_run",
+        "run": run,
     })))
 }
 

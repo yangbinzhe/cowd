@@ -12,17 +12,17 @@ use super::{
     IaccActionExecution, IaccActionExecutionRequest, IaccActionFeedback, IaccAttentionItem,
     IaccCasePromotion, IaccChangeEvent, IaccCockpitProfile, IaccCockpitProjection,
     IaccCockpitReportDeliveryReceipt, IaccCockpitReportRequest, IaccCockpitReportSnapshot,
-    IaccCockpitWidget, IaccComputeJob, IaccComputeJobInput, IaccComputePlan,
-    IaccCrossPlaneBridgeReceipt, IaccDataPlane, IaccDataPlaneHealth, IaccDataPlaneIngestPlan,
-    IaccDataPlaneIngestPlanInput, IaccDataPlaneWatermark, IaccDomainSeedResult, IaccEntity,
-    IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact, IaccImpactHop, IaccImpactTrace,
-    IaccIncident, IaccMemoryCase, IaccMetricDefinition, IaccMetricDependency, IaccMetricLineage,
-    IaccMetricState, IaccOperationalAnalysis, IaccPlaybook, IaccQualityGateDecision, IaccRelation,
-    IaccSeverity, IaccSourceDeltaPlan, IaccSourcePack, IaccSourcePackValidation,
-    IaccSqliteDataPlane,
+    IaccCockpitWidget, IaccComputeJob, IaccComputeJobInput, IaccComputePlan, IaccConnectorRun,
+    IaccConnectorRunInput, IaccCrossPlaneBridgeReceipt, IaccDataPlane, IaccDataPlaneHealth,
+    IaccDataPlaneIngestPlan, IaccDataPlaneIngestPlanInput, IaccDataPlaneWatermark,
+    IaccDomainSeedResult, IaccEntity, IaccEvidencePacket, IaccEvidenceSourceRef, IaccFact,
+    IaccImpactHop, IaccImpactTrace, IaccIncident, IaccMemoryCase, IaccMetricDefinition,
+    IaccMetricDependency, IaccMetricLineage, IaccMetricState, IaccOperationalAnalysis,
+    IaccPlaybook, IaccQualityGateDecision, IaccRelation, IaccSeverity, IaccSourceDeltaPlan,
+    IaccSourcePack, IaccSourcePackValidation, IaccSqliteDataPlane,
 };
 
-pub const IACC_SCHEMA_VERSION: i64 = 12;
+pub const IACC_SCHEMA_VERSION: i64 = 13;
 
 #[derive(Debug, Error)]
 pub enum IaccStoreError {
@@ -57,6 +57,7 @@ pub struct IaccHealth {
     pub playbook_count: u64,
     pub source_pack_count: u64,
     pub data_plane_watermark_count: u64,
+    pub connector_run_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -121,6 +122,7 @@ impl IaccStore {
             playbook_count: count_table(&connection, "iacc_playbook")?,
             source_pack_count: count_table(&connection, "iacc_source_pack")?,
             data_plane_watermark_count: count_table(&connection, "iacc_data_plane_watermark")?,
+            connector_run_count: count_table(&connection, "iacc_connector_run")?,
         })
     }
 
@@ -561,27 +563,35 @@ impl IaccStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let source_pack = find_source_pack(&connection, source_pack_id)?
             .ok_or_else(|| IaccStoreError::NotFound(source_pack_id.to_string()))?;
-        let mut fact_types = source_pack
-            .fact_mappings
-            .iter()
-            .map(|mapping| mapping.fact_type.clone())
-            .collect::<Vec<_>>();
-        fact_types.sort();
-        fact_types.dedup();
-        let mut affected_metric_ids = Vec::new();
-        for fact_type in &fact_types {
-            affected_metric_ids.extend(metrics_affected_by_fact_type(&connection, fact_type)?);
-            affected_metric_ids.extend(metric_ids_for_fact_type(&connection, fact_type)?);
-        }
-        affected_metric_ids.sort();
-        affected_metric_ids.dedup();
-        Ok(IaccSourceDeltaPlan {
-            source_pack_id: source_pack.source_pack_id,
-            fact_types,
-            affected_metric_ids,
-            compute_scope: "partitioned_by_source_period_entity".to_string(),
-            planned_at: Utc::now(),
-        })
+        source_pack_delta_plan_for(&connection, &source_pack)
+    }
+
+    pub fn plan_connector_run(
+        &self,
+        source_pack_id: &str,
+        input: IaccConnectorRunInput,
+    ) -> Result<IaccConnectorRun, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source_pack = find_source_pack(&connection, source_pack_id)?
+            .ok_or_else(|| IaccStoreError::NotFound(source_pack_id.to_string()))?;
+        let delta_plan = source_pack_delta_plan_for(&connection, &source_pack)?;
+        let run = IaccConnectorRun::from_source_pack(&source_pack, &delta_plan, input);
+        insert_connector_run(&connection, &run)?;
+        Ok(run)
+    }
+
+    pub fn get_connector_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<IaccConnectorRun>, IaccStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        find_connector_run(&connection, run_id)
     }
 
     pub fn list_attention(&self, limit: usize) -> Result<Vec<IaccAttentionItem>, IaccStoreError> {
@@ -1108,7 +1118,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL
         );
         INSERT INTO iacc_schema (id, schema_version, updated_at)
-        VALUES (1, 12, datetime('now'))
+        VALUES (1, 13, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
             schema_version = CASE
                 WHEN iacc_schema.schema_version < excluded.schema_version
@@ -1388,7 +1398,21 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY(source_ref, fact_type, partition_ref)
         );
         CREATE INDEX IF NOT EXISTS idx_iacc_data_plane_watermark_updated
-            ON iacc_data_plane_watermark(updated_at DESC);",
+            ON iacc_data_plane_watermark(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS iacc_connector_run (
+            run_id TEXT PRIMARY KEY,
+            source_pack_id TEXT NOT NULL,
+            connector_kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            run_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_iacc_connector_run_source
+            ON iacc_connector_run(source_pack_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_iacc_connector_run_status
+            ON iacc_connector_run(status, updated_at DESC);",
     )
 }
 
@@ -2924,6 +2948,75 @@ fn find_source_pack(
         .query_row(
             "SELECT source_pack_json FROM iacc_source_pack WHERE source_pack_id = ?1",
             params![source_pack_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| serde_json::from_str(&json).map_err(IaccStoreError::from))
+        .transpose()
+}
+
+fn source_pack_delta_plan_for(
+    connection: &Connection,
+    source_pack: &IaccSourcePack,
+) -> Result<IaccSourceDeltaPlan, IaccStoreError> {
+    let mut fact_types = source_pack
+        .fact_mappings
+        .iter()
+        .map(|mapping| mapping.fact_type.clone())
+        .collect::<Vec<_>>();
+    fact_types.sort();
+    fact_types.dedup();
+    let mut affected_metric_ids = Vec::new();
+    for fact_type in &fact_types {
+        affected_metric_ids.extend(metrics_affected_by_fact_type(connection, fact_type)?);
+        affected_metric_ids.extend(metric_ids_for_fact_type(connection, fact_type)?);
+    }
+    affected_metric_ids.extend(
+        source_pack
+            .fact_mappings
+            .iter()
+            .map(|mapping| mapping.metric_key.clone()),
+    );
+    affected_metric_ids.sort();
+    affected_metric_ids.dedup();
+    Ok(IaccSourceDeltaPlan {
+        source_pack_id: source_pack.source_pack_id.clone(),
+        fact_types,
+        affected_metric_ids,
+        compute_scope: "partitioned_by_source_period_entity".to_string(),
+        planned_at: Utc::now(),
+    })
+}
+
+fn insert_connector_run(
+    connection: &Connection,
+    run: &IaccConnectorRun,
+) -> Result<(), IaccStoreError> {
+    connection.execute(
+        r"INSERT OR REPLACE INTO iacc_connector_run (
+            run_id, source_pack_id, connector_kind, status, run_json, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            run.run_id,
+            run.source_pack_id,
+            run.connector_kind,
+            run.status,
+            serde_json::to_string(run)?,
+            run.created_at.to_rfc3339(),
+            run.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn find_connector_run(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<IaccConnectorRun>, IaccStoreError> {
+    connection
+        .query_row(
+            "SELECT run_json FROM iacc_connector_run WHERE run_id = ?1",
+            params![run_id],
             |row| row.get::<_, String>(0),
         )
         .optional()?

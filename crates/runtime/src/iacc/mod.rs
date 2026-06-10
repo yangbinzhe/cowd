@@ -10,6 +10,7 @@ mod attention;
 mod change;
 mod cockpit;
 mod compute;
+mod connector_runtime;
 mod data_plane;
 mod domain;
 mod entity;
@@ -39,6 +40,9 @@ pub use cockpit::{
     IaccCockpitReportSnapshot, IaccCockpitWidget,
 };
 pub use compute::{IaccComputeJob, IaccComputeJobInput, IaccComputePlan};
+pub use connector_runtime::{
+    IaccConnectorQualityReport, IaccConnectorReceipt, IaccConnectorRun, IaccConnectorRunInput,
+};
 pub use data_plane::{
     IaccDataPlane, IaccDataPlaneCapability, IaccDataPlaneHealth, IaccDataPlaneIngestPlan,
     IaccDataPlaneIngestPlanInput, IaccDataPlaneWatermark, IaccSqliteDataPlane,
